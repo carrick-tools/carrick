@@ -110,6 +110,12 @@ pub struct FunctionDefinition {
     /// Start line number for navigation
     #[serde(default)]
     pub line_number: u32,
+    /// Last line of the function body. Paired with `line_number` this lets a
+    /// consumer read exactly the function instead of the whole file — the
+    /// index locates code, and without an end line every hit still costs a
+    /// full-file read to see thirty lines. 0 when the span is unavailable.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub end_line: u32,
     /// LLM-generated description of what this function intends to do
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intent: Option<String>,
@@ -136,6 +142,10 @@ pub struct FunctionDefinition {
     /// callee's intent shifts. `None` until an intent is generated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent_input_hash: Option<String>,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A reference to a called function, for navigating to its source via GitHub.
@@ -338,6 +348,14 @@ impl FunctionDefinitionExtractor {
         self.source_map.lookup_char_pos(span.lo).line as u32
     }
 
+    /// Get the last line of a span (see `FunctionDefinition::end_line`).
+    fn end_line(&self, span: swc_common::Span) -> u32 {
+        if span.is_dummy() {
+            return 0;
+        }
+        self.source_map.lookup_char_pos(span.hi).line as u32
+    }
+
     /// Render a `TsTypeAnn` as raw TS source text (the text between `:` and
     /// the next token in the source file). Falls back to `None` if the span
     /// can't be resolved.
@@ -504,6 +522,7 @@ impl Visit for FunctionDefinitionExtractor {
                         .as_ref()
                         .and_then(|b| self.extract_source(b.span));
                     let line_number = self.line_number(fn_expr.function.span);
+                    let end_line = self.end_line(fn_expr.function.span);
                     let return_type = fn_expr
                         .function
                         .return_type
@@ -521,6 +540,7 @@ impl Visit for FunctionDefinitionExtractor {
                             body_source,
                             is_exported: true,
                             line_number,
+                            end_line,
                             intent: None,
                             calls: vec![],
                             return_is_explicit: return_type.is_some(),
@@ -574,6 +594,7 @@ impl Visit for FunctionDefinitionExtractor {
             .as_ref()
             .and_then(|b| self.extract_source(b.span));
         let line_number = self.line_number(fn_decl.function.span);
+        let end_line = self.end_line(fn_decl.function.span);
         let return_type = fn_decl
             .function
             .return_type
@@ -590,6 +611,7 @@ impl Visit for FunctionDefinitionExtractor {
                 body_source,
                 is_exported: false, // Updated in a post-pass
                 line_number,
+                end_line,
                 intent: None,
                 calls: vec![],
                 return_is_explicit: return_type.is_some(),
@@ -615,6 +637,7 @@ impl Visit for FunctionDefinitionExtractor {
                         let arguments = self.extract_arrow_arguments(&arrow.params);
                         let body_source = self.extract_source(arrow.span);
                         let line_number = self.line_number(arrow.span);
+                        let end_line = self.end_line(arrow.span);
                         let return_type = arrow
                             .return_type
                             .as_ref()
@@ -629,6 +652,7 @@ impl Visit for FunctionDefinitionExtractor {
                                 body_source,
                                 is_exported: false,
                                 line_number,
+                                end_line,
                                 intent: None,
                                 calls: vec![],
                                 return_is_explicit: return_type.is_some(),
@@ -646,6 +670,7 @@ impl Visit for FunctionDefinitionExtractor {
                             .as_ref()
                             .and_then(|b| self.extract_source(b.span));
                         let line_number = self.line_number(fn_expr.function.span);
+                        let end_line = self.end_line(fn_expr.function.span);
                         let return_type = fn_expr
                             .function
                             .return_type
@@ -663,6 +688,7 @@ impl Visit for FunctionDefinitionExtractor {
                                 body_source,
                                 is_exported: false,
                                 line_number,
+                                end_line,
                                 intent: None,
                                 calls: vec![],
                                 return_is_explicit: return_type.is_some(),
@@ -697,6 +723,7 @@ impl Visit for FunctionDefinitionExtractor {
                             let arguments = self.extract_arrow_arguments(&arrow.params);
                             let body_source = self.extract_source(arrow.span);
                             let line_number = self.line_number(arrow.span);
+                            let end_line = self.end_line(arrow.span);
                             let return_type = arrow
                                 .return_type
                                 .as_ref()
@@ -713,6 +740,7 @@ impl Visit for FunctionDefinitionExtractor {
                                     body_source,
                                     is_exported: false,
                                     line_number,
+                                    end_line,
                                     intent: None,
                                     calls: vec![],
                                     return_is_explicit: return_type.is_some(),
@@ -734,6 +762,7 @@ impl Visit for FunctionDefinitionExtractor {
                                 .as_ref()
                                 .and_then(|b| self.extract_source(b.span));
                             let line_number = self.line_number(fn_expr.function.span);
+                            let end_line = self.end_line(fn_expr.function.span);
                             let return_type = fn_expr
                                 .function
                                 .return_type
@@ -751,6 +780,7 @@ impl Visit for FunctionDefinitionExtractor {
                                     body_source,
                                     is_exported: false,
                                     line_number,
+                                    end_line,
                                     intent: None,
                                     calls: vec![],
                                     return_is_explicit: return_type.is_some(),

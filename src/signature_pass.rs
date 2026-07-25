@@ -250,6 +250,7 @@ mod tests {
             body_source: None,
             is_exported: true,
             line_number: 10,
+            end_line: 0,
             intent: None,
             calls: vec![],
             return_type: return_type.map(|t| t.to_string()),
