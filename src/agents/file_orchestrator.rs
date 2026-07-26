@@ -3206,26 +3206,32 @@ impl FileOrchestrator {
     /// causes are not confusable in a scan log.
     ///
     /// A file reaches the analyzer by one of two routes. Normally it raised
-    /// SWC candidates and they are offered to the analyzer as hints, so a
+    /// HTTP candidates and they are offered to the analyzer as hints, so a
     /// `candidate_id` that is absent from the map really is an id the analyzer
-    /// invented. But a file can also be *force-analyzed* with zero candidates
-    /// of any protocol — the GraphQL resolver/consumer fall-throughs, the
+    /// invented. But a file can also be *force-analyzed* with no HTTP
+    /// candidates at all — the GraphQL resolver/consumer fall-throughs, the
     /// messaging-client fall-through, and the #369 wrapper rescue all do this,
     /// and the last one alone routes ~30% of the analyzed files on a large
     /// monorepo. For those the map is empty by construction, so EVERY reported
     /// operation is dropped and none of them says anything about analyzer
     /// accuracy.
     ///
+    /// The count is of HTTP candidates specifically, since that is what
+    /// `candidate_map` is built from: a force-analyzed GraphQL or messaging
+    /// file may well have raised unrouted candidates of another protocol, so
+    /// "no SWC candidates" would be the wrong claim.
+    ///
     /// Reporting both as "no matching SWC candidate" made a force-analyzed
     /// file look like a wholesale extraction failure. The offered count is the
     /// only fact that separates them, so it goes in the message.
-    fn drop_reason(candidates_offered: usize) -> String {
-        if candidates_offered == 0 {
-            "file was force-analyzed with no SWC candidates, so nothing could join".to_string()
+    fn drop_reason(http_candidates_offered: usize) -> String {
+        if http_candidates_offered == 0 {
+            "file was force-analyzed with no HTTP candidates offered, so nothing could join"
+                .to_string()
         } else {
             format!(
-                "candidate_id matched none of the {} SWC candidate(s) offered for this file",
-                candidates_offered
+                "candidate_id matched none of the {} HTTP candidate(s) offered for this file",
+                http_candidates_offered
             )
         }
     }
@@ -6995,6 +7001,13 @@ export { routes };
         assert!(
             forced.contains("force-analyzed"),
             "an empty map must be reported as force-analysis, got: {forced}"
+        );
+        // The map is built from HTTP candidates only, so an empty map must not
+        // claim the scanner saw nothing: a force-analyzed GraphQL or messaging
+        // file can still have raised unrouted candidates of another protocol.
+        assert!(
+            forced.contains("HTTP"),
+            "the empty-map message must scope its claim to HTTP candidates, got: {forced}"
         );
 
         let mismatch = FileOrchestrator::drop_reason(19);
