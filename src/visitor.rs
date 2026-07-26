@@ -1351,6 +1351,56 @@ mod tests {
     }
 
     #[test]
+    fn captures_end_line_for_each_function_form() {
+        // Line numbers are 1-based and the leading newline makes them easy to
+        // read off directly: `alpha` opens on 2 and closes on 5.
+        let defs = extract(
+            "\n\
+             function alpha(a: number): number {\n\
+             \x20 const b = a + 1;\n\
+             \x20 return b;\n\
+             }\n\
+             const beta = (x: number) => {\n\
+             \x20 return x * 2;\n\
+             };\n\
+             const gamma = function (y: number) {\n\
+             \x20 return y - 1;\n\
+             };\n\
+             function delta() { return 0; }\n",
+        );
+
+        for (name, start, end) in [
+            ("alpha", 2, 5),
+            ("beta", 6, 8),
+            ("gamma", 9, 11),
+            // Single-line function: start and end are the same line, which is
+            // the case that would expose an off-by-one from `span.hi`.
+            ("delta", 12, 12),
+        ] {
+            let def = defs.get(name).unwrap_or_else(|| panic!("captured {name}"));
+            assert_eq!(def.line_number, start, "{name} line_number");
+            assert_eq!(def.end_line, end, "{name} end_line");
+            assert!(def.end_line >= def.line_number, "{name} end after start");
+        }
+    }
+
+    #[test]
+    fn end_line_is_omitted_from_json_when_unset() {
+        // `skip_serializing_if` is what keeps existing index blobs byte-stable
+        // for definitions whose span could not be resolved.
+        let defs = extract("function greet(): void {}");
+        let mut def = defs.get("greet").expect("should find greet").clone();
+        assert!(def.end_line > 0, "a real span should populate end_line");
+
+        let json = serde_json::to_value(&def).expect("serialize");
+        assert_eq!(json["end_line"], def.end_line);
+
+        def.end_line = 0;
+        let json = serde_json::to_value(&def).expect("serialize");
+        assert!(json.get("end_line").is_none(), "0 must not serialize");
+    }
+
+    #[test]
     fn derive_handler_name_works() {
         assert_eq!(
             super::derive_handler_name("get", Some("/users/:id")),
