@@ -3437,6 +3437,7 @@ mod tests {
                 body_source: None,
                 is_exported: true,
                 line_number: 3,
+                end_line: 0,
                 intent: Some("handles the thing".to_string()),
                 calls: vec![FunctionCallRef {
                     name: "helper".to_string(),
@@ -3464,6 +3465,7 @@ mod tests {
                 body_source: None,
                 is_exported: true,
                 line_number: 1,
+                end_line: 0,
                 intent: None,
                 calls: vec![],
                 return_type: None,
@@ -4590,6 +4592,7 @@ mod tests {
                 body_source: None, // stripped before upload
                 is_exported: true,
                 line_number: 1,
+                end_line: 0,
                 intent: Some("fetches a user by id".to_string()),
                 calls: vec![],
                 return_type: None,
