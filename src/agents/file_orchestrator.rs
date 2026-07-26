@@ -3167,9 +3167,10 @@ impl FileOrchestrator {
 
         if !dropped_endpoints.is_empty() {
             warn!(
-                "[FileOrchestrator] {} endpoint(s) in {} dropped — no matching SWC candidate: {}",
+                "[FileOrchestrator] {} endpoint(s) in {} dropped — {}: {}",
                 dropped_endpoints.len(),
                 file_path,
+                Self::drop_reason(candidate_map.len()),
                 dropped_endpoints.join(", ")
             );
         }
@@ -3193,9 +3194,39 @@ impl FileOrchestrator {
 
         if dropped_count > 0 {
             warn!(
-                "[FileOrchestrator] {} data call(s) had no matching SWC candidate (spans unavailable)",
-                dropped_count
+                "[FileOrchestrator] {} data call(s) in {} had no matching SWC candidate ({}, spans unavailable)",
+                dropped_count,
+                file_path,
+                Self::drop_reason(candidate_map.len())
             );
+        }
+    }
+
+    /// Why a reported operation failed the candidate join, phrased so the two
+    /// causes are not confusable in a scan log.
+    ///
+    /// A file reaches the analyzer by one of two routes. Normally it raised
+    /// SWC candidates and they are offered to the analyzer as hints, so a
+    /// `candidate_id` that is absent from the map really is an id the analyzer
+    /// invented. But a file can also be *force-analyzed* with zero candidates
+    /// of any protocol — the GraphQL resolver/consumer fall-throughs, the
+    /// messaging-client fall-through, and the #369 wrapper rescue all do this,
+    /// and the last one alone routes ~30% of the analyzed files on a large
+    /// monorepo. For those the map is empty by construction, so EVERY reported
+    /// operation is dropped and none of them says anything about analyzer
+    /// accuracy.
+    ///
+    /// Reporting both as "no matching SWC candidate" made a force-analyzed
+    /// file look like a wholesale extraction failure. The offered count is the
+    /// only fact that separates them, so it goes in the message.
+    fn drop_reason(candidates_offered: usize) -> String {
+        if candidates_offered == 0 {
+            "file was force-analyzed with no SWC candidates, so nothing could join".to_string()
+        } else {
+            format!(
+                "candidate_id matched none of the {} SWC candidate(s) offered for this file",
+                candidates_offered
+            )
         }
     }
 
@@ -6949,6 +6980,60 @@ export { routes };
         FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "src/app.ts");
         assert_eq!(result.endpoints[0].path, "/x/:y");
         assert_eq!(result.endpoints[1].path, "/a");
+    }
+
+    /// A force-analyzed file (GraphQL fall-through, messaging fall-through, or
+    /// the #369 wrapper rescue) carries an empty candidate map by construction,
+    /// so every reported operation is dropped for a reason that has nothing to
+    /// do with the analyzer inventing an id. The two causes must not share a
+    /// message: reading "no matching SWC candidate" against a force-analyzed
+    /// file reads as a wholesale extraction failure, which is what sent one
+    /// investigation after a phantom regression.
+    #[test]
+    fn test_drop_reason_separates_no_candidates_from_id_mismatch() {
+        let forced = FileOrchestrator::drop_reason(0);
+        assert!(
+            forced.contains("force-analyzed"),
+            "an empty map must be reported as force-analysis, got: {forced}"
+        );
+
+        let mismatch = FileOrchestrator::drop_reason(19);
+        assert!(
+            mismatch.contains("19"),
+            "the offered count is the fact that distinguishes the causes, got: {mismatch}"
+        );
+        assert!(
+            !mismatch.contains("force-analyzed"),
+            "a real id mismatch must not claim force-analysis, got: {mismatch}"
+        );
+    }
+
+    /// Diagnostics only: dropping an endpoint whose candidate_id matches no
+    /// offered candidate is the existing contract and stays exactly as it was,
+    /// on both routes into the analyzer.
+    #[test]
+    fn test_apply_candidate_map_drops_unjoinable_endpoints_on_both_routes() {
+        // Route 1: candidates were offered, one id is unknown.
+        let mut result = FileAnalysisResult {
+            endpoints: vec![
+                endpoint_with_candidate("/known", "c1"),
+                endpoint_with_candidate("/invented", "c-nope"),
+            ],
+            ..Default::default()
+        };
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
+        FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "src/app.ts");
+        assert_eq!(result.endpoints.len(), 1);
+        assert_eq!(result.endpoints[0].path, "/known");
+
+        // Route 2: force-analyzed, no candidates offered at all.
+        let mut forced = FileAnalysisResult {
+            endpoints: vec![endpoint_with_candidate("/a", "c1")],
+            ..Default::default()
+        };
+        FileOrchestrator::apply_candidate_map(&mut forced, &HashMap::new(), "src/forced.ts");
+        assert!(forced.endpoints.is_empty());
     }
 
     /// `collect_pubsub_type_requests` walks a `HashMap<String, _>`, whose
