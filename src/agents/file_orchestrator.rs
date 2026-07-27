@@ -2417,6 +2417,19 @@ impl FileOrchestrator {
             return None;
         }
         let base = importer.parent()?.join(spec);
+        // NodeNext/ESM: `./helper.js` names the emitted JS but the source on
+        // disk is `helper.ts`. Reuse the one substitution table
+        // (`ts_sibling_candidates`, carrick#148) that `canonicalize_or_probe`
+        // already resolves through, so the two resolvers cannot drift again
+        // (#468). Same early return as `canonicalize_or_probe`: for a
+        // JS-family specifier the TS sources are the whole candidate set, with
+        // the literal JS last for genuinely JS-only modules.
+        if let Some(siblings) = base.to_str().and_then(Self::ts_sibling_candidates) {
+            return siblings
+                .into_iter()
+                .map(PathBuf::from)
+                .find_map(|c| c.is_file().then(|| c.canonicalize().ok())?);
+        }
         let mut candidates: Vec<PathBuf> = Vec::new();
         if base.extension().is_some() {
             candidates.push(base.clone());
@@ -4326,6 +4339,66 @@ mod tests {
         assert!(FileOrchestrator::resolve_relative_import(&importer, "@/lib/client").is_none());
         // Nonexistent target resolves to nothing.
         assert!(FileOrchestrator::resolve_relative_import(&importer, "./missing").is_none());
+    }
+
+    /// #468: under `moduleResolution: nodenext` a relative import names the
+    /// EMITTED JS (`./helper.js`) while the source on disk is `helper.ts`.
+    /// `resolve_relative_import` must apply the same `.js`→`.ts` rewrite the
+    /// scanner already does in `ts_sibling_candidates`/`canonicalize_or_probe`
+    /// (carrick#148), otherwise #369/#370 wrapper resolution and cross-file env
+    /// aliasing are inert on every NodeNext repo.
+    #[test]
+    fn resolve_relative_import_rewrites_js_specifier_to_ts_source() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let src = root.join("src");
+        // Only the TS-family sources exist on disk — exactly what a NodeNext
+        // repo looks like before `tsc` has emitted anything.
+        std::fs::write(src.join("helper.ts"), "export {}").unwrap();
+        std::fs::write(src.join("widget.tsx"), "export {}").unwrap();
+        std::fs::write(src.join("typed.d.ts"), "export {}").unwrap();
+        std::fs::write(src.join("modern.mts"), "export {}").unwrap();
+        std::fs::write(src.join("legacyCjs.cts"), "export {}").unwrap();
+        // A genuine JS-only module: no TS sibling, so the literal file wins.
+        std::fs::write(src.join("vendored.js"), "module.exports = {}").unwrap();
+        let importer = src.join("caller.ts");
+        std::fs::write(&importer, "import {} from './helper.js';").unwrap();
+
+        let cases = [
+            ("./helper.js", "src/helper.ts"),
+            ("./widget.js", "src/widget.tsx"),
+            ("./typed.js", "src/typed.d.ts"),
+            ("./modern.mjs", "src/modern.mts"),
+            ("./legacyCjs.cjs", "src/legacyCjs.cts"),
+            // Regression guard for the probe-order change: a real emitted/
+            // vendored `.js` with no TS sibling still resolves to itself.
+            ("./vendored.js", "src/vendored.js"),
+        ];
+        for (spec, expected) in cases {
+            let resolved = FileOrchestrator::resolve_relative_import(&importer, spec)
+                .unwrap_or_else(|| panic!("{spec} should resolve to {expected}"));
+            assert!(
+                resolved.ends_with(expected),
+                "{spec} resolved to {resolved:?}, expected it to end with {expected}"
+            );
+        }
+
+        // A parent-relative `.js` specifier resolves the same way (the live
+        // shape is `../../helper.js`).
+        let nested = root.join("src/nodes/deep.ts");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, "import {} from '../helper.js';").unwrap();
+        let resolved = FileOrchestrator::resolve_relative_import(&nested, "../helper.js")
+            .expect("../helper.js should resolve to the .ts source");
+        assert!(resolved.ends_with("src/helper.ts"));
+
+        // TS-family specifiers are probed exactly — no extension swapping, and
+        // a dangling one still resolves to nothing.
+        let resolved = FileOrchestrator::resolve_relative_import(&importer, "./helper.ts")
+            .expect("explicit .ts specifier should resolve");
+        assert!(resolved.ends_with("src/helper.ts"));
+        assert!(FileOrchestrator::resolve_relative_import(&importer, "./missing.js").is_none());
     }
 
     /// Pub/sub Part B: a NATS pub/sub-only file produces ZERO SWC candidates,
