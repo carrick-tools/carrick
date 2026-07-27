@@ -2,7 +2,7 @@
 //!
 //! The unit tests in `src/file_based_router.rs` and `src/agents/file_orchestrator.rs`
 //! feed synthetic string paths into the deriver. These tests instead walk the
-//! actual fixture trees under `tests/fixtures/{nextjs-app,astro}` and run them
+//! actual fixture trees under `tests/fixtures/{nextjs-app,astro,remix-flat}` and run them
 //! through the same deterministic synthesis the orchestrator uses in production
 //! (`FileOrchestrator::file_based_endpoints` over `builtin_conventions`), so a
 //! regression in route derivation, the SWC handler extractor, or the framework
@@ -152,6 +152,76 @@ fn astro_fixture_derives_expected_routes() {
         "astro fixture should yield endpoints from .ts/.js files only — \
          skipping index.astro, _helpers.ts, and the `prerender` export"
     );
+}
+
+/// carrick#473: flat routes pack the whole route chain into one dot-separated
+/// filename, and their route modules export a *read* handler and a *write*
+/// handler rather than one export per HTTP method. Crucially, those handlers
+/// are often the RESULT OF A CALL — a route-builder factory owns auth, parsing
+/// and the response envelope — so the module contains no HTTP registration and
+/// no path literal at all. Measured on a large OSS TypeScript monorepo, 86 of
+/// its 140 internal route files were `Skipped (no API patterns)` for exactly
+/// this reason.
+///
+/// The fixture locks both the recall and the precision side: the declared and
+/// called forms must derive identically, while the UI page plane (`.tsx`),
+/// framework-private files, and non-handler exports must derive nothing.
+#[test]
+fn flat_routes_fixture_derives_expected_routes() {
+    let routes = synthesized_routes("remix-flat", &builtin_conventions(&["Remix".to_string()]));
+
+    let expected: BTreeSet<String> = [
+        // Call-expression export, dot-separated path, `$param` -> `:param`.
+        "POST /api/v1/widgets/:widgetId/activate",
+        "GET /api/v1/widgets/:widgetId",
+        // Declared-function exports derive exactly the same way.
+        "GET /api/v1/widgets",
+        "POST /api/v1/widgets",
+        // Bare `$` is the splat; a trailing `index` collapses onto its parent
+        // (which is why `/api/v1/widgets` above is not duplicated).
+        "GET /api/v1/blobs/**",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    assert_eq!(
+        routes, expected,
+        "flat-route fixture should yield the .ts route handlers only — \
+         skipping the .tsx page plane, the `_`-prefixed module, and the \
+         `config`/helper exports, and never deriving from the route builder \
+         module itself"
+    );
+}
+
+#[test]
+fn flat_route_convention_rejects_a_non_flat_layout() {
+    // The convention must be scoped by its own root and grammar, not merely by
+    // the framework gate: run a non-empty flat convention over the app-router
+    // and astro trees and expect nothing.
+    let conventions = builtin_conventions(&["Remix".to_string()]);
+    for fixture in ["nextjs-app", "astro"] {
+        let routes = synthesized_routes(fixture, &conventions);
+        assert!(
+            routes.is_empty(),
+            "flat-route conventions must not match {fixture} files, got {routes:?}"
+        );
+    }
+}
+
+#[test]
+fn other_conventions_reject_the_flat_route_layout() {
+    // The reverse containment: the app-router/astro conventions must not claim
+    // flat-route files, so adding this convention cannot re-interpret a repo
+    // that another convention already covers.
+    for framework in ["Next.js", "Astro"] {
+        let routes =
+            synthesized_routes("remix-flat", &builtin_conventions(&[framework.to_string()]));
+        assert!(
+            routes.is_empty(),
+            "{framework} conventions must not match flat-route files, got {routes:?}"
+        );
+    }
 }
 
 #[test]

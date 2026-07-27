@@ -14,14 +14,19 @@
 //! or by `carrick.json` overrides them. This keeps framework knowledge out of
 //! the scanner core while still shipping value today.
 
+use crate::type_manifest::is_http_method;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// How the HTTP method of a file-based endpoint is determined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MethodSource {
     /// The HTTP method is the name of an exported handler function, e.g.
-    /// Next.js app-router `export async function GET(...) {}`.
+    /// Next.js app-router `export async function GET(...) {}`. Conventions
+    /// whose route modules name their exports for a *role* rather than a
+    /// method (a read export and a write export) map those names to methods
+    /// through [`RoutingConvention::method_exports`].
     ExportName,
     /// A single default-exported handler serves every method and branches on the
     /// request at runtime (e.g. pages-router `req.method`). The concrete method
@@ -39,7 +44,16 @@ pub enum SegmentSource {
     DirectoryChain { terminal_files: Vec<String> },
     /// Pages-router style: the filename (minus extension) is the final path
     /// segment. `index` collapses to its directory.
-    FileName { extensions: Vec<String> },
+    ///
+    /// When `segment_separator` is set, the filename is not one segment but a
+    /// *flattened chain* of them: the stem is split on that separator and each
+    /// piece becomes its own path segment (`a.b.$id.ts` -> `/a/b/:id`). This is
+    /// how "flat route" schemes encode nesting without directories.
+    FileName {
+        extensions: Vec<String>,
+        #[serde(default)]
+        segment_separator: Option<String>,
+    },
 }
 
 /// A declarative description of a file-based routing scheme. Executed by
@@ -69,6 +83,15 @@ pub struct RoutingConvention {
     pub group_close: String,
     /// How the HTTP method is determined for endpoints under this convention.
     pub method_source: MethodSource,
+    /// Conventional route-module export names that are not themselves HTTP
+    /// method names, mapped to the method they serve (e.g. a read export ->
+    /// `GET`, a write export -> `POST`). Consulted only for
+    /// [`MethodSource::ExportName`], and only for exports whose own name is not
+    /// already a method. Plain data on the convention — the executor never
+    /// branches on a framework, and an export not listed here yields no
+    /// endpoint.
+    #[serde(default)]
+    pub method_exports: BTreeMap<String, String>,
 }
 
 /// A route successfully derived from a file's location.
@@ -81,6 +104,28 @@ pub struct DerivedRoute {
     pub method_source: MethodSource,
     /// The convention name that matched (diagnostic).
     pub convention: String,
+    /// The matched convention's role-export -> method map (see
+    /// [`RoutingConvention::method_exports`]).
+    pub method_exports: BTreeMap<String, String>,
+}
+
+impl DerivedRoute {
+    /// The HTTP method an exported binding serves, or `None` when the export is
+    /// not a route handler under this convention.
+    ///
+    /// An export named for a method *is* that method (app-router style
+    /// `export function GET`); otherwise the convention's `method_exports` map
+    /// names the conventional handler exports. Everything else — helpers,
+    /// types, config objects a route module also exports — yields no endpoint.
+    pub fn http_method_for_export(&self, export: &str) -> Option<String> {
+        if is_http_method(export) {
+            return Some(export.to_uppercase());
+        }
+        self.method_exports
+            .get(export)
+            .filter(|m| is_http_method(m))
+            .map(|m| m.to_uppercase())
+    }
 }
 
 impl RoutingConvention {
@@ -104,6 +149,7 @@ impl RoutingConvention {
             group_open: "(".to_string(),
             group_close: ")".to_string(),
             method_source: MethodSource::ExportName,
+            method_exports: BTreeMap::new(),
         }
     }
 
@@ -120,6 +166,7 @@ impl RoutingConvention {
                     "tsx".to_string(),
                     "jsx".to_string(),
                 ],
+                segment_separator: None,
             },
             path_prefix: "/api".to_string(),
             dynamic_open: "[".to_string(),
@@ -128,6 +175,7 @@ impl RoutingConvention {
             group_open: "(".to_string(),
             group_close: ")".to_string(),
             method_source: MethodSource::DefaultExport,
+            method_exports: BTreeMap::new(),
         }
     }
 
@@ -150,6 +198,7 @@ impl RoutingConvention {
                 // `.mjs` are not Astro route extensions, and the SWC handler
                 // extractor doesn't parse TS syntax in `.mts` anyway.
                 extensions: vec!["ts".to_string(), "js".to_string()],
+                segment_separator: None,
             },
             path_prefix: String::new(),
             dynamic_open: "[".to_string(),
@@ -160,6 +209,49 @@ impl RoutingConvention {
             group_open: String::new(),
             group_close: String::new(),
             method_source: MethodSource::ExportName,
+            method_exports: BTreeMap::new(),
+        }
+    }
+
+    /// Flat file-based routes: the whole route chain is encoded in one
+    /// dot-separated filename under `app/routes` (`a.b.$id.ts` -> `/a/b/:id`),
+    /// dynamic segments are `$`-prefixed, a bare `$` is the splat, and the
+    /// route module exports a *read* handler and a *write* handler rather than
+    /// one export per HTTP method (carrick#473).
+    ///
+    /// Only `.ts`/`.js` files are treated as endpoints. That exclusion is the
+    /// precision wall of this convention: in these stacks `.tsx` route modules
+    /// are the UI page plane, which shares the same directory and the same
+    /// export names but is not an API surface.
+    pub fn flat_routes() -> Self {
+        Self {
+            name: "remix-flat".to_string(),
+            root_globs: vec!["app/routes".to_string(), "src/app/routes".to_string()],
+            segment_source: SegmentSource::FileName {
+                extensions: vec!["ts".to_string(), "js".to_string()],
+                segment_separator: Some(".".to_string()),
+            },
+            path_prefix: String::new(),
+            dynamic_open: "$".to_string(),
+            // The dynamic segment has no closing delimiter — `$id` runs to the
+            // end of the segment.
+            dynamic_close: String::new(),
+            // No catch-all marker: the splat is an *unnamed* dynamic segment
+            // (a bare `$`), which `transform_segment` maps to `**`.
+            catch_all_marker: String::new(),
+            // A `_`-prefixed segment is a pathless layout: it nests the module
+            // but contributes no path segment, exactly like a route group.
+            group_open: "_".to_string(),
+            group_close: String::new(),
+            method_source: MethodSource::ExportName,
+            method_exports: BTreeMap::from([
+                ("loader".to_string(), "GET".to_string()),
+                // The write export serves every non-GET method the route
+                // accepts; only POST is claimed, because emitting the whole
+                // write family would fabricate endpoints the module may not
+                // serve.
+                ("action".to_string(), "POST".to_string()),
+            ]),
         }
     }
 
@@ -205,19 +297,36 @@ impl RoutingConvention {
         // catch-all (see `path_matches_with_wildcards` in src/mount_graph.rs).
         // The param name plays no part in matching, so it is dropped. Catch-alls
         // are always terminal in these conventions, so `**` lands at the end.
+        // The doubled form only exists in schemes that bracket their dynamic
+        // segments; a delimiter-free scheme has no such spelling.
         let double_open = format!("{}{}", self.dynamic_open, self.dynamic_open);
         let double_close = format!("{}{}", self.dynamic_close, self.dynamic_close);
-        if raw.starts_with(&double_open) && raw.ends_with(&double_close) {
+        if !self.dynamic_close.is_empty()
+            && raw.starts_with(&double_open)
+            && raw.ends_with(&double_close)
+        {
             return Some("**".to_string());
         }
 
         // Dynamic segment "[id]" or catch-all "[...slug]".
-        if raw.starts_with(&self.dynamic_open) && raw.ends_with(&self.dynamic_close) {
+        if !self.dynamic_open.is_empty()
+            && raw.starts_with(&self.dynamic_open)
+            && raw.ends_with(&self.dynamic_close)
+            && raw.len() >= self.dynamic_open.len() + self.dynamic_close.len()
+        {
             let inner = &raw[self.dynamic_open.len()..raw.len() - self.dynamic_close.len()];
-            if inner.starts_with(&self.catch_all_marker) {
+            // An empty marker would make *every* dynamic segment a catch-all,
+            // so a convention without one opts out of the marker check.
+            if !self.catch_all_marker.is_empty() && inner.starts_with(&self.catch_all_marker) {
                 return Some("**".to_string());
             }
-            return Some(format!(":{}", sanitize_param(inner)));
+            // An unnamed dynamic segment (a bare `$`) matches whatever remains
+            // and is the splat of the delimiter-free flat schemes.
+            let param = sanitize_param(inner);
+            if param.is_empty() {
+                return Some("**".to_string());
+            }
+            return Some(format!(":{}", param));
         }
 
         // Literal segment.
@@ -241,7 +350,10 @@ impl RoutingConvention {
                 }
                 Some(dirs.iter().map(|s| s.to_string()).collect())
             }
-            SegmentSource::FileName { extensions } => {
+            SegmentSource::FileName {
+                extensions,
+                segment_separator,
+            } => {
                 // Skip framework-private files like _app / _document / _middleware.
                 if file.starts_with('_') {
                     return None;
@@ -251,10 +363,22 @@ impl RoutingConvention {
                     return None;
                 }
                 let mut segs: Vec<String> = dirs.iter().map(|s| s.to_string()).collect();
-                // `index` collapses to its directory; otherwise the stem is the
-                // final segment.
-                if stem != "index" {
-                    segs.push(stem.to_string());
+                // A flat scheme packs the whole chain into the stem; otherwise
+                // the stem is one segment.
+                let stem_segs: Vec<&str> = match segment_separator {
+                    Some(sep) if !sep.is_empty() => {
+                        stem.split(sep.as_str()).filter(|s| !s.is_empty()).collect()
+                    }
+                    _ => vec![stem],
+                };
+                // A trailing `index` collapses to its parent; every other piece
+                // is a path segment.
+                let last = stem_segs.len().saturating_sub(1);
+                for (i, seg) in stem_segs.iter().enumerate() {
+                    if i == last && *seg == "index" {
+                        continue;
+                    }
+                    segs.push((*seg).to_string());
                 }
                 Some(segs)
             }
@@ -304,6 +428,7 @@ pub fn derive_route(rel_path: &Path, conventions: &[RoutingConvention]) -> Optio
             path: full,
             method_source: convention.method_source.clone(),
             convention: convention.name.clone(),
+            method_exports: convention.method_exports.clone(),
         });
     }
     None
@@ -321,6 +446,9 @@ pub fn builtin_conventions(frameworks: &[String]) -> Vec<RoutingConvention> {
     }
     if mentions("astro") {
         out.push(RoutingConvention::astro());
+    }
+    if mentions("remix") {
+        out.push(RoutingConvention::flat_routes());
     }
     out
 }
@@ -516,6 +644,122 @@ mod tests {
         let astro = builtin_conventions(&["Astro".to_string()]);
         assert_eq!(astro.len(), 1);
         assert_eq!(astro[0].name, "astro");
+    }
+
+    // --- Flat routes (dot-separated filename) ---
+
+    fn flat_route(p: &str) -> Option<DerivedRoute> {
+        derive_route(&PathBuf::from(p), &[RoutingConvention::flat_routes()])
+    }
+
+    #[test]
+    fn flat_routes_filename_dots_become_segments() {
+        let r = flat_route("app/routes/api.v1.widgets.ts").unwrap();
+        assert_eq!(r.path, "/api/v1/widgets");
+        assert_eq!(r.method_source, MethodSource::ExportName);
+        assert_eq!(r.convention, "remix-flat");
+    }
+
+    #[test]
+    fn flat_routes_dollar_params_become_colon_params() {
+        assert_eq!(
+            flat_route("app/routes/api.v1.widgets.$widgetId.activate.ts")
+                .unwrap()
+                .path,
+            "/api/v1/widgets/:widgetId/activate"
+        );
+        // Several params in one filename, including adjacent ones.
+        assert_eq!(
+            flat_route("app/routes/api.v1.projects.$projectRef.$env.ts")
+                .unwrap()
+                .path,
+            "/api/v1/projects/:projectRef/:env"
+        );
+    }
+
+    #[test]
+    fn flat_routes_bare_dollar_is_a_splat() {
+        // An unnamed dynamic segment matches everything that remains.
+        assert_eq!(
+            flat_route("app/routes/api.v1.packets.$.ts").unwrap().path,
+            "/api/v1/packets/**"
+        );
+    }
+
+    #[test]
+    fn flat_routes_pathless_layout_segments_contribute_no_path() {
+        // `_`-prefixed segments nest the module without adding a path segment.
+        assert_eq!(
+            flat_route("app/routes/widgets._layout.$widgetId.ts")
+                .unwrap()
+                .path,
+            "/widgets/:widgetId"
+        );
+    }
+
+    #[test]
+    fn flat_routes_trailing_index_collapses() {
+        assert_eq!(
+            flat_route("app/routes/api.v1.widgets.index.ts")
+                .unwrap()
+                .path,
+            "/api/v1/widgets"
+        );
+    }
+
+    #[test]
+    fn flat_routes_src_prefixed_root() {
+        assert_eq!(
+            flat_route("src/app/routes/api.health.ts").unwrap().path,
+            "/api/health"
+        );
+    }
+
+    #[test]
+    fn flat_routes_exclude_the_ui_page_plane() {
+        // `.tsx` route modules under the same directory are UI pages, not API
+        // endpoints — this exclusion is the convention's precision wall.
+        assert!(flat_route("app/routes/api.v1.widgets.$widgetId.tsx").is_none());
+        assert!(flat_route("app/routes/widgets.$widgetId.jsx").is_none());
+    }
+
+    #[test]
+    fn flat_routes_ignore_non_route_files_and_private_files() {
+        assert!(flat_route("app/services/widgets.server.ts").is_none());
+        assert!(flat_route("app/lib/api.v1.widgets.ts").is_none());
+        // Leading-underscore *files* stay excluded (framework-private).
+        assert!(flat_route("app/routes/_app.widgets.ts").is_none());
+    }
+
+    #[test]
+    fn flat_routes_gated_on_framework_detection() {
+        assert!(builtin_conventions(&["express".to_string()]).is_empty());
+        let flat = builtin_conventions(&["Remix".to_string()]);
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].name, "remix-flat");
+    }
+
+    #[test]
+    fn flat_routes_map_role_exports_to_methods() {
+        let r = flat_route("app/routes/api.v1.widgets.ts").unwrap();
+        assert_eq!(r.http_method_for_export("loader").as_deref(), Some("GET"));
+        assert_eq!(r.http_method_for_export("action").as_deref(), Some("POST"));
+        // Anything the convention doesn't name is not a handler.
+        assert_eq!(r.http_method_for_export("config"), None);
+        assert_eq!(r.http_method_for_export("default"), None);
+        // A method-named export is still its own method.
+        assert_eq!(r.http_method_for_export("GET").as_deref(), Some("GET"));
+    }
+
+    #[test]
+    fn method_named_exports_need_no_alias_map() {
+        // The app-router conventions carry no alias map; method-named exports
+        // resolve on their own name, and nothing else resolves at all.
+        let r = route("app/users/route.ts").unwrap();
+        assert!(r.method_exports.is_empty());
+        assert_eq!(r.http_method_for_export("POST").as_deref(), Some("POST"));
+        assert_eq!(r.http_method_for_export("loader"), None);
+        assert_eq!(r.http_method_for_export("runtime"), None);
     }
 
     // --- Negative / boundary ---
