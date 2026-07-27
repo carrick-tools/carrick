@@ -2,7 +2,7 @@
 name = "carrick-match"
 # Deliberately versioned outside release-please: the root `carrick` package is
 # the only release-please target. Bump manually if the crate is ever published.
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 
 [lib]

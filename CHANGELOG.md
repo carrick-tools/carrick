@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.3.3](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.2...carrick-v0.3.3) (2026-07-27)
+
+
+### Features
+
+* **scanner:** capture end_line for function definitions ([#459](https://github.com/carrick-tools/carrick/issues/459)) ([e7bbda5](https://github.com/carrick-tools/carrick/commit/e7bbda585f4241e6b82379d5a3d26596bd212ebd))
+
+
+### Bug Fixes
+
+* **cloud:** enable reqwest gzip so large-project reads inflate ([#471](https://github.com/carrick-tools/carrick/issues/471)) ([08c62b3](https://github.com/carrick-tools/carrick/commit/08c62b31170676935ae12f0811c03635a2cde7e0))
+* fetch-depth: 0 for incremental Carrick scans (FAR-76) ([#453](https://github.com/carrick-tools/carrick/issues/453)) ([f5a11b7](https://github.com/carrick-tools/carrick/commit/f5a11b79e12b03a2b1b001537cd69691f0ad935b))
+* **scanner:** distinguish force-analyzed drops from candidate-id misses ([#462](https://github.com/carrick-tools/carrick/issues/462)) ([733e0c1](https://github.com/carrick-tools/carrick/commit/733e0c112afe6026c2f5d5b69b7964dc1143da97))
+* **scanner:** resolve NodeNext `.js` import specifiers to their TS source ([#469](https://github.com/carrick-tools/carrick/issues/469)) ([41b2e03](https://github.com/carrick-tools/carrick/commit/41b2e03568c49fe92c5c4e87f18bae4b6ed320dd)), closes [#468](https://github.com/carrick-tools/carrick/issues/468)
+* **scanner:** strip a dependency-injected base from the consumer match key ([#467](https://github.com/carrick-tools/carrick/issues/467)) ([#470](https://github.com/carrick-tools/carrick/issues/470)) ([fb70d12](https://github.com/carrick-tools/carrick/commit/fb70d12c4fc366453a23b2d662671dca93aa485f))
+* **verified:** emit honest per-endpoint type verdicts ([#455](https://github.com/carrick-tools/carrick/issues/455), [#456](https://github.com/carrick-tools/carrick/issues/456)) ([#457](https://github.com/carrick-tools/carrick/issues/457)) ([bccf74e](https://github.com/carrick-tools/carrick/commit/bccf74efafadaf087559644353f00158c7f4deed))
+
+
+### Documentation
+
+* fix stale "exported functions" index-scope claims ([#458](https://github.com/carrick-tools/carrick/issues/458)) ([092787d](https://github.com/carrick-tools/carrick/commit/092787da2a817a77246c686d10f29110dd0d7900))
+
 ## [0.3.2](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.1...carrick-v0.3.2) (2026-07-22)
 
 
