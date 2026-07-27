@@ -2938,10 +2938,17 @@ impl FileOrchestrator {
             MethodSource::ExportName => scanner
                 .exported_handlers(file_path, content)
                 .into_iter()
-                .filter(|h| is_http_method(&h.name))
-                .map(|h| {
-                    let method = h.name.to_uppercase();
-                    EndpointResult {
+                .filter_map(|h| {
+                    // An export named for a method *is* that method; a
+                    // convention whose route modules name their handlers for a
+                    // role instead (a read export, a write export) maps those
+                    // names itself. Either way the endpoint is anchored on the
+                    // export's own span, so an exported binding initialized
+                    // from a call — a handler built by a route-builder factory
+                    // rather than declared as a function — anchors exactly like
+                    // a function declaration does (carrick#473).
+                    let method = route.http_method_for_export(&h.name)?;
+                    Some(EndpointResult {
                         candidate_id: format!("file-route:{}:{}", method, h.span_start),
                         line_number: h.line_number as i32,
                         owner_node: FILE_BASED_ROUTE_OWNER.to_string(),
@@ -2958,7 +2965,7 @@ impl FileOrchestrator {
                         emission_style: None,
                         primary_type_symbol: None,
                         type_import_source: None,
-                    }
+                    })
                 })
                 .collect(),
             // Pages-router style: a single default export serves every method. The
@@ -6749,6 +6756,137 @@ export const prerender = false;
             endpoints.is_empty(),
             "non-route files should yield no file-based endpoints"
         );
+    }
+
+    fn flat_conventions() -> Vec<RoutingConvention> {
+        builtin_conventions(&["remix".to_string()])
+    }
+
+    #[test]
+    fn test_file_based_endpoints_flat_route_factory_export() {
+        // carrick#473: the route module's handler is the *result of a call*
+        // (a route-builder factory), not a function declaration. It raises no
+        // call-site candidate, so the endpoint has to be anchored on the
+        // export itself — exactly as a declared handler would be.
+        let scanner = SwcScanner::new();
+        let content = r#"
+import { makeRoute } from "~/lib/routeBuilders.server";
+export const action = makeRoute({ body: WidgetSchema }, async ({ body }) => {
+  return json({ ok: true });
+});
+"#;
+        let endpoints = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            Path::new("app/routes/api.v1.widgets.$widgetId.activate.ts"),
+            Path::new("app/routes/api.v1.widgets.$widgetId.activate.ts"),
+            content,
+            &flat_conventions(),
+        );
+        assert_eq!(endpoints.len(), 1, "expected one endpoint for the action");
+        let ep = &endpoints[0];
+        assert_eq!(ep.method, "POST");
+        assert_eq!(ep.path, "/api/v1/widgets/:widgetId/activate");
+        assert_eq!(ep.handler_name, "action");
+        assert_eq!(ep.owner_node, FILE_BASED_ROUTE_OWNER);
+        assert_eq!(ep.pattern_matched, "remix-flat");
+        // Span-anchored on the export, so the normal candidate join applies.
+        assert!(ep.call_expression_span_start.is_some());
+        assert!(ep.call_expression_span_end.is_some());
+    }
+
+    #[test]
+    fn test_file_based_endpoints_flat_route_loader_is_get() {
+        let scanner = SwcScanner::new();
+        let content = r#"
+export const loader = makeRoute({}, async () => json([]));
+"#;
+        let endpoints = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            Path::new("app/routes/api.v1.widgets.$widgetId.ts"),
+            Path::new("app/routes/api.v1.widgets.$widgetId.ts"),
+            content,
+            &flat_conventions(),
+        );
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].method, "GET");
+        assert_eq!(endpoints[0].path, "/api/v1/widgets/:widgetId");
+    }
+
+    #[test]
+    fn test_file_based_endpoints_flat_route_declared_and_called_forms_agree() {
+        // The declared-function form and the factory-call form of the same
+        // route module must produce the same endpoint: the discriminator is
+        // the export name, never the shape of its initializer.
+        let scanner = SwcScanner::new();
+        let rel = Path::new("app/routes/api.v1.widgets.$widgetId.activate.ts");
+        let declared = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            rel,
+            rel,
+            "export async function action({ request }) { return json({}); }\n",
+            &flat_conventions(),
+        );
+        let called = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            rel,
+            rel,
+            "export const action = makeRoute({}, async () => json({}));\n",
+            &flat_conventions(),
+        );
+        assert_eq!(declared.len(), 1);
+        assert_eq!(called.len(), 1);
+        assert_eq!(declared[0].method, called[0].method);
+        assert_eq!(declared[0].path, called[0].path);
+    }
+
+    #[test]
+    fn test_file_based_endpoints_flat_route_non_handler_exports_ignored() {
+        // A route module also exports helpers and config. Only the exports the
+        // convention names as handlers become endpoints.
+        let scanner = SwcScanner::new();
+        let content = r#"
+export const config = makeConfig({ runtime: "node" });
+export const schema = buildSchema({});
+export function serializeWidget(w) { return w; }
+"#;
+        let endpoints = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            Path::new("app/routes/api.v1.widgets.ts"),
+            Path::new("app/routes/api.v1.widgets.ts"),
+            content,
+            &flat_conventions(),
+        );
+        assert!(
+            endpoints.is_empty(),
+            "non-handler exports must not become endpoints, got {endpoints:?}"
+        );
+    }
+
+    #[test]
+    fn test_file_based_endpoints_flat_route_gate_is_the_route_plane() {
+        // The same call-expression export outside the route plane yields
+        // nothing: the recall fix is scoped to files a convention claims.
+        let scanner = SwcScanner::new();
+        let content = "export const action = makeRoute({}, async () => json({}));\n";
+        for rel in [
+            // Not under the route root.
+            "app/services/widgets.server.ts",
+            "src/lib/api.v1.widgets.$widgetId.activate.ts",
+            // Under the route root, but the UI page plane, not an API surface.
+            "app/routes/api.v1.widgets.$widgetId.activate.tsx",
+        ] {
+            let endpoints = FileOrchestrator::file_based_endpoints(
+                &scanner,
+                Path::new(rel),
+                Path::new(rel),
+                content,
+                &flat_conventions(),
+            );
+            assert!(
+                endpoints.is_empty(),
+                "{rel} is not a route module; expected no endpoints, got {endpoints:?}"
+            );
+        }
     }
 
     #[test]
