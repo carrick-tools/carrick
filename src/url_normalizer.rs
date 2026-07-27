@@ -577,7 +577,9 @@ impl UrlNormalizer {
         let Some(end) = inner_start.find('}') else {
             return false;
         };
-        let base = &inner_start[..end];
+        // `${ PAYMENTS_URL }` is valid JS: trim before the shape test so a
+        // spaced env-var base is not misread as injected.
+        let base = inner_start[..end].trim();
         if !inner_start[end + 1..].starts_with('/') {
             return false;
         }
@@ -1107,6 +1109,12 @@ mod tests {
         assert_eq!(
             normalizer.consumer_call_path("${PAYMENTS_URL}/charges"),
             "${PAYMENTS_URL}/charges"
+        );
+        // `${ PAYMENTS_URL }` is valid JS — internal whitespace must not
+        // reclassify an env-var-shaped base as injected (Copilot review find).
+        assert_eq!(
+            normalizer.consumer_call_path("${ PAYMENTS_URL }/charges"),
+            "${ PAYMENTS_URL }/charges"
         );
         // A DECLARED-external base stays verbatim regardless of its shape.
         let external = Config {
