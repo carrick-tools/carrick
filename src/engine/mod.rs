@@ -1052,6 +1052,7 @@ async fn analyze_current_repo_incremental(
                         &guidance,
                         &detection,
                         &service_root,
+                        &packages.declared_dependency_names(),
                         &graphql_producer_hints,
                         &graphql_consumer_hints,
                         &normalizer,

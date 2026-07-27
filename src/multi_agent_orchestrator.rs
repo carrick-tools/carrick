@@ -130,6 +130,7 @@ impl MultiAgentOrchestrator {
                 &framework_guidance,
                 &framework_detection,
                 std::path::Path::new(service_root),
+                &packages.declared_dependency_names(),
                 graphql_producer_hints,
                 graphql_consumer_hints,
                 normalizer,
