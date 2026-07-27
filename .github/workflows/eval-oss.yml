@@ -172,6 +172,19 @@ jobs:
           cargo test --release --test eval_xrepo -- \
             --ignored xrepo_live_scorer --test-threads=1 --nocapture
 
+      # EXPERIMENT #463 (this branch only): the per-file `[#463]` policy lines
+      # are `debug!`, which the harness's non-verbose scanner invocation keeps
+      # off stderr but which always reach the rolling file log. Each line
+      # reports what ALL THREE modes would have done, so one pass yields
+      # keep_would_admit / witness_would_admit without a second paid run.
+      - name: Upload scanner debug log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: carrick-debug-log-oss
+          path: ~/.carrick/logs/
+          if-no-files-found: warn
+
       - name: Upload eval run records
         if: always()
         uses: actions/upload-artifact@v4
