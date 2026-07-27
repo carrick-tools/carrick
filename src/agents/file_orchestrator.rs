@@ -56,7 +56,8 @@ use swc_common::{
     sync::Lrc,
 };
 use swc_ecma_ast::{
-    BinExpr, BinaryOp, BindingIdent, Expr, Lit, Pat, Str, Tpl, TsEntityName, TsType, VarDeclarator,
+    BinExpr, BinaryOp, BindingIdent, ExportSpecifier, Expr, Lit, ModuleDecl, ModuleItem, Pat, Str,
+    Tpl, TsEntityName, TsType, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::{debug, warn};
@@ -977,12 +978,17 @@ impl FileOrchestrator {
         // Attach wrapper context to files that import a wrapper module via a
         // RELATIVE specifier (v1 scope: `./`/`../` only — tsconfig path
         // aliases would need sidecar-grade resolution).
+        // Re-export specifiers per module, memoized across every importer in the
+        // repo (#472): the follow only runs on a `wrapper_map` miss, which is the
+        // common case, so without this a scan would re-parse the same barrels
+        // once per importing file.
+        let mut reexport_cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
         if !wrapper_map.is_empty() {
             for pf in &mut pending {
                 let importer = Path::new(&pf.path_str).to_path_buf();
                 let self_canon = importer.canonicalize().ok();
                 let mut seen: HashSet<PathBuf> = HashSet::new();
-                let mut ctx: Vec<String> = Vec::new();
+                let mut matched: Vec<PathBuf> = Vec::new();
                 for symbol in pf.symbol_table.imported_symbols.values() {
                     let Some(resolved) = Self::resolve_relative_import(&importer, &symbol.source)
                     else {
@@ -991,11 +997,24 @@ impl FileOrchestrator {
                     if self_canon.as_ref() == Some(&resolved) || !seen.insert(resolved.clone()) {
                         continue;
                     }
-                    if let Some(snippet) = wrapper_map.get(&resolved) {
-                        ctx.push(snippet.clone());
-                    }
+                    matched.extend(Self::wrapper_modules_behind(
+                        &resolved,
+                        self_canon.as_ref(),
+                        &wrapper_map,
+                        &mut reexport_cache,
+                        &cm,
+                        &handler,
+                    ));
                 }
-                pf.wrapper_context = ctx;
+                // `imported_symbols` is a HashMap, so sort before materializing
+                // the prompt context: identical inputs must yield identical
+                // wrapper context.
+                matched.sort();
+                matched.dedup();
+                pf.wrapper_context = matched
+                    .iter()
+                    .filter_map(|path| wrapper_map.get(path).cloned())
+                    .collect();
             }
         }
 
@@ -1005,21 +1024,33 @@ impl FileOrchestrator {
         // everything else is skipped exactly as before this pass existed.
         for deferred in deferred_zero_candidates {
             let mut seen: HashSet<PathBuf> = HashSet::new();
-            let mut ctx: Vec<String> = Vec::new();
+            let mut matched: Vec<PathBuf> = Vec::new();
             if !wrapper_map.is_empty() {
+                let self_canon = deferred.file_path.canonicalize().ok();
                 for spec in &deferred.import_sources {
                     let Some(resolved) = Self::resolve_relative_import(&deferred.file_path, spec)
                     else {
                         continue;
                     };
-                    if !seen.insert(resolved.clone()) {
+                    if self_canon.as_ref() == Some(&resolved) || !seen.insert(resolved.clone()) {
                         continue;
                     }
-                    if let Some(snippet) = wrapper_map.get(&resolved) {
-                        ctx.push(snippet.clone());
-                    }
+                    matched.extend(Self::wrapper_modules_behind(
+                        &resolved,
+                        self_canon.as_ref(),
+                        &wrapper_map,
+                        &mut reexport_cache,
+                        &cm,
+                        &handler,
+                    ));
                 }
+                matched.sort();
+                matched.dedup();
             }
+            let ctx: Vec<String> = matched
+                .iter()
+                .filter_map(|path| wrapper_map.get(path).cloned())
+                .collect();
             if ctx.is_empty() {
                 debug!(
                     "Skipped (no API patterns): {} [0 candidates]",
@@ -2452,6 +2483,153 @@ impl FileOrchestrator {
         candidates
             .into_iter()
             .find_map(|c| c.is_file().then(|| c.canonicalize().ok())?)
+    }
+
+    /// Collect the module specifiers a file RE-EXPORTS from — `export * from
+    /// "./x.js"`, `export * as ns from "./x.js"`, `export { a } from "./x.js"`.
+    ///
+    /// Ordinary imports are deliberately NOT collected: a module that merely
+    /// imports a wrapper is not a stand-in for it, only a module that
+    /// re-publishes its bindings is. Type-only re-exports (`export type { T }
+    /// from …`, `export type * from …`) cannot carry a runtime fetch helper and
+    /// are skipped. Purely structural — no name or path heuristics (#472).
+    fn reexport_sources(file: &Path, cm: &Lrc<SourceMap>, handler: &Handler) -> Vec<String> {
+        let Some(module) = parse_file(file, cm, handler) else {
+            return Vec::new();
+        };
+        let mut sources: Vec<String> = Vec::new();
+        for item in &module.body {
+            match item {
+                ModuleItem::ModuleDecl(ModuleDecl::ExportAll(export)) => {
+                    if export.type_only {
+                        continue;
+                    }
+                    sources.push(export.src.value.to_string());
+                }
+                ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(export)) => {
+                    let Some(src) = &export.src else {
+                        continue; // `export { a }` — local, not a re-export
+                    };
+                    if export.type_only {
+                        continue;
+                    }
+                    // `export { type A, type B } from …` carries no value binding.
+                    let has_value_specifier = export.specifiers.iter().any(|spec| match spec {
+                        ExportSpecifier::Named(named) => !named.is_type_only,
+                        _ => true,
+                    });
+                    if !has_value_specifier {
+                        continue;
+                    }
+                    sources.push(src.value.to_string());
+                }
+                _ => {}
+            }
+        }
+        sources
+    }
+
+    /// How many re-export hops beyond the directly-resolved module the wrapper
+    /// search follows (#472). `barrel -> impl` is one hop. Bounded because a
+    /// deep chain is indistinguishable from a mis-resolution, and each hop
+    /// costs a file parse.
+    const WRAPPER_REEXPORT_MAX_HOPS: usize = 3;
+    /// Hard cap on modules visited per import while following re-exports, so a
+    /// wide barrel fan-out (`export *` × N, each re-exporting further) cannot
+    /// turn one import into an unbounded parse storm.
+    const WRAPPER_REEXPORT_MAX_VISITS: usize = 32;
+    /// How many wrapper modules a single re-export chain may stand for before it
+    /// is rejected outright (#472). A helper barrel fronts one or two modules
+    /// that actually perform HTTP; a package's public-surface `index.ts` fronts
+    /// dozens, and tells you nothing about which helper the importer uses.
+    /// Rejecting rather than truncating keeps the decision structural — there is
+    /// no principled way to pick N of 20 — and bounds the wrapper context a
+    /// single import can add.
+    const WRAPPER_REEXPORT_MAX_HITS: usize = 4;
+
+    /// The wrapper modules a resolved import target stands for (#472).
+    ///
+    /// Normally that is the target itself. But with NodeNext specifier
+    /// resolution fixed (#469), a wrapper import commonly resolves to a
+    /// RE-EXPORT BARREL — a module whose whole body is `export * from "./…"`.
+    /// A barrel raises zero HTTP candidates, so it is never in `wrapper_map`
+    /// (built at the candidate gate), and the #369/#370 rescue stopped one hop
+    /// short of the module that actually defines the fetch helper.
+    ///
+    /// So: on a miss, follow re-export declarations breadth-first up to
+    /// `WRAPPER_REEXPORT_MAX_HOPS` hops and return every wrapper module reached,
+    /// i.e. treat the re-exporting chain as aliases of the defining module.
+    /// Visited canonical paths are tracked, so a barrel that re-exports itself
+    /// (or a cycle of barrels) terminates. Behaviour is byte-identical to before
+    /// whenever the resolved target is already in `wrapper_map`: the follow only
+    /// runs on a miss.
+    ///
+    /// A chain that stands for more than `WRAPPER_REEXPORT_MAX_HITS` wrapper
+    /// modules is rejected whole: that is a package's public-surface barrel, not
+    /// an alias for one helper, and attaching its whole HTTP surface as "the
+    /// wrapper this file uses" is noise.
+    ///
+    /// Results are sorted by canonical path so wrapper context is deterministic
+    /// regardless of import-table iteration order.
+    fn wrapper_modules_behind(
+        resolved: &Path,
+        self_canon: Option<&PathBuf>,
+        wrapper_map: &HashMap<PathBuf, String>,
+        reexport_cache: &mut HashMap<PathBuf, Vec<String>>,
+        cm: &Lrc<SourceMap>,
+        handler: &Handler,
+    ) -> Vec<PathBuf> {
+        if wrapper_map.contains_key(resolved) {
+            return vec![resolved.to_path_buf()];
+        }
+        let mut hits: Vec<PathBuf> = Vec::new();
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        visited.insert(resolved.to_path_buf());
+        if let Some(importer) = self_canon {
+            visited.insert(importer.clone());
+        }
+        let mut frontier: Vec<PathBuf> = vec![resolved.to_path_buf()];
+        let mut budget = Self::WRAPPER_REEXPORT_MAX_VISITS;
+        for _ in 0..Self::WRAPPER_REEXPORT_MAX_HOPS {
+            if frontier.is_empty() || budget == 0 {
+                break;
+            }
+            let mut next: Vec<PathBuf> = Vec::new();
+            for module in &frontier {
+                // Borrowed, not cloned: nothing in the loop body touches the
+                // cache again, so the memoized specifiers are read in place.
+                let specs: &[String] = reexport_cache
+                    .entry(module.clone())
+                    .or_insert_with(|| Self::reexport_sources(module, cm, handler));
+                for spec in specs {
+                    if budget == 0 {
+                        break;
+                    }
+                    let Some(target) = Self::resolve_relative_import(module, spec) else {
+                        continue;
+                    };
+                    if !visited.insert(target.clone()) {
+                        continue;
+                    }
+                    budget -= 1;
+                    if wrapper_map.contains_key(&target) {
+                        hits.push(target);
+                    } else {
+                        next.push(target);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        // Too wide to stand for one helper — or too wide to have been measured
+        // at all, because the visit budget ran out before the chain was fully
+        // walked. Both are the same verdict: this is a module surface, not a
+        // wrapper alias.
+        if hits.len() > Self::WRAPPER_REEXPORT_MAX_HITS || budget == 0 {
+            return Vec::new();
+        }
+        hits.sort();
+        hits
     }
 
     /// An import source matches a `messaging_clients` entry when it is exactly
@@ -4406,6 +4584,348 @@ mod tests {
             .expect("explicit .ts specifier should resolve");
         assert!(resolved.ends_with("src/helper.ts"));
         assert!(FileOrchestrator::resolve_relative_import(&importer, "./missing.js").is_none());
+    }
+
+    /// #472 helpers: build a throwaway source map + handler, and a
+    /// `wrapper_map` whose keys are the canonical paths of `wrappers`.
+    fn reexport_test_env() -> (Lrc<SourceMap>, Handler) {
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
+        (cm, handler)
+    }
+
+    fn wrapper_map_of(wrappers: &[PathBuf]) -> HashMap<PathBuf, String> {
+        wrappers
+            .iter()
+            .map(|p| {
+                (
+                    p.canonicalize().expect("wrapper must exist"),
+                    format!("--- wrapper module: {} ---\n", p.display()),
+                )
+            })
+            .collect()
+    }
+
+    /// #472: `reexport_sources` collects ONLY re-export declarations. An
+    /// ordinary import is not a pass-through (a module that imports a wrapper
+    /// does not re-publish it), and a type-only re-export cannot carry a
+    /// runtime fetch helper.
+    #[test]
+    fn reexport_sources_collects_only_value_re_exports() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("barrel.ts");
+        std::fs::write(
+            &file,
+            r#"
+import { unrelated } from "./notAReExport.js";
+export * from "./starred.js";
+export * as ns from "./namespaced.js";
+export { helper } from "./named.js";
+export { helper as aliased, other } from "./mixed.js";
+export type { Options } from "./typesOnly.js";
+export type * from "./starTypesOnly.js";
+export { type OnlyAType } from "./inlineTypesOnly.js";
+export { local };
+const local = 1;
+"#,
+        )
+        .unwrap();
+        let (cm, handler) = reexport_test_env();
+        let sources = FileOrchestrator::reexport_sources(&file, &cm, &handler);
+        assert_eq!(
+            sources,
+            vec![
+                "./starred.js",
+                "./namespaced.js",
+                "./named.js",
+                "./mixed.js",
+            ],
+            "only value re-exports are pass-throughs"
+        );
+    }
+
+    /// #472: the core defect. A wrapper import that resolves to a re-export
+    /// barrel found nothing, because a barrel raises zero HTTP candidates and
+    /// so is never in `wrapper_map`. Following `export * from` / named
+    /// re-exports reaches the module that actually defines the helper.
+    ///
+    /// Cases, all on one fixture tree: single barrel, chained barrels, a named
+    /// re-export, a self-referencing cycle, a chain one hop past the cap, and
+    /// the unchanged direct-hit path.
+    #[test]
+    fn wrapper_modules_behind_follows_re_export_barrels() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        // The defining module: the only one that would raise HTTP candidates.
+        let impl_path = src.join("fetching.ts");
+        std::fs::write(
+            &impl_path,
+            "export async function typedFetch(u: string) { return fetch(u); }",
+        )
+        .unwrap();
+
+        // One hop: barrel -> impl.
+        std::fs::write(src.join("barrel.ts"), r#"export * from "./fetching.js";"#).unwrap();
+        // Named re-export instead of a star.
+        std::fs::write(
+            src.join("named.ts"),
+            r#"export { typedFetch } from "./fetching.js";"#,
+        )
+        .unwrap();
+        // Two hops: outer -> inner -> impl.
+        std::fs::write(src.join("outer.ts"), r#"export * from "./inner.js";"#).unwrap();
+        std::fs::write(src.join("inner.ts"), r#"export * from "./fetching.js";"#).unwrap();
+        // Cycle: ringA <-> ringB, reaching nothing.
+        std::fs::write(src.join("ringA.ts"), r#"export * from "./ringB.js";"#).unwrap();
+        std::fs::write(src.join("ringB.ts"), r#"export * from "./ringA.js";"#).unwrap();
+        // Self-referencing barrel.
+        std::fs::write(
+            src.join("ouroboros.ts"),
+            r#"export * from "./ouroboros.js";"#,
+        )
+        .unwrap();
+        // Four hops: one past WRAPPER_REEXPORT_MAX_HOPS (3).
+        std::fs::write(src.join("deep1.ts"), r#"export * from "./deep2.js";"#).unwrap();
+        std::fs::write(src.join("deep2.ts"), r#"export * from "./deep3.js";"#).unwrap();
+        std::fs::write(src.join("deep3.ts"), r#"export * from "./deep4.js";"#).unwrap();
+        std::fs::write(src.join("deep4.ts"), r#"export * from "./fetching.js";"#).unwrap();
+        // Exactly three hops: the last chain that must still resolve.
+        std::fs::write(src.join("edge1.ts"), r#"export * from "./edge2.js";"#).unwrap();
+        std::fs::write(src.join("edge2.ts"), r#"export * from "./edge3.js";"#).unwrap();
+        std::fs::write(src.join("edge3.ts"), r#"export * from "./fetching.js";"#).unwrap();
+        // A module that merely IMPORTS the wrapper is not a pass-through.
+        std::fs::write(
+            src.join("importsOnly.ts"),
+            r#"import { typedFetch } from "./fetching.js"; export const x = typedFetch;"#,
+        )
+        .unwrap();
+
+        let (cm, handler) = reexport_test_env();
+        let wrapper_map = wrapper_map_of(std::slice::from_ref(&impl_path));
+        let canonical_impl = impl_path.canonicalize().unwrap();
+
+        let behind = |module: &str| {
+            let resolved = src.join(module).canonicalize().expect("module must exist");
+            let mut cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
+            FileOrchestrator::wrapper_modules_behind(
+                &resolved,
+                None,
+                &wrapper_map,
+                &mut cache,
+                &cm,
+                &handler,
+            )
+        };
+
+        // Direct hit: unchanged behaviour, no following.
+        assert_eq!(behind("fetching.ts"), vec![canonical_impl.clone()]);
+        // Single barrel — the live shape, and what fails on main.
+        assert_eq!(
+            behind("barrel.ts"),
+            vec![canonical_impl.clone()],
+            "`export * from` barrel must resolve to the defining module"
+        );
+        // Named re-export.
+        assert_eq!(behind("named.ts"), vec![canonical_impl.clone()]);
+        // Chained barrels.
+        assert_eq!(behind("outer.ts"), vec![canonical_impl.clone()]);
+        // Exactly at the cap.
+        assert_eq!(behind("edge1.ts"), vec![canonical_impl.clone()]);
+
+        // Cycles terminate and find nothing.
+        assert!(behind("ringA.ts").is_empty(), "barrel cycle must terminate");
+        assert!(
+            behind("ouroboros.ts").is_empty(),
+            "self-referencing barrel must terminate"
+        );
+        // One hop past the cap is not followed.
+        assert!(
+            behind("deep1.ts").is_empty(),
+            "chain longer than WRAPPER_REEXPORT_MAX_HOPS must not resolve"
+        );
+        // Ordinary imports are never pass-throughs.
+        assert!(behind("importsOnly.ts").is_empty());
+    }
+
+    /// #472: a barrel that fans out to several modules yields every wrapper
+    /// behind it, sorted by canonical path so the prompt context does not
+    /// depend on `imported_symbols` HashMap iteration order. The re-export
+    /// cache is shared, so each module is parsed once.
+    #[test]
+    fn wrapper_modules_behind_is_sorted_and_memoized() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let a = src.join("aFetch.ts");
+        let b = src.join("bFetch.ts");
+        std::fs::write(&a, "export function a(u: string) { return fetch(u); }").unwrap();
+        std::fs::write(&b, "export function b(u: string) { return fetch(u); }").unwrap();
+        std::fs::write(src.join("plain.ts"), "export const plain = 1;").unwrap();
+        // Declaration order is b, plain, a — the result must come back sorted.
+        std::fs::write(
+            src.join("wide.ts"),
+            r#"export * from "./bFetch.js";
+export * from "./plain.js";
+export * from "./aFetch.js";"#,
+        )
+        .unwrap();
+
+        let (cm, handler) = reexport_test_env();
+        let wrapper_map = wrapper_map_of(&[a.clone(), b.clone()]);
+        let mut cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        let resolved = src.join("wide.ts").canonicalize().unwrap();
+        let hits = FileOrchestrator::wrapper_modules_behind(
+            &resolved,
+            None,
+            &wrapper_map,
+            &mut cache,
+            &cm,
+            &handler,
+        );
+        let mut expected = vec![a.canonicalize().unwrap(), b.canonicalize().unwrap()];
+        expected.sort();
+        assert_eq!(hits, expected);
+
+        // `plain.ts` is not a wrapper, so it was expanded — proving the cache
+        // holds every module whose re-exports were read, not just the barrel.
+        assert!(cache.contains_key(&resolved));
+        assert!(cache.contains_key(&src.join("plain.ts").canonicalize().unwrap()));
+
+        // A second call reuses the cache: mutate the barrel on disk and the
+        // memoized specifiers still drive the result.
+        std::fs::write(src.join("wide.ts"), "export const nothing = 1;").unwrap();
+        let hits_again = FileOrchestrator::wrapper_modules_behind(
+            &resolved,
+            None,
+            &wrapper_map,
+            &mut cache,
+            &cm,
+            &handler,
+        );
+        assert_eq!(hits_again, expected, "re-export sources must be memoized");
+    }
+
+    /// #472: a package's public-surface `index.ts` re-exports its whole HTTP
+    /// surface. It is not an alias for one helper, so it stands for nothing —
+    /// otherwise every file importing the package barrel would carry dozens of
+    /// wrapper snippets into its prompt. Measured on a real monorepo: a helper
+    /// barrel fronts one HTTP module, the package barrel fronts 22.
+    #[test]
+    fn wrapper_modules_behind_rejects_a_wide_package_barrel() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let mut wrappers: Vec<PathBuf> = Vec::new();
+        let mut narrow = String::new();
+        let mut wide = String::new();
+        for i in 0..(FileOrchestrator::WRAPPER_REEXPORT_MAX_HITS + 1) {
+            let path = src.join(format!("client{i}.ts"));
+            std::fs::write(
+                &path,
+                format!("export function c{i}(u: string) {{ return fetch(u); }}"),
+            )
+            .unwrap();
+            wrappers.push(path);
+            wide.push_str(&format!("export * from \"./client{i}.js\";\n"));
+            if i < FileOrchestrator::WRAPPER_REEXPORT_MAX_HITS {
+                narrow.push_str(&format!("export * from \"./client{i}.js\";\n"));
+            }
+        }
+        std::fs::write(src.join("wideBarrel.ts"), &wide).unwrap();
+        std::fs::write(src.join("narrowBarrel.ts"), &narrow).unwrap();
+
+        let (cm, handler) = reexport_test_env();
+        let wrapper_map = wrapper_map_of(&wrappers);
+        let mut cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
+
+        let wide_hits = FileOrchestrator::wrapper_modules_behind(
+            &src.join("wideBarrel.ts").canonicalize().unwrap(),
+            None,
+            &wrapper_map,
+            &mut cache,
+            &cm,
+            &handler,
+        );
+        assert!(
+            wide_hits.is_empty(),
+            "a barrel over the whole HTTP surface stands for no single wrapper"
+        );
+
+        // Exactly at the limit still resolves, so the rejection is a cliff at a
+        // stated threshold rather than a silent squeeze.
+        let narrow_hits = FileOrchestrator::wrapper_modules_behind(
+            &src.join("narrowBarrel.ts").canonicalize().unwrap(),
+            None,
+            &wrapper_map,
+            &mut cache,
+            &cm,
+            &handler,
+        );
+        // A barrel wide enough to exhaust the visit budget is rejected too, even
+        // though only a couple of its targets are wrappers: the budget ran out
+        // before its width could be measured, so it cannot be judged narrow.
+        let mut sparse = String::new();
+        for i in 0..(FileOrchestrator::WRAPPER_REEXPORT_MAX_VISITS + 1) {
+            let path = src.join(format!("plain{i}.ts"));
+            std::fs::write(&path, format!("export const p{i} = {i};")).unwrap();
+            sparse.push_str(&format!("export * from \"./plain{i}.js\";\n"));
+        }
+        sparse.push_str("export * from \"./client0.js\";\n");
+        std::fs::write(src.join("sparseBarrel.ts"), &sparse).unwrap();
+        let sparse_hits = FileOrchestrator::wrapper_modules_behind(
+            &src.join("sparseBarrel.ts").canonicalize().unwrap(),
+            None,
+            &wrapper_map,
+            &mut cache,
+            &cm,
+            &handler,
+        );
+        assert!(
+            sparse_hits.is_empty(),
+            "an unmeasurably wide barrel must not sneak under the hit limit"
+        );
+
+        assert_eq!(
+            narrow_hits.len(),
+            FileOrchestrator::WRAPPER_REEXPORT_MAX_HITS
+        );
+    }
+
+    /// #472: the importer itself is excluded from the follow, so a barrel that
+    /// re-exports back to the importing file cannot make a file its own
+    /// wrapper context.
+    #[test]
+    fn wrapper_modules_behind_excludes_the_importer() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let consumer = src.join("consumer.ts");
+        std::fs::write(
+            &consumer,
+            "export function go(u: string) { return fetch(u); }",
+        )
+        .unwrap();
+        std::fs::write(src.join("loop.ts"), r#"export * from "./consumer.js";"#).unwrap();
+
+        let (cm, handler) = reexport_test_env();
+        // The importer is itself wrapper material (it raised candidates).
+        let wrapper_map = wrapper_map_of(std::slice::from_ref(&consumer));
+        let mut cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        let self_canon = consumer.canonicalize().unwrap();
+        let resolved = src.join("loop.ts").canonicalize().unwrap();
+        let hits = FileOrchestrator::wrapper_modules_behind(
+            &resolved,
+            Some(&self_canon),
+            &wrapper_map,
+            &mut cache,
+            &cm,
+            &handler,
+        );
+        assert!(hits.is_empty(), "a file must not become its own wrapper");
     }
 
     /// Pub/sub Part B: a NATS pub/sub-only file produces ZERO SWC candidates,
