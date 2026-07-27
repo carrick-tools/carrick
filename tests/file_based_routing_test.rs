@@ -76,7 +76,10 @@ fn synthesized_routes(fixture: &str, conventions: &[RoutingConvention]) -> BTree
 
 #[test]
 fn nextjs_app_router_fixture_derives_expected_routes() {
-    let routes = synthesized_routes("nextjs-app", &builtin_conventions(&["Next.js".to_string()]));
+    let routes = synthesized_routes(
+        "nextjs-app",
+        &builtin_conventions(&["Next.js".to_string()], &[]),
+    );
 
     let expected: BTreeSet<String> = [
         "GET /users",
@@ -107,7 +110,7 @@ fn nextjs_app_router_fixture_derives_expected_routes() {
 /// derives nothing).
 #[test]
 fn nextjs_app_router_monorepo_derives_routes_relative_to_service_root() {
-    let conventions = builtin_conventions(&["Next.js".to_string()]);
+    let conventions = builtin_conventions(&["Next.js".to_string()], &[]);
 
     let repo_root_relative = synthesized_routes("nextjs-app-monorepo", &conventions);
     assert!(
@@ -135,7 +138,7 @@ fn nextjs_app_router_monorepo_derives_routes_relative_to_service_root() {
 
 #[test]
 fn astro_fixture_derives_expected_routes() {
-    let routes = synthesized_routes("astro", &builtin_conventions(&["Astro".to_string()]));
+    let routes = synthesized_routes("astro", &builtin_conventions(&["Astro".to_string()], &[]));
 
     let expected: BTreeSet<String> = [
         "GET /api/users",
@@ -168,7 +171,10 @@ fn astro_fixture_derives_expected_routes() {
 /// framework-private files, and non-handler exports must derive nothing.
 #[test]
 fn flat_routes_fixture_derives_expected_routes() {
-    let routes = synthesized_routes("remix-flat", &builtin_conventions(&["Remix".to_string()]));
+    let routes = synthesized_routes(
+        "remix-flat",
+        &builtin_conventions(&["Remix".to_string()], &[]),
+    );
 
     let expected: BTreeSet<String> = [
         // Call-expression export, dot-separated path, `$param` -> `:param`.
@@ -194,12 +200,43 @@ fn flat_routes_fixture_derives_expected_routes() {
     );
 }
 
+/// The gate must open on the manifest alone. Framework detection reports the
+/// HTTP *server* a service runs, so a file-routed app served by a generic HTTP
+/// server is reported as that server and nothing else — which is exactly the
+/// shape measured on a large OSS TypeScript monorepo, where the whole flat-route
+/// tree stayed dark. The service's declared dependencies say what its routing
+/// scheme is without asking a model anything.
+#[test]
+fn declared_dependencies_alone_open_the_flat_route_gate() {
+    let detected_server = vec!["express".to_string()];
+
+    let dark = synthesized_routes("remix-flat", &builtin_conventions(&detected_server, &[]));
+    assert!(
+        dark.is_empty(),
+        "framework labels alone cannot open the gate here, got {dark:?}"
+    );
+
+    let lit = synthesized_routes(
+        "remix-flat",
+        &builtin_conventions(&detected_server, &["@remix-run/node".to_string()]),
+    );
+    assert_eq!(
+        lit,
+        synthesized_routes(
+            "remix-flat",
+            &builtin_conventions(&["Remix".to_string()], &[])
+        ),
+        "a declared dependency must derive exactly the routes the framework label does"
+    );
+    assert!(!lit.is_empty(), "fixture should yield routes");
+}
+
 #[test]
 fn flat_route_convention_rejects_a_non_flat_layout() {
     // The convention must be scoped by its own root and grammar, not merely by
     // the framework gate: run a non-empty flat convention over the app-router
     // and astro trees and expect nothing.
-    let conventions = builtin_conventions(&["Remix".to_string()]);
+    let conventions = builtin_conventions(&["Remix".to_string()], &[]);
     for fixture in ["nextjs-app", "astro"] {
         let routes = synthesized_routes(fixture, &conventions);
         assert!(
@@ -215,8 +252,10 @@ fn other_conventions_reject_the_flat_route_layout() {
     // flat-route files, so adding this convention cannot re-interpret a repo
     // that another convention already covers.
     for framework in ["Next.js", "Astro"] {
-        let routes =
-            synthesized_routes("remix-flat", &builtin_conventions(&[framework.to_string()]));
+        let routes = synthesized_routes(
+            "remix-flat",
+            &builtin_conventions(&[framework.to_string()], &[]),
+        );
         assert!(
             routes.is_empty(),
             "{framework} conventions must not match flat-route files, got {routes:?}"
@@ -228,7 +267,7 @@ fn other_conventions_reject_the_flat_route_layout() {
 fn file_based_pass_is_noop_without_matching_framework() {
     // No convention-bearing framework detected → empty conventions → no routes,
     // regardless of what's on disk.
-    let routes = synthesized_routes("astro", &builtin_conventions(&["express".to_string()]));
+    let routes = synthesized_routes("astro", &builtin_conventions(&["express".to_string()], &[]));
     assert!(
         routes.is_empty(),
         "no endpoints expected when no file-based framework is detected, got {routes:?}"
@@ -242,7 +281,10 @@ fn astro_convention_rejects_a_non_astro_layout() {
     // The matcher must reject every file via strip_root/raw_segments and yield
     // nothing — proving the convention is correctly scoped, not just that an
     // empty slice produces nothing.
-    let routes = synthesized_routes("nextjs-app", &builtin_conventions(&["Astro".to_string()]));
+    let routes = synthesized_routes(
+        "nextjs-app",
+        &builtin_conventions(&["Astro".to_string()], &[]),
+    );
     assert!(
         routes.is_empty(),
         "astro conventions must not match app-router files, got {routes:?}"

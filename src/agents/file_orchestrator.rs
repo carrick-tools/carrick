@@ -581,6 +581,11 @@ impl FileOrchestrator {
         // carrick.json declares one, else the repo root. Convention root globs
         // (`app`, `src/app`, …) are matched against paths relative to THIS.
         service_root: &Path,
+        // Package names the service's own package.json declares. Second input to
+        // the routing-convention bootstrap, so a file-routed service is
+        // recognized from its manifest even when framework detection names only
+        // the HTTP server it runs behind.
+        dependency_names: &[String],
         graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
         graphql_consumer_hints: &crate::graphql::GraphqlConsumerHints,
         normalizer: &UrlNormalizer,
@@ -601,9 +606,14 @@ impl FileOrchestrator {
         let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
 
         // Routing conventions for file-based routes (Next.js app/pages router,
-        // etc.). Empty when no convention-bearing framework is detected, in
-        // which case the file-based pass below is a no-op.
-        let conventions = builtin_conventions(&framework_detection.frameworks);
+        // etc.). Empty when neither the detected frameworks nor the declared
+        // dependencies name a convention-bearing framework, in which case the
+        // file-based pass below is a no-op.
+        let conventions = builtin_conventions(&framework_detection.frameworks, dependency_names);
+        debug!(
+            "File-based routing conventions active: {:?}",
+            conventions.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
 
         // A file that passed the SWC gatekeeper and is ready for the (expensive) LLM call.
         // The CPU-bound preprocessing (read, scan, symbol table) is done serially up front;
@@ -7146,7 +7156,7 @@ export * from "./aFetch.js";"#,
     }
 
     fn next_conventions() -> Vec<RoutingConvention> {
-        builtin_conventions(&["Next.js".to_string()])
+        builtin_conventions(&["Next.js".to_string()], &[])
     }
 
     #[test]
@@ -7214,7 +7224,7 @@ export const prerender = false;
             Path::new("src/pages/api/users.ts"),
             Path::new("src/pages/api/users.ts"),
             content,
-            &builtin_conventions(&["Astro".to_string()]),
+            &builtin_conventions(&["Astro".to_string()], &[]),
         );
         endpoints.sort_by(|a, b| a.method.cmp(&b.method));
 
@@ -7238,7 +7248,7 @@ export const prerender = false;
             Path::new("src/pages/posts/[id].ts"),
             Path::new("src/pages/posts/[id].ts"),
             content,
-            &builtin_conventions(&["Astro".to_string()]),
+            &builtin_conventions(&["Astro".to_string()], &[]),
         );
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].method, "GET");
@@ -7279,7 +7289,7 @@ export const prerender = false;
     }
 
     fn flat_conventions() -> Vec<RoutingConvention> {
-        builtin_conventions(&["remix".to_string()])
+        builtin_conventions(&["remix".to_string()], &[])
     }
 
     #[test]
@@ -7419,7 +7429,7 @@ export function serializeWidget(w) { return w; }
             Path::new("app/users/route.ts"),
             Path::new("app/users/route.ts"),
             content,
-            &builtin_conventions(&["express".to_string()]),
+            &builtin_conventions(&["express".to_string()], &[]),
         );
         assert!(endpoints.is_empty());
     }

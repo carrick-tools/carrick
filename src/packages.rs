@@ -87,6 +87,31 @@ pub fn collect_internal_package_names(
 }
 
 impl Packages {
+    /// Every package name this service's own `package.json` files declare, in
+    /// any of the three dependency maps, deduplicated and sorted.
+    ///
+    /// Read straight off `package_jsons` rather than from
+    /// `merged_dependencies`: that map is built through version parsing, and a
+    /// name is a name whatever its version spec says (`workspace:*`,
+    /// `catalog:`, a git URL). Callers that ask "does this service declare X?"
+    /// must not be answered by the version resolver.
+    pub fn declared_dependency_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .package_jsons
+            .iter()
+            .flat_map(|pkg| {
+                pkg.dependencies
+                    .keys()
+                    .chain(pkg.dev_dependencies.keys())
+                    .chain(pkg.peer_dependencies.keys())
+            })
+            .cloned()
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     pub fn new(package_json_paths: Vec<PathBuf>) -> Result<Self, io::Error> {
         let mut packages = Packages::default();
 
