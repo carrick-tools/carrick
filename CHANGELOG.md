@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.5](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.4...carrick-v0.3.5) (2026-07-27)
+
+
+### Bug Fixes
+
+* **engine:** bump CACHE_VERSION so 0.3.5 extraction changes reach unchanged files ([#480](https://github.com/carrick-tools/carrick/issues/480)) ([28ecc76](https://github.com/carrick-tools/carrick/commit/28ecc76d20ebd657492d1961ab0b38ca384df343))
+* **routing:** select file-based conventions from declared dependencies ([#479](https://github.com/carrick-tools/carrick/issues/479)) ([eab4a6f](https://github.com/carrick-tools/carrick/commit/eab4a6f2defd73251ffa5b428f18f391e50e1ba7))
+
 ## [0.3.4](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.3...carrick-v0.3.4) (2026-07-27)
 
 
