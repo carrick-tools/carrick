@@ -125,6 +125,24 @@ struct GetCrossRepoRequest {
     action: String,
 }
 
+/// The shared configuration of every cloud-call client.
+///
+/// Transparent gzip is not configured here — it comes from reqwest's `gzip`
+/// crate feature (see Cargo.toml), which makes every client this builder
+/// produces send `Accept-Encoding: gzip` and inflate a `Content-Encoding:
+/// gzip` response before the body is read. That matters for
+/// `get-cross-repo-data`, whose response inlines every repo's index blob and
+/// breaches AWS Lambda's 6,291,556-byte synchronous-response cap on large
+/// projects; the cloud gzips it, but only for callers that advertise gzip.
+///
+/// Exists as a builder rather than a finished `Client` so tests can add
+/// `.no_proxy()` and still exercise the production configuration.
+fn http_client_builder() -> reqwest::ClientBuilder {
+    Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+}
+
 impl AwsStorage {
     pub fn new() -> Result<Self, StorageError> {
         let api_endpoint = env!("CARRICK_API_ENDPOINT");
@@ -134,13 +152,9 @@ impl AwsStorage {
         // from the signed OIDC claims, so there is no other way to authenticate.
         OidcProvider::global().map_err(|e| StorageError::ConnectionError(e.to_string()))?;
 
-        let http_client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .map_err(|e| {
-                StorageError::ConnectionError(format!("Failed to build HTTP client: {}", e))
-            })?;
+        let http_client = http_client_builder().build().map_err(|e| {
+            StorageError::ConnectionError(format!("Failed to build HTTP client: {}", e))
+        })?;
 
         Ok(Self {
             lambda_url,
@@ -628,5 +642,83 @@ mod tests {
         assert_eq!(v["pr_number"], 7);
         assert_eq!(v["stats"]["calls"], 2);
         assert!(v.get("payload").is_none());
+    }
+
+    /// The cloud gzips `get-cross-repo-data` only for callers that advertise
+    /// gzip, so a scanner that stays silent is served — and size-checked
+    /// against — the uncompressed aggregate, and past ~5.8 MB the response
+    /// breaches Lambda's synchronous cap and comes back as a 413 that
+    /// `is_transient_status` correctly refuses to retry. Both halves of the
+    /// fix are properties of the client, not of any call site, so pin them
+    /// both here: the request must advertise gzip, and a gzipped response
+    /// must deserialize as if it had never been compressed.
+    ///
+    /// Guards the reqwest `gzip` crate feature specifically: drop it from
+    /// Cargo.toml and this test fails on the `accept-encoding` assertion.
+    #[tokio::test]
+    async fn cloud_client_advertises_gzip_and_inflates_the_response() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            let body = r#"{"repos":[{"repo":"api-server","hash":"deadbeef",
+                "s3Url":"https://example.invalid/api-server.json",
+                "filename":"api-server.json","metadata":null,
+                "lastUpdated":"2026-07-27T00:00:00Z"}]}"#;
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(body.as_bytes()).unwrap();
+            let gzipped = encoder.finish().unwrap();
+
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Encoding: gzip\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                gzipped.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&gzipped).unwrap();
+            stream.flush().unwrap();
+            request
+        });
+
+        // The production builder, plus no_proxy so CI proxy env vars can't
+        // intercept the localhost call (same guard as the OIDC tests).
+        let client = http_client_builder().no_proxy().build().unwrap();
+        let response = client
+            .post(format!("http://{}/types/check-or-upload", addr))
+            .json(&GetCrossRepoRequest {
+                action: "get-cross-repo-data".to_string(),
+            })
+            .send()
+            .await
+            .unwrap();
+
+        // Inflated transparently: no manual decode, no `Content-Encoding`
+        // left on the response for a caller to have to notice.
+        assert!(response.headers().get("content-encoding").is_none());
+        let parsed: CrossRepoResponse = response.json().await.unwrap();
+        assert_eq!(parsed.repos.len(), 1);
+        assert_eq!(parsed.repos[0].repo, "api-server");
+        assert_eq!(parsed.repos[0].hash, "deadbeef");
+        assert!(parsed.repos[0].s3_url.ends_with("api-server.json"));
+
+        let request = server.join().unwrap();
+        assert!(
+            request
+                .to_lowercase()
+                .lines()
+                .any(|l| l.starts_with("accept-encoding:") && l.contains("gzip")),
+            "client did not advertise gzip; the reqwest `gzip` feature is off: {request}"
+        );
     }
 }
