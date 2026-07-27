@@ -497,12 +497,11 @@ pub fn builtin_conventions(
     frameworks: &[String],
     dependency_names: &[String],
 ) -> Vec<RoutingConvention> {
-    let mentions = |needle: &str| frameworks.iter().any(|f| f.to_lowercase().contains(needle));
-    let declares = |names: &[&str]| {
-        dependency_names
-            .iter()
-            .any(|dep| names.contains(&dep.to_lowercase().as_str()))
-    };
+    let frameworks_lower: Vec<String> = frameworks.iter().map(|f| f.to_lowercase()).collect();
+    let deps_lower: std::collections::HashSet<String> =
+        dependency_names.iter().map(|d| d.to_lowercase()).collect();
+    let mentions = |needle: &str| frameworks_lower.iter().any(|f| f.contains(needle));
+    let declares = |names: &[&str]| names.iter().any(|n| deps_lower.contains(*n));
     let mut out = Vec::new();
     if mentions("next") || declares(NEXTJS_PACKAGES) {
         out.push(RoutingConvention::nextjs_app());
