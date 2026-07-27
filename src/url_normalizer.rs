@@ -517,11 +517,26 @@ impl UrlNormalizer {
     /// path and match its own endpoint (a literal origin that survived into the
     /// key could match nothing and evaded the self-call / decoy checks).
     ///
-    /// An UNKNOWN/undeclared env-var BASE (`${SOME_URL}/charges`, not in
-    /// `internalEnvVars`) is still returned VERBATIM: there is no concrete origin
-    /// to strip, so keeping the raw `${VAR}` (a) prevents a third-party call from
-    /// colliding with an internal producer's path and (b) lets the "unclassified
-    /// env var" config-suggestion still see the raw var.
+    /// An UNKNOWN/undeclared ENV-VAR base (`${SOME_URL}/charges`,
+    /// `${process.env.STRIPE_URL}/charges` — not in `internalEnvVars`) is still
+    /// returned VERBATIM: there is no concrete origin to strip, so keeping the
+    /// raw `${VAR}` (a) prevents a third-party call from colliding with an
+    /// internal producer's path and (b) lets the "unclassified env var"
+    /// config-suggestion still see the raw var. A DECLARED-external base
+    /// (`externalEnvVars`) is kept verbatim whatever its shape.
+    ///
+    /// A leading interpolation that is NOT env-var-shaped is a different animal
+    /// (#467): a base held on a class property or a local binding
+    /// (`${this.apiUrl}/api/v1/widgets`, `${opts.baseUrl}/catalog`) is
+    /// dependency-injected, not read from the environment, so there is no env
+    /// var for the user to declare and no `internalEnvVars` entry that could
+    /// ever rescue the key — the "declare it to classify it" escape hatch the
+    /// verbatim rule assumes simply does not exist. That is the ordinary shape
+    /// of an internal client in a TS monorepo, so the base is stripped and the
+    /// bare route becomes the key. The residual collision risk is bounded by
+    /// shape: third-party bases are overwhelmingly `SCREAMING_SNAKE` or
+    /// `process.env.*`, both of which still stay verbatim, and the #307
+    /// literal-segment gate still drops keys with nothing to match on.
     ///
     /// The raw target is always retained separately on the call (`target_url`)
     /// for per-call classification/display; only the MATCH key is canonicalized.
@@ -533,10 +548,52 @@ impl UrlNormalizer {
             || trimmed.starts_with("//");
         let normalized = self.normalize(url);
         if normalized.is_internal || is_relative_path || is_absolute_url {
-            normalized.path
-        } else {
-            url.to_string()
+            return normalized.path;
         }
+        // A base the user DECLARED external stays verbatim whatever its shape —
+        // `externalEnvVars` is tested against the raw interpolation text, so it
+        // can name a property base just as well as an env var.
+        if !normalized.is_external && Self::has_injected_base(trimmed) {
+            return normalized.path;
+        }
+        url.to_string()
+    }
+
+    /// Whether `url` is `${<base>}/<route…>` where `<base>` is NOT env-var-shaped
+    /// — i.e. a dependency-injected base (class property, local binding) rather
+    /// than an environment variable the user could classify in carrick.json.
+    ///
+    /// Env-var shape is defined POSITIVELY, so no property name is special-cased:
+    /// a `process.env.` / `import.meta.env.` read, or a bare `SCREAMING_SNAKE`
+    /// identifier. Everything else — `this.apiUrl`, `opts.baseUrl`, `clientBase`
+    /// — is an injected base. A route remainder (a leading `/` after the closing
+    /// brace) is required, which is the same structural test #378 applies: a
+    /// whole-URL opaque variable (`${url}`, `${base}${path}`) has no path to key
+    /// on and stays raw.
+    fn has_injected_base(url: &str) -> bool {
+        let Some(inner_start) = url.strip_prefix("${") else {
+            return false;
+        };
+        let Some(end) = inner_start.find('}') else {
+            return false;
+        };
+        // `${ PAYMENTS_URL }` is valid JS: trim before the shape test so a
+        // spaced env-var base is not misread as injected.
+        let base = inner_start[..end].trim();
+        if !inner_start[end + 1..].starts_with('/') {
+            return false;
+        }
+        // A `process.env.X` anywhere else in the target routes `normalize`
+        // through `normalize_process_env_pattern` rather than the template
+        // branch, so its `path` is not this base's remainder. Leave those raw.
+        if url.contains("process.env.") || url.contains("import.meta.env.") {
+            return false;
+        }
+        let is_screaming_snake = !base.is_empty()
+            && base
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit());
+        !is_screaming_snake
     }
 
     /// Whether a canonical consumer path carries at least one LITERAL segment —
@@ -1010,6 +1067,75 @@ mod tests {
         assert!(
             !param.contains("process.env"),
             "internal base var must be stripped, got {param}"
+        );
+    }
+
+    #[test]
+    fn consumer_call_path_strips_non_env_var_base_keeps_env_shaped_base_raw() {
+        // #467: a dependency-injected base held on a class property
+        // (`this.apiUrl = opts.apiUrl`) is NOT an environment variable, so it
+        // can never be classified through `internalEnvVars` — keeping it on the
+        // match key made every such call permanently unmatchable.
+        let config = create_test_config();
+        let normalizer = UrlNormalizer::new(&config);
+
+        assert_eq!(
+            normalizer.consumer_call_path("${this.someBase}/api/v1/widgets/${id}"),
+            "/api/v1/widgets/:id"
+        );
+        assert_eq!(
+            normalizer.consumer_call_path("${this.apiUrl}/engine/v1/worker-actions/heartbeat"),
+            "/engine/v1/worker-actions/heartbeat"
+        );
+        // A plain camelCase local/injected base behaves the same — the rule is
+        // about SHAPE, not about the `this.` receiver.
+        assert_eq!(
+            normalizer.consumer_call_path("${opts.baseUrl}/catalog/items"),
+            "/catalog/items"
+        );
+        assert_eq!(
+            normalizer.consumer_call_path("${clientBase}/catalog/items"),
+            "/catalog/items"
+        );
+
+        // The env-var carve-out is unchanged: an UNDECLARED env-var base stays
+        // VERBATIM so a third-party call can't collide with an internal
+        // producer's path and the "unclassified env var" config suggestion
+        // still sees the raw var name.
+        assert_eq!(
+            normalizer.consumer_call_path("${process.env.STRIPE_URL}/charges"),
+            "${process.env.STRIPE_URL}/charges"
+        );
+        assert_eq!(
+            normalizer.consumer_call_path("${PAYMENTS_URL}/charges"),
+            "${PAYMENTS_URL}/charges"
+        );
+        // `${ PAYMENTS_URL }` is valid JS — internal whitespace must not
+        // reclassify an env-var-shaped base as injected (Copilot review find).
+        assert_eq!(
+            normalizer.consumer_call_path("${ PAYMENTS_URL }/charges"),
+            "${ PAYMENTS_URL }/charges"
+        );
+        // A DECLARED-external base stays verbatim regardless of its shape.
+        let external = Config {
+            external_env_vars: ["billing.baseUrl".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let external_normalizer = UrlNormalizer::new(&external);
+        assert_eq!(
+            external_normalizer.consumer_call_path("${billing.baseUrl}/charges"),
+            "${billing.baseUrl}/charges"
+        );
+
+        // A whole-URL opaque variable has no route remainder to key on and is
+        // still returned verbatim (the #307 literal-segment gate drops it).
+        assert_eq!(
+            normalizer.consumer_call_path("${this.someBase}"),
+            "${this.someBase}"
+        );
+        assert_eq!(
+            normalizer.consumer_call_path("${this.someBase}${path}"),
+            "${this.someBase}${path}"
         );
     }
 
