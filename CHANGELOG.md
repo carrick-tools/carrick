@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.4](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.3...carrick-v0.3.4) (2026-07-27)
+
+
+### Features
+
+* **routing:** derive endpoints for flat file-based route modules ([#476](https://github.com/carrick-tools/carrick/issues/476)) ([c2d951f](https://github.com/carrick-tools/carrick/commit/c2d951fa322b2959555a748df2c40ab2a25b21ab)), closes [#473](https://github.com/carrick-tools/carrick/issues/473)
+
+
+### Bug Fixes
+
+* **scanner:** follow re-export barrels when resolving wrapper imports ([#475](https://github.com/carrick-tools/carrick/issues/475)) ([01312aa](https://github.com/carrick-tools/carrick/commit/01312aa2de5dc257b2f58d9c3338663461283917)), closes [#472](https://github.com/carrick-tools/carrick/issues/472)
+
 ## [0.3.3](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.2...carrick-v0.3.3) (2026-07-27)
 
 
