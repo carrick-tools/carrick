@@ -20,7 +20,15 @@ indicatif = "0.17"
 
 matchit = "0.8.6"
 regex = "1.11.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `gzip` is load-bearing, not an optimisation. The cloud's `get-cross-repo-data`
+# response inlines every repo's index blob, and past ~5.8 MB it breaches AWS
+# Lambda's 6,291,556-byte synchronous-response cap. The cloud gzips that
+# response, but only for callers that advertise `Accept-Encoding: gzip`;
+# without this feature reqwest advertises nothing, so the scanner was served
+# (and size-checked against) the uncompressed body and got a 413 it correctly
+# refuses to retry. With the feature on, reqwest sets the header and inflates
+# the response transparently.
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "rustls-tls"] }
 semver = "1.0"
 serde = "1.0.219"
 serde_json = "1.0.140"
@@ -41,3 +49,7 @@ walkdir = "2.5.0"
 [dev-dependencies]
 tempfile = "3.0"
 serial_test = "3.0"
+# Test-only gzip encoder, so the cloud-client test can serve a real
+# `Content-Encoding: gzip` response. Adds nothing to the dependency graph:
+# reqwest's `gzip` feature already pulls flate2 in transitively.
+flate2 = "1"
