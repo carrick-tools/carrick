@@ -130,6 +130,51 @@ const ROUTE_DESCRIPTOR_OWNER: &str = "__route_descriptor__";
 /// route-descriptor data (#234).
 const ROUTE_DESCRIPTOR_PATTERN: &str = "route-descriptor";
 
+/// EXPERIMENT (#463) — what to do with endpoints the analyzer reports for a
+/// file that was force-analyzed with no HTTP candidates, where the candidate
+/// map is empty by construction and `apply_candidate_map` therefore drops all
+/// of them.
+///
+/// Selected by `CARRICK_FORCE_ANALYZED_ENDPOINTS`. This is experimental
+/// scaffolding for the live A/B the issue asks for, not a supported knob: an
+/// absent or unrecognized value is `Drop`, which is today's behaviour exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForceAnalyzedEndpointMode {
+    /// Current behaviour. Every reported endpoint on the force-analysis routes
+    /// is dropped, because there is no SWC span to anchor it to.
+    Drop,
+    /// Admit every reported endpoint, span-less, with the analyzer's own line
+    /// number. The recall ceiling of `Drop` is whatever this adds.
+    Keep,
+    /// Admit only endpoints whose route string is witnessed in the file's own
+    /// source text — see `route_string_witnessed_in_source` for exactly what
+    /// that means.
+    Witness,
+}
+
+impl ForceAnalyzedEndpointMode {
+    fn from_env() -> Self {
+        match std::env::var("CARRICK_FORCE_ANALYZED_ENDPOINTS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "keep" => Self::Keep,
+            "witness" => Self::Witness,
+            _ => Self::Drop,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Drop => "drop",
+            Self::Keep => "keep",
+            Self::Witness => "witness",
+        }
+    }
+}
+
 type EndpointLookup = HashMap<(String, u32), Vec<(String, String)>>;
 type DataCallLookup = HashMap<(String, u32), Vec<(String, String, String)>>;
 
@@ -649,6 +694,12 @@ impl FileOrchestrator {
             /// (carrick#387), merged in after the LLM pass so an extraction
             /// omission cannot lose them. Empty when Signal 7's gates are off.
             pubsub_anchor_ops: Vec<PubsubAnchorOp>,
+            /// EXPERIMENT (#463): which force-analysis fall-through routed this
+            /// file into the LLM pass with no HTTP candidates, or `None` for the
+            /// normal candidate-bearing route. Read only by the
+            /// `CARRICK_FORCE_ANALYZED_ENDPOINTS` toggle, so the A/B can report
+            /// per-route instead of lumping four unrelated fall-throughs.
+            force_route: Option<&'static str>,
         }
 
         /// A zero-candidate file whose skip decision is deferred until the
@@ -821,6 +872,10 @@ impl FileOrchestrator {
             // protocol, SKIP the (expensive) LLM call. File-based route and
             // route-descriptor endpoints are still recorded: they're derived
             // structurally and need no LLM.
+            //
+            // EXPERIMENT (#463): records which fall-through, if any, sent this
+            // file to the analyzer with an empty candidate map.
+            let mut force_route: Option<&'static str> = None;
             if http_candidates.is_empty() {
                 let structural_endpoints: Vec<EndpointResult> = route_endpoints
                     .iter()
@@ -853,6 +908,7 @@ impl FileOrchestrator {
                         "Routed GraphQL resolver file (no HTTP candidates): {}",
                         path_str
                     );
+                    force_route = Some("graphql-resolver");
                 } else if is_graphql_consumer_file {
                     // Fall through to the LLM pass with empty HTTP candidates:
                     // the file-analyzer reads the consumer-hint context and the
@@ -861,6 +917,7 @@ impl FileOrchestrator {
                         "Routed GraphQL consumer file (no HTTP candidates): {}",
                         path_str
                     );
+                    force_route = Some("graphql-consumer");
                 } else if imports_messaging_client {
                     // Pub/sub Part B: this file imports a cloud-detected
                     // messaging-client package but raised no HTTP candidate (its
@@ -872,6 +929,7 @@ impl FileOrchestrator {
                         "Force-analyzing messaging-client file (no HTTP candidates): {}",
                         path_str
                     );
+                    force_route = Some("messaging-client");
                 } else if unrouted_candidates.is_empty() {
                     // Defer the skip decision (#369): if this file imports a
                     // same-repo module that performs HTTP (a request wrapper),
@@ -932,6 +990,7 @@ impl FileOrchestrator {
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: Vec::new(),
                 pubsub_anchor_ops: scan_result.pubsub_anchor_ops,
+                force_route,
             });
         }
 
@@ -1064,6 +1123,7 @@ impl FileOrchestrator {
                 // Rescued zero-candidate files by definition raised no Signal 7
                 // candidate, so they can carry no anchor ops either.
                 pubsub_anchor_ops: Vec::new(),
+                force_route: Some("wrapper-rescue"),
             });
         }
 
@@ -1127,6 +1187,11 @@ impl FileOrchestrator {
             .collect()
             .await;
 
+        // EXPERIMENT (#463): read the force-analyzed-endpoint policy once, here,
+        // rather than inside the per-file helper — the helper stays pure so the
+        // unit tests can drive every mode without touching process env.
+        let force_analyzed_mode = ForceAnalyzedEndpointMode::from_env();
+
         // PHASE 3 (serial): fold the per-file results into the aggregate.
         for (pf, result) in analyzed {
             match result {
@@ -1135,7 +1200,25 @@ impl FileOrchestrator {
                     // using the compiler-based approach instead of position-based extraction.
 
                     let mut adjusted = result;
+                    // EXPERIMENT (#463): on the force-analysis routes the
+                    // candidate map is empty by construction, so
+                    // `apply_candidate_map` drops every endpoint the analyzer
+                    // reported. Stash the survivors the toggle says to keep
+                    // BEFORE the drop and re-append immediately after, so the
+                    // drop site itself stays byte-identical and every
+                    // downstream normalization below still sees them. In the
+                    // default `drop` mode `rescued` is always empty and the
+                    // `extend` is a no-op.
+                    let rescued = Self::force_analyzed_endpoints_to_keep(
+                        force_analyzed_mode,
+                        &adjusted.endpoints,
+                        &pf.candidate_map,
+                        &pf.content,
+                        &pf.path_str,
+                        pf.force_route,
+                    );
                     Self::apply_candidate_map(&mut adjusted, &pf.candidate_map, &pf.path_str);
+                    adjusted.endpoints.extend(rescued);
                     // Collapse inline env-var fallbacks the model rendered
                     // verbatim (`${A ?? "http://localhost"}/p` -> `${A}/p`,
                     // carrick#399) BEFORE alias resolution: a local alias with
@@ -3148,6 +3231,158 @@ impl FileOrchestrator {
                 mount.mount_path = trimmed.to_string();
             }
         }
+    }
+
+    /// EXPERIMENT (#463) — endpoints the analyzer reported for a file that was
+    /// force-analyzed with an empty candidate map, that `apply_candidate_map`
+    /// is about to drop. Returns what the active policy says to put back.
+    ///
+    /// Pure: the mode is passed in, never read from env here, so the unit tests
+    /// can exercise all three modes without `set_var` racing across threads.
+    ///
+    /// Only fires when the map is empty (the force-analysis routes). A file
+    /// that DID offer candidates and got a `candidate_id` that joined nothing
+    /// is a genuine analyzer miss and keeps being dropped in every mode — the
+    /// A/B is about route 2 only.
+    ///
+    /// The log line reports what EVERY mode would have done, not just the
+    /// active one, so a single (paid, stochastic) live pass yields the
+    /// endpoint-level data for all three arms. `witness` admits a strict
+    /// subset of `keep`'s additions and the additions are purely additive, so
+    /// the witness arm is exactly derivable from a `keep` or `drop` run's log.
+    fn force_analyzed_endpoints_to_keep(
+        mode: ForceAnalyzedEndpointMode,
+        endpoints: &[EndpointResult],
+        candidate_map: &HashMap<String, CandidateTarget>,
+        source: &str,
+        file_path: &str,
+        force_route: Option<&'static str>,
+    ) -> Vec<EndpointResult> {
+        if !candidate_map.is_empty() || endpoints.is_empty() {
+            return Vec::new();
+        }
+
+        let mut witnessed: Vec<String> = Vec::new();
+        let mut unwitnessed: Vec<String> = Vec::new();
+        let mut kept: Vec<EndpointResult> = Vec::new();
+        for endpoint in endpoints {
+            let has_witness = Self::route_string_witnessed_in_source(&endpoint.path, source);
+            let label = format!("{} {}", endpoint.method, endpoint.path);
+            if has_witness {
+                witnessed.push(label);
+            } else {
+                unwitnessed.push(label);
+            }
+            let admit = match mode {
+                ForceAnalyzedEndpointMode::Drop => false,
+                ForceAnalyzedEndpointMode::Keep => true,
+                ForceAnalyzedEndpointMode::Witness => has_witness,
+            };
+            if admit {
+                kept.push(endpoint.clone());
+            }
+        }
+
+        debug!(
+            "[FileOrchestrator][#463] mode={} route={} file={} reported={} admitted={} | keep_would_admit={} | witness_would_admit={} | witnessed=[{}] | unwitnessed=[{}]",
+            mode.as_str(),
+            force_route.unwrap_or("unknown"),
+            file_path,
+            endpoints.len(),
+            kept.len(),
+            endpoints.len(),
+            witnessed.len(),
+            witnessed.join(", "),
+            unwitnessed.join(", ")
+        );
+
+        kept
+    }
+
+    /// EXPERIMENT (#463) — the cheap secondary witness for `witness` mode.
+    ///
+    /// True when the endpoint's route string appears literally in the file's
+    /// raw source text, after normalizing the template-literal noise that makes
+    /// a literal comparison fail for uninteresting reasons:
+    ///
+    /// Two containment tests, either of which witnesses the path. A trailing
+    /// `/` is stripped from the path first (never from the source), and case is
+    /// preserved on both sides — route paths are case-sensitive.
+    ///
+    /// 1. **Verbatim.** The path occurs in the source exactly as reported.
+    ///    Catches a route the source spells the same way the analyzer did
+    ///    (`app.get('/orders/:id', …)`), which test 2 cannot see because the
+    ///    source's `:id` is not an interpolation.
+    /// 2. **Interpolation-normalized.** Every `${...}` in the SOURCE collapses
+    ///    to one sentinel char, and every dynamic segment in the PATH collapses
+    ///    to the same sentinel — `:name` (Express/Fastify), `{name}`
+    ///    (OpenAPI/ts-rest), `[name]` and `[...name]` (Next.js), and a bare `*`
+    ///    wildcard. So `` `${BASE}/users/${id}` `` becomes `\u{1}/users/\u{1}`,
+    ///    `/users/:id` becomes `/users/\u{1}`, and the two meet in the middle.
+    ///
+    /// Deliberate looseness, so the eval numbers are read correctly:
+    /// - The search is over RAW SOURCE, not string-literal nodes. A path that
+    ///   only occurs in a comment, a JSDoc block, or an unrelated string still
+    ///   counts as witnessed. Walking the AST for literals was rejected as
+    ///   scope creep for an experiment.
+    /// - Short paths (`/id`) can be substrings of unrelated text.
+    /// - A root path (`/`, or empty) is NEVER witnessed: every source with a
+    ///   single slash anywhere would trivially match, which is not evidence.
+    ///   Root routes therefore cost `witness` recall by construction.
+    fn route_string_witnessed_in_source(path: &str, source: &str) -> bool {
+        const SENTINEL: char = '\u{1}';
+
+        let trimmed = path.trim();
+        let stripped = trimmed.strip_suffix('/').unwrap_or(trimmed);
+        if stripped.is_empty() || stripped == "/" {
+            return false;
+        }
+
+        // Test 1 — the path verbatim. Catches a route written in the source in
+        // the same spelling the analyzer reported it (`'/orders/:id'`), which
+        // the interpolation normalization below would otherwise miss: the
+        // source's `:id` is not a `${...}` and so is never collapsed.
+        if source.contains(stripped) {
+            return true;
+        }
+
+        // Test 2 — collapse dynamic segments of the path to the sentinel.
+        let needle: String = stripped
+            .split('/')
+            .map(|segment| {
+                let dynamic = segment.starts_with(':')
+                    || (segment.starts_with('{') && segment.ends_with('}'))
+                    || (segment.starts_with('[') && segment.ends_with(']'))
+                    || segment == "*";
+                if dynamic {
+                    SENTINEL.to_string()
+                } else {
+                    segment.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+
+        // Collapse `${...}` interpolations of the source to the sentinel. A
+        // single pass, non-nested: nested interpolations are rare and a
+        // slightly over-collapsed haystack only ever makes witnessing easier,
+        // never wrongly strict.
+        let mut haystack = String::with_capacity(source.len());
+        let mut rest = source;
+        while let Some(open) = rest.find("${") {
+            haystack.push_str(&rest[..open]);
+            haystack.push(SENTINEL);
+            match rest[open + 2..].find('}') {
+                Some(close) => rest = &rest[open + 2 + close + 1..],
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        haystack.push_str(rest);
+
+        haystack.contains(&needle)
     }
 
     fn apply_candidate_map(
@@ -7120,6 +7355,117 @@ export { routes };
         };
         FileOrchestrator::apply_candidate_map(&mut forced, &HashMap::new(), "src/forced.ts");
         assert!(forced.endpoints.is_empty());
+    }
+
+    /// EXPERIMENT (#463). The three modes at the force-analysis drop site.
+    /// `Drop` is the default and must rescue nothing, so an absent env var
+    /// leaves today's behaviour byte-identical.
+    #[test]
+    fn test_force_analyzed_modes_admit_the_documented_sets() {
+        let source = r#"
+            const base = process.env.API_BASE;
+            register("GET", `${base}/orders/${id}`, getOrder);
+        "#;
+        let endpoints = vec![
+            endpoint_with_candidate("/orders/:id", "c1"),
+            endpoint_with_candidate("/invented/thing", "c2"),
+        ];
+        let empty = HashMap::new();
+
+        let dropped = FileOrchestrator::force_analyzed_endpoints_to_keep(
+            ForceAnalyzedEndpointMode::Drop,
+            &endpoints,
+            &empty,
+            source,
+            "src/forced.ts",
+            Some("wrapper-rescue"),
+        );
+        assert!(dropped.is_empty(), "drop must rescue nothing");
+
+        let kept = FileOrchestrator::force_analyzed_endpoints_to_keep(
+            ForceAnalyzedEndpointMode::Keep,
+            &endpoints,
+            &empty,
+            source,
+            "src/forced.ts",
+            Some("wrapper-rescue"),
+        );
+        assert_eq!(kept.len(), 2, "keep must admit every reported endpoint");
+
+        let witnessed = FileOrchestrator::force_analyzed_endpoints_to_keep(
+            ForceAnalyzedEndpointMode::Witness,
+            &endpoints,
+            &empty,
+            source,
+            "src/forced.ts",
+            Some("wrapper-rescue"),
+        );
+        assert_eq!(
+            witnessed
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/orders/:id"],
+            "witness must admit only the path present in the source text"
+        );
+    }
+
+    /// The toggle is scoped to route 2. A file that DID offer candidates and
+    /// got an invented `candidate_id` back is a genuine analyzer miss, and
+    /// must keep being dropped in every mode — otherwise `keep` would quietly
+    /// disable the drop guard everywhere, not just on the force-analysis path.
+    #[test]
+    fn test_force_analyzed_toggle_never_rescues_a_real_candidate_id_miss() {
+        let endpoints = vec![endpoint_with_candidate("/orders/:id", "c-nope")];
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
+        for mode in [
+            ForceAnalyzedEndpointMode::Keep,
+            ForceAnalyzedEndpointMode::Witness,
+        ] {
+            let rescued = FileOrchestrator::force_analyzed_endpoints_to_keep(
+                mode,
+                &endpoints,
+                &candidate_map,
+                "register('/orders/:id')",
+                "src/app.ts",
+                None,
+            );
+            assert!(
+                rescued.is_empty(),
+                "{mode:?} must not rescue an endpoint from a candidate-bearing file"
+            );
+        }
+    }
+
+    /// What "appears literally" means for `witness`, pinned. Template-literal
+    /// interpolations in the source and dynamic segments in the path both
+    /// collapse to one sentinel, so the normalizations meet in the middle.
+    #[test]
+    fn test_route_string_witness_normalizes_template_and_param_syntax() {
+        let w = FileOrchestrator::route_string_witnessed_in_source;
+
+        // Plain literal.
+        assert!(w("/orders", "app.get('/orders', h)"));
+        // Express param vs template interpolation.
+        assert!(w("/orders/:id", "fetch(`${base}/orders/${orderId}`)"));
+        // OpenAPI/ts-rest and Next.js dynamic-segment spellings.
+        assert!(w("/orders/{id}", "fetch(`/orders/${orderId}`)"));
+        assert!(w("/orders/[id]", "fetch(`/orders/${orderId}`)"));
+        // Trailing slash on the reported path is not a reason to refuse.
+        assert!(w("/orders/", "app.get('/orders', h)"));
+        // Absent from the source.
+        assert!(!w("/invented", "app.get('/orders', h)"));
+
+        // A root path is never witnessed: every source with a slash anywhere
+        // would trivially match, which is not evidence. This is a deliberate
+        // recall cost of `witness`, not a bug.
+        assert!(!w("/", "app.get('/', h)"));
+        assert!(!w("", "app.get('/', h)"));
+
+        // Documented looseness: the search is over raw source, so a path that
+        // only occurs in a comment still counts as witnessed.
+        assert!(w("/orders/:id", "// TODO: implement /orders/:id"));
     }
 
     /// `collect_pubsub_type_requests` walks a `HashMap<String, _>`, whose

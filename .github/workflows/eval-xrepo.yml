@@ -34,6 +34,12 @@ on:
         required: false
         type: boolean
         default: true
+      force_analyzed_endpoints:
+        description: "EXPERIMENT #463 (this branch only): what to do with endpoints reported for a force-analyzed file whose candidate map is empty. drop = today's behaviour."
+        required: false
+        type: choice
+        options: ["drop", "keep", "witness"]
+        default: "drop"
 
 permissions:
   id-token: write
@@ -95,9 +101,24 @@ jobs:
           # the exact live prompt for any file can be replayed in the cloud
           # prompt harness. The scanner child processes inherit this env.
           CARRICK_EVAL_DUMP_DIR: ${{ github.workspace }}/target/eval-dump
+          # EXPERIMENT #463 (this branch only). Absent/`drop` is today's
+          # behaviour exactly; `keep`/`witness` admit endpoints reported for a
+          # force-analyzed file whose candidate map is empty by construction.
+          CARRICK_FORCE_ANALYZED_ENDPOINTS: ${{ inputs.force_analyzed_endpoints }}
         run: |
           cargo test --release --test eval_xrepo -- \
             --ignored xrepo_live_scorer --test-threads=1 --nocapture
+
+      # EXPERIMENT #463 (this branch only): the per-file `[#463]` policy lines
+      # are `debug!`, which the harness's non-verbose scanner invocation keeps
+      # off stderr but which always reach the rolling file log.
+      - name: Upload scanner debug log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: carrick-debug-log-${{ inputs.corpus }}-${{ inputs.force_analyzed_endpoints }}
+          path: ~/.carrick/logs/
+          if-no-files-found: warn
 
       # #359: raw analyzer I/O per file (input prompt + raw model response).
       - name: Upload analyzer dump
