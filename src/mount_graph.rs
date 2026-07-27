@@ -780,6 +780,43 @@ mod tests {
     }
 
     #[test]
+    fn injected_base_consumer_key_matches_producer_endpoint() {
+        // #467: an internal HTTP client whose base URL is dependency-injected
+        // onto a class property (`this.apiUrl = opts.apiUrl`) is the ordinary
+        // shape of a sibling-service client in a TS monorepo. Its canonical key
+        // must reduce to the bare route so it joins the sibling's producer
+        // endpoint; keeping `${this.apiUrl}` on the key made the join impossible.
+        let mut graph = MountGraph::new();
+        graph.endpoints.push(ResolvedEndpoint {
+            method: "GET".to_string(),
+            path: "/api/v1/widgets/:id".to_string(),
+            full_path: "/api/v1/widgets/:id".to_string(),
+            handler: Some("getWidget".to_string()),
+            owner: "widgetRouter".to_string(),
+            file_location: "services/widget-plane/src/routes.ts:12:1".to_string(),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+        });
+
+        // No env vars declared: the injected base cannot be classified through
+        // `internalEnvVars`, which is exactly the point.
+        let normalizer = UrlNormalizer::new(&Config::default());
+        let canonical = normalizer.consumer_call_path("${this.someBase}/api/v1/widgets/${id}");
+        assert_eq!(canonical, "/api/v1/widgets/:id");
+        assert!(UrlNormalizer::canonical_path_has_literal_segment(
+            &canonical
+        ));
+
+        let result = graph.find_matching_endpoints_with_normalizer(&canonical, "GET", &normalizer);
+        let matched = result.expect("injected-base consumer key must reach the matcher");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].full_path, "/api/v1/widgets/:id");
+    }
+
+    #[test]
     fn test_url_normalized_matching_template_literal() {
         let mut graph = MountGraph::new();
 

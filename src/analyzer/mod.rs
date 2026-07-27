@@ -1261,12 +1261,20 @@ impl Analyzer {
             // #378: casing is not identity. ANY leading variable followed by
             // a path remainder is structurally a base URL — the call cannot
             // be located without knowing it, so it must be classified
-            // (internalEnvVars/externalEnvVars) before it may match. This is
-            // the same policy the persisted consumer key already applies
-            // (`consumer_call_path` keeps an undeclared `${var}` base
-            // verbatim); previously the matcher silently stripped lowercase
-            // bases and paired third-party calls with in-org producers that
-            // happened to share a generic path.
+            // (internalEnvVars/externalEnvVars) before it may match;
+            // previously the matcher silently stripped lowercase bases and
+            // paired third-party calls with in-org producers that happened to
+            // share a generic path.
+            //
+            // #467 narrowed the persisted consumer key: `consumer_call_path`
+            // now keeps only an ENV-VAR-SHAPED undeclared base
+            // (`process.env.*` / `SCREAMING_SNAKE`) verbatim and strips an
+            // injected one (`${this.apiUrl}/…`), because no `internalEnvVars`
+            // entry could ever classify a class property. This gate is
+            // deliberately left as-is: it runs on the ALREADY-canonicalized
+            // key, so an injected base no longer reaches it as a `${var}`
+            // prefix, and the branch still guards any other route shape that
+            // does.
             if route[end + 1..].starts_with('/') {
                 return true;
             }
