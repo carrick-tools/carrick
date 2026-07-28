@@ -18,6 +18,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// one Lambda cold start or load-balancer blip must not discard the run.
 const MAX_TRANSIENT_RETRIES: u32 = 3;
 
+/// Above this serialized size, CloudRepoData is PUT to a presigned S3
+/// staging URL instead of being inlined in the request body (carrick#486).
+/// The inline path dies at two walls: API Gateway rejects bodies over 10 MB
+/// with a 413, and the Lambda event cap (6,291,556 bytes minus ~7.6% JSON
+/// envelope escaping, so ~5.8 MB effective) surfaces as an unattributable
+/// 500. 4 MB leaves margin under the lower wall; one class-heavy service in
+/// a large monorepo measured past 10 MB after #483.
+const INLINE_PAYLOAD_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+
 fn retry_backoff(retries_so_far: u32) -> Duration {
     // 2s, 4s, 8s
     Duration::from_secs(2u64 << retries_so_far)
@@ -59,6 +68,17 @@ struct LambdaRequest {
     #[serde(rename = "s3Url")]
     #[serde(skip_serializing_if = "Option::is_none")]
     s3_url: Option<String>,
+    /// Payload staging (carrick#486): on check-or-upload, ask the cloud to
+    /// mint a presigned PUT URL for the raw CloudRepoData because it exceeds
+    /// [`INLINE_PAYLOAD_LIMIT_BYTES`].
+    #[serde(rename = "wantsPayloadUrl")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wants_payload_url: Option<bool>,
+    /// Payload staging: on complete-upload / store-metadata, signal that the
+    /// CloudRepoData was PUT to the staging object instead of sent inline.
+    #[serde(rename = "payloadInS3")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_in_s3: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +90,12 @@ struct LambdaResponse {
     #[serde(rename = "uploadUrl")]
     #[allow(dead_code)]
     upload_url: Option<String>,
+    /// Presigned PUT URL for the payload-staging object (carrick#486). Only
+    /// present when the request set `wantsPayloadUrl` AND the deployed cloud
+    /// supports staging; `default` so older clouds simply omit it.
+    #[serde(rename = "payloadUploadUrl")]
+    #[serde(default)]
+    payload_upload_url: Option<String>,
     #[allow(dead_code)]
     hash: String,
     #[serde(default)]
@@ -273,12 +299,22 @@ impl AwsStorage {
     /// PUTs content to a pre-signed S3 URL. The PUT is idempotent, so
     /// transient failures (network errors, 5xx) are retried with backoff.
     async fn upload_to_s3(&self, upload_url: &str, content: &str) -> Result<(), StorageError> {
+        self.upload_to_s3_with_content_type(upload_url, content, "text/plain")
+            .await
+    }
+
+    async fn upload_to_s3_with_content_type(
+        &self,
+        upload_url: &str,
+        content: &str,
+        content_type: &str,
+    ) -> Result<(), StorageError> {
         let mut retries = 0u32;
         loop {
             let transient_error = match self
                 .http_client
                 .put(upload_url)
-                .header("Content-Type", "text/plain")
+                .header("Content-Type", content_type)
                 .body(content.to_string())
                 .send()
                 .await
@@ -327,6 +363,7 @@ impl AwsStorage {
         &self,
         data: &CloudRepoData,
         s3_url: &str,
+        payload_staged: bool,
     ) -> Result<(), StorageError> {
         let request = LambdaRequest {
             action: "store-metadata".to_string(),
@@ -334,8 +371,10 @@ impl AwsStorage {
             service_name: data.service_name.clone(),
             hash: data.commit_hash.clone(),
             filename: "types.d.ts".to_string(),
-            cloud_repo_data: Some(data.clone()),
+            cloud_repo_data: (!payload_staged).then(|| data.clone()),
             s3_url: Some(s3_url.to_string()),
+            wants_payload_url: None,
+            payload_in_s3: payload_staged.then_some(true),
         };
 
         let _response: StoreMetadataResponse = self.call_lambda(&request).await?;
@@ -343,12 +382,49 @@ impl AwsStorage {
 
         Ok(())
     }
+
+    /// Stage an oversized serialized CloudRepoData to the presigned URL from
+    /// check-or-upload (carrick#486). Errors clearly when the deployed cloud
+    /// doesn't mint staging URLs yet, since the inline fallback is guaranteed
+    /// to die at the request-size walls.
+    async fn stage_payload(
+        &self,
+        payload_upload_url: Option<&str>,
+        serialized: &str,
+        repo: &str,
+    ) -> Result<(), StorageError> {
+        let url = payload_upload_url.ok_or_else(|| {
+            StorageError::ConnectionError(format!(
+                "serialized payload for {} is {} bytes (over the {} byte inline limit) \
+                 but the cloud did not return payloadUploadUrl — deploy carrick-cloud \
+                 with payload staging (carrick#486) first",
+                repo,
+                serialized.len(),
+                INLINE_PAYLOAD_LIMIT_BYTES
+            ))
+        })?;
+        debug!(
+            "Staging {} byte payload for {} via presigned S3 URL",
+            serialized.len(),
+            repo
+        );
+        self.upload_to_s3_with_content_type(url, serialized, "application/json")
+            .await
+    }
 }
 
 #[async_trait]
 impl CloudStorage for AwsStorage {
     async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<(), StorageError> {
         let repo = &data.repo_name;
+
+        // Payload staging decision (carrick#486): measure the serialized
+        // CloudRepoData once. Over the inline limit, ask check-or-upload for
+        // a presigned staging URL and keep the write-action bodies small.
+        let serialized = serde_json::to_string(data).map_err(|e| {
+            StorageError::SerializationError(format!("Failed to serialize repo data: {}", e))
+        })?;
+        let stage_payload = serialized.len() > INLINE_PAYLOAD_LIMIT_BYTES;
 
         // Step 1: Check if we need to upload type file
         let check_request = LambdaRequest {
@@ -359,9 +435,20 @@ impl CloudStorage for AwsStorage {
             filename: "types.d.ts".to_string(),
             cloud_repo_data: None,
             s3_url: None,
+            wants_payload_url: stage_payload.then_some(true),
+            payload_in_s3: None,
         };
 
         let lambda_response: LambdaResponse = self.call_lambda(&check_request).await?;
+
+        if stage_payload {
+            self.stage_payload(
+                lambda_response.payload_upload_url.as_deref(),
+                &serialized,
+                repo,
+            )
+            .await?;
+        }
 
         // Step 2: Upload type file if needed
         if let Some(upload_url) = lambda_response.upload_url {
@@ -376,8 +463,10 @@ impl CloudStorage for AwsStorage {
                     service_name: data.service_name.clone(),
                     hash: data.commit_hash.clone(),
                     filename: "types.d.ts".to_string(),
-                    cloud_repo_data: Some(data.clone()),
+                    cloud_repo_data: (!stage_payload).then(|| data.clone()),
                     s3_url: Some(lambda_response.s3_url),
+                    wants_payload_url: None,
+                    payload_in_s3: stage_payload.then_some(true),
                 };
 
                 let _complete_response: serde_json::Value =
@@ -388,12 +477,12 @@ impl CloudStorage for AwsStorage {
                     "No bundled types available for {}; storing metadata only",
                     repo
                 );
-                self.store_repo_metadata(data, &lambda_response.s3_url)
+                self.store_repo_metadata(data, &lambda_response.s3_url, stage_payload)
                     .await?;
             }
         } else {
             debug!("Type file already exists, just updating metadata");
-            self.store_repo_metadata(data, &lambda_response.s3_url)
+            self.store_repo_metadata(data, &lambda_response.s3_url, stage_payload)
                 .await?;
         }
 
@@ -418,6 +507,8 @@ impl CloudStorage for AwsStorage {
             filename: file_name.to_string(),
             cloud_repo_data: None,
             s3_url: None,
+            wants_payload_url: None,
+            payload_in_s3: None,
         };
 
         let lambda_response: LambdaResponse = self.call_lambda(&request).await?;
@@ -545,6 +636,8 @@ impl CloudStorage for AwsStorage {
             filename: "health.ts".to_string(),
             cloud_repo_data: None,
             s3_url: None,
+            wants_payload_url: None,
+            payload_in_s3: None,
         };
 
         match self.call_lambda::<LambdaResponse>(&request).await {
@@ -600,6 +693,58 @@ mod tests {
         assert_eq!(retry_backoff(0), Duration::from_secs(2));
         assert_eq!(retry_backoff(1), Duration::from_secs(4));
         assert_eq!(retry_backoff(2), Duration::from_secs(8));
+    }
+
+    /// Payload-staging wire contract (carrick#486): the flags serialize under
+    /// the camelCase names the cloud reads, and are omitted entirely when
+    /// unset so requests to older clouds are byte-identical to pre-staging
+    /// scanners.
+    #[test]
+    fn payload_staging_flags_serialize_by_name_and_omit_when_none() {
+        let bare = LambdaRequest {
+            action: "check-or-upload".to_string(),
+            repo: "r".to_string(),
+            service_name: None,
+            hash: "h".to_string(),
+            filename: "types.d.ts".to_string(),
+            cloud_repo_data: None,
+            s3_url: None,
+            wants_payload_url: None,
+            payload_in_s3: None,
+        };
+        let json = serde_json::to_string(&bare).unwrap();
+        assert!(!json.contains("wantsPayloadUrl"));
+        assert!(!json.contains("payloadInS3"));
+
+        let staged = LambdaRequest {
+            wants_payload_url: Some(true),
+            payload_in_s3: Some(true),
+            ..bare
+        };
+        let json = serde_json::to_string(&staged).unwrap();
+        assert!(json.contains("\"wantsPayloadUrl\":true"));
+        assert!(json.contains("\"payloadInS3\":true"));
+    }
+
+    /// A pre-staging cloud omits `payloadUploadUrl` entirely; a staging cloud
+    /// sends it as a string or null. All three must deserialize.
+    #[test]
+    fn payload_upload_url_tolerates_all_cloud_generations() {
+        let old_cloud = r#"{"exists":false,"s3Url":"s","uploadUrl":null,"hash":"h"}"#;
+        let parsed: LambdaResponse = serde_json::from_str(old_cloud).unwrap();
+        assert_eq!(parsed.payload_upload_url, None);
+
+        let null_url =
+            r#"{"exists":false,"s3Url":"s","uploadUrl":null,"hash":"h","payloadUploadUrl":null}"#;
+        let parsed: LambdaResponse = serde_json::from_str(null_url).unwrap();
+        assert_eq!(parsed.payload_upload_url, None);
+
+        let minted = r#"{"exists":false,"s3Url":"s","uploadUrl":null,"hash":"h","payloadUploadUrl":"https://bucket/staging"}"#;
+        let parsed: LambdaResponse = serde_json::from_str(minted).unwrap();
+        assert_eq!(
+            parsed.payload_upload_url.as_deref(),
+            Some("https://bucket/staging")
+        );
     }
 
     /// The transport envelope flattens the payload next to the action tag —
