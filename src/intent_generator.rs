@@ -112,6 +112,36 @@ fn body_references_identifier(body: &str, name: &str) -> bool {
     false
 }
 
+/// Does `body` (the body of the function keyed `caller_key`) reference the
+/// local function keyed `candidate_key`?
+///
+/// Class members are keyed as `Class.member` (see FunctionDefinitionExtractor;
+/// a static colliding with a same-named instance member is `Class.static.member`),
+/// but call sites reference the bare member name (`foo(...)`, `this.foo(...)`,
+/// `Class.foo(...)`) — never the dotted key as one identifier. So identifier
+/// matching runs on the bare name (the LAST segment), and a method callee
+/// additionally requires class evidence from the FIRST segment: either the same
+/// enclosing class as the caller (the `this.foo()` case) or a reference to its
+/// class name in the body (the `Class.foo()` case).
+/// Module-level functions keep the exact pre-existing behaviour.
+fn is_local_callee(caller_key: &str, body: &str, candidate_key: &str) -> bool {
+    fn bare_name(key: &str) -> &str {
+        key.rsplit_once('.').map_or(key, |(_, tail)| tail)
+    }
+    fn class_of(key: &str) -> Option<&str> {
+        key.split_once('.').map(|(head, _)| head)
+    }
+    candidate_key != caller_key
+        && body_references_identifier(body, bare_name(candidate_key))
+        && match class_of(candidate_key) {
+            None => true,
+            Some(callee_class) => {
+                class_of(caller_key) == Some(callee_class)
+                    || body_references_identifier(body, callee_class)
+            }
+        }
+}
+
 /// Generate intents for every function with a non-trivial body source,
 /// regardless of export status. The only exclusion is a trivial body
 /// (single line, at most [`TRIVIAL_BODY_MAX_CHARS`] chars), which keeps
@@ -167,9 +197,7 @@ pub async fn generate_function_intents(
         {
             let called: Vec<String> = local_fn_names
                 .iter()
-                .filter(|&&fn_name| {
-                    fn_name != name.as_str() && body_references_identifier(body, fn_name)
-                })
+                .filter(|&&fn_name| is_local_callee(name, body, fn_name))
                 .map(|&s| s.to_string())
                 .collect();
             deps.insert(name.clone(), called);
@@ -868,5 +896,81 @@ mod tests {
             Some("Mock intent: function does something.")
         );
         assert!(defs["main"].intent_input_hash.is_some());
+    }
+
+    #[test]
+    fn method_callee_matches_this_calls_within_the_same_class() {
+        // `Presenter.toJson` calls `this.isFinished(...)`: same class, so the
+        // bare-name match is enough.
+        assert!(is_local_callee(
+            "Presenter.toJson",
+            "return { done: this.isFinished(status) };",
+            "Presenter.isFinished"
+        ));
+        // Private members work the same way (`this.#reload()`).
+        assert!(is_local_callee(
+            "Job.run",
+            "await this.#reload();",
+            "Job.#reload"
+        ));
+    }
+
+    #[test]
+    fn method_callee_matches_static_calls_via_class_name() {
+        assert!(is_local_callee(
+            "serialiseRun",
+            "return Presenter.isFinished(status);",
+            "Presenter.isFinished"
+        ));
+    }
+
+    #[test]
+    fn method_callee_requires_class_evidence_across_classes() {
+        // Another class has a same-named method; a bare `this.create(...)`
+        // in an unrelated class must not link to it.
+        assert!(!is_local_callee(
+            "OrderController.submit",
+            "return this.create(payload);",
+            "UserService.create"
+        ));
+        // ...but naming the class is evidence enough.
+        assert!(is_local_callee(
+            "OrderController.submit",
+            "return UserService.create(payload);",
+            "UserService.create"
+        ));
+    }
+
+    #[test]
+    fn collision_qualified_static_keys_resolve_class_from_first_segment() {
+        // `Counter.static.create` (a static colliding with an instance member):
+        // bare name is the LAST segment, class evidence the FIRST.
+        assert!(is_local_callee(
+            "main",
+            "return Counter.create(1);",
+            "Counter.static.create"
+        ));
+        // Same-class caller links too.
+        assert!(is_local_callee(
+            "Counter.report",
+            "return Counter.create(1);",
+            "Counter.static.create"
+        ));
+        // No class evidence, no edge.
+        assert!(!is_local_callee(
+            "Other.run",
+            "return this.create(1);",
+            "Counter.static.create"
+        ));
+    }
+
+    #[test]
+    fn module_level_callees_keep_pre_existing_behaviour() {
+        assert!(is_local_callee("main", "return helper();", "helper"));
+        assert!(!is_local_callee("main", "return userHelper();", "helper"));
+        // Self-reference is never an edge.
+        assert!(!is_local_callee("helper", "return helper();", "helper"));
+        // A method body referencing a module-level function links normally.
+        assert!(is_local_callee("Svc.run", "return helper();", "helper"));
     }
 }
