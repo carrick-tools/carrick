@@ -308,6 +308,10 @@ pub struct FunctionDefinitionExtractor {
     source_map: swc_common::sync::Lrc<swc_common::SourceMap>,
     /// Names of functions that are exported (populated by visit_export_decl / visit_named_export)
     exported_names: HashSet<String>,
+    /// Name of the class whose body is currently being visited. Class members
+    /// are indexed as `Class.member`; None inside anonymous class expressions,
+    /// whose members cannot be given a stable name.
+    current_class: Option<String>,
 }
 
 impl FunctionDefinitionExtractor {
@@ -320,6 +324,7 @@ impl FunctionDefinitionExtractor {
             current_file_path: file_path,
             source_map,
             exported_names: HashSet::new(),
+            current_class: None,
         }
     }
 
@@ -478,12 +483,98 @@ impl FunctionDefinitionExtractor {
 
     /// Mark functions as exported based on collected export names.
     /// Call this after `module.visit_with()` completes.
+    /// A class member (`Class.member`) is exported iff its class is.
     pub fn finalize_exports(&mut self) {
         for (name, def) in self.function_definitions.iter_mut() {
-            if self.exported_names.contains(name) {
+            let exported = self.exported_names.contains(name)
+                || name
+                    .split_once('.')
+                    .is_some_and(|(class_name, _)| self.exported_names.contains(class_name));
+            if exported {
                 def.is_exported = true;
             }
         }
+    }
+
+    /// Resolve a class-member key to its name, if it has a statically-known one.
+    fn prop_name_to_string(key: &PropName) -> Option<String> {
+        match key {
+            PropName::Ident(ident) => Some(ident.sym.to_string()),
+            PropName::Str(s) => Some(s.value.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Insert a definition for a class member backed by a `Function` node
+    /// (methods, private methods, and function-expression class props). The
+    /// node is wrapped as an anonymous `FnExpr` so every downstream consumer
+    /// of `FunctionNodeType` works unchanged.
+    fn insert_method_definition(&mut self, name: String, function: &Function) {
+        let arguments = self.extract_arguments(&function.params);
+        let body_source = function
+            .body
+            .as_ref()
+            .and_then(|b| self.extract_source(b.span));
+        let line_number = self.line_number(function.span);
+        let end_line = self.end_line(function.span);
+        let return_type = function
+            .return_type
+            .as_ref()
+            .and_then(|t| self.type_ann_to_string(t));
+        self.function_definitions.insert(
+            name.clone(),
+            FunctionDefinition {
+                name,
+                file_path: self.current_file_path.clone(),
+                node_type: FunctionNodeType::FunctionExpression(Box::new(FnExpr {
+                    ident: None,
+                    function: Box::new(function.clone()),
+                })),
+                arguments,
+                body_source,
+                is_exported: false, // Updated in a post-pass
+                line_number,
+                end_line,
+                intent: None,
+                calls: vec![],
+                return_is_explicit: return_type.is_some(),
+                return_type,
+                signature: None,
+                intent_input_hash: None,
+            },
+        );
+    }
+
+    /// Insert a definition for an arrow-initialized class prop
+    /// (`handle = () => { ... }`).
+    fn insert_arrow_definition(&mut self, name: String, arrow: &ArrowExpr) {
+        let arguments = self.extract_arrow_arguments(&arrow.params);
+        let body_source = self.extract_source(arrow.span);
+        let line_number = self.line_number(arrow.span);
+        let end_line = self.end_line(arrow.span);
+        let return_type = arrow
+            .return_type
+            .as_ref()
+            .and_then(|t| self.type_ann_to_string(t));
+        self.function_definitions.insert(
+            name.clone(),
+            FunctionDefinition {
+                name,
+                file_path: self.current_file_path.clone(),
+                node_type: FunctionNodeType::ArrowFunction(Box::new(arrow.clone())),
+                arguments,
+                body_source,
+                is_exported: false, // Updated in a post-pass
+                line_number,
+                end_line,
+                intent: None,
+                calls: vec![],
+                return_is_explicit: return_type.is_some(),
+                return_type,
+                signature: None,
+                intent_input_hash: None,
+            },
+        );
     }
 }
 
@@ -500,6 +591,9 @@ impl Visit for FunctionDefinitionExtractor {
                         self.exported_names.insert(ident.id.sym.to_string());
                     }
                 }
+            }
+            Decl::Class(class_decl) => {
+                self.exported_names.insert(class_decl.ident.sym.to_string());
             }
             _ => {}
         }
@@ -705,6 +799,68 @@ impl Visit for FunctionDefinitionExtractor {
 
         // Continue visiting child nodes
         var_decl.visit_children_with(self);
+    }
+
+    /// Track the enclosing class name so members can be indexed as `Class.member`.
+    fn visit_class_decl(&mut self, class: &ClassDecl) {
+        let prev = self.current_class.replace(class.ident.sym.to_string());
+        class.visit_children_with(self);
+        self.current_class = prev;
+    }
+
+    /// Class expressions (`const Foo = class { ... }`, `export default class Foo`).
+    /// An anonymous class expression clears the tracked name: its members have
+    /// no stable qualified name and must not be attributed to an outer class.
+    fn visit_class_expr(&mut self, class: &ClassExpr) {
+        let prev = match &class.ident {
+            Some(ident) => self.current_class.replace(ident.sym.to_string()),
+            None => self.current_class.take(),
+        };
+        class.visit_children_with(self);
+        self.current_class = prev;
+    }
+
+    /// Index class methods (static and instance) as `Class.method`.
+    /// Getters are included (`Class.name` — they carry real logic surprisingly
+    /// often); setters are skipped so a getter/setter pair doesn't collide on
+    /// one key.
+    fn visit_class_method(&mut self, method: &ClassMethod) {
+        if let Some(class_name) = self.current_class.clone()
+            && !matches!(method.kind, MethodKind::Setter)
+            && let Some(member_name) = Self::prop_name_to_string(&method.key)
+        {
+            self.insert_method_definition(format!("{class_name}.{member_name}"), &method.function);
+        }
+        method.visit_children_with(self);
+    }
+
+    /// Index private methods as `Class.#method`.
+    fn visit_private_method(&mut self, method: &PrivateMethod) {
+        if let Some(class_name) = self.current_class.clone()
+            && !matches!(method.kind, MethodKind::Setter)
+        {
+            let name = format!("{class_name}.#{}", method.key.name);
+            self.insert_method_definition(name, &method.function);
+        }
+        method.visit_children_with(self);
+    }
+
+    /// Index function-valued class props (`handle = () => { ... }`) as
+    /// `Class.prop` — the common controller idiom that is not a
+    /// `VarDeclarator` and so never reaches `visit_var_declarator`.
+    fn visit_class_prop(&mut self, prop: &ClassProp) {
+        if let Some(class_name) = self.current_class.clone()
+            && let Some(member_name) = Self::prop_name_to_string(&prop.key)
+            && let Some(init) = &prop.value
+        {
+            let name = format!("{class_name}.{member_name}");
+            match &**init {
+                Expr::Arrow(arrow) => self.insert_arrow_definition(name, arrow),
+                Expr::Fn(fn_expr) => self.insert_method_definition(name, &fn_expr.function),
+                _ => {}
+            }
+        }
+        prop.visit_children_with(self);
     }
 
     /// Capture anonymous closures passed as arguments to method calls.
@@ -1411,5 +1567,141 @@ mod tests {
             "on_data_handler"
         );
         assert_eq!(super::derive_handler_name("use", None), "use_handler");
+    }
+
+    #[test]
+    fn captures_static_and_instance_class_methods() {
+        let defs = extract(
+            "export class OrderPresenter {\n\
+               static isFinished(status: string): boolean { return status === \"DONE\"; }\n\
+               public static async findOrder(id: string): Promise<string> { return id; }\n\
+               format(count: number): string { return `count: ${count}`; }\n\
+             }",
+        );
+        let is_finished = defs
+            .get("OrderPresenter.isFinished")
+            .expect("static method should be indexed");
+        assert!(
+            is_finished.is_exported,
+            "member of an exported class is exported"
+        );
+        assert_eq!(is_finished.return_type.as_deref(), Some("boolean"));
+        assert_eq!(is_finished.arguments.len(), 1);
+        assert_eq!(is_finished.arguments[0].name, "status");
+        assert_eq!(
+            is_finished.arguments[0].type_string.as_deref(),
+            Some("string")
+        );
+        assert!(is_finished.body_source.as_ref().unwrap().contains("DONE"));
+        assert!(is_finished.line_number > 0);
+        assert!(is_finished.end_line >= is_finished.line_number);
+        assert!(
+            defs.contains_key("OrderPresenter.findOrder"),
+            "public static async method should be indexed"
+        );
+        assert!(
+            defs.contains_key("OrderPresenter.format"),
+            "instance method should be indexed"
+        );
+    }
+
+    #[test]
+    fn members_of_unexported_class_are_not_exported() {
+        let defs = extract("class Local { run(): number { return 1; } }");
+        let def = defs
+            .get("Local.run")
+            .expect("instance method should be indexed");
+        assert!(!def.is_exported);
+    }
+
+    #[test]
+    fn captures_arrow_class_props_and_private_methods() {
+        let defs = extract(
+            "export class JobController {\n\
+               handle = async (req: string): Promise<void> => { console.log(req); };\n\
+               #reload(): void { console.log(\"reloading\"); }\n\
+             }",
+        );
+        let handle = defs
+            .get("JobController.handle")
+            .expect("arrow-valued class prop should be indexed");
+        assert_eq!(handle.arguments.len(), 1);
+        assert_eq!(handle.arguments[0].name, "req");
+        assert!(handle.is_exported);
+        assert!(
+            defs.contains_key("JobController.#reload"),
+            "private method should be indexed"
+        );
+    }
+
+    #[test]
+    fn getter_is_indexed_and_setter_is_skipped() {
+        let defs = extract(
+            "class Run {\n\
+               get finished(): boolean { return this.status === \"DONE\"; }\n\
+               set finished(v: boolean) { console.log(v); }\n\
+             }",
+        );
+        let def = defs.get("Run.finished").expect("getter should be indexed");
+        assert_eq!(def.return_type.as_deref(), Some("boolean"));
+        assert!(
+            def.body_source.as_ref().unwrap().contains("this.status"),
+            "getter body, not setter body, should win the key"
+        );
+    }
+
+    #[test]
+    fn default_exported_class_members_are_exported() {
+        let defs = extract("export default class Worker { run(): number { return 1; } }");
+        let def = defs.get("Worker.run").expect("method should be indexed");
+        assert!(def.is_exported);
+    }
+
+    #[test]
+    fn anonymous_class_expression_members_are_skipped() {
+        let defs = extract("const Foo = class { run(): number { return 1; } };");
+        assert!(
+            defs.is_empty(),
+            "anonymous class members have no stable name; got {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn module_functions_inside_and_after_class_are_unaffected() {
+        let defs = extract(
+            "class Svc { run(): number { return helper(); } }\n\
+             function helper(): number { return 2; }",
+        );
+        assert!(defs.contains_key("Svc.run"));
+        let helper = defs.get("helper").expect("module function still indexed");
+        assert!(!helper.name.contains('.'));
+    }
+
+    #[test]
+    fn nestjs_controller_fixture_yields_class_methods() {
+        // In-tree reproduction of carrick#483: this fixture previously
+        // produced zero function definitions.
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/nestjs-api/users.controller.ts"
+        ))
+        .expect("fixture should exist");
+        let defs = extract(&source);
+        for name in [
+            "UsersController.findAll",
+            "UsersController.findOne",
+            "UsersController.create",
+        ] {
+            assert!(
+                defs.contains_key(name),
+                "missing {name}; got {:?}",
+                defs.keys().collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            defs.get("UsersController.findAll").unwrap().is_exported,
+            "exported controller's methods are exported"
+        );
     }
 }
