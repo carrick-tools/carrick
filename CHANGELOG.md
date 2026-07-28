@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.6](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.5...carrick-v0.3.6) (2026-07-28)
+
+
+### Features
+
+* **visitor:** index class methods as first-class functions ([#483](https://github.com/carrick-tools/carrick/issues/483)) ([#484](https://github.com/carrick-tools/carrick/issues/484)) ([281376e](https://github.com/carrick-tools/carrick/commit/281376eec9f86111723d372ad3f0db674ecae50b))
+
 ## [0.3.5](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.4...carrick-v0.3.5) (2026-07-27)
 
 
