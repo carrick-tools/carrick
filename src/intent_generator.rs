@@ -115,19 +115,21 @@ fn body_references_identifier(body: &str, name: &str) -> bool {
 /// Does `body` (the body of the function keyed `caller_key`) reference the
 /// local function keyed `candidate_key`?
 ///
-/// Class members are keyed as `Class.member` (see FunctionDefinitionExtractor),
+/// Class members are keyed as `Class.member` (see FunctionDefinitionExtractor;
+/// a static colliding with a same-named instance member is `Class.static.member`),
 /// but call sites reference the bare member name (`foo(...)`, `this.foo(...)`,
 /// `Class.foo(...)`) — never the dotted key as one identifier. So identifier
-/// matching runs on the bare name, and a method callee additionally requires
-/// either the same enclosing class as the caller (the `this.foo()` case) or a
-/// reference to its class name in the body (the `Class.foo()` case).
+/// matching runs on the bare name (the LAST segment), and a method callee
+/// additionally requires class evidence from the FIRST segment: either the same
+/// enclosing class as the caller (the `this.foo()` case) or a reference to its
+/// class name in the body (the `Class.foo()` case).
 /// Module-level functions keep the exact pre-existing behaviour.
 fn is_local_callee(caller_key: &str, body: &str, candidate_key: &str) -> bool {
     fn bare_name(key: &str) -> &str {
         key.rsplit_once('.').map_or(key, |(_, tail)| tail)
     }
     fn class_of(key: &str) -> Option<&str> {
-        key.rsplit_once('.').map(|(head, _)| head)
+        key.split_once('.').map(|(head, _)| head)
     }
     candidate_key != caller_key
         && body_references_identifier(body, bare_name(candidate_key))
@@ -936,6 +938,29 @@ mod tests {
             "OrderController.submit",
             "return UserService.create(payload);",
             "UserService.create"
+        ));
+    }
+
+    #[test]
+    fn collision_qualified_static_keys_resolve_class_from_first_segment() {
+        // `Counter.static.create` (a static colliding with an instance member):
+        // bare name is the LAST segment, class evidence the FIRST.
+        assert!(is_local_callee(
+            "main",
+            "return Counter.create(1);",
+            "Counter.static.create"
+        ));
+        // Same-class caller links too.
+        assert!(is_local_callee(
+            "Counter.report",
+            "return Counter.create(1);",
+            "Counter.static.create"
+        ));
+        // No class evidence, no edge.
+        assert!(!is_local_callee(
+            "Other.run",
+            "return this.create(1);",
+            "Counter.static.create"
         ));
     }
 

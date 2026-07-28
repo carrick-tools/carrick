@@ -312,6 +312,10 @@ pub struct FunctionDefinitionExtractor {
     /// are indexed as `Class.member`; None inside anonymous class expressions,
     /// whose members cannot be given a stable name.
     current_class: Option<String>,
+    /// Member names of the current class that exist as BOTH a static and an
+    /// instance member — the one case where `Class.member` would collide on a
+    /// single key. The static side is keyed `Class.static.member` instead.
+    current_class_collisions: HashSet<String>,
 }
 
 impl FunctionDefinitionExtractor {
@@ -325,6 +329,7 @@ impl FunctionDefinitionExtractor {
             source_map,
             exported_names: HashSet::new(),
             current_class: None,
+            current_class_collisions: HashSet::new(),
         }
     }
 
@@ -497,11 +502,55 @@ impl FunctionDefinitionExtractor {
     }
 
     /// Resolve a class-member key to its name, if it has a statically-known one.
+    /// String-literal names containing `.` are rejected: they would make the
+    /// `Class.member` key ambiguous for everything that parses it
+    /// (`finalize_exports`, the intent generator's class-evidence check).
     fn prop_name_to_string(key: &PropName) -> Option<String> {
         match key {
             PropName::Ident(ident) => Some(ident.sym.to_string()),
-            PropName::Str(s) => Some(s.value.to_string()),
+            PropName::Str(s) if !s.value.contains('.') => Some(s.value.to_string()),
             _ => None,
+        }
+    }
+
+    /// Member names defined as BOTH a static and an instance member of the
+    /// class — the one shape where `Class.member` would collide on a single
+    /// map key. Private members are tracked with their `#` prefix, so they
+    /// can never collide with a same-named public member.
+    fn static_instance_collisions(class: &Class) -> HashSet<String> {
+        let mut static_names = HashSet::new();
+        let mut instance_names = HashSet::new();
+        for member in &class.body {
+            let (name, is_static) = match member {
+                ClassMember::Method(m) => (Self::prop_name_to_string(&m.key), m.is_static),
+                ClassMember::ClassProp(p) => (Self::prop_name_to_string(&p.key), p.is_static),
+                ClassMember::PrivateMethod(m) => (Some(format!("#{}", m.key.name)), m.is_static),
+                _ => continue,
+            };
+            if let Some(name) = name {
+                if is_static {
+                    static_names.insert(name);
+                } else {
+                    instance_names.insert(name);
+                }
+            }
+        }
+        static_names
+            .intersection(&instance_names)
+            .cloned()
+            .collect()
+    }
+
+    /// Key for a class member. The instance member keeps `Class.member`; when
+    /// a same-named static member also exists, the static side is keyed
+    /// `Class.static.member` so neither definition silently overwrites the
+    /// other. Parsers of these keys take the class from the FIRST `.` and the
+    /// member from the LAST, so both forms resolve correctly.
+    fn member_key(&self, class_name: &str, member_name: &str, is_static: bool) -> String {
+        if is_static && self.current_class_collisions.contains(member_name) {
+            format!("{class_name}.static.{member_name}")
+        } else {
+            format!("{class_name}.{member_name}")
         }
     }
 
@@ -804,8 +853,13 @@ impl Visit for FunctionDefinitionExtractor {
     /// Track the enclosing class name so members can be indexed as `Class.member`.
     fn visit_class_decl(&mut self, class: &ClassDecl) {
         let prev = self.current_class.replace(class.ident.sym.to_string());
+        let prev_collisions = std::mem::replace(
+            &mut self.current_class_collisions,
+            Self::static_instance_collisions(&class.class),
+        );
         class.visit_children_with(self);
         self.current_class = prev;
+        self.current_class_collisions = prev_collisions;
     }
 
     /// Class expressions (`const Foo = class { ... }`, `export default class Foo`).
@@ -816,11 +870,17 @@ impl Visit for FunctionDefinitionExtractor {
             Some(ident) => self.current_class.replace(ident.sym.to_string()),
             None => self.current_class.take(),
         };
+        let prev_collisions = std::mem::replace(
+            &mut self.current_class_collisions,
+            Self::static_instance_collisions(&class.class),
+        );
         class.visit_children_with(self);
         self.current_class = prev;
+        self.current_class_collisions = prev_collisions;
     }
 
-    /// Index class methods (static and instance) as `Class.method`.
+    /// Index class methods (static and instance) as `Class.method` (see
+    /// `member_key` for the static/instance collision case).
     /// Getters are included (`Class.name` — they carry real logic surprisingly
     /// often); setters are skipped so a getter/setter pair doesn't collide on
     /// one key.
@@ -829,7 +889,8 @@ impl Visit for FunctionDefinitionExtractor {
             && !matches!(method.kind, MethodKind::Setter)
             && let Some(member_name) = Self::prop_name_to_string(&method.key)
         {
-            self.insert_method_definition(format!("{class_name}.{member_name}"), &method.function);
+            let name = self.member_key(&class_name, &member_name, method.is_static);
+            self.insert_method_definition(name, &method.function);
         }
         method.visit_children_with(self);
     }
@@ -839,7 +900,8 @@ impl Visit for FunctionDefinitionExtractor {
         if let Some(class_name) = self.current_class.clone()
             && !matches!(method.kind, MethodKind::Setter)
         {
-            let name = format!("{class_name}.#{}", method.key.name);
+            let member_name = format!("#{}", method.key.name);
+            let name = self.member_key(&class_name, &member_name, method.is_static);
             self.insert_method_definition(name, &method.function);
         }
         method.visit_children_with(self);
@@ -853,7 +915,7 @@ impl Visit for FunctionDefinitionExtractor {
             && let Some(member_name) = Self::prop_name_to_string(&prop.key)
             && let Some(init) = &prop.value
         {
-            let name = format!("{class_name}.{member_name}");
+            let name = self.member_key(&class_name, &member_name, prop.is_static);
             match &**init {
                 Expr::Arrow(arrow) => self.insert_arrow_definition(name, arrow),
                 Expr::Fn(fn_expr) => self.insert_method_definition(name, &fn_expr.function),
@@ -1676,6 +1738,57 @@ mod tests {
         assert!(defs.contains_key("Svc.run"));
         let helper = defs.get("helper").expect("module function still indexed");
         assert!(!helper.name.contains('.'));
+    }
+
+    #[test]
+    fn static_instance_collision_gets_distinct_keys() {
+        let defs = extract(
+            "export class Counter {\n\
+               static create(seed: number): Counter { return new Counter(); }\n\
+               create(step: number): number { return step + 1; }\n\
+             }",
+        );
+        let instance = defs
+            .get("Counter.create")
+            .expect("instance member keeps the plain key");
+        assert_eq!(instance.arguments[0].name, "step");
+        let stat = defs
+            .get("Counter.static.create")
+            .expect("colliding static member gets the qualified key");
+        assert_eq!(stat.arguments[0].name, "seed");
+        assert!(
+            stat.is_exported && instance.is_exported,
+            "export propagation parses the class from the FIRST dot"
+        );
+    }
+
+    #[test]
+    fn non_colliding_static_keeps_plain_key() {
+        let defs = extract(
+            "class Presenter { static isFinished(s: string): boolean { return s === \"DONE\"; } }",
+        );
+        assert!(defs.contains_key("Presenter.isFinished"));
+        assert!(!defs.keys().any(|k| k.contains(".static.")));
+    }
+
+    #[test]
+    fn string_literal_member_containing_dot_is_skipped() {
+        let defs = extract(
+            "class Api {\n\
+               \"a.b\"(): number { return 1; }\n\
+               \"plain\"(): number { return 2; }\n\
+             }",
+        );
+        assert!(
+            defs.contains_key("Api.plain"),
+            "dot-free string keys are indexed"
+        );
+        assert_eq!(
+            defs.len(),
+            1,
+            "a string key containing '.' would break the Class.member invariant; got {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
