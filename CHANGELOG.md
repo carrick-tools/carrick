@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.7](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.6...carrick-v0.3.7) (2026-07-28)
+
+
+### Features
+
+* **cloud:** stage oversized CloudRepoData via presigned S3 ([#486](https://github.com/carrick-tools/carrick/issues/486)) ([#487](https://github.com/carrick-tools/carrick/issues/487)) ([71537fc](https://github.com/carrick-tools/carrick/commit/71537fc94a96de820ba92962d6d4a6bde8bf21da))
+
 ## [0.3.6](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.5...carrick-v0.3.6) (2026-07-28)
 
 
