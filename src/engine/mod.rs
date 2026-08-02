@@ -4520,6 +4520,16 @@ mod tests {
         assert_eq!(deserialized.data_calls.len(), 1);
         assert_eq!(deserialized.endpoints[0].path, "/api/users");
         assert_eq!(deserialized.data_calls[0].target, "/external/api");
+        // The candidate span must survive the cache: the incremental path
+        // rebuilds the mount graph from these rehydrated results, and
+        // `build_mount_graph` reads `call_expression_span_start` to tell a real
+        // client call site from a wrapper-resolution echo. If it were dropped
+        // here, every rehydrated call would look candidate-less and the
+        // suppression would silently stop firing on incremental scans.
+        assert_eq!(
+            deserialized.data_calls[0].call_expression_span_start,
+            Some(300)
+        );
     }
 
     #[test]

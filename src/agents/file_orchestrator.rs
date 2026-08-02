@@ -4285,6 +4285,13 @@ impl FileOrchestrator {
         // candidate-backed record wins — it is the real client call site and
         // the only one with spans for the type sidecar. When every record for a
         // key is candidate-less (the #370 case above), none is dropped.
+        //
+        // Known limitation: `swc_scanner` DOES raise a candidate for a plain
+        // imported-function wrapper call (`getOrders()` from `./client`), so
+        // when that wrapper's own URL is concrete both records are
+        // candidate-backed and this rule does not separate them. Covered here
+        // is the delegation-through-a-value shape (injected dependency, method
+        // call, object property), which raises no candidate at the site.
         let anchored: HashSet<(String, String)> = collected
             .iter()
             .filter(|(_, candidate_backed)| *candidate_backed)
