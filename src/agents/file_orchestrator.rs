@@ -4205,7 +4205,15 @@ impl FileOrchestrator {
             }
         }
 
-        // Fifth pass: add data calls
+        // Fifth pass: add data calls.
+        //
+        // Collected before anything is committed to the graph so the
+        // wrapper-echo suppression below can see the whole service's calls.
+        // The bool is "candidate-backed": `apply_candidate_map` stamps a span
+        // onto a data call only when the model's `candidate_id` joined a real
+        // SWC HTTP candidate, i.e. only when the deterministic scanner saw an
+        // HTTP client call at that source location.
+        let mut collected: Vec<(DataFetchingCall, bool)> = Vec::new();
         for (file_path, result) in file_results {
             for data_call in &result.data_calls {
                 let Some(method) = Self::normalize_consumer_method(data_call.method.as_deref())
@@ -4236,17 +4244,70 @@ impl FileOrchestrator {
                     );
                     continue;
                 }
-                graph.data_calls.push(DataFetchingCall {
-                    method,
-                    target_url: data_call.target.clone(),
-                    canonical_path,
-                    client: data_call.pattern_matched.clone(),
-                    file_location: format!("{}:{}", file_path, data_call.line_number),
-                    call_kind: data_call.call_kind,
-                    repo_name: None,
-                    service_name: None,
-                });
+                collected.push((
+                    DataFetchingCall {
+                        method,
+                        target_url: data_call.target.clone(),
+                        canonical_path,
+                        client: data_call.pattern_matched.clone(),
+                        file_location: format!("{}:{}", file_path, data_call.line_number),
+                        call_kind: data_call.call_kind,
+                        repo_name: None,
+                        service_name: None,
+                    },
+                    data_call.call_expression_span_start.is_some(),
+                ));
             }
+        }
+
+        // Suppress wrapper-resolution echoes (#369/#370 follow-up).
+        //
+        // A file that imports a module which itself performs HTTP is analyzed
+        // with that module's source as wrapper context, and the model is asked
+        // to emit the outbound call RESOLVED THROUGH the wrapper at the
+        // delegating call site. That is the only record of the call when the
+        // wrapper's own request URL is too templated to index (`${base}${path}`
+        // is dropped a few lines above by the literal-segment gate) — which is
+        // the case #370 was built for.
+        //
+        // It is a DUPLICATE when the wrapper's own request URL is already
+        // concrete: the same physical outbound request is then extracted twice,
+        // once at the wrapper's real client call and once at the delegating
+        // site, under one (method, canonical path) but two file locations — so
+        // nothing downstream collapses it and the reported call count is one
+        // too high. The delegating site is distinguishable structurally: it has
+        // no SWC HTTP candidate behind it, because the delegation
+        // (`this.svc.fetchOrders()`, `helper.load()`) is not a client call the
+        // scanner recognizes. No framework knowledge involved.
+        //
+        // So: drop a candidate-less call whose (method, canonical path) is
+        // already carried by a candidate-backed call in this service. The
+        // candidate-backed record wins — it is the real client call site and
+        // the only one with spans for the type sidecar. When every record for a
+        // key is candidate-less (the #370 case above), none is dropped.
+        //
+        // Known limitation: `swc_scanner` DOES raise a candidate for a plain
+        // imported-function wrapper call (`getOrders()` from `./client`), so
+        // when that wrapper's own URL is concrete both records are
+        // candidate-backed and this rule does not separate them. Covered here
+        // is the delegation-through-a-value shape (injected dependency, method
+        // call, object property), which raises no candidate at the site.
+        let anchored: HashSet<(String, String)> = collected
+            .iter()
+            .filter(|(_, candidate_backed)| *candidate_backed)
+            .map(|(call, _)| (call.method.clone(), call.canonical_path.clone()))
+            .collect();
+        for (call, candidate_backed) in collected {
+            if !candidate_backed
+                && anchored.contains(&(call.method.clone(), call.canonical_path.clone()))
+            {
+                debug!(
+                    "Suppressing wrapper-resolution echo of a call already extracted at its client call site: {} {} ({})",
+                    call.method, call.canonical_path, call.file_location
+                );
+                continue;
+            }
+            graph.data_calls.push(call);
         }
 
         // Sixth pass: resolve full paths for endpoints
@@ -5695,6 +5756,148 @@ export * from "./aFetch.js";"#,
             "https://api.example.com/data"
         );
         assert_eq!(graph.data_calls[0].method, "POST");
+    }
+
+    /// A data call as the fifth pass sees it. `span` carries the
+    /// `apply_candidate_map` stamp: `Some` when the model's `candidate_id`
+    /// joined a real SWC HTTP candidate, `None` when the model reported an
+    /// outbound call at a location the deterministic scanner saw no client
+    /// call at (the wrapper-resolved delegating site).
+    fn call_with_span(line: i32, target: &str, span: Option<u32>) -> DataCallResult {
+        DataCallResult {
+            call_kind: None,
+            candidate_id: "span:200-260".to_string(),
+            line_number: line,
+            target: target.to_string(),
+            method: Some("GET".to_string()),
+            pattern_matched: "axios.get(".to_string(),
+            call_expression_span_start: span,
+            call_expression_span_end: span.map(|s| s + 40),
+            call_expression_text: None,
+            call_expression_line: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+        }
+    }
+
+    /// Reproduction of the cross-service call double-count.
+    ///
+    /// One physical outbound request: a class-based service module holds the
+    /// only `axios.get(`${ORDER_SERVICE_URL}/api/orders`)` in the repo, and a
+    /// controller in another file delegates to it. The controller is analyzed
+    /// with the service as wrapper context (#369/#370), so the model resolves
+    /// the call through the wrapper and emits it a second time at the
+    /// delegating site — with no SWC candidate behind it, because
+    /// `this.usersService.fetchOrdersForUser(...)` is not a client call the
+    /// scanner recognizes.
+    ///
+    /// Both records carry the same (method, canonical path) but different file
+    /// locations, so nothing downstream collapses them: `ApiAnalysisResult`
+    /// counts calls raw, and the PR comment reported one call too many.
+    /// Structural, not framework-specific — any delegation to a same-repo
+    /// module whose own request URL is concrete produces it.
+    #[test]
+    fn test_build_mount_graph_drops_wrapper_echo_of_an_extracted_call_site() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let target = "${ORDER_SERVICE_URL}/api/orders";
+        let mut file_results = HashMap::new();
+        // The real client call site: candidate-backed.
+        file_results.insert(
+            "src/users/users.service.ts".to_string(),
+            result_with_data_calls(vec![call_with_span(27, target, Some(640))]),
+        );
+        // The delegating site, resolved through wrapper context: no candidate.
+        file_results.insert(
+            "src/users/users.controller.ts".to_string(),
+            result_with_data_calls(vec![call_with_span(50, target, None)]),
+        );
+
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
+
+        assert_eq!(
+            graph.data_calls.len(),
+            1,
+            "one physical call site must yield one call, got {:?}",
+            graph
+                .data_calls
+                .iter()
+                .map(|c| c.file_location.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            graph.data_calls[0].file_location, "src/users/users.service.ts:27",
+            "the surviving record must be the real client call site, not the delegation"
+        );
+    }
+
+    /// The suppression must be a no-op for the case #370 was built for: a
+    /// wrapper whose own request URL is fully templated (`${base}${path}`) is
+    /// dropped by the literal-segment gate, so the delegating site's resolved
+    /// emission is the ONLY record of the call and must survive even though it
+    /// has no SWC candidate behind it.
+    #[test]
+    fn test_build_mount_graph_keeps_wrapper_resolved_call_with_no_extracted_twin() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/http/client.ts".to_string(),
+            result_with_data_calls(vec![call_with_span(8, "${API_BASE}${path}", Some(120))]),
+        );
+        file_results.insert(
+            "src/orders/orders.repository.ts".to_string(),
+            result_with_data_calls(vec![call_with_span(33, "${API_BASE}/api/orders", None)]),
+        );
+
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
+
+        assert_eq!(graph.data_calls.len(), 1);
+        assert_eq!(
+            graph.data_calls[0].file_location,
+            "src/orders/orders.repository.ts:33"
+        );
+    }
+
+    /// Two genuinely distinct client call sites to the same operation are two
+    /// consumers, not a duplicate: both are candidate-backed, so neither is an
+    /// echo and both survive. Guards the fix against collapsing into a blanket
+    /// repo-wide dedup on (method, canonical path).
+    #[test]
+    fn test_build_mount_graph_keeps_two_real_call_sites_to_the_same_operation() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let target = "${ORDER_SERVICE_URL}/api/orders";
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/reports/nightly.ts".to_string(),
+            result_with_data_calls(vec![call_with_span(11, target, Some(300))]),
+        );
+        file_results.insert(
+            "src/orders/sync.ts".to_string(),
+            result_with_data_calls(vec![call_with_span(74, target, Some(900))]),
+        );
+
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+        );
+
+        assert_eq!(graph.data_calls.len(), 2);
     }
 
     /// Pre-fix-failing case for carrick#399 (eval run 29677844107): the model
