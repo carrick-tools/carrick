@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.8](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.7...carrick-v0.3.8) (2026-08-02)
+
+
+### Bug Fixes
+
+* **orchestrator:** drop wrapper-resolution echoes of an already-extracted call site ([#490](https://github.com/carrick-tools/carrick/issues/490)) ([d00e929](https://github.com/carrick-tools/carrick/commit/d00e929a02caaa1d9981e9b0ad1ee78582d94858))
+* **type-compat:** stop guessing array-ness when the inference came back blind ([#491](https://github.com/carrick-tools/carrick/issues/491)) ([f24c701](https://github.com/carrick-tools/carrick/commit/f24c701b4c7a3482269f6ced1254dcb89a2e671f))
+
+
+### Documentation
+
+* **research:** cross-repo type-checking strategy (structural inlining vs real .d.ts emit) + ts-go revisit trigger ([#262](https://github.com/carrick-tools/carrick/issues/262)) ([a7684bc](https://github.com/carrick-tools/carrick/commit/a7684bcf019ba8538ea3b2d099876316ec1787b9))
+
 ## [0.3.7](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.6...carrick-v0.3.7) (2026-07-28)
 
 
