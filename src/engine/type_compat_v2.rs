@@ -142,6 +142,45 @@ fn usable_inferred_text(text: &str) -> Option<&str> {
     }
 }
 
+/// True when an inference for an alias came back BLIND: tsc resolved the use
+/// site to a bare `any`/`unknown` — no anchor symbol, no array depth, no
+/// shape. This is not "the type is scalar"; it is "the compiler could not see
+/// the type at all", the routine CI shape whenever a payload flowed through an
+/// unresolved third-party import on a bare checkout (#349).
+///
+/// Deliberately narrower than [`contains_disqualifying_top_type`]: a partially
+/// decayed shape (`{ ok: boolean; count: any }`) still witnesses the use
+/// site's array-ness, so it is NOT blindness and must not demote anything.
+/// Only the bare top types mean the inference saw nothing.
+fn inference_was_blind(inf: &crate::services::type_sidecar::InferredType) -> bool {
+    inf.primary_type_symbol.is_none()
+        && inf.array_depth.is_none()
+        && matches!(
+            inf.type_string.trim().trim_end_matches(';').trim(),
+            "any" | "unknown"
+        )
+}
+
+/// Aliases whose deterministic inference ran and came back blind for EVERY
+/// result it produced. A single sighted inference for the alias clears it: the
+/// depth join (`apply_inferred_array_depth`) is first-anchor-carrying-wins, so
+/// blindness is only meaningful when nothing else saw the use site.
+fn blind_inference_aliases(
+    inferred: &[crate::services::type_sidecar::InferredType],
+) -> HashSet<&str> {
+    let mut blind: HashSet<&str> = HashSet::new();
+    let mut sighted: HashSet<&str> = HashSet::new();
+    for inf in inferred {
+        if inference_was_blind(inf) {
+            blind.insert(inf.alias.as_str());
+        } else {
+            sighted.insert(inf.alias.as_str());
+        }
+    }
+    blind.retain(|alias| !sighted.contains(alias));
+    blind
+}
+
 /// Derive one capture anchor per alias from the collected v1 type requests.
 ///
 /// Precedence mirrors the v1 bundle: an explicit symbol request wins over an
@@ -179,12 +218,38 @@ pub(crate) fn derive_capture_anchors(
             inferred_text.entry(inf.alias.as_str()).or_insert(text);
         }
     }
+    let blind = blind_inference_aliases(inferred);
 
     for request in explicit {
         let Some(alias) = request.alias.as_deref() else {
             // No alias means no manifest entry to join; nothing to capture.
             continue;
         };
+        // An LLM symbol anchor is a BARE element identifier by schema contract
+        // (`Order[]` -> `Order`), so the use-site's array-ness rides only on
+        // `array_depth`, which `apply_inferred_array_depth` copies from the
+        // deterministic inference for the same alias. When that inference came
+        // back blind there is no depth to copy — and no way to tell "the type
+        // is scalar" from "nothing was seen". Capturing the bare symbol anyway
+        // publishes a CONFIDENT contract whose array-ness was guessed, which is
+        // how a correct `Order[]` producer renders as `Order` and reads
+        // incompatible against a correct `Order[]` consumer.
+        //
+        // Fail closed: emit no symbol anchor and leave the alias to its own
+        // infer anchor below, which captures the decayed use site (`any`),
+        // self-checks `decayed_internal`, and routes through the check's
+        // IsAny gate to unverifiable. A depth the caller already knows (the
+        // GraphQL SDL list marker, or a depth the join did land) is evidence
+        // in its own right and keeps the anchor.
+        if request.array_depth.is_none() && blind.contains(alias) {
+            debug!(
+                "v2 capture: alias {} has an explicit '{}' anchor but its inference \
+                 resolved to a bare top type; skipping the symbol anchor so the \
+                 array-ness is not guessed (pair verdicts unverifiable)",
+                alias, request.symbol_name
+            );
+            continue;
+        }
         if !seen.insert(alias.to_string()) {
             continue;
         }
@@ -1171,6 +1236,230 @@ mod tests {
             }
             other => panic!("expected literal anchor, got {:?}", other),
         }
+    }
+
+    fn inferred(
+        alias: &str,
+        type_string: &str,
+        primary_type_symbol: Option<&str>,
+        array_depth: Option<u32>,
+    ) -> crate::services::type_sidecar::InferredType {
+        crate::services::type_sidecar::InferredType {
+            alias: alias.to_string(),
+            type_string: type_string.to_string(),
+            is_explicit: false,
+            source_location: crate::services::type_sidecar::SourceLocation {
+                file_path: "/repo/src/handler.ts".to_string(),
+                start_line: 7,
+                end_line: 7,
+                start_column: Some(0),
+                end_column: Some(0),
+            },
+            infer_kind: InferKind::ResponseBody,
+            primary_type_symbol: primary_type_symbol.map(str::to_string),
+            array_depth,
+            primary_type_symbol_source: None,
+        }
+    }
+
+    fn order_explicit(alias: &str) -> SymbolRequest {
+        SymbolRequest {
+            symbol_name: "Order".to_string(),
+            source_file: "src/types.ts".to_string(),
+            alias: Some(alias.to_string()),
+            // The join found no depth to copy — the LLM anchor is bare by
+            // schema contract, so this is the state every unjoined alias is in.
+            array_depth: None,
+            payload_borrow_witness: false,
+        }
+    }
+
+    fn response_body_infer(alias: &str) -> InferRequestItem {
+        InferRequestItem {
+            file_path: "/repo/src/handler.ts".to_string(),
+            line_number: 7,
+            span_start: Some(10),
+            span_end: Some(20),
+            expression_text: None,
+            expression_line: None,
+            infer_kind: InferKind::ResponseBody,
+            alias: Some(alias.to_string()),
+            param_name: None,
+        }
+    }
+
+    /// A blind inference must never let the LLM's bare element symbol ride as
+    /// a confident contract.
+    ///
+    /// Live repro (carrick-demo, scanner v0.3.7): user-service's
+    /// `GET /api/users/:id/orders` does `res.json(userOrders)` where
+    /// `userOrders` came from `(await axios.get<Order[]>(...)).data.filter(...)`.
+    /// CI scans a bare checkout (#349), so `axios` is unresolved and the whole
+    /// expression decays to `any`: the `response_body` inference returns
+    /// `type_string: "any"` with NO `primary_type_symbol` and NO `array_depth`
+    /// (measured offline against the real source). `apply_inferred_array_depth`
+    /// then has nothing to copy, the `Order` symbol anchor captures at depth 0,
+    /// and the surface line is `import('./types/order').Order` — so the correct
+    /// `Order[]` producer reads incompatible against the correct `Order[]`
+    /// consumer and ships a CAUTION type_mismatch on every PR.
+    ///
+    /// The array-ness cannot be recovered here (nothing deterministic witnesses
+    /// it), so the only honest outcome is to stop claiming it: no symbol anchor,
+    /// the alias falls to its own infer anchor, which captures `any`,
+    /// self-checks `decayed_internal`, and verdicts unverifiable.
+    #[test]
+    fn derive_anchors_drops_symbol_anchor_when_the_inference_was_blind() {
+        let explicit = vec![order_explicit("Endpoint_blind_Response")];
+        let infer = vec![response_body_infer("Endpoint_blind_Response")];
+        let inferred_types = vec![inferred("Endpoint_blind_Response", "any", None, None)];
+
+        let anchors = derive_capture_anchors(&explicit, &infer, &[], &inferred_types, "/repo");
+
+        assert_eq!(
+            anchors.len(),
+            1,
+            "expected exactly the infer anchor, got {:?}",
+            anchors
+        );
+        match &anchors[0] {
+            CaptureAnchor::Infer { alias, .. } => {
+                assert_eq!(alias, "Endpoint_blind_Response")
+            }
+            other => panic!(
+                "a blind inference must demote the LLM symbol anchor to its \
+                 locator-based infer anchor, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// `unknown` is the scrubbers' failed-inference placeholder and means the
+    /// same thing as `any` here: nothing was seen.
+    #[test]
+    fn derive_anchors_drops_symbol_anchor_on_blind_unknown() {
+        let explicit = vec![order_explicit("Endpoint_blind_Response")];
+        let infer = vec![response_body_infer("Endpoint_blind_Response")];
+        let inferred_types = vec![inferred("Endpoint_blind_Response", "unknown", None, None)];
+
+        let anchors = derive_capture_anchors(&explicit, &infer, &[], &inferred_types, "/repo");
+        assert!(
+            matches!(anchors.as_slice(), [CaptureAnchor::Infer { .. }]),
+            "got {:?}",
+            anchors
+        );
+    }
+
+    /// The guard is blindness-only, and every other state keeps the anchor —
+    /// this is what bounds the recall cost of the demotion.
+    #[test]
+    fn derive_anchors_keeps_symbol_anchor_whenever_the_inference_saw_anything() {
+        // (a) Sighted inference that resolved a real shape: the depth join
+        //     already ran upstream (depth Some(1) here), anchor kept.
+        let sighted = derive_capture_anchors(
+            &[SymbolRequest {
+                array_depth: Some(1),
+                ..order_explicit("Endpoint_a_Response")
+            }],
+            &[response_body_infer("Endpoint_a_Response")],
+            &[],
+            &[inferred(
+                "Endpoint_a_Response",
+                "{ id: number; }[]",
+                Some("Order"),
+                Some(1),
+            )],
+            "/repo",
+        );
+        assert!(
+            matches!(
+                sighted.as_slice(),
+                [CaptureAnchor::Symbol {
+                    array_depth: Some(1),
+                    ..
+                }]
+            ),
+            "got {:?}",
+            sighted
+        );
+
+        // (b) PARTIAL decay: a shape with an `any` member still witnesses the
+        //     use site's array-ness, so it is not blindness. Using
+        //     `contains_disqualifying_top_type` here instead would demote it
+        //     and widen the blast radius well past the defect.
+        let partial = derive_capture_anchors(
+            &[order_explicit("Endpoint_b_Response")],
+            &[response_body_infer("Endpoint_b_Response")],
+            &[],
+            &[inferred(
+                "Endpoint_b_Response",
+                "{ ok: boolean; count: any; }",
+                None,
+                None,
+            )],
+            "/repo",
+        );
+        assert!(
+            matches!(partial.as_slice(), [CaptureAnchor::Symbol { .. }]),
+            "partial decay is not blindness; got {:?}",
+            partial
+        );
+
+        // (c) No inference at all for the alias (socket/pub-sub explicit-only
+        //     anchors): the guard is structurally inert.
+        let no_inference = derive_capture_anchors(
+            &[order_explicit("Endpoint_c_Response")],
+            &[],
+            &[],
+            &[],
+            "/repo",
+        );
+        assert!(
+            matches!(no_inference.as_slice(), [CaptureAnchor::Symbol { .. }]),
+            "got {:?}",
+            no_inference
+        );
+
+        // (d) One blind result but another sighted one for the SAME alias:
+        //     something saw the use site, so the anchor is kept.
+        let mixed = derive_capture_anchors(
+            &[order_explicit("Endpoint_d_Response")],
+            &[response_body_infer("Endpoint_d_Response")],
+            &[],
+            &[
+                inferred("Endpoint_d_Response", "any", None, None),
+                inferred("Endpoint_d_Response", "Order[]", Some("Order"), Some(1)),
+            ],
+            "/repo",
+        );
+        assert!(
+            matches!(mixed.as_slice(), [CaptureAnchor::Symbol { .. }]),
+            "got {:?}",
+            mixed
+        );
+
+        // (e) A caller-supplied depth (the GraphQL SDL list marker, #248) is
+        //     evidence in its own right and survives a blind inference.
+        let sdl_depth = derive_capture_anchors(
+            &[SymbolRequest {
+                array_depth: Some(1),
+                ..order_explicit("Endpoint_e_Response")
+            }],
+            &[response_body_infer("Endpoint_e_Response")],
+            &[],
+            &[inferred("Endpoint_e_Response", "any", None, None)],
+            "/repo",
+        );
+        assert!(
+            matches!(
+                sdl_depth.as_slice(),
+                [CaptureAnchor::Symbol {
+                    array_depth: Some(1),
+                    ..
+                }]
+            ),
+            "got {:?}",
+            sdl_depth
+        );
     }
 
     // ---- contains_disqualifying_top_type ----------------------------------
