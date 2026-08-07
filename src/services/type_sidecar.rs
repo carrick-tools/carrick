@@ -224,6 +224,13 @@ pub enum CaptureAnchor {
         line_number: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         expression_text: Option<String>,
+        /// #498: the anchor names a handler PARAMETER, not an expression —
+        /// the `InferKind::FunctionParam` locator carried through to capture.
+        /// A subscriber's contract is what its handler receives, and without
+        /// this the line-only locator resolves the registration CALL and
+        /// captures that call's return type instead.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        param_name: Option<String>,
     },
     /// Inline literal type text (the v1 inline-alias path).
     Literal {
@@ -1756,6 +1763,7 @@ mod tests {
             span_end: Some(20),
             line_number: None,
             expression_text: None,
+            param_name: None,
         };
         let json = serde_json::to_string(&infer).unwrap();
         assert!(json.contains(r#""kind":"infer""#));

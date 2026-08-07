@@ -28,8 +28,8 @@ use crate::operation::OperationKey;
 use crate::services::TypeSidecar;
 use crate::services::type_sidecar::{
     AnchorOrigin, CaptureAliasRecord, CaptureAnchor, CheckPairEndpoint, CheckPairSpec,
-    CheckStubInput, InferRequestItem, ManifestEntry, ProbeProtocol, ProbeTypeKind, SymbolRequest,
-    VerdictBucket,
+    CheckStubInput, InferKind, InferRequestItem, ManifestEntry, ProbeProtocol, ProbeTypeKind,
+    SymbolRequest, VerdictBucket,
 };
 
 // ===========================================================================
@@ -286,6 +286,18 @@ pub(crate) fn derive_capture_anchors(
             .filter(|l| *l > 0)
             .or(Some(request.line_number))
             .filter(|l| *l > 0);
+        // #498: a `function_param` request names what a HANDLER RECEIVES, and
+        // that is the whole locator a subscriber carries (its collector sends
+        // no expression text on purpose). Dropping it here left the capture
+        // with a bare line, whose locator resolves the enclosing registration
+        // CALL — so every subscriber alias captured that call's return type
+        // (`void`, a subscription handle) as its payload contract, self-checked
+        // clean, and read incompatible against every correctly-typed publisher.
+        // Gated on the kind: an expression-kind request must never carry one.
+        let param_name = match request.infer_kind {
+            InferKind::FunctionParam => request.param_name.clone(),
+            _ => None,
+        };
         anchors.push(CaptureAnchor::Infer {
             alias: alias.to_string(),
             source_file: repo_relative(&request.file_path, repo_root),
@@ -294,6 +306,7 @@ pub(crate) fn derive_capture_anchors(
             span_end: request.span_end,
             line_number,
             expression_text: request.expression_text.clone(),
+            param_name,
         });
     }
 
@@ -1580,6 +1593,59 @@ mod tests {
         }
     }
 
+    /// #498: a subscriber's request is a `function_param` locator — a payload
+    /// PARAMETER name, with no expression text (its collector sends none on
+    /// purpose). That locator must reach the capture anchor. Dropping it left
+    /// a bare line, whose capture locator resolves the enclosing registration
+    /// CALL and captures that call's return type as the payload contract.
+    ///
+    /// An expression-kind request must never carry one: the gate is the kind,
+    /// not the presence of the field.
+    #[test]
+    fn derive_anchors_carry_function_param_locator_for_subscribers() {
+        let request = |alias: &str, kind: InferKind, param: Option<&str>| {
+            crate::services::type_sidecar::InferRequestItem {
+                file_path: "src/subscriber.ts".to_string(),
+                line_number: 12,
+                span_start: None,
+                span_end: None,
+                expression_text: None,
+                expression_line: None,
+                infer_kind: kind,
+                alias: Some(alias.to_string()),
+                param_name: param.map(str::to_string),
+            }
+        };
+
+        let infer = vec![
+            request("Sub_Producer", InferKind::FunctionParam, Some("msg")),
+            request(
+                "Sub_Destructured",
+                InferKind::FunctionParam,
+                Some("{ orderId, total }"),
+            ),
+            // Same field set on a non-param kind: must be dropped.
+            request("Pub_Consumer", InferKind::Expression, Some("msg")),
+        ];
+
+        let anchors = derive_capture_anchors(&[], &infer, &[], &[], ".");
+        assert_eq!(anchors.len(), 3);
+        let param_of = |index: usize| match &anchors[index] {
+            CaptureAnchor::Infer {
+                param_name,
+                line_number,
+                ..
+            } => {
+                assert_eq!(*line_number, Some(12));
+                param_name.clone()
+            }
+            other => panic!("expected an infer anchor, got {other:?}"),
+        };
+        assert_eq!(param_of(0).as_deref(), Some("msg"));
+        assert_eq!(param_of(1).as_deref(), Some("{ orderId, total }"));
+        assert_eq!(param_of(2), None);
+    }
+
     /// An infer-request alias whose v1 inference produced a real shape rides
     /// a LITERAL anchor carrying that text (the kind-aware inference result);
     /// a placeholder text (`unknown`) keeps the locator-based infer anchor.
@@ -2548,6 +2614,7 @@ mod tests {
                 span_end: None,
                 line_number: Some(27),
                 expression_text: None,
+                param_name: None,
             }],
             &HashMap::new(),
         )

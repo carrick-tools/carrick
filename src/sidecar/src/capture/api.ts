@@ -100,6 +100,17 @@ export interface InferAnchorRequest {
   /** Exact source text of the target expression (locator fallback). */
   expression_text?: string;
   /**
+   * carrick#498: the anchor targets a handler PARAMETER, not an expression.
+   * Carries the upstream `function_param` locator (a parameter name, a whole
+   * destructured binding pattern, or one binding element inside it), so the
+   * capture resolves the payload the handler RECEIVES. Without it a line-only
+   * subscriber anchor resolves the enclosing registration CALL and captures
+   * that call's return type (`void`, a subscription handle) as the contract.
+   * When present the parameter resolution is authoritative: a failure demotes
+   * rather than falling back to the expression locator.
+   */
+  param_name?: string;
+  /**
    * Transport unwrapping applied to the located type before printing
    * (design doc, Capture step 6: machinery unwrapping stays at capture time).
    * Default 'awaited': Promise / thenable layers are unwrapped.
