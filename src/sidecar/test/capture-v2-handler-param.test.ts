@@ -87,7 +87,13 @@ voidClient.subscribe(
   }
 );
 
-// 6. No such parameter anywhere: must abstain, never fall back to the call.
+// 6. Two registrations nested on one line, each with a \`msg\` parameter. The
+//    anchor's line denotes the INNER one; the outer handler takes a different
+//    payload, so picking it would be a confident wrong answer.
+declare function wrap(value: void, after: (msg: Envelope) => void): void;
+wrap(voidClient.subscribe('orders.nested', async (msg: OrderEvent) => { console.log(msg.total); }), (msg: Envelope) => { console.log(msg.receivedAt); });
+
+// 7. No such parameter anywhere: must abstain, never fall back to the call.
 voidClient.subscribe('orders.archived', async (msg: OrderEvent) => {
   console.log(msg.orderId);
 });
@@ -152,6 +158,7 @@ describe('capture v2: subscriber anchors capture the handler payload parameter (
         // Anchored on the topic argument line; the handler starts one line below,
         // inside the tolerance the fix mirrors from the v1 inferrer.
         anchor('NextLine_Producer_Response', lineOf("'orders.refunded'"), 'msg'),
+        anchor('Nested_Producer_Response', lineOf("'orders.nested'"), 'msg'),
         anchor('Missing_Producer_Response', lineOf("'orders.archived'"), 'nosuchparam'),
       ],
     });
@@ -195,6 +202,12 @@ describe('capture v2: subscriber anchors capture the handler payload parameter (
 
   it('a handler whose signature starts below the registration line resolves', () => {
     assert.match(aliasLine('NextLine_Producer_Response'), /OrderEvent/);
+  });
+
+  it('same-line nested registrations resolve the innermost handler', () => {
+    const text = aliasLine('Nested_Producer_Response');
+    assert.match(text, /OrderEvent/);
+    assert.doesNotMatch(text, /Envelope|receivedAt/);
   });
 
   it('no surface line captures the registration call type', () => {

@@ -572,7 +572,11 @@ function locateHandlerParam(
  *
  *  1. the LAST function-typed argument of a call starting on the anchor's
  *     line — the handler slot of a registration call, structurally (a
- *     registration passes its routing key first and its handler last);
+ *     registration passes its routing key first and its handler last).
+ *     Several calls can start on one line (`wrap(bus.subscribe(t, h), g)`),
+ *     so they are ordered INNERMOST first: the innermost is the registration
+ *     the anchor's own line most nearly denotes, and it is the same
+ *     innermost-wins tie-break the v1 inferrer's `findFunctionByLine` uses;
  *  2. any function whose declaration starts within
  *     `HANDLER_LINE_TOLERANCE` lines of the anchor, innermost first — the
  *     locator may name a binding on the handler's own signature lines rather
@@ -613,7 +617,12 @@ function callsStartingOnLine(
     node.forEachChild(visit);
   };
   visit(sourceFile);
-  return calls;
+  // Innermost (smallest span) first: a pre-order walk would otherwise hand
+  // back the OUTER call of a same-line nest, whose handler is not the one the
+  // anchor's line denotes.
+  return calls.sort(
+    (a, b) => a.getEnd() - a.getStart() - (b.getEnd() - b.getStart())
+  );
 }
 
 /**
