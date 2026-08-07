@@ -195,6 +195,29 @@ export function resolveAnchor(
   }
 
   // kind === 'infer'
+  // #498: a `param_name` anchor targets what a handler RECEIVES. Resolve the
+  // parameter before anything else and treat the outcome as final — the
+  // expression locator below resolves the enclosing registration call, whose
+  // return type (`void`, a subscription handle) is not the payload, and it
+  // self-checks clean, so falling through would ship a confidently wrong
+  // contract instead of an honest `unknown`.
+  if (request.param_name !== undefined) {
+    const param = locateHandlerParam(sourceFile, request, request.param_name);
+    if (!param) {
+      return demote(
+        `no handler parameter '${request.param_name}' resolved in ` +
+          `${request.source_file} (${paramLocatorHints(request)})`
+      );
+    }
+    return finishInferAnchor(
+      program,
+      sourceFile,
+      request,
+      param,
+      args.placeholder,
+      undefined
+    );
+  }
   let located = locateNode(sourceFile, request);
   if (!located) {
     return demote(locatorFailureReason(request));
@@ -214,6 +237,37 @@ export function resolveAnchor(
     located = builderReaim.node;
     reaimNote = builderReaim.note;
   }
+  return finishInferAnchor(
+    program,
+    sourceFile,
+    request,
+    located,
+    args.placeholder,
+    reaimNote
+  );
+}
+
+/**
+ * Shared tail of the infer paths (locator-resolved node and #498
+ * parameter-resolved node alike): read the type at the node, unwrap the
+ * transport layer, run the #433 recovery and the carrick#371 machinery guard,
+ * and print through the node builder.
+ */
+function finishInferAnchor(
+  program: ts.Program,
+  sourceFile: ts.SourceFile,
+  request: InferAnchorRequest,
+  located: ts.Node,
+  placeholder: ts.TypeAliasDeclaration | undefined,
+  reaimNote: string | undefined
+): ResolvedAnchor {
+  const checker = program.getTypeChecker();
+  const demote = (reason: string): ResolvedAnchor => ({
+    request,
+    aliasText: 'unknown',
+    serialization: 'structural_fallback',
+    failureReason: reason,
+  });
   let type = checker.getTypeAtLocation(located);
   if ((request.unwrap ?? 'awaited') === 'awaited') {
     type = checker.getAwaitedType(type) ?? type;
@@ -251,10 +305,10 @@ export function resolveAnchor(
         'degraded to unknown rather than emit a wrapper envelope as a response contract'
     );
   }
-  if (!args.placeholder) {
+  if (!placeholder) {
     return demote('internal: no placeholder destination for infer anchor');
   }
-  const printed = printTypeForDestination(program, type, args.placeholder);
+  const printed = printTypeForDestination(program, type, placeholder);
   if (!printed.text) {
     return demote(printed.failure ?? 'node builder print failed');
   }
@@ -480,6 +534,198 @@ function literalResolvesLocally(
   };
   visit(literal);
   return resolves;
+}
+
+// ===========================================================================
+// carrick#498: handler-parameter anchors.
+//
+// A subscriber's contract is what its handler RECEIVES, so its anchor carries
+// a `param_name` locator instead of an expression. Resolving it needs the
+// handler function, and the only locator upstream can supply for an anonymous
+// inline handler is a line. Everything below is STRUCTURAL — argument
+// position and binding shape, never a method name, library, or topic string.
+// ===========================================================================
+
+/** v1's `findFunctionByLine` tolerance, mirrored so the two paths agree. */
+const HANDLER_LINE_TOLERANCE = 2;
+
+/**
+ * The payload parameter named by `paramName` on the handler this anchor
+ * points at, or undefined when neither the handler nor the parameter can be
+ * picked. The caller demotes on undefined: an unresolved parameter must never
+ * fall back to the expression locator.
+ */
+function locateHandlerParam(
+  sourceFile: ts.SourceFile,
+  request: InferAnchorRequest,
+  paramName: string
+): ts.Node | undefined {
+  for (const fn of handlerCandidates(sourceFile, request)) {
+    const target = resolveParamTarget(fn, paramName);
+    if (target) return target;
+  }
+  return undefined;
+}
+
+/**
+ * Handler functions this anchor could be naming, most specific first:
+ *
+ *  1. the LAST function-typed argument of a call starting on the anchor's
+ *     line — the handler slot of a registration call, structurally (a
+ *     registration passes its routing key first and its handler last).
+ *     Several calls can start on one line (`wrap(bus.subscribe(t, h), g)`),
+ *     so they are ordered INNERMOST first: the innermost is the registration
+ *     the anchor's own line most nearly denotes, and it is the same
+ *     innermost-wins tie-break the v1 inferrer's `findFunctionByLine` uses;
+ *  2. any function whose declaration starts within
+ *     `HANDLER_LINE_TOLERANCE` lines of the anchor, innermost first — the
+ *     locator may name a binding on the handler's own signature lines rather
+ *     than the registration line;
+ *  3. the innermost function ENCLOSING the node the expression locator
+ *     resolves — covers a locator that landed in the handler body.
+ */
+function handlerCandidates(
+  sourceFile: ts.SourceFile,
+  request: InferAnchorRequest
+): ts.SignatureDeclaration[] {
+  const out: ts.SignatureDeclaration[] = [];
+  const push = (fn: ts.SignatureDeclaration | undefined) => {
+    if (fn && !out.includes(fn)) out.push(fn);
+  };
+
+  const line = request.line_number;
+  if (line !== undefined) {
+    for (const call of callsStartingOnLine(sourceFile, line)) {
+      const handlerArgs = call.arguments.filter(isFunctionArgument);
+      push(handlerArgs[handlerArgs.length - 1]);
+    }
+    for (const fn of functionsNearLine(sourceFile, line)) push(fn);
+  }
+  push(enclosingFunction(locateNode(sourceFile, request)));
+  return out;
+}
+
+function callsStartingOnLine(
+  sourceFile: ts.SourceFile,
+  line: number
+): ts.CallExpression[] {
+  const calls: ts.CallExpression[] = [];
+  const visit = (node: ts.Node) => {
+    if (ts.isCallExpression(node) && startLineOf(sourceFile, node) === line) {
+      calls.push(node);
+    }
+    node.forEachChild(visit);
+  };
+  visit(sourceFile);
+  // Innermost (smallest span) first: a pre-order walk would otherwise hand
+  // back the OUTER call of a same-line nest, whose handler is not the one the
+  // anchor's line denotes.
+  return calls.sort(
+    (a, b) => a.getEnd() - a.getStart() - (b.getEnd() - b.getStart())
+  );
+}
+
+/**
+ * Functions declared within the line tolerance of `line`, ordered innermost
+ * (smallest span) first so a nested handler wins over its enclosing function.
+ */
+function functionsNearLine(
+  sourceFile: ts.SourceFile,
+  line: number
+): ts.SignatureDeclaration[] {
+  const found: ts.SignatureDeclaration[] = [];
+  const visit = (node: ts.Node) => {
+    if (
+      isHandlerFunctionLike(node) &&
+      Math.abs(startLineOf(sourceFile, node) - line) <= HANDLER_LINE_TOLERANCE
+    ) {
+      found.push(node);
+    }
+    node.forEachChild(visit);
+  };
+  visit(sourceFile);
+  return found.sort(
+    (a, b) => a.getEnd() - a.getStart() - (b.getEnd() - b.getStart())
+  );
+}
+
+function startLineOf(sourceFile: ts.SourceFile, node: ts.Node): number {
+  return (
+    sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1
+  );
+}
+
+function isHandlerFunctionLike(node: ts.Node): node is ts.SignatureDeclaration {
+  return (
+    ts.isArrowFunction(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isFunctionDeclaration(node) ||
+    ts.isMethodDeclaration(node)
+  );
+}
+
+function enclosingFunction(
+  node: ts.Node | undefined
+): ts.SignatureDeclaration | undefined {
+  let current: ts.Node | undefined = node;
+  while (current) {
+    if (isHandlerFunctionLike(current)) return current;
+    current = current.parent;
+  }
+  return undefined;
+}
+
+/**
+ * The three binding shapes a `function_param` locator can name, mirroring the
+ * v1 inferrer's `resolveParamTarget` so both anchor paths answer identically:
+ *
+ *  1. an exact parameter name (`(payload) => …` <- "payload");
+ *  2. a whole destructured binding pattern under whitespace normalisation
+ *     (`({ id, total }) => …` <- "{ id, total }") — the pattern's own type IS
+ *     the payload;
+ *  3. one named binding element inside a destructured parameter
+ *     (`({ payload }) => …` <- "payload") — the payload is a property of an
+ *     envelope parameter, and the checker projects the element's type.
+ */
+function resolveParamTarget(
+  fn: ts.SignatureDeclaration,
+  paramName: string
+): ts.Node | undefined {
+  const params = fn.parameters;
+
+  for (const param of params) {
+    if (ts.isIdentifier(param.name) && param.name.text === paramName) {
+      return param;
+    }
+  }
+
+  const wanted = paramName.replace(/\s+/g, ' ').trim();
+  for (const param of params) {
+    if (
+      (ts.isObjectBindingPattern(param.name) ||
+        ts.isArrayBindingPattern(param.name)) &&
+      param.name.getText().replace(/\s+/g, ' ').trim() === wanted
+    ) {
+      return param;
+    }
+  }
+
+  for (const param of params) {
+    if (!ts.isObjectBindingPattern(param.name)) continue;
+    for (const element of param.name.elements) {
+      if (ts.isIdentifier(element.name) && element.name.text === paramName) {
+        return element;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function paramLocatorHints(request: InferAnchorRequest): string {
+  return request.line_number !== undefined
+    ? `line ${request.line_number}`
+    : 'no line hint';
 }
 
 function locatorFailureReason(request: InferAnchorRequest): string {
