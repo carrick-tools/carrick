@@ -13,6 +13,12 @@
  * all-literal object literal argument of a chain of >=2 fluent calls; the
  * payload is the lone non-literal, non-inline-function chain argument. All
  * fixtures are synthetic and generically named.
+ *
+ * #497 extends the same suite to the descriptor written as a REFERENCE
+ * (`.meta(createWidgetMeta)`, the const declared in a sibling module), which
+ * has no object literal ancestor for the walk-up to find, plus the two
+ * over-trigger controls that keep the widened trigger from firing on an
+ * ordinary schema argument.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -26,7 +32,22 @@ import type { CaptureStubResult } from '../src/capture/api.js';
 let repoDir: string;
 let outRoot: string;
 
+// #497: a sibling module exporting a metadata descriptor by reference plus the
+// payload schema the chain really carries.
+const TYPES_TS = `
+// An all-literal metadata descriptor exported as a const, referenced by name at
+// the chain instead of being written inline.
+export const createWidgetMeta = {
+  openapi: { method: "POST", path: "/widgets/create", summary: "create a widget" },
+};
+
+// The payload schema the chain's input argument carries.
+export declare const ZWidgetSchema: { widgetId: number; label: string };
+`;
+
 const ROUTER_TS = `
+import { createWidgetMeta, ZWidgetSchema } from './widget.types';
+
 interface Builder {
   meta(config: object): Builder;
   input(schema: unknown): Builder;
@@ -91,6 +112,35 @@ export const literalPayloadRoute = procedure
   .input({ orderId: 1, label: "x" })
   .tag(routeTag)
   .mutation(() => ({}));
+
+// #497: the descriptor is an IMPORTED reference, not an inline literal. There
+// is no object literal ancestor to walk up to, so the pre-fix re-aim never
+// fired and the meta descriptor's own shape was captured as the request type.
+export const importedMetaRoute = procedure
+  .meta(createWidgetMeta)
+  .input(ZWidgetSchema)
+  .mutation(() => ({}));
+
+// #497: same shape with a LOCALLY declared descriptor const. The payload here
+// is itself an all-literal const, which is why the descriptor argument has to
+// be excluded from the candidate set by node identity rather than by shape.
+const localWidgetMeta = {
+  openapi: { method: "PATCH", path: "/widgets/rename", summary: "rename" },
+};
+const localRenameSchema = { renameId: 1, newLabel: "x" };
+export const localMetaRoute = procedure
+  .meta(localWidgetMeta)
+  .input(localRenameSchema)
+  .mutation(() => ({}));
+
+// #497 over-trigger control: the locator lands on the SCHEMA identifier of a
+// chain, not on a descriptor. The generalised trigger must not fire, and the
+// schema type must be captured exactly as it stands.
+declare const controlSchema: { controlId: number };
+export const controlRoute = procedure
+  .meta({ openapi: { method: "GET", path: "/widgets/control" } })
+  .input(controlSchema)
+  .mutation(() => ({}));
 `;
 
 function writeRepo(): void {
@@ -109,7 +159,20 @@ function writeRepo(): void {
       include: ['src'],
     })
   );
+  fs.writeFileSync(path.join(repoDir, 'src', 'widget.types.ts'), TYPES_TS);
   fs.writeFileSync(path.join(repoDir, 'src', 'router.ts'), ROUTER_TS);
+}
+
+/**
+ * 1-based line of the first line of ROUTER_TS containing `needle`. The
+ * reference-descriptor anchors need a `line_number` floor so the locator skips
+ * the identifier in the import declaration and lands on the chain argument.
+ */
+function routerLine(needle: string): number {
+  const lines = ROUTER_TS.split('\n');
+  const idx = lines.findIndex((l) => l.includes(needle));
+  assert.ok(idx >= 0, `fixture line not found: ${needle}`);
+  return idx + 1;
 }
 
 describe('capture v2: builder-chain payload selection over config descriptor', () => {
@@ -182,6 +245,49 @@ describe('capture v2: builder-chain payload selection over config descriptor', (
           expression_text: '{ openapi: { method: "POST", path: "/documents/create" } }',
           unwrap: 'none',
         },
+        // #497: descriptor referenced by an IMPORTED identifier -> re-aim at
+        // the chain's schema argument, exactly as for the inline literal.
+        {
+          kind: 'infer',
+          alias: 'ImportedMeta_Request',
+          source_file: 'src/router.ts',
+          anchor_origin: 'deterministic-infer',
+          expression_text: 'createWidgetMeta',
+          line_number: routerLine('.meta(createWidgetMeta)'),
+          unwrap: 'none',
+        },
+        // #497: descriptor referenced by a LOCAL const identifier.
+        {
+          kind: 'infer',
+          alias: 'LocalMeta_Request',
+          source_file: 'src/router.ts',
+          anchor_origin: 'deterministic-infer',
+          expression_text: 'localWidgetMeta',
+          line_number: routerLine('.meta(localWidgetMeta)'),
+          unwrap: 'none',
+        },
+        // #497 over-trigger control: locator on a FLAT all-literal payload
+        // const. Treating it as a descriptor would re-aim onto the metadata
+        // reference beside it, manufacturing the very defect #497 fixes.
+        {
+          kind: 'infer',
+          alias: 'FlatPayload_Request',
+          source_file: 'src/router.ts',
+          anchor_origin: 'deterministic-infer',
+          expression_text: 'localRenameSchema',
+          line_number: routerLine('.input(localRenameSchema)'),
+          unwrap: 'none',
+        },
+        // #497 over-trigger control: locator on the schema identifier itself.
+        {
+          kind: 'infer',
+          alias: 'Control_Request',
+          source_file: 'src/router.ts',
+          anchor_origin: 'deterministic-infer',
+          expression_text: 'controlSchema',
+          line_number: routerLine('.input(controlSchema)'),
+          unwrap: 'none',
+        },
       ],
     });
     assert.strictEqual(result.success, true, JSON.stringify(result.errors));
@@ -195,6 +301,20 @@ describe('capture v2: builder-chain payload selection over config descriptor', (
     fs.rmSync(repoDir, { recursive: true, force: true });
     fs.rmSync(outRoot, { recursive: true, force: true });
   });
+
+  /**
+   * Just the one alias's surface line. The suite's older assertions match
+   * `Alias = [\s\S]*needle` against the whole surface, which reaches past the
+   * alias into every line below it; the #497 assertions stay bounded so a
+   * later fixture cannot make them pass or fail for the wrong reason.
+   */
+  function surfaceFor(alias: string): string {
+    const m = surface.match(
+      new RegExp(`export type ${alias} =[\\s\\S]*?(?=\\nexport type |$)`)
+    );
+    assert.ok(m, `no surface line for ${alias}:\n${surface}`);
+    return m[0];
+  }
 
   function record(alias: string) {
     const r = result.aliases.find((a) => a.alias === alias);
@@ -250,6 +370,65 @@ describe('capture v2: builder-chain payload selection over config descriptor', (
     assert.match(surface, /Tag_Request = unknown;/);
     // Never captures the string constant as a payload.
     assert.ok(!/Tag_Request = string;/.test(surface), surface);
+  });
+
+  it('#497: re-aims when the descriptor is an imported identifier reference', () => {
+    // Pre-fix there was no ObjectLiteralExpression ancestor to walk up to, so
+    // the re-aim never fired and the meta descriptor's own shape was captured.
+    const r = record('ImportedMeta_Request');
+    assert.strictEqual(r.self_check, 'ok', r.self_check_detail);
+    const line = surfaceFor('ImportedMeta_Request');
+    assert.match(line, /widgetId/);
+    assert.match(line, /label/);
+    assert.ok(!/openapi/.test(line), `descriptor metadata must not be captured:\n${line}`);
+    // Pins the full fix: a generalised trigger without the descriptor-argument
+    // identity skip would abstain here instead of re-aiming.
+    assert.ok(!/= unknown;/.test(line), `must re-aim, not abstain:\n${line}`);
+    assert.match(r.self_check_detail ?? '', /re-aimed at the chain schema argument/);
+  });
+
+  it('#497: re-aims when the descriptor is a locally declared const', () => {
+    const r = record('LocalMeta_Request');
+    assert.strictEqual(r.self_check, 'ok', r.self_check_detail);
+    const line = surfaceFor('LocalMeta_Request');
+    assert.match(line, /renameId/);
+    assert.match(line, /newLabel/);
+    assert.ok(!/openapi/.test(line), `descriptor metadata must not be captured:\n${line}`);
+    assert.ok(!/= unknown;/.test(line), `must re-aim, not abstain:\n${line}`);
+    assert.match(r.self_check_detail ?? '', /re-aimed at the chain schema argument/);
+  });
+
+  it('#497 control: a flat all-literal payload const is never read as a descriptor', () => {
+    // The reference spelling of the descriptor test has to be stricter than the
+    // inline one. Without that, this flat const is classified as the descriptor
+    // and the chain's lone remaining candidate is the metadata reference beside
+    // it, so the capture re-aims ONTO the descriptor.
+    const r = record('FlatPayload_Request');
+    assert.strictEqual(r.self_check, 'ok', r.self_check_detail);
+    const line = surfaceFor('FlatPayload_Request');
+    assert.match(line, /renameId/);
+    assert.match(line, /newLabel/);
+    assert.ok(
+      !/openapi/.test(line),
+      `must not re-aim onto the metadata descriptor:\n${line}`
+    );
+    assert.ok(!/= unknown;/.test(line), line);
+    assert.ok(
+      !/re-aimed at the chain schema argument/.test(r.self_check_detail ?? ''),
+      `a flat payload const must not trigger the re-aim: ${r.self_check_detail}`
+    );
+  });
+
+  it('#497 control: a locator on the schema identifier does not trigger a re-aim', () => {
+    const r = record('Control_Request');
+    assert.strictEqual(r.self_check, 'ok', r.self_check_detail);
+    const line = surfaceFor('Control_Request');
+    assert.match(line, /controlId/);
+    assert.ok(!/= unknown;/.test(line), line);
+    assert.ok(
+      !/re-aimed at the chain schema argument/.test(r.self_check_detail ?? ''),
+      `an ordinary reference argument must not trigger the re-aim: ${r.self_check_detail}`
+    );
   });
 
   it('abstains when a literal-object payload sits beside a non-schema identifier', () => {

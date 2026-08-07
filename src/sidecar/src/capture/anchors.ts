@@ -732,6 +732,17 @@ function typeQueryMatchesSymbol(
 // chain argument whose RESOLVED type has object/payload meaning (a schema
 // resolves to an object; a string/number tag does not).
 //
+// #497 widened the descriptor test one step: the descriptor also counts when it
+// is REFERENCED by name (`.meta(createWidgetMeta)`, the const declared in a
+// sibling module) rather than written inline. The reference is resolved through
+// its symbol to its declaration's initialiser and tested there. That reference
+// test is deliberately STRICTER than the inline one, for the reason set out on
+// `isMetadataDescriptor`: an inline all-literal object argument is never a
+// payload here, while a reference is an ordinary identifier that would
+// otherwise be a payload candidate. The descriptor argument is then excluded
+// from the candidate set by NODE IDENTITY, never by shape: a payload schema
+// that happens to be an all-literal const must stay a candidate.
+//
 // SAFETY of the two outcomes:
 //   - the DEMOTE branches (no object candidate, or several) are no-worse-than
 //     the descriptor: within this trigger the locator already sat on the
@@ -747,7 +758,15 @@ function typeQueryMatchesSymbol(
 // silent brittleness is not): a chain carrying two object-typed arguments —
 // e.g. both an input and an output schema — cannot be disambiguated as request
 // vs response without method-name knowledge, so it demotes rather than risk
-// the wrong side.
+// the wrong side. Three further descriptor spellings are deliberately NOT
+// recognised, none of them backed by an observed repro and each of them a
+// widening of the trigger on guesswork: a descriptor produced by a call
+// (`.meta(buildMeta())`, which would need the callee's return analysed); a
+// descriptor literal carrying a spread (`{ ...base, openapi }`, which
+// `isAllLiteralMetadata` rejects along with every other non-property member);
+// and a FLAT referenced descriptor (`const m = { tag: "x" }`), excluded by the
+// stricter reference test below. All three keep the pre-#497 behaviour: no
+// re-aim, descriptor captured.
 // ===========================================================================
 
 type BuilderReaim =
@@ -759,12 +778,12 @@ function reaimBuilderChainPayload(
   checker: ts.TypeChecker,
   located: ts.Node
 ): BuilderReaim {
-  const descriptorCall = enclosingChainDescriptorCall(located);
-  if (!descriptorCall) return { kind: 'none' };
-  const chain = fluentChainCalls(descriptorCall);
+  const descriptor = enclosingChainDescriptorArgument(checker, located);
+  if (!descriptor) return { kind: 'none' };
+  const chain = fluentChainCalls(descriptor.call);
   if (chain.length < 2) return { kind: 'none' };
 
-  const candidates = payloadCandidates(checker, chain);
+  const candidates = payloadCandidates(checker, chain, descriptor.argument);
   if (candidates.length === 1) {
     return {
       kind: 'reaim',
@@ -789,28 +808,93 @@ function reaimBuilderChainPayload(
 }
 
 /**
- * Walk up from the located node to the enclosing object literal that is (a) a
- * direct argument of a call and (b) all-literal metadata (the descriptor
- * signature). Returns that call, or undefined when the located node is not
- * inside such a descriptor.
+ * Walk up from the located node to the enclosing call argument that carries the
+ * descriptor signature: all-literal metadata, written inline or referenced by
+ * name (#497). Returns the call and the descriptor argument itself, or
+ * undefined when the located node is not inside such a descriptor. The argument
+ * comes back so the caller can exclude exactly that node from the payload
+ * candidates by identity.
  */
-function enclosingChainDescriptorCall(
+function enclosingChainDescriptorArgument(
+  checker: ts.TypeChecker,
   located: ts.Node
-): ts.CallExpression | undefined {
+): { call: ts.CallExpression; argument: ts.Expression } | undefined {
   let node: ts.Node | undefined = located;
   while (node) {
+    const parent: ts.Node | undefined = node.parent;
     if (
-      ts.isObjectLiteralExpression(node) &&
-      node.parent &&
-      ts.isCallExpression(node.parent) &&
-      (node.parent.arguments as readonly ts.Node[]).includes(node) &&
-      isAllLiteralMetadata(node)
+      parent &&
+      ts.isCallExpression(parent) &&
+      (parent.arguments as readonly ts.Node[]).includes(node) &&
+      isMetadataDescriptor(checker, node as ts.Expression)
     ) {
-      return node.parent;
+      return { call: parent, argument: node as ts.Expression };
     }
-    node = node.parent;
+    node = parent;
   }
   return undefined;
+}
+
+/**
+ * A config-descriptor argument: a non-empty, all-literal object literal, either
+ * written inline or named by a reference whose declaration initialises it to
+ * one (#497 — `.meta(createWidgetMeta)` with the const in a sibling module).
+ *
+ * The REFERENCE spelling is deliberately STRICTER than the inline one, and the
+ * asymmetry is load-bearing. In this file's model an inline all-literal object
+ * argument is never a payload, so the inline test can stay loose. A reference is
+ * an ordinary identifier that `payloadCandidates` otherwise treats as a payload
+ * candidate, so classifying one as a descriptor takes it out of the running: a
+ * flat hand-rolled const (`const s = { id: 0, name: "" }` passed to `.input`)
+ * would be misread as the descriptor and the capture would re-aim onto the
+ * metadata beside it — manufacturing the exact defect #497 fixes. Requiring a
+ * nested object-literal property (the `{ openapi: { ... } }` shape both observed
+ * variants carry) separates a descriptor from a flat payload const without
+ * consulting a single method or library name.
+ */
+function isMetadataDescriptor(checker: ts.TypeChecker, arg: ts.Expression): boolean {
+  if (ts.isObjectLiteralExpression(arg)) return isAllLiteralMetadata(arg);
+  const literal = referencedObjectLiteral(checker, arg);
+  return (
+    literal !== undefined &&
+    isAllLiteralMetadata(literal) &&
+    literal.properties.some(
+      (p) => ts.isPropertyAssignment(p) && ts.isObjectLiteralExpression(p.initializer)
+    )
+  );
+}
+
+/**
+ * The object literal a reference ultimately initialises to, or undefined. Only
+ * plain name references are followed (an identifier or a property access);
+ * re-export aliases are resolved so an imported const reaches its declaration,
+ * and `as const` / `satisfies` / parenthesised initialisers are unwrapped.
+ */
+function referencedObjectLiteral(
+  checker: ts.TypeChecker,
+  arg: ts.Expression
+): ts.ObjectLiteralExpression | undefined {
+  if (!ts.isIdentifier(arg) && !ts.isPropertyAccessExpression(arg)) return undefined;
+  const symbol = checker.getSymbolAtLocation(arg);
+  if (!symbol) return undefined;
+  const declaration = resolveSymbolAliases(checker, symbol).valueDeclaration;
+  if (!declaration) return undefined;
+  let initializer: ts.Expression | undefined;
+  if (ts.isVariableDeclaration(declaration) || ts.isPropertyAssignment(declaration)) {
+    initializer = declaration.initializer;
+  }
+  while (
+    initializer &&
+    (ts.isAsExpression(initializer) ||
+      ts.isSatisfiesExpression(initializer) ||
+      ts.isParenthesizedExpression(initializer) ||
+      ts.isTypeAssertionExpression(initializer))
+  ) {
+    initializer = initializer.expression;
+  }
+  return initializer && ts.isObjectLiteralExpression(initializer)
+    ? initializer
+    : undefined;
 }
 
 /**
@@ -862,14 +946,22 @@ function fluentChainCalls(anyCall: ts.CallExpression): ts.CallExpression[] {
  *    argument is a real schema.
  * With this filter the single-candidate re-aim fires only on a genuine schema,
  * and a non-object, ambiguous (>1), or absent candidate abstains via demote.
+ *
+ * `descriptor` is the argument the anchor landed in, excluded by NODE IDENTITY
+ * (#497). Identity, not shape: an inline descriptor was already excluded by the
+ * syntactic filter, but a descriptor named by reference is an identifier like
+ * any other, and excluding it by shape would also strike out a payload schema
+ * that happens to be an all-literal const.
  */
 function payloadCandidates(
   checker: ts.TypeChecker,
-  chain: ts.CallExpression[]
+  chain: ts.CallExpression[],
+  descriptor: ts.Expression
 ): ts.Expression[] {
   const out: ts.Expression[] = [];
   for (const call of chain) {
     for (const arg of call.arguments) {
+      if (arg === descriptor) continue;
       if (
         (ts.isIdentifier(arg) ||
           ts.isPropertyAccessExpression(arg) ||
