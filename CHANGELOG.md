@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.9](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.8...carrick-v0.3.9) (2026-08-07)
+
+
+### Bug Fixes
+
+* **capture:** anchor subscriber payloads on the handler parameter ([#498](https://github.com/carrick-tools/carrick/issues/498)) ([#500](https://github.com/carrick-tools/carrick/issues/500)) ([c37fab5](https://github.com/carrick-tools/carrick/commit/c37fab59f30ce6c63619047f5afb9b875e6bb1d5))
+* **sidecar:** recognise a referenced builder-chain descriptor ([#497](https://github.com/carrick-tools/carrick/issues/497)) ([#499](https://github.com/carrick-tools/carrick/issues/499)) ([113e477](https://github.com/carrick-tools/carrick/commit/113e4770488363a83d4096f09bac78bdcc32fe40))
+
 ## [0.3.8](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.7...carrick-v0.3.8) (2026-08-02)
 
 
