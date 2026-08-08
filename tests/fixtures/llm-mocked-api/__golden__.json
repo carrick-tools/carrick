@@ -90,6 +90,7 @@
       "handler": "fetch(",
       "request_type": null,
       "response_type": null,
+      "target_url": "https://orders.internal/api/orders?user=${userId}",
       "file": "tests/fixtures/llm-mocked-api/src/client.ts",
       "line": 4,
       "type_alias": "Endpoint_4022e5b76e4552db_Response_Calle64c9717ada550f1",

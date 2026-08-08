@@ -2350,6 +2350,33 @@ impl Analyzer {
         }
     }
 
+    /// Raw call targets for the eval projection, keyed by the same identity a
+    /// consumer `ApiEndpointDetails` carries: `(canonical key, file location)`.
+    /// The canonical key path is host-free by design (`consumer_call_path`
+    /// strips a literal origin so the match key can join a producer route), so
+    /// the raw source target (`http://comment-service/api/comments?...`) is the
+    /// only place the host survives. The Tier-A scorer's `host_contains`
+    /// labels assert against it; nothing in the product path reads this.
+    pub fn call_raw_targets(&self) -> HashMap<(String, String), String> {
+        self.mount_graph
+            .as_ref()
+            .map(|g| {
+                g.get_data_calls()
+                    .iter()
+                    .map(|c| {
+                        (
+                            (
+                                OperationKey::http(&c.method, c.canonical_path.clone()).canonical(),
+                                c.file_location.clone(),
+                            ),
+                            c.target_url.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Overlay the type-compatibility verdict onto each captured cross-repo
     /// edge, keyed by the producer's `(METHOD, identity)` AND the consumer's
     /// source location — so each `(producer, consumer)` pair gets ITS OWN

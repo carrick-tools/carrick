@@ -123,10 +123,24 @@ fn mean_sd(xs: &[f64]) -> (f64, f64) {
 /// `dump_dir`, when set (capture mode), is passed to the scanner as
 /// `CARRICK_EVAL_DUMP_DIR` so the file-analyzer persists its raw input/output
 /// there for prompt-hardening diagnostics.
+///
+/// Each scan runs HERMETIC: `CARRICK_LOCAL_STORAGE_DIR` (a per-scan temp dir)
+/// selects `LocalDirStorage` over the real cloud store, and
+/// `CARRICK_LOCAL_STORAGE_ISOLATE=1` makes sibling-repo download return empty
+/// (the xrepo harness's Phase-A isolation). Without this, the scan joins
+/// whatever the CI identity's live project holds — when dogfood scans populated
+/// that project, every fixture's projection inherited its endpoints and calls,
+/// collapsing precision while recall stayed 1.0 (#505). The LLM extraction
+/// path is unaffected: file-analyzer calls go to the compile-time API endpoint
+/// regardless of the storage backend.
 fn run_scanner(bin: &Path, fixture_dir: &Path, dump_dir: Option<&Path>) -> Option<EvalProjection> {
     for attempt in 1..=2 {
+        let hermetic_store = tempfile::tempdir().expect("create hermetic storage dir");
         let mut cmd = Command::new(bin);
-        cmd.arg(fixture_dir).env("CARRICK_OUTPUT_JSON", "1");
+        cmd.arg(fixture_dir)
+            .env("CARRICK_OUTPUT_JSON", "1")
+            .env("CARRICK_LOCAL_STORAGE_DIR", hermetic_store.path())
+            .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1");
         if let Some(d) = dump_dir {
             cmd.env("CARRICK_EVAL_DUMP_DIR", d);
         }
@@ -189,21 +203,29 @@ fn score_run(
     let ep_hits: Vec<bool> = expected_eps.iter().map(|e| found_eps.contains(e)).collect();
 
     // Calls: fuzzy match on method + host_contains + path_contains, HTTP only.
-    let found_calls: Vec<(String, String)> = proj
+    // `path` is the canonical MATCH key and is host-free for literal-origin
+    // URLs (`consumer_call_path` strips `scheme://host`), so `host_contains`
+    // is checked against the raw source target (`target_url`) with the
+    // canonical path as fallback — the host would otherwise be unmatchable
+    // by construction and every host-asserting label would MISS.
+    let found_calls: Vec<(String, String, String)> = proj
         .calls
         .iter()
         .filter(|o| o.protocol == "http")
         .filter_map(|o| {
+            let path = o.path.clone()?;
+            let raw = o.target_url.clone().unwrap_or_else(|| path.clone());
             Some((
                 o.method.clone().unwrap_or_default().to_uppercase(),
-                o.path.clone()?,
+                path,
+                raw,
             ))
         })
         .collect();
-    let matches = |e: &ExpCall, c: &(String, String)| {
+    let matches = |e: &ExpCall, c: &(String, String, String)| {
         c.0 == e.method.to_uppercase()
-            && c.1.contains(&e.host_contains)
-            && c.1.contains(&e.path_contains)
+            && (c.1.contains(&e.host_contains) || c.2.contains(&e.host_contains))
+            && (c.1.contains(&e.path_contains) || c.2.contains(&e.path_contains))
     };
     let call_hits: Vec<bool> = expected
         .calls

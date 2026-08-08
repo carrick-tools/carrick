@@ -47,6 +47,14 @@ pub struct EvalOp {
     pub handler: Option<String>,
     pub request_type: Option<String>,
     pub response_type: Option<String>,
+    /// Consumer ops only: the raw call target as written in source
+    /// (`http://comment-service/api/comments?userId=${id}`). `path` above is
+    /// the canonical MATCH key and is host-free for literal-origin URLs, so
+    /// this is the only field that still carries the host. The Tier-A
+    /// scorer's `host_contains` labels assert against it. `None` for
+    /// producer ops and for calls with no mount-graph raw target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_url: Option<String>,
     pub file: String,
     pub line: u32,
     // --- Type-manifest fields (contract §3), joined by OperationKey ---
@@ -125,8 +133,16 @@ pub struct EvalDependencyConflict {
 impl EvalProjection {
     /// Build the projection from analyzer results plus the merged type manifest.
     /// The manifest is joined per op by `OperationKey`; deps come straight from
-    /// `result.dependency_conflicts`; matches from `result.cross_repo_matches`.
-    pub fn from_results(result: &ApiAnalysisResult, type_manifest: &[TypeManifestEntry]) -> Self {
+    /// `result.dependency_conflicts`; matches from `result.cross_repo_matches`;
+    /// `raw_targets` (from [`ApiAnalyzer::call_raw_targets`], keyed
+    /// `(canonical key, file location)`) attaches each consumer op's raw source
+    /// target so host-asserting eval labels can still see a literal origin the
+    /// canonical key deliberately strips.
+    pub fn from_results(
+        result: &ApiAnalysisResult,
+        type_manifest: &[TypeManifestEntry],
+        raw_targets: &HashMap<(String, String), String>,
+    ) -> Self {
         let manifest_index = ManifestIndex::build(type_manifest);
         // Canonical ordering so the projection is deterministic across runs:
         // the matcher's edge order and analyze_dependencies' conflict order are
@@ -194,7 +210,16 @@ impl EvalProjection {
                 .calls
                 .iter()
                 .filter(|d| !is_self_loop_op(d))
-                .map(|d| EvalOp::from_details(d, &manifest_index, ManifestRole::Consumer))
+                .map(|d| {
+                    let mut op = EvalOp::from_details(d, &manifest_index, ManifestRole::Consumer);
+                    op.target_url = raw_targets
+                        .get(&(
+                            d.key.canonical(),
+                            d.file_path.to_string_lossy().into_owned(),
+                        ))
+                        .cloned();
+                    op
+                })
                 .collect(),
             cross_repo_matches,
             dependency_conflicts,
@@ -441,6 +466,7 @@ impl EvalOp {
                 .response_type
                 .as_ref()
                 .map(|t| t.composite_type_string.clone()),
+            target_url: None,
             file,
             line,
             type_alias: fields.as_ref().and_then(|f| f.type_alias.clone()),
@@ -692,7 +718,7 @@ mod tests {
             cross_repo_matches: vec![],
         };
 
-        let projection = EvalProjection::from_results(&result, &[]);
+        let projection = EvalProjection::from_results(&result, &[], &HashMap::new());
         let endpoint_keys: Vec<&str> = projection
             .endpoints
             .iter()
@@ -752,7 +778,7 @@ mod tests {
             cross_repo_matches: vec![],
         };
 
-        let projection = EvalProjection::from_results(&result, &[]);
+        let projection = EvalProjection::from_results(&result, &[], &HashMap::new());
         let surviving: Vec<(&str, &str)> = projection
             .endpoints
             .iter()
@@ -860,7 +886,7 @@ mod tests {
             Some("OrderResponse"),
         )];
 
-        let projection = EvalProjection::from_results(&result, &manifest);
+        let projection = EvalProjection::from_results(&result, &manifest, &HashMap::new());
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
 
@@ -935,7 +961,7 @@ mod tests {
             cross_repo_matches: vec![],
         };
 
-        let projection = EvalProjection::from_results(&result, &[]);
+        let projection = EvalProjection::from_results(&result, &[], &HashMap::new());
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
         let op = &json["endpoints"].as_array().unwrap()[0];
@@ -1008,7 +1034,7 @@ mod tests {
             Some("Payment"),
         )];
 
-        let projection = EvalProjection::from_results(&result, &manifest);
+        let projection = EvalProjection::from_results(&result, &manifest, &HashMap::new());
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
         let op = &json["calls"].as_array().unwrap()[0];
@@ -1085,7 +1111,7 @@ mod tests {
             ),
         ];
 
-        let projection = EvalProjection::from_results(&result, &manifest);
+        let projection = EvalProjection::from_results(&result, &manifest, &HashMap::new());
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
 
@@ -1160,7 +1186,7 @@ mod tests {
             ),
         ];
 
-        let projection = EvalProjection::from_results(&result, &manifest);
+        let projection = EvalProjection::from_results(&result, &manifest, &HashMap::new());
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
         let op = &json["endpoints"].as_array().unwrap()[0];
@@ -1217,7 +1243,7 @@ mod tests {
             None,
         )];
 
-        let projection = EvalProjection::from_results(&result, &manifest);
+        let projection = EvalProjection::from_results(&result, &manifest, &HashMap::new());
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
         let op = &json["calls"].as_array().unwrap()[0];
@@ -1294,7 +1320,7 @@ mod tests {
             ),
         ];
 
-        let projection = EvalProjection::from_results(&result, &manifest);
+        let projection = EvalProjection::from_results(&result, &manifest, &HashMap::new());
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
         let calls = json["calls"].as_array().unwrap();
