@@ -4537,25 +4537,30 @@ impl FileOrchestrator {
             } else {
                 format!("/{}", trimmed_path)
             }
-        } else if trimmed_path.is_empty() {
-            trimmed_prefix.to_string()
         } else {
+            // Every emitted path must be absolute. A mount prefix reaches here
+            // exactly as extracted (only trimmed), so a slashless one would
+            // otherwise emit a slashless full path, which the type-manifest
+            // writer drops on its `starts_with('/')` guard.
+            let pfx = if trimmed_prefix.starts_with('/') {
+                trimmed_prefix.to_string()
+            } else {
+                format!("/{}", trimmed_prefix)
+            };
+            if trimmed_path.is_empty() {
+                return pfx;
+            }
             // Idempotent guard: if the endpoint path already carries this prefix,
             // don't apply it twice. This happens when a constructor-carried prefix
             // is baked into the endpoint path AND also (redundantly) emitted as the
             // mount's path_prefix — without the guard that doubled to
             // `/api/v1/api/v1/status`. Match on a segment boundary so `/api` does
             // not spuriously swallow `/apixyz`. Framework-agnostic.
-            let pfx = if trimmed_prefix.starts_with('/') {
-                trimmed_prefix.to_string()
-            } else {
-                format!("/{}", trimmed_prefix)
-            };
             let full = format!("/{}", trimmed_path);
             match full.strip_prefix(&pfx) {
                 // Already prefixed (exact, or at a segment boundary) — don't double it.
                 Some(rest) if rest.is_empty() || rest.starts_with('/') => full,
-                _ => format!("{}/{}", trimmed_prefix, trimmed_path),
+                _ => format!("{}/{}", pfx, trimmed_path),
             }
         }
     }
@@ -5114,6 +5119,37 @@ export * from "./aFetch.js";"#,
         );
         // Empty prefix passes the path through.
         assert_eq!(FileOrchestrator::join_paths("", "/users"), "/users");
+    }
+
+    /// A mount prefix that arrives without a leading slash must still produce
+    /// an absolute full path. Nothing between the extraction pass and
+    /// `resolve_endpoint_paths` guarantees the slash (the mount path is only
+    /// trimmed), and a slashless full path is dropped outright by the
+    /// `starts_with('/')` guards in the type-manifest writer, so the endpoint
+    /// gets no SymbolRequest and no bundled types.
+    #[test]
+    fn join_paths_normalizes_a_slashless_prefix() {
+        // Nested path under a slashless prefix: the join must not leak the raw
+        // prefix through (pre-fix this emitted `field/document/field/create-many`).
+        assert_eq!(
+            FileOrchestrator::join_paths("field", "/document/field/create-many"),
+            "/field/document/field/create-many"
+        );
+        // Root route on a slashless-prefixed router (`router.get('/')`).
+        assert_eq!(FileOrchestrator::join_paths("field", "/"), "/field");
+        // Empty endpoint path is the same branch.
+        assert_eq!(FileOrchestrator::join_paths("field", ""), "/field");
+        // The idempotent guard still holds when the prefix has no leading slash.
+        assert_eq!(
+            FileOrchestrator::join_paths("api/v1", "/api/v1/status"),
+            "/api/v1/status"
+        );
+        // A slashless prefix with a trailing slash must not double the separator.
+        assert_eq!(
+            FileOrchestrator::join_paths("field/", "/create"),
+            "/field/create"
+        );
+        assert_eq!(FileOrchestrator::join_paths("field/", "/"), "/field");
     }
 
     /// Regression: `tsconfig.json` with `"baseUrl": "."` makes
