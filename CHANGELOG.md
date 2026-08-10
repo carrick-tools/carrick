@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.10](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.9...carrick-v0.3.10) (2026-08-10)
+
+
+### Bug Fixes
+
+* **eval:** make Tier-A scans hermetic + surface raw call targets in the projection ([#505](https://github.com/carrick-tools/carrick/issues/505)) ([#506](https://github.com/carrick-tools/carrick/issues/506)) ([a0268d0](https://github.com/carrick-tools/carrick/commit/a0268d0a8a3e7dee7fca560da61c8045b08f727e))
+* normalize joined route paths so a slashless mount prefix cannot drop endpoints ([#509](https://github.com/carrick-tools/carrick/issues/509)) ([a71295e](https://github.com/carrick-tools/carrick/commit/a71295e182d3f07f70ebbdca003641f2e4b9f9e4))
+
 ## [0.3.9](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.8...carrick-v0.3.9) (2026-08-07)
 
 
