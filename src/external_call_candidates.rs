@@ -1,12 +1,24 @@
-//! Deterministic, AST-only detection of SDK-mediated outbound call candidates.
+//! Outbound call candidates: the scanner's egress channel.
 //!
-//! The scanner's existing outbound-call candidates are HTTP-shaped: `fetch` /
-//! axios-style calls, env-var-anchored URLs, absolute URLs. A call made through
-//! a service client imported from an npm package never looks like that, so it
-//! is invisible to candidate generation and to every surface downstream of it.
+//! Two sources feed one row shape.
 //!
-//! This module adds a parallel data channel for that class. It is intentionally
-//! narrow:
+//! **SDK-mediated calls** ([`scan_files`]) are detected here, deterministically
+//! and AST-only. The scanner's existing outbound-call candidates are
+//! HTTP-shaped: `fetch` / axios-style calls, env-var-anchored URLs, absolute
+//! URLs. A call made through a service client imported from an npm package
+//! never looks like that, so it is invisible to candidate generation and to
+//! every surface downstream of it.
+//!
+//! **HTTP-shaped calls** ([`from_data_calls`]) are already extracted and
+//! already classified; they are projected into this channel rather than
+//! detected again. A call to a host the repo declares in `externalDomains`, or
+//! through a base declared in `externalEnvVars`, is excluded from endpoint
+//! matching by design — which is correct, and which used to mean the fact of
+//! the call was recorded nowhere an egress inventory could read. Projecting the
+//! row changes no classification and no matching; it records what the
+//! classification already decided.
+//!
+//! The SDK detection is intentionally narrow:
 //!
 //! - **Structural, not name-based.** A call becomes a candidate when its callee
 //!   traces, through this file's own imports, to a package that the service's
@@ -41,7 +53,12 @@
 //! - Constructor calls (`new Client(...)`) resolve the receiver without becoming
 //!   rows themselves, because constructing a client is not egress.
 
+use crate::analyzer::Analyzer;
+use crate::config::Config;
+use crate::mount_graph::DataFetchingCall;
 use crate::packages::Packages;
+use crate::type_manifest::parse_file_location;
+use crate::url_normalizer::UrlNormalizer;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -60,37 +77,51 @@ use tracing::warn;
 pub const MAX_CANDIDATES_PER_SERVICE: usize = 5000;
 
 /// How the scanner established that a call site leaves the service.
-///
-/// Only [`CallMechanism::Sdk`] is produced today. The env-var-URL and
-/// external-domain HTTP classes are detected elsewhere in the scanner and are
-/// not yet projected into this channel; the enum is shaped so they join without
-/// changing the row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CallMechanism {
     /// The callee resolves, through an import, to a declared runtime dependency.
     Sdk,
+    /// An extracted HTTP call whose target names a host the repo declares in
+    /// `externalDomains`.
+    ExternalHttp,
+    /// An extracted HTTP call whose base URL is an environment variable the
+    /// repo declares in `externalEnvVars`.
+    EnvVarUrl,
 }
 
 /// One outbound call candidate.
 ///
-/// Ordering is `(file, line, callee, package)`, which is also the sort key the
-/// scan emits in, so the row list is byte-identical across runs of the same
-/// tree.
+/// Ordering is `(file, line, callee, package, mechanism)`, which is also the
+/// sort key rows are emitted in. SDK rows are byte-identical across runs of the
+/// same tree because they are pure AST; the HTTP-shaped rows are projected from
+/// LLM extraction and inherit its stability, so the ORDER is fixed but the row
+/// set is only as reproducible as the extraction behind it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ExternalCallCandidate {
     /// Repo-relative path of the file containing the call.
     pub file: String,
     /// 1-based line number of the call expression.
     pub line: usize,
-    /// The callee as written, dotted (`ledger.payments.create`). Computed from
-    /// the AST, so it carries no whitespace or comments from the source.
+    /// What was called, in the terms the mechanism knows.
+    ///
+    /// For [`CallMechanism::Sdk`], the callee as written, dotted
+    /// (`ledger.payments.create`), computed from the AST so it carries no
+    /// whitespace or comments from the source. For the two HTTP-shaped
+    /// mechanisms there is no callee to name — the client is `fetch` or an
+    /// axios-alike in every case — so the field carries the HTTP method, which
+    /// is the operation the row records.
     pub callee: String,
-    /// The declared dependency the callee resolves to, exactly as the
-    /// `package.json` names it (a subpath import such as `pkg/edge` resolves to
-    /// `pkg`).
+    /// Where the call goes, in the terms the mechanism knows: the declared
+    /// dependency for [`CallMechanism::Sdk`], exactly as the `package.json`
+    /// names it (a subpath import such as `pkg/edge` resolves to `pkg`); the
+    /// hostname for [`CallMechanism::ExternalHttp`]; the environment variable
+    /// name for [`CallMechanism::EnvVarUrl`].
+    ///
+    /// The field keeps the name it shipped with in carrick#511, when `sdk` was
+    /// the only mechanism. cloud#350 calls the same column `target`.
     pub package: String,
-    /// Always [`CallMechanism::Sdk`] for now.
+    /// Which of the three detections produced this row.
     pub mechanism: CallMechanism,
 }
 
@@ -119,7 +150,98 @@ pub fn scan_files(
         rows.extend(scan_content(&relative, file, &content, &dependencies));
     }
 
-    let mut rows: Vec<ExternalCallCandidate> = rows.into_iter().collect();
+    cap(rows.into_iter().collect())
+}
+
+/// Project the already-classified HTTP-shaped calls of a service into channel
+/// rows.
+///
+/// `data_calls` are the consumer calls of the built mount graph, so every row
+/// here corresponds to a call the scanner already extracted, already keyed, and
+/// already classified. Nothing is re-detected and nothing is re-classified:
+/// this reads `host` (retained by the mount-graph builder from normalisation)
+/// and the same `externalDomains` / `externalEnvVars` declarations the matcher
+/// consults, and writes down what they already say.
+///
+/// Which calls become rows, and the reason in each case:
+///
+/// - **Declared-external host** → [`CallMechanism::ExternalHttp`]. The repo has
+///   said this host is somebody else's.
+/// - **Declared-external env-var base** → [`CallMechanism::EnvVarUrl`]. Same
+///   statement, made about a base URL the source does not spell out.
+/// - **Declared-internal, either shape** → no row. An in-org destination is
+///   already carried by the endpoint index, and calling it is not egress.
+/// - **Undeclared, either shape** → no row. Where the call goes is exactly what
+///   is unknown; the scanner already reports the undeclared env-var bases as
+///   `EnvVarCall` findings, and inventing an egress row from a host nobody
+///   classified would be a guess. The retained `host` on the call itself is
+///   what a later surface would widen from, without another scan.
+///
+/// A call whose extracted line is not a positive integer is skipped: a row
+/// without a location cannot be audited.
+pub fn from_data_calls(
+    data_calls: &[DataFetchingCall],
+    repo_root: &Path,
+    config: &Config,
+    normalizer: &UrlNormalizer,
+) -> Vec<ExternalCallCandidate> {
+    let mut rows: BTreeSet<ExternalCallCandidate> = BTreeSet::new();
+    for call in data_calls {
+        let Some((target, mechanism)) = classify_data_call(call, config, normalizer) else {
+            continue;
+        };
+        let Some(line) = call.line else {
+            continue;
+        };
+        // `file_location` packs the file and the line as `"{file}:{line}"`;
+        // only the file half is wanted here, because the line is carried
+        // typed. `parse_file_location` is the repo's existing unpacker, and is
+        // used rather than a second string split so this file half is the same
+        // one every other consumer of the location sees.
+        let (file, _) = parse_file_location(&call.file_location);
+        rows.insert(ExternalCallCandidate {
+            file: relative_location(&file, repo_root),
+            line: line as usize,
+            // No callee to name on an HTTP call; the method is the operation.
+            callee: call.method.to_uppercase(),
+            package: target,
+            mechanism,
+        });
+    }
+    cap(rows.into_iter().collect())
+}
+
+/// The mechanism and target for one already-classified consumer call, or `None`
+/// when the call is not declared external.
+fn classify_data_call(
+    call: &DataFetchingCall,
+    config: &Config,
+    normalizer: &UrlNormalizer,
+) -> Option<(String, CallMechanism)> {
+    // Host first: a literal absolute origin is never an env-var base, and the
+    // host is only retained for that shape.
+    if let Some(host) = &call.host {
+        return normalizer
+            .is_external_host(host)
+            .then(|| (host.clone(), CallMechanism::ExternalHttp));
+    }
+    // The env-var check runs on `canonical_path` — the key the matcher itself
+    // classifies on — so this row names the variable the matcher excluded the
+    // call for, not a differently-derived one.
+    if !Analyzer::is_env_var_base_url(&call.canonical_path) {
+        return None;
+    }
+    let env_var = Analyzer::extract_env_var_name(&call.canonical_path);
+    config
+        .is_external_env_var(&env_var)
+        .then_some((env_var, CallMechanism::EnvVarUrl))
+}
+
+/// Sort order is already fixed by the `BTreeSet` the rows arrive in; this
+/// applies the per-service cap, so a service over it yields a stable prefix
+/// rather than an arbitrary sample. The cap spans mechanisms, because the cap
+/// exists to bound the payload and the payload carries one list.
+fn cap(mut rows: Vec<ExternalCallCandidate>) -> Vec<ExternalCallCandidate> {
     if rows.len() > MAX_CANDIDATES_PER_SERVICE {
         warn!(
             "External call candidates truncated to {} of {} rows for this service",
@@ -129,6 +251,18 @@ pub fn scan_files(
         rows.truncate(MAX_CANDIDATES_PER_SERVICE);
     }
     rows
+}
+
+/// Merge the rows of both sources into the single list the payload carries.
+///
+/// Sorted and deduplicated as one set, then capped once, so the channel has one
+/// order and one bound whatever produced a given row.
+pub fn merge(
+    sdk_rows: Vec<ExternalCallCandidate>,
+    http_rows: Vec<ExternalCallCandidate>,
+) -> Vec<ExternalCallCandidate> {
+    let merged: BTreeSet<ExternalCallCandidate> = sdk_rows.into_iter().chain(http_rows).collect();
+    cap(merged.into_iter().collect())
 }
 
 /// Package names that count as external runtime dependencies of this service.
@@ -178,6 +312,23 @@ fn relative_path(file: &Path, repo_root: &Path) -> String {
             file.to_string_lossy().to_string()
         }
     }
+}
+
+/// Repo-relative file path for a projected HTTP row.
+///
+/// The mount graph keys `file_location` as the analysis scanned it: already
+/// repo-relative on the incremental path (the engine normalises the keys before
+/// rebuilding the graph) and as-scanned on the full path. Strip the scan root
+/// when it is present, and a leading `./` either way, so the two paths produce
+/// the same row for the same file — and so an HTTP row is comparable with an
+/// SDK row, which is relative by construction.
+fn relative_location(file: &str, repo_root: &Path) -> String {
+    let path = Path::new(file);
+    path.strip_prefix(repo_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .trim_start_matches("./")
+        .to_string()
 }
 
 /// Which declared dependency does this module specifier import from?
@@ -797,5 +948,251 @@ export function real() {
                 "mechanism": "sdk"
             })
         );
+    }
+
+    /// The HTTP-shaped mechanisms ride the row shape `sdk` shipped with — same
+    /// five keys, same casing — so one reader handles all three.
+    #[test]
+    fn http_mechanisms_serialize_in_the_same_row_shape() {
+        let row = ExternalCallCandidate {
+            file: "src/pay.ts".to_string(),
+            line: 12,
+            callee: "POST".to_string(),
+            package: "api.vendor.test".to_string(),
+            mechanism: CallMechanism::ExternalHttp,
+        };
+        assert_eq!(
+            serde_json::to_value(&row).unwrap(),
+            serde_json::json!({
+                "file": "src/pay.ts",
+                "line": 12,
+                "callee": "POST",
+                "package": "api.vendor.test",
+                "mechanism": "external_http"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ExternalCallCandidate {
+                mechanism: CallMechanism::EnvVarUrl,
+                package: "BILLING_API".to_string(),
+                ..row
+            })
+            .unwrap()["mechanism"],
+            serde_json::json!("env_var_url")
+        );
+    }
+
+    mod http_rows {
+        use super::*;
+        use crate::mount_graph::DataFetchingCall;
+
+        fn config() -> Config {
+            Config {
+                internal_domains: ["orders.internal.test".to_string()].into_iter().collect(),
+                external_domains: ["api.vendor.test".to_string()].into_iter().collect(),
+                internal_env_vars: ["ORDERS_URL".to_string()].into_iter().collect(),
+                external_env_vars: ["BILLING_API".to_string()].into_iter().collect(),
+                ..Config::default()
+            }
+        }
+
+        /// A consumer call as the mount-graph builder records one: the host and
+        /// the typed line are the fields it now retains from normalisation and
+        /// extraction.
+        fn call(target: &str, host: Option<&str>, line: Option<u32>) -> DataFetchingCall {
+            DataFetchingCall {
+                method: "get".to_string(),
+                target_url: target.to_string(),
+                canonical_path: target.to_string(),
+                client: "fetch(".to_string(),
+                file_location: format!("src/client.ts:{}", line.unwrap_or(1)),
+                call_kind: None,
+                repo_name: None,
+                service_name: None,
+                host: host.map(str::to_string),
+                line,
+            }
+        }
+
+        fn rows(calls: &[DataFetchingCall]) -> Vec<ExternalCallCandidate> {
+            let config = config();
+            from_data_calls(
+                calls,
+                Path::new("/repo"),
+                &config,
+                &crate::url_normalizer::UrlNormalizer::new(&config),
+            )
+        }
+
+        /// The domain and the line the scanner used to discard both reach the
+        /// row, and the HTTP method stands in for the callee.
+        #[test]
+        fn declared_external_host_becomes_a_row() {
+            assert_eq!(
+                rows(&[call(
+                    "https://api.vendor.test/v1/charges",
+                    Some("api.vendor.test"),
+                    Some(12)
+                )]),
+                vec![ExternalCallCandidate {
+                    file: "src/client.ts".to_string(),
+                    line: 12,
+                    callee: "GET".to_string(),
+                    package: "api.vendor.test".to_string(),
+                    mechanism: CallMechanism::ExternalHttp,
+                }]
+            );
+        }
+
+        /// A subdomain of a declared external domain is classified external by
+        /// the normalizer, and the row names the host as written, not the
+        /// declaration that matched it.
+        #[test]
+        fn subdomain_of_a_declared_host_keeps_its_own_name() {
+            let rows = rows(&[call(
+                "https://eu.api.vendor.test/v1/charges",
+                Some("eu.api.vendor.test"),
+                Some(3),
+            )]);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].package, "eu.api.vendor.test");
+        }
+
+        /// The env-var name reaches the row for a variable the repo declares
+        /// external — the pair the matcher drops on its way past the call.
+        #[test]
+        fn declared_external_env_var_becomes_a_row() {
+            assert_eq!(
+                rows(&[call("${process.env.BILLING_API}/invoices", None, Some(7))]),
+                vec![ExternalCallCandidate {
+                    file: "src/client.ts".to_string(),
+                    line: 7,
+                    callee: "GET".to_string(),
+                    package: "BILLING_API".to_string(),
+                    mechanism: CallMechanism::EnvVarUrl,
+                }]
+            );
+        }
+
+        /// The canonical `ENV_VAR:NAME:/path` shape resolves to the same row as
+        /// the raw interpolation.
+        #[test]
+        fn canonical_env_var_route_becomes_a_row() {
+            let rows = rows(&[call("ENV_VAR:BILLING_API:/invoices", None, Some(4))]);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].package, "BILLING_API");
+            assert_eq!(rows[0].mechanism, CallMechanism::EnvVarUrl);
+        }
+
+        /// An undeclared destination is the one thing the scanner does not
+        /// know. It stays out of the inventory rather than being guessed into
+        /// it; the unclassified env-var case is already reported as an
+        /// `EnvVarCall` finding, which this channel does not touch.
+        #[test]
+        fn undeclared_destinations_emit_nothing() {
+            assert_eq!(
+                rows(&[
+                    call(
+                        "https://api.unlisted.test/v1/x",
+                        Some("api.unlisted.test"),
+                        Some(2)
+                    ),
+                    call("${process.env.UNKNOWN_API}/x", None, Some(3)),
+                ]),
+                Vec::new()
+            );
+        }
+
+        /// An in-org destination is not egress: it is already in the endpoint
+        /// index as a call, and the inventory would double-count it.
+        #[test]
+        fn declared_internal_destinations_emit_nothing() {
+            assert_eq!(
+                rows(&[
+                    call(
+                        "https://orders.internal.test/orders",
+                        Some("orders.internal.test"),
+                        Some(2)
+                    ),
+                    call("${process.env.ORDERS_URL}/orders", None, Some(3)),
+                ]),
+                Vec::new()
+            );
+        }
+
+        /// A relative call has no destination to name at all.
+        #[test]
+        fn relative_call_emits_nothing() {
+            assert_eq!(rows(&[call("/api/orders", None, Some(9))]), Vec::new());
+        }
+
+        /// A row with no line cannot be audited, so it is dropped rather than
+        /// carried with a guessed location.
+        #[test]
+        fn call_without_a_line_emits_nothing() {
+            assert_eq!(
+                rows(&[call(
+                    "https://api.vendor.test/v1/charges",
+                    Some("api.vendor.test"),
+                    None
+                )]),
+                Vec::new()
+            );
+        }
+
+        /// The file half of `file_location` is repo-relative in the row
+        /// whichever analysis path recorded it — the incremental path
+        /// normalises its keys, the full path does not.
+        #[test]
+        fn absolute_scan_paths_are_relativized() {
+            let mut absolute = call(
+                "https://api.vendor.test/v1/charges",
+                Some("api.vendor.test"),
+                Some(5),
+            );
+            absolute.file_location = "/repo/src/client.ts:5".to_string();
+            assert_eq!(rows(&[absolute])[0].file, "src/client.ts");
+        }
+
+        /// Two calls to the same host on the same line collapse; the same host
+        /// on different lines does not.
+        #[test]
+        fn rows_are_deduplicated_and_sorted() {
+            let hit = call(
+                "https://api.vendor.test/v1/charges",
+                Some("api.vendor.test"),
+                Some(12),
+            );
+            let mut earlier = hit.clone();
+            earlier.line = Some(4);
+            earlier.file_location = "src/client.ts:4".to_string();
+            let rows = rows(&[hit.clone(), earlier, hit]);
+            assert_eq!(
+                rows.iter().map(|row| row.line).collect::<Vec<_>>(),
+                vec![4, 12]
+            );
+        }
+
+        /// The merged list is one sorted, deduplicated set, so the payload has
+        /// a single order whatever produced a given row.
+        #[test]
+        fn merge_sorts_both_sources_as_one_set() {
+            let sdk = ExternalCallCandidate {
+                file: "src/client.ts".to_string(),
+                line: 20,
+                callee: "ledger.charge".to_string(),
+                package: "ledger-client".to_string(),
+                mechanism: CallMechanism::Sdk,
+            };
+            let http = ExternalCallCandidate {
+                file: "src/client.ts".to_string(),
+                line: 12,
+                callee: "GET".to_string(),
+                package: "api.vendor.test".to_string(),
+                mechanism: CallMechanism::ExternalHttp,
+            };
+            let merged = merge(vec![sdk.clone(), sdk.clone()], vec![http.clone()]);
+            assert_eq!(merged, vec![http, sdk]);
+        }
     }
 }

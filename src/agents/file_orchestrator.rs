@@ -4254,6 +4254,12 @@ impl FileOrchestrator {
                         call_kind: data_call.call_kind,
                         repo_name: None,
                         service_name: None,
+                        // Retention only. Normalisation computes the host and
+                        // the extractor reports the line; both were previously
+                        // thrown away (the line survived as packed text inside
+                        // `file_location`). Neither field is read by matching.
+                        host: normalizer.absolute_host(&data_call.target),
+                        line: u32::try_from(data_call.line_number).ok().filter(|l| *l > 0),
                     },
                     data_call.call_expression_span_start.is_some(),
                 ));
@@ -5792,6 +5798,66 @@ export * from "./aFetch.js";"#,
             "https://api.example.com/data"
         );
         assert_eq!(graph.data_calls[0].method, "POST");
+    }
+
+    /// The host normalisation computes and the line extraction reports are both
+    /// retained on the call, and `file_location` keeps the exact text it
+    /// always had.
+    ///
+    /// The host is retained WITHOUT classification: `api.vendor.test` is
+    /// declared external here and `orders.internal.test` internal, and both
+    /// keep their host. What the declarations decide is matching, which this
+    /// retention does not touch.
+    #[test]
+    fn data_calls_retain_the_host_and_a_typed_line() {
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let config = crate::config::Config {
+            internal_domains: ["orders.internal.test".to_string()].into_iter().collect(),
+            external_domains: ["api.vendor.test".to_string()].into_iter().collect(),
+            external_env_vars: ["BILLING_API".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/service.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![
+                    call_with_span(12, "https://api.vendor.test/v1/charges", Some(200)),
+                    call_with_span(18, "https://orders.internal.test/orders", Some(210)),
+                    call_with_span(24, "${process.env.BILLING_API}/invoices", Some(220)),
+                    call_with_span(31, "/api/local", Some(230)),
+                ],
+                graphql_operations: vec![],
+                pubsub_operations: vec![],
+            },
+        );
+
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::new(&config),
+            Path::new(""),
+        );
+
+        let mut retained: Vec<(Option<&str>, Option<u32>, &str)> = graph
+            .data_calls
+            .iter()
+            .map(|call| (call.host.as_deref(), call.line, call.file_location.as_str()))
+            .collect();
+        retained.sort();
+        assert_eq!(
+            retained,
+            vec![
+                (None, Some(24), "src/service.ts:24"),
+                (None, Some(31), "src/service.ts:31"),
+                (Some("api.vendor.test"), Some(12), "src/service.ts:12"),
+                (Some("orders.internal.test"), Some(18), "src/service.ts:18"),
+            ],
+            "an env-var base and a relative path have no literal host to retain"
+        );
     }
 
     /// A data call as the fifth pass sees it. `span` carries the

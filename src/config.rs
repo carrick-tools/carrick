@@ -124,13 +124,24 @@ impl Config {
             .any(|domain| route.starts_with(domain))
     }
 
+    /// True when `env_var` is declared in `externalEnvVars`.
+    ///
+    /// The same set [`Self::is_external_call`] consults for an
+    /// `ENV_VAR:<name>:<path>` route, exposed by name so a caller already
+    /// holding the variable name does not rebuild the route to ask. Keeping one
+    /// implementation matters: a second copy of the membership test is how the
+    /// egress channel would come to name a variable the matcher classifies
+    /// differently.
+    pub fn is_external_env_var(&self, env_var: &str) -> bool {
+        self.external_env_vars.contains(env_var)
+    }
+
     pub fn is_external_call(&self, route: &str) -> bool {
         // Check if route starts with any external env var
         if route.starts_with("ENV_VAR:") {
             let parts: Vec<&str> = route.split(':').collect();
             if parts.len() >= 2 {
-                let env_var = parts[1];
-                return self.external_env_vars.iter().any(|var| var == env_var);
+                return self.is_external_env_var(parts[1]);
             }
         }
 
