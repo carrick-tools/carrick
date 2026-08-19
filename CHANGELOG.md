@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.11](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.10...carrick-v0.3.11) (2026-08-19)
+
+
+### Features
+
+* **scanner:** deterministic SDK-mediated external call candidates ([#511](https://github.com/carrick-tools/carrick/issues/511)) ([ce2271b](https://github.com/carrick-tools/carrick/commit/ce2271bc979175dd894af6d1bc7fb0ac84643d3a)), closes [#510](https://github.com/carrick-tools/carrick/issues/510)
+* **scanner:** retain egress domains, call lines, and env-var call sites ([#514](https://github.com/carrick-tools/carrick/issues/514)) ([0b10430](https://github.com/carrick-tools/carrick/commit/0b104308abfd955e0cc72d9451edd79f32e59853))
+
 ## [0.3.10](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.9...carrick-v0.3.10) (2026-08-10)
 
 
