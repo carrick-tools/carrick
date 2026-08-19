@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.12](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.11...carrick-v0.3.12) (2026-08-19)
+
+
+### Features
+
+* **scanner:** resolve external-call candidates through workspace wrappers ([#510](https://github.com/carrick-tools/carrick/issues/510)) ([#515](https://github.com/carrick-tools/carrick/issues/515)) ([10c1729](https://github.com/carrick-tools/carrick/commit/10c172960477426ddea744ca0d776c7a25e3b48e))
+
 ## [0.3.11](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.10...carrick-v0.3.11) (2026-08-19)
 
 
