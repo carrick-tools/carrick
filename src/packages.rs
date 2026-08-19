@@ -18,6 +18,15 @@ pub struct PackageJson {
     #[serde(default)]
     #[serde(rename = "peerDependencies")]
     pub peer_dependencies: HashMap<String, String>,
+    /// npm `optionalDependencies`. Deliberately NOT folded into
+    /// [`Packages::resolve_dependencies`]: `merged_dependencies` drives the
+    /// cloud dependency list and the synthetic type-check install, and an
+    /// optional dependency is by definition allowed to be absent there. It is
+    /// read only where "could this package be present at runtime?" is the
+    /// question — see `crate::external_call_candidates`.
+    #[serde(default)]
+    #[serde(rename = "optionalDependencies")]
+    pub optional_dependencies: HashMap<String, String>,
     /// yarn/pnpm `resolutions` (version-override map). Keys may be plain names
     /// or `name@range` selectors; values may be `npm:<real-name>@<range>`
     /// aliases that remap a locally-invented dependency name (e.g. MetaMask's

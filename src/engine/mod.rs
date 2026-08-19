@@ -1154,6 +1154,7 @@ async fn analyze_current_repo_incremental(
                 &protocol_extractions,
                 &merged_results,
             );
+            attach_external_call_candidates(&mut cloud_data, repo_path, &files, packages);
 
             // Populate cache fields
             let mut cached_file_results = merged_results.clone();
@@ -2171,6 +2172,38 @@ fn relativize_function_definition_paths(
     }
 }
 
+/// Run the deterministic external-call candidate scan and attach its rows to
+/// the payload (carrick#510).
+///
+/// Called on both analysis paths and deliberately outside the incremental
+/// cache: the scan is pure AST over the service's already-discovered file list,
+/// costs nothing, and `files` is always the full set on both paths, so a cached
+/// run and a full run produce the same rows.
+///
+/// `None` rather than an empty vector when there is nothing to report, so the
+/// cloud can tell "no candidates" apart from "scanned before this channel
+/// existed".
+fn attach_external_call_candidates(
+    cloud_data: &mut CloudRepoData,
+    repo_path: &str,
+    files: &[PathBuf],
+    packages: &Packages,
+) {
+    let candidates = crate::external_call_candidates::scan_files(
+        files,
+        std::path::Path::new(repo_path),
+        packages,
+    );
+    debug!(
+        "External call candidates: {} row(s) for {}",
+        candidates.len(),
+        cloud_data.repo_name
+    );
+    if !candidates.is_empty() {
+        cloud_data.external_call_candidates = Some(candidates);
+    }
+}
+
 fn build_cloud_data_from_mount_graph(
     repo_name: &str,
     repo_path: &str,
@@ -2240,6 +2273,7 @@ fn build_cloud_data_from_mount_graph(
         type_extraction_status: None,
         compat_verdicts: None,
         capture_stub: None,
+        external_call_candidates: None,
     }
 }
 
@@ -3178,6 +3212,7 @@ async fn analyze_current_repo(
         &protocol_extractions,
         &analysis_result.file_results,
     );
+    attach_external_call_candidates(&mut cloud_data, repo_path, &files, packages);
 
     let mut manifest_entries =
         build_type_manifest_entries(&analysis_result.mount_graph, config, repo_path);
@@ -3557,6 +3592,7 @@ mod tests {
             type_extraction_status: None,
             compat_verdicts: None,
             capture_stub: None,
+            external_call_candidates: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -3599,6 +3635,7 @@ mod tests {
             type_extraction_status: None,
             compat_verdicts: None,
             capture_stub: None,
+            external_call_candidates: None,
         }];
 
         // Test Config merging
@@ -3678,6 +3715,7 @@ mod tests {
             type_extraction_status: None,
             compat_verdicts: None,
             capture_stub: None,
+            external_call_candidates: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -4271,6 +4309,7 @@ mod tests {
             type_extraction_status: None,
             compat_verdicts: None,
             capture_stub: None,
+            external_call_candidates: None,
         };
 
         let stripped = strip_ast_nodes(data);
@@ -4316,6 +4355,7 @@ mod tests {
             type_extraction_status: None,
             compat_verdicts: None,
             capture_stub: None,
+            external_call_candidates: None,
         };
 
         let stripped = strip_ast_nodes(data);
@@ -4364,6 +4404,7 @@ mod tests {
             type_extraction_status: None,
             compat_verdicts: None,
             capture_stub: None,
+            external_call_candidates: None,
         };
 
         // Size the file_results filler so the payload lands just UNDER the 5MB
@@ -4575,6 +4616,7 @@ mod tests {
             type_extraction_status: None,
             compat_verdicts: None,
             capture_stub: None,
+            external_call_candidates: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -4595,6 +4637,68 @@ mod tests {
             deserialized.package_json_hash,
             Some("abc123hash".to_string())
         );
+    }
+
+    /// The deterministic candidate scan reaches the payload, and it reaches it
+    /// as its own channel: endpoints and calls are untouched, so SDK rows can
+    /// never leak into HTTP endpoint matching.
+    #[test]
+    fn attach_external_call_candidates_populates_only_the_new_field() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/external-call-candidates");
+        let fixture_str = fixture.to_string_lossy().to_string();
+        let service = Config {
+            directory: Some("apps/api".to_string()),
+            ..Default::default()
+        };
+        let ignore_patterns = service_ignore_patterns(&service);
+        let (files, package_json) =
+            crate::file_finder::find_service_files(&fixture_str, &service, &ignore_patterns);
+        let mut packages = Packages::new(package_json.into_iter().collect()).expect("packages");
+        packages.internal_names = crate::packages::collect_internal_package_names(&fixture);
+
+        let mut data = CloudRepoData {
+            repo_name: "svc".to_string(),
+            service_name: None,
+            endpoints: vec![],
+            calls: vec![],
+            mounts: vec![],
+            apps: HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: HashMap::new(),
+            config_json: None,
+            package_json: None,
+            packages: None,
+            last_updated: chrono::Utc::now(),
+            commit_hash: "abc123".to_string(),
+            mount_graph: None,
+            bundled_types: None,
+            type_manifest: None,
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            cached_extraction_config: None,
+            package_json_hash: None,
+            cache_version: None,
+            type_extraction_status: None,
+            compat_verdicts: None,
+            capture_stub: None,
+            external_call_candidates: None,
+        };
+
+        attach_external_call_candidates(&mut data, &fixture_str, &files, &packages);
+
+        let rows = data
+            .external_call_candidates
+            .as_ref()
+            .expect("fixture yields candidates");
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .all(|row| row.mechanism == crate::external_call_candidates::CallMechanism::Sdk)
+        );
+        assert!(data.endpoints.is_empty(), "endpoints must not be touched");
+        assert!(data.calls.is_empty(), "calls must not be touched");
     }
 
     #[test]
@@ -4649,6 +4753,7 @@ mod tests {
             type_extraction_status: None,
             compat_verdicts: None,
             capture_stub: None,
+            external_call_candidates: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -6951,6 +7056,7 @@ mod tests {
             type_extraction_status: None,
             compat_verdicts: None,
             capture_stub: None,
+            external_call_candidates: None,
         }
     }
 }

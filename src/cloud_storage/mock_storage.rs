@@ -114,6 +114,7 @@ impl CloudStorage for MockStorage {
                     type_extraction_status: None,
                     compat_verdicts: None,
                     capture_stub: None,
+                    external_call_candidates: None,
                 },
                 CloudRepoData {
                     repo_name: "repo-b".to_string(),
@@ -141,6 +142,7 @@ impl CloudStorage for MockStorage {
                     type_extraction_status: None,
                     compat_verdicts: None,
                     capture_stub: None,
+                    external_call_candidates: None,
                 },
             ];
             result.extend(mock_repos);
@@ -183,6 +185,7 @@ impl MockStorage {
             dependencies,
             dev_dependencies: HashMap::new(),
             peer_dependencies: HashMap::new(),
+            optional_dependencies: HashMap::new(),
             resolutions: HashMap::new(),
         };
 
@@ -211,6 +214,7 @@ impl MockStorage {
             dependencies,
             dev_dependencies: HashMap::new(),
             peer_dependencies: HashMap::new(),
+            optional_dependencies: HashMap::new(),
             resolutions: HashMap::new(),
         };
 

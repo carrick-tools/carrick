@@ -1156,6 +1156,7 @@ mod tests {
             type_extraction_status: None,
             compat_verdicts: None,
             capture_stub,
+            external_call_candidates: None,
         }
     }
 
