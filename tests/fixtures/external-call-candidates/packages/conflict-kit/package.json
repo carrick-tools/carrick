@@ -1,0 +1,9 @@
+{
+  "name": "@fixture/conflict-kit",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "ledger-client": "^2.0.0",
+    "vault-blob": "^1.0.0"
+  }
+}

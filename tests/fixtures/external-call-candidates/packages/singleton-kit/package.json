@@ -1,0 +1,8 @@
+{
+  "name": "@fixture/singleton-kit",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "pulse-analytics": "^2.0.0"
+  }
+}

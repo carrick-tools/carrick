@@ -32,3 +32,4 @@ pub mod type_manifest;
 pub mod url_normalizer;
 pub mod utils;
 pub mod visitor;
+pub mod workspace_resolver;

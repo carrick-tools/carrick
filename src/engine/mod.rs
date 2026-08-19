@@ -1154,7 +1154,7 @@ async fn analyze_current_repo_incremental(
                 &protocol_extractions,
                 &merged_results,
             );
-            attach_external_call_candidates(&mut cloud_data, repo_path, &files, packages, config);
+            attach_external_call_candidates(&mut cloud_data, repo_path, &files, config);
 
             // Populate cache fields
             let mut cached_file_results = merged_results.clone();
@@ -2181,9 +2181,15 @@ fn relativize_function_definition_paths(
 /// same set of calls.
 ///
 /// Called on both analysis paths and deliberately outside the incremental
-/// cache: the SDK scan is pure AST over the service's already-discovered file
-/// list, costs nothing, and `files` is always the full set on both paths, so a
-/// cached run and a full run produce the same rows.
+/// cache: the SDK scan is pure AST over the tree on disk, and `files` is always
+/// the full service file list on both paths, so a cached run and a full run
+/// produce the same rows.
+///
+/// The dependency set the SDK scan resolves against comes from every manifest
+/// in the repo rather than from `packages`, which is scoped to this service's
+/// own `package.json` — in a monorepo the manifest declaring a vendor client is
+/// usually the shared package holding the wrapper, not the service shipping the
+/// call.
 ///
 /// `None` rather than an empty vector when there is nothing to report, so the
 /// cloud can tell "no candidates" apart from "scanned before this channel
@@ -2192,11 +2198,10 @@ fn attach_external_call_candidates(
     cloud_data: &mut CloudRepoData,
     repo_path: &str,
     files: &[PathBuf],
-    packages: &Packages,
     config: &Config,
 ) {
     let repo_root = std::path::Path::new(repo_path);
-    let sdk_rows = crate::external_call_candidates::scan_files(files, repo_root, packages);
+    let sdk_rows = crate::external_call_candidates::scan_workspace(files, repo_root);
     let normalizer = UrlNormalizer::new(config);
     let http_rows = cloud_data
         .mount_graph
@@ -3230,7 +3235,7 @@ async fn analyze_current_repo(
         &protocol_extractions,
         &analysis_result.file_results,
     );
-    attach_external_call_candidates(&mut cloud_data, repo_path, &files, packages, config);
+    attach_external_call_candidates(&mut cloud_data, repo_path, &files, config);
 
     let mut manifest_entries =
         build_type_manifest_entries(&analysis_result.mount_graph, config, repo_path);
@@ -4708,7 +4713,7 @@ mod tests {
             external_call_candidates: None,
         };
 
-        attach_external_call_candidates(&mut data, &fixture_str, &files, &packages, &service);
+        attach_external_call_candidates(&mut data, &fixture_str, &files, &service);
 
         let rows = data
             .external_call_candidates
@@ -4802,7 +4807,7 @@ mod tests {
             external_call_candidates: None,
         };
 
-        attach_external_call_candidates(&mut data, &fixture_str, &files, &packages, &service);
+        attach_external_call_candidates(&mut data, &fixture_str, &files, &service);
 
         let rows = data.external_call_candidates.expect("rows");
         assert!(
