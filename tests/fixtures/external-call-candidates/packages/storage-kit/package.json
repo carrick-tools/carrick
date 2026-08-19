@@ -1,0 +1,9 @@
+{
+  "name": "@fixture/storage-kit",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "beacon-metrics": "^3.0.0",
+    "vault-blob": "^1.0.0"
+  }
+}

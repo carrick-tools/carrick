@@ -1,0 +1,8 @@
+{
+  "name": "@fixture/crawl-kit",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "crawler-kit": "^2.0.0"
+  }
+}

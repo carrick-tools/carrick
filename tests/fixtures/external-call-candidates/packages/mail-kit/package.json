@@ -1,0 +1,8 @@
+{
+  "name": "@fixture/mail-kit",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "postbox-mailer": "^5.0.0"
+  }
+}

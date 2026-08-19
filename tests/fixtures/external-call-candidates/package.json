@@ -2,5 +2,11 @@
   "name": "@fixture/egress-root",
   "version": "0.0.0",
   "private": true,
-  "workspaces": ["apps/*", "packages/*"]
+  "workspaces": ["apps/*", "packages/*"],
+  "dependencies": {
+    "pdf-toolkit": "^0.4.1"
+  },
+  "devDependencies": {
+    "bench-harness": "^1.0.0"
+  }
 }
