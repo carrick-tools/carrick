@@ -1,0 +1,19 @@
+{
+  "name": "@fixture/api",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/internal-lib": "workspace:*",
+    "courier-sdk": "^1.0.0",
+    "ledger-client": "^2.0.0"
+  },
+  "devDependencies": {
+    "bench-harness": "^1.0.0"
+  },
+  "peerDependencies": {
+    "telemetry-sink": "^3.0.0"
+  },
+  "optionalDependencies": {
+    "storage-uplink": "^4.0.0"
+  }
+}

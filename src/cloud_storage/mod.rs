@@ -2,6 +2,7 @@ use crate::{
     agents::{file_analyzer_agent::FileAnalysisResult, framework_guidance_agent::ProtocolGuidance},
     analyzer::ApiEndpointDetails,
     app_context::AppContext,
+    external_call_candidates::ExternalCallCandidate,
     framework_detector::DetectionResult,
     mount_graph::MountGraph,
     multi_agent_orchestrator::MultiAgentAnalysisResult,
@@ -211,6 +212,18 @@ pub struct CloudRepoData {
     /// pairs verdict unverifiable with a re-scan reason, never compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_stub: Option<CaptureStubArtifact>,
+    /// Deterministic, AST-only outbound call candidates for this service
+    /// (carrick#510). A parallel data channel, not part of the operation
+    /// index: these rows are never projected into `endpoints` or `calls`, and
+    /// nothing in matching or type compatibility reads them. The downstream
+    /// consumer is an egress-inventory surface that enumerates where a service
+    /// talks to something it does not own.
+    ///
+    /// Additive and optional: blobs scanned before the field existed carry
+    /// `None`, which reads as "this scan predates the channel", not as "this
+    /// service makes no external calls".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_call_candidates: Option<Vec<ExternalCallCandidate>>,
 }
 
 /// Version of the v2 capture stub artifact schema. Bumped on incompatible
@@ -367,6 +380,7 @@ impl CloudRepoData {
             type_extraction_status: None,
             compat_verdicts: None,
             capture_stub: None,
+            external_call_candidates: None,
         }
     }
 }
@@ -687,6 +701,7 @@ mod tests {
             type_extraction_status: None,
             compat_verdicts: None,
             capture_stub: None,
+            external_call_candidates: None,
         }
     }
 
