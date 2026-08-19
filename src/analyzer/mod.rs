@@ -1175,7 +1175,7 @@ impl Analyzer {
     /// - "${process.env.SERVICE_URL}/orders" -> "SERVICE_URL"
     /// - "${API_BASE}/users" -> "API_BASE"
     /// - "unknown" -> "UNKNOWN_API"
-    fn extract_env_var_name(route: &str) -> String {
+    pub(crate) fn extract_env_var_name(route: &str) -> String {
         // Handle ENV_VAR:NAME:/path format
         if route.starts_with("ENV_VAR:") {
             let parts: Vec<&str> = route.splitn(3, ':').collect();
@@ -1234,7 +1234,7 @@ impl Analyzer {
     /// - "/users/${userId}" (path parameter, not base URL)
     /// - "/api/${version}/data" (path parameter in middle)
     /// - "${userId}" (whole-URL opaque variable — no path to classify)
-    fn is_env_var_base_url(route: &str) -> bool {
+    pub(crate) fn is_env_var_base_url(route: &str) -> bool {
         // Check for explicit ENV_VAR: prefix format
         if route.starts_with("ENV_VAR:") {
             return true;
@@ -3532,6 +3532,71 @@ mod tests {
         )));
     }
 
+    /// Pin on the classification the egress channel reads (carrick#510).
+    ///
+    /// A call through a base declared in `externalEnvVars` is excluded from
+    /// matching and reported as nothing at all: no missing endpoint, no
+    /// env-var finding. An undeclared base still becomes an `EnvVarCall`.
+    /// The channel records the excluded call elsewhere; if that recording ever
+    /// starts changing this behaviour, this test is what fails.
+    #[test]
+    fn external_env_var_calls_stay_excluded_and_silent() {
+        let config = Config {
+            external_env_vars: ["BILLING_API".to_string()].into_iter().collect(),
+            ..Config::default()
+        };
+        let mut analyzer = Analyzer::new(config);
+        for route in [
+            "ENV_VAR:BILLING_API:/invoices",
+            "ENV_VAR:UNKNOWN_API:/posts",
+        ] {
+            analyzer.calls.push(ApiEndpointDetails {
+                owner: None,
+                key: OperationKey::http("GET", route),
+                params: vec![],
+                request_body: None,
+                response_body: None,
+                handler_name: None,
+                request_type: None,
+                response_type: None,
+                file_path: PathBuf::from("src/client.ts"),
+                repo_name: None,
+                service_name: None,
+                provenance: Default::default(),
+            });
+        }
+
+        let (findings, verified, cross_repo_matches) =
+            analyzer.analyze_matches_with_mount_graph(&MountGraph::new());
+
+        assert!(
+            !findings.iter().any(|f| matches!(
+                f,
+                Finding::EnvVarCall { env_var, .. } if env_var == "BILLING_API"
+            )),
+            "a declared-external base is not an env-var finding: {:?}",
+            findings
+        );
+        assert!(
+            !findings.iter().any(|f| matches!(
+                f,
+                Finding::MissingEndpoint { path, .. } if path == "/invoices"
+            )),
+            "a declared-external base is not a missing endpoint: {:?}",
+            findings
+        );
+        assert!(
+            findings.iter().any(|f| matches!(
+                f,
+                Finding::EnvVarCall { env_var, .. } if env_var == "UNKNOWN_API"
+            )),
+            "an undeclared base still reports: {:?}",
+            findings
+        );
+        assert!(verified.is_empty());
+        assert!(cross_repo_matches.is_empty());
+    }
+
     /// A consumer call whose path exists in the index under a different verb
     /// must surface exactly once, as a method-mismatch risk — not as a
     /// missing-endpoint + orphaned-endpoint pair.
@@ -3700,6 +3765,8 @@ mod tests {
             call_kind: None,
             repo_name: Some("consumer-repo".to_string()),
             service_name: None,
+            host: None,
+            line: None,
         });
 
         let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -3803,6 +3870,8 @@ mod tests {
             call_kind: None,
             repo_name: Some("repo-beta".to_string()),
             service_name: None,
+            host: None,
+            line: None,
         });
         analyzer
             .calls
@@ -3875,6 +3944,8 @@ mod tests {
             call_kind: None,
             repo_name: Some("repo-beta".to_string()),
             service_name: None,
+            host: None,
+            line: None,
         });
         analyzer
             .calls
@@ -3930,6 +4001,8 @@ mod tests {
             call_kind: None,
             repo_name: Some("repo-alpha".to_string()),
             service_name: None,
+            host: None,
+            line: None,
         });
         analyzer.calls.push(http_call(
             "POST",
@@ -5010,6 +5083,8 @@ mod tests {
             call_kind: None,
             repo_name: Some(repo.to_string()),
             service_name: None,
+            host: None,
+            line: None,
         }
     }
 

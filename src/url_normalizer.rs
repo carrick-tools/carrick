@@ -420,8 +420,35 @@ impl UrlNormalizer {
     }
 
     /// Check if a host is configured as external
-    fn is_external_host(&self, host: &str) -> bool {
+    pub fn is_external_host(&self, host: &str) -> bool {
         Self::host_matches_domains(host, &self.external_domains)
+    }
+
+    /// The literal hostname a target carries when it is written as an absolute
+    /// URL, or `None` when it carries none.
+    ///
+    /// [`Self::normalize`] already computes this on its way to a comparable
+    /// path and drops it with the rest of the `NormalizedUrl`. This exposes it
+    /// so a caller can retain the host without re-implementing the parse.
+    ///
+    /// Only the absolute (`scheme://host`) and protocol-relative (`//host`)
+    /// shapes have a literal host. For an `ENV_VAR:`, `process.env`, or
+    /// template-literal base, `NormalizedUrl::stripped_host` holds the variable
+    /// expression that stood in for the origin (`${API_URL}`,
+    /// `process.env.API_URL`) rather than a hostname, so those return `None` —
+    /// an interpolated origin (`https://${host}/v1`) does too, for the same
+    /// reason.
+    pub fn absolute_host(&self, url: &str) -> Option<String> {
+        let trimmed = url.trim_matches(|c| c == '`' || c == '"' || c == '\'');
+        if !(trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || trimmed.starts_with("//"))
+        {
+            return None;
+        }
+        self.normalize(url)
+            .stripped_host
+            .filter(|host| !host.is_empty() && !host.contains('$') && !host.contains('{'))
     }
 
     /// True if `host` exactly equals, or is a subdomain of, one of `domains`.
@@ -1282,5 +1309,65 @@ mod tests {
         let unknown_result = normalizer.normalize("https://unknown-service.local/api/data");
         assert!(!unknown_result.is_internal);
         assert!(!unknown_result.is_external);
+    }
+
+    /// `absolute_host` retains a hostname and nothing else. Every shape whose
+    /// `stripped_host` is a variable expression standing in for the origin
+    /// returns `None`, so a caller retaining the host never records
+    /// `${API_URL}` as a domain.
+    #[test]
+    fn absolute_host_retains_only_literal_hosts() {
+        let config = create_test_config();
+        let normalizer = UrlNormalizer::new(&config);
+
+        assert_eq!(
+            normalizer.absolute_host("https://api.stripe.com/v1/charges"),
+            Some("api.stripe.com".to_string())
+        );
+        assert_eq!(
+            normalizer.absolute_host("http://localhost:4002/orders"),
+            Some("localhost:4002".to_string()),
+            "the port is part of the host the normalizer strips"
+        );
+        assert_eq!(
+            normalizer.absolute_host("//cdn.example.com/asset.js"),
+            Some("cdn.example.com".to_string()),
+            "a protocol-relative origin is still a literal host"
+        );
+        assert_eq!(
+            normalizer.absolute_host("`https://api.github.com/repos`"),
+            Some("api.github.com".to_string()),
+            "extraction can hand back the source quoting"
+        );
+
+        for no_host in [
+            "/api/orders",
+            "ENV_VAR:STRIPE_API:/v1/charges",
+            "${process.env.STRIPE_API}/v1/charges",
+            "${API_URL}/users",
+            "https://${host}/v1/charges",
+        ] {
+            assert_eq!(
+                normalizer.absolute_host(no_host),
+                None,
+                "{} carries no literal host",
+                no_host
+            );
+        }
+    }
+
+    /// Retention is not classification: an undeclared host is retained exactly
+    /// like a declared one.
+    #[test]
+    fn absolute_host_ignores_domain_classification() {
+        let config = create_test_config();
+        let normalizer = UrlNormalizer::new(&config);
+
+        assert_eq!(
+            normalizer.absolute_host("https://unknown-service.local/api/data"),
+            Some("unknown-service.local".to_string())
+        );
+        assert!(!normalizer.is_external_host("unknown-service.local"));
+        assert!(normalizer.is_external_host("api.stripe.com"));
     }
 }

@@ -1154,7 +1154,7 @@ async fn analyze_current_repo_incremental(
                 &protocol_extractions,
                 &merged_results,
             );
-            attach_external_call_candidates(&mut cloud_data, repo_path, &files, packages);
+            attach_external_call_candidates(&mut cloud_data, repo_path, &files, packages, config);
 
             // Populate cache fields
             let mut cached_file_results = merged_results.clone();
@@ -2172,13 +2172,18 @@ fn relativize_function_definition_paths(
     }
 }
 
-/// Run the deterministic external-call candidate scan and attach its rows to
-/// the payload (carrick#510).
+/// Attach the service's outbound-call candidates to the payload (carrick#510).
+///
+/// Two sources, one list: the deterministic SDK scan over the service's files,
+/// and the declared-external HTTP calls projected out of the mount graph the
+/// payload already carries. Reading the graph back off `cloud_data` rather than
+/// taking it as an argument keeps the rows and the uploaded graph provably the
+/// same set of calls.
 ///
 /// Called on both analysis paths and deliberately outside the incremental
-/// cache: the scan is pure AST over the service's already-discovered file list,
-/// costs nothing, and `files` is always the full set on both paths, so a cached
-/// run and a full run produce the same rows.
+/// cache: the SDK scan is pure AST over the service's already-discovered file
+/// list, costs nothing, and `files` is always the full set on both paths, so a
+/// cached run and a full run produce the same rows.
 ///
 /// `None` rather than an empty vector when there is nothing to report, so the
 /// cloud can tell "no candidates" apart from "scanned before this channel
@@ -2188,17 +2193,30 @@ fn attach_external_call_candidates(
     repo_path: &str,
     files: &[PathBuf],
     packages: &Packages,
+    config: &Config,
 ) {
-    let candidates = crate::external_call_candidates::scan_files(
-        files,
-        std::path::Path::new(repo_path),
-        packages,
-    );
+    let repo_root = std::path::Path::new(repo_path);
+    let sdk_rows = crate::external_call_candidates::scan_files(files, repo_root, packages);
+    let normalizer = UrlNormalizer::new(config);
+    let http_rows = cloud_data
+        .mount_graph
+        .as_ref()
+        .map(|graph| {
+            crate::external_call_candidates::from_data_calls(
+                &graph.data_calls,
+                repo_root,
+                config,
+                &normalizer,
+            )
+        })
+        .unwrap_or_default();
     debug!(
-        "External call candidates: {} row(s) for {}",
-        candidates.len(),
+        "External call candidates: {} sdk + {} http row(s) for {}",
+        sdk_rows.len(),
+        http_rows.len(),
         cloud_data.repo_name
     );
+    let candidates = crate::external_call_candidates::merge(sdk_rows, http_rows);
     if !candidates.is_empty() {
         cloud_data.external_call_candidates = Some(candidates);
     }
@@ -3212,7 +3230,7 @@ async fn analyze_current_repo(
         &protocol_extractions,
         &analysis_result.file_results,
     );
-    attach_external_call_candidates(&mut cloud_data, repo_path, &files, packages);
+    attach_external_call_candidates(&mut cloud_data, repo_path, &files, packages, config);
 
     let mut manifest_entries =
         build_type_manifest_entries(&analysis_result.mount_graph, config, repo_path);
@@ -3819,6 +3837,8 @@ mod tests {
                 call_kind: None,
                 repo_name: None,
                 service_name: None,
+                host: None,
+                line: None,
             }
         };
         let mut mount_graph = MountGraph::new();
@@ -3953,6 +3973,8 @@ mod tests {
             call_kind: None,
             repo_name: None,
             service_name: None,
+            host: None,
+            line: None,
         }];
 
         let entries = build_type_manifest_entries(&mount_graph, &config, ".");
@@ -4686,7 +4708,7 @@ mod tests {
             external_call_candidates: None,
         };
 
-        attach_external_call_candidates(&mut data, &fixture_str, &files, &packages);
+        attach_external_call_candidates(&mut data, &fixture_str, &files, &packages, &service);
 
         let rows = data
             .external_call_candidates
@@ -4699,6 +4721,132 @@ mod tests {
         );
         assert!(data.endpoints.is_empty(), "endpoints must not be touched");
         assert!(data.calls.is_empty(), "calls must not be touched");
+    }
+
+    /// Both sources reach the payload as one list, and the HTTP rows come from
+    /// the mount graph the payload itself carries — the same calls the index
+    /// records, not a second traversal that could disagree with it.
+    #[test]
+    fn attach_external_call_candidates_merges_sdk_and_http_rows() {
+        use crate::external_call_candidates::CallMechanism;
+
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/external-call-candidates");
+        let fixture_str = fixture.to_string_lossy().to_string();
+        let service = Config {
+            directory: Some("apps/api".to_string()),
+            external_domains: ["api.vendor.test".to_string()].into_iter().collect(),
+            external_env_vars: ["BILLING_API".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let ignore_patterns = service_ignore_patterns(&service);
+        let (files, package_json) =
+            crate::file_finder::find_service_files(&fixture_str, &service, &ignore_patterns);
+        let mut packages = Packages::new(package_json.into_iter().collect()).expect("packages");
+        packages.internal_names = crate::packages::collect_internal_package_names(&fixture);
+
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.data_calls = vec![
+            crate::mount_graph::DataFetchingCall {
+                method: "POST".to_string(),
+                target_url: "https://api.vendor.test/v1/charges".to_string(),
+                canonical_path: "/v1/charges".to_string(),
+                client: "fetch(".to_string(),
+                file_location: format!("{}/apps/api/src/pay.ts:12", fixture_str),
+                call_kind: None,
+                repo_name: None,
+                service_name: None,
+                host: Some("api.vendor.test".to_string()),
+                line: Some(12),
+            },
+            crate::mount_graph::DataFetchingCall {
+                method: "GET".to_string(),
+                target_url: "${process.env.BILLING_API}/invoices".to_string(),
+                canonical_path: "${process.env.BILLING_API}/invoices".to_string(),
+                client: "axios.".to_string(),
+                file_location: "apps/api/src/billing.ts:7".to_string(),
+                call_kind: None,
+                repo_name: None,
+                service_name: None,
+                host: None,
+                line: Some(7),
+            },
+        ];
+
+        let mut data = CloudRepoData {
+            repo_name: "svc".to_string(),
+            service_name: None,
+            endpoints: vec![],
+            calls: vec![],
+            mounts: vec![],
+            apps: HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: HashMap::new(),
+            config_json: None,
+            package_json: None,
+            packages: None,
+            last_updated: chrono::Utc::now(),
+            commit_hash: "abc123".to_string(),
+            mount_graph: Some(graph),
+            bundled_types: None,
+            type_manifest: None,
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            cached_extraction_config: None,
+            package_json_hash: None,
+            cache_version: None,
+            type_extraction_status: None,
+            compat_verdicts: None,
+            capture_stub: None,
+            external_call_candidates: None,
+        };
+
+        attach_external_call_candidates(&mut data, &fixture_str, &files, &packages, &service);
+
+        let rows = data.external_call_candidates.expect("rows");
+        assert!(
+            rows.iter().any(|row| row.mechanism == CallMechanism::Sdk),
+            "SDK rows survive the merge: {:?}",
+            rows
+        );
+        let http: Vec<_> = rows
+            .iter()
+            .filter(|row| row.mechanism != CallMechanism::Sdk)
+            .map(|row| {
+                (
+                    row.file.as_str(),
+                    row.line,
+                    row.callee.as_str(),
+                    row.package.as_str(),
+                    row.mechanism,
+                )
+            })
+            .collect();
+        assert_eq!(
+            http,
+            vec![
+                (
+                    "apps/api/src/billing.ts",
+                    7,
+                    "GET",
+                    "BILLING_API",
+                    CallMechanism::EnvVarUrl
+                ),
+                (
+                    "apps/api/src/pay.ts",
+                    12,
+                    "POST",
+                    "api.vendor.test",
+                    CallMechanism::ExternalHttp
+                ),
+            ],
+            "an absolute scan-root prefix is stripped, so both paths key the same way"
+        );
+        // The whole list is sorted as one set, whatever produced each row.
+        let mut sorted = rows.clone();
+        sorted.sort();
+        assert_eq!(rows, sorted);
     }
 
     #[test]
@@ -5224,6 +5372,8 @@ mod tests {
             call_kind: None,
             repo_name: None,
             service_name: None,
+            host: None,
+            line: None,
         }
     }
 
@@ -5275,6 +5425,8 @@ mod tests {
             call_kind: None,
             repo_name: None,
             service_name: None,
+            host: None,
+            line: None,
         }];
         let graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],

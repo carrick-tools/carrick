@@ -94,6 +94,24 @@ pub struct DataFetchingCall {
     /// producer by service but the consumer by repo (#368).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
+    /// Hostname of an absolute-URL target, retained from normalisation.
+    ///
+    /// `UrlNormalizer` computes the host on its way to a comparable path and
+    /// then discards it, so the only record of WHERE a call goes used to be the
+    /// raw `target_url`. Retained verbatim and without judgement: the field
+    /// says a host was written at this call site, not that the host is external
+    /// (classification stays with `internalDomains`/`externalDomains` and is
+    /// unchanged by this field existing).
+    ///
+    /// `None` for relative paths, env-var bases, and template bases — those
+    /// have no literal hostname to retain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// 1-based line of the call site: the typed counterpart of the line packed
+    /// into `file_location` as `"{file}:{line}"` text. `None` when extraction
+    /// reported a line that is not a positive integer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
 }
 
 /// The complete mount and endpoint graph
@@ -457,6 +475,53 @@ mod tests {
     use super::*;
 
     use crate::config::Config;
+
+    /// The retained fields are additive on the wire: a call with nothing to
+    /// retain serialises to exactly the keys it always had, so a payload
+    /// written by this scanner is byte-identical to one written before the
+    /// fields existed, and an older payload still deserialises.
+    #[test]
+    fn retained_fields_are_absent_when_empty() {
+        let call = DataFetchingCall {
+            method: "GET".to_string(),
+            target_url: "/api/orders".to_string(),
+            canonical_path: "/api/orders".to_string(),
+            client: "fetch(".to_string(),
+            file_location: "src/orders.ts:4".to_string(),
+            call_kind: None,
+            repo_name: None,
+            service_name: None,
+            host: None,
+            line: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&call).unwrap(),
+            serde_json::json!({
+                "method": "GET",
+                "target_url": "/api/orders",
+                "canonical_path": "/api/orders",
+                "client": "fetch(",
+                "file_location": "src/orders.ts:4"
+            })
+        );
+
+        let older: DataFetchingCall = serde_json::from_str(
+            r#"{"method":"GET","target_url":"/api/orders","canonical_path":"/api/orders",
+                "client":"fetch(","file_location":"src/orders.ts:4"}"#,
+        )
+        .expect("a payload written before the fields existed still reads");
+        assert_eq!(older.host, None);
+        assert_eq!(older.line, None);
+
+        let retained = DataFetchingCall {
+            host: Some("api.vendor.test".to_string()),
+            line: Some(4),
+            ..call
+        };
+        let json = serde_json::to_value(&retained).unwrap();
+        assert_eq!(json["host"], serde_json::json!("api.vendor.test"));
+        assert_eq!(json["line"], serde_json::json!(4));
+    }
 
     #[test]
     fn test_url_normalized_matching_full_url() {
@@ -1043,6 +1108,8 @@ mod tests {
                 call_kind: None,
                 repo_name: None,
                 service_name: None,
+                host: None,
+                line: None,
             });
         let merged = MountGraph::merge_from_repos(&[repo]);
         assert_eq!(merged.data_calls.len(), 1);
