@@ -1,0 +1,9 @@
+{
+  "name": "@fixture/forge",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "callback-scraper": "^3.0.0",
+    "forge-sdk": "^1.0.0"
+  }
+}

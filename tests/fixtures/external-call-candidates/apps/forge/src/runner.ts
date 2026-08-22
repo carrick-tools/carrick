@@ -1,10 +1,10 @@
-import Steel from "steel-sdk";
+import Forge from "forge-sdk";
 
 export class Runner {
-  private client: Steel;
+  private client: Forge;
 
   constructor() {
-    this.client = new Steel({ apiKey: process.env.STEEL_API_KEY ?? "" });
+    this.client = new Forge({ apiKey: process.env.FORGE_API_KEY ?? "" });
   }
 
   async go(id: string): Promise<void> {

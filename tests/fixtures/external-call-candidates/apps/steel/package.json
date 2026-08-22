@@ -1,9 +1,0 @@
-{
-  "name": "@fixture/steel",
-  "version": "0.0.0",
-  "private": true,
-  "dependencies": {
-    "atlas-scraper": "^3.0.0",
-    "steel-sdk": "^1.0.0"
-  }
-}

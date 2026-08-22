@@ -1520,8 +1520,8 @@ impl FactCollector<'_> {
     /// The dependency a type annotation names, when the file's own imports say
     /// which package the name came from.
     ///
-    /// Only a bare type reference is read — `Steel`, or `ns.Steel` through a
-    /// namespace import. A generic wrapper (`Promise<Steel>`), a union, and an
+    /// Only a bare type reference is read — `Forge`, or `ns.Forge` through a
+    /// namespace import. A generic wrapper (`Promise<Forge>`), a union, and an
     /// inline object type all name nothing this can attribute, so they resolve
     /// to nothing.
     fn annotation_package(&self, annotation: Option<&TsTypeAnn>) -> Option<PkgRef> {
@@ -2232,8 +2232,8 @@ fn destructured_properties(pattern: &ObjectPat) -> Vec<(String, BindingId)> {
     bound
 }
 
-/// The name a type reference starts from: `Steel` in `Steel`, and `ns` in
-/// `ns.Steel`, which is the name a namespace import binds.
+/// The name a type reference starts from: `Forge` in `Forge`, and `ns` in
+/// `ns.Forge`, which is the name a namespace import binds.
 fn leftmost_type_ident(name: &TsEntityName) -> &Ident {
     match name {
         TsEntityName::Ident(ident) => ident,
@@ -3068,8 +3068,8 @@ mod tests {
     mod receiver_shapes {
         use super::*;
 
-        fn steel() -> Vec<ExternalCallCandidate> {
-            scan("apps/steel")
+        fn forge() -> Vec<ExternalCallCandidate> {
+            scan("apps/forge")
         }
 
         fn anchors_for(rows: &[ExternalCallCandidate], file: &str) -> Vec<FileAnchor> {
@@ -3091,78 +3091,78 @@ mod tests {
             vec![(
                 line,
                 callee.to_string(),
-                "steel-sdk".to_string(),
+                "forge-sdk".to_string(),
                 symbol.map(str::to_string),
                 subpath.map(str::to_string),
             )]
         }
 
         #[test]
-        fn steel_service_scan_matches_expected_rows() {
+        fn forge_service_scan_matches_expected_rows() {
             assert_eq!(
-                anchored(&steel()),
+                anchored(&forge()),
                 expected_anchored(&[
                     (
-                        "apps/steel/src/atlas.ts",
+                        "apps/forge/src/callback.ts",
                         25,
-                        "steel.sessions.open",
-                        "steel-sdk",
+                        "forge.sessions.open",
+                        "forge-sdk",
                         Some("default"),
                         None,
                     ),
                     (
-                        "apps/steel/src/atlas.ts",
+                        "apps/forge/src/callback.ts",
                         25,
-                        "steel.sessions.open().then",
-                        "steel-sdk",
+                        "forge.sessions.open().then",
+                        "forge-sdk",
                         Some("default"),
                         None,
                     ),
                     (
-                        "apps/steel/src/dynamic.ts",
+                        "apps/forge/src/dynamic.ts",
                         5,
                         "client.sessions.create",
-                        "steel-sdk",
+                        "forge-sdk",
                         Some("default"),
                         None,
                     ),
                     (
-                        "apps/steel/src/dynamic.ts",
+                        "apps/forge/src/dynamic.ts",
                         11,
                         "sdk.close",
-                        "steel-sdk",
+                        "forge-sdk",
                         None,
                         None,
                     ),
                     (
-                        "apps/steel/src/injected-runner.ts",
+                        "apps/forge/src/injected-runner.ts",
                         7,
                         "this.client.sessions.release",
-                        "steel-sdk",
+                        "forge-sdk",
                         Some("default"),
                         None,
                     ),
                     (
-                        "apps/steel/src/release.ts",
+                        "apps/forge/src/release.ts",
                         6,
                         "client.sessions.release",
-                        "steel-sdk",
-                        Some("Steel"),
+                        "forge-sdk",
+                        Some("Forge"),
                         Some("edge"),
                     ),
                     (
-                        "apps/steel/src/runner.ts",
+                        "apps/forge/src/runner.ts",
                         11,
                         "this.client.sessions.release",
-                        "steel-sdk",
+                        "forge-sdk",
                         Some("default"),
                         None,
                     ),
                     (
-                        "apps/steel/src/sessions.ts",
+                        "apps/forge/src/sessions.ts",
                         9,
-                        "steel.sessions.create",
-                        "steel-sdk",
+                        "forge.sessions.create",
+                        "forge-sdk",
                         Some("default"),
                         None,
                     ),
@@ -3176,8 +3176,8 @@ mod tests {
         #[test]
         fn a_relative_factory_resolves_through_what_it_returns() {
             assert_eq!(
-                anchors_for(&steel(), "apps/steel/src/sessions.ts"),
-                anchor(9, "steel.sessions.create", Some("default"), None)
+                anchors_for(&forge(), "apps/forge/src/sessions.ts"),
+                anchor(9, "forge.sessions.create", Some("default"), None)
             );
         }
 
@@ -3188,8 +3188,8 @@ mod tests {
         #[test]
         fn a_relative_factory_resolves_through_its_declared_return_type() {
             assert_eq!(
-                anchors_for(&steel(), "apps/steel/src/release.ts"),
-                anchor(6, "client.sessions.release", Some("Steel"), Some("edge"))
+                anchors_for(&forge(), "apps/forge/src/release.ts"),
+                anchor(6, "client.sessions.release", Some("Forge"), Some("edge"))
             );
         }
 
@@ -3198,7 +3198,7 @@ mod tests {
         #[test]
         fn a_class_property_constructed_in_the_constructor_resolves() {
             assert_eq!(
-                anchors_for(&steel(), "apps/steel/src/runner.ts"),
+                anchors_for(&forge(), "apps/forge/src/runner.ts"),
                 anchor(11, "this.client.sessions.release", Some("default"), None)
             );
         }
@@ -3209,7 +3209,7 @@ mod tests {
         #[test]
         fn a_class_property_typed_by_a_dependency_resolves() {
             assert_eq!(
-                anchors_for(&steel(), "apps/steel/src/injected-runner.ts"),
+                anchors_for(&forge(), "apps/forge/src/injected-runner.ts"),
                 anchor(7, "this.client.sessions.release", Some("default"), None)
             );
         }
@@ -3221,19 +3221,19 @@ mod tests {
         #[test]
         fn dynamic_import_bindings_carry_the_export_they_name() {
             assert_eq!(
-                anchors_for(&steel(), "apps/steel/src/dynamic.ts"),
+                anchors_for(&forge(), "apps/forge/src/dynamic.ts"),
                 vec![
                     (
                         5,
                         "client.sessions.create".to_string(),
-                        "steel-sdk".to_string(),
+                        "forge-sdk".to_string(),
                         Some("default".to_string()),
                         None,
                     ),
                     (
                         11,
                         "sdk.close".to_string(),
-                        "steel-sdk".to_string(),
+                        "forge-sdk".to_string(),
                         None,
                         None,
                     ),
@@ -3248,7 +3248,7 @@ mod tests {
         #[test]
         fn one_package_reached_through_two_anchors_emits_nothing() {
             assert_eq!(
-                anchors_for(&steel(), "apps/steel/src/split-consumer.ts"),
+                anchors_for(&forge(), "apps/forge/src/split-consumer.ts"),
                 Vec::new()
             );
         }
@@ -3265,19 +3265,19 @@ mod tests {
         #[test]
         fn a_callback_parameter_does_not_inherit_its_receiver() {
             assert_eq!(
-                anchors_for(&steel(), "apps/steel/src/atlas.ts"),
+                anchors_for(&forge(), "apps/forge/src/callback.ts"),
                 vec![
                     (
                         25,
-                        "steel.sessions.open".to_string(),
-                        "steel-sdk".to_string(),
+                        "forge.sessions.open".to_string(),
+                        "forge-sdk".to_string(),
                         Some("default".to_string()),
                         None,
                     ),
                     (
                         25,
-                        "steel.sessions.open().then".to_string(),
-                        "steel-sdk".to_string(),
+                        "forge.sessions.open().then".to_string(),
+                        "forge-sdk".to_string(),
                         Some("default".to_string()),
                         None,
                     ),
