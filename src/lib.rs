@@ -16,6 +16,7 @@ pub mod findings;
 pub mod formatter;
 pub mod framework_detector;
 pub mod graphql;
+pub mod import_bindings;
 pub mod intent_generator;
 pub mod logging;
 pub mod mount_graph;

@@ -1,0 +1,9 @@
+{
+  "name": "barrel-reexport-mounts",
+  "version": "1.0.0",
+  "description": "Plugins registered through a barrel that re-exports each module's default export",
+  "main": "src/plugin.ts",
+  "dependencies": {
+    "fastify": "^5.0.0"
+  }
+}

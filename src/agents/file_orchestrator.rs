@@ -20,7 +20,8 @@ use crate::{
     agent_service::AgentService,
     agents::{
         file_analyzer_agent::{
-            EmissionStyle, EndpointResult, FileAnalysisResult, FileAnalyzerAgent, PubsubOperation,
+            EmissionStyle, EndpointResult, FileAnalysisResult, FileAnalyzerAgent, MountResult,
+            PubsubOperation,
         },
         framework_guidance_agent::ProtocolGuidance,
     },
@@ -32,6 +33,7 @@ use crate::{
     },
     file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
     framework_detector::DetectionResult,
+    import_bindings::BindingResolver,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
     operation::{OperationKey, Protocol},
     parser::parse_file,
@@ -48,7 +50,7 @@ use crate::{
     visitor::{ImportSymbolExtractor, ImportedSymbol, SymbolKind, TypeSymbolExtractor},
 };
 use futures::stream::StreamExt;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swc_common::{
     SourceMap,
@@ -534,6 +536,17 @@ fn template_pattern_matches(quasis: &[String], topic: &str) -> bool {
         }
     }
     remaining.ends_with(last.as_str())
+}
+
+/// A mount-site binding, resolved back to the file that defines it.
+///
+/// `child_node` is the name the MOUNTING file registered (`sessionsRoutes`);
+/// `local_name` is what the defining module calls it (`routes`), when its
+/// export table names it at all.
+#[derive(Debug, Clone)]
+struct MountBinding {
+    child_node: String,
+    local_name: Option<String>,
 }
 
 /// Orchestrates file-centric analysis using the FileAnalyzerAgent.
@@ -1276,7 +1289,8 @@ impl FileOrchestrator {
         debug!("  - Total data calls: {}", stats.total_data_calls);
 
         // STEP 5: Build aggregated mount graph from all file results
-        let mount_graph = self.build_mount_graph(&file_results, normalizer, service_root);
+        let mount_graph =
+            self.build_mount_graph(&file_results, normalizer, service_root, Path::new(""));
 
         Ok(FileCentricAnalysisResult {
             file_results,
@@ -2453,7 +2467,7 @@ impl FileOrchestrator {
     /// specifiers (packages, tsconfig aliases) return `None` — alias
     /// resolution needs the sidecar's tsconfig knowledge and is out of scope
     /// here.
-    fn resolve_relative_import(importer: &Path, spec: &str) -> Option<PathBuf> {
+    pub(crate) fn resolve_relative_import(importer: &Path, spec: &str) -> Option<PathBuf> {
         if !(spec.starts_with("./") || spec.starts_with("../")) {
             return None;
         }
@@ -4079,11 +4093,29 @@ impl FileOrchestrator {
         // the keys are already repo-relative (the engine normalizes them
         // before rebuilding the graph).
         scan_root: &Path,
+        // Directory the `file_results` keys are relative to ON DISK, so an
+        // imported binding can be resolved back to the module that defines
+        // it. `Path::new("")` when the keys already resolve as written
+        // (absolute, or relative to the working directory); the repo root
+        // when the engine has normalized them to repo-relative paths.
+        file_root: &Path,
     ) -> MountGraph {
         let mut graph = MountGraph::new();
 
-        // Track import mappings: import_source -> (file_path, local_name)
-        let mut import_map: HashMap<String, String> = HashMap::new();
+        // Which mount-site binding stands for which analysed file, resolved
+        // through the module graph — (file, exported name), never a bare name.
+        // This is what attributes a mounted plugin's routes to the binding it
+        // was registered under; everything below it is fallback.
+        let owner_bindings = Self::resolve_mount_bindings(file_results, file_root);
+
+        // Fallback name map for mounts the module graph cannot reach (tsconfig
+        // path aliases, workspace packages, files not on disk): normalized
+        // import source -> every child node mounted from it. A specifier that
+        // fronts SEVERAL distinct children is a barrel, and the name alone
+        // cannot say which module an endpoint belongs to, so the set is kept
+        // whole and the ambiguity refused rather than silently resolved to
+        // whichever mount was seen last.
+        let mut import_map: HashMap<String, BTreeSet<String>> = HashMap::new();
 
         // First pass: collect all nodes and build import mappings
         for (file_path, result) in file_results {
@@ -4135,7 +4167,10 @@ impl FileOrchestrator {
                 if let Some(import_source) = &mount.import_source {
                     // Normalize the import source
                     let normalized = Self::normalize_import_source(import_source);
-                    import_map.insert(normalized, mount.child_node.clone());
+                    import_map
+                        .entry(normalized)
+                        .or_default()
+                        .insert(mount.child_node.clone());
                 }
             }
         }
@@ -4178,8 +4213,12 @@ impl FileOrchestrator {
                 }
 
                 // Try to resolve the owner using import information
-                let resolved_owner =
-                    self.resolve_endpoint_owner(&graph, &endpoint.owner_node, file_path);
+                let resolved_owner = Self::resolve_endpoint_owner(
+                    &owner_bindings,
+                    &import_map,
+                    &endpoint.owner_node,
+                    file_path,
+                );
 
                 graph.endpoints.push(ResolvedEndpoint {
                     method,
@@ -4428,32 +4467,158 @@ impl FileOrchestrator {
         }
     }
 
-    /// Resolve endpoint owner using import information.
+    /// Resolve every mount's imported child back to the file that DEFINES it,
+    /// keyed by the `file_results` key of that file.
+    ///
+    /// This is the identity the old name-based resolution lost. A barrel gives
+    /// four mounts the same import specifier (`./routes.js`) and each module
+    /// typically names its own plugin identically (`const routes = ...; export
+    /// default routes`), so neither the specifier nor the local symbol
+    /// distinguishes them — only the module a binding was re-exported FROM
+    /// does. `BindingResolver` walks `export { default as X } from`,
+    /// `export { a as b } from`, and `export * from` hops to find it, with no
+    /// framework knowledge involved: an Express router, a Fastify plugin, and
+    /// anything else the mount graph follows resolve through the same path.
+    ///
+    /// Bindings are deduped by `child_node` so the same module mounted under
+    /// several prefixes stays ONE binding (the alias fan-out in
+    /// `resolve_endpoint_paths` handles the prefixes, #373).
+    ///
+    /// Keys are resolved against `file_root`, which is `Path::new("")` when
+    /// they already resolve as written and the repo root when the engine has
+    /// normalized them to repo-relative paths.
+    ///
+    /// Returns an empty map when nothing resolves — non-relative specifiers,
+    /// or `file_results` keys that are not paths on disk (in-memory tests, a
+    /// graph rebuilt away from the checkout). Callers fall back to the name
+    /// map there.
+    fn resolve_mount_bindings(
+        file_results: &HashMap<String, FileAnalysisResult>,
+        file_root: &Path,
+    ) -> HashMap<String, Vec<MountBinding>> {
+        // Canonical path -> the `file_results` key naming that file. Both
+        // sides are canonicalized: the resolver returns canonical paths, and a
+        // key can reach the same file through a relative path or a symlinked
+        // parent (`/var` -> `/private/var` on macOS).
+        let mut key_by_canonical: HashMap<PathBuf, &str> = HashMap::new();
+        for key in file_results.keys() {
+            if let Ok(canonical) = file_root.join(key).canonicalize() {
+                key_by_canonical.insert(canonical, key.as_str());
+            }
+        }
+        if key_by_canonical.is_empty() {
+            return HashMap::new();
+        }
+
+        // `file_results` is a HashMap: sort the mount sites so the bindings
+        // (and any tie-break between them) are identical run to run.
+        let mut mount_sites: Vec<(&str, &MountResult)> = file_results
+            .iter()
+            .flat_map(|(file_path, result)| {
+                result
+                    .mounts
+                    .iter()
+                    .map(move |mount| (file_path.as_str(), mount))
+            })
+            .collect();
+        mount_sites.sort_by(|(a_file, a), (b_file, b)| {
+            a_file
+                .cmp(b_file)
+                .then(a.line_number.cmp(&b.line_number))
+                .then(a.child_node.cmp(&b.child_node))
+        });
+
+        let mut resolver = BindingResolver::new();
+        let mut bindings: HashMap<String, Vec<MountBinding>> = HashMap::new();
+        for (file_path, mount) in mount_sites {
+            let Some(import_source) = &mount.import_source else {
+                continue; // locally defined child: no module to resolve
+            };
+            let Ok(importer) = file_root.join(file_path).canonicalize() else {
+                continue;
+            };
+            let Some(resolved) = resolver.resolve(&importer, import_source, &mount.child_node)
+            else {
+                continue;
+            };
+            let Some(target_key) = key_by_canonical.get(&resolved.file) else {
+                continue; // defining module was not analysed (no endpoints in it)
+            };
+            let entry = bindings.entry((*target_key).to_string()).or_default();
+            if entry
+                .iter()
+                .any(|binding| binding.child_node == mount.child_node)
+            {
+                continue;
+            }
+            entry.push(MountBinding {
+                child_node: mount.child_node.clone(),
+                local_name: resolved.local_name,
+            });
+        }
+        bindings
+    }
+
+    /// Resolve the node an endpoint belongs to, so its path can be joined to
+    /// the prefix its module was mounted under.
+    ///
+    /// Identity is file-first: when exactly one mounted binding resolves to
+    /// the file an endpoint was extracted from, that binding owns it. The
+    /// endpoint's own `owner_node` cannot carry that decision — it is the
+    /// variable the route was attached to, which for a plugin is the
+    /// framework instance handed to it (`server`, `fastify`), a name every
+    /// module in a repo shares.
+    ///
+    /// `local_name` only breaks ties, in the rarer case where one file
+    /// defines several mounted routers. When it cannot break the tie, the
+    /// original owner is kept: an unmounted-looking endpoint is a visible
+    /// gap, a confidently wrong prefix is not.
     fn resolve_endpoint_owner(
-        &self,
-        graph: &MountGraph,
+        owner_bindings: &HashMap<String, Vec<MountBinding>>,
+        import_map: &HashMap<String, BTreeSet<String>>,
         owner_name: &str,
         file_path: &str,
     ) -> String {
-        // Extract just the filename parts for matching
-        let file_parts: Vec<&str> = file_path.split('/').collect();
-
-        // Try to find a matching import mapping
-        for (key, node) in &graph.nodes {
-            if key.starts_with("__import_map__::") {
-                let source_pattern = key.trim_start_matches("__import_map__::");
-
-                // Check if the current file matches this source pattern
-                if file_path.contains(source_pattern)
-                    || file_parts.iter().any(|part| part.contains(source_pattern))
-                {
-                    return node.name.clone();
-                }
+        if let Some(bindings) = owner_bindings.get(file_path) {
+            if let [only] = bindings.as_slice() {
+                return only.child_node.clone();
             }
+            if let Some(binding) = bindings
+                .iter()
+                .find(|binding| binding.local_name.as_deref() == Some(owner_name))
+            {
+                return binding.child_node.clone();
+            }
+            // Several bindings resolved to this file and none of them names
+            // this owner: refuse to guess.
+            return owner_name.to_string();
         }
 
-        // No mapping found, return original owner
-        owner_name.to_string()
+        // Fallback: match the file against the import specifiers seen at mount
+        // sites. Substring matching, so it is only ever a hint — `./routes.js`
+        // matches every path containing "routes". Take the most specific
+        // pattern that matches, and use it only when the mounts agree on a
+        // single child; a specifier fronting several children is a barrel this
+        // path cannot see through.
+        let file_parts: Vec<&str> = file_path.split('/').collect();
+        let mut best_len = 0usize;
+        let mut candidates: BTreeSet<&str> = BTreeSet::new();
+        for (pattern, children) in import_map {
+            let matches =
+                file_path.contains(pattern) || file_parts.iter().any(|part| part.contains(pattern));
+            if !matches || pattern.len() < best_len {
+                continue;
+            }
+            if pattern.len() > best_len {
+                best_len = pattern.len();
+                candidates.clear();
+            }
+            candidates.extend(children.iter().map(String::as_str));
+        }
+        match candidates.iter().copied().collect::<Vec<_>>().as_slice() {
+            [only] => (*only).to_string(),
+            _ => owner_name.to_string(),
+        }
     }
 
     /// Resolve full paths for endpoints by traversing the mount graph.
@@ -5551,6 +5716,7 @@ export * from "./aFetch.js";"#,
             &file_results,
             &UrlNormalizer::default_permissive(),
             Path::new(""),
+            Path::new(""),
         );
 
         assert_eq!(graph.mounts.len(), 1);
@@ -5616,6 +5782,7 @@ export * from "./aFetch.js";"#,
             &file_results,
             &UrlNormalizer::default_permissive(),
             Path::new(""),
+            Path::new(""),
         );
 
         let mut full_paths: Vec<&str> = graph
@@ -5673,6 +5840,7 @@ export * from "./aFetch.js";"#,
         let graph = orchestrator.build_mount_graph(
             &file_results,
             &UrlNormalizer::default_permissive(),
+            Path::new(""),
             Path::new(""),
         );
 
@@ -5735,6 +5903,7 @@ export * from "./aFetch.js";"#,
             &file_results,
             &UrlNormalizer::default_permissive(),
             Path::new("tests/fixtures/mocks/service-a"),
+            Path::new(""),
         );
 
         assert_eq!(graph.endpoints.len(), 1);
@@ -5790,6 +5959,7 @@ export * from "./aFetch.js";"#,
             &file_results,
             &UrlNormalizer::default_permissive(),
             Path::new(""),
+            Path::new(""),
         );
 
         assert_eq!(graph.data_calls.len(), 1);
@@ -5839,6 +6009,7 @@ export * from "./aFetch.js";"#,
         let graph = orchestrator.build_mount_graph(
             &file_results,
             &UrlNormalizer::new(&config),
+            Path::new(""),
             Path::new(""),
         );
 
@@ -5922,6 +6093,7 @@ export * from "./aFetch.js";"#,
             &file_results,
             &UrlNormalizer::default_permissive(),
             Path::new(""),
+            Path::new(""),
         );
 
         assert_eq!(
@@ -5964,6 +6136,7 @@ export * from "./aFetch.js";"#,
             &file_results,
             &UrlNormalizer::default_permissive(),
             Path::new(""),
+            Path::new(""),
         );
 
         assert_eq!(graph.data_calls.len(), 1);
@@ -5996,6 +6169,7 @@ export * from "./aFetch.js";"#,
         let graph = orchestrator.build_mount_graph(
             &file_results,
             &UrlNormalizer::default_permissive(),
+            Path::new(""),
             Path::new(""),
         );
 
@@ -6045,7 +6219,7 @@ export * from "./aFetch.js";"#,
         let build = |result: FileAnalysisResult| {
             let mut file_results = HashMap::new();
             file_results.insert("lib/audit.ts".to_string(), result);
-            orchestrator.build_mount_graph(&file_results, &normalizer, Path::new(""))
+            orchestrator.build_mount_graph(&file_results, &normalizer, Path::new(""), Path::new(""))
         };
 
         // The verbatim rendering, run through the fold-time normalization the
@@ -6158,6 +6332,7 @@ export * from "./aFetch.js";"#,
             &file_results,
             &UrlNormalizer::default_permissive(),
             Path::new(""),
+            Path::new(""),
         );
 
         let call_paths: Vec<&str> = graph
@@ -6248,6 +6423,7 @@ export * from "./aFetch.js";"#,
             &file_results,
             &UrlNormalizer::default_permissive(),
             Path::new(""),
+            Path::new(""),
         );
 
         let evidence_of = |method: &str| {
@@ -6329,6 +6505,7 @@ export * from "./aFetch.js";"#,
             &file_results,
             &UrlNormalizer::default_permissive(),
             Path::new(""),
+            Path::new(""),
         );
 
         let targets: Vec<&str> = graph
@@ -6398,6 +6575,7 @@ export * from "./aFetch.js";"#,
             &file_results,
             &UrlNormalizer::default_permissive(),
             Path::new(""),
+            Path::new(""),
         );
         let config = Config::default();
         let (_explicit, infer, _inline) =
@@ -6442,6 +6620,7 @@ export * from "./aFetch.js";"#,
         let graph = orchestrator.build_mount_graph(
             &file_results,
             &UrlNormalizer::default_permissive(),
+            Path::new(""),
             Path::new(""),
         );
         let config = Config::default();
@@ -6508,6 +6687,7 @@ export * from "./aFetch.js";"#,
             &file_results,
             &UrlNormalizer::default_permissive(),
             Path::new(""),
+            Path::new(""),
         );
         let config = Config::default();
         let (_explicit, infer, _inline) =
@@ -6566,6 +6746,7 @@ export * from "./aFetch.js";"#,
         let graph = orchestrator.build_mount_graph(
             &file_results,
             &UrlNormalizer::default_permissive(),
+            Path::new(""),
             Path::new(""),
         );
         let config = Config::default();
@@ -6638,6 +6819,7 @@ export * from "./aFetch.js";"#,
         let graph = orchestrator.build_mount_graph(
             &file_results,
             &UrlNormalizer::default_permissive(),
+            Path::new(""),
             Path::new(""),
         );
         let config = Config::default();
@@ -7388,6 +7570,7 @@ export * from "./aFetch.js";"#,
             &file_results,
             &UrlNormalizer::default_permissive(),
             Path::new(""),
+            Path::new(""),
         );
 
         // Should have the mount and both endpoints
@@ -7400,6 +7583,218 @@ export * from "./aFetch.js";"#,
             .keys()
             .any(|k| k.starts_with("__import_map__::"));
         assert!(has_import_map, "Should have import mapping node");
+    }
+
+    /// Root of the on-disk module graph both barrel tests resolve through.
+    /// Endpoint extraction is LLM-side, so the `FileAnalysisResult`s below are
+    /// authored by hand to mirror what the analyzer emits for these files; the
+    /// FIXTURE is what the deterministic import/mount resolution reads.
+    fn barrel_fixture_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/barrel-reexport-mounts")
+    }
+
+    fn barrel_fixture(relative: &str) -> String {
+        barrel_fixture_root()
+            .join(relative)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// One route, attached to the plugin's own framework instance. Every
+    /// module in the fixture uses the SAME owner name (`server`) — that
+    /// collision is the point: the owner name cannot identify the module.
+    fn plugin_endpoint(method: &str, path: &str) -> EndpointResult {
+        EndpointResult {
+            candidate_id: format!("span:{method}:{path}"),
+            line_number: 4,
+            owner_node: "server".to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            handler_name: "anonymous".to_string(),
+            pattern_matched: format!(".{}(", method.to_lowercase()),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+        }
+    }
+
+    fn register_mount(line_number: i32, child: &str, prefix: &str, source: &str) -> MountResult {
+        MountResult {
+            line_number,
+            parent_node: "fastify".to_string(),
+            child_node: child.to_string(),
+            mount_path: prefix.to_string(),
+            import_source: Some(source.to_string()),
+            pattern_matched: ".register(".to_string(),
+        }
+    }
+
+    /// (method, full_path, owner) for every endpoint, sorted.
+    fn resolved_routes(graph: &MountGraph) -> Vec<(String, String, String)> {
+        let mut routes: Vec<(String, String, String)> = graph
+            .endpoints
+            .iter()
+            .map(|e| (e.method.clone(), e.full_path.clone(), e.owner.clone()))
+            .collect();
+        routes.sort();
+        routes
+    }
+
+    /// Four plugins registered through ONE barrel: same import specifier for
+    /// all four, and three of the four modules name their plugin `routes`.
+    /// Resolving by name collapsed every route onto the last binding
+    /// (`/v1/logs/<path>`, owner `logsRoutes`); resolving by (file, exported
+    /// name) keeps each module's identity.
+    #[test]
+    fn test_build_mount_graph_resolves_barrel_reexported_plugins_to_their_own_module() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/plugin.ts".to_string(),
+            FileAnalysisResult {
+                mounts: vec![
+                    register_mount(10, "actionsRoutes", "/v1", "./routes.js"),
+                    register_mount(11, "sessionsRoutes", "/v1", "./routes.js"),
+                    register_mount(12, "filesRoutes", "/v1", "./routes.js"),
+                    register_mount(13, "logsRoutes", "/v1/logs", "./routes.js"),
+                ],
+                ..Default::default()
+            },
+        );
+        for (module, path) in [
+            ("actions", "/actions"),
+            ("sessions", "/sessions"),
+            ("files", "/files"),
+        ] {
+            file_results.insert(
+                format!("src/modules/{module}/{module}.routes.ts"),
+                FileAnalysisResult {
+                    endpoints: vec![plugin_endpoint("POST", path)],
+                    ..Default::default()
+                },
+            );
+        }
+        file_results.insert(
+            "src/modules/logs/logs.routes.ts".to_string(),
+            FileAnalysisResult {
+                endpoints: vec![plugin_endpoint("POST", "/entries")],
+                ..Default::default()
+            },
+        );
+
+        // Repo-relative keys with the root passed separately: the shape the
+        // engine rebuilds a graph in, and the one that has to reach the
+        // module files on disk to resolve the barrel.
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            &barrel_fixture_root(),
+        );
+
+        assert_eq!(
+            resolved_routes(&graph),
+            vec![
+                (
+                    "POST".to_string(),
+                    "/v1/actions".to_string(),
+                    "actionsRoutes".to_string()
+                ),
+                (
+                    "POST".to_string(),
+                    "/v1/files".to_string(),
+                    "filesRoutes".to_string()
+                ),
+                (
+                    "POST".to_string(),
+                    "/v1/logs/entries".to_string(),
+                    "logsRoutes".to_string()
+                ),
+                (
+                    "POST".to_string(),
+                    "/v1/sessions".to_string(),
+                    "sessionsRoutes".to_string()
+                ),
+            ],
+            "each barrel-re-exported plugin must keep its own module's routes and prefix"
+        );
+    }
+
+    /// The same collision without a barrel: two modules, both `export default
+    /// routes`, imported directly and registered under different prefixes.
+    #[test]
+    fn test_build_mount_graph_resolves_direct_default_imports_to_their_own_module() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            barrel_fixture("src/direct-plugin.ts"),
+            FileAnalysisResult {
+                mounts: vec![
+                    register_mount(
+                        8,
+                        "ordersRoutes",
+                        "/v1/orders",
+                        "./modules/orders/orders.routes.js",
+                    ),
+                    register_mount(
+                        9,
+                        "reportsRoutes",
+                        "/v1/reports",
+                        "./modules/reports/reports.routes.js",
+                    ),
+                ],
+                ..Default::default()
+            },
+        );
+        file_results.insert(
+            barrel_fixture("src/modules/orders/orders.routes.ts"),
+            FileAnalysisResult {
+                endpoints: vec![plugin_endpoint("GET", "/pending")],
+                ..Default::default()
+            },
+        );
+        file_results.insert(
+            barrel_fixture("src/modules/reports/reports.routes.ts"),
+            FileAnalysisResult {
+                endpoints: vec![plugin_endpoint("GET", "/daily")],
+                ..Default::default()
+            },
+        );
+
+        // As-scanned absolute keys, the shape `analyze_files` builds in.
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            &barrel_fixture_root(),
+            Path::new(""),
+        );
+
+        assert_eq!(
+            resolved_routes(&graph),
+            vec![
+                (
+                    "GET".to_string(),
+                    "/v1/orders/pending".to_string(),
+                    "ordersRoutes".to_string()
+                ),
+                (
+                    "GET".to_string(),
+                    "/v1/reports/daily".to_string(),
+                    "reportsRoutes".to_string()
+                ),
+            ],
+            "directly imported default exports must not collapse onto one module either"
+        );
     }
 
     #[test]
@@ -7948,6 +8343,7 @@ export { routes };
         let graph = orchestrator.build_mount_graph(
             &file_results,
             &UrlNormalizer::default_permissive(),
+            Path::new(""),
             Path::new(""),
         );
 
