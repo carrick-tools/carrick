@@ -145,6 +145,77 @@ pub struct CompatVerdict {
     pub scanner_version: String,
 }
 
+/// A consumer call that reaches a producer endpoint through a published npm
+/// client rather than over a URL the consumer writes (carrick#466, cloud#370).
+///
+/// The consumer's own source contains no route at all — it writes
+/// `ledger.payments.create(...)` — so the direct HTTP matcher can never see
+/// the pair. This edge is that relationship recorded explicitly: the candidate
+/// call site, the SDK member it lands on, and the producer endpoint the SDK's
+/// own outbound call at that member already matched. It is deliberately its
+/// own relationship and never folded into `endpoints`/`calls`: projecting SDK
+/// traffic into HTTP matching is the known false-positive class the
+/// [`crate::external_call_candidates`] design exists to avoid.
+///
+/// Stored on the CONSUMER's blob, keyed by the same canonical identities as
+/// [`CompatVerdict`] (`OperationKey::canonical()` and `service_name ??
+/// repo_name`), so the cloud joins it to the producer endpoint by exact match.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SdkEdge {
+    /// Consumer service id (`service_name ?? repo_name`).
+    pub consumer_repo: String,
+    /// `"file:line"` of the consumer's call, repo-relative.
+    pub consumer_location: String,
+    /// The npm package the client was imported from, exactly as the
+    /// `package.json` names it.
+    pub package: String,
+    /// Which export of the package the receiver came from: `default`, or the
+    /// named export. `None` for a namespace import, which never produces an
+    /// edge (it resolves to no single member).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_symbol: Option<String>,
+    /// The callee as written at the consumer's call site: `ledger.payments.create`.
+    pub callee: String,
+    /// Service id of the repo publishing `package`.
+    pub sdk_repo: String,
+    /// The member path inside the SDK, without the root binding:
+    /// `payments.create`.
+    pub sdk_member: String,
+    /// `"file:line"` of that member in the SDK repo, repo-relative to it.
+    pub sdk_location: String,
+    /// Producer service id (`service_name ?? repo_name`).
+    pub producer_repo: String,
+    /// Producer endpoint `OperationKey::canonical()` (e.g.
+    /// `http|POST|/v1/payments`), byte-identical to the producer endpoint's own
+    /// key so the cloud de-orphans by exact match.
+    pub producer_key: String,
+    /// The verdict for the SDK→producer pair, carried verbatim from the
+    /// `CrossRepoMatch` the SDK's own call formed. `None` = compat was not
+    /// evaluated for that edge, never "compatible".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_compatible: Option<bool>,
+    /// Populated iff `type_compatible == Some(false)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mismatch_reason: Option<String>,
+    /// Scanner release that produced this edge (`CARGO_PKG_VERSION`).
+    pub scanner_version: String,
+}
+
+/// SDK-mediated calls the join could not turn into an edge, aggregated per
+/// package and reason.
+///
+/// Recorded rather than dropped so the surface can say "this package is
+/// called, and here is why nothing is known about where those calls land"
+/// instead of silently showing nothing. `reason` is one of
+/// `no_sdk_repo_in_project`, `member_not_found`, `receiver_unresolved`,
+/// `no_matching_producer`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SdkUnresolved {
+    pub package: String,
+    pub count: usize,
+    pub reason: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CloudRepoData {
     pub repo_name: String,
@@ -224,6 +295,28 @@ pub struct CloudRepoData {
     /// service makes no external calls".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_call_candidates: Option<Vec<ExternalCallCandidate>>,
+    /// The callable surface THIS repo publishes as an npm package
+    /// (carrick#466): every member path its entry module exports, anchored to
+    /// the source span implementing it. Computed deterministically by
+    /// [`crate::sdk_surface`], and read only by the SDK-edge join — nothing in
+    /// matching or type compatibility touches it.
+    ///
+    /// `None` on a repo that publishes no resolvable TypeScript entry, and on
+    /// every blob written before the field existed; the join treats the second
+    /// case as "member not found" and logs it, because a peer that predates
+    /// the channel cannot be told from one with no surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdk_surface: Option<Vec<crate::sdk_surface::SdkMember>>,
+    /// SDK-mediated consumer edges where THIS repo is the consumer, computed
+    /// at cross-repo time by [`crate::sdk_edges`]. Same storage convention as
+    /// `compat_verdicts`: consumer-side only, canonical keys, additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdk_edges: Option<Vec<SdkEdge>>,
+    /// Why this repo's remaining SDK calls produced no edge, per package and
+    /// reason. Kept beside `sdk_edges` so "no edges" is distinguishable from
+    /// "no SDK calls".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdk_unresolved: Option<Vec<SdkUnresolved>>,
 }
 
 /// Version of the v2 capture stub artifact schema. Bumped on incompatible
@@ -381,6 +474,9 @@ impl CloudRepoData {
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
+            sdk_surface: None,
+            sdk_edges: None,
+            sdk_unresolved: None,
         }
     }
 }
@@ -702,6 +798,9 @@ mod tests {
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
+            sdk_surface: None,
+            sdk_edges: None,
+            sdk_unresolved: None,
         }
     }
 

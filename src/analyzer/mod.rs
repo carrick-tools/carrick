@@ -255,6 +255,15 @@ pub struct ApiAnalysisResult {
     /// the PR comment, not just what's broken — clean runs otherwise produce
     /// no positive signal.
     pub verified_endpoints: Vec<VerifiedEndpointEntry>,
+    /// SDK-mediated consumer edges for this run (carrick#466). Not produced by
+    /// the analyzer — the join needs the peer blobs, which the analyzer does
+    /// not keep — so the engine fills these in from
+    /// [`crate::sdk_edges::join`] before the report is rendered. Empty
+    /// everywhere else.
+    pub sdk_edges: Vec<crate::cloud_storage::SdkEdge>,
+    /// Why the remaining SDK calls produced no edge, aggregated per package
+    /// and reason. Filled in alongside `sdk_edges`.
+    pub sdk_unresolved: Vec<crate::cloud_storage::SdkUnresolved>,
     /// GraphQL libraries detected across all scanned repos (subset of
     /// `detected_data_fetchers`). When libraries are present but no
     /// operations were extracted, the formatter suggests committing an
@@ -2369,6 +2378,10 @@ impl Analyzer {
             findings,
             dependency_conflicts,
             verified_endpoints,
+            // Filled in by the engine after cross-repo analysis: the join
+            // reads the peer blobs, which the analyzer does not hold.
+            sdk_edges: Vec::new(),
+            sdk_unresolved: Vec::new(),
             detected_graphql_libraries,
             graphql_operations_indexed,
             cross_repo_matches,

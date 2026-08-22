@@ -130,6 +130,64 @@ impl BindingResolver {
         self.follow(&target, DEFAULT_EXPORT)
     }
 
+    /// Resolve one named export of `file` to the module that declares it.
+    ///
+    /// The same walk [`resolve`](Self::resolve) performs, entered from the
+    /// module side rather than from an importing file: the caller already
+    /// holds the entry module and asks what a given export of it resolves to.
+    /// `export_name` is the name as PUBLISHED (`default` for a default
+    /// export), not a local binding.
+    pub fn resolve_export(&mut self, file: &Path, export_name: &str) -> Option<ResolvedBinding> {
+        self.follow(file, export_name)
+    }
+
+    /// Every name `file` publishes, deduplicated and sorted.
+    ///
+    /// Locally declared exports and one-hop re-exports are read off the
+    /// module's own table; `export * from "./m"` is followed so a barrel
+    /// reports what it republishes rather than reporting nothing. The star
+    /// walk is bounded by the same hop and visit caps a single resolution
+    /// gets, and a star never republishes a default (mirroring
+    /// [`follow_inner`](Self::follow_inner)).
+    pub fn export_names(&mut self, file: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        visited.insert(file.to_path_buf());
+        self.collect_export_names(file.to_path_buf(), 0, &mut visited, &mut names);
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn collect_export_names(
+        &mut self,
+        file: PathBuf,
+        hops: usize,
+        visited: &mut HashSet<PathBuf>,
+        names: &mut Vec<String>,
+    ) {
+        if hops > MAX_HOPS || visited.len() > MAX_VISITS {
+            return;
+        }
+        let Some(exports) = self.exports_of(&file) else {
+            return;
+        };
+        names.extend(exports.local.keys().cloned());
+        names.extend(exports.forwarded.keys().cloned());
+        for specifier in exports.stars.clone() {
+            let Some(next) = FileOrchestrator::resolve_relative_import(&file, &specifier) else {
+                continue;
+            };
+            if !visited.insert(next.clone()) {
+                continue;
+            }
+            let mut republished = Vec::new();
+            self.collect_export_names(next, hops + 1, visited, &mut republished);
+            // A star republishes named exports only, never a default.
+            names.extend(republished.into_iter().filter(|n| n != DEFAULT_EXPORT));
+        }
+    }
+
     /// Follow `export_name` out of `file` through re-export hops to the
     /// module that declares it.
     fn follow(&mut self, file: &Path, export_name: &str) -> Option<ResolvedBinding> {
