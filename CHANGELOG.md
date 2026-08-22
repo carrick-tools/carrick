@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.13](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.12...carrick-v0.3.13) (2026-08-22)
+
+
+### Features
+
+* **egress:** resolve factory, class-property and dynamic-import receivers ([#520](https://github.com/carrick-tools/carrick/issues/520)) ([d1622c0](https://github.com/carrick-tools/carrick/commit/d1622c0a723b249ba8b7e3fbb013ae9a4685207a))
+* **sdk:** SDK-mediated consumer edges ([#524](https://github.com/carrick-tools/carrick/issues/524)) ([b57cc85](https://github.com/carrick-tools/carrick/commit/b57cc854a589e84529b13a89e62eae73a28edf1e))
+
+
+### Bug Fixes
+
+* **intents:** bound per-level concurrency and jitter the retry backoff ([#522](https://github.com/carrick-tools/carrick/issues/522)) ([6afe8f4](https://github.com/carrick-tools/carrick/commit/6afe8f4aeb8f2886fc774f1094df4830c3c946a8)), closes [#460](https://github.com/carrick-tools/carrick/issues/460)
+* **scanner:** make every uploaded path repo-relative at one boundary ([#518](https://github.com/carrick-tools/carrick/issues/518)) ([9e19722](https://github.com/carrick-tools/carrick/commit/9e1972200fbd2f29f190c6c9de61dc76ba53f420))
+* **scanner:** resolve mounted plugins by module, not by bare name ([#517](https://github.com/carrick-tools/carrick/issues/517)) ([6a101ca](https://github.com/carrick-tools/carrick/commit/6a101ca22f1274a1762558f59bb60f52eb1c1fd7))
+
 ## [0.3.12](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.11...carrick-v0.3.12) (2026-08-19)
 
 
