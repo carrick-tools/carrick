@@ -1100,6 +1100,9 @@ async fn analyze_current_repo_incremental(
                 &merged_results,
                 &normalizer,
                 std::path::Path::new(""),
+                // Keys are repo-relative here, so the import/mount resolution
+                // needs the repo root to reach the modules on disk.
+                std::path::Path::new(repo_path),
             );
 
             // Deterministic protocol scans run BEFORE the graph is projected:

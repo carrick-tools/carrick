@@ -16,6 +16,7 @@ mod findings;
 mod formatter;
 mod framework_detector;
 mod graphql;
+mod import_bindings;
 mod intent_generator;
 mod logging;
 mod mount_graph;

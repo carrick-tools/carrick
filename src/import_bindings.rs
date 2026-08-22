@@ -1,0 +1,501 @@
+//! Resolve an imported binding to the module that actually defines it.
+//!
+//! A mount site names its child by whatever local binding the importing file
+//! happens to use (`fastify.register(sessionsRoutes)`, `app.use(userRouter)`).
+//! Attributing the mounted routes to that binding needs the module the binding
+//! came FROM, and a barrel breaks the naive answer:
+//!
+//! ```text
+//! routes.ts:   export { default as sessionsRoutes } from "./modules/sessions/sessions.routes.js";
+//!              export { default as logsRoutes }     from "./modules/logs/logs.routes.js";
+//! plugin.ts:   import { sessionsRoutes, logsRoutes } from "./routes.js";
+//! ```
+//!
+//! Every one of those bindings has the SAME import specifier, and each module
+//! usually names its own plugin identically (`const routes = ...; export
+//! default routes`). Anything that keys on the specifier, on the local symbol
+//! name, or on a substring of the file path collapses all of them onto one
+//! module — last write wins.
+//!
+//! This module resolves the pair that is actually unique: **(file, exported
+//! name)**. It reads each module's export table with SWC and follows
+//! re-export hops — `export { default as X } from`, `export { a as b } from`,
+//! and `export * from` — until it reaches the module that declares the
+//! binding. Purely structural: no framework knowledge, no naming heuristics.
+//! Non-relative specifiers (packages, tsconfig path aliases) are out of scope
+//! and resolve to `None`, because reaching them needs the sidecar's tsconfig
+//! knowledge; the caller falls back to its previous behaviour there.
+
+use crate::agents::file_orchestrator::FileOrchestrator;
+use crate::parser::parse_file;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use swc_common::{
+    SourceMap,
+    errors::{ColorConfig, Handler},
+    sync::Lrc,
+};
+use swc_ecma_ast::{
+    Decl, DefaultDecl, ExportSpecifier, Expr, ModuleDecl, ModuleExportName, ModuleItem, Pat,
+};
+
+/// The export name a default export is published under. Not a valid
+/// identifier, so it can never collide with a named export in the same table.
+const DEFAULT_EXPORT: &str = "default";
+
+/// How many re-export hops a single binding may be followed through. A barrel
+/// in front of a barrel is two; a deeper chain is indistinguishable from a
+/// mis-resolution and each hop costs a file parse.
+const MAX_HOPS: usize = 8;
+
+/// Hard cap on modules parsed while resolving one binding, so a wide
+/// `export *` fan-out cannot turn one import into an unbounded parse storm.
+const MAX_VISITS: usize = 64;
+
+/// Where an imported binding is defined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedBinding {
+    /// Canonical path of the module that declares the binding.
+    pub file: PathBuf,
+    /// The local symbol the module declares it as (`export default routes` →
+    /// `routes`). `None` when the export has no nameable local binding —
+    /// `export default async (server) => {}` — which is common enough that
+    /// callers must treat identity as file-level and use this only to break
+    /// ties between two bindings resolved to the same file.
+    pub local_name: Option<String>,
+}
+
+/// One module's export table, as written in its source.
+#[derive(Debug, Default, Clone)]
+struct ModuleExports {
+    /// Exported name → the local binding it names in THIS module.
+    local: HashMap<String, Option<String>>,
+    /// Exported name → (module specifier, name inside that module).
+    forwarded: HashMap<String, (String, String)>,
+    /// `export * from "./x"` specifiers, in source order.
+    stars: Vec<String>,
+}
+
+/// Resolver with a per-file export-table cache. Parsing is the expensive part
+/// and barrels are re-read by every importer, so one resolver should be built
+/// per pass and reused across every binding it resolves.
+pub struct BindingResolver {
+    source_map: Lrc<SourceMap>,
+    handler: Handler,
+    exports: HashMap<PathBuf, ModuleExports>,
+}
+
+impl Default for BindingResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BindingResolver {
+    pub fn new() -> Self {
+        let source_map: Lrc<SourceMap> = Default::default();
+        // Quiet, non-colour diagnostics: a barrel that fails to parse is a
+        // resolution miss, not something to shout about mid-scan.
+        let handler =
+            Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(source_map.clone()));
+        Self {
+            source_map,
+            handler,
+            exports: HashMap::new(),
+        }
+    }
+
+    /// Resolve the binding `local_binding` that `importer` imports from
+    /// `specifier` to the module that declares it.
+    ///
+    /// `local_binding` is the name the IMPORTING file uses. Two export names
+    /// are tried against the target module, in order: the binding name itself
+    /// (`import { sessionsRoutes } from "./routes.js"` — the usual named
+    /// import, where local and exported names agree) and then `default`
+    /// (`import sessionsRoutes from "./sessions.routes.js"`). A renaming
+    /// import (`import { a as b }`) is not recoverable from a mount site
+    /// alone and resolves to `None` rather than to a guess.
+    pub fn resolve(
+        &mut self,
+        importer: &Path,
+        specifier: &str,
+        local_binding: &str,
+    ) -> Option<ResolvedBinding> {
+        let target = FileOrchestrator::resolve_relative_import(importer, specifier)?;
+        if local_binding != DEFAULT_EXPORT
+            && let Some(found) = self.follow(&target, local_binding)
+        {
+            return Some(found);
+        }
+        self.follow(&target, DEFAULT_EXPORT)
+    }
+
+    /// Follow `export_name` out of `file` through re-export hops to the
+    /// module that declares it.
+    fn follow(&mut self, file: &Path, export_name: &str) -> Option<ResolvedBinding> {
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        visited.insert(file.to_path_buf());
+        self.follow_inner(file.to_path_buf(), export_name.to_string(), 0, &mut visited)
+    }
+
+    fn follow_inner(
+        &mut self,
+        file: PathBuf,
+        export_name: String,
+        hops: usize,
+        visited: &mut HashSet<PathBuf>,
+    ) -> Option<ResolvedBinding> {
+        if hops > MAX_HOPS || visited.len() > MAX_VISITS {
+            return None;
+        }
+
+        let exports = self.exports_of(&file)?;
+
+        // `export { x as y } from "./m"` — the binding lives one hop away.
+        if let Some((specifier, upstream_name)) = exports.forwarded.get(&export_name).cloned() {
+            let next = FileOrchestrator::resolve_relative_import(&file, &specifier)?;
+            if !visited.insert(next.clone()) {
+                return None; // circular re-export
+            }
+            return self.follow_inner(next, upstream_name, hops + 1, visited);
+        }
+
+        // Declared here.
+        if let Some(local_name) = exports.local.get(&export_name).cloned() {
+            return Some(ResolvedBinding { file, local_name });
+        }
+
+        // `export * from "./m"` re-publishes every NAMED export of the target
+        // but never its default, so a default lookup stops here.
+        if export_name != DEFAULT_EXPORT {
+            for specifier in exports.stars.clone() {
+                let Some(next) = FileOrchestrator::resolve_relative_import(&file, &specifier)
+                else {
+                    continue;
+                };
+                if !visited.insert(next.clone()) {
+                    continue;
+                }
+                if let Some(found) = self.follow_inner(next, export_name.clone(), hops + 1, visited)
+                {
+                    return Some(found);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn exports_of(&mut self, file: &Path) -> Option<&ModuleExports> {
+        if !self.exports.contains_key(file) {
+            let module = parse_file(file, &self.source_map, &self.handler)?;
+            self.exports
+                .insert(file.to_path_buf(), collect_exports(&module));
+        }
+        self.exports.get(file)
+    }
+}
+
+/// Read a module's export table from its AST.
+///
+/// Type-only exports are skipped throughout: they bind nothing at runtime, so
+/// they can never be the plugin or router a mount site registers.
+fn collect_exports(module: &swc_ecma_ast::Module) -> ModuleExports {
+    let mut exports = ModuleExports::default();
+
+    for item in &module.body {
+        let ModuleItem::ModuleDecl(decl) = item else {
+            continue;
+        };
+        match decl {
+            // `export const routes = ...`, `export function f() {}`, `export class C {}`
+            ModuleDecl::ExportDecl(export) => match &export.decl {
+                Decl::Fn(f) => {
+                    let name = f.ident.sym.to_string();
+                    exports.local.insert(name.clone(), Some(name));
+                }
+                Decl::Class(c) => {
+                    let name = c.ident.sym.to_string();
+                    exports.local.insert(name.clone(), Some(name));
+                }
+                Decl::Var(var) => {
+                    for declarator in &var.decls {
+                        if let Pat::Ident(ident) = &declarator.name {
+                            let name = ident.id.sym.to_string();
+                            exports.local.insert(name.clone(), Some(name));
+                        }
+                    }
+                }
+                _ => {}
+            },
+            // `export default function routes() {}`, `export default class C {}`
+            ModuleDecl::ExportDefaultDecl(export) => match &export.decl {
+                DefaultDecl::Fn(f) => {
+                    exports.local.insert(
+                        DEFAULT_EXPORT.to_string(),
+                        f.ident.as_ref().map(|i| i.sym.to_string()),
+                    );
+                }
+                DefaultDecl::Class(c) => {
+                    exports.local.insert(
+                        DEFAULT_EXPORT.to_string(),
+                        c.ident.as_ref().map(|i| i.sym.to_string()),
+                    );
+                }
+                DefaultDecl::TsInterfaceDecl(_) => {}
+            },
+            // `export default routes;`, `export default async (s) => {};`
+            ModuleDecl::ExportDefaultExpr(export) => {
+                let local = match &*export.expr {
+                    Expr::Ident(ident) => Some(ident.sym.to_string()),
+                    _ => None,
+                };
+                exports.local.insert(DEFAULT_EXPORT.to_string(), local);
+            }
+            ModuleDecl::ExportNamed(named) => {
+                if named.type_only {
+                    continue;
+                }
+                match &named.src {
+                    // `export { a as b } from "./m"`, `export { default as X } from "./m"`
+                    Some(src) => {
+                        let specifier = src.value.to_string();
+                        for spec in &named.specifiers {
+                            match spec {
+                                ExportSpecifier::Named(spec) if !spec.is_type_only => {
+                                    let upstream = export_name_string(&spec.orig);
+                                    let exported = spec
+                                        .exported
+                                        .as_ref()
+                                        .map(export_name_string)
+                                        .unwrap_or_else(|| upstream.clone());
+                                    exports
+                                        .forwarded
+                                        .insert(exported, (specifier.clone(), upstream));
+                                }
+                                // `export v from "./m"` — the default under a new name.
+                                ExportSpecifier::Default(spec) => {
+                                    exports.forwarded.insert(
+                                        spec.exported.sym.to_string(),
+                                        (specifier.clone(), DEFAULT_EXPORT.to_string()),
+                                    );
+                                }
+                                // `export * as ns from "./m"` binds a namespace
+                                // OBJECT, not a mountable value; nothing to follow.
+                                _ => {}
+                            }
+                        }
+                    }
+                    // `export { routes as default }`, `export { router }` — local.
+                    None => {
+                        for spec in &named.specifiers {
+                            if let ExportSpecifier::Named(spec) = spec
+                                && !spec.is_type_only
+                            {
+                                let local = export_name_string(&spec.orig);
+                                let exported = spec
+                                    .exported
+                                    .as_ref()
+                                    .map(export_name_string)
+                                    .unwrap_or_else(|| local.clone());
+                                exports.local.insert(exported, Some(local));
+                            }
+                        }
+                    }
+                }
+            }
+            ModuleDecl::ExportAll(export) if !export.type_only => {
+                exports.stars.push(export.src.value.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    exports
+}
+
+fn export_name_string(name: &ModuleExportName) -> String {
+    match name {
+        ModuleExportName::Ident(ident) => ident.sym.to_string(),
+        ModuleExportName::Str(s) => s.value.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Write a small module tree and return its canonicalized root.
+    fn workspace(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (relative, content) in files {
+            let path = dir.path().join(relative);
+            fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            fs::write(&path, content).expect("write");
+        }
+        let root = dir.path().canonicalize().expect("canonicalize root");
+        (dir, root)
+    }
+
+    #[test]
+    fn resolves_default_reexport_through_a_barrel_to_its_own_module() {
+        let (_dir, root) = workspace(&[
+            (
+                "src/routes.ts",
+                r#"
+export { default as sessionsRoutes } from "./modules/sessions/sessions.routes.js";
+export { default as logsRoutes } from "./modules/logs/logs.routes.js";
+"#,
+            ),
+            (
+                "src/modules/sessions/sessions.routes.ts",
+                "const routes = async (server) => {};\nexport default routes;\n",
+            ),
+            (
+                "src/modules/logs/logs.routes.ts",
+                "const logsRoutes = async (server) => {};\nexport default logsRoutes;\n",
+            ),
+            (
+                "src/plugin.ts",
+                "import { sessionsRoutes } from './routes.js';\n",
+            ),
+        ]);
+
+        let mut resolver = BindingResolver::new();
+        let importer = root.join("src/plugin.ts");
+
+        let sessions = resolver
+            .resolve(&importer, "./routes.js", "sessionsRoutes")
+            .expect("sessionsRoutes resolves");
+        assert_eq!(
+            sessions.file,
+            root.join("src/modules/sessions/sessions.routes.ts")
+        );
+        assert_eq!(sessions.local_name.as_deref(), Some("routes"));
+
+        let logs = resolver
+            .resolve(&importer, "./routes.js", "logsRoutes")
+            .expect("logsRoutes resolves");
+        assert_eq!(logs.file, root.join("src/modules/logs/logs.routes.ts"));
+        assert_eq!(logs.local_name.as_deref(), Some("logsRoutes"));
+    }
+
+    #[test]
+    fn resolves_renaming_reexport_and_star_barrel() {
+        let (_dir, root) = workspace(&[
+            (
+                "src/index.ts",
+                r#"
+export { router as userRouter } from "./users.js";
+export * from "./health.js";
+"#,
+            ),
+            ("src/users.ts", "export const router = 1;\n"),
+            ("src/health.ts", "export const healthRouter = 1;\n"),
+            ("src/app.ts", "import { userRouter } from './index.js';\n"),
+        ]);
+
+        let mut resolver = BindingResolver::new();
+        let importer = root.join("src/app.ts");
+
+        let user = resolver
+            .resolve(&importer, "./index.js", "userRouter")
+            .expect("renamed re-export resolves");
+        assert_eq!(user.file, root.join("src/users.ts"));
+        assert_eq!(user.local_name.as_deref(), Some("router"));
+
+        let health = resolver
+            .resolve(&importer, "./index.js", "healthRouter")
+            .expect("star re-export resolves");
+        assert_eq!(health.file, root.join("src/health.ts"));
+        assert_eq!(health.local_name.as_deref(), Some("healthRouter"));
+    }
+
+    #[test]
+    fn resolves_direct_default_import_without_a_barrel() {
+        let (_dir, root) = workspace(&[
+            (
+                "src/modules/a.routes.ts",
+                "const routes = async (server) => {};\nexport default routes;\n",
+            ),
+            (
+                "src/plugin.ts",
+                "import aRoutes from './modules/a.routes.js';\n",
+            ),
+        ]);
+
+        let mut resolver = BindingResolver::new();
+        let binding = resolver
+            .resolve(
+                &root.join("src/plugin.ts"),
+                "./modules/a.routes.js",
+                "aRoutes",
+            )
+            .expect("default import resolves");
+        assert_eq!(binding.file, root.join("src/modules/a.routes.ts"));
+        assert_eq!(binding.local_name.as_deref(), Some("routes"));
+    }
+
+    #[test]
+    fn anonymous_default_export_resolves_to_the_file_with_no_local_name() {
+        let (_dir, root) = workspace(&[
+            ("src/a.routes.ts", "export default async (server) => {};\n"),
+            ("src/plugin.ts", "import aRoutes from './a.routes.js';\n"),
+        ]);
+
+        let mut resolver = BindingResolver::new();
+        let binding = resolver
+            .resolve(&root.join("src/plugin.ts"), "./a.routes.js", "aRoutes")
+            .expect("anonymous default resolves to its file");
+        assert_eq!(binding.file, root.join("src/a.routes.ts"));
+        assert_eq!(binding.local_name, None);
+    }
+
+    #[test]
+    fn star_reexport_does_not_carry_default_and_cycles_terminate() {
+        let (_dir, root) = workspace(&[
+            ("src/a.ts", "export * from \"./b.js\";\n"),
+            (
+                "src/b.ts",
+                "export * from \"./a.js\";\nconst r = 1;\nexport default r;\n",
+            ),
+            ("src/app.ts", "import x from './a.js';\n"),
+        ]);
+
+        let mut resolver = BindingResolver::new();
+        assert_eq!(
+            resolver.resolve(&root.join("src/app.ts"), "./a.js", "x"),
+            None,
+            "`export *` must not republish a default, and the cycle must terminate"
+        );
+    }
+
+    #[test]
+    fn non_relative_specifier_is_out_of_scope() {
+        let (_dir, root) = workspace(&[("src/app.ts", "import x from '@acme/routes';\n")]);
+        let mut resolver = BindingResolver::new();
+        assert_eq!(
+            resolver.resolve(&root.join("src/app.ts"), "@acme/routes", "x"),
+            None
+        );
+    }
+
+    #[test]
+    fn type_only_reexport_binds_nothing() {
+        let (_dir, root) = workspace(&[
+            (
+                "src/index.ts",
+                "export type { Routes } from \"./types.js\";\n",
+            ),
+            ("src/types.ts", "export type Routes = string;\n"),
+            ("src/app.ts", "import { Routes } from './index.js';\n"),
+        ]);
+
+        let mut resolver = BindingResolver::new();
+        assert_eq!(
+            resolver.resolve(&root.join("src/app.ts"), "./index.js", "Routes"),
+            None
+        );
+    }
+}
