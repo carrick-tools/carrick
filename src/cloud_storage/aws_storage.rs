@@ -566,6 +566,9 @@ impl CloudStorage for AwsStorage {
                     compat_verdicts: None,
                     capture_stub: None,
                     external_call_candidates: None,
+                    sdk_surface: None,
+                    sdk_edges: None,
+                    sdk_unresolved: None,
                 };
                 repo_s3_urls.insert(adjacent.repo.clone(), adjacent.s3_url);
                 all_repo_data.push(repo_data);

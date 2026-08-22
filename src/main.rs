@@ -25,6 +25,8 @@ mod oidc;
 mod operation;
 mod packages;
 mod parser;
+mod sdk_edges;
+mod sdk_surface;
 mod services;
 mod signature_pass;
 mod socket_io;

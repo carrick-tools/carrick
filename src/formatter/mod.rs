@@ -107,7 +107,11 @@ pub fn format_analysis_results(
     ));
     output.push_str("\n\n");
 
-    output.push_str(&format_pr_delta(pr_delta, &categorized.missing_keys()));
+    output.push_str(&format_pr_delta(
+        pr_delta,
+        &categorized.missing_keys(),
+        &result.sdk_edges,
+    ));
 
     output.push_str(&format!(
         "Indexed **{} endpoints** and **{} cross-service calls**.\n\n",
@@ -152,6 +156,13 @@ pub fn format_analysis_results(
         ));
         output.push_str("\n\n");
     }
+    if !result.sdk_edges.is_empty() || !result.sdk_unresolved.is_empty() {
+        output.push_str(&format_sdk_section(
+            &result.sdk_edges,
+            &result.sdk_unresolved,
+        ));
+        output.push_str("\n\n");
+    }
     if !result.verified_endpoints.is_empty() {
         output.push_str(&format_verified_section(&result.verified_endpoints));
         output.push_str("\n\n");
@@ -166,7 +177,11 @@ pub fn format_analysis_results(
 /// when there is no prior index to diff against, or when nothing changed.
 /// A removed endpoint whose (method, path) still shows up as a missing
 /// endpoint is flagged — the PR deletes a producer something still calls.
-fn format_pr_delta(pr_delta: Option<&PrDelta>, still_missing: &[(String, String)]) -> String {
+fn format_pr_delta(
+    pr_delta: Option<&PrDelta>,
+    still_missing: &[(String, String)],
+    sdk_edges: &[crate::cloud_storage::SdkEdge],
+) -> String {
     let Some(delta) = pr_delta else {
         return String::new();
     };
@@ -187,9 +202,12 @@ fn format_pr_delta(pr_delta: Option<&PrDelta>, still_missing: &[(String, String)
             .iter()
             .any(|(method, path)| endpoints_overlap(&ep.method, &ep.path, method, path))
         {
-            " — ⚠ still consumed"
+            " — ⚠ still consumed".to_string()
         } else {
-            ""
+            // A consumer that reaches this route through a published client
+            // writes no URL, so it can never appear as a missing endpoint.
+            // The SDK edge is the only evidence the route still has a caller.
+            sdk_consumers_of(&ep.method, &ep.path, sdk_edges)
         };
         output.push_str(&format!(
             "- Removed `{} {}`{}{}\n",
@@ -348,7 +366,7 @@ fn format_no_issues(
         "> [!TIP]\n> All cross-service calls match the indexed contracts across {}.\n\n",
         topology.scope_phrase()
     ));
-    output.push_str(&format_pr_delta(pr_delta, &[]));
+    output.push_str(&format_pr_delta(pr_delta, &[], &result.sdk_edges));
     output.push_str(&format!(
         "Indexed **{} endpoints** and **{} cross-service calls**.\n\n",
         result.endpoints.len(),
@@ -358,11 +376,155 @@ fn format_no_issues(
         &result.detected_graphql_libraries,
         result.graphql_operations_indexed,
     ));
+    if !result.sdk_edges.is_empty() || !result.sdk_unresolved.is_empty() {
+        output.push_str(&format_sdk_section(
+            &result.sdk_edges,
+            &result.sdk_unresolved,
+        ));
+        output.push_str("\n\n");
+    }
     if !result.verified_endpoints.is_empty() {
         output.push_str(&format_verified_section(&result.verified_endpoints));
         output.push_str("\n\n");
     }
     output.push_str("<!-- CARRICK_OUTPUT_END -->\n");
+    output
+}
+
+/// The " still consumed via `<package>` by `<consumer>`" marker for a removed
+/// endpoint that an SDK edge still points at, or an empty string.
+///
+/// Route comparison defers to [`endpoints_overlap`] so this flag and the
+/// direct one agree on what a param segment is: the removed side carries
+/// declared param names (`/orders/:id`) while an SDK edge's `producer_key`
+/// carries the producer's own resolved path, and literal equality would miss
+/// every parameterized route.
+fn sdk_consumers_of(
+    method: &str,
+    path: &str,
+    sdk_edges: &[crate::cloud_storage::SdkEdge],
+) -> String {
+    let mut packages: BTreeSet<&str> = BTreeSet::new();
+    let mut consumers: BTreeSet<&str> = BTreeSet::new();
+    for edge in sdk_edges {
+        let Some((edge_method, edge_path)) = http_route(&edge.producer_key) else {
+            continue;
+        };
+        if endpoints_overlap(method, path, edge_method, edge_path) {
+            packages.insert(&edge.package);
+            consumers.insert(&edge.consumer_repo);
+        }
+    }
+    if packages.is_empty() {
+        return String::new();
+    }
+    let render = |names: BTreeSet<&str>| {
+        join_human(
+            &names
+                .into_iter()
+                .map(|name| format!("`{}`", code_span(name)))
+                .collect::<Vec<_>>(),
+        )
+    };
+    format!(
+        " — ⚠ still consumed via {} by {}",
+        render(packages),
+        render(consumers)
+    )
+}
+
+/// Split an `OperationKey::canonical()` into `(METHOD, path)`, for HTTP keys
+/// only — a GraphQL or socket key names no route.
+fn http_route(producer_key: &str) -> Option<(&str, &str)> {
+    let mut parts = producer_key.splitn(3, '|');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("http"), Some(method), Some(path)) => Some((method, path)),
+        _ => None,
+    }
+}
+
+/// The collapsed "Consumers via SDK" block: who reaches this project's
+/// endpoints through a published npm client rather than over a URL.
+///
+/// These pairs are invisible to the direct matcher by construction — the
+/// consumer's source contains no route at all — so the section exists to make
+/// the relationship visible, not to flag anything. Unresolved calls are
+/// reported as one honest line rather than being left out: "this package is
+/// called and nothing is known about where those calls land" is a different
+/// statement from "there are no such calls".
+fn format_sdk_section(
+    edges: &[crate::cloud_storage::SdkEdge],
+    unresolved: &[crate::cloud_storage::SdkUnresolved],
+) -> String {
+    let mut output = format!(
+        "<details>\n<summary><strong>Consumers via SDK ({})</strong></summary>\n\n",
+        edges.len()
+    );
+    output.push_str(
+        "> Calls that reach an indexed endpoint through a published client rather than a \
+         URL the caller writes.\n\n",
+    );
+
+    if edges.is_empty() {
+        output.push_str("No SDK call resolved to an indexed endpoint.\n\n");
+    } else {
+        output.push_str(
+            "| Consumer | Call site | Through | Endpoint | Types |\n\
+             | :--- | :--- | :--- | :--- | :--- |\n",
+        );
+        for edge in edges {
+            let endpoint = match http_route(&edge.producer_key) {
+                Some((method, path)) => format!("`{} {}`", code_span(method), code_span(path)),
+                None => format!("`{}`", code_span(&edge.producer_key)),
+            };
+            let verdict = match edge.type_compatible {
+                Some(true) => "compatible".to_string(),
+                Some(false) => format!(
+                    "incompatible: {}",
+                    code_span(
+                        edge.mismatch_reason
+                            .as_deref()
+                            .unwrap_or("no reason recorded")
+                    )
+                ),
+                None => "not compared".to_string(),
+            };
+            output.push_str(&format!(
+                "| `{}` | `{}` | `{}` → `{}` | {} (`{}`) | {} |\n",
+                code_span(&edge.consumer_repo),
+                code_span(&edge.consumer_location),
+                code_span(&edge.callee),
+                code_span(&edge.package),
+                endpoint,
+                code_span(&edge.producer_repo),
+                verdict
+            ));
+        }
+        output.push('\n');
+    }
+
+    if !unresolved.is_empty() {
+        let total: usize = unresolved.iter().map(|entry| entry.count).sum();
+        let reasons: Vec<String> = unresolved
+            .iter()
+            .map(|entry| {
+                format!(
+                    "`{}` ×{} {}",
+                    code_span(&entry.package),
+                    entry.count,
+                    code_span(&entry.reason)
+                )
+            })
+            .collect();
+        output.push_str(&format!(
+            "{} SDK call{} could not be resolved to an endpoint: {}.\n\n",
+            total,
+            plural(total),
+            join_human(&reasons)
+        ));
+    }
+
+    output.push_str("</details>");
     output
 }
 
@@ -983,6 +1145,165 @@ mod tests {
         }
     }
 
+    fn sdk_edge(producer_key: &str) -> crate::cloud_storage::SdkEdge {
+        crate::cloud_storage::SdkEdge {
+            consumer_repo: "checkout".to_string(),
+            consumer_location: "src/checkout.ts:42".to_string(),
+            package: "@fixture/ledger-sdk".to_string(),
+            import_symbol: Some("default".to_string()),
+            callee: "ledger.payments.create".to_string(),
+            sdk_repo: "ledger-sdk".to_string(),
+            sdk_member: "payments.create".to_string(),
+            sdk_location: "src/resources/payments.ts:28".to_string(),
+            producer_repo: "payments-api".to_string(),
+            producer_key: producer_key.to_string(),
+            type_compatible: Some(true),
+            mismatch_reason: None,
+            scanner_version: "0.0.0-test".to_string(),
+        }
+    }
+
+    fn result_with_sdk(
+        edges: Vec<crate::cloud_storage::SdkEdge>,
+        unresolved: Vec<crate::cloud_storage::SdkUnresolved>,
+    ) -> ApiAnalysisResult {
+        let mut result = result_with(vec![]);
+        result.sdk_edges = edges;
+        result.sdk_unresolved = unresolved;
+        result
+    }
+
+    /// The section states the whole relationship on one row: who calls, from
+    /// where, through what, onto which endpoint, and what the types say.
+    #[test]
+    fn sdk_section_lists_each_edge_end_to_end() {
+        let output = format_analysis_results(
+            result_with_sdk(vec![sdk_edge("http|POST|/v1/payments")], vec![]),
+            &topology_baseline(),
+            None,
+        );
+
+        assert!(output.contains("<summary><strong>Consumers via SDK (1)</strong></summary>"));
+        assert!(output.contains("| `checkout` | `src/checkout.ts:42` | `ledger.payments.create` \u{2192} `@fixture/ledger-sdk` | `POST /v1/payments` (`payments-api`) | compatible |"));
+    }
+
+    /// A pair the compiler never compared must not read as compatible.
+    #[test]
+    fn sdk_section_reports_an_unevaluated_pair_as_not_compared() {
+        let mut edge = sdk_edge("http|POST|/v1/payments");
+        edge.type_compatible = None;
+        let output = format_analysis_results(
+            result_with_sdk(vec![edge], vec![]),
+            &topology_baseline(),
+            None,
+        );
+        assert!(output.contains("| not compared |"));
+        assert!(!output.contains("| compatible |"));
+    }
+
+    /// "There are no such calls" and "this package is called and nothing is
+    /// known about where those calls land" are different statements.
+    #[test]
+    fn sdk_section_reports_unresolved_calls_with_their_reasons() {
+        let output = format_analysis_results(
+            result_with_sdk(
+                vec![],
+                vec![
+                    crate::cloud_storage::SdkUnresolved {
+                        package: "@fixture/ledger-sdk".to_string(),
+                        count: 3,
+                        reason: "member_not_found".to_string(),
+                    },
+                    crate::cloud_storage::SdkUnresolved {
+                        package: "@vendor/mailer".to_string(),
+                        count: 1,
+                        reason: "no_sdk_repo_in_project".to_string(),
+                    },
+                ],
+            ),
+            &topology_baseline(),
+            None,
+        );
+
+        assert!(output.contains("<summary><strong>Consumers via SDK (0)</strong></summary>"));
+        assert!(output.contains("No SDK call resolved to an indexed endpoint."));
+        assert!(output.contains(
+            "4 SDK calls could not be resolved to an endpoint: `@fixture/ledger-sdk` \u{00d7}3 \
+             member_not_found and `@vendor/mailer` \u{00d7}1 no_sdk_repo_in_project."
+        ));
+    }
+
+    /// A consumer reaching a route through a published client writes no URL,
+    /// so it can never appear as a missing endpoint — the SDK edge is the only
+    /// evidence the removed route still has a caller.
+    #[test]
+    fn test_pr_delta_flags_a_removed_endpoint_still_consumed_via_an_sdk() {
+        let delta = PrDelta {
+            new_endpoints: vec![],
+            removed_endpoints: vec![EndpointRef {
+                method: "POST".to_string(),
+                path: "/v1/payments".to_string(),
+                service: None,
+            }],
+        };
+        let output = format_analysis_results(
+            result_with_sdk(vec![sdk_edge("http|POST|/v1/payments")], vec![]),
+            &topology_baseline(),
+            Some(&delta),
+        );
+
+        assert!(output.contains(
+            "- Removed `POST /v1/payments` \u{2014} \u{26a0} still consumed via \
+             `@fixture/ledger-sdk` by `checkout`"
+        ));
+    }
+
+    /// The SDK marker reuses the param-aware route join, so a producer key
+    /// carrying `:paymentId` still flags a removal declared as `:id`.
+    #[test]
+    fn sdk_still_consumed_marker_is_param_aware() {
+        let delta = PrDelta {
+            new_endpoints: vec![],
+            removed_endpoints: vec![EndpointRef {
+                method: "POST".to_string(),
+                path: "/v1/payments/:id/refunds".to_string(),
+                service: None,
+            }],
+        };
+        let output = format_analysis_results(
+            result_with_sdk(
+                vec![sdk_edge("http|POST|/v1/payments/:paymentId/refunds")],
+                vec![],
+            ),
+            &topology_baseline(),
+            Some(&delta),
+        );
+
+        assert!(output.contains("still consumed via `@fixture/ledger-sdk` by `checkout`"));
+    }
+
+    /// A non-HTTP producer key names no route, so it can never flag a removed
+    /// HTTP endpoint.
+    #[test]
+    fn sdk_marker_ignores_non_http_producer_keys() {
+        let delta = PrDelta {
+            new_endpoints: vec![],
+            removed_endpoints: vec![EndpointRef {
+                method: "POST".to_string(),
+                path: "/v1/payments".to_string(),
+                service: None,
+            }],
+        };
+        let output = format_analysis_results(
+            result_with_sdk(vec![sdk_edge("graphql|query|payments")], vec![]),
+            &topology_baseline(),
+            Some(&delta),
+        );
+
+        assert!(output.contains("- Removed `POST /v1/payments`\n"));
+        assert!(!output.contains("still consumed"));
+    }
+
     fn result_with(findings: Vec<Finding>) -> ApiAnalysisResult {
         ApiAnalysisResult {
             endpoints: vec![],
@@ -990,6 +1311,8 @@ mod tests {
             findings,
             dependency_conflicts: vec![],
             verified_endpoints: vec![],
+            sdk_edges: Vec::new(),
+            sdk_unresolved: Vec::new(),
             detected_graphql_libraries: vec![],
             graphql_operations_indexed: false,
             cross_repo_matches: vec![],

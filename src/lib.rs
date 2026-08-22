@@ -25,6 +25,8 @@ pub mod oidc;
 pub mod operation;
 pub mod packages;
 pub mod parser;
+pub mod sdk_edges;
+pub mod sdk_surface;
 pub mod services;
 pub mod signature_pass;
 pub mod socket_io;

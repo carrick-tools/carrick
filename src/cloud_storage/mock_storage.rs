@@ -115,6 +115,9 @@ impl CloudStorage for MockStorage {
                     compat_verdicts: None,
                     capture_stub: None,
                     external_call_candidates: None,
+                    sdk_surface: None,
+                    sdk_edges: None,
+                    sdk_unresolved: None,
                 },
                 CloudRepoData {
                     repo_name: "repo-b".to_string(),
@@ -143,6 +146,9 @@ impl CloudStorage for MockStorage {
                     compat_verdicts: None,
                     capture_stub: None,
                     external_call_candidates: None,
+                    sdk_surface: None,
+                    sdk_edges: None,
+                    sdk_unresolved: None,
                 },
             ];
             result.extend(mock_repos);

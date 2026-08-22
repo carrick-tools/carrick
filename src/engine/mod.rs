@@ -423,6 +423,17 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         Vec::new()
     };
 
+    // Same reason as above: project what the SDK-edge join reads before the
+    // blobs move into the analyzer. Its other input — the `CrossRepoMatch`
+    // edges — only exists after the analysis runs, so the two halves cannot be
+    // gathered in one place. Peers are every blob in the run (any of them can
+    // be the publisher); consumers are the current services only, because an
+    // edge is stored on the consumer's blob and this run writes only its own.
+    let sdk_join_input = crate::sdk_edges::SdkJoinInput::collect(
+        all_repo_data.iter().chain(current_services_data.iter()),
+        current_services_data.iter(),
+    );
+
     let sp = logging::spinner("Running cross-repo analysis...");
     let analyzer =
         match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar).await {
@@ -444,7 +455,25 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         };
     logging::finish_spinner(&sp, "Cross-repo analysis complete");
 
-    let results = analyzer.get_results();
+    let mut results = analyzer.get_results();
+
+    // 6a. Resolve this run's SDK-mediated consumer edges: consumer candidate →
+    //     the publishing repo's exported member → the producer endpoint that
+    //     member's own outbound call already matched. Nothing new is matched
+    //     here (see `crate::sdk_edges`); the edges the analyzer just produced
+    //     are read, and the result is its own relationship, never folded back
+    //     into `endpoints`/`calls`. Computed outside the upload branch because
+    //     the PR comment renders them and a PR run never uploads.
+    let sdk_join = crate::sdk_edges::join(&sdk_join_input, &results.cross_repo_matches);
+    if !sdk_join.is_empty() {
+        debug!(
+            "SDK edges: {} resolved, {} unresolved group(s)",
+            sdk_join.edges().len(),
+            sdk_join.unresolved().len()
+        );
+    }
+    results.sdk_edges = sdk_join.edges().to_vec();
+    results.sdk_unresolved = sdk_join.unresolved();
 
     // Eval harness output mode: emit a machine-readable projection of the
     // results and skip the human Markdown report + PR-comment relay. Consumed
@@ -469,6 +498,9 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     //     which the cloud reads as "not compared" (fail closed, #324).
     if let Some(mut payloads) = upload_payloads {
         crate::cloud_storage::attach_compat_verdicts(&mut payloads, &results.cross_repo_matches);
+        // SDK edges ride along on the same terms as the verdicts: small,
+        // consumer-side, canonical-keyed, and attached before the size guard.
+        crate::sdk_edges::attach_sdk_edges(&mut payloads, &sdk_join);
         // The size guard already ran once inside strip_ast_nodes, but the
         // verdicts were appended after it — re-apply so a payload that was
         // near the cap can't be re-inflated past it and 413 the upload
@@ -1158,6 +1190,7 @@ async fn analyze_current_repo_incremental(
                 &merged_results,
             );
             attach_external_call_candidates(&mut cloud_data, repo_path, &files, config);
+            attach_sdk_surface(&mut cloud_data, repo_path, config);
 
             // Populate cache fields
             let mut cached_file_results = merged_results.clone();
@@ -2317,6 +2350,14 @@ fn relativize_cloud_paths(cloud_data: &mut CloudRepoData, repo_path: &str) {
             candidate.file = repo_relative(&candidate.file, repo_path);
         }
     }
+
+    // Published SDK members, same story: the walker strips the root it was
+    // given, and the sweep holds the invariant if it ever cannot.
+    if let Some(members) = cloud_data.sdk_surface.as_mut() {
+        for member in members {
+            member.file = repo_relative(&member.file, repo_path);
+        }
+    }
 }
 
 /// Repo-relative paths for cloud-bound function definitions. The scan runs
@@ -2407,6 +2448,28 @@ fn attach_external_call_candidates(
     }
 }
 
+/// Compute the callable surface this service publishes as an npm package and
+/// attach it to the payload (carrick#466).
+///
+/// Deterministic and AST-only, and empty for the overwhelming majority of
+/// services — a repo that publishes no client library resolves an entry module
+/// whose exports reach no class or object literal, and contributes nothing.
+/// Absent rather than empty in that case, the same convention
+/// `external_call_candidates` follows: a peer with `None` predates the
+/// channel, and the join says so.
+fn attach_sdk_surface(cloud_data: &mut CloudRepoData, repo_path: &str, config: &Config) {
+    let repo_root = std::path::Path::new(repo_path);
+    let members = crate::sdk_surface::scan(repo_root, &service_scan_root(repo_path, config));
+    debug!(
+        "SDK surface: {} member(s) for {}",
+        members.len(),
+        cloud_data.repo_name
+    );
+    if !members.is_empty() {
+        cloud_data.sdk_surface = Some(members);
+    }
+}
+
 /// Build `CloudRepoData` from a mount graph (used by the incremental path).
 fn build_cloud_data_from_mount_graph(
     repo_name: &str,
@@ -2478,6 +2541,9 @@ fn build_cloud_data_from_mount_graph(
         compat_verdicts: None,
         capture_stub: None,
         external_call_candidates: None,
+        sdk_surface: None,
+        sdk_edges: None,
+        sdk_unresolved: None,
     }
 }
 
@@ -3417,6 +3483,7 @@ async fn analyze_current_repo(
         &analysis_result.file_results,
     );
     attach_external_call_candidates(&mut cloud_data, repo_path, &files, config);
+    attach_sdk_surface(&mut cloud_data, repo_path, config);
 
     let mut manifest_entries =
         build_type_manifest_entries(&analysis_result.mount_graph, config, repo_path);
@@ -3939,6 +4006,15 @@ mod tests {
                 import_symbol: None,
                 subpath: None,
             }]),
+            sdk_surface: Some(vec![crate::sdk_surface::SdkMember {
+                export: "default".to_string(),
+                chain: "payments.create".to_string(),
+                file: abs("src/resources/payments.ts"),
+                line: 28,
+                end_line: 33,
+            }]),
+            sdk_edges: None,
+            sdk_unresolved: None,
         };
 
         relativize_cloud_paths(&mut data, repo_path);
@@ -4066,6 +4142,9 @@ mod tests {
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
+            sdk_surface: None,
+            sdk_edges: None,
+            sdk_unresolved: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -4109,6 +4188,9 @@ mod tests {
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
+            sdk_surface: None,
+            sdk_edges: None,
+            sdk_unresolved: None,
         }];
 
         // Test Config merging
@@ -4189,6 +4271,9 @@ mod tests {
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
+            sdk_surface: None,
+            sdk_edges: None,
+            sdk_unresolved: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -4787,6 +4872,9 @@ mod tests {
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
+            sdk_surface: None,
+            sdk_edges: None,
+            sdk_unresolved: None,
         };
 
         let stripped = strip_ast_nodes(data);
@@ -4833,6 +4921,9 @@ mod tests {
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
+            sdk_surface: None,
+            sdk_edges: None,
+            sdk_unresolved: None,
         };
 
         let stripped = strip_ast_nodes(data);
@@ -4882,6 +4973,9 @@ mod tests {
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
+            sdk_surface: None,
+            sdk_edges: None,
+            sdk_unresolved: None,
         };
 
         // Size the file_results filler so the payload lands just UNDER the 5MB
@@ -5094,6 +5188,9 @@ mod tests {
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
+            sdk_surface: None,
+            sdk_edges: None,
+            sdk_unresolved: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -5161,6 +5258,9 @@ mod tests {
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
+            sdk_surface: None,
+            sdk_edges: None,
+            sdk_unresolved: None,
         };
 
         attach_external_call_candidates(&mut data, &fixture_str, &files, &service);
@@ -5255,6 +5355,9 @@ mod tests {
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
+            sdk_surface: None,
+            sdk_edges: None,
+            sdk_unresolved: None,
         };
 
         attach_external_call_candidates(&mut data, &fixture_str, &files, &service);
@@ -5357,6 +5460,9 @@ mod tests {
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
+            sdk_surface: None,
+            sdk_edges: None,
+            sdk_unresolved: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -7664,6 +7770,9 @@ mod tests {
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
+            sdk_surface: None,
+            sdk_edges: None,
+            sdk_unresolved: None,
         }
     }
 }
