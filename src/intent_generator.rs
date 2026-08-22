@@ -10,8 +10,9 @@
 //! definitions so that source code is not uploaded to AWS. The intent
 //! serves as the index; GitHub is the source of truth for code.
 
-use crate::agent_service::AgentService;
+use crate::agent_service::{AgentCallError, AgentService, rate_limit_tripped};
 use crate::visitor::{FunctionCallRef, FunctionDefinition, ImportedSymbol};
+use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, warn};
@@ -142,6 +143,76 @@ fn is_local_callee(caller_key: &str, body: &str, candidate_key: &str) -> bool {
         }
 }
 
+/// A cache-miss function awaiting its `/generate-intent` call: everything the
+/// payload needs, plus the content hash to persist if the call succeeds.
+struct Pending {
+    name: String,
+    body: String,
+    called_intents: Vec<String>,
+    hash: String,
+}
+
+/// Concurrent `/generate-intent` calls in flight per dependency level when
+/// `CARRICK_INTENT_CONCURRENCY` is unset.
+///
+/// Deliberately below the shared `CARRICK_CONCURRENCY_LIMIT` (20) that file
+/// analysis runs at. Intent calls outnumber file-analysis calls by an order of
+/// magnitude on a function-dense repo — roughly one per function rather than
+/// one per file — so the same in-flight count is a far higher sustained
+/// request rate against the same backend quota, which is what produced the
+/// 429-wrapped 503s in #460.
+const DEFAULT_INTENT_CONCURRENCY: usize = 8;
+
+/// In-flight `/generate-intent` calls allowed per level.
+///
+/// `CARRICK_INTENT_CONCURRENCY` overrides the default. Raising it above
+/// `CARRICK_CONCURRENCY_LIMIT` has no effect: `AgentService` holds a semaphore
+/// at that count, so it is the hard ceiling for every lambda call.
+fn intent_concurrency() -> usize {
+    std::env::var("CARRICK_INTENT_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_INTENT_CONCURRENCY)
+        .max(1)
+}
+
+/// Dispatch one dependency level's calls at most `concurrency` at a time,
+/// returning each `Pending` paired with its own result **in input order**.
+///
+/// Completion order under `buffer_unordered` is arbitrary — a slow call
+/// finishes after ones queued behind it. Results are therefore carried
+/// alongside the `Pending` that produced them and re-sorted by input position,
+/// so neither the fold nor any future caller can associate an intent with the
+/// wrong function, and a re-run over the same level produces the same sequence
+/// regardless of backend timing.
+async fn generate_level<F, Fut>(
+    pending: Vec<Pending>,
+    concurrency: usize,
+    call: F,
+) -> Vec<(Pending, Result<String, AgentCallError>)>
+where
+    F: Fn(Pending) -> Fut,
+    Fut: std::future::Future<Output = (Pending, Result<String, AgentCallError>)>,
+{
+    let mut results: Vec<(usize, Pending, Result<String, AgentCallError>)> =
+        futures::stream::iter(pending.into_iter().enumerate().map(|(idx, item)| {
+            let fut = call(item);
+            async move {
+                let (item, result) = fut.await;
+                (idx, item, result)
+            }
+        }))
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+
+    results.sort_by_key(|(idx, _, _)| *idx);
+    results
+        .into_iter()
+        .map(|(_, item, result)| (item, result))
+        .collect()
+}
+
 /// Generate intents for every function with a non-trivial body source,
 /// regardless of export status. The only exclusion is a trivial body
 /// (single line, at most [`TRIVIAL_BODY_MAX_CHARS`] chars), which keeps
@@ -269,15 +340,9 @@ pub async fn generate_function_intents(
     let mut reused = 0usize;
     let mut generated = 0usize;
 
-    for level in &levels {
+    for (level_idx, level) in levels.iter().enumerate() {
         // Compute each function's called_intents context and content hash, then
         // split into cache hits (reuse) and misses (call the lambda).
-        struct Pending {
-            name: String,
-            body: String,
-            called_intents: Vec<String>,
-            hash: String,
-        }
         let mut to_generate: Vec<Pending> = Vec::new();
 
         for name in level {
@@ -319,25 +384,36 @@ pub async fn generate_function_intents(
             }
         }
 
-        // Run all cache-miss lambda calls for this level in parallel.
-        let futures: Vec<_> = to_generate
-            .iter()
-            .map(|pending| async move {
-                let payload = serde_json::json!({
-                    "name": pending.name,
-                    "body": pending.body,
-                    "called_intents": pending.called_intents,
-                });
-                let result = agent_service
-                    .post_to_lambda("/generate-intent", &payload, &pending.name)
-                    .await;
-                (pending.name.clone(), pending.hash.clone(), result)
-            })
-            .collect();
+        if to_generate.is_empty() {
+            continue;
+        }
 
-        let results = futures::future::join_all(futures).await;
+        // Run this level's cache-miss lambda calls with bounded concurrency
+        // (#460). Every call in a level is independent, so the old unbounded
+        // `join_all` queued the whole level at once; on a function-dense repo
+        // that is thousands of simultaneous requests, and the backend answers
+        // the overflow with a 429-wrapped 503 that costs those functions their
+        // intents.
+        let attempted = to_generate.len();
+        let outcomes = generate_level(to_generate, intent_concurrency(), |pending| async move {
+            let payload = serde_json::json!({
+                "name": pending.name,
+                "body": pending.body,
+                "called_intents": pending.called_intents,
+            });
+            let result = agent_service
+                .post_to_lambda("/generate-intent", &payload, &pending.name)
+                .await;
+            (pending, result)
+        })
+        .await;
 
-        for (name, hash, result) in results {
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        let mut aborted = 0usize;
+
+        for (pending, result) in outcomes {
+            let Pending { name, hash, .. } = pending;
             match result {
                 Ok(intent) => {
                     let intent = intent.trim().to_string();
@@ -345,6 +421,7 @@ pub async fn generate_function_intents(
                         hashes.insert(name.clone(), hash);
                         intents.insert(name, intent);
                         generated += 1;
+                        succeeded += 1;
                     } else {
                         // Empty or over-long response: drop it. The function
                         // keeps `intent = None`, so it (and its callers) retry
@@ -355,12 +432,56 @@ pub async fn generate_function_intents(
                             name,
                             intent.len()
                         );
+                        failed += 1;
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to generate intent for {}: {}", name, e);
+                    // Degrade gracefully: no intent and no content hash is
+                    // written, so the next scan retries exactly this function
+                    // and replays the rest from cache.
+                    if e.is_quota_abort() {
+                        aborted += 1;
+                    } else {
+                        warn!("Failed to generate intent for {}: {}", name, e);
+                        failed += 1;
+                    }
                 }
             }
+        }
+
+        // One line per level that actually called out, so a degraded scan is
+        // visible as a number rather than as N scattered warnings.
+        // Aborts are named only when they happened, but they must be named:
+        // without them `attempted` would not equal succeeded + failed and the
+        // line would read as unexplained loss.
+        let summary = format!(
+            "Intent level {}/{}: attempted {}, succeeded {}, failed after retry {}{}",
+            level_idx + 1,
+            levels.len(),
+            attempted,
+            succeeded,
+            failed,
+            if aborted > 0 {
+                format!(", aborted on backend quota {}", aborted)
+            } else {
+                String::new()
+            }
+        );
+        if failed > 0 || aborted > 0 {
+            warn!("{}", summary);
+        } else {
+            debug!("{}", summary);
+        }
+
+        // The quota breaker is process-global and does not clear inside a
+        // scan: every remaining call would fail instantly without reaching the
+        // model, so stop here rather than logging a level's worth of aborts.
+        if rate_limit_tripped() {
+            warn!(
+                "Backend LLM quota exhausted; stopping intent generation ({} call(s) in this level aborted unattempted)",
+                aborted
+            );
+            break;
         }
     }
 
@@ -972,5 +1093,158 @@ mod tests {
         assert!(!is_local_callee("helper", "return helper();", "helper"));
         // A method body referencing a module-level function links normally.
         assert!(is_local_callee("Svc.run", "return helper();", "helper"));
+    }
+
+    fn pending(name: &str) -> Pending {
+        Pending {
+            name: name.to_string(),
+            body: format!("return {}();", name),
+            called_intents: vec![],
+            hash: format!("hash-of-{}", name),
+        }
+    }
+
+    #[tokio::test]
+    async fn level_results_stay_associated_when_calls_finish_out_of_order() {
+        // Under `buffer_unordered` completion order is arbitrary. Force the
+        // worst case: the first call finishes last, the last finishes first.
+        let names = ["alpha", "beta", "gamma", "delta"];
+        let level: Vec<Pending> = names.iter().map(|n| pending(n)).collect();
+        let total = level.len() as u64;
+        let completion_order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let observed = completion_order.clone();
+        let outcomes = generate_level(level, 4, move |p| {
+            let observed = observed.clone();
+            async move {
+                let position = names.iter().position(|n| *n == p.name).unwrap() as u64;
+                tokio::time::sleep(std::time::Duration::from_millis((total - position) * 20)).await;
+                observed.lock().unwrap().push(p.name.clone());
+                let intent = format!("intent for {}", p.name);
+                (p, Ok(intent))
+            }
+        })
+        .await;
+
+        // The hazard is real: they did NOT complete in input order.
+        assert_eq!(
+            *completion_order.lock().unwrap(),
+            vec!["delta", "gamma", "beta", "alpha"],
+            "test did not actually exercise out-of-order completion"
+        );
+
+        // Output order is input order regardless, and every result is paired
+        // with the function that produced it.
+        let returned: Vec<&str> = outcomes.iter().map(|(p, _)| p.name.as_str()).collect();
+        assert_eq!(returned, names);
+        for (p, result) in &outcomes {
+            assert_eq!(
+                result.as_ref().unwrap(),
+                &format!("intent for {}", p.name),
+                "result was paired with the wrong function"
+            );
+            assert_eq!(p.hash, format!("hash-of-{}", p.name));
+        }
+    }
+
+    #[tokio::test]
+    async fn level_failures_are_isolated_to_their_own_function() {
+        // One failing call must not cost its siblings their intents, and the
+        // failure must arrive attached to the function that failed — that is
+        // what leaves exactly that function with `intent = None` and no
+        // content hash, so a rescan retries it alone.
+        let level = vec![pending("ok_one"), pending("boom"), pending("ok_two")];
+
+        let outcomes = generate_level(level, 2, |p| async move {
+            if p.name == "boom" {
+                let err = AgentCallError {
+                    code: "model_error".to_string(),
+                    message: "Gemini overloaded; retries exhausted".to_string(),
+                    retriable: true,
+                };
+                return (p, Err(err));
+            }
+            let intent = format!("intent for {}", p.name);
+            (p, Ok(intent))
+        })
+        .await;
+
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes[0].1.is_ok());
+        assert_eq!(outcomes[1].0.name, "boom");
+        let err = outcomes[1].1.as_ref().unwrap_err();
+        // Transient class, so the summary counts it as failed-after-retry
+        // rather than as a doomed-from-the-start quota abort.
+        assert!(err.retriable);
+        assert!(!err.is_quota_abort());
+        assert!(outcomes[2].1.is_ok());
+    }
+
+    #[tokio::test]
+    async fn intent_concurrency_knob_overrides_the_default() {
+        let _env = ENV_LOCK.lock().await;
+        let prev = std::env::var("CARRICK_INTENT_CONCURRENCY").ok();
+
+        // SAFETY: env vars are process-global; ENV_LOCK serializes this
+        // module's env-touching tests, and the var is restored before the
+        // guard drops.
+        unsafe {
+            std::env::remove_var("CARRICK_INTENT_CONCURRENCY");
+        }
+        assert_eq!(intent_concurrency(), DEFAULT_INTENT_CONCURRENCY);
+
+        unsafe {
+            std::env::set_var("CARRICK_INTENT_CONCURRENCY", "3");
+        }
+        assert_eq!(intent_concurrency(), 3);
+
+        // Zero would stall `buffer_unordered` forever; garbage falls back to
+        // the default rather than failing the scan.
+        unsafe {
+            std::env::set_var("CARRICK_INTENT_CONCURRENCY", "0");
+        }
+        assert_eq!(intent_concurrency(), 1);
+        unsafe {
+            std::env::set_var("CARRICK_INTENT_CONCURRENCY", "lots");
+        }
+        assert_eq!(intent_concurrency(), DEFAULT_INTENT_CONCURRENCY);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CARRICK_INTENT_CONCURRENCY", v),
+                None => std::env::remove_var("CARRICK_INTENT_CONCURRENCY"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_concurrency_caps_calls_in_flight() {
+        // The point of the fix: a level of 12 must never put more than the
+        // configured number of requests on the backend at once.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let level: Vec<Pending> = (0..12).map(|i| pending(&format!("fn{}", i))).collect();
+        let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let (in_flight_c, peak_c) = (in_flight.clone(), peak.clone());
+        let outcomes = generate_level(level, 3, move |p| {
+            let (in_flight, peak) = (in_flight_c.clone(), peak_c.clone());
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                (p, Ok("intent".to_string()))
+            }
+        })
+        .await;
+
+        assert_eq!(outcomes.len(), 12);
+        assert!(
+            peak.load(Ordering::SeqCst) <= 3,
+            "peak in-flight was {}, expected at most 3",
+            peak.load(Ordering::SeqCst)
+        );
     }
 }

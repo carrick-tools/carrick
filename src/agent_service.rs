@@ -48,14 +48,137 @@ fn is_quota_error(err: &AgentError) -> bool {
     err.code == "rate_limited"
 }
 
+/// Pseudo-code for the call-level failure raised once the quota breaker is
+/// open. Not a cloud code: the cloud never sends it, the scanner synthesises it
+/// so callers can tell "the backend is out of quota, everything downstream is
+/// doomed" apart from a genuine per-call failure.
+pub const QUOTA_ABORT_CODE: &str = "quota_exhausted";
+
 /// The error returned for an individual call once the breaker is open. Scoped
 /// to what's true at the call level (this call fails fast); the engine turns a
 /// tripped breaker into a fatal, no-upload abort via [`rate_limit_tripped`].
-fn rate_limit_abort_error() -> Box<dyn std::error::Error> {
-    "Carrick Cloud LLM quota exhausted; failing fast. This is a rate/quota \
-     limit on the analysis backend, not a problem with the scanned code. The \
-     scan will stop before uploading; re-run after the quota resets."
-        .into()
+fn rate_limit_abort_error() -> AgentCallError {
+    AgentCallError {
+        code: QUOTA_ABORT_CODE.to_string(),
+        message: "Carrick Cloud LLM quota exhausted; failing fast. This is a rate/quota \
+                  limit on the analysis backend, not a problem with the scanned code. The \
+                  scan will stop before uploading; re-run after the quota resets."
+            .to_string(),
+        retriable: false,
+    }
+}
+
+/// A failed lambda call, carrying the cloud's own transient/permanent verdict
+/// so callers can classify a failure without pattern-matching on message text.
+///
+/// `retriable` is the envelope's `error.retriable` verbatim when the call
+/// reached the lambda (the 429-wrapped 503 `model_error` the backend raises
+/// under Vertex pressure is `retriable: true`); for failures that never
+/// produced an envelope — bare network errors, unparseable gateway bodies —
+/// the scanner fills in the equivalent verdict. An `Err` with `retriable: true`
+/// therefore means "transient, and the backoff chain was already spent on it",
+/// which is what lets a caller report failed-after-retry honestly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCallError {
+    /// Cloud error code (`model_error`, `rate_limited`, `internal_error`), or a
+    /// scanner-side pseudo-code for a failure that never reached the envelope.
+    pub code: String,
+    pub message: String,
+    /// Whether the failure class is transient. See the type doc.
+    pub retriable: bool,
+}
+
+impl AgentCallError {
+    /// A permanent, non-retriable failure (server-side bug, malformed response).
+    fn permanent(code: &str, message: String) -> Self {
+        Self {
+            code: code.to_string(),
+            message,
+            retriable: false,
+        }
+    }
+
+    /// A transient failure whose backoff chain has been spent.
+    fn transient(code: &str, message: String) -> Self {
+        Self {
+            code: code.to_string(),
+            message,
+            retriable: true,
+        }
+    }
+
+    /// Whether this call failed because the process-global quota breaker is
+    /// open rather than on its own merits. Such a call was never attempted, so
+    /// counting it as a retry failure overstates the loss.
+    pub fn is_quota_abort(&self) -> bool {
+        self.code == QUOTA_ABORT_CODE
+    }
+}
+
+impl std::fmt::Display for AgentCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Agent error '{}' (retriable={}): {}",
+            self.code, self.retriable, self.message
+        )
+    }
+}
+
+impl std::error::Error for AgentCallError {}
+
+/// Attempts per call: the initial try plus six backed-off retries.
+const MAX_RETRIES: u32 = 7;
+/// First backoff sleep; doubles each attempt.
+const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+/// Ceiling on a single backoff sleep (reached at attempt 6: 2→4→8→16→32→64s).
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(64);
+
+/// Whether a failed call should consume a backoff attempt.
+///
+/// The cloud's `retriable` flag is the single source of truth for the
+/// transient class — the scanner does not re-derive it from status codes or
+/// message text. A quota abort is excluded even though quota errors are
+/// nominally transient: quota does not clear inside one scan, and the breaker
+/// has already decided that every remaining call fails fast.
+fn should_retry(err: &AgentCallError, attempt: u32, max_retries: u32) -> bool {
+    err.retriable && !err.is_quota_abort() && attempt < max_retries
+}
+
+/// Equal-jitter exponential backoff: half the exponential delay, plus a random
+/// share of the other half.
+///
+/// Jitter is not cosmetic here. Up to `CARRICK_CONCURRENCY_LIMIT` workers hit
+/// the same overloaded backend within milliseconds of each other, and an
+/// unjittered `2^attempt` sleep makes them all wake in lockstep and re-fire as
+/// one burst — the exact pattern that keeps a rate-limited backend rate
+/// limited. Spreading each waker across half a window decorrelates them.
+///
+/// This is the standard equal-jitter formulation, so the previous unjittered
+/// schedule (2, 4, 8, 16, 32, 64s) is now the *ceiling* of each window rather
+/// than its midpoint: the worst-case chain is unchanged at ~126s, the mean
+/// sleep is three quarters of what it was. Decorrelating the wakers is worth
+/// more than the quarter-window of extra patience.
+///
+/// Pure so it can be tested: `jitter` is any value in `0..=u32::MAX`, supplied
+/// by [`jitter_seed`] at the call site.
+fn backoff_delay(attempt: u32, jitter: u32) -> Duration {
+    let exponential = RETRY_BASE_DELAY
+        .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1)))
+        .min(RETRY_MAX_DELAY);
+    let half = exponential / 2;
+    let spread = half.mul_f64(f64::from(jitter) / f64::from(u32::MAX));
+    half + spread
+}
+
+/// Jitter source: the sub-second component of the wall clock. Enough entropy
+/// to decorrelate wakers that are milliseconds apart, and avoids taking a
+/// direct dependency on `rand` for a sleep length.
+fn jitter_seed() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0)
 }
 
 /// Reusable service for making Agent API calls
@@ -97,7 +220,7 @@ impl AgentService {
         task_path: &str,
         user_message: &str,
         response_schema: Option<serde_json::Value>,
-    ) -> Result<String, Box<dyn std::error::Error>> {
+    ) -> Result<String, AgentCallError> {
         let request = LambdaRequest {
             user_message: user_message.to_string(),
             response_schema,
@@ -113,12 +236,13 @@ impl AgentService {
         task_path: &str,
         body: &B,
         mock_seed: &str,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|e| format!("Failed to acquire semaphore permit: {}", e))?;
+    ) -> Result<String, AgentCallError> {
+        let _permit = self.semaphore.acquire().await.map_err(|e| {
+            AgentCallError::permanent(
+                "semaphore_closed",
+                format!("Failed to acquire semaphore permit: {}", e),
+            )
+        })?;
 
         if env::var("CARRICK_MOCK_ALL").is_ok() {
             return Ok(generate_mock_for_task(task_path, body, mock_seed));
@@ -131,11 +255,7 @@ impl AgentService {
     /// the version header, parses the structured error envelope, and
     /// only consumes a backoff attempt when the error is marked
     /// retriable=true (or on bare network failures).
-    async fn post_with_retry<B>(
-        &self,
-        path: &str,
-        body: &B,
-    ) -> Result<String, Box<dyn std::error::Error>>
+    async fn post_with_retry<B>(&self, path: &str, body: &B) -> Result<String, AgentCallError>
     where
         B: Serialize + ?Sized,
     {
@@ -145,18 +265,23 @@ impl AgentService {
         // Mint the OIDC token once up front; the cloud derives identity from
         // its signed claims. Tokens are short-lived, so on a 401 we re-mint
         // once mid-loop (long scans can outlive a token).
-        let provider = OidcProvider::global()?;
-        let mut token = provider.token().await?;
+        let provider = OidcProvider::global()
+            .map_err(|e| AgentCallError::permanent("oidc_unavailable", e.to_string()))?;
+        let mut token = provider
+            .token()
+            .await
+            .map_err(|e| AgentCallError::permanent("oidc_unavailable", e.to_string()))?;
         let mut reminted = false;
 
-        // Retry logic for transient failures with exponential backoff.
-        // 7 attempts: 2s, 4s, 8s, 16s, 32s, 64s. The lambda's structured
-        // error envelope (`error.retriable`) is the source of truth for
+        // Retry logic for transient failures with jittered exponential
+        // backoff. 7 attempts, sleeps halving-jittered around 2s, 4s, 8s, 16s,
+        // 32s, 64s (see `backoff_delay`). The lambda's structured error
+        // envelope (`error.retriable`) is the source of truth for
         // application-level errors. We additionally retry on transient
         // *gateway* errors (429/502/503/504) where the body may not
         // even be a parseable JSON envelope (API Gateway timeouts return
         // non-envelope responses).
-        let max_retries = 7;
+        let max_retries = MAX_RETRIES;
         for attempt in 1..=max_retries {
             // A sibling call (any phase, any `AgentService`) may have already
             // hit the backend quota wall. Re-checked each attempt so a worker
@@ -184,7 +309,9 @@ impl AgentService {
                     // consuming a backoff sleep.
                     if status.as_u16() == 401 && !reminted {
                         warn!("Agent proxy returned 401; re-minting OIDC token and retrying once");
-                        token = provider.remint().await?;
+                        token = provider.remint().await.map_err(|e| {
+                            AgentCallError::permanent("oidc_unavailable", e.to_string())
+                        })?;
                         reminted = true;
                         continue;
                     }
@@ -199,7 +326,7 @@ impl AgentService {
                             // is a known transient gateway code, retry —
                             // otherwise fail fast (server-side bug).
                             if is_transient_gateway_status && attempt < max_retries {
-                                let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
+                                let wait_time = backoff_delay(attempt, jitter_seed());
                                 warn!(
                                     "Gateway status {} with non-envelope body: {}. Retrying in {:?} (attempt {}/{})",
                                     status, e, wait_time, attempt, max_retries
@@ -207,11 +334,15 @@ impl AgentService {
                                 sleep(wait_time).await;
                                 continue;
                             }
-                            return Err(format!(
+                            let message = format!(
                                 "Agent proxy returned status {} with unparseable body: {}",
                                 status, e
-                            )
-                            .into());
+                            );
+                            return Err(if is_transient_gateway_status {
+                                AgentCallError::transient("gateway_error", message)
+                            } else {
+                                AgentCallError::permanent("bad_response", message)
+                            });
                         }
                     };
 
@@ -222,11 +353,13 @@ impl AgentService {
                     let err = match body.error {
                         Some(err) => err,
                         None => {
-                            return Err(format!(
-                                "Agent proxy status {} success={} but no error envelope",
-                                status, body.success
-                            )
-                            .into());
+                            return Err(AgentCallError::permanent(
+                                "bad_response",
+                                format!(
+                                    "Agent proxy status {} success={} but no error envelope",
+                                    status, body.success
+                                ),
+                            ));
                         }
                     };
 
@@ -244,26 +377,28 @@ impl AgentService {
                         return Err(rate_limit_abort_error());
                     }
 
-                    if err.retriable && attempt < max_retries {
-                        let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
+                    let call_err = AgentCallError {
+                        code: err.code,
+                        message: err.message,
+                        retriable: err.retriable,
+                    };
+
+                    if should_retry(&call_err, attempt, max_retries) {
+                        let wait_time = backoff_delay(attempt, jitter_seed());
                         warn!(
                             "Agent error '{}' is retriable, retrying in {:?} (attempt {}/{}): {}",
-                            err.code, wait_time, attempt, max_retries, err.message
+                            call_err.code, wait_time, attempt, max_retries, call_err.message
                         );
                         sleep(wait_time).await;
                         continue;
                     }
 
-                    return Err(format!(
-                        "Agent error '{}' (retriable={}): {}",
-                        err.code, err.retriable, err.message
-                    )
-                    .into());
+                    return Err(call_err);
                 }
                 Err(e) => {
                     // Bare network failure (no response received) — retriable by definition.
                     if attempt < max_retries {
-                        let wait_time = Duration::from_secs(2u64.pow(attempt as u32));
+                        let wait_time = backoff_delay(attempt, jitter_seed());
                         warn!(
                             "Agent proxy network error: {}, retrying in {:?} (attempt {}/{})",
                             e, wait_time, attempt, max_retries
@@ -272,12 +407,18 @@ impl AgentService {
                         continue;
                     }
 
-                    return Err(format!("Agent proxy call failed: {}", e).into());
+                    return Err(AgentCallError::transient(
+                        "network_error",
+                        format!("Agent proxy call failed: {}", e),
+                    ));
                 }
             }
         }
 
-        Err("Maximum retry attempts exceeded".into())
+        Err(AgentCallError::transient(
+            "retries_exhausted",
+            "Maximum retry attempts exceeded".to_string(),
+        ))
     }
 }
 
@@ -1475,5 +1616,55 @@ mod tests {
         // The message must read as a backend capacity limit, not a code fault.
         let msg = rate_limit_abort_error().to_string().to_lowercase();
         assert!(msg.contains("quota"));
+    }
+
+    #[test]
+    fn transient_errors_retry_and_permanent_ones_do_not() {
+        // The cloud's own `retriable` flag decides — the scanner never
+        // re-derives the class from message text. The 429-wrapped 503 the
+        // backend raises under Vertex pressure (#460) arrives as
+        // `model_error, retriable: true` and must consume a backoff attempt.
+        let transient = AgentCallError::transient("model_error", "Gemini overloaded".to_string());
+        assert!(should_retry(&transient, 1, MAX_RETRIES));
+        assert!(should_retry(&transient, MAX_RETRIES - 1, MAX_RETRIES));
+        // ...but only while attempts remain.
+        assert!(!should_retry(&transient, MAX_RETRIES, MAX_RETRIES));
+
+        // A permanent failure is never retried, at any attempt.
+        let permanent = AgentCallError::permanent("internal_error", "boom".to_string());
+        assert!(!should_retry(&permanent, 1, MAX_RETRIES));
+
+        // A quota abort is not a per-call failure: the breaker is open, so
+        // retrying only burns more of an exhausted budget.
+        assert!(rate_limit_abort_error().is_quota_abort());
+        assert!(!should_retry(&rate_limit_abort_error(), 1, MAX_RETRIES));
+        assert!(!transient.is_quota_abort());
+    }
+
+    #[test]
+    fn backoff_is_jittered_exponential_under_a_cap() {
+        // Zero jitter is the floor (half the exponential), max jitter the
+        // ceiling (the full exponential) — so every waker lands somewhere in
+        // the back half of its window instead of all on the same instant.
+        for attempt in 1..=MAX_RETRIES {
+            let low = backoff_delay(attempt, 0);
+            let high = backoff_delay(attempt, u32::MAX);
+            assert!(low <= high, "attempt {attempt}: jitter inverted the range");
+            assert!(
+                high <= RETRY_MAX_DELAY,
+                "attempt {attempt}: {high:?} exceeded the {RETRY_MAX_DELAY:?} cap"
+            );
+            assert!(low >= RETRY_BASE_DELAY / 2);
+        }
+
+        // Unjittered schedule: 2, 4, 8, 16, 32, 64 seconds, then held at the cap.
+        assert_eq!(backoff_delay(1, u32::MAX), Duration::from_secs(2));
+        assert_eq!(backoff_delay(2, u32::MAX), Duration::from_secs(4));
+        assert_eq!(backoff_delay(6, u32::MAX), RETRY_MAX_DELAY);
+        assert_eq!(backoff_delay(7, u32::MAX), RETRY_MAX_DELAY);
+        // Doubling is real, not an artefact of the cap.
+        assert!(backoff_delay(3, 0) > backoff_delay(2, 0));
+        // A large attempt number cannot overflow into a tiny (or huge) sleep.
+        assert_eq!(backoff_delay(64, u32::MAX), RETRY_MAX_DELAY);
     }
 }
