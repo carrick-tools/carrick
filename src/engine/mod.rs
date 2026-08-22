@@ -2249,6 +2249,22 @@ fn relativize_cloud_paths(cloud_data: &mut CloudRepoData, repo_path: &str) {
         for entry in entries {
             entry.file_path = repo_relative(&entry.file_path, repo_path);
             entry.evidence.file_path = repo_relative(&entry.evidence.file_path, repo_path);
+            // Both definition strings are printed TypeScript, so they carry
+            // the same `import("/abs/path")` leak the bundle does — and
+            // `expanded_definition` is what the PR comment prints as the type
+            // label on a mismatch row, so an absolute root here is rendered,
+            // not just stored.
+            for definition in [
+                entry.resolved_definition.as_mut(),
+                entry.expanded_definition.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if definition.contains(&prefix) {
+                    *definition = definition.replace(&prefix, "");
+                }
+            }
         }
     }
 
@@ -2282,8 +2298,15 @@ fn relativize_cloud_paths(cloud_data: &mut CloudRepoData, repo_path: &str) {
     }
 
     // Cache keys: normalized on both branches already, re-applied here so the
-    // invariant is enforced in one place.
-    if let Some(file_results) = cloud_data.file_results.take() {
+    // invariant is enforced in one place. Gated on an actual offender —
+    // `normalize_file_results_keys` clones every result, which is the multi-MB
+    // bulk of the payload.
+    if cloud_data.file_results.as_ref().is_some_and(|results| {
+        results
+            .keys()
+            .any(|key| key.starts_with(&prefix) || key.starts_with("./"))
+    }) && let Some(file_results) = cloud_data.file_results.take()
+    {
         cloud_data.file_results = Some(normalize_file_results_keys(&file_results, repo_path));
     }
 
@@ -3733,10 +3756,11 @@ mod tests {
     ///
     /// Walks the serialized blob for any string that still starts with the
     /// repo root. Known limit of that walk: it catches a path that IS the
-    /// root-prefixed string, not a root EMBEDDED mid-string — `bundled_types`
-    /// (`import("/abs/x")`) is asserted separately below, and
-    /// `capture_stub.files` is deliberately left untouched by the pass (see
-    /// `relativize_cloud_paths`).
+    /// root-prefixed string, not a root EMBEDDED mid-string. The three fields
+    /// carrying printed TypeScript (`bundled_types`, `resolved_definition`,
+    /// `expanded_definition`) leak the root that way and are asserted
+    /// separately below; `capture_stub.files` can still hold one and is
+    /// deliberately left untouched by the pass (see `relativize_cloud_paths`).
     #[test]
     fn relativize_cloud_paths_leaves_no_absolute_path_in_the_payload() {
         use crate::external_call_candidates::{CallMechanism, ExternalCallCandidate};
@@ -3890,8 +3914,11 @@ mod tests {
                     is_explicit: true,
                     type_state: ManifestTypeState::Explicit,
                 },
-                resolved_definition: None,
-                expanded_definition: None,
+                resolved_definition: Some(format!(
+                    "export type Endpoint_Response = import(\"{}\").Order;",
+                    abs("src/types/order")
+                )),
+                expanded_definition: Some(format!("import(\"{}\").Order", abs("src/types/order"))),
                 primary_type_symbol: None,
             }]),
             file_results: Some(file_results),
@@ -3930,6 +3957,19 @@ mod tests {
             data.bundled_types.as_deref(),
             Some("export type Order = import(\"src/types/order\").Order;\n"),
             "the compiler leaks the absolute root into the bundle as import(\"...\")"
+        );
+        // Printed TypeScript carries the same leak, and `expanded_definition`
+        // is what a mismatch row prints as the type label. The JSON sweep below
+        // cannot see these: they start with `export type` / `import(`, not with
+        // the root.
+        let entry = &data.type_manifest.as_ref().expect("manifest")[0];
+        assert_eq!(
+            entry.resolved_definition.as_deref(),
+            Some("export type Endpoint_Response = import(\"src/types/order\").Order;")
+        );
+        assert_eq!(
+            entry.expanded_definition.as_deref(),
+            Some("import(\"src/types/order\").Order")
         );
 
         // Then the exhaustive sweep over the serialized payload.
