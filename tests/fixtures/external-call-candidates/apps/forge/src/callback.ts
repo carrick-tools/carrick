@@ -1,12 +1,12 @@
-import type { Session } from "atlas-scraper";
-import Steel from "steel-sdk";
+import type { Session } from "callback-scraper";
+import Forge from "forge-sdk";
 
 // The vendor's shape, declared here rather than imported.
 interface Scraper {
   scrape(url: string): Promise<string>;
 }
 
-const steel = new Steel({ apiKey: "" });
+const forge = new Forge({ apiKey: "" });
 
 // A parameter typed by an interface this file declares names no package.
 export const capture = (local: Scraper, url: string): Promise<string> =>
@@ -22,4 +22,4 @@ export const captureVendor = (vendor: Session, url: string): Promise<string> =>
 // settles came out of a receiver that does resolve. The outer call is the
 // row; the call inside the callback is not.
 export const captureLater = (url: string): Promise<string> =>
-  steel.sessions.open(url).then((session) => session.scrape(url));
+  forge.sessions.open(url).then((session) => session.scrape(url));

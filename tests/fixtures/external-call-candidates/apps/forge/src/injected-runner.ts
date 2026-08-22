@@ -1,7 +1,7 @@
-import type Steel from "steel-sdk";
+import type Forge from "forge-sdk";
 
 export class InjectedRunner {
-  private readonly client!: Steel;
+  private readonly client!: Forge;
 
   async go(id: string): Promise<void> {
     await this.client.sessions.release(id);
