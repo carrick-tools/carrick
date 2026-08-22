@@ -3936,6 +3936,8 @@ mod tests {
                 callee: "GET".to_string(),
                 package: "SEARCH_URL".to_string(),
                 mechanism: CallMechanism::EnvVarUrl,
+                import_symbol: None,
+                subpath: None,
             }]),
         };
 

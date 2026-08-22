@@ -31,9 +31,17 @@ const SOURCE_EXTENSIONS: [&str; 4] = ["ts", "tsx", "js", "jsx"];
 /// What a module specifier names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
-    /// A package the repo's manifests declare as an external dependency. Carries
-    /// the declared name, so a subpath specifier reports the package.
-    External(String),
+    /// A package the repo's manifests declare as an external dependency.
+    ///
+    /// `package` is the declared name, so a subpath specifier still reports the
+    /// package. `subpath` is what the specifier named under it — `edge` for
+    /// `pkg/edge`, `None` for the root — which the egress scan records
+    /// alongside the package rather than discarding, because a vendor's edge
+    /// entry point and its node entry point are different destinations.
+    External {
+        package: String,
+        subpath: Option<String>,
+    },
     /// A file inside this repo, repo-relative.
     Internal(PathBuf),
     /// Node builtins, absolute paths, assets, and anything the repo's own
@@ -171,7 +179,11 @@ impl WorkspaceIndex {
         }
 
         match longest_match(specifier, self.external_packages.iter()) {
-            Some(package) => Resolution::External(package),
+            Some(package) => {
+                let subpath = specifier[package.len()..].trim_start_matches('/');
+                let subpath = (!subpath.is_empty()).then(|| subpath.to_string());
+                Resolution::External { package, subpath }
+            }
             None => Resolution::Unresolved,
         }
     }
@@ -372,11 +384,31 @@ mod tests {
     fn declared_dependency_resolves_external_by_name_and_by_subpath() {
         assert_eq!(
             resolve("apps/api/src/direct-call.ts", "courier-sdk"),
-            Resolution::External("courier-sdk".to_string())
+            Resolution::External {
+                package: "courier-sdk".to_string(),
+                subpath: None
+            }
         );
         assert_eq!(
             resolve("apps/api/src/direct-call.ts", "courier-sdk/edge"),
-            Resolution::External("courier-sdk".to_string())
+            Resolution::External {
+                package: "courier-sdk".to_string(),
+                subpath: Some("edge".to_string())
+            }
+        );
+    }
+
+    /// Everything past the package name is the subpath, however many segments
+    /// it has, so a deep entry point is not confused with the shallow one it
+    /// sits under.
+    #[test]
+    fn a_deep_subpath_is_kept_whole() {
+        assert_eq!(
+            resolve("apps/api/src/direct-call.ts", "courier-sdk/edge/runtime"),
+            Resolution::External {
+                package: "courier-sdk".to_string(),
+                subpath: Some("edge/runtime".to_string())
+            }
         );
     }
 
@@ -386,7 +418,10 @@ mod tests {
     fn root_only_dependency_is_in_the_external_universe() {
         assert_eq!(
             resolve("packages/doc-kit/sign.ts", "pdf-toolkit"),
-            Resolution::External("pdf-toolkit".to_string())
+            Resolution::External {
+                package: "pdf-toolkit".to_string(),
+                subpath: None
+            }
         );
     }
 
@@ -461,7 +496,10 @@ mod tests {
         let index = WorkspaceIndex::build(root);
         assert_eq!(
             index.resolve(Path::new("app.ts"), "courier-sdk"),
-            Resolution::External("courier-sdk".to_string())
+            Resolution::External {
+                package: "courier-sdk".to_string(),
+                subpath: None
+            }
         );
         assert_eq!(
             index.resolve(Path::new("app.ts"), "hoisted-only"),
