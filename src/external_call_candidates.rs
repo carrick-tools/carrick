@@ -52,15 +52,27 @@
 //!   runtime dependencies every `package.json` in the tree declares, minus the
 //!   workspace's own package names. There is no allowlist and no denylist of
 //!   SDK or vendor names anywhere in this module.
-//! - **No type checking.** Resolution is limited to what the AST proves about
-//!   values. A receiver whose only anchor is a type annotation — a parameter
-//!   typed by an imported class, a value read off a DI container — is not
-//!   resolved and emits nothing.
+//! - **Almost no type reading.** Resolution is limited to what the AST proves
+//!   about values, with two exceptions, both of them a declaration the code
+//!   makes about its own shape rather than an inference over the type graph: a
+//!   function's declared return type, and a class property's declared type. A
+//!   name written in either position, when the file imports that name from a
+//!   dependency, owns that dependency. Every other type position stays out —
+//!   a parameter typed by an imported class, a value read off a DI container,
+//!   a variable's declared type — because none of those says what the value
+//!   the code hands back or holds actually is.
 //! - **Unknown never blocks, disagreement does.** An unresolved contributor to
 //!   a slot leaves the slot's other contributors intact; two contributors that
 //!   name different packages drop it. That is the recall-leaning choice, taken
 //!   deliberately: a wrapper whose branches all reach one package is the common
 //!   shape, and a wrapper that reaches two is a genuine ambiguity.
+//! - **Ownership is anchored, not just packaged.** A package-owned value
+//!   carries the export it came from (`default` for a default import, the
+//!   exported name for a named one, nothing for a namespace) and the subpath
+//!   the specifier named (`edge` for `pkg/edge`). Rows report both, and the
+//!   rule above reaches them: two chains that name one package through
+//!   different exports, or through different subpaths, disagree and drop the
+//!   slot.
 //! - **Never merged into HTTP matching.** These rows are their own mechanism
 //!   and their own payload field. They are not endpoints, they are not consumer
 //!   calls, and nothing here touches extraction, matching, or type
@@ -79,11 +91,12 @@
 //! - **ESM only.** `import` declarations, re-exports, and `import()` with a
 //!   string literal. `require()`, TypeScript `import =`, and a dynamic import
 //!   whose specifier is computed produce no bindings and no reachability edge.
-//! - **Type-only imports carry nothing.** `import type ...`, per-specifier
-//!   `import { type Foo }`, and type-only re-exports bind nothing at runtime,
-//!   so a receiver whose only anchor is one of them is permanently out of
-//!   reach. That is the same line as "no type checking", seen from the import
-//!   side.
+//! - **Type-only imports bind nothing.** `import type ...`, per-specifier
+//!   `import { type Foo }`, and type-only re-exports bind no value and are not
+//!   reachability edges, so no chain runs through one. They do name a package
+//!   for the two annotation positions above: a factory declared to return a
+//!   type-imported client owns that client's package, which is the shape the
+//!   annotation rule exists for.
 //! - **Destructuring** is followed through object patterns with identifier
 //!   keys. Array patterns, rest elements, and computed keys are not.
 //! - **Transitivity has a shape, not a depth limit.** A handle reached through
@@ -168,13 +181,39 @@ pub enum CallMechanism {
     EnvVarUrl,
 }
 
+/// A value that came out of a dependency, with the import that anchored it.
+///
+/// The package is the destination a row reports. The two anchors say which
+/// export of it, and which entry point of it, the receiver was reached
+/// through. They are part of the value's identity rather than decoration on
+/// it, so two chains reaching one slot through different exports of the same
+/// package disagree, and disagreement drops the slot. That is the rule the
+/// package name is already held to, applied one level finer. A handle built
+/// from `pkg`'s default export and one built from its `edge` entry point are
+/// not interchangeable, and a slot that is sometimes one and sometimes the
+/// other says nothing a reader can act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PkgRef {
+    /// The dependency exactly as a `package.json` names it.
+    package: String,
+    /// The exported name the root binding came from: `default` for a default
+    /// import, the exported name for a named one, `None` for a namespace
+    /// import, which binds the module rather than one of its exports.
+    import_symbol: Option<String>,
+    /// What the specifier named under the package root — `edge` for
+    /// `pkg/edge` — and `None` when it named the root.
+    subpath: Option<String>,
+}
+
 /// One outbound call candidate.
 ///
 /// Ordering is `(file, line, callee, package, mechanism)`, which is also the
-/// sort key rows are emitted in. SDK rows are byte-identical across runs of the
-/// same tree because they are pure AST; the HTTP-shaped rows are projected from
-/// LLM extraction and inherit its stability, so the ORDER is fixed but the row
-/// set is only as reproducible as the extraction behind it.
+/// sort key rows are emitted in. The two anchor fields sit after that key and
+/// never reorder anything, because one call site yields one row and so no two
+/// rows share the key. SDK rows are byte-identical across runs of the same
+/// tree because they are pure AST; the HTTP-shaped rows are projected from LLM
+/// extraction and inherit its stability, so the ORDER is fixed but the row set
+/// is only as reproducible as the extraction behind it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ExternalCallCandidate {
     /// Repo-relative path of the file containing the call.
@@ -203,6 +242,18 @@ pub struct ExternalCallCandidate {
     pub package: String,
     /// Which of the three detections produced this row.
     pub mechanism: CallMechanism,
+    /// Which export of `package` the receiver's root binding came from:
+    /// `default` for a default import, the exported name for a named one.
+    /// Absent for a namespace import, which binds the module rather than one
+    /// of its exports, and absent for the two HTTP-shaped mechanisms, which
+    /// have no import behind them at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_symbol: Option<String>,
+    /// The subpath the import specifier named under the package root — `edge`
+    /// for `pkg/edge`. Absent when the import named the root, and absent on
+    /// the HTTP-shaped mechanisms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subpath: Option<String>,
 }
 
 /// Scan the whole workspace and return the SDK-mediated call candidates that
@@ -295,6 +346,9 @@ pub fn from_data_calls(
             callee: call.method.to_uppercase(),
             package: target,
             mechanism,
+            // An HTTP row has no import behind it, so neither anchor applies.
+            import_symbol: None,
+            subpath: None,
         });
     }
     cap(rows.into_iter().collect())
@@ -484,7 +538,7 @@ impl Chain {
 /// inside a record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PropValue {
-    Pkg(String),
+    Pkg(PkgRef),
     Conflict,
 }
 
@@ -492,8 +546,8 @@ enum PropValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Owner {
     /// A value that came out of an external package. Any property of it, and
-    /// any call on it, is still that package's.
-    Pkg(String),
+    /// any call on it, is still that package's, and carries the same anchors.
+    Pkg(PkgRef),
     /// An object whose named properties are owned — a function's returned
     /// object literal, or a class instance's field map.
     Record(BTreeMap<String, PropValue>),
@@ -520,6 +574,12 @@ enum Value {
     Conflict,
 }
 
+/// Two owners joined.
+///
+/// Equality is structural, so two [`Owner::Pkg`] values that name one package
+/// through different exports or different subpaths are already unequal here
+/// and already fall through to `Conflict`. The symbol and subpath needed no
+/// arm of their own: they are part of what a package-owned value *is*.
 fn join_owners(left: &Owner, right: &Owner) -> Value {
     if left == right {
         return Value::Owned(left.clone());
@@ -640,7 +700,7 @@ impl Ownership {
     /// The package a chain resolves to, if it resolves to one at all. Records,
     /// namespaces, and uncalled functions are resolved values but not
     /// destinations, so they yield no row.
-    fn resolve_package(&self, file: usize, chain: &Chain) -> Option<String> {
+    fn resolve_package(&self, file: usize, chain: &Chain) -> Option<PkgRef> {
         match self.eval(file, chain)? {
             Owner::Pkg(package) => Some(package),
             _ => None,
@@ -671,7 +731,7 @@ fn join_into<K: Ord>(map: &mut BTreeMap<K, Value>, key: K, value: Value) {
 /// Where a name imported or re-exported by a file comes from.
 #[derive(Debug, Clone)]
 enum Source {
-    ExternalPackage(String),
+    ExternalPackage(PkgRef),
     /// A named export of another workspace file.
     InternalNamed(usize, String),
     /// Another workspace file taken whole.
@@ -748,6 +808,10 @@ impl ReturnShape {
 struct FunctionFact {
     local: BindingId,
     shape: ReturnShape,
+    /// The dependency the declared return type names, when it names one. The
+    /// function's own statement about what it hands back, which is what a
+    /// factory has instead of a returned expression the reducer can follow.
+    annotation: Option<PkgRef>,
 }
 
 /// A static member that is a function: a factory, or a getter standing in for a
@@ -767,6 +831,10 @@ struct ClassFact {
     /// resolves to the class itself, through which the static slots are reached.
     binding: Option<BindingId>,
     instance_fields: Vec<(String, Chain)>,
+    /// Instance properties whose declared type names a dependency. The class's
+    /// own statement about what the field holds, which is what a field nothing
+    /// visibly assigns has instead of an assignment.
+    annotation_fields: Vec<(String, PkgRef)>,
     /// Static property initializers.
     static_fields: Vec<(String, Chain)>,
     static_functions: Vec<StaticFunction>,
@@ -786,6 +854,12 @@ struct CallSite {
 #[derive(Debug, Default)]
 struct FileFacts {
     imports: Vec<ImportFact>,
+    /// Every name this file imports from a dependency, whether the import
+    /// binds a value or only a type, keyed by the local name a type annotation
+    /// would write. Keyed by name rather than by binding because a type
+    /// reference is erased before it reaches a runtime binding, so there is no
+    /// syntax context to compare it on.
+    type_names: BTreeMap<String, PkgRef>,
     reexports: Vec<ReExportFact>,
     /// `export * from <internal file>`.
     star_exports: BTreeSet<usize>,
@@ -887,7 +961,15 @@ impl Workspace {
         }
 
         for (index, class) in facts.classes.iter().enumerate() {
-            let instance = record_of(file, &class.instance_fields, previous);
+            let mut instance = record_of(file, &class.instance_fields, previous);
+            // A declared property type decides the field. It is the class's own
+            // statement about what the field holds, it is a fact of the source
+            // rather than of the round, and in the shape it exists for — a
+            // field no construction site ever fills in — it is the only thing
+            // there.
+            for (name, package) in &class.annotation_fields {
+                instance.insert(name.clone(), PropValue::Pkg(package.clone()));
+            }
             if !instance.is_empty() {
                 next.join_class_instance((file, index), record_value(instance));
             }
@@ -918,7 +1000,17 @@ impl Workspace {
         }
 
         for function in &facts.functions {
-            if let Some(owner) = return_owner(file, &function.shape, previous) {
+            // Same order as a class property: what the signature declares
+            // decides, and the returned expressions answer only when the
+            // signature names no dependency. A declared return type is the
+            // function's own statement, and it is what a factory that hands
+            // back a cached or injected handle has instead of a `return` the
+            // reducer can follow.
+            let owner = match &function.annotation {
+                Some(package) => Some(Owner::Pkg(package.clone())),
+                None => return_owner(file, &function.shape, previous),
+            };
+            if let Some(owner) = owner {
                 next.join_binding(
                     (file, function.local.clone()),
                     Value::Owned(Owner::FnReturning(Box::new(owner))),
@@ -1064,8 +1156,10 @@ impl Workspace {
                         file: self.files[file].to_string_lossy().to_string(),
                         line: site.line,
                         callee: site.callee.text(),
-                        package,
+                        package: package.package,
                         mechanism: CallMechanism::Sdk,
+                        import_symbol: package.import_symbol,
+                        subpath: package.subpath,
                     },
                 );
             }
@@ -1114,7 +1208,7 @@ fn record_value(fields: BTreeMap<String, PropValue>) -> Value {
     Value::Owned(Owner::Record(fields))
 }
 
-fn insert_prop(fields: &mut BTreeMap<String, PropValue>, name: String, package: String) {
+fn insert_prop(fields: &mut BTreeMap<String, PropValue>, name: String, package: PkgRef) {
     match fields.get(&name) {
         Some(PropValue::Pkg(existing)) if *existing == package => {}
         Some(_) => {
@@ -1270,7 +1364,7 @@ impl Resolver<'_> {
     /// asset, or a file the walk excluded (a test tree, build output).
     fn resolve(&self, specifier: &str) -> Option<Target> {
         match self.index.resolve(&self.from, specifier) {
-            Resolution::External(package) => Some(Target::External(package)),
+            Resolution::External { package, subpath } => Some(Target::External(package, subpath)),
             Resolution::Internal(path) => self.file_index.get(&path).copied().map(Target::Internal),
             Resolution::Unresolved => None,
         }
@@ -1278,7 +1372,9 @@ impl Resolver<'_> {
 }
 
 enum Target {
-    External(String),
+    /// The declared package name, and the subpath the specifier named under
+    /// it.
+    External(String, Option<String>),
     Internal(usize),
 }
 
@@ -1322,10 +1418,7 @@ impl FactCollector<'_> {
                             // A default-exported function is a `FnExpr`, not a
                             // `FnDecl`, so the declaration visitor never sees
                             // it and its returns have to be read here.
-                            self.collect_function_body(
-                                local.clone(),
-                                function.function.body.as_ref(),
-                            );
+                            self.collect_function(local.clone(), &function.function);
                             self.export_binding("default", local);
                         }
                     }
@@ -1361,40 +1454,82 @@ impl FactCollector<'_> {
     }
 
     fn collect_import(&mut self, import: &ImportDecl) {
-        // `import type { X } from 'pkg'` binds nothing at runtime.
-        if import.type_only {
-            return;
-        }
         let Some(target) = self.resolver.resolve(import.src.value.as_ref()) else {
             return;
         };
-        if let Target::Internal(file) = target {
-            self.facts.edges.insert(file);
+        // `import type { X } from './x'` ships nothing, so it is not a
+        // reachability edge either.
+        if let Target::Internal(file) = &target
+            && !import.type_only
+        {
+            self.facts.edges.insert(*file);
         }
         for specifier in &import.specifiers {
             let (local, imported) = match specifier {
-                // `import { type X, y }` — the inline type specifier is erased.
-                ImportSpecifier::Named(named) if named.is_type_only => continue,
                 ImportSpecifier::Named(named) => {
                     let imported = match &named.imported {
                         Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
                         Some(ModuleExportName::Str(name)) => name.value.to_string(),
                         None => named.local.sym.to_string(),
                     };
-                    (BindingId::of(&named.local), Some(imported))
+                    (&named.local, Some(imported))
                 }
-                ImportSpecifier::Default(default) => {
-                    (BindingId::of(&default.local), Some("default".to_string()))
-                }
-                ImportSpecifier::Namespace(namespace) => (BindingId::of(&namespace.local), None),
+                ImportSpecifier::Default(default) => (&default.local, Some("default".to_string())),
+                ImportSpecifier::Namespace(namespace) => (&namespace.local, None),
             };
+
+            // A name imported from a dependency is what a type annotation
+            // writing that name resolves to, and a type-only import is exactly
+            // as good a witness of that as a value import. It still binds no
+            // value: only the annotation positions below read this map.
+            if let Target::External(package, subpath) = &target {
+                self.facts.type_names.insert(
+                    local.sym.to_string(),
+                    PkgRef {
+                        package: package.clone(),
+                        import_symbol: imported.clone(),
+                        subpath: subpath.clone(),
+                    },
+                );
+            }
+
+            // `import type ...` and the inline `import { type X }` are erased,
+            // so neither binds a value.
+            let type_only = import.type_only
+                || matches!(specifier, ImportSpecifier::Named(named) if named.is_type_only);
+            if type_only {
+                continue;
+            }
+
             let source = match (&target, imported) {
-                (Target::External(package), _) => Source::ExternalPackage(package.clone()),
+                (Target::External(package, subpath), imported) => Source::ExternalPackage(PkgRef {
+                    package: package.clone(),
+                    import_symbol: imported,
+                    subpath: subpath.clone(),
+                }),
                 (Target::Internal(file), Some(name)) => Source::InternalNamed(*file, name),
                 (Target::Internal(file), None) => Source::InternalNamespace(*file),
             };
-            self.facts.imports.push(ImportFact { local, source });
+            self.facts.imports.push(ImportFact {
+                local: BindingId::of(local),
+                source,
+            });
         }
+    }
+
+    /// The dependency a type annotation names, when the file's own imports say
+    /// which package the name came from.
+    ///
+    /// Only a bare type reference is read — `Steel`, or `ns.Steel` through a
+    /// namespace import. A generic wrapper (`Promise<Steel>`), a union, and an
+    /// inline object type all name nothing this can attribute, so they resolve
+    /// to nothing.
+    fn annotation_package(&self, annotation: Option<&TsTypeAnn>) -> Option<PkgRef> {
+        let TsType::TsTypeRef(reference) = &*annotation?.type_ann else {
+            return None;
+        };
+        let root = leftmost_type_ident(&reference.type_name);
+        self.facts.type_names.get(root.sym.as_ref()).cloned()
     }
 
     fn collect_named_export(&mut self, export: &NamedExport) {
@@ -1421,10 +1556,14 @@ impl FactCollector<'_> {
                         None => local.sym.to_string(),
                     };
                     match &target {
-                        Some(Target::External(package)) => {
+                        Some(Target::External(package, subpath)) => {
                             self.facts.reexports.push(ReExportFact {
                                 name: exported,
-                                source: Source::ExternalPackage(package.clone()),
+                                source: Source::ExternalPackage(PkgRef {
+                                    package: package.clone(),
+                                    import_symbol: Some(local.sym.to_string()),
+                                    subpath: subpath.clone(),
+                                }),
                             });
                         }
                         Some(Target::Internal(file)) => {
@@ -1443,7 +1582,15 @@ impl FactCollector<'_> {
                         continue;
                     };
                     let source = match &target {
-                        Some(Target::External(package)) => Source::ExternalPackage(package.clone()),
+                        // `export * as ns from 'pkg'` re-exports the module
+                        // itself, so it names no one export of it.
+                        Some(Target::External(package, subpath)) => {
+                            Source::ExternalPackage(PkgRef {
+                                package: package.clone(),
+                                import_symbol: None,
+                                subpath: subpath.clone(),
+                            })
+                        }
                         Some(Target::Internal(file)) => Source::InternalNamespace(*file),
                         None => continue,
                     };
@@ -1592,9 +1739,7 @@ impl FactCollector<'_> {
             // yields.
             match unwrap_value(init) {
                 Expr::Arrow(arrow) => self.collect_arrow(local.clone(), arrow),
-                Expr::Fn(function) => {
-                    self.collect_function_body(local.clone(), function.function.body.as_ref())
-                }
+                Expr::Fn(function) => self.collect_function(local.clone(), &function.function),
                 _ => {}
             }
 
@@ -1627,9 +1772,15 @@ impl FactCollector<'_> {
 
     fn collect_dynamic_import_binding(&mut self, pattern: &Pat, target: &Target) {
         match pattern {
+            // `const mod = await import('pkg')` binds the module, not one of
+            // its exports, exactly as a namespace import does.
             Pat::Ident(name) => {
                 let source = match target {
-                    Target::External(package) => Source::ExternalPackage(package.clone()),
+                    Target::External(package, subpath) => Source::ExternalPackage(PkgRef {
+                        package: package.clone(),
+                        import_symbol: None,
+                        subpath: subpath.clone(),
+                    }),
                     Target::Internal(file) => Source::InternalNamespace(*file),
                 };
                 self.facts.imports.push(ImportFact {
@@ -1637,10 +1788,16 @@ impl FactCollector<'_> {
                     source,
                 });
             }
+            // `const { default: C } = await import('pkg')` names an export,
+            // and the key it is read under is that export's name.
             Pat::Object(object) => {
                 for (property, local) in destructured_properties(object) {
                     let source = match target {
-                        Target::External(package) => Source::ExternalPackage(package.clone()),
+                        Target::External(package, subpath) => Source::ExternalPackage(PkgRef {
+                            package: package.clone(),
+                            import_symbol: Some(property),
+                            subpath: subpath.clone(),
+                        }),
                         Target::Internal(file) => Source::InternalNamed(*file, property),
                     };
                     self.facts.imports.push(ImportFact { local, source });
@@ -1652,7 +1809,8 @@ impl FactCollector<'_> {
 
     fn collect_arrow(&mut self, local: BindingId, arrow: &ArrowExpr) {
         let shape = self.arrow_shape(arrow);
-        self.push_function(local, shape);
+        let annotation = self.annotation_package(arrow.return_type.as_deref());
+        self.push_function(local, shape, annotation);
     }
 
     fn arrow_shape(&mut self, arrow: &ArrowExpr) -> ReturnShape {
@@ -1664,9 +1822,10 @@ impl FactCollector<'_> {
         shape
     }
 
-    fn collect_function_body(&mut self, local: BindingId, body: Option<&BlockStmt>) {
-        let shape = self.body_shape(body);
-        self.push_function(local, shape);
+    fn collect_function(&mut self, local: BindingId, function: &Function) {
+        let shape = self.body_shape(function.body.as_ref());
+        let annotation = self.annotation_package(function.return_type.as_deref());
+        self.push_function(local, shape, annotation);
     }
 
     fn body_shape(&mut self, body: Option<&BlockStmt>) -> ReturnShape {
@@ -1675,11 +1834,15 @@ impl FactCollector<'_> {
         shape
     }
 
-    fn push_function(&mut self, local: BindingId, shape: ReturnShape) {
-        if shape.is_empty() {
+    fn push_function(&mut self, local: BindingId, shape: ReturnShape, annotation: Option<PkgRef>) {
+        if shape.is_empty() && annotation.is_none() {
             return;
         }
-        self.facts.functions.push(FunctionFact { local, shape });
+        self.facts.functions.push(FunctionFact {
+            local,
+            shape,
+            annotation,
+        });
     }
 
     fn collect_returns(&mut self, body: Option<&BlockStmt>, shape: &mut ReturnShape) {
@@ -1753,6 +1916,7 @@ impl FactCollector<'_> {
         self.facts.classes.push(ClassFact {
             binding,
             instance_fields: Vec::new(),
+            annotation_fields: Vec::new(),
             static_fields: Vec::new(),
             static_functions: Vec::new(),
             ctor_param_fields: Vec::new(),
@@ -1781,8 +1945,20 @@ impl FactCollector<'_> {
         for member in &class.body {
             match member {
                 ClassMember::ClassProp(property) => {
-                    let (Some(name), Some(value)) = (property_name(&property.key), &property.value)
-                    else {
+                    let Some(name) = property_name(&property.key) else {
+                        continue;
+                    };
+                    // Read before the initializer, because the shape this
+                    // exists for has a declared type and no initializer at
+                    // all. Something outside the class body fills it in.
+                    if !property.is_static
+                        && let Some(package) = self.annotation_package(property.type_ann.as_deref())
+                    {
+                        self.facts.classes[index]
+                            .annotation_fields
+                            .push((name.clone(), package));
+                    }
+                    let Some(value) = &property.value else {
                         continue;
                     };
                     let Some(chain) = self.chain_of(value) else {
@@ -1934,10 +2110,7 @@ impl Visit for FactCollector<'_> {
     }
 
     fn visit_fn_decl(&mut self, function: &FnDecl) {
-        self.collect_function_body(
-            BindingId::of(&function.ident),
-            function.function.body.as_ref(),
-        );
+        self.collect_function(BindingId::of(&function.ident), &function.function);
         function.visit_children_with(self);
     }
 
@@ -2059,6 +2232,15 @@ fn destructured_properties(pattern: &ObjectPat) -> Vec<(String, BindingId)> {
     bound
 }
 
+/// The name a type reference starts from: `Steel` in `Steel`, and `ns` in
+/// `ns.Steel`, which is the name a namespace import binds.
+fn leftmost_type_ident(name: &TsEntityName) -> &Ident {
+    match name {
+        TsEntityName::Ident(ident) => ident,
+        TsEntityName::TsQualifiedName(qualified) => leftmost_type_ident(&qualified.left),
+    }
+}
+
 fn property_name(key: &PropName) -> Option<String> {
     match key {
         PropName::Ident(ident) => Some(ident.sym.to_string()),
@@ -2108,6 +2290,62 @@ mod tests {
                     row.line,
                     row.callee.clone(),
                     row.package.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// One row reduced to what the anchor tests read: the sort key, then the
+    /// export and the subpath the receiver came through.
+    type AnchoredRow = (
+        String,
+        usize,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    );
+
+    /// The same without the file, for the assertions scoped to one file.
+    type FileAnchor = (usize, String, String, Option<String>, Option<String>);
+
+    /// The row plus the two anchors, for the tests that are about which import
+    /// a receiver came through rather than only which package.
+    fn anchored(rows: &[ExternalCallCandidate]) -> Vec<AnchoredRow> {
+        rows.iter()
+            .map(|row| {
+                (
+                    row.file.clone(),
+                    row.line,
+                    row.callee.clone(),
+                    row.package.clone(),
+                    row.import_symbol.clone(),
+                    row.subpath.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// The literal form an expected row is written in.
+    type AnchorLiteral<'a> = (
+        &'a str,
+        usize,
+        &'a str,
+        &'a str,
+        Option<&'a str>,
+        Option<&'a str>,
+    );
+
+    fn expected_anchored(rows: &[AnchorLiteral<'_>]) -> Vec<AnchoredRow> {
+        rows.iter()
+            .map(|(file, line, callee, package, symbol, subpath)| {
+                (
+                    file.to_string(),
+                    *line,
+                    callee.to_string(),
+                    package.to_string(),
+                    symbol.map(str::to_string),
+                    subpath.map(str::to_string),
                 )
             })
             .collect()
@@ -2215,6 +2453,27 @@ mod tests {
 
         /// A type-only declaration binds nothing, while the value specifier in
         /// a mixed declaration still does.
+        /// A subpath import reports the package it belongs to, and now also
+        /// which entry point of it the value came through.
+        #[test]
+        fn a_subpath_import_records_its_subpath() {
+            let rows = scan("apps/api");
+            assert_eq!(
+                anchored(&rows)
+                    .into_iter()
+                    .filter(|(file, ..)| file == "apps/api/src/subpath-import.ts")
+                    .collect::<Vec<_>>(),
+                expected_anchored(&[(
+                    "apps/api/src/subpath-import.ts",
+                    4,
+                    "publishEdge",
+                    "courier-sdk",
+                    Some("publishEdge"),
+                    Some("edge"),
+                )])
+            );
+        }
+
         #[test]
         fn type_only_imports_emit_nothing() {
             let rows = scan("apps/api");
@@ -2802,6 +3061,231 @@ mod tests {
     }
 
     /// Two scans of the same tree produce byte-identical rows.
+    /// The receiver shapes carrick#511 could not reach, and the two anchors a
+    /// row now carries. Its own service, because the shapes are about which
+    /// import a value came through and the fixture's other services are about
+    /// how far a value travels.
+    mod receiver_shapes {
+        use super::*;
+
+        fn steel() -> Vec<ExternalCallCandidate> {
+            scan("apps/steel")
+        }
+
+        fn anchors_for(rows: &[ExternalCallCandidate], file: &str) -> Vec<FileAnchor> {
+            anchored(rows)
+                .into_iter()
+                .filter(|(row_file, ..)| row_file == file)
+                .map(|(_, line, callee, package, symbol, subpath)| {
+                    (line, callee, package, symbol, subpath)
+                })
+                .collect()
+        }
+
+        fn anchor(
+            line: usize,
+            callee: &str,
+            symbol: Option<&str>,
+            subpath: Option<&str>,
+        ) -> Vec<FileAnchor> {
+            vec![(
+                line,
+                callee.to_string(),
+                "steel-sdk".to_string(),
+                symbol.map(str::to_string),
+                subpath.map(str::to_string),
+            )]
+        }
+
+        #[test]
+        fn steel_service_scan_matches_expected_rows() {
+            assert_eq!(
+                anchored(&steel()),
+                expected_anchored(&[
+                    (
+                        "apps/steel/src/atlas.ts",
+                        25,
+                        "steel.sessions.open",
+                        "steel-sdk",
+                        Some("default"),
+                        None,
+                    ),
+                    (
+                        "apps/steel/src/atlas.ts",
+                        25,
+                        "steel.sessions.open().then",
+                        "steel-sdk",
+                        Some("default"),
+                        None,
+                    ),
+                    (
+                        "apps/steel/src/dynamic.ts",
+                        5,
+                        "client.sessions.create",
+                        "steel-sdk",
+                        Some("default"),
+                        None,
+                    ),
+                    (
+                        "apps/steel/src/dynamic.ts",
+                        11,
+                        "sdk.close",
+                        "steel-sdk",
+                        None,
+                        None,
+                    ),
+                    (
+                        "apps/steel/src/injected-runner.ts",
+                        7,
+                        "this.client.sessions.release",
+                        "steel-sdk",
+                        Some("default"),
+                        None,
+                    ),
+                    (
+                        "apps/steel/src/release.ts",
+                        6,
+                        "client.sessions.release",
+                        "steel-sdk",
+                        Some("Steel"),
+                        Some("edge"),
+                    ),
+                    (
+                        "apps/steel/src/runner.ts",
+                        11,
+                        "this.client.sessions.release",
+                        "steel-sdk",
+                        Some("default"),
+                        None,
+                    ),
+                    (
+                        "apps/steel/src/sessions.ts",
+                        9,
+                        "steel.sessions.create",
+                        "steel-sdk",
+                        Some("default"),
+                        None,
+                    ),
+                ])
+            );
+        }
+
+        /// A handle built by a factory in a sibling file: the factory's own
+        /// `return` names the client, so the call through the handle is a row
+        /// even though the calling file never mentions the package.
+        #[test]
+        fn a_relative_factory_resolves_through_what_it_returns() {
+            assert_eq!(
+                anchors_for(&steel(), "apps/steel/src/sessions.ts"),
+                anchor(9, "steel.sessions.create", Some("default"), None)
+            );
+        }
+
+        /// The same hop when the factory hands back something the AST cannot
+        /// follow — a pooled handle read out of a map. Its declared return type
+        /// is the statement that resolves it, and the type is imported from a
+        /// subpath, so the row records the subpath too.
+        #[test]
+        fn a_relative_factory_resolves_through_its_declared_return_type() {
+            assert_eq!(
+                anchors_for(&steel(), "apps/steel/src/release.ts"),
+                anchor(6, "client.sessions.release", Some("Steel"), Some("edge"))
+            );
+        }
+
+        /// A client held in a class property, constructed in the constructor.
+        /// The callee prints as written.
+        #[test]
+        fn a_class_property_constructed_in_the_constructor_resolves() {
+            assert_eq!(
+                anchors_for(&steel(), "apps/steel/src/runner.ts"),
+                anchor(11, "this.client.sessions.release", Some("default"), None)
+            );
+        }
+
+        /// The same property when nothing in the class assigns it — the shape a
+        /// framework or an injector fills in. The declared type is all there
+        /// is, and it is enough.
+        #[test]
+        fn a_class_property_typed_by_a_dependency_resolves() {
+            assert_eq!(
+                anchors_for(&steel(), "apps/steel/src/injected-runner.ts"),
+                anchor(7, "this.client.sessions.release", Some("default"), None)
+            );
+        }
+
+        /// `const { default: C } = await import('pkg')` names an export and
+        /// `const m = await import('pkg')` names the module, so the two rows
+        /// carry different anchors. Constructing through the first is still not
+        /// a row of its own; it only resolves the receiver.
+        #[test]
+        fn dynamic_import_bindings_carry_the_export_they_name() {
+            assert_eq!(
+                anchors_for(&steel(), "apps/steel/src/dynamic.ts"),
+                vec![
+                    (
+                        5,
+                        "client.sessions.create".to_string(),
+                        "steel-sdk".to_string(),
+                        Some("default".to_string()),
+                        None,
+                    ),
+                    (
+                        11,
+                        "sdk.close".to_string(),
+                        "steel-sdk".to_string(),
+                        None,
+                        None,
+                    ),
+                ]
+            );
+        }
+
+        /// Two branches reaching one binding through different exports of one
+        /// package, and two more through different subpaths of it. The package
+        /// agrees in both cases and the anchor does not, which is a
+        /// disagreement like any other: the binding owns nothing.
+        #[test]
+        fn one_package_reached_through_two_anchors_emits_nothing() {
+            assert_eq!(
+                anchors_for(&steel(), "apps/steel/src/split-consumer.ts"),
+                Vec::new()
+            );
+        }
+
+        /// The line the annotation rule does not cross. A parameter's declared
+        /// type says what a caller is expected to pass, not what it passed, so
+        /// neither a locally declared interface nor an imported one resolves a
+        /// receiver.
+        ///
+        /// Nor does a callback's parameter inherit the receiver the promise
+        /// came off. The rows here are the owned call and the `.then` applied
+        /// to what it returned, both of them chains off a value the package
+        /// produced; `session.scrape` inside the callback is not one of them.
+        #[test]
+        fn a_callback_parameter_does_not_inherit_its_receiver() {
+            assert_eq!(
+                anchors_for(&steel(), "apps/steel/src/atlas.ts"),
+                vec![
+                    (
+                        25,
+                        "steel.sessions.open".to_string(),
+                        "steel-sdk".to_string(),
+                        Some("default".to_string()),
+                        None,
+                    ),
+                    (
+                        25,
+                        "steel.sessions.open().then".to_string(),
+                        "steel-sdk".to_string(),
+                        Some("default".to_string()),
+                        None,
+                    ),
+                ]
+            );
+        }
+    }
+
     #[test]
     fn scan_is_deterministic() {
         assert_eq!(scan("apps/worker"), scan("apps/worker"));
@@ -2833,6 +3317,8 @@ mod tests {
             callee: "client.send".to_string(),
             package: "courier-sdk".to_string(),
             mechanism: CallMechanism::Sdk,
+            import_symbol: Some("default".to_string()),
+            subpath: Some("edge".to_string()),
         };
         assert_eq!(
             serde_json::to_value(&row).unwrap(),
@@ -2841,9 +3327,53 @@ mod tests {
                 "line": 3,
                 "callee": "client.send",
                 "package": "courier-sdk",
+                "mechanism": "sdk",
+                "import_symbol": "default",
+                "subpath": "edge"
+            })
+        );
+    }
+
+    /// The anchors are additive: a row that has neither serializes to exactly
+    /// the five keys the channel shipped with, so a reader written against
+    /// carrick#511 still reads every row.
+    #[test]
+    fn absent_anchors_are_omitted_from_the_row() {
+        let row = ExternalCallCandidate {
+            file: "src/a.ts".to_string(),
+            line: 3,
+            callee: "sdk.send".to_string(),
+            package: "courier-sdk".to_string(),
+            mechanism: CallMechanism::Sdk,
+            import_symbol: None,
+            subpath: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&row).unwrap(),
+            serde_json::json!({
+                "file": "src/a.ts",
+                "line": 3,
+                "callee": "sdk.send",
+                "package": "courier-sdk",
                 "mechanism": "sdk"
             })
         );
+    }
+
+    /// And they are optional on the way back in, so a row serialized before
+    /// they existed still deserializes.
+    #[test]
+    fn a_row_without_anchors_deserializes() {
+        let row: ExternalCallCandidate = serde_json::from_value(serde_json::json!({
+            "file": "src/a.ts",
+            "line": 3,
+            "callee": "sdk.send",
+            "package": "courier-sdk",
+            "mechanism": "sdk"
+        }))
+        .expect("row");
+        assert_eq!(row.import_symbol, None);
+        assert_eq!(row.subpath, None);
     }
 
     /// The HTTP-shaped mechanisms ride the row shape `sdk` shipped with — same
@@ -2856,6 +3386,8 @@ mod tests {
             callee: "POST".to_string(),
             package: "api.vendor.test".to_string(),
             mechanism: CallMechanism::ExternalHttp,
+            import_symbol: None,
+            subpath: None,
         };
         assert_eq!(
             serde_json::to_value(&row).unwrap(),
@@ -2936,6 +3468,8 @@ mod tests {
                     callee: "GET".to_string(),
                     package: "api.vendor.test".to_string(),
                     mechanism: CallMechanism::ExternalHttp,
+                    import_symbol: None,
+                    subpath: None,
                 }]
             );
         }
@@ -2966,6 +3500,8 @@ mod tests {
                     callee: "GET".to_string(),
                     package: "BILLING_API".to_string(),
                     mechanism: CallMechanism::EnvVarUrl,
+                    import_symbol: None,
+                    subpath: None,
                 }]
             );
         }
@@ -3079,6 +3615,8 @@ mod tests {
                 callee: "ledger.charge".to_string(),
                 package: "ledger-client".to_string(),
                 mechanism: CallMechanism::Sdk,
+                import_symbol: Some("default".to_string()),
+                subpath: None,
             };
             let http = ExternalCallCandidate {
                 file: "src/client.ts".to_string(),
@@ -3086,6 +3624,8 @@ mod tests {
                 callee: "GET".to_string(),
                 package: "api.vendor.test".to_string(),
                 mechanism: CallMechanism::ExternalHttp,
+                import_symbol: None,
+                subpath: None,
             };
             let merged = merge(vec![sdk.clone(), sdk.clone()], vec![http.clone()]);
             assert_eq!(merged, vec![http, sdk]);
