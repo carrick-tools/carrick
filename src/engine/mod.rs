@@ -1239,6 +1239,12 @@ async fn analyze_current_repo_incremental(
                 let _ = std::fs::remove_dir_all(&stub_dir);
             }
 
+            // Last step on this branch: everything above resolves against the
+            // absolute tree on disk, everything after this reads the payload as
+            // index data. `repo_path` is the canonicalized root the whole
+            // function ran against, so the strip is exact.
+            relativize_cloud_paths(&mut cloud_data, repo_path);
+
             return Ok(cloud_data);
         } else {
             debug!("git diff failed, falling back to full analysis");
@@ -2141,7 +2147,178 @@ fn add_protocol_manifest_entry(
     });
 }
 
-/// Build CloudRepoData from a mount graph (used by incremental path).
+/// Reduce a source path to its repo-root-relative form, with forward slashes.
+/// Absolute paths under the root are stripped; anything else (a path outside
+/// the root, an already-relative path) passes through unchanged, which is what
+/// makes the function idempotent and safe to run over a payload whose paths
+/// are already relative.
+///
+/// This is the one place the repo root is stripped from a string path. Callers:
+/// the cloud-projection pass below, and the v2 capture wire (the sidecar joins
+/// `source_file` back onto `repo_root`).
+pub(crate) fn repo_relative(file_path: &str, repo_root: &str) -> String {
+    let root = repo_root.trim_end_matches('/');
+    let stripped = if root.is_empty() || root == "." {
+        file_path
+    } else {
+        file_path
+            .strip_prefix(root)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .unwrap_or(file_path)
+    };
+    let stripped = stripped.strip_prefix("./").unwrap_or(stripped);
+    if cfg!(windows) {
+        stripped.replace('\\', "/")
+    } else {
+        stripped.to_string()
+    }
+}
+
+/// `repo_relative` for a `PathBuf` field.
+fn relativize_path_buf(path: &mut PathBuf, repo_root: &str) {
+    let relative = repo_relative(&path.to_string_lossy(), repo_root);
+    if relative != path.to_string_lossy() {
+        *path = PathBuf::from(relative);
+    }
+}
+
+/// Make every path in a cloud-bound payload repo-relative, once, at the
+/// boundary where analysis results stop being local coordinates and become
+/// index data.
+///
+/// The scan runs against a canonicalized absolute repo root (in CI the runner
+/// checkout, e.g. `/home/runner/work/<dir>/<repo>`), and that root ends up
+/// stamped on every location the analysis produces. Whether it SURVIVES to the
+/// upload used to depend on which branch ran: the incremental branch normalizes
+/// `file_results` keys before rebuilding the mount graph, so every
+/// `file_location` derived from a key came out relative, while the full branch
+/// normalized only the cached copy — after the graph was already projected — so
+/// the same fields came out absolute. Same repo, different day, different
+/// answer; and a consumer joining the path back to the repo (GitHub deep links,
+/// MCP tools fetching `repos/{owner}/{repo}/contents/{file_path}`) got a path
+/// that resolves to nothing.
+///
+/// Run this at the end of BOTH branches instead. It is idempotent, so the
+/// incremental branch (already relative) is unaffected, and it is a structural
+/// strip of the real root — never a match on `/home/runner/`, which would only
+/// cover GitHub-hosted runners.
+///
+/// Deliberately NOT rewritten: `capture_stub.files`, the compiler-emitted
+/// declaration tree. It is re-materialized into the synthetic type-check
+/// workspace verbatim, and rewriting module specifiers inside it would change
+/// what tsc resolves. `mounts`, `apps` and `imported_handlers` carry no paths.
+fn relativize_cloud_paths(cloud_data: &mut CloudRepoData, repo_path: &str) {
+    let prefix = format!("{}/", repo_path.trim_end_matches('/'));
+
+    // Endpoints and calls: the op's own source location, plus the source file
+    // of any attached type reference.
+    for op in cloud_data
+        .endpoints
+        .iter_mut()
+        .chain(cloud_data.calls.iter_mut())
+    {
+        relativize_path_buf(&mut op.file_path, repo_path);
+        for type_ref in [op.request_type.as_mut(), op.response_type.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            relativize_path_buf(&mut type_ref.file_path, repo_path);
+        }
+    }
+
+    // Mount graph: the source of truth every projection above is derived from,
+    // and itself uploaded for cross-repo matching.
+    if let Some(graph) = cloud_data.mount_graph.as_mut() {
+        for node in graph.nodes.values_mut() {
+            node.file_location = repo_relative(&node.file_location, repo_path);
+            if let Some(site) = node.creation_site.as_mut() {
+                *site = repo_relative(site, repo_path);
+            }
+        }
+        for endpoint in &mut graph.endpoints {
+            endpoint.file_location = repo_relative(&endpoint.file_location, repo_path);
+        }
+        for call in &mut graph.data_calls {
+            call.file_location = repo_relative(&call.file_location, repo_path);
+        }
+    }
+
+    // Type manifest: the entry location and the evidence location are separate
+    // fields and both are read as repo coordinates.
+    if let Some(entries) = cloud_data.type_manifest.as_mut() {
+        for entry in entries {
+            entry.file_path = repo_relative(&entry.file_path, repo_path);
+            entry.evidence.file_path = repo_relative(&entry.evidence.file_path, repo_path);
+            // Both definition strings are printed TypeScript, so they carry
+            // the same `import("/abs/path")` leak the bundle does — and
+            // `expanded_definition` is what the PR comment prints as the type
+            // label on a mismatch row, so an absolute root here is rendered,
+            // not just stored.
+            for definition in [
+                entry.resolved_definition.as_mut(),
+                entry.expanded_definition.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if definition.contains(&prefix) {
+                    *definition = definition.replace(&prefix, "");
+                }
+            }
+        }
+    }
+
+    // Function definitions are already stripped on both branches (see
+    // `relativize_function_definition_paths`); re-running is a no-op and keeps
+    // the invariant true for any future construction path that forgets to.
+    relativize_function_definition_paths(&mut cloud_data.function_definitions, repo_path);
+
+    // The compiler leaks the absolute root into the bundle as
+    // `import("/abs/path/x")`, the same way it does into signatures.
+    if let Some(bundled) = cloud_data.bundled_types.as_mut()
+        && bundled.contains(&prefix)
+    {
+        *bundled = bundled.replace(&prefix, "");
+    }
+
+    // Package manifest locations. `merged_dependencies` holds its own copy of
+    // the source path (`Packages::resolve_dependencies` clones it per entry),
+    // so both have to be walked; `package_json` is a serialization of the same
+    // struct, so re-serialize rather than leave the two disagreeing.
+    if let Some(packages) = cloud_data.packages.as_mut() {
+        for path in &mut packages.source_paths {
+            relativize_path_buf(path, repo_path);
+        }
+        for info in packages.merged_dependencies.values_mut() {
+            relativize_path_buf(&mut info.source_path, repo_path);
+        }
+        if let Ok(json) = serde_json::to_string(packages) {
+            cloud_data.package_json = Some(json);
+        }
+    }
+
+    // Cache keys: normalized on both branches already, re-applied here so the
+    // invariant is enforced in one place. Gated on an actual offender —
+    // `normalize_file_results_keys` clones every result, which is the multi-MB
+    // bulk of the payload.
+    if cloud_data.file_results.as_ref().is_some_and(|results| {
+        results
+            .keys()
+            .any(|key| key.starts_with(&prefix) || key.starts_with("./"))
+    }) && let Some(file_results) = cloud_data.file_results.take()
+    {
+        cloud_data.file_results = Some(normalize_file_results_keys(&file_results, repo_path));
+    }
+
+    // Outbound-call candidates are relativized at construction; keep them in
+    // the sweep so the invariant does not depend on that staying true.
+    if let Some(candidates) = cloud_data.external_call_candidates.as_mut() {
+        for candidate in candidates {
+            candidate.file = repo_relative(&candidate.file, repo_path);
+        }
+    }
+}
+
 /// Repo-relative paths for cloud-bound function definitions. The scan runs
 /// against a canonicalized absolute repo root (in CI the runner checkout,
 /// e.g. `/home/runner/work/<dir>/<repo>`), and the extractor stamps that
@@ -2230,6 +2407,7 @@ fn attach_external_call_candidates(
     }
 }
 
+/// Build `CloudRepoData` from a mount graph (used by the incremental path).
 fn build_cloud_data_from_mount_graph(
     repo_name: &str,
     repo_path: &str,
@@ -3332,6 +3510,14 @@ async fn analyze_current_repo(
     // Same workspace-wide hash the incremental gate compares against.
     cloud_data.package_json_hash = Some(hash_workspace_package_jsons(packages, repo_path));
 
+    // 8. Last step: make every path in the payload repo-relative. This branch
+    // builds its mount graph from `file_results` keyed by as-scanned ABSOLUTE
+    // paths (the incremental branch normalizes those keys before rebuilding the
+    // graph; step 7 above normalizes only the cached copy, too late for the
+    // projections), so without this the same repo uploads absolute locations on
+    // a full scan and relative ones on an incremental scan.
+    relativize_cloud_paths(&mut cloud_data, repo_path);
+
     Ok(cloud_data)
 }
 
@@ -3560,6 +3746,265 @@ mod tests {
             defs["external"].file_path,
             PathBuf::from("/opt/other/place.ts")
         );
+    }
+
+    /// Every path a payload carries must be repo-relative before it is
+    /// uploaded, whichever analysis branch built it. The full branch used to
+    /// project its mount graph from `file_results` keyed by absolute
+    /// as-scanned paths, so the same repo shipped absolute call sites on a
+    /// full scan and relative ones on an incremental scan.
+    ///
+    /// Walks the serialized blob for any string that still starts with the
+    /// repo root. Known limit of that walk: it catches a path that IS the
+    /// root-prefixed string, not a root EMBEDDED mid-string. The three fields
+    /// carrying printed TypeScript (`bundled_types`, `resolved_definition`,
+    /// `expanded_definition`) leak the root that way and are asserted
+    /// separately below; `capture_stub.files` can still hold one and is
+    /// deliberately left untouched by the pass (see `relativize_cloud_paths`).
+    #[test]
+    fn relativize_cloud_paths_leaves_no_absolute_path_in_the_payload() {
+        use crate::external_call_candidates::{CallMechanism, ExternalCallCandidate};
+        use crate::mount_graph::{DataFetchingCall, GraphNode, NodeType, ResolvedEndpoint};
+        use crate::packages::PackageInfo;
+        use crate::visitor::FunctionDefinition;
+
+        let repo_path = "/home/runner/work/bench-sbx-app/bench-sbx-app";
+        let abs = |rel: &str| format!("{}/{}", repo_path, rel);
+
+        let op = |file: &str| ApiEndpointDetails {
+            owner: None,
+            key: OperationKey::http("GET", "/orders".to_string()),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: Some(TypeReference {
+                file_path: PathBuf::from(abs("src/types/order.ts")),
+                type_ann: None,
+                start_position: 0,
+                composite_type_string: "Order".to_string(),
+                alias: "Order".to_string(),
+            }),
+            response_type: Some(TypeReference {
+                file_path: PathBuf::from(abs("src/types/order.ts")),
+                type_ann: None,
+                start_position: 0,
+                composite_type_string: "Order".to_string(),
+                alias: "Order".to_string(),
+            }),
+            file_path: PathBuf::from(abs(file)),
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+        };
+
+        let mut graph = MountGraph::new();
+        graph.nodes.insert(
+            "app".to_string(),
+            GraphNode {
+                name: "app".to_string(),
+                node_type: NodeType::Root,
+                creation_site: Some(abs("src/server.ts:3")),
+                file_location: abs("src/server.ts:3"),
+            },
+        );
+        graph.endpoints.push(ResolvedEndpoint {
+            method: "GET".to_string(),
+            path: "/orders".to_string(),
+            full_path: "/orders".to_string(),
+            handler: None,
+            owner: "app".to_string(),
+            file_location: abs("src/routes/orders.ts:18"),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+        });
+        graph.data_calls.push(DataFetchingCall {
+            method: "GET".to_string(),
+            target_url: "http://api/search".to_string(),
+            canonical_path: "/search".to_string(),
+            client: "fetch(".to_string(),
+            file_location: abs("src/providers/search.ts:313"),
+            call_kind: None,
+            repo_name: None,
+            service_name: None,
+            host: None,
+            line: Some(313),
+        });
+
+        let mut function_definitions = HashMap::new();
+        function_definitions.insert(
+            "handler".to_string(),
+            FunctionDefinition {
+                name: "handler".to_string(),
+                file_path: PathBuf::from(abs("src/routes/orders.ts")),
+                node_type: Default::default(),
+                arguments: vec![],
+                body_source: None,
+                is_exported: true,
+                line_number: 18,
+                end_line: 24,
+                intent: None,
+                calls: vec![],
+                return_type: None,
+                return_is_explicit: false,
+                signature: Some(format!(
+                    "(req: import(\"{}\").Req) => void",
+                    abs("src/types")
+                )),
+                intent_input_hash: None,
+            },
+        );
+
+        let mut packages = Packages {
+            source_paths: vec![PathBuf::from(abs("package.json"))],
+            ..Packages::default()
+        };
+        packages.merged_dependencies.insert(
+            "express".to_string(),
+            PackageInfo {
+                name: "express".to_string(),
+                version: "4.18.0".to_string(),
+                source_path: PathBuf::from(abs("package.json")),
+            },
+        );
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            abs("src/providers/search.ts"),
+            crate::agents::file_analyzer_agent::FileAnalysisResult::default(),
+        );
+
+        let mut data = CloudRepoData {
+            repo_name: "bench-sbx-app".to_string(),
+            service_name: None,
+            endpoints: vec![op("src/routes/orders.ts:18")],
+            calls: vec![op("src/providers/search.ts:313")],
+            mounts: vec![],
+            apps: HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions,
+            config_json: None,
+            package_json: serde_json::to_string(&packages).ok(),
+            packages: Some(packages),
+            last_updated: chrono::Utc::now(),
+            commit_hash: "test".to_string(),
+            mount_graph: Some(graph),
+            bundled_types: Some(format!(
+                "export type Order = import(\"{}\").Order;\n",
+                abs("src/types/order")
+            )),
+            type_manifest: Some(vec![TypeManifestEntry {
+                key: OperationKey::http("GET", "/orders".to_string()),
+                role: ManifestRole::Producer,
+                type_kind: ManifestTypeKind::Response,
+                type_alias: "Endpoint_Response".to_string(),
+                file_path: abs("src/routes/orders.ts"),
+                line_number: 18,
+                is_explicit: true,
+                type_state: ManifestTypeState::Explicit,
+                evidence: TypeEvidence {
+                    file_path: abs("src/routes/orders.ts"),
+                    span_start: None,
+                    span_end: None,
+                    line_number: 18,
+                    infer_kind: InferKind::Expression,
+                    is_explicit: true,
+                    type_state: ManifestTypeState::Explicit,
+                },
+                resolved_definition: Some(format!(
+                    "export type Endpoint_Response = import(\"{}\").Order;",
+                    abs("src/types/order")
+                )),
+                expanded_definition: Some(format!("import(\"{}\").Order", abs("src/types/order"))),
+                primary_type_symbol: None,
+            }]),
+            file_results: Some(file_results),
+            cached_detection: None,
+            cached_guidance: None,
+            cached_extraction_config: None,
+            package_json_hash: None,
+            cache_version: None,
+            type_extraction_status: None,
+            compat_verdicts: None,
+            capture_stub: None,
+            external_call_candidates: Some(vec![ExternalCallCandidate {
+                file: abs("src/providers/search.ts"),
+                line: 313,
+                callee: "GET".to_string(),
+                package: "SEARCH_URL".to_string(),
+                mechanism: CallMechanism::EnvVarUrl,
+            }]),
+        };
+
+        relativize_cloud_paths(&mut data, repo_path);
+
+        // Spot-check the field the CI comment actually renders, so a walk that
+        // silently stopped finding strings can't pass this test.
+        let graph = data.mount_graph.as_ref().expect("graph");
+        assert_eq!(
+            graph.data_calls[0].file_location,
+            "src/providers/search.ts:313"
+        );
+        assert_eq!(graph.endpoints[0].file_location, "src/routes/orders.ts:18");
+        assert_eq!(
+            data.calls[0].file_path,
+            PathBuf::from("src/providers/search.ts:313")
+        );
+        assert_eq!(
+            data.bundled_types.as_deref(),
+            Some("export type Order = import(\"src/types/order\").Order;\n"),
+            "the compiler leaks the absolute root into the bundle as import(\"...\")"
+        );
+        // Printed TypeScript carries the same leak, and `expanded_definition`
+        // is what a mismatch row prints as the type label. The JSON sweep below
+        // cannot see these: they start with `export type` / `import(`, not with
+        // the root.
+        let entry = &data.type_manifest.as_ref().expect("manifest")[0];
+        assert_eq!(
+            entry.resolved_definition.as_deref(),
+            Some("export type Endpoint_Response = import(\"src/types/order\").Order;")
+        );
+        assert_eq!(
+            entry.expanded_definition.as_deref(),
+            Some("import(\"src/types/order\").Order")
+        );
+
+        // Then the exhaustive sweep over the serialized payload.
+        let json = serde_json::to_value(&data).expect("payload serializes");
+        let mut offenders: Vec<String> = Vec::new();
+        walk_json_strings(&json, &mut |s| {
+            if s.starts_with(repo_path) {
+                offenders.push(s.to_string());
+            }
+        });
+        assert!(
+            offenders.is_empty(),
+            "uploaded payload still carries absolute paths: {:?}",
+            offenders
+        );
+    }
+
+    /// Visit every string in a JSON value, keys included: an absolute path can
+    /// be a map KEY (the `file_results` cache) as easily as a value.
+    fn walk_json_strings(value: &serde_json::Value, visit: &mut impl FnMut(&str)) {
+        match value {
+            serde_json::Value::String(s) => visit(s),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk_json_strings(item, visit);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (key, item) in map {
+                    visit(key);
+                    walk_json_strings(item, visit);
+                }
+            }
+            _ => {}
+        }
     }
 
     #[test]

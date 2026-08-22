@@ -18,9 +18,10 @@
 //! CARRICK_MOCK_ALL=1 CARRICK_OUTPUT_JSON=1 \
 //!   CARRICK_MOCK_FIXTURE_DIR=tests/fixtures/llm-mocked-api/__llm__/ \
 //!   cargo run -- tests/fixtures/llm-mocked-api \
-//!   | sed "s#$(pwd)/##" \
 //!   > tests/fixtures/llm-mocked-api/__golden__.json
 //! ```
+//! The golden is portable with no masking because the scanner emits
+//! repo-relative paths; the assertion below holds that property.
 //!
 //! `Endpoint_<hash>_<Kind>_Call<id>` aliases are compared verbatim:
 //! `build_call_site_id` hashes the REPO-RELATIVE call-site path (#355), so the
@@ -49,14 +50,18 @@ fn cassette_hard_gate_llm_mocked_api() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("scanner stdout was not UTF-8");
-    // Relativise the absolute repo root so the golden is portable across
-    // machines / CI runners. The scanner is invoked with `{repo}/...`, so file
-    // paths in the projection are anchored at the same prefix. Call-site ids
-    // need no masking: they hash the repo-relative path (#355).
-    let normalized = stdout.replace(&format!("{repo}/"), "");
+    // Every path the scanner emits is relative to the SCANNED repo root, so
+    // the golden is portable across machines with no masking. Asserted rather
+    // than masked: masking is what let absolute runner paths ride into the
+    // uploaded index unnoticed for as long as they did. Call-site ids need no
+    // masking either — they hash the repo-relative path (#355).
+    assert!(
+        !stdout.contains(&format!("{repo}/")),
+        "scanner output leaked an absolute path anchored at the scan root:\n{stdout}"
+    );
 
     let actual: serde_json::Value =
-        serde_json::from_str(&normalized).expect("scanner output was not valid JSON");
+        serde_json::from_str(&stdout).expect("scanner output was not valid JSON");
     let golden: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/llm-mocked-api/__golden__.json"))
             .expect("golden fixture was not valid JSON");
