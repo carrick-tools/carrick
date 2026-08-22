@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
 
+use super::repo_relative;
 use crate::analyzer::PairCheckOutcome;
 use crate::cloud_storage::{
     CAPTURE_ARTIFACT_VERSION, CaptureStubArtifact, CloudRepoData, ManifestRole, ManifestTypeKind,
@@ -35,22 +36,6 @@ use crate::services::type_sidecar::{
 // ===========================================================================
 // Scan time: capture
 // ===========================================================================
-
-/// Reduce a source path to its repo-root-relative form for the capture wire
-/// (the sidecar joins `source_file` onto `repo_root`). Absolute paths under
-/// the root are stripped; anything else passes through unchanged.
-fn repo_relative(file_path: &str, repo_root: &str) -> String {
-    let root = repo_root.trim_end_matches('/');
-    let stripped = if root.is_empty() || root == "." {
-        file_path
-    } else {
-        file_path
-            .strip_prefix(root)
-            .and_then(|rest| rest.strip_prefix('/'))
-            .unwrap_or(file_path)
-    };
-    stripped.strip_prefix("./").unwrap_or(stripped).to_string()
-}
 
 /// One shared notion of a "disqualifying top type" in printed TypeScript
 /// type text (adversarial-review finding 2, aligned with the capture

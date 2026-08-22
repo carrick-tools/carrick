@@ -110,7 +110,11 @@ fn dependency_conflict_finding(conflict: &DependencyConflict) -> Finding {
             .map(|repo| PackageVersionRef {
                 repo: repo.repo_name.clone(),
                 version: repo.version.clone(),
-                source: repo.source_path.display().to_string(),
+                // A blob uploaded before paths were relativized at the
+                // source carries the runner checkout here; strip it so the
+                // conflict row cites `package.json`, not a runner path.
+                source: strip_ci_workspace_prefix(&repo.source_path.display().to_string())
+                    .to_string(),
             })
             .collect(),
     )
@@ -382,9 +386,20 @@ fn consumer_identity(location: &str) -> (String, u32) {
 }
 
 /// Strip the GitHub Actions checkout prefix (`/home/runner/work/<repo>/<repo>/`)
-/// from a call-site location so PR-comment risk rows cite `server.ts:66`, not
-/// the runner's absolute workspace path (#337). Anything else (local absolute
+/// from a stored location so PR-comment rows cite `server.ts:66`, not the
+/// runner's absolute workspace path (#337). Anything else (local absolute
 /// paths, already-relative paths) passes through unchanged.
+///
+/// READ-SIDE GUARD ONLY, for blobs uploaded before the scanner relativized
+/// paths at the source (`engine::relativize_cloud_paths`). Fresh scans arrive
+/// here already relative, so this is a no-op on them; it stays because the
+/// index still holds older blobs, and a peer repo may not have re-scanned yet.
+/// Never the fix for a new path field: match the repo root structurally at the
+/// projection boundary instead — this pattern only knows GitHub-hosted runners.
+///
+/// Apply it where a stored location is RENDERED. Not where one is JOINED: the
+/// compat-verdict join pairs a call's location against the manifest's
+/// `consumer_file`, and stripping one side only would break the join.
 fn strip_ci_workspace_prefix(location: &str) -> &str {
     location
         .strip_prefix("/home/runner/work/")
@@ -1636,7 +1651,16 @@ impl Analyzer {
             let Some((method, target)) = call.key.as_http() else {
                 continue;
             };
-            let call_site = call.file_path.display().to_string();
+            // Rendered, not joined: `call_site` feeds the missing-endpoint,
+            // wrong-verb, shared-contract and env-var rows. Blobs uploaded
+            // before paths were relativized at the source carry the runner
+            // checkout, so strip it here. The compat-verdict join keys below
+            // (`consumer_location`, `consumer_repo_by_call`) deliberately keep
+            // the stored text: their other side is the manifest's
+            // `consumer_file`, which is not stripped, and stripping one side
+            // would break the join.
+            let call_site =
+                strip_ci_workspace_prefix(&call.file_path.display().to_string()).to_string();
 
             // Env-var base URLs (framework-agnostic; smarter detection avoids
             // false positives on path parameters) look up by their canonical
@@ -1747,7 +1771,9 @@ impl Analyzer {
                                 // its source location is a group member too,
                                 // so the report shows where every encoding
                                 // lives, including the double-extracted one.
-                                sites.insert(endpoint.file_location.clone());
+                                sites.insert(
+                                    strip_ci_workspace_prefix(&endpoint.file_location).to_string(),
+                                );
                                 if edge.producer_repo != edge.consumer_repo {
                                     cross_repo_matches.push(edge);
                                 }
@@ -2105,10 +2131,9 @@ impl Analyzer {
                 }
             } else {
                 let (label, name) = call.key.display_labels();
-                missing
-                    .entry((label, name))
-                    .or_default()
-                    .insert(call.file_path.display().to_string());
+                missing.entry((label, name)).or_default().insert(
+                    strip_ci_workspace_prefix(&call.file_path.display().to_string()).to_string(),
+                );
             }
         }
 
@@ -3699,6 +3724,63 @@ mod tests {
                 Finding::missing_endpoint("GET", "/api/missing", None, vec!["client.ts:3".into()]),
                 Finding::orphaned_endpoint("POST", "/api/orders", Some("api".to_string())),
             ]
+        );
+    }
+
+    /// A blob uploaded before paths were relativized at the source carries the
+    /// runner checkout on its call sites. The missing-endpoint row must still
+    /// cite the repo-relative file — this is the finding site that the
+    /// type-mismatch row's guard did not cover, and the one the real CI
+    /// comment rendered as `/home/runner/work/...`.
+    #[test]
+    fn test_missing_endpoint_strips_legacy_ci_workspace_prefix() {
+        use crate::mount_graph::ResolvedEndpoint;
+
+        let mut analyzer = Analyzer::new(Config::default());
+
+        analyzer.calls.push(ApiEndpointDetails {
+            owner: None,
+            key: OperationKey::http("GET", "/api/missing"),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from(
+                "/home/runner/work/bench-sbx-app/bench-sbx-app/src/providers/search.ts:313",
+            ),
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+        });
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph.endpoints.push(ResolvedEndpoint {
+            method: "POST".to_string(),
+            path: "/api/orders".to_string(),
+            full_path: "/api/orders".to_string(),
+            handler: None,
+            owner: "app".to_string(),
+            file_location: "server.ts:10".to_string(),
+            middleware_chain: vec![],
+            repo_name: Some("api".to_string()),
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+        });
+
+        let (findings, _, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert!(
+            findings.contains(&Finding::missing_endpoint(
+                "GET",
+                "/api/missing",
+                None,
+                vec!["src/providers/search.ts:313".into()],
+            )),
+            "the runner checkout prefix must be stripped from the call site: {:?}",
+            findings
         );
     }
 
