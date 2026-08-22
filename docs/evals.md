@@ -111,6 +111,7 @@ Label conventions the scorer normalizes for you:
 | `CARRICK_EVAL_CAPTURE=1` | Tier-A: dump raw file-analyzer input/output per run |
 | `CARRICK_EVAL_DUMP_DIR=<dir>` | Persist raw analyzer I/O for prompt diagnosis |
 | `CARRICK_SKIP_INTENTS=1` | Skip intent generation (dominant cost term; no eval dimension consumes intents) |
+| `CARRICK_INTENT_CONCURRENCY=N` | Concurrent `/generate-intent` calls per dependency level (default 8, capped by `CARRICK_CONCURRENCY_LIMIT`) |
 | `CARRICK_XREPO_CORPUS=<path>` | Offline harness corpus override |
 | `CARRICK_MOCK_ALL=1` | Fully offline scanner run (mocked LLM responses) |
 | `CARRICK_LOCAL_STORAGE_DIR` | Local upload cache dir — eval runs never write the real cloud index |

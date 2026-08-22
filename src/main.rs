@@ -117,6 +117,10 @@ ENVIRONMENT VARIABLES:
     ACTIONS_ID_TOKEN_REQUEST_TOKEN  Bearer token for the OIDC endpoint (auto-set)
     CARRICK_MOCK_ALL                Use mock storage instead of Carrick Cloud
     CARRICK_API_ENDPOINT            API endpoint for the carrick service (build-time)
+    CARRICK_INTENT_CONCURRENCY      Concurrent function-intent requests (default 8).
+                                    Lower it if a large repo loses intents to
+                                    backend overload; capped by
+                                    CARRICK_CONCURRENCY_LIMIT
 "#
         );
     }
