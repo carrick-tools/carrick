@@ -153,6 +153,12 @@ jobs:
             assert.strictEqual(m.paths_match('/users', '/orders'), false);
             assert.strictEqual(m.is_param_segment(':id'), true);
             assert.strictEqual(m.is_param_segment('users'), false);
+            assert.strictEqual(m.is_unknown_call_path('/*'), true);
+            assert.strictEqual(m.is_unknown_call_path('/api/v1/login'), false);
+            assert.strictEqual(m.match_verdict('/*', '/*'), m.MatchVerdict.UnknownCallPath);
+            assert.strictEqual(m.match_verdict('/*', '/api/v1/login'), m.MatchVerdict.CatchAllRoute);
+            assert.strictEqual(m.reportable_agreement('/*', '/api/v1/login'), undefined);
+            assert.strictEqual(m.reportable_agreement('/files/**', '/files/report'), 1);
             console.log('wasm smoke ok');
           "
 

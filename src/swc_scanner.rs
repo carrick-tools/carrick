@@ -52,10 +52,33 @@ pub struct CandidateTarget {
     pub callee_property: Option<String>,
     /// Name of the enclosing function (if any)
     pub enclosing_function: Option<String>,
-    /// First-argument snippet (e.g., URL/path literal/template)
+    /// First-argument snippet (e.g., URL/path literal/template). For a
+    /// request-spec call (see [`CandidateTarget::request_spec`]) this is the
+    /// quoted `url`/`path` literal read off the object, not the object's own
+    /// source text — the raw snippet of a multi-line config object is just
+    /// `{`, which anchors nothing.
     pub path_snippet: Option<String>,
     /// A snippet of the code at this location
     pub code_snippet: String,
+    /// Method and URL read structurally off a single object-literal argument
+    /// that carries both (`client({ method: "post", url: "/api/v1/login" })`).
+    /// Present only for that shape. Not serialized: the JSON candidate
+    /// context the HTTP prompt receives stays exactly as before, and these
+    /// facts are used to overrule the model's answer after it replies (#537).
+    #[serde(skip)]
+    pub request_spec: Option<RequestSpec>,
+}
+
+/// The HTTP method and URL a call declares as data on one object-literal
+/// argument, rather than positionally. Both are string literals; the URL is
+/// route-shaped. Structural: the shape is the signal, no client library is
+/// named anywhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestSpec {
+    /// The `method` literal, upper-cased and known to be an HTTP verb.
+    pub method: String,
+    /// The `url` (or `path`) literal, verbatim.
+    pub url: String,
 }
 
 impl CandidateTarget {
@@ -1042,7 +1065,14 @@ impl CandidateVisitor {
         let line_number = self.get_line_number(call.span);
         let candidate_id = self.candidate_id(span_start, span_end);
         let code_snippet = self.get_code_snippet(call.span);
-        let path_snippet = self.extract_first_arg_snippet(call);
+        // A request-spec call carries its URL as a property, not positionally.
+        // Its raw first-arg snippet is the opening brace of the object, so the
+        // literal has to come off the AST or the candidate anchors nothing.
+        let request_spec = Self::call_request_spec(call);
+        let path_snippet = match &request_spec {
+            Some(spec) => Some(format!("'{}'", spec.url)),
+            None => self.extract_first_arg_snippet(call),
+        };
 
         self.candidates.push(CandidateTarget {
             protocol: Protocol::Http,
@@ -1055,6 +1085,7 @@ impl CandidateVisitor {
             enclosing_function: self.current_function(),
             path_snippet,
             code_snippet,
+            request_spec,
         });
     }
 
@@ -1088,6 +1119,7 @@ impl CandidateVisitor {
             enclosing_function: self.current_function(),
             path_snippet,
             code_snippet,
+            request_spec: None,
         });
     }
 
@@ -1128,6 +1160,87 @@ impl CandidateVisitor {
             .ok()
             .map(|s| s.lines().next().unwrap_or("").to_string())
             .map(|s| s.chars().take(120).collect())
+    }
+
+    /// The request spec of a call that declares its method and URL as data on
+    /// its first argument (`client({ method: "post", url: "/api/v1/login" })`,
+    /// `axios({ ... })`, `client.request({ ... })`). `None` for every other
+    /// call shape.
+    ///
+    /// This is the config-object form of an outbound HTTP call, and nothing in
+    /// the candidate layer could see it before (#537): no argument is a
+    /// string, so the URL-scheme and stringish-argument signals never fire;
+    /// the callee is frequently a bare binding (a client passed in as a
+    /// parameter), so the member-name heuristics never fire either; and the
+    /// object's raw first-line snippet is `{`. The call was invisible, and the
+    /// path was whatever the model guessed.
+    ///
+    /// Purely structural — the property names on the object are the whole
+    /// signal, and no client library is named. A producer route declared the
+    /// same way (`server.route({ method, url, handler })`) satisfies it too,
+    /// which is correct: the candidate carries the route literal either way
+    /// and the analyzer decides which side of the contract it is on.
+    fn call_request_spec(call: &CallExpr) -> Option<RequestSpec> {
+        let arg = call.args.first()?;
+        if arg.spread.is_some() {
+            return None;
+        }
+        let Expr::Object(obj) = &*arg.expr else {
+            return None;
+        };
+        Self::request_spec(obj)
+    }
+
+    /// The `{ method, url }` pair of an object literal, when both are string
+    /// literals, the method is an HTTP verb, and the URL is route-shaped
+    /// (leading `/` or an http(s) URL). `path` is accepted as the URL key for
+    /// the clients that spell it that way.
+    ///
+    /// The three guards are what keep this off ordinary config objects: an
+    /// options bag with a `method` naming an RPC operation, or a `url` holding
+    /// a bare token, is not a request. Deliberately separate from
+    /// [`Self::route_descriptor`], which owns the producer-side registry shape
+    /// and must not start recognising `url` (#241 pins that a standalone
+    /// `{ method, path }` object is never a deterministic endpoint).
+    fn request_spec(node: &ObjectLit) -> Option<RequestSpec> {
+        let mut method = None;
+        let mut url = None;
+
+        for prop in &node.props {
+            let PropOrSpread::Prop(prop) = prop else {
+                continue;
+            };
+            let Prop::KeyValue(kv) = &**prop else {
+                continue;
+            };
+            let key = match &kv.key {
+                PropName::Ident(id) => id.sym.to_string(),
+                PropName::Str(s) => s.value.to_string(),
+                _ => continue,
+            };
+            let Expr::Lit(Lit::Str(value)) = &*kv.value else {
+                continue;
+            };
+            match key.as_str() {
+                "method" => method = Some(value.value.to_string()),
+                // `url` wins over `path` when a config carries both.
+                "url" => url = Some(value.value.to_string()),
+                "path" if url.is_none() => url = Some(value.value.to_string()),
+                _ => {}
+            }
+        }
+
+        let (method, url) = (method?, url?);
+        if !crate::type_manifest::is_http_method(&method) {
+            return None;
+        }
+        if !RouteDescriptorVisitor::is_route_shaped_path(&url) {
+            return None;
+        }
+        Some(RequestSpec {
+            method: method.trim().to_uppercase(),
+            url,
+        })
     }
 
     /// Inspect an object literal for the route-descriptor shape
@@ -1494,6 +1607,23 @@ impl Visit for CandidateVisitor {
             // that can emit this span first labels it identically.
             let property = Self::callee_member_prop(callee_expr);
             self.push_candidate(call, root, property);
+        }
+
+        // Signal 2b: the call declares its method and URL as data on a single
+        // object-literal argument (`client({ method: "post", url: "/x" })`).
+        // None of the other call-site signals can see this shape — see
+        // `call_request_spec` — so without this one the call raises no
+        // candidate at all and the file can be skipped before the analyzer
+        // ever reads it (#537).
+        if Self::call_request_spec(call).is_some() {
+            let (obj, prop) = match &call.callee {
+                Callee::Expr(e) => (
+                    Self::extract_callee_object(e).unwrap_or_else(|| "<request-spec>".to_string()),
+                    Self::callee_member_prop(e),
+                ),
+                _ => ("<request-spec>".to_string(), None),
+            };
+            self.push_candidate(call, obj, prop);
         }
 
         // Signal 3: first argument is a URL with a network scheme.
@@ -2465,6 +2595,139 @@ export { routes };
         assert_eq!(endpoints[0].handler.as_deref(), Some("onHook"));
     }
 
+    /// #537: the config-object call form. The client is a bare binding (here a
+    /// destructured parameter, the shape that makes every callee-name
+    /// heuristic useless), no argument is a string, and the object spans
+    /// several lines — so before this signal the call raised no candidate at
+    /// all and its path was left to the model, which produced a wildcard.
+    #[test]
+    fn config_object_call_yields_a_candidate_carrying_method_and_url() {
+        let content = r#"
+export const login = async ({ clientId, apiClient }) => {
+  const response = await apiClient({
+    method: "post",
+    url: "/api/v1/auth/universal-auth/login",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    data: loginData
+  });
+  return response.data.accessToken;
+};
+"#;
+        let result = scan_test_content(content);
+        let candidate = result
+            .candidates
+            .iter()
+            .find(|c| c.callee_object == "apiClient")
+            .unwrap_or_else(|| {
+                panic!(
+                    "config-object call must raise a candidate: {:#?}",
+                    result.candidates
+                )
+            });
+
+        let spec = candidate
+            .request_spec
+            .as_ref()
+            .expect("the candidate must carry the structural request spec");
+        assert_eq!(spec.method, "POST");
+        assert_eq!(spec.url, "/api/v1/auth/universal-auth/login");
+        // The hint must show the URL, not the object's opening brace.
+        assert_eq!(
+            candidate.path_snippet.as_deref(),
+            Some("'/api/v1/auth/universal-auth/login'")
+        );
+    }
+
+    /// The same shape written on one line, called on a member and on a plain
+    /// module binding. Structural, so the callee spelling is irrelevant.
+    #[test]
+    fn config_object_call_is_recognised_whatever_the_callee_is() {
+        let content = r#"
+import axios from "axios";
+export async function run() {
+  await axios({ method: "GET", url: "/api/v1/status" });
+  await client.request({ method: 'delete', url: '/api/v1/sessions/current' });
+}
+"#;
+        let result = scan_test_content(content);
+        let mut seen: Vec<(String, String)> = result
+            .candidates
+            .iter()
+            .filter_map(|c| {
+                c.request_spec
+                    .as_ref()
+                    .map(|s| (s.method.clone(), s.url.clone()))
+            })
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("DELETE".to_string(), "/api/v1/sessions/current".to_string()),
+                ("GET".to_string(), "/api/v1/status".to_string()),
+            ]
+        );
+    }
+
+    /// The three guards that keep this off ordinary options bags: a method
+    /// that is not an HTTP verb, a URL that is not route-shaped, and a
+    /// non-literal value for either.
+    #[test]
+    fn non_request_config_objects_carry_no_spec() {
+        let cases = [
+            // `method` names an RPC operation, not an HTTP verb.
+            r#"await rpc({ method: "workspace.list", url: "/rpc" });"#,
+            // `url` is a bare token, not a route.
+            r#"await send({ method: "post", url: "queue-name" });"#,
+            // Method is computed.
+            r#"await client({ method: verb, url: "/api/v1/things" });"#,
+            // URL is a template literal, so no unambiguous literal to anchor.
+            r#"await client({ method: "post", url: `${base}/things` });"#,
+            // No URL key at all.
+            r#"await client({ method: "post", body: payload });"#,
+        ];
+        for case in cases {
+            let content = format!("export async function run() {{ {case} }}");
+            let result = scan_test_content(&content);
+            assert!(
+                result.candidates.iter().all(|c| c.request_spec.is_none()),
+                "must carry no request spec: {case}"
+            );
+        }
+    }
+
+    /// A producer route declared the same way (`server.route({ method, url })`,
+    /// the config-object route registration form) is recognised by the same
+    /// structural reader, so its path literal anchors the candidate too —
+    /// including the SPA-fallback wildcard, which must be read verbatim rather
+    /// than guessed at.
+    #[test]
+    fn config_object_route_registration_anchors_its_path_literal() {
+        let content = r#"
+export function register(server) {
+  server.route({
+    method: "GET",
+    url: "/*",
+    handler: (request, reply) => reply.send(indexHtml)
+  });
+}
+"#;
+        let result = scan_test_content(content);
+        let candidate = result
+            .candidates
+            .iter()
+            .find(|c| c.request_spec.is_some())
+            .unwrap_or_else(|| {
+                panic!(
+                    "route registration must raise a candidate: {:#?}",
+                    result.candidates
+                )
+            });
+        let spec = candidate.request_spec.as_ref().expect("checked above");
+        assert_eq!((spec.method.as_str(), spec.url.as_str()), ("GET", "/*"));
+        assert_eq!(candidate.path_snippet.as_deref(), Some("'/*'"));
+    }
+
     #[test]
     fn test_detects_express_style_endpoints() {
         let content = r#"
@@ -2618,6 +2881,7 @@ async function fetchUser(id: string) {
             enclosing_function: Some("handler".to_string()),
             path_snippet: Some("'/users'".to_string()),
             code_snippet: "app.get('/users', handler)".to_string(),
+            request_spec: None,
         };
 
         let hint = candidate.format_hint();

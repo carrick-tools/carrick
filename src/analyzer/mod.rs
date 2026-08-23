@@ -1712,10 +1712,27 @@ impl Analyzer {
                     // to the pre-typed matcher); the plain edge re-normalizes
                     // the raw target.
                     let normalized_path = if is_env_route {
-                        miss_path
+                        miss_path.clone()
                     } else {
                         normalizer.normalize(&lookup_url).path
                     };
+                    // #537: the consumer's own path never resolved to a
+                    // literal segment (`/*`, a wholly-interpolated template,
+                    // empty). The call names no operation, so no producer may
+                    // claim it — and a catch-all producer will otherwise route
+                    // every one of them, which is how a handful of
+                    // path-less calls became a handful of confident-looking
+                    // edges against one SPA fallback. Report it UNMATCHED, the
+                    // same as when no producer matched at all: the reason is
+                    // the extraction gap on this side, not the absence of a
+                    // producer.
+                    if carrick_match::is_unknown_call_path(&normalized_path) {
+                        missing
+                            .entry((method.to_string(), miss_path))
+                            .or_default()
+                            .insert(call_site);
+                        continue;
+                    }
                     for endpoint in matching_endpoints {
                         // #381: a pairing with zero literal agreement — a
                         // wildcard-only producer (`GET /*`) absorbing an
@@ -1724,10 +1741,14 @@ impl Analyzer {
                         // MATCHED: no verified mark, no cross-repo edge.
                         // Non-zero pairs are already the most specific
                         // available (the mount graph filters to maximal
-                        // agreement).
-                        if carrick_match::match_agreement(&endpoint.full_path, &normalized_path)
-                            .unwrap_or(0)
-                            == 0
+                        // agreement). `reportable_agreement` is the shared
+                        // definition of that rule (#537) — the cloud and the
+                        // MCP server run the same one over wasm.
+                        if carrick_match::reportable_agreement(
+                            &endpoint.full_path,
+                            &normalized_path,
+                        )
+                        .is_none()
                         {
                             continue;
                         }
@@ -5266,6 +5287,59 @@ mod tests {
         assert!(
             findings.is_empty(),
             "absorbed call is not missing, and a catch-all is never orphaned; got {findings:?}"
+        );
+    }
+
+    /// KILL (#537): a consumer call whose own path never resolved — the shape
+    /// a config-object request the scanner could not read leaves behind — must
+    /// never pair with anything, least of all the producer catch-all that
+    /// routes literally every path. Both sides being `/*` is the case the
+    /// exact-equality shortcut in `match_agreement` scored as a match. The
+    /// call stays UNMATCHED and says so, rather than vanishing into a
+    /// confident-looking edge.
+    #[test]
+    fn unknown_path_call_never_pairs_and_is_reported_unmatched() {
+        let mut analyzer = Analyzer::new(Config::default());
+
+        analyzer
+            .calls
+            .push(http_call("POST", "/*", "action-svc/src/client.ts:45"));
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph
+            .endpoints
+            .push(resolved_in("POST", "/*", "site-shell"));
+        mount_graph.data_calls.push(data_call_in(
+            "POST",
+            "/*",
+            "action-svc/src/client.ts:45",
+            "action-svc",
+        ));
+
+        let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert!(
+            edges.is_empty(),
+            "an unresolved call path must not pair with any producer, got {edges:?}"
+        );
+        assert!(
+            verified.is_empty(),
+            "absorbing a path-less call verifies nothing, got {verified:?}"
+        );
+        let missing: Vec<_> = findings
+            .iter()
+            .filter(|f| matches!(f, Finding::MissingEndpoint { .. }))
+            .collect();
+        assert_eq!(
+            missing.len(),
+            1,
+            "the call must surface as unmatched, got {findings:?}"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| matches!(f, Finding::OrphanedEndpoint { .. })),
+            "a catch-all producer is never orphaned, got {findings:?}"
         );
     }
 
