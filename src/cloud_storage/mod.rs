@@ -23,6 +23,7 @@ mod mock_storage;
 pub use mock_storage::MockStorage;
 mod aws_storage;
 pub use aws_storage::AwsStorage;
+pub(crate) use aws_storage::INLINE_PAYLOAD_LIMIT_BYTES;
 mod local_dir_storage;
 pub use local_dir_storage::{CACHE_DIR_ENV, LocalDirStorage};
 
@@ -569,6 +570,18 @@ pub trait CloudStorage {
     /// Mock storage records uploads in memory and is safe, so it overrides
     /// this. Gates multi-service index upload in the engine.
     fn supports_multi_service(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend can carry a `CloudRepoData` that exceeds
+    /// [`INLINE_PAYLOAD_LIMIT_BYTES`] without dropping anything from it.
+    ///
+    /// `AwsStorage` PUTs oversized payloads to a presigned staging object
+    /// (carrick#486), which has no request-size wall, so the incremental
+    /// caches survive at any size. The engine's payload-size guard reads this:
+    /// when it is false the caches are dropped to fit the request under the
+    /// wall, and the next scan re-analyzes every file (carrick#536).
+    fn stages_oversized_payloads(&self) -> bool {
         false
     }
 

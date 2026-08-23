@@ -3,6 +3,7 @@ use crate::oidc::OidcProvider;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -18,6 +19,50 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// one Lambda cold start or load-balancer blip must not discard the run.
 const MAX_TRANSIENT_RETRIES: u32 = 3;
 
+/// Retries after the first attempt for the actions that write the cloud index.
+/// A 5xx on a write is ambiguous: the gateway cuts the connection at its
+/// integration timeout while the handler keeps running, so the write may
+/// already have landed (carrick#536 — a `store-metadata` answered 200 after
+/// 118s, long past the 30s gateway cut, and each blind retry re-ran the whole
+/// embed). The cloud recognises a duplicate arriving after the row is durable
+/// and answers it cheaply, so one retry is worth making. A storm of them is
+/// not: on the measured incident four attempts did the same expensive work
+/// four times and the scan was still reported as failed.
+const MAX_WRITE_RETRIES: u32 = 1;
+
+/// The actions that write the cloud index. Everything else is a read (or a
+/// mint) and is safely repeatable, so it keeps the full retry budget.
+const WRITE_ACTIONS: [&str; 2] = ["complete-upload", "store-metadata"];
+
+fn is_write_action(action: &str) -> bool {
+    WRITE_ACTIONS.contains(&action)
+}
+
+/// Retry budget for an action. Unknown actions are treated as reads.
+fn max_retries_for_action(action: &str) -> u32 {
+    if is_write_action(action) {
+        MAX_WRITE_RETRIES
+    } else {
+        MAX_TRANSIENT_RETRIES
+    }
+}
+
+/// The error a caller sees once the retry budget is spent. On a write action
+/// the failure is ambiguous rather than final, and saying so is what stops the
+/// next reader from assuming the index is stale and forcing a re-scan.
+fn retry_exhausted_message(action: &str, transient_error: &str, attempts: u32) -> String {
+    if is_write_action(action) {
+        format!(
+            "{} (after {} attempts on '{}'). This action writes the index, and a response \
+             lost to a gateway timeout does not mean the write was lost — the index may \
+             already be current at this commit. Check it before re-running the scan.",
+            transient_error, attempts, action
+        )
+    } else {
+        format!("{} (after {} attempts)", transient_error, attempts)
+    }
+}
+
 /// Above this serialized size, CloudRepoData is PUT to a presigned S3
 /// staging URL instead of being inlined in the request body (carrick#486).
 /// The inline path dies at two walls: API Gateway rejects bodies over 10 MB
@@ -25,7 +70,7 @@ const MAX_TRANSIENT_RETRIES: u32 = 3;
 /// envelope escaping, so ~5.8 MB effective) surfaces as an unattributable
 /// 500. 4 MB leaves margin under the lower wall; one class-heavy service in
 /// a large monorepo measured past 10 MB after #483.
-const INLINE_PAYLOAD_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const INLINE_PAYLOAD_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 
 fn retry_backoff(retries_so_far: u32) -> Duration {
     // 2s, 4s, 8s
@@ -79,6 +124,37 @@ struct LambdaRequest {
     #[serde(rename = "payloadInS3")]
     #[serde(skip_serializing_if = "Option::is_none")]
     payload_in_s3: Option<bool>,
+    /// Payload staging integrity (carrick#536): lowercase-hex SHA-256 of the
+    /// exact bytes PUT to the staging object. The cloud verifies the object it
+    /// fetches against this before parsing it, so a truncated or swapped blob
+    /// is rejected instead of indexed. Only meaningful alongside
+    /// `payloadInS3`; when `cloudRepoData` rides inline the request body is
+    /// itself the authenticated payload and there is no second hop to verify.
+    #[serde(rename = "payloadSha256")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_sha256: Option<String>,
+    /// Byte length of those same bytes. Checked off the cloud's HeadObject
+    /// before the download, so a truncated PUT costs one head request.
+    #[serde(rename = "payloadSize")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_size: Option<u64>,
+}
+
+/// Integrity fields for a payload that was staged to S3 rather than inlined.
+/// Computed once, from the same serialized bytes that are PUT.
+#[derive(Clone)]
+struct StagedPayload {
+    sha256: String,
+    size: u64,
+}
+
+impl StagedPayload {
+    fn of(serialized: &str) -> Self {
+        Self {
+            sha256: format!("{:x}", Sha256::digest(serialized.as_bytes())),
+            size: serialized.len() as u64,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -193,11 +269,14 @@ impl AwsStorage {
     /// returning the raw response body on success. OIDC tokens are short-lived,
     /// so on a 401 (token likely expired mid-run) we re-mint once and retry.
     /// Transient failures (network errors, 408/429/5xx) are retried with
-    /// exponential backoff up to [`MAX_TRANSIENT_RETRIES`] times.
-    async fn send_lambda<B>(&self, body: &B) -> Result<String, StorageError>
+    /// exponential backoff, up to [`max_retries_for_action`] times for the
+    /// named action — the full budget for reads, one retry for the actions
+    /// that write the index, where a lost response does not mean a lost write.
+    async fn send_lambda<B>(&self, action: &str, body: &B) -> Result<String, StorageError>
     where
         B: serde::Serialize + ?Sized,
     {
+        let max_retries = max_retries_for_action(action);
         let provider =
             OidcProvider::global().map_err(|e| StorageError::ConnectionError(e.to_string()))?;
         let mut token = provider
@@ -251,11 +330,11 @@ impl AwsStorage {
                 Err(e) => format!("Lambda request failed: {}", e),
             };
 
-            if retries >= MAX_TRANSIENT_RETRIES {
-                return Err(StorageError::ConnectionError(format!(
-                    "{} (after {} attempts)",
-                    transient_error,
-                    retries + 1
+            if retries >= max_retries {
+                return Err(StorageError::ConnectionError(retry_exhausted_message(
+                    action,
+                    &transient_error,
+                    retries + 1,
                 )));
             }
 
@@ -265,7 +344,7 @@ impl AwsStorage {
                 transient_error,
                 backoff.as_secs(),
                 retries + 1,
-                MAX_TRANSIENT_RETRIES
+                max_retries
             );
             tokio::time::sleep(backoff).await;
             retries += 1;
@@ -276,7 +355,7 @@ impl AwsStorage {
     where
         T: for<'de> serde::Deserialize<'de>,
     {
-        let response_text = self.send_lambda(request).await?;
+        let response_text = self.send_lambda(&request.action, request).await?;
         serde_json::from_str(&response_text).map_err(|e| {
             StorageError::SerializationError(format!(
                 "Failed to parse lambda response for action '{}': {}. Raw response: {}",
@@ -285,12 +364,16 @@ impl AwsStorage {
         })
     }
 
-    async fn call_lambda_generic<Req, Resp>(&self, request: &Req) -> Result<Resp, StorageError>
+    async fn call_lambda_generic<Req, Resp>(
+        &self,
+        action: &str,
+        request: &Req,
+    ) -> Result<Resp, StorageError>
     where
         Req: serde::Serialize,
         Resp: for<'de> serde::Deserialize<'de>,
     {
-        let response_text = self.send_lambda(request).await?;
+        let response_text = self.send_lambda(action, request).await?;
         serde_json::from_str(&response_text).map_err(|e| {
             StorageError::SerializationError(format!("Failed to parse lambda response: {}", e))
         })
@@ -363,7 +446,7 @@ impl AwsStorage {
         &self,
         data: &CloudRepoData,
         s3_url: &str,
-        payload_staged: bool,
+        staged: Option<&StagedPayload>,
     ) -> Result<(), StorageError> {
         let request = LambdaRequest {
             action: "store-metadata".to_string(),
@@ -371,10 +454,12 @@ impl AwsStorage {
             service_name: data.service_name.clone(),
             hash: data.commit_hash.clone(),
             filename: "types.d.ts".to_string(),
-            cloud_repo_data: (!payload_staged).then(|| data.clone()),
+            cloud_repo_data: staged.is_none().then(|| data.clone()),
             s3_url: Some(s3_url.to_string()),
             wants_payload_url: None,
-            payload_in_s3: payload_staged.then_some(true),
+            payload_in_s3: staged.is_some().then_some(true),
+            payload_sha256: staged.map(|s| s.sha256.clone()),
+            payload_size: staged.map(|s| s.size),
         };
 
         let _response: StoreMetadataResponse = self.call_lambda(&request).await?;
@@ -426,6 +511,11 @@ impl CloudStorage for AwsStorage {
         })?;
         let stage_payload = serialized.len() > INLINE_PAYLOAD_LIMIT_BYTES;
 
+        // Integrity fields for the staged object, digested once over exactly
+        // the bytes that get PUT (carrick#536). Not computed on the inline
+        // path, where the request body is itself the authenticated payload.
+        let staged = stage_payload.then(|| StagedPayload::of(&serialized));
+
         // Step 1: Check if we need to upload type file
         let check_request = LambdaRequest {
             action: "check-or-upload".to_string(),
@@ -437,6 +527,8 @@ impl CloudStorage for AwsStorage {
             s3_url: None,
             wants_payload_url: stage_payload.then_some(true),
             payload_in_s3: None,
+            payload_sha256: None,
+            payload_size: None,
         };
 
         let lambda_response: LambdaResponse = self.call_lambda(&check_request).await?;
@@ -467,6 +559,8 @@ impl CloudStorage for AwsStorage {
                     s3_url: Some(lambda_response.s3_url),
                     wants_payload_url: None,
                     payload_in_s3: stage_payload.then_some(true),
+                    payload_sha256: staged.as_ref().map(|s| s.sha256.clone()),
+                    payload_size: staged.as_ref().map(|s| s.size),
                 };
 
                 let _complete_response: serde_json::Value =
@@ -477,12 +571,12 @@ impl CloudStorage for AwsStorage {
                     "No bundled types available for {}; storing metadata only",
                     repo
                 );
-                self.store_repo_metadata(data, &lambda_response.s3_url, stage_payload)
+                self.store_repo_metadata(data, &lambda_response.s3_url, staged.as_ref())
                     .await?;
             }
         } else {
             debug!("Type file already exists, just updating metadata");
-            self.store_repo_metadata(data, &lambda_response.s3_url, stage_payload)
+            self.store_repo_metadata(data, &lambda_response.s3_url, staged.as_ref())
                 .await?;
         }
 
@@ -509,6 +603,8 @@ impl CloudStorage for AwsStorage {
             s3_url: None,
             wants_payload_url: None,
             payload_in_s3: None,
+            payload_sha256: None,
+            payload_size: None,
         };
 
         let lambda_response: LambdaResponse = self.call_lambda(&request).await?;
@@ -527,7 +623,8 @@ impl CloudStorage for AwsStorage {
             action: "get-cross-repo-data".to_string(),
         };
 
-        let response: CrossRepoResponse = self.call_lambda_generic(&request).await?;
+        let response: CrossRepoResponse =
+            self.call_lambda_generic(&request.action, &request).await?;
 
         let mut all_repo_data = Vec::new();
         let mut repo_s3_urls = HashMap::new();
@@ -600,7 +697,7 @@ impl CloudStorage for AwsStorage {
             timestamp,
         };
 
-        let resp: UploadLogsResponse = self.call_lambda_generic(&request).await?;
+        let resp: UploadLogsResponse = self.call_lambda_generic(&request.action, &request).await?;
         self.upload_to_s3(&resp.upload_url, log_content).await?;
 
         Ok(())
@@ -623,7 +720,7 @@ impl CloudStorage for AwsStorage {
 
         // Best-effort by contract (caller logs and swallows), but surface the
         // transport error so the caller can log a useful message.
-        self.send_lambda(&request).await?;
+        self.send_lambda(request.action, &request).await?;
         debug!(
             "Posted PR result for {} (PR #{})",
             payload.repo, payload.pr_number
@@ -642,6 +739,8 @@ impl CloudStorage for AwsStorage {
             s3_url: None,
             wants_payload_url: None,
             payload_in_s3: None,
+            payload_sha256: None,
+            payload_size: None,
         };
 
         match self.call_lambda::<LambdaResponse>(&request).await {
@@ -665,6 +764,16 @@ impl CloudStorage for AwsStorage {
     fn supports_multi_service(&self) -> bool {
         self.multi_service
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // Oversized payloads go to the presigned staging object rather than the
+    // request body. Unconditionally true, and honest because it is: this is a
+    // property of the upload path, not a cloud capability to be discovered. A
+    // cloud that has not shipped staging returns no `payloadUploadUrl`, and
+    // `stage_payload` fails the upload with that named as the cause instead of
+    // silently truncating the payload.
+    fn stages_oversized_payloads(&self) -> bool {
+        true
     }
 }
 
@@ -715,6 +824,8 @@ mod tests {
             s3_url: None,
             wants_payload_url: None,
             payload_in_s3: None,
+            payload_sha256: None,
+            payload_size: None,
         };
         let json = serde_json::to_string(&bare).unwrap();
         assert!(!json.contains("wantsPayloadUrl"));
@@ -728,6 +839,123 @@ mod tests {
         let json = serde_json::to_string(&staged).unwrap();
         assert!(json.contains("\"wantsPayloadUrl\":true"));
         assert!(json.contains("\"payloadInS3\":true"));
+    }
+
+    /// Staged-payload integrity (carrick#536): the digest is lowercase hex of
+    /// the raw serialized bytes, and the size is their byte length — not the
+    /// character count of some re-encoding of the same data.
+    #[test]
+    fn staged_payload_digest_is_lowercase_hex_of_the_raw_bytes() {
+        // Known SHA-256 vector.
+        let staged = StagedPayload::of("abc");
+        assert_eq!(
+            staged.sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(staged.size, 3);
+        assert_eq!(staged.sha256.len(), 64);
+        assert!(
+            staged
+                .sha256
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        );
+
+        // Multi-byte characters count as bytes, matching what S3 stores.
+        let multibyte = StagedPayload::of("{\"note\":\"café\"}");
+        assert_eq!(multibyte.size, 16);
+    }
+
+    /// The integrity fields ride the write actions under the camelCase names
+    /// the cloud reads, and are omitted on every request that does not stage —
+    /// the inline body is itself the authenticated payload, so there is no
+    /// second hop to verify.
+    #[test]
+    fn integrity_fields_serialize_by_name_and_omit_when_none() {
+        let inline = LambdaRequest {
+            action: "store-metadata".to_string(),
+            repo: "r".to_string(),
+            service_name: None,
+            hash: "h".to_string(),
+            filename: "types.d.ts".to_string(),
+            cloud_repo_data: None,
+            s3_url: None,
+            wants_payload_url: None,
+            payload_in_s3: None,
+            payload_sha256: None,
+            payload_size: None,
+        };
+        let json = serde_json::to_string(&inline).unwrap();
+        assert!(!json.contains("payloadSha256"));
+        assert!(!json.contains("payloadSize"));
+
+        let digest = StagedPayload::of("{}");
+        let staged = LambdaRequest {
+            payload_in_s3: Some(true),
+            payload_sha256: Some(digest.sha256.clone()),
+            payload_size: Some(digest.size),
+            ..inline
+        };
+        let v = serde_json::to_value(&staged).unwrap();
+        assert_eq!(v["payloadSha256"], digest.sha256);
+        assert_eq!(v["payloadSize"], 2);
+    }
+
+    /// carrick#536: `complete-upload` and `store-metadata` write the index, so
+    /// a 5xx on them is ambiguous rather than final — the gateway can cut the
+    /// connection while the handler runs on and commits. One retry is enough
+    /// to catch the duplicate-recognition path; more just repeats the work.
+    /// Reads keep the full budget.
+    #[test]
+    fn write_actions_get_one_retry_and_reads_keep_the_full_budget() {
+        assert_eq!(max_retries_for_action("complete-upload"), 1);
+        assert_eq!(max_retries_for_action("store-metadata"), 1);
+
+        assert_eq!(
+            max_retries_for_action("check-or-upload"),
+            MAX_TRANSIENT_RETRIES
+        );
+        assert_eq!(
+            max_retries_for_action("get-cross-repo-data"),
+            MAX_TRANSIENT_RETRIES
+        );
+        assert_eq!(max_retries_for_action("upload-logs"), MAX_TRANSIENT_RETRIES);
+        assert_eq!(
+            max_retries_for_action("post-pr-result"),
+            MAX_TRANSIENT_RETRIES
+        );
+        // An action this file does not know is treated as a read.
+        assert_eq!(max_retries_for_action("some-new-action"), 3);
+    }
+
+    /// 5xx stays retryable as a status — the write cap is what bounds it, not
+    /// a status reclassification. Reclassifying would give writes zero retries
+    /// and lose the one attempt that recovers a cold start.
+    #[test]
+    fn write_cap_bounds_retries_without_reclassifying_5xx() {
+        assert!(is_transient_status(StatusCode::GATEWAY_TIMEOUT));
+        assert!(is_transient_status(StatusCode::INTERNAL_SERVER_ERROR));
+        let write = max_retries_for_action("store-metadata");
+        let read = max_retries_for_action("check-or-upload");
+        assert_eq!(write, MAX_WRITE_RETRIES);
+        assert!(write >= 1, "one retry is still made");
+        assert!(write < read, "writes are capped below the read budget");
+    }
+
+    /// Exhausting the budget on a write must not read as "the scan is lost".
+    /// The write may have landed before the gateway cut the response, which is
+    /// exactly what happened on the incident behind carrick#536.
+    #[test]
+    fn write_exhaustion_message_says_the_index_may_already_be_current() {
+        let msg = retry_exhausted_message("store-metadata", "Lambda returned 504: timeout", 2);
+        assert!(msg.contains("Lambda returned 504: timeout"));
+        assert!(msg.contains("after 2 attempts"));
+        assert!(msg.contains("store-metadata"));
+        assert!(msg.contains("may already be current"));
+
+        // Reads are unambiguous — no such caveat.
+        let read = retry_exhausted_message("get-cross-repo-data", "boom", 4);
+        assert_eq!(read, "boom (after 4 attempts)");
     }
 
     /// A pre-staging cloud omits `payloadUploadUrl` entirely; a staging cloud

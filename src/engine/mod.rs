@@ -3,8 +3,8 @@ use crate::agents::file_orchestrator::FileOrchestrator;
 use crate::agents::framework_guidance_agent::{FrameworkGuidanceAgent, ProtocolGuidance};
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{
-    CloudRepoData, CloudStorage, ManifestRole, ManifestTypeKind, ManifestTypeState,
-    TypeManifestEntry, get_current_commit_hash, mount_graph_to_api_details,
+    CloudRepoData, CloudStorage, INLINE_PAYLOAD_LIMIT_BYTES, ManifestRole, ManifestTypeKind,
+    ManifestTypeState, TypeManifestEntry, get_current_commit_hash, mount_graph_to_api_details,
 };
 use crate::config::Config;
 use crate::file_finder::find_service_files;
@@ -298,7 +298,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
             Some(
                 current_services_data
                     .iter()
-                    .map(|data| strip_ast_nodes(data.clone()))
+                    .map(|data| strip_ast_nodes(data.clone(), storage.stages_oversized_payloads()))
                     .collect(),
             )
         }
@@ -513,8 +513,9 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         // verdicts were appended after it — re-apply so a payload that was
         // near the cap can't be re-inflated past it and 413 the upload
         // (verdicts are tiny; the caches are what gets dropped).
+        let staging_available = storage.stages_oversized_payloads();
         for payload in &mut payloads {
-            enforce_payload_size_limit(payload);
+            enforce_payload_size_limit(payload, staging_available);
         }
         upload_service_payloads(storage, &payloads).await?;
     }
@@ -722,9 +723,11 @@ async fn upload_service_payloads<T: CloudStorage>(
     Ok(())
 }
 
-/// Remove AST nodes from CloudRepoData for serialization.
-/// Also enforces payload size limit for Lambda (6MB) — drops file_results if too large.
-fn strip_ast_nodes(mut data: CloudRepoData) -> CloudRepoData {
+/// Remove AST nodes from CloudRepoData for serialization, then run the payload
+/// size guard. `staging_available` comes from the storage backend and decides
+/// whether an oversized payload can keep its incremental caches — see
+/// [`enforce_payload_size_limit`].
+fn strip_ast_nodes(mut data: CloudRepoData, staging_available: bool) -> CloudRepoData {
     fn strip_endpoint_ast(endpoint: &mut ApiEndpointDetails) {
         endpoint.request_type = None;
         endpoint.response_type = None;
@@ -733,53 +736,78 @@ fn strip_ast_nodes(mut data: CloudRepoData) -> CloudRepoData {
     data.endpoints.iter_mut().for_each(strip_endpoint_ast);
     data.calls.iter_mut().for_each(strip_endpoint_ast);
 
-    enforce_payload_size_limit(&mut data);
+    enforce_payload_size_limit(&mut data, staging_available);
 
     data
 }
 
-/// Payload size guard: Lambda function URLs have a 6MB request payload limit.
-/// If serialized data exceeds ~5MB, drop the incremental caches (file_results
-/// being the bulk) to stay under the limit; warn loudly if it is still over
-/// Lambda's hard limit afterwards.
+/// Payload size guard for the request body.
+///
+/// A payload over [`INLINE_PAYLOAD_LIMIT_BYTES`] is not sent in the request
+/// body at all: `upload_repo_data` PUTs it to a presigned staging object and
+/// the write action carries only a pointer. The staged object has no
+/// request-size wall, so there is nothing to make room for and the incremental
+/// caches are kept whole. `staging_available` is the backend's answer to
+/// whether it does that (`CloudStorage::stages_oversized_payloads`); the
+/// threshold below is the same one `upload_repo_data` measures against, so the
+/// two decisions cannot drift.
+///
+/// Only when the backend does not stage does the request body have to fit, and
+/// then the incremental caches (`file_results` being the multi-MB bulk) are
+/// what gets dropped. Before carrick#536 the drop ran unconditionally, so every
+/// large repo lost its caches and re-analyzed every file on the next scan even
+/// though its payload had been staged.
 ///
 /// Called twice per upload payload: inside [`strip_ast_nodes`] when the payload
 /// is prepared, and again after [`crate::cloud_storage::attach_compat_verdicts`]
 /// adds the per-pair type verdicts (#351) — anything appended after the first
-/// pass could otherwise re-inflate the JSON past the cap and 413 the upload.
-/// Degradation order is deliberate: verdicts are tiny (a handful of short
-/// strings per cross-repo edge) while `file_results` is the multi-MB bulk, so
-/// the caches are always what gets dropped; verdicts are kept.
-fn enforce_payload_size_limit(data: &mut CloudRepoData) {
-    const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024; // 5MB safety margin
-    const LAMBDA_HARD_LIMIT_BYTES: usize = 6 * 1024 * 1024;
-    if let Ok(serialized) = serde_json::to_string(&data)
-        && serialized.len() > MAX_PAYLOAD_BYTES
+/// pass could otherwise re-inflate the JSON past the cap. Degradation order is
+/// deliberate: verdicts are tiny (a handful of short strings per cross-repo
+/// edge) while `file_results` is the bulk, so the caches are always what gets
+/// dropped; verdicts are kept.
+fn enforce_payload_size_limit(data: &mut CloudRepoData, staging_available: bool) {
+    // Sits above INLINE_PAYLOAD_LIMIT_BYTES, so any payload that reaches this
+    // threshold is one `upload_repo_data` stages rather than inlines.
+    const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
+    let Ok(serialized) = serde_json::to_string(&data) else {
+        return;
+    };
+    if serialized.len() <= MAX_PAYLOAD_BYTES {
+        return;
+    }
+
+    if staging_available && serialized.len() > INLINE_PAYLOAD_LIMIT_BYTES {
+        debug!(
+            "Payload size {}KB is over the {}KB inline limit, so it will be staged to S3 \
+             rather than sent in the request body; keeping the incremental caches",
+            serialized.len() / 1024,
+            INLINE_PAYLOAD_LIMIT_BYTES / 1024
+        );
+        return;
+    }
+
+    warn!(
+        "Payload size {}KB exceeds {}KB limit and this backend does not stage oversized \
+         payloads, so the file_results cache is dropped for this upload — the next scan \
+         cannot run incrementally and will re-analyze every file",
+        serialized.len() / 1024,
+        MAX_PAYLOAD_BYTES / 1024
+    );
+    data.file_results = None;
+    data.cached_detection = None;
+    data.cached_guidance = None;
+
+    // Re-check: if the body is still over the inline limit even without the
+    // caches, say so up front — the upload will be rejected.
+    if let Ok(reserialized) = serde_json::to_string(&data)
+        && reserialized.len() > INLINE_PAYLOAD_LIMIT_BYTES
     {
         warn!(
-            "Payload size {}KB exceeds {}KB limit, dropping file_results cache for this \
-             upload — the next scan cannot run incrementally and will re-analyze every file",
-            serialized.len() / 1024,
-            MAX_PAYLOAD_BYTES / 1024
+            "Payload is still {}KB after dropping caches, over the {}KB the request body \
+             can carry — the upload will be rejected.",
+            reserialized.len() / 1024,
+            INLINE_PAYLOAD_LIMIT_BYTES / 1024
         );
-        data.file_results = None;
-        data.cached_detection = None;
-        data.cached_guidance = None;
-
-        // Re-check: if the payload is still over Lambda's hard request limit
-        // even without the cache, say so up front — the upload will be
-        // rejected with an otherwise cryptic 413.
-        if let Ok(reserialized) = serde_json::to_string(&data)
-            && reserialized.len() > LAMBDA_HARD_LIMIT_BYTES
-        {
-            warn!(
-                "Payload is still {}KB after dropping caches, which exceeds the cloud's \
-                 {}KB request limit — the upload will likely be rejected. Consider splitting \
-                 the repo into services via carrick.json.",
-                reserialized.len() / 1024,
-                LAMBDA_HARD_LIMIT_BYTES / 1024
-            );
-        }
     }
 }
 
@@ -4156,7 +4184,7 @@ mod tests {
         };
 
         // Verify strip_ast_nodes removes AST nodes
-        let stripped = strip_ast_nodes(test_data);
+        let stripped = strip_ast_nodes(test_data, true);
 
         assert!(stripped.endpoints[0].request_type.is_none());
         assert!(stripped.endpoints[0].response_type.is_none());
@@ -4885,12 +4913,14 @@ mod tests {
             sdk_unresolved: None,
         };
 
-        let stripped = strip_ast_nodes(data);
+        // Staging unavailable: the request body has to carry the payload, so
+        // the caches are what gets dropped to fit it under the wall.
+        let stripped = strip_ast_nodes(data, false);
 
-        // file_results should be dropped because payload exceeds 5MB
         assert!(
             stripped.file_results.is_none(),
-            "file_results should be dropped when payload exceeds 5MB"
+            "file_results should be dropped when the payload exceeds 5MB and \
+             the backend cannot stage it"
         );
     }
 
@@ -4934,7 +4964,7 @@ mod tests {
             sdk_unresolved: None,
         };
 
-        let stripped = strip_ast_nodes(data);
+        let stripped = strip_ast_nodes(data, true);
 
         // file_results should be preserved (small payload)
         assert!(
@@ -4943,10 +4973,93 @@ mod tests {
         );
     }
 
+    /// carrick#536 regression: the guard used to drop the incremental caches
+    /// from every payload over 5MB, without asking whether that payload was
+    /// going to travel in the request body at all. It was not — anything over
+    /// the 5MB guard is also over [`INLINE_PAYLOAD_LIMIT_BYTES`], so
+    /// `upload_repo_data` stages it to S3 and the request carries a pointer.
+    /// Large repos lost their caches and re-analyzed every file on the next
+    /// scan for nothing. Same oversized payload, both answers from the backend.
+    #[test]
+    fn test_payload_size_guard_keeps_caches_when_the_payload_will_be_staged() {
+        const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024; // mirrors the guard
+
+        fn oversized() -> CloudRepoData {
+            let mut result = make_file_result(vec!["/api/orders"], vec![]);
+            result.endpoints[0].payload_expression_text = Some("x".repeat(MAX_PAYLOAD_BYTES));
+            let mut file_results = HashMap::new();
+            file_results.insert("src/big.ts".to_string(), result);
+            CloudRepoData {
+                repo_name: "orders-svc".to_string(),
+                service_name: None,
+                endpoints: vec![],
+                calls: vec![],
+                mounts: vec![],
+                apps: HashMap::new(),
+                imported_handlers: vec![],
+                function_definitions: HashMap::new(),
+                config_json: None,
+                package_json: None,
+                packages: None,
+                last_updated: chrono::Utc::now(),
+                commit_hash: "test-hash".to_string(),
+                mount_graph: None,
+                bundled_types: None,
+                type_manifest: None,
+                file_results: Some(file_results),
+                cached_detection: Some(crate::framework_detector::DetectionResult {
+                    frameworks: vec!["express".to_string()],
+                    data_fetchers: vec![],
+                    messaging_clients: vec![],
+                    notes: String::new(),
+                }),
+                cached_guidance: None,
+                cached_extraction_config: None,
+                package_json_hash: None,
+                cache_version: Some(CACHE_VERSION),
+                type_extraction_status: None,
+                compat_verdicts: None,
+                capture_stub: None,
+                external_call_candidates: None,
+                sdk_surface: None,
+                sdk_edges: None,
+                sdk_unresolved: None,
+            }
+        }
+
+        // Test setup: the payload is over the guard's threshold, and therefore
+        // also over the inline limit the staging decision measures against.
+        let len = serde_json::to_string(&oversized()).unwrap().len();
+        assert!(len > MAX_PAYLOAD_BYTES);
+        assert!(len > INLINE_PAYLOAD_LIMIT_BYTES);
+
+        let mut staged = oversized();
+        enforce_payload_size_limit(&mut staged, true);
+        assert!(
+            staged.file_results.is_some(),
+            "a payload the upload path will stage keeps its file_results cache"
+        );
+        assert!(
+            staged.cached_detection.is_some(),
+            "a payload the upload path will stage keeps its detection cache"
+        );
+
+        let mut inlined = oversized();
+        enforce_payload_size_limit(&mut inlined, false);
+        assert!(
+            inlined.file_results.is_none(),
+            "without staging the request body must fit, so the caches are dropped"
+        );
+        assert!(
+            inlined.cached_detection.is_none(),
+            "without staging the detection cache is dropped too"
+        );
+    }
+
     /// #351 regression: `attach_compat_verdicts` runs AFTER the strip_ast_nodes
     /// size-guard pass, so verdicts appended to a payload that squeaked under
-    /// the 5MB cap could re-inflate it past the Lambda limit and 413 the
-    /// upload. The engine re-applies `enforce_payload_size_limit` after
+    /// the 5MB cap could re-inflate it past what the request body can carry.
+    /// The engine re-applies `enforce_payload_size_limit` after
     /// attachment; this pins that a near-limit payload with verdicts attached
     /// still respects the cap, with the SAME degradation order as the first
     /// pass — the bulky caches are dropped, the tiny verdicts are kept.
@@ -5007,7 +5120,7 @@ mod tests {
 
         // First guard pass (as strip_ast_nodes runs it): under the cap, so the
         // caches survive.
-        let mut payloads = vec![strip_ast_nodes(data)];
+        let mut payloads = vec![strip_ast_nodes(data, false)];
         assert!(
             payloads[0].file_results.is_some(),
             "test setup: payload must start under the cap with caches intact"
@@ -5038,7 +5151,7 @@ mod tests {
 
         // The engine's post-attachment pass: back under the cap, caches
         // dropped, verdicts kept.
-        enforce_payload_size_limit(&mut payloads[0]);
+        enforce_payload_size_limit(&mut payloads[0], false);
         let after = serde_json::to_string(&payloads[0]).unwrap().len();
         assert!(
             after <= MAX_PAYLOAD_BYTES,
