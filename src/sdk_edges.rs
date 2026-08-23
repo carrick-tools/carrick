@@ -10,7 +10,9 @@
 //! 2. the SDK repo's [`crate::sdk_surface`], which maps that export and member
 //!    chain to the source span implementing it;
 //! 3. the [`crate::analyzer::CrossRepoMatch`] the SDK repo's OWN outbound call
-//!    inside that span already formed with the producer endpoint.
+//!    inside that span — or inside one of the member's delegate spans, for a
+//!    client that layers its transport below the published method — already
+//!    formed with the producer endpoint.
 //!
 //! Nothing new is matched here. Step 3 reads the edges the cross-repo analyzer
 //! produced this run — it merges every repo's calls and endpoints into one
@@ -53,9 +55,11 @@
 //!
 //! - `no_sdk_repo_in_project` — no scanned repo declares that package name, or
 //!   several do (which one publishes it is then a guess).
-//! - `receiver_unresolved` — the receiver is a namespace import, or the callee
-//!   chain runs through a call (`getClient().payments.create`), so no single
-//!   member is named.
+//! - `receiver_unresolved` — the receiver is a namespace import, so there is no
+//!   export to anchor the chain to. An accessor call INSIDE the chain is not
+//!   this case: `client.transfers().send` names the member the surface
+//!   walks as `transfers.send`, and whether it exists is
+//!   `member_not_found`'s answer.
 //! - `member_not_found` — the SDK repo publishes no such member; also the
 //!   answer for a subpath import (`pkg/edge`), whose entry module is not the
 //!   root one the surface was walked from, and for a peer scanned before
@@ -344,7 +348,10 @@ pub fn join(input: &SdkJoinInput, matches: &[CrossRepoMatch]) -> SdkJoin {
             // 3. Which producer does the SDK's own call inside that member reach?
             let mut matched = false;
             for (file, line) in &peer.data_calls {
-                if file != &member.file || *line < member.line || *line > member.end_line {
+                let inside = member_spans(member).any(|(span_file, start, end)| {
+                    span_file == file && *line >= start && *line <= end
+                });
+                if !inside {
                     continue;
                 }
                 let Some(producers) =
@@ -516,12 +523,34 @@ fn key_labels(producer_key: &str) -> (String, String) {
 /// already answered by `import_symbol`.
 fn member_chain(callee: &str) -> Option<String> {
     let mut segments = callee.split('.');
+    // The root binding's own `()` is not read: what bound the receiver is
+    // already answered by `import_symbol`.
     segments.next()?;
-    let rest: Vec<&str> = segments.collect();
-    if rest.iter().any(|segment| segment.contains("()")) {
-        return None;
+    let mut chain = Vec::new();
+    for segment in segments {
+        // An accessor call inside the chain names a member exactly as a field
+        // does — `client.transfers().send` reaches what the published
+        // surface walks as `transfers.send`. Whether that member exists is
+        // the surface's answer, not a reason to stop here.
+        let name = segment.trim_end_matches("()");
+        if name.contains('(') || name.contains(')') {
+            return None;
+        }
+        chain.push(name);
     }
-    Some(rest.join("."))
+    Some(chain.join("."))
+}
+
+/// Every span the SDK's own outbound call for `member` may sit in: the member
+/// itself, and the same-repo methods it delegates to. A layered client writes
+/// its route one hop below the published method.
+fn member_spans(member: &SdkMember) -> impl Iterator<Item = (&str, u32, u32)> {
+    std::iter::once((member.file.as_str(), member.line, member.end_line)).chain(
+        member
+            .delegates
+            .iter()
+            .map(|span| (span.file.as_str(), span.line, span.end_line)),
+    )
 }
 
 /// Attach each service's SDK edges to its upload payload, mirroring
@@ -611,6 +640,7 @@ mod tests {
             file: "src/resources/payments.ts".to_string(),
             line: 28,
             end_line: 33,
+            delegates: vec![],
         }]);
         let mut graph = MountGraph::new();
         graph.data_calls = vec![DataFetchingCall {
@@ -712,6 +742,90 @@ mod tests {
         assert!(joined.unresolved().is_empty());
     }
 
+    /// A layered client: the member a consumer calls holds no route, and the
+    /// SDK's own outbound call sits in the api wrapper one hop below it. The
+    /// consumer writes the accessor call in the middle of the chain.
+    ///
+    /// Both halves of the join move here — `transfers().send` has to reduce to
+    /// the member `transfers.send`, and the producer has to be found through
+    /// the member's delegate span rather than its own.
+    fn layered_sdk_repo() -> CloudRepoData {
+        let mut data = sdk_repo();
+        data.sdk_surface = Some(vec![SdkMember {
+            export: "default".to_string(),
+            chain: "transfers.send".to_string(),
+            file: "src/resources/transfers.ts".to_string(),
+            line: 6,
+            end_line: 8,
+            delegates: vec![crate::sdk_surface::SdkSpan {
+                file: "src/api/transfers.ts".to_string(),
+                line: 2,
+                end_line: 7,
+            }],
+        }]);
+        let mut graph = MountGraph::new();
+        graph.data_calls = vec![DataFetchingCall {
+            method: "POST".to_string(),
+            target_url: "/v1/payments".to_string(),
+            canonical_path: "/v1/payments".to_string(),
+            client: "fetch(".to_string(),
+            file_location: "src/api/transfers.ts:3".to_string(),
+            call_kind: None,
+            repo_name: None,
+            service_name: None,
+            host: None,
+            line: Some(3),
+        }];
+        data.mount_graph = Some(graph);
+        data
+    }
+
+    fn layered_match() -> CrossRepoMatch {
+        let mut edge = sdk_to_producer_match();
+        edge.consumer_location = Some("src/api/transfers.ts:3".to_string());
+        edge
+    }
+
+    #[test]
+    fn an_accessor_call_in_the_chain_resolves_to_the_member_it_names() {
+        let joined = run(
+            &[producer(), layered_sdk_repo()],
+            &[consumer_with(candidate("ledger.transfers().send"))],
+            &[layered_match()],
+        );
+
+        assert_eq!(joined.edges().len(), 1, "{:?}", joined);
+        let edge = &joined.edges()[0];
+        assert_eq!(edge.sdk_member, "transfers.send");
+        assert_eq!(edge.callee, "ledger.transfers().send");
+        // The location stays the member's own: the delegate is where the call
+        // was found, not what the consumer reached.
+        assert_eq!(edge.sdk_location, "src/resources/transfers.ts:6");
+        assert_eq!(edge.producer_key, PRODUCER_KEY);
+        assert!(joined.unresolved().is_empty());
+    }
+
+    /// Without the delegate span the same call has nowhere to land: the
+    /// member's own body holds no route.
+    #[test]
+    fn a_layered_call_outside_every_known_span_is_unresolved() {
+        let mut sdk = layered_sdk_repo();
+        if let Some(members) = sdk.sdk_surface.as_mut() {
+            members[0].delegates.clear();
+        }
+        let joined = run(
+            &[producer(), sdk],
+            &[consumer_with(candidate("ledger.transfers().send"))],
+            &[layered_match()],
+        );
+
+        assert!(joined.edges().is_empty());
+        assert_eq!(
+            reasons(&joined),
+            vec![(SDK_PACKAGE.to_string(), NO_MATCHING_PRODUCER.to_string(), 1)]
+        );
+    }
+
     /// The edge lands on the CONSUMER's blob, the same storage convention the
     /// compat verdicts follow — never on the producer's or the SDK's.
     #[test]
@@ -779,10 +893,12 @@ mod tests {
         );
     }
 
-    /// A call in the middle of the chain means the value the chain continues
-    /// from only exists at runtime.
+    /// A call in the middle of the chain names a member the surface may or may
+    /// not publish. When it does not, that is `member_not_found` — the same
+    /// answer a field spelled the same way would get, and not a claim that the
+    /// receiver was unresolvable.
     #[test]
-    fn a_call_inside_the_chain_is_unresolved() {
+    fn an_accessor_the_sdk_does_not_publish_is_not_found() {
         let joined = run(
             &[producer(), sdk_repo()],
             &[consumer_with(candidate("ledger.transport().create"))],
@@ -791,7 +907,7 @@ mod tests {
         assert!(joined.edges().is_empty());
         assert_eq!(
             reasons(&joined),
-            vec![(SDK_PACKAGE.to_string(), RECEIVER_UNRESOLVED.to_string(), 1)]
+            vec![(SDK_PACKAGE.to_string(), MEMBER_NOT_FOUND.to_string(), 1)]
         );
     }
 
@@ -1162,6 +1278,17 @@ mod tests {
             member_chain("getLedger().scrape").as_deref(),
             Some("scrape")
         );
-        assert_eq!(member_chain("ledger.transport().send"), None);
+        // An accessor call inside the chain names a member exactly as a field
+        // does; whether that member exists is the surface's answer.
+        assert_eq!(
+            member_chain("ledger.transfers().send").as_deref(),
+            Some("transfers.send")
+        );
+        // `Step::Call` renders as a bare `()` whatever its arguments, so a
+        // curried factory repeats it rather than printing anything else.
+        assert_eq!(
+            member_chain("ledger.transfers()().send").as_deref(),
+            Some("transfers.send")
+        );
     }
 }
