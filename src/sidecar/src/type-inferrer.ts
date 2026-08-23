@@ -28,6 +28,7 @@ import {
   type FunctionExpression,
   type MethodDeclaration,
   type CallExpression,
+  type ObjectLiteralExpression,
   type ParameterDeclaration,
   type PropertyAssignment,
   type Type,
@@ -340,6 +341,19 @@ export class TypeInferrer {
     request: InferRequestItem,
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
+    // A `function_return` request can point at a route REGISTRATION: that is
+    // the shape the scanner sends for a route whose handler RETURNS its
+    // payload. The containing-function walk below then resolves the function
+    // that registers the route, not the handler — so a registration declaring
+    // its response contract is read from that declaration first.
+    const registration = this.routeRegistrationForRequest(sourceFile, request);
+    if (registration) {
+      const declared = this.declaredResponseInferredType(request, registration);
+      if (declared) {
+        return declared;
+      }
+    }
+
     const func = this.resolveContainingFunction(sourceFile, request);
 
     if (!func) {
@@ -591,14 +605,21 @@ export class TypeInferrer {
       // away from the registration line. Follow the handler at that line before
       // the generic function-return fallback, which can't reach a handler more
       // than a couple of lines from the registration.
-      const lineHandler = this.handlerAtLine(sourceFile, request.line_number);
-      if (lineHandler) {
+      const atLine = this.registrationAtLine(sourceFile, request.line_number);
+      if (atLine) {
+        const declared = this.declaredResponseInferredType(
+          request,
+          atLine.registration
+        );
+        if (declared) {
+          return declared;
+        }
         this.log(
           `Line ${request.line_number} is a route registration; following handler return`
         );
         return this.buildFunctionReturnInferredType(
           request,
-          lineHandler,
+          atLine.handler,
           extractionConfig,
           true
         );
@@ -619,6 +640,10 @@ export class TypeInferrer {
     if (!Node.isCallExpression(node)) {
       const registryHandler = this.resolveRegisteredHandler(node);
       if (registryHandler) {
+        const declared = this.declaredResponseInferredType(request, node);
+        if (declared) {
+          return declared;
+        }
         this.log(
           `Span resolves to a route-registry object literal at ${request.file_path}:${request.line_number}; following handler return`
         );
@@ -646,6 +671,14 @@ export class TypeInferrer {
         (arg) => Node.isArrowFunction(arg) || Node.isFunctionExpression(arg)
       );
       if (registersCallback) {
+        // A registration that DECLARES its response contract in a schema needs
+        // no indirection: the declaration is the contract the framework
+        // serializes against, so it wins over whatever the handler happens to
+        // return.
+        const declared = this.declaredResponseInferredType(request, node);
+        if (declared) {
+          return declared;
+        }
         // The locator lands on a route registration whose handler carries the
         // response contract in its RETURN type — one indirection away. Follow
         // the handler and infer its return instead of dropping the payload.
@@ -922,17 +955,21 @@ export class TypeInferrer {
     if (!located) {
       // Line-only anchor: the scanner points a request infer at the route
       // registration line with no span/text. Follow the handler at that line and
-      // read its first typed request expression (`c.req.json<T>()`, `req.body as
-      // T`) — one indirection into the handler body.
-      const lineHandler = this.handlerAtLine(sourceFile, request.line_number);
-      if (lineHandler) {
-        const requestType = this.inferRequestReadFromHandler(lineHandler);
+      // read the route's declared request contract — the handler's parameter
+      // annotation, the registration's schema, or the first typed request
+      // expression in the body (`c.req.json<T>()`, `req.body as T`).
+      const atLine = this.registrationAtLine(sourceFile, request.line_number);
+      if (atLine) {
+        const requestType = this.requestContractFromRegistration(
+          atLine.registration,
+          atLine.handler
+        );
         if (requestType) {
           return this.createInferredType(
             request,
             requestType,
             true,
-            this.getNodeLocation(lineHandler),
+            this.getNodeLocation(atLine.handler),
             undefined,
             undefined
           );
@@ -952,7 +989,10 @@ export class TypeInferrer {
     // consumer `JSON.stringify(payload)` / `req.body as T` paths are untouched.
     const registrationHandler = this.registrationHandlerAt(located);
     if (registrationHandler) {
-      const requestType = this.inferRequestReadFromHandler(registrationHandler);
+      const requestType = this.requestContractFromRegistration(
+        this.unwrapExpressionNode(located),
+        registrationHandler
+      );
       if (requestType) {
         return this.createInferredType(
           request,
@@ -2245,6 +2285,20 @@ export class TypeInferrer {
     sourceFile: SourceFile,
     line: number
   ): FunctionLike | undefined {
+    return this.registrationAtLine(sourceFile, line)?.handler;
+  }
+
+  /**
+   * The route registration on `line` together with the handler it references.
+   *
+   * `handlerAtLine` returns only the handler, but the route's DECLARED contract
+   * (a validation-schema object passed alongside the handler) lives on the
+   * registration node itself, so the schema anchors need both halves.
+   */
+  private registrationAtLine(
+    sourceFile: SourceFile,
+    line: number
+  ): { registration: Node; handler: FunctionLike } | undefined {
     for (const node of sourceFile.getDescendants()) {
       if (
         (Node.isCallExpression(node) ||
@@ -2253,7 +2307,7 @@ export class TypeInferrer {
       ) {
         const handler = this.resolveRegisteredHandler(node);
         if (handler) {
-          return handler;
+          return { registration: node, handler };
         }
       }
     }
@@ -2525,6 +2579,400 @@ export class TypeInferrer {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Same reduction as `structuralTextFromTypeNode`, but starting from a resolved
+   * `Type` rather than a syntax node. `at` only supplies the scope the type is
+   * rendered in.
+   */
+  private structuralTextFromType(type: Type, at: Node): string | null {
+    try {
+      const resolved = this.unwrapPromiseType(type);
+      const bare = typeText(resolved, at);
+      if (this.isUselessType(bare)) {
+        return null;
+      }
+      const expanded = this.expandResolvedTypeStructural(resolved, bare);
+      return this.isUselessType(expanded) ? null : expanded;
+    } catch {
+      return null;
+    }
+  }
+
+  // ===========================================================================
+  // Route-contract anchors (carrick#528)
+  // ===========================================================================
+  //
+  // A route registration can DECLARE its request/response contract in two
+  // places the payload locators never reach, because neither is an expression
+  // the handler evaluates:
+  //
+  //  (a) the handler's own parameter annotation — a request parameter typed
+  //      `T<{ Body: CreateWidget }>` exposes the contract as the `body` member
+  //      of that parameter's type;
+  //  (b) a validation-schema object passed alongside the handler — `{ schema:
+  //      { body: ref('CreateWidget'), response: { 200: ref('Widget') } } }` —
+  //      whose entries reference schema VALUES that carry their parsed output
+  //      type.
+  //
+  // Both are read structurally: (a) is "the `body` member of a parameter's
+  // type", (b) is "a `schema` property on a registration argument, whose
+  // entries resolve to a value whose `parse` returns the contract". No
+  // framework, library, or method-name list is involved — a framework whose
+  // request object exposes `body` and whose route options carry `schema` is
+  // read the same way regardless of which one it is.
+
+  /**
+   * The route registration a request's locator points AT, or undefined when it
+   * points at anything else.
+   *
+   * Deliberately strict: the located node must itself be the registration (a
+   * call registering a handler, or a route-registry object literal), never an
+   * ancestor of it, so an expression inside a handler is not mistaken for the
+   * route it belongs to. A locator that resolves nothing falls back to the
+   * registration on the request's line.
+   */
+  private routeRegistrationForRequest(
+    sourceFile: SourceFile,
+    request: InferRequestItem
+  ): Node | undefined {
+    const located = this.resolveTargetNode(sourceFile, request);
+    if (located) {
+      const node = this.unwrapExpressionNode(located);
+      return this.registrationHandlerAt(node) ? node : undefined;
+    }
+    return this.registrationAtLine(sourceFile, request.line_number)?.registration;
+  }
+
+  /**
+   * Anchor (b) on the response side: the success-status contract declared in the
+   * registration's schema, as an `InferredType` ready to return. Null when the
+   * registration declares no resolvable response schema, so the caller falls
+   * back to following the handler's return.
+   */
+  private declaredResponseInferredType(
+    request: InferRequestItem,
+    registration: Node
+  ): InferredType | null {
+    const declared = this.routeSchemaContractText(registration, 'response');
+    if (!declared) {
+      return null;
+    }
+    this.log(
+      `Route registration at ${request.file_path}:${request.line_number} declares its ` +
+        'response schema; using the declared contract'
+    );
+    return this.createInferredType(
+      request,
+      declared,
+      true,
+      this.getNodeLocation(registration),
+      undefined,
+      undefined
+    );
+  }
+
+  /**
+   * The request contract of a route registration, in anchor order: the
+   * handler's parameter annotation (a), the registration's declared schema (b),
+   * then the first typed request read in the handler body (the pre-existing
+   * behaviour). The first anchor yielding a non-useless type wins; null means
+   * the route declares its request nowhere we can read.
+   */
+  private requestContractFromRegistration(
+    registration: Node,
+    handler: FunctionLike
+  ): string | null {
+    return (
+      this.requestBodyFromHandlerParams(handler) ??
+      this.routeSchemaContractText(registration, 'body') ??
+      this.inferRequestReadFromHandler(handler)
+    );
+  }
+
+  /**
+   * Anchor (a): the request contract declared on the handler's own signature.
+   *
+   * A typed request parameter (`request: CreateWidgetRequest` where that alias
+   * resolves to a request type parameterised with the body shape) exposes the
+   * contract as the `body` member of the parameter's type. Parameters are
+   * scanned in order and the first one carrying a non-useless `body` member
+   * wins; a reply/response parameter has no `body` member, and an unparameterised
+   * request type resolves `body` to `unknown`/`any`, which the useless-type
+   * guard rejects. So a handler that declares nothing yields null and the next
+   * anchor runs.
+   */
+  private requestBodyFromHandlerParams(func: FunctionLike): string | null {
+    for (const param of func.getParameters()) {
+      let paramType: Type;
+      try {
+        paramType = param.getType();
+      } catch {
+        continue;
+      }
+      const bodySymbol = paramType.getProperty('body');
+      if (!bodySymbol) {
+        continue;
+      }
+      let bodyType: Type;
+      try {
+        bodyType = bodySymbol.getTypeAtLocation(param);
+      } catch {
+        continue;
+      }
+      const text = this.structuralTextFromType(bodyType, param);
+      if (text) {
+        return text;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Anchor (b): the contract declared in the route's validation schema.
+   *
+   * `part` is `'body'` for the request contract and `'response'` for the
+   * response contract; a `response` entry keyed by status code resolves to its
+   * success entry. Returns null when the registration carries no schema, when
+   * the entry references something whose parsed output cannot be resolved, or
+   * when the schema is a plain JSON-schema literal (whose own object type is
+   * the JSON-Schema document, not the payload — emitting that would be worse
+   * than abstaining).
+   */
+  private routeSchemaContractText(
+    registration: Node,
+    part: 'body' | 'response'
+  ): string | null {
+    const schemaObject = this.routeSchemaObject(registration);
+    if (!schemaObject) {
+      return null;
+    }
+    const entry = schemaObject.getProperty(part);
+    if (!entry || !Node.isPropertyAssignment(entry)) {
+      return null;
+    }
+    const initializer = entry.getInitializer();
+    if (!initializer) {
+      return null;
+    }
+    const value: Node =
+      part === 'response'
+        ? (this.successStatusEntry(initializer) ?? initializer)
+        : initializer;
+    return this.schemaOutputTypeText(value);
+  }
+
+  /**
+   * The `schema` object literal carried by a route registration: scan the
+   * registration call's arguments (or the registry object literal itself) for a
+   * `schema` property whose value is an object literal.
+   */
+  private routeSchemaObject(
+    registration: Node
+  ): ObjectLiteralExpression | undefined {
+    const candidates: Node[] = [];
+    if (Node.isCallExpression(registration)) {
+      candidates.push(...registration.getArguments());
+    } else if (Node.isObjectLiteralExpression(registration)) {
+      candidates.push(registration);
+    }
+    for (const candidate of candidates) {
+      if (!Node.isObjectLiteralExpression(candidate)) {
+        continue;
+      }
+      const schemaProp = candidate.getProperty('schema');
+      if (!schemaProp || !Node.isPropertyAssignment(schemaProp)) {
+        continue;
+      }
+      const schemaValue = schemaProp.getInitializer();
+      if (schemaValue && Node.isObjectLiteralExpression(schemaValue)) {
+        return schemaValue;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * The success entry of a status-keyed response map (`{ 200: …, 4xx: … }`):
+   * exact `200` when present, else the lowest 2xx key. Returns undefined when
+   * the value is not a status-keyed map, so the caller reads it as the schema
+   * itself.
+   */
+  private successStatusEntry(value: Node): Node | undefined {
+    if (!Node.isObjectLiteralExpression(value)) {
+      return undefined;
+    }
+    let best: { code: number; node: Node } | undefined;
+    for (const prop of value.getProperties()) {
+      if (!Node.isPropertyAssignment(prop)) {
+        continue;
+      }
+      const name = prop.getName().replace(/['"`]/g, '').toLowerCase();
+      // `2xx` is a status RANGE key; treat it as the bottom of its range.
+      const code = /^\d{3}$/.test(name)
+        ? Number(name)
+        : /^\dxx$/.test(name)
+          ? Number(name[0]) * 100
+          : NaN;
+      if (!Number.isFinite(code) || code < 200 || code > 299) {
+        continue;
+      }
+      const initializer = prop.getInitializer();
+      if (!initializer) {
+        continue;
+      }
+      if (!best || code < best.code) {
+        best = { code, node: initializer };
+      }
+    }
+    return best?.node;
+  }
+
+  /**
+   * The payload type a schema entry declares.
+   *
+   * The entry is either a REFERENCE call — `ref('CreateWidget')`, a
+   * name-to-schema indirection whose registry is the argument the ref function
+   * was built from — or the schema value itself. Either way the payload is the
+   * schema's parsed output: the return type of its `parse` method (the shape
+   * every schema value exposes as its public validate-and-return API), falling
+   * back to a declared `_output` member. A value with neither is not a schema
+   * and yields null.
+   */
+  private schemaOutputTypeText(value: Node): string | null {
+    const node = this.unwrapExpressionNode(value);
+
+    let schemaType: Type | undefined;
+    if (Node.isCallExpression(node)) {
+      schemaType = this.registrySchemaType(node);
+    }
+    if (!schemaType) {
+      try {
+        schemaType = node.getType();
+      } catch {
+        return null;
+      }
+    }
+
+    const output = this.schemaOutputType(schemaType, node);
+    if (!output) {
+      this.log(
+        `Route schema entry at ${this.getNodeLocation(node).file_path}:${
+          this.getNodeLocation(node).start_line
+        } declares no resolvable parsed output (schema library types unavailable, ` +
+          'or a plain JSON-Schema literal); leaving unresolved'
+      );
+      return null;
+    }
+    return this.structuralTextFromType(output, node);
+  }
+
+  /**
+   * Follow a schema REFERENCE call (`ref('CreateWidget')`) to the schema value
+   * it names.
+   *
+   * The ref function is produced by a registry-building call — `const { $ref } =
+   * build({ CreateWidget, Widget })` — so the registry is that call's first
+   * argument, and the referenced key is a property of it. Resolve the callee to
+   * its declaration, walk to the variable declaration it is bound in, and read
+   * the key off the builder argument's type. Returns undefined for anything
+   * that is not this shape.
+   */
+  private registrySchemaType(call: CallExpression): Type | undefined {
+    const args = call.getArguments();
+    if (args.length === 0) {
+      return undefined;
+    }
+    const keyArg = this.unwrapExpressionNode(args[0]);
+    if (!Node.isStringLiteral(keyArg)) {
+      return undefined;
+    }
+    const key = keyArg.getLiteralValue();
+
+    const callee = call.getExpression();
+    const identifier = Node.isIdentifier(callee)
+      ? callee
+      : Node.isPropertyAccessExpression(callee)
+        ? callee.getNameNode()
+        : undefined;
+    if (!identifier || !Node.isIdentifier(identifier)) {
+      return undefined;
+    }
+
+    for (const def of identifier.getDefinitionNodes()) {
+      const varDecl = Node.isVariableDeclaration(def)
+        ? def
+        : def.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
+      const initializer = varDecl?.getInitializer();
+      if (!initializer) {
+        continue;
+      }
+      const builderCall = this.unwrapExpressionNode(initializer);
+      if (!Node.isCallExpression(builderCall)) {
+        continue;
+      }
+      const registryArg = builderCall.getArguments()[0];
+      if (!registryArg) {
+        continue;
+      }
+      let registryType: Type;
+      try {
+        registryType = registryArg.getType();
+      } catch {
+        continue;
+      }
+      const schemaSymbol = registryType.getProperty(key);
+      if (!schemaSymbol) {
+        continue;
+      }
+      try {
+        return schemaSymbol.getTypeAtLocation(registryArg);
+      } catch {
+        continue;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * The parsed output type of a schema value: the return type of its `parse`
+   * method, else a declared `_output` member. Returns undefined when neither
+   * carries a usable type — including when the schema library's own types are
+   * unavailable (an uninstalled dependency resolves the schema to `any`), which
+   * must abstain rather than publish `any` as a contract.
+   */
+  private schemaOutputType(schemaType: Type, at: Node): Type | undefined {
+    const usable = (type: Type | undefined): Type | undefined => {
+      if (!type) {
+        return undefined;
+      }
+      return this.isUselessType(typeText(type, at)) ? undefined : type;
+    };
+
+    const parseSymbol = schemaType.getProperty('parse');
+    if (parseSymbol) {
+      try {
+        const signatures = parseSymbol.getTypeAtLocation(at).getCallSignatures();
+        const returned = usable(signatures[0]?.getReturnType());
+        if (returned) {
+          return returned;
+        }
+      } catch {
+        // fall through to the declared-output member
+      }
+    }
+
+    const outputSymbol = schemaType.getProperty('_output');
+    if (outputSymbol) {
+      try {
+        return usable(outputSymbol.getTypeAtLocation(at));
+      } catch {
+        return undefined;
+      }
+    }
+
+    return undefined;
   }
 
   /**
