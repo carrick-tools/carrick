@@ -24,12 +24,35 @@
 //!   into each field whose declared type or `new X(...)` initialiser names a
 //!   class declared in the repo (`payments: API.Payments = new
 //!   API.Payments(this)` → the `Payments` class, with `payments.` prefixed to
-//!   every member it contributes);
+//!   every member it contributes). A constructor **parameter property**
+//!   (`constructor(public payments: Payments) {}`) is a field like any other;
+//! - a method or function-valued field that **hands back** a sub-resource
+//!   (`transfers = () => this.transfersClient`, `transfers(): Transfers { ... }`)
+//!   is both a callable member and a hop: the class it returns contributes
+//!   `transfers.` — which is the chain a consumer writes as
+//!   `client.transfers().send(...)`;
 //! - an exported **object literal** contributes the same way over its
 //!   properties;
 //! - `export { default as Ledger } from './client'` and `export default
 //!   Ledger` both publish under the export name `default`, which is what a
 //!   consumer's default import binds.
+//!
+//! `private` and `protected` members are not surface: TypeScript forbids a
+//! consumer writing them, so publishing `transfersClient.send` for a
+//! `private transfersClient` names a chain nobody can call. They stay fully
+//! resolvable internally — a public accessor that returns `this.transfersClient`
+//! reaches the class through exactly that field.
+//!
+//! # Delegates
+//!
+//! A layered client puts the route one hop below the member: the published
+//! `send` calls `this.api.send(...)`, and only THAT method writes
+//! `/v1/transfers`. A member therefore carries the spans of the
+//! same-repo methods its body calls through a `this.<field>` receiver, up to
+//! [`MAX_DELEGATE_DEPTH`] hops, so the join in [`crate::sdk_edges`] can find
+//! the SDK's own outbound call wherever in that chain it sits. Only class
+//! hops are followed: a field holding an object literal names no declaration
+//! to resolve a method in.
 //!
 //! Resolution runs through [`crate::import_bindings::BindingResolver`], so a
 //! barrel in front of the real module is followed rather than guessed at.
@@ -69,10 +92,12 @@ use swc_common::{
     sync::Lrc,
 };
 use swc_ecma_ast::{
-    Class, ClassMember, Decl, DefaultDecl, Expr, ImportSpecifier, MethodKind, Module, ModuleDecl,
-    ModuleExportName, ModuleItem, ObjectLit, Pat, Prop, PropName, PropOrSpread, Stmt, TsEntityName,
-    TsType, TsTypeAnn,
+    Accessibility, ArrowExpr, BindingIdent, BlockStmt, BlockStmtOrExpr, CallExpr, Callee, Class,
+    ClassMember, Decl, DefaultDecl, Expr, Function, ImportSpecifier, MethodKind, Module,
+    ModuleDecl, ModuleExportName, ModuleItem, ObjectLit, ParamOrTsParamProp, Pat, Prop, PropName,
+    PropOrSpread, Stmt, TsEntityName, TsParamPropParam, TsType, TsTypeAnn,
 };
+use swc_ecma_visit::{Visit, VisitWith};
 use tracing::{debug, warn};
 
 /// The export name a default export is published under.
@@ -84,6 +109,15 @@ const MAX_DEPTH: usize = 4;
 /// Hard cap on emitted members. A surface this size is a resolution accident,
 /// not a client library; truncating keeps the payload bounded and logs loudly.
 const MAX_MEMBERS: usize = 20_000;
+
+/// How many same-repo method hops a member's delegate spans follow. Two covers
+/// the layered shape this exists for — published method → api wrapper → the
+/// transport that writes the URL — without walking a whole call graph.
+const MAX_DELEGATE_DEPTH: usize = 2;
+
+/// Cap on the delegate spans one member carries. A member that reaches more
+/// than this is a fan-out, not a delegation chain.
+const MAX_DELEGATES: usize = 32;
 
 /// Directories whose contents are build output or dependencies, never the
 /// package's own source.
@@ -105,7 +139,25 @@ pub struct SdkMember {
     /// 1-based first line of the method.
     pub line: u32,
     /// 1-based last line of the method. The span a consumer's call maps onto:
-    /// the SDK's own outbound call sits somewhere inside it.
+    /// the SDK's own outbound call sits somewhere inside it, or inside one of
+    /// the [`SdkMember::delegates`].
+    pub end_line: u32,
+    /// Spans of the same-repo methods this member's body calls through a
+    /// `this.<field>` receiver, and what those call in turn. A layered client
+    /// writes its route one hop below the published method, so the SDK's own
+    /// outbound call is not always inside the member's own span.
+    ///
+    /// `default` for surfaces written before the field existed: absent is an
+    /// unlayered member, which is what every such surface was read as.
+    #[serde(default)]
+    pub delegates: Vec<SdkSpan>,
+}
+
+/// A source range in the SDK repo, repo-relative and 1-based.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SdkSpan {
+    pub file: String,
+    pub line: u32,
     pub end_line: u32,
 }
 
@@ -252,6 +304,83 @@ impl Declared {
     }
 }
 
+/// The class a `this` refers to, with the module context that resolves its
+/// fields. Carried through the walk so an arrow written in a class body — as a
+/// field, or inside an object literal a field holds — resolves `this.<field>`
+/// against the class that lexically encloses it.
+#[derive(Clone)]
+struct ClassCtx {
+    file: PathBuf,
+    module: Rc<Module>,
+    class: Rc<Class>,
+}
+
+/// A function written as a value: `payments = () => ...` or `payments =
+/// function () { ... }`. The two shapes answer the same three questions, and
+/// every caller needs all three.
+enum FunctionValue<'a> {
+    Arrow(&'a ArrowExpr),
+    Fn(&'a Function),
+}
+
+impl FunctionValue<'_> {
+    fn this_calls(&self) -> Vec<Vec<String>> {
+        match self {
+            FunctionValue::Arrow(arrow) => this_calls_of_arrow(arrow),
+            FunctionValue::Fn(function) => this_calls_of_function(function),
+        }
+    }
+
+    fn return_type(&self) -> Option<&TsTypeAnn> {
+        match self {
+            FunctionValue::Arrow(arrow) => arrow.return_type.as_deref(),
+            FunctionValue::Fn(function) => function.return_type.as_deref(),
+        }
+    }
+
+    fn returned_expr(&self) -> Option<Expr> {
+        match self {
+            FunctionValue::Arrow(arrow) => arrow_returned_expr(arrow).cloned(),
+            FunctionValue::Fn(function) => function
+                .body
+                .as_ref()
+                .and_then(block_returned_expr)
+                .cloned(),
+        }
+    }
+}
+
+/// The function an initialiser expression IS, if any.
+fn function_value(expr: Option<&Expr>) -> Option<FunctionValue<'_>> {
+    match expr? {
+        Expr::Arrow(arrow) => Some(FunctionValue::Arrow(arrow)),
+        Expr::Fn(function) => Some(FunctionValue::Fn(&function.function)),
+        _ => None,
+    }
+}
+
+/// The binding a constructor parameter property declares, whether or not it
+/// carries a default (`public receipts: Refunds = new Refunds()`).
+fn param_prop_ident(param: &TsParamPropParam) -> Option<&BindingIdent> {
+    match param {
+        TsParamPropParam::Ident(ident) => Some(ident),
+        TsParamPropParam::Assign(assign) => match &*assign.left {
+            Pat::Ident(ident) => Some(ident),
+            _ => None,
+        },
+    }
+}
+
+/// Whether a class member is part of the surface a consumer can write.
+/// TypeScript forbids reaching a `private` or `protected` member from outside
+/// the class, so publishing one names a chain nobody can call.
+fn is_public(accessibility: Option<Accessibility>) -> bool {
+    !matches!(
+        accessibility,
+        Some(Accessibility::Private) | Some(Accessibility::Protected)
+    )
+}
+
 struct SurfaceScanner {
     repo_root: PathBuf,
     source_map: Lrc<SourceMap>,
@@ -290,7 +419,7 @@ impl SurfaceScanner {
                 continue;
             };
             let mut visited = HashSet::new();
-            self.walk(&export, "", declared, 0, &mut visited);
+            self.walk(&export, "", declared, None, 0, &mut visited);
         }
     }
 
@@ -424,11 +553,13 @@ impl SurfaceScanner {
         self.declaration_of(&binding.file, binding.local_name.as_deref())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         &mut self,
         export: &str,
         prefix: &str,
         declared: Declared,
+        this_ctx: Option<&ClassCtx>,
         depth: usize,
         visited: &mut HashSet<(PathBuf, BytePos)>,
     ) {
@@ -441,12 +572,18 @@ impl SurfaceScanner {
         }
         match &declared {
             Declared::Class(file, module, class) => {
-                let (file, module, class) = (file.clone(), module.clone(), class.clone());
-                self.walk_class(export, prefix, &file, &module, &class, depth, visited);
+                let ctx = ClassCtx {
+                    file: file.clone(),
+                    module: module.clone(),
+                    class: class.clone(),
+                };
+                self.walk_class(export, prefix, &ctx, depth, visited);
             }
             Declared::Object(file, module, object) => {
                 let (file, module, object) = (file.clone(), module.clone(), object.clone());
-                self.walk_object(export, prefix, &file, &module, &object, depth, visited);
+                self.walk_object(
+                    export, prefix, &file, &module, &object, this_ctx, depth, visited,
+                );
             }
             // A bare exported function has no member chain under it: the
             // consumer calls the export itself, which `import_symbol` already
@@ -456,39 +593,76 @@ impl SurfaceScanner {
         visited.remove(&anchor);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn walk_class(
         &mut self,
         export: &str,
         prefix: &str,
-        file: &Path,
-        module: &Rc<Module>,
-        class: &Class,
+        ctx: &ClassCtx,
         depth: usize,
         visited: &mut HashSet<(PathBuf, BytePos)>,
     ) {
+        let class = ctx.class.clone();
         for member in &class.body {
             match member {
                 // An overload signature carries no body and no implementation
                 // to anchor to; the implementation that follows it does.
                 ClassMember::Method(method)
-                    if method.function.body.is_some() && method.kind == MethodKind::Method =>
+                    if method.function.body.is_some()
+                        && method.kind == MethodKind::Method
+                        && is_public(method.accessibility) =>
                 {
                     let Some(name) = member_name(&method.key) else {
                         continue;
                     };
-                    self.emit(export, prefix, &name, file, method.span);
+                    let delegates =
+                        self.delegates_of(ctx, this_calls_of_function(&method.function));
+                    self.emit(export, prefix, &name, &ctx.file, method.span, delegates);
+                    let returned = self.returned_declaration(
+                        ctx,
+                        method.function.return_type.as_deref(),
+                        method
+                            .function
+                            .body
+                            .as_ref()
+                            .and_then(block_returned_expr)
+                            .cloned(),
+                    );
+                    self.hop(export, prefix, &name, returned, ctx, depth, visited);
                 }
-                ClassMember::ClassProp(property) => {
+                ClassMember::ClassProp(property) if is_public(property.accessibility) => {
                     let Some(name) = member_name(&property.key) else {
                         continue;
                     };
-                    // A field holding a function IS a callable member.
-                    if matches!(
-                        property.value.as_deref(),
-                        Some(Expr::Arrow(_) | Expr::Fn(_))
-                    ) {
-                        self.emit(export, prefix, &name, file, property.span);
+                    // A field holding a function IS a callable member — and, if
+                    // that function hands back a sub-resource, a hop as well.
+                    if let Some(function) = function_value(property.value.as_deref()) {
+                        let delegates = self.delegates_of(ctx, function.this_calls());
+                        self.emit(export, prefix, &name, &ctx.file, property.span, delegates);
+                        let returned = self.returned_declaration(
+                            ctx,
+                            function.return_type(),
+                            function.returned_expr(),
+                        );
+                        self.hop(export, prefix, &name, returned, ctx, depth, visited);
+                        continue;
+                    }
+                    // An inline object literal keeps this class's `this`: the
+                    // arrows inside it are declared in its body.
+                    if let Some(Expr::Object(object)) = property.value.as_deref() {
+                        let declared = Declared::Object(
+                            ctx.file.clone(),
+                            ctx.module.clone(),
+                            Rc::new(object.clone()),
+                        );
+                        self.walk_member(
+                            export,
+                            prefix,
+                            &name,
+                            declared,
+                            Some(ctx),
+                            depth,
+                            visited,
+                        );
                         continue;
                     }
                     // Otherwise the field is a sub-resource when its declared
@@ -497,40 +671,89 @@ impl SurfaceScanner {
                     // exists for declares the type and assigns the instance on
                     // one line, and the two always agree there.
                     let declared = annotation_path(property.type_ann.as_deref())
-                        .and_then(|path| self.resolve_type_path(file, module, &path))
+                        .and_then(|path| self.resolve_type_path(&ctx.file, &ctx.module, &path))
                         .or_else(|| {
-                            property
-                                .value
-                                .as_deref()
-                                .and_then(|value| self.value_declaration(file, module, value))
+                            property.value.as_deref().and_then(|value| {
+                                self.value_declaration(&ctx.file, &ctx.module, value)
+                            })
                         });
                     let Some(declared) = declared else {
                         continue;
                     };
-                    self.walk_member(export, prefix, &name, declared, depth, visited);
+                    self.walk_member(export, prefix, &name, declared, None, depth, visited);
+                }
+                // `constructor(public payments: Payments) {}` declares a field
+                // as surely as a `ClassProp` does.
+                ClassMember::Constructor(constructor) => {
+                    for parameter in constructor.params.clone() {
+                        let ParamOrTsParamProp::TsParamProp(property) = parameter else {
+                            continue;
+                        };
+                        if !is_public(property.accessibility) {
+                            continue;
+                        }
+                        let Some(ident) = param_prop_ident(&property.param) else {
+                            continue;
+                        };
+                        let name = ident.id.sym.to_string();
+                        let Some(declared) = annotation_path(ident.type_ann.as_deref())
+                            .and_then(|path| self.resolve_type_path(&ctx.file, &ctx.module, &path))
+                        else {
+                            continue;
+                        };
+                        self.walk_member(export, prefix, &name, declared, None, depth, visited);
+                    }
                 }
                 _ => {}
             }
         }
     }
 
+    /// Compose a returned sub-resource's members under `name`, so a consumer's
+    /// `client.transfers().send(...)` finds `transfers.send`. The
+    /// member itself was already emitted: this only walks what it hands back.
+    #[allow(clippy::too_many_arguments)]
+    fn hop(
+        &mut self,
+        export: &str,
+        prefix: &str,
+        name: &str,
+        returned: Option<Declared>,
+        ctx: &ClassCtx,
+        depth: usize,
+        visited: &mut HashSet<(PathBuf, BytePos)>,
+    ) {
+        let Some(declared) = returned else {
+            return;
+        };
+        // A returned function is not a resource to compose under: it is called
+        // by the member's own name.
+        if declared.function_span().is_some() {
+            return;
+        }
+        let nested = format!("{}{}.", prefix, name);
+        self.walk(export, &nested, declared, Some(ctx), depth + 1, visited);
+    }
+
     /// A resolved field or property: a function is the member itself, anything
     /// else is a sub-resource whose own members compose under this name.
+    #[allow(clippy::too_many_arguments)]
     fn walk_member(
         &mut self,
         export: &str,
         prefix: &str,
         name: &str,
         declared: Declared,
+        this_ctx: Option<&ClassCtx>,
         depth: usize,
         visited: &mut HashSet<(PathBuf, BytePos)>,
     ) {
         if let Some((file, span)) = declared.function_span() {
-            self.emit(export, prefix, name, &file, span);
+            self.emit(export, prefix, name, &file, span, Vec::new());
             return;
         }
         let nested = format!("{}{}.", prefix, name);
-        self.walk(export, &nested, declared, depth + 1, visited);
+        self.walk(export, &nested, declared, this_ctx, depth + 1, visited);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -541,6 +764,7 @@ impl SurfaceScanner {
         file: &Path,
         module: &Rc<Module>,
         object: &ObjectLit,
+        this_ctx: Option<&ClassCtx>,
         depth: usize,
         visited: &mut HashSet<(PathBuf, BytePos)>,
     ) {
@@ -553,20 +777,25 @@ impl SurfaceScanner {
                     let Some(name) = member_name(&method.key) else {
                         continue;
                     };
-                    self.emit(export, prefix, &name, file, method.function.span);
+                    let delegates = self.object_delegates(this_ctx, &method.function);
+                    self.emit(export, prefix, &name, file, method.function.span, delegates);
                 }
                 Prop::KeyValue(entry) => {
                     let Some(name) = member_name(&entry.key) else {
                         continue;
                     };
-                    if matches!(&*entry.value, Expr::Arrow(_) | Expr::Fn(_)) {
-                        self.emit(export, prefix, &name, file, entry.value.span());
+                    if let Some(function) = function_value(Some(&entry.value)) {
+                        let delegates = match this_ctx {
+                            Some(ctx) => self.delegates_of(ctx, function.this_calls()),
+                            None => Vec::new(),
+                        };
+                        self.emit(export, prefix, &name, file, entry.value.span(), delegates);
                         continue;
                     }
                     let Some(declared) = self.value_declaration(file, module, &entry.value) else {
                         continue;
                     };
-                    self.walk_member(export, prefix, &name, declared, depth, visited);
+                    self.walk_member(export, prefix, &name, declared, this_ctx, depth, visited);
                 }
                 // `{ payments }` is `{ payments: payments }`.
                 Prop::Shorthand(ident) => {
@@ -576,14 +805,33 @@ impl SurfaceScanner {
                     else {
                         continue;
                     };
-                    self.walk_member(export, prefix, &name, declared, depth, visited);
+                    self.walk_member(export, prefix, &name, declared, this_ctx, depth, visited);
                 }
                 _ => {}
             }
         }
     }
 
-    fn emit(&mut self, export: &str, prefix: &str, name: &str, file: &Path, span: Span) {
+    fn object_delegates(
+        &mut self,
+        this_ctx: Option<&ClassCtx>,
+        function: &Function,
+    ) -> Vec<SdkSpan> {
+        match this_ctx {
+            Some(ctx) => self.delegates_of(ctx, this_calls_of_function(function)),
+            None => Vec::new(),
+        }
+    }
+
+    fn emit(
+        &mut self,
+        export: &str,
+        prefix: &str,
+        name: &str,
+        file: &Path,
+        span: Span,
+        delegates: Vec<SdkSpan>,
+    ) {
         if self.members.len() >= MAX_MEMBERS {
             if !self.truncated {
                 warn!(
@@ -600,7 +848,143 @@ impl SurfaceScanner {
             file: self.repo_relative(file),
             line: self.line_of(span.lo),
             end_line: self.line_of(span.hi),
+            delegates,
         });
+    }
+
+    /// What a method or function-valued field hands back, when that is a
+    /// declaration this can reach.
+    ///
+    /// The declared return type is read first — same rule as a field's
+    /// annotation — and the returned expression is the fallback for the
+    /// commonest accessor of all, `transfers = () => this.transfersClient`, which
+    /// declares nothing. A `Promise<Payments>` return type names nothing here,
+    /// by the same no-generics rule fields follow.
+    fn returned_declaration(
+        &mut self,
+        ctx: &ClassCtx,
+        return_type: Option<&TsTypeAnn>,
+        returned: Option<Expr>,
+    ) -> Option<Declared> {
+        if let Some(path) = annotation_path(return_type)
+            && let Some(declared) = self.resolve_type_path(&ctx.file, &ctx.module, &path)
+        {
+            return Some(declared);
+        }
+        let expr = returned?;
+        if let Some(field) = this_field_name(&expr) {
+            return self.class_field(ctx, &field);
+        }
+        self.value_declaration(&ctx.file, &ctx.module, &expr)
+    }
+
+    /// The declaration a `this.<name>` receiver holds: a field, or a
+    /// constructor parameter property (`constructor(private api: Api) {}`),
+    /// which is the shape every layered client in the wild writes.
+    ///
+    /// Accessibility is deliberately not consulted. This resolves what the
+    /// SDK's own code reaches, not what it publishes: a public accessor
+    /// returning `this.transfersClient` has to find that private field.
+    fn class_field(&mut self, ctx: &ClassCtx, name: &str) -> Option<Declared> {
+        let class = ctx.class.clone();
+        for member in &class.body {
+            match member {
+                ClassMember::ClassProp(property)
+                    if member_name(&property.key).as_deref() == Some(name) =>
+                {
+                    return annotation_path(property.type_ann.as_deref())
+                        .and_then(|path| self.resolve_type_path(&ctx.file, &ctx.module, &path))
+                        .or_else(|| {
+                            property.value.as_deref().and_then(|value| {
+                                self.value_declaration(&ctx.file, &ctx.module, value)
+                            })
+                        });
+                }
+                ClassMember::Constructor(constructor) => {
+                    for parameter in &constructor.params {
+                        let ParamOrTsParamProp::TsParamProp(property) = parameter else {
+                            continue;
+                        };
+                        let Some(ident) = param_prop_ident(&property.param) else {
+                            continue;
+                        };
+                        if ident.id.sym.as_ref() != name {
+                            continue;
+                        }
+                        let path = annotation_path(ident.type_ann.as_deref())?;
+                        return self.resolve_type_path(&ctx.file, &ctx.module, &path);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The spans of the same-repo methods a member's body calls, and what those
+    /// call in turn. See the module docs on delegates.
+    fn delegates_of(&mut self, ctx: &ClassCtx, calls: Vec<Vec<String>>) -> Vec<SdkSpan> {
+        let mut spans = Vec::new();
+        let mut seen = HashSet::new();
+        self.collect_delegates(ctx, calls, 0, &mut seen, &mut spans);
+        spans.sort();
+        spans.dedup();
+        spans
+    }
+
+    fn collect_delegates(
+        &mut self,
+        ctx: &ClassCtx,
+        calls: Vec<Vec<String>>,
+        depth: usize,
+        seen: &mut HashSet<(PathBuf, BytePos)>,
+        spans: &mut Vec<SdkSpan>,
+    ) {
+        if depth >= MAX_DELEGATE_DEPTH {
+            return;
+        }
+        for path in calls {
+            if spans.len() >= MAX_DELEGATES {
+                return;
+            }
+            let Some((target, span)) = self.resolve_this_call(ctx, &path) else {
+                continue;
+            };
+            if !seen.insert((target.file.clone(), span.lo)) {
+                continue;
+            }
+            spans.push(SdkSpan {
+                file: self.repo_relative(&target.file),
+                line: self.line_of(span.lo),
+                end_line: self.line_of(span.hi),
+            });
+            let Some(name) = path.last() else {
+                continue;
+            };
+            let nested = callable_this_calls(&target.class, name);
+            self.collect_delegates(&target, nested, depth + 1, seen, spans);
+        }
+    }
+
+    /// Follow a `this`-rooted call path — `["api", "send"]` — to
+    /// the class method it names, and to the context that method's own `this`
+    /// resolves against. Only class hops are followed: an intermediate field
+    /// holding an object literal names no declaration to look a method up in.
+    fn resolve_this_call(&mut self, ctx: &ClassCtx, path: &[String]) -> Option<(ClassCtx, Span)> {
+        let (name, fields) = path.split_last()?;
+        let mut current = ctx.clone();
+        for field in fields {
+            let Declared::Class(file, module, class) = self.class_field(&current, field)? else {
+                return None;
+            };
+            current = ClassCtx {
+                file,
+                module,
+                class,
+            };
+        }
+        let span = class_callable_span(&current.class, name)?;
+        Some((current, span))
     }
 
     fn line_of(&self, pos: BytePos) -> u32 {
@@ -656,6 +1040,131 @@ fn anonymous_default(file: &Path, module: &Rc<Module>) -> Option<Declared> {
         }
     }
     None
+}
+
+/// The span of the callable `name` a class declares: a method with a body, or
+/// a field holding a function.
+fn class_callable_span(class: &Class, name: &str) -> Option<Span> {
+    for member in &class.body {
+        match member {
+            ClassMember::Method(method)
+                if method.function.body.is_some()
+                    && member_name(&method.key).as_deref() == Some(name) =>
+            {
+                return Some(method.span);
+            }
+            ClassMember::ClassProp(property)
+                if member_name(&property.key).as_deref() == Some(name)
+                    && function_value(property.value.as_deref()).is_some() =>
+            {
+                return Some(property.span);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The `this`-rooted calls in the body of the callable `name` a class declares.
+fn callable_this_calls(class: &Class, name: &str) -> Vec<Vec<String>> {
+    for member in &class.body {
+        match member {
+            ClassMember::Method(method)
+                if method.function.body.is_some()
+                    && member_name(&method.key).as_deref() == Some(name) =>
+            {
+                return this_calls_of_function(&method.function);
+            }
+            ClassMember::ClassProp(property)
+                if member_name(&property.key).as_deref() == Some(name) =>
+            {
+                if let Some(function) = function_value(property.value.as_deref()) {
+                    return function.this_calls();
+                }
+            }
+            _ => {}
+        }
+    }
+    Vec::new()
+}
+
+fn this_calls_of_function(function: &Function) -> Vec<Vec<String>> {
+    let mut collector = ThisCallCollector::default();
+    if let Some(body) = &function.body {
+        body.visit_with(&mut collector);
+    }
+    collector.paths
+}
+
+fn this_calls_of_arrow(arrow: &ArrowExpr) -> Vec<Vec<String>> {
+    let mut collector = ThisCallCollector::default();
+    arrow.body.visit_with(&mut collector);
+    collector.paths
+}
+
+/// Every call whose receiver chain starts at `this`, as the property names it
+/// walks: `this.api.send(...)` -> `["api", "send"]`.
+#[derive(Default)]
+struct ThisCallCollector {
+    paths: Vec<Vec<String>>,
+}
+
+impl Visit for ThisCallCollector {
+    fn visit_call_expr(&mut self, node: &CallExpr) {
+        if let Callee::Expr(callee) = &node.callee
+            && let Some(path) = this_rooted_path(callee)
+        {
+            self.paths.push(path);
+        }
+        node.visit_children_with(self);
+    }
+}
+
+fn this_rooted_path(expr: &Expr) -> Option<Vec<String>> {
+    match expr {
+        Expr::Member(member) => {
+            let name = member.prop.as_ident()?.sym.to_string();
+            match &*member.obj {
+                Expr::This(_) => Some(vec![name]),
+                other => {
+                    let mut path = this_rooted_path(other)?;
+                    path.push(name);
+                    Some(path)
+                }
+            }
+        }
+        Expr::Paren(inner) => this_rooted_path(&inner.expr),
+        _ => None,
+    }
+}
+
+/// The field name a `this.<field>` expression reads, and nothing else.
+fn this_field_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Member(member) if matches!(&*member.obj, Expr::This(_)) => {
+            Some(member.prop.as_ident()?.sym.to_string())
+        }
+        Expr::Paren(inner) => this_field_name(&inner.expr),
+        Expr::TsAs(cast) => this_field_name(&cast.expr),
+        Expr::TsNonNull(inner) => this_field_name(&inner.expr),
+        _ => None,
+    }
+}
+
+/// The expression an arrow hands back: its expression body, or the last
+/// top-level `return` in its block.
+fn arrow_returned_expr(arrow: &ArrowExpr) -> Option<&Expr> {
+    match &*arrow.body {
+        BlockStmtOrExpr::Expr(expr) => Some(expr),
+        BlockStmtOrExpr::BlockStmt(block) => block_returned_expr(block),
+    }
+}
+
+fn block_returned_expr(block: &BlockStmt) -> Option<&Expr> {
+    block.stmts.iter().rev().find_map(|stmt| match stmt {
+        Stmt::Return(statement) => statement.arg.as_deref(),
+        _ => None,
+    })
 }
 
 fn member_name(key: &PropName) -> Option<String> {
@@ -838,6 +1347,75 @@ mod tests {
 
         // And a function is never recursed into as if it were a resource.
         assert!(!members.iter().any(|m| m.chain.starts_with("chargeCard.")));
+    }
+
+    /// The shape a layered client publishes: `ledger.transfers().send(...)`.
+    /// The accessor is a callable member of its own AND a hop, so the resource
+    /// it hands back composes under its name — which is the chain the consumer
+    /// writes, with the call in the middle.
+    #[test]
+    fn a_member_that_hands_back_a_resource_composes_under_its_name() {
+        let root = fixture();
+        let members = scan(&root, &root);
+
+        // The arrow-valued field, resolved through the private field it reads.
+        let send = member(&members, "default", "transfers.send").expect("transfers.send");
+        assert_eq!(send.file, "src/resources/transfers.ts");
+        // And the accessor itself stays callable.
+        assert!(member(&members, "default", "transfers").is_some());
+
+        // The method form, resolved through its declared return type.
+        let issue = member(&members, "default", "refunds.issue").expect("refunds.issue");
+        assert_eq!(issue.file, "src/resources/refunds.ts");
+    }
+
+    /// A layered client writes its route one hop below the published method:
+    /// `Transfers.send` calls `this.api.send(...)`, and only THAT method holds
+    /// the URL. The member carries that span so the join can find the call.
+    #[test]
+    fn a_member_carries_the_spans_it_delegates_to() {
+        let root = fixture();
+        let members = scan(&root, &root);
+
+        let send = member(&members, "default", "transfers.send").expect("transfers.send");
+        let delegate = send
+            .delegates
+            .iter()
+            .find(|span| span.file == "src/api/transfers.ts")
+            .expect("the api wrapper's span");
+        assert!(delegate.line < delegate.end_line);
+
+        // A member that calls nothing of its own delegates to nothing.
+        let list = member(&members, "default", "payments.list").expect("payments.list");
+        assert!(list.delegates.is_empty());
+    }
+
+    /// TypeScript forbids a consumer writing a `private` member, so publishing
+    /// one names a chain nobody can call. It stays resolvable internally: the
+    /// public accessor above reaches its resource through exactly that field.
+    #[test]
+    fn private_members_are_not_surface() {
+        let root = fixture();
+        let members = scan(&root, &root);
+        assert!(
+            !members
+                .iter()
+                .any(|m| m.chain == "transfersClient" || m.chain.starts_with("transfersClient.")),
+            "{:?}",
+            members
+        );
+        assert!(member(&members, "default", "transfers.send").is_some());
+    }
+
+    /// `constructor(public receipts: Refunds)` declares a field as surely as a
+    /// `ClassProp` does, and a consumer writes it the same way.
+    #[test]
+    fn a_public_constructor_parameter_property_is_a_field() {
+        let root = fixture();
+        let members = scan(&root, &root);
+        assert!(member(&members, "default", "receipts.issue").is_some());
+        // The private parameter property beside it is not surface.
+        assert!(!members.iter().any(|m| m.chain.starts_with("baseUrl")));
     }
 
     /// A getter is not a call, a constructor is not a member, and neither is

@@ -2364,6 +2364,9 @@ fn relativize_cloud_paths(cloud_data: &mut CloudRepoData, repo_path: &str) {
     if let Some(members) = cloud_data.sdk_surface.as_mut() {
         for member in members {
             member.file = repo_relative(&member.file, repo_path);
+            for span in member.delegates.iter_mut() {
+                span.file = repo_relative(&span.file, repo_path);
+            }
         }
     }
 }
@@ -4020,6 +4023,11 @@ mod tests {
                 file: abs("src/resources/payments.ts"),
                 line: 28,
                 end_line: 33,
+                delegates: vec![crate::sdk_surface::SdkSpan {
+                    file: abs("src/api/payments.ts"),
+                    line: 12,
+                    end_line: 18,
+                }],
             }]),
             sdk_edges: None,
             sdk_unresolved: None,
