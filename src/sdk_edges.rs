@@ -486,7 +486,7 @@ pub fn type_mismatch_findings(edges: &[SdkEdge]) -> Vec<Finding> {
                 edge.producer_repo.clone(),
                 format!("{} ({})", edge.package, edge.sdk_member),
                 &format!(
-                    "reached through `{}` — `{}` at {}:{} — {}",
+                    "reached through `{}` (`{}` at {}:{}): {}",
                     edge.package, edge.sdk_member, edge.sdk_repo, edge.sdk_location, reason
                 ),
             )
