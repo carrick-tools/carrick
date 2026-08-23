@@ -96,6 +96,12 @@ impl CloudStorage for LocalDirStorage {
         true
     }
 
+    // Writes to a local file, so no request-size wall applies and the caches
+    // are kept whatever the payload weighs.
+    fn stages_oversized_payloads(&self) -> bool {
+        true
+    }
+
     async fn download_all_repo_data(
         &self,
     ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError> {

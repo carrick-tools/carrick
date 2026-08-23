@@ -44,6 +44,12 @@ impl CloudStorage for MockStorage {
         true
     }
 
+    // Nothing crosses a wire, so no request-size wall applies and payloads are
+    // recorded whole — mock runs see the same caches a staged upload keeps.
+    fn stages_oversized_payloads(&self) -> bool {
+        true
+    }
+
     async fn post_pr_result(
         &self,
         payload: &crate::findings::PrResultPayload,
