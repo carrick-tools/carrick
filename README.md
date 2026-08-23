@@ -126,6 +126,12 @@ When Carrick sees a call like `fetch(process.env.ORDER_SERVICE_URL + '/orders')`
 
 ```json
 {
+  "includes": {
+    "lambdas/_shared": {
+      "externalEnvVars": ["GITHUB_API_BASE"],
+      "externalDomains": ["https://api.github.com"]
+    }
+  },
   "services": [
     {
       "name": "check-or-upload",
@@ -149,7 +155,30 @@ When Carrick sees a call like `fetch(process.env.ORDER_SERVICE_URL + '/orders')`
 | `include` | Extra source roots to pull in for type/function resolution (e.g. shared libraries copied in at build time), relative to `carrick.json` |
 | `tsconfig` | Path to this service's `tsconfig.json`, relative to `directory`. Scopes type extraction to the service |
 
+Alongside `services`, the optional top-level `includes` map declares classification for a shared source root once. See [Declaring a shared root once](#declaring-a-shared-root-once).
+
 Each service also accepts the call-classification fields (`internalEnvVars`, `externalEnvVars`, `internalDomains`, `externalDomains`). When `services` is present, any sibling top-level flat fields are ignored. Cross-service drift, dependency conflicts, and duplicate intents are detected between the declared services just as they are across repositories.
+
+#### Declaring a shared root once
+
+When several services reach a third-party API through the same shared directory, the calls belong to that directory, not to each service that pulls it in. The optional top-level `includes` map declares classification per shared source root:
+
+```json
+{
+  "includes": {
+    "lambdas/_shared": {
+      "externalEnvVars": ["GITHUB_API_BASE"],
+      "externalDomains": ["https://api.github.com"]
+    }
+  }
+}
+```
+
+Each key is a source root spelled as a service names it in its `include` (a leading `./` and a trailing `/` are ignored when matching). Each value takes the same four classification fields a service takes.
+
+Every service whose `include` lists that root inherits those declarations, unioned with its own. A service keeps everything it declares itself, and a name declared in both places appears once. A service that does not include the root inherits nothing.
+
+A key that no service lists in its `include` fails the scan rather than doing nothing, so a mistyped root is reported instead of leaving the calls unclassified.
 
 ## How it works
 
