@@ -460,6 +460,13 @@ fn pair_verdict(peer: &SdkPeer, producer: &CrossRepoMatch) -> (Option<bool>, Opt
 /// the SDK repo's scan persists a verdict and a diagnostic but no type names,
 /// so naming a symbol would mean inventing one. The hop the break travels
 /// through is spelled out in `detail`, ahead of the stored diagnostic.
+///
+/// Nothing is deduped against the direct findings, and in one shape that shows:
+/// a `carrick.json` whose `services` array holds BOTH the SDK service and a
+/// service that consumes it. The SDK's own pair is then checked this run and
+/// emits its own risk row, alongside this one. Two rows for one broken field,
+/// deliberately — they cite different call sites, and in that layout both are
+/// the reader's to fix.
 pub fn type_mismatch_findings(edges: &[SdkEdge]) -> Vec<Finding> {
     edges
         .iter()
