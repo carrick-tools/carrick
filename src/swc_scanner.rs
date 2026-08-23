@@ -27,6 +27,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::operation::{Protocol, PubsubRole};
 use crate::parser::parse_file;
+use crate::wrapper_request_shape::{RequestShapeSignal, call_request_shape};
 
 /// A candidate API call site detected by the SWC scanner.
 /// This is passed as a "hint" to the LLM to ensure 100% recall.
@@ -67,6 +68,16 @@ pub struct CandidateTarget {
     /// facts are used to overrule the model's answer after it replies (#537).
     #[serde(skip)]
     pub request_spec: Option<RequestSpec>,
+    /// What this call site says about the request shape of the module it lives
+    /// in — the literal HTTP method and body presence, when they are readable
+    /// off the AST (carrick-cloud#386). Read only when this module is another
+    /// file's imported HTTP wrapper, to resolve the METHOD of the delegating
+    /// site the same way #369/#370 resolves its target. Where `request_spec`
+    /// reads a call that declares its whole request as data, this reads the
+    /// options bag of a call whose URL is an expression — the shape a request
+    /// wrapper is built out of. Not serialized, for the same reason.
+    #[serde(skip)]
+    pub request_shape: RequestShapeSignal,
 }
 
 /// The HTTP method and URL a call declares as data on one object-literal
@@ -1073,6 +1084,10 @@ impl CandidateVisitor {
             Some(spec) => Some(format!("'{}'", spec.url)),
             None => self.extract_first_arg_snippet(call),
         };
+        // What this site says about its own module's request shape, for when
+        // another file imports this module as its HTTP wrapper
+        // (carrick-cloud#386).
+        let request_shape = call_request_shape(call, callee_property.as_deref());
 
         self.candidates.push(CandidateTarget {
             protocol: Protocol::Http,
@@ -1086,6 +1101,7 @@ impl CandidateVisitor {
             path_snippet,
             code_snippet,
             request_spec,
+            request_shape,
         });
     }
 
@@ -1120,6 +1136,8 @@ impl CandidateVisitor {
             path_snippet,
             code_snippet,
             request_spec: None,
+            // Not a call expression, so there are no request arguments to read.
+            request_shape: RequestShapeSignal::NotARequest,
         });
     }
 
@@ -2882,6 +2900,7 @@ async function fetchUser(id: string) {
             path_snippet: Some("'/users'".to_string()),
             code_snippet: "app.get('/users', handler)".to_string(),
             request_spec: None,
+            request_shape: RequestShapeSignal::NotARequest,
         };
 
         let hint = candidate.format_hint();

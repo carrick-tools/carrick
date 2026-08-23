@@ -36,6 +36,7 @@ mod url_normalizer;
 mod utils;
 mod visitor;
 mod workspace_resolver;
+mod wrapper_request_shape;
 
 use crate::cloud_storage::{AwsStorage, LocalDirStorage, MockStorage};
 use crate::services::TypeSidecar;
