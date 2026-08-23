@@ -475,6 +475,14 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     results.sdk_edges = sdk_join.edges().to_vec();
     results.sdk_unresolved = sdk_join.unresolved();
 
+    // An SDK-mediated break is a contract risk like any other, so it joins the
+    // findings rather than living only in its own section (#525). The PR result
+    // payload the cloud renders the comment from carries `findings` and not
+    // `sdk_edges`, so this is what turns the consumer's PR red.
+    results
+        .findings
+        .extend(crate::sdk_edges::type_mismatch_findings(&results.sdk_edges));
+
     // Eval harness output mode: emit a machine-readable projection of the
     // results and skip the human Markdown report + PR-comment relay. Consumed
     // by the offline scorer (Slice 1 of the evals plan). Deliberately terminal —
