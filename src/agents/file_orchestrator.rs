@@ -4715,6 +4715,14 @@ impl FileOrchestrator {
             }
         }
 
+        // `graph.mounts` is built by iterating a `HashMap` of file results, so
+        // the edge order arriving here is not stable. Sorted before the walk:
+        // the fan-out cap truncates, and an unsorted cap would keep a
+        // different subset of chains run to run — inside uploaded index data.
+        for edges in by_child.values_mut() {
+            edges.sort();
+        }
+
         let mut resolved: HashMap<String, Vec<String>> = HashMap::new();
         for child in by_child.keys() {
             let mut visiting: HashSet<&str> = HashSet::new();

@@ -661,10 +661,45 @@ fn old_space_cap_mb(total_memory_mb: Option<u64>) -> u64 {
     derived.clamp(MIN_OLD_SPACE_MB, MAX_OLD_SPACE_MB)
 }
 
+/// The cgroup memory limit in MB, when this process runs under one.
+///
+/// `/proc/meminfo` reports the HOST's memory, so a scanner inside a
+/// memory-limited container would otherwise derive a cap from memory it
+/// cannot touch and be OS-killed at the limit — exactly the silent failure
+/// the sizing exists to avoid. cgroup v2 first, then v1. `max` (v2) and v1's
+/// "no limit" sentinel both read as no limit.
+#[cfg(target_os = "linux")]
+fn cgroup_memory_limit_mb() -> Option<u64> {
+    const V2: &str = "/sys/fs/cgroup/memory.max";
+    const V1: &str = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
+    for path in [V2, V1] {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed == "max" {
+            continue;
+        }
+        let Ok(bytes) = trimmed.parse::<u64>() else {
+            continue;
+        };
+        // v1 writes a near-u64::MAX sentinel when unlimited. Anything past a
+        // terabyte is that sentinel, not a real container limit.
+        let mb = bytes / (1024 * 1024);
+        if mb == 0 || mb > 1024 * 1024 {
+            continue;
+        }
+        return Some(mb);
+    }
+    None
+}
+
 /// Physical memory in MB, or `None` when this platform's probe fails.
 ///
 /// Deliberately dependency-free: one `/proc/meminfo` read on Linux (where CI
-/// runs) and one `sysctl` call on macOS (where it is developed).
+/// runs) and one `sysctl` call on macOS (where it is developed). On Linux the
+/// cgroup limit wins when it is lower, because that is the memory this
+/// process actually has.
 fn total_memory_mb() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -676,7 +711,11 @@ fn total_memory_mb() -> Option<u64> {
             .next()?
             .parse()
             .ok()?;
-        return Some(kb / 1024);
+        let host_mb = kb / 1024;
+        return Some(match cgroup_memory_limit_mb() {
+            Some(limit) => host_mb.min(limit),
+            None => host_mb,
+        });
     }
     #[cfg(target_os = "macos")]
     {
