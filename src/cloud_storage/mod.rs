@@ -217,6 +217,17 @@ pub struct SdkUnresolved {
     pub reason: String,
 }
 
+/// Why one service's type extraction failed. Structured rather than a
+/// prose string so the finding, the terminal report, and the index all read
+/// the same two fields.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TypeDegradation {
+    /// Which stage lost the types: `spawn`, `init`, `resolve`, `capture`.
+    pub stage: String,
+    /// The underlying error, verbatim.
+    pub detail: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CloudRepoData {
     pub repo_name: String,
@@ -261,6 +272,15 @@ pub struct CloudRepoData {
     /// Cache format version — discard cached data if mismatched
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_version: Option<u32>,
+    /// Set when this service's type extraction FAILED outright: the sidecar
+    /// was missing, never became ready, died mid-run, or the resolution /
+    /// capture call errored. `None` means types were resolved (possibly with
+    /// per-symbol failures, which are not a degradation of the whole
+    /// service). Drives the loud `degraded_types` finding and `has_types`
+    /// on the PR-result payload (carrick#535) — before it existed, a dead
+    /// sidecar cost the run every type verdict and said so in one log line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub types_degraded: Option<TypeDegradation>,
     /// Why type extraction was skipped or failed for this service, if it was.
     /// `None` means types were resolved normally. Set so the index records
     /// that this service's data is degraded (endpoints without types) instead
@@ -472,6 +492,7 @@ impl CloudRepoData {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            types_degraded: None,
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
@@ -808,6 +829,7 @@ mod tests {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            types_degraded: None,
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,

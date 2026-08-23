@@ -1139,6 +1139,7 @@ mod tests {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            types_degraded: None,
             compat_verdicts: None,
             capture_stub,
             external_call_candidates: None,

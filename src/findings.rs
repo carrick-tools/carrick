@@ -140,6 +140,19 @@ pub enum Finding {
         repos: Vec<String>,
         call_sites: Vec<String>,
     },
+    /// Type extraction failed for one service, so every contract in it is
+    /// unverified for this run (carrick#535). Not endpoint-scoped: it says
+    /// the type layer is missing, which silently turns every type check into
+    /// "not compared". A risk, because a green comment that omits it reads as
+    /// "no type problems found" when the truth is "types were never read".
+    DegradedTypes {
+        /// Service this happened in (`service_name ?? repo_name`).
+        service: String,
+        /// Which stage lost the types: `spawn`, `init`, `resolve`, `capture`.
+        stage: String,
+        /// What went wrong, pre-truncated to [`MAX_DETAIL_CHARS`] chars.
+        detail: String,
+    },
 }
 
 impl Finding {
@@ -264,6 +277,19 @@ impl Finding {
         }
     }
 
+    /// Type extraction failed for `service` at `stage`.
+    pub fn degraded_types(
+        service: impl Into<String>,
+        stage: impl Into<String>,
+        detail: &str,
+    ) -> Self {
+        Finding::DegradedTypes {
+            service: service.into(),
+            stage: stage.into(),
+            detail: truncate_chars(detail, MAX_DETAIL_CHARS),
+        }
+    }
+
     /// The wire `kind` tag.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -274,6 +300,7 @@ impl Finding {
             Finding::EnvVarCall { .. } => "env_var_call",
             Finding::DependencyConflict { .. } => "dependency_conflict",
             Finding::SharedExternalContract { .. } => "shared_external_contract",
+            Finding::DegradedTypes { .. } => "degraded_types",
         }
     }
 
@@ -282,7 +309,9 @@ impl Finding {
     /// drift from the kind.
     pub fn severity(&self) -> Severity {
         match self {
-            Finding::TypeMismatch { .. } | Finding::MethodMismatch { .. } => Severity::Risk,
+            Finding::TypeMismatch { .. }
+            | Finding::MethodMismatch { .. }
+            | Finding::DegradedTypes { .. } => Severity::Risk,
             Finding::MissingEndpoint { .. } | Finding::OrphanedEndpoint { .. } => Severity::Gap,
             Finding::EnvVarCall { .. } | Finding::SharedExternalContract { .. } => {
                 Severity::Advisory
@@ -392,6 +421,15 @@ impl Serialize for Finding {
                 map.serialize_entry("repos", repos)?;
                 map.serialize_entry("call_sites", wire_call_sites(call_sites))?;
             }
+            Finding::DegradedTypes {
+                service,
+                stage,
+                detail,
+            } => {
+                map.serialize_entry("service", service)?;
+                map.serialize_entry("stage", stage)?;
+                map.serialize_entry("detail", detail)?;
+            }
         }
         map.end()
     }
@@ -486,6 +524,11 @@ pub struct PrResultPayload {
     pub delta: Option<PrDelta>,
     pub verified: Vec<VerifiedEndpoint>,
     pub graphql: GraphqlStatus,
+    /// Whether every scanned service resolved its types this run. `false`
+    /// when any service degraded (see the `degraded_types` findings), so a
+    /// surface reading the payload can say "types were not read" instead of
+    /// inferring it from an absent type verdict.
+    pub has_types: bool,
 }
 
 #[cfg(test)]
@@ -583,6 +626,31 @@ mod tests {
         assert!(detail.ends_with("..."));
     }
 
+    /// A dead sidecar costs the run every type verdict, so the loss has to
+    /// reach the comment as a finding the renderer can show. The cloud
+    /// buckets an unrecognised kind by its self-reported `severity` and
+    /// renders `detail`, so a scanner ahead of the cloud still surfaces it
+    /// (carrick#535).
+    #[test]
+    fn degraded_types_serializes_as_a_risk_with_detail() {
+        let finding =
+            Finding::degraded_types("api", "capture", "Sidecar process died unexpectedly");
+        let v = serde_json::to_value(&finding).unwrap();
+        assert_eq!(v["kind"], json!("degraded_types"));
+        assert_eq!(v["severity"], json!("risk"));
+        assert_eq!(v["service"], json!("api"));
+        assert_eq!(v["stage"], json!("capture"));
+        assert_eq!(v["detail"], json!("Sidecar process died unexpectedly"));
+
+        let long = "e".repeat(900);
+        let Finding::DegradedTypes { detail, .. } =
+            Finding::degraded_types("api", "resolve", &long)
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(detail.chars().count(), MAX_DETAIL_CHARS);
+    }
+
     /// Snapshot of the wire shape: kind tags, severity strings, tier values,
     /// and field names must match docs/internal/pr-result-pipeline.md
     /// (schema_version 1) in carrick-cloud exactly.
@@ -671,6 +739,7 @@ mod tests {
                 libraries: vec![],
                 operations_indexed: false,
             },
+            has_types: true,
         };
 
         let v = serde_json::to_value(&payload).unwrap();
@@ -853,6 +922,7 @@ mod tests {
                 libraries: vec![],
                 operations_indexed: false,
             },
+            has_types: true,
         };
         let v = serde_json::to_value(&payload).unwrap();
         assert!(v.get("run_id").is_none());

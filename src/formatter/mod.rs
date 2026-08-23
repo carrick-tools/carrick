@@ -85,8 +85,10 @@ pub fn format_analysis_results(
     } else {
         0
     };
-    let total_issues =
-        categorized.risks.len() + connectivity_in_headline + categorized.major_dependencies.len();
+    let total_issues = categorized.risks.len()
+        + connectivity_in_headline
+        + categorized.major_dependencies.len()
+        + categorized.degraded_types.len();
 
     let mut output = String::new();
 
@@ -127,6 +129,10 @@ pub fn format_analysis_results(
 
     // Sections, ordered by actionability. Verified runs last as a collapsed
     // positive signal.
+    if !categorized.degraded_types.is_empty() {
+        output.push_str(&format_degraded_types_section(&categorized.degraded_types));
+        output.push_str("\n\n");
+    }
     if !categorized.risks.is_empty() {
         output.push_str(&format_critical_section(&categorized.risks));
         output.push_str("\n\n");
@@ -265,7 +271,7 @@ fn format_verdict(
     has_baseline: bool,
     topology: &Topology,
 ) -> String {
-    let kind = if !categorized.risks.is_empty() {
+    let kind = if !categorized.risks.is_empty() || !categorized.degraded_types.is_empty() {
         "CAUTION"
     } else if total_issues > 0 {
         "WARNING"
@@ -274,6 +280,14 @@ fn format_verdict(
     };
 
     let mut parts: Vec<String> = Vec::new();
+    // First in the summary line: it qualifies everything after it.
+    if !categorized.degraded_types.is_empty() {
+        parts.push(format!(
+            "**types not extracted for {} service{}**",
+            categorized.degraded_types.len(),
+            plural(categorized.degraded_types.len())
+        ));
+    }
     if !categorized.risks.is_empty() {
         parts.push(format!(
             "**{} contract risk{}**",
@@ -708,6 +722,9 @@ struct CategorizedFindings<'a> {
     /// encode the same externally-served API. Advisory; carries no
     /// producer/consumer roles.
     shared_contracts: Vec<&'a Finding>,
+    /// Services whose type extraction failed (carrick#535). Counts toward the
+    /// headline: it is the reason the type verdicts below are missing.
+    degraded_types: Vec<&'a Finding>,
 }
 
 impl CategorizedFindings<'_> {
@@ -747,6 +764,7 @@ fn categorize_findings(findings: &[Finding]) -> CategorizedFindings<'_> {
     let mut major_dependencies = Vec::new();
     let mut unparseable_dependencies = Vec::new();
     let mut shared_contracts = Vec::new();
+    let mut degraded_types = Vec::new();
 
     for finding in findings {
         match finding {
@@ -762,6 +780,7 @@ fn categorize_findings(findings: &[Finding]) -> CategorizedFindings<'_> {
                 }
             }
             Finding::SharedExternalContract { .. } => shared_contracts.push(finding),
+            Finding::DegradedTypes { .. } => degraded_types.push(finding),
         }
     }
 
@@ -773,7 +792,43 @@ fn categorize_findings(findings: &[Finding]) -> CategorizedFindings<'_> {
         major_dependencies,
         unparseable_dependencies,
         shared_contracts,
+        degraded_types,
     }
+}
+
+/// The degraded-types banner: which services lost their types, at which
+/// stage, and what the failure was. Rendered above every other section
+/// because it changes how the rest of the report should be read — no type
+/// verdict below it means "not checked", not "checked and fine".
+fn format_degraded_types_section(degraded: &[&Finding]) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "<details open>\n<summary><strong>Types not extracted ({})</strong></summary>\n\n",
+        degraded.len()
+    ));
+    output.push_str(
+        "> Type extraction failed for the services below, so no contract in them was \
+         type-checked this run. Endpoints and calls are still indexed; their types are not.\n\n",
+    );
+    output.push_str("| Service | Stage | Failure |\n| :--- | :--- | :--- |\n");
+    for finding in degraded {
+        let Finding::DegradedTypes {
+            service,
+            stage,
+            detail,
+        } = finding
+        else {
+            continue;
+        };
+        output.push_str(&format!(
+            "| `{}` | `{}` | {} |\n",
+            code_cell(service),
+            code_cell(stage),
+            cell(detail)
+        ));
+    }
+    output.push_str("\n</details>");
+    output
 }
 
 fn format_critical_section(risks: &[&Finding]) -> String {
@@ -1200,6 +1255,32 @@ mod tests {
         result.sdk_edges = edges;
         result.sdk_unresolved = unresolved;
         result
+    }
+
+    /// A run that lost its types must say so above everything else and count
+    /// toward the headline. Before this, a dead sidecar produced one warn
+    /// line and a report that read as clean (carrick#535).
+    #[test]
+    fn degraded_types_section_leads_the_report_and_counts() {
+        let output = format_analysis_results(
+            result_with(vec![Finding::degraded_types(
+                "api",
+                "capture",
+                "Sidecar process died unexpectedly",
+            )]),
+            &topology_baseline(),
+            None,
+        );
+
+        assert!(output.contains("<!-- CARRICK_ISSUE_COUNT:1 -->"));
+        assert!(output.contains("[!CAUTION]"));
+        assert!(output.contains("**types not extracted for 1 service**"));
+        assert!(output.contains("<summary><strong>Types not extracted (1)</strong></summary>"));
+        assert!(output.contains("| `api` | `capture` | Sidecar process died unexpectedly |"));
+        // It leads: nothing else may be rendered above it.
+        let degraded_at = output.find("Types not extracted").expect("section");
+        let indexed_at = output.find("Indexed **").expect("stats line");
+        assert!(degraded_at > indexed_at);
     }
 
     /// The section states the whole relationship on one row: who calls, from
