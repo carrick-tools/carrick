@@ -24,9 +24,18 @@
 //! `paths_match` is defined as `match_agreement(..).is_some()`, so the two
 //! can never disagree about WHETHER a pair matches.
 //!
+//! Neither of those two is the question a REPORTING surface asks, which is
+//! "may I show this pair as a match, and if not why" — [`match_verdict`] and
+//! its `Option<u32>` form [`reportable_agreement`] answer that one, and every
+//! surface (scanner, cloud, MCP) should call them rather than re-deriving the
+//! rule from `paths_match` (#537). They fold in the consumer-side check
+//! [`is_unknown_call_path`]: a call path with no literal segment is an
+//! extraction gap, not a call to every route, so no producer may claim it.
+//!
 //! The `wasm` feature (default off) adds wasm-bindgen exports for
 //! [`paths_match`], [`is_param_segment`], [`match_agreement`],
-//! [`path_literal_specificity`], [`is_catch_all_path`], and
+//! [`path_literal_specificity`], [`is_catch_all_path`],
+//! [`is_unknown_call_path`], [`match_verdict`], [`reportable_agreement`], and
 //! [`classify_relationship`]:
 //!
 //! ```text
@@ -161,6 +170,85 @@ pub fn path_literal_specificity(path: &str) -> u32 {
 #[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
 pub fn is_catch_all_path(path: &str) -> bool {
     path.ends_with("/*") || path.ends_with("/**") || path.ends_with("/(.*)")
+}
+
+/// Whether a CONSUMER call path names nothing the index can join on: it has
+/// no literal segment at all. That is the empty string, `/`, a bare or
+/// leading-slash wildcard (`*`, `/*`, `/**`, `/(.*)`), and a path that
+/// normalised down to placeholders only (`:base/:rest`, the shape a
+/// template-literal URL whose every segment was interpolated collapses to).
+///
+/// Such a call is not a call to "any route" — it is a call whose path the
+/// scanner failed to resolve. Routing it anywhere fabricates an edge, so it
+/// must stay unmatched (#537). This is the consumer-side counterpart of
+/// [`is_catch_all_path`]: a catch-all is a producer deliberately covering a
+/// subtree; an unknown call path is an extraction gap.
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn is_unknown_call_path(call_path: &str) -> bool {
+    path_literal_specificity(call_path) == 0
+}
+
+/// Why a producer route and a consumer call are, or are not, a reportable
+/// match. Returned by [`match_verdict`]; the named rejections are what a
+/// surface shows instead of an edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum MatchVerdict {
+    /// The pair routes AND agrees on at least one literal segment. The only
+    /// verdict a surface may report as a match.
+    Matched,
+    /// The consumer call path carries no literal segment
+    /// ([`is_unknown_call_path`]): the scanner never resolved where this call
+    /// goes, so no producer may claim it.
+    UnknownCallPath,
+    /// The producer route is a bare catch-all (`/*`, `/**`, `/(.*)`) with no
+    /// literal prefix. It absorbs every path by design and corroborates none.
+    CatchAllRoute,
+    /// The two paths do not route to each other at all.
+    NoRouteMatch,
+    /// The pair routes but shares no literal segment — a prefixed catch-all or
+    /// a param-only route covering the call without vouching for it.
+    NoLiteralAgreement,
+}
+
+/// The single decision every surface asks of the matcher: is this
+/// producer/consumer pair reportable, and if not, why.
+///
+/// The rejections are ordered so the reason names the consumer's own failure
+/// first: an unresolved call path is an extraction gap regardless of which
+/// producer happened to be offered, and it is checked before anything about
+/// the route.
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn match_verdict(endpoint_path: &str, call_path: &str) -> MatchVerdict {
+    if is_unknown_call_path(call_path) {
+        return MatchVerdict::UnknownCallPath;
+    }
+    if is_catch_all_path(endpoint_path) && path_literal_specificity(endpoint_path) == 0 {
+        return MatchVerdict::CatchAllRoute;
+    }
+    match match_agreement(endpoint_path, call_path) {
+        None => MatchVerdict::NoRouteMatch,
+        Some(0) => MatchVerdict::NoLiteralAgreement,
+        Some(_) => MatchVerdict::Matched,
+    }
+}
+
+/// The literal agreement of a pair a surface is allowed to report as a match,
+/// or `None` when it is not — see [`match_verdict`] for which of the four
+/// rejections applied.
+///
+/// This is the function surfaces should call. [`match_agreement`] answers the
+/// narrower question of how much two paths agree and returns `Some(0)` for
+/// pairs that route but corroborate nothing; reading that as a match is the
+/// bug this wrapper exists to make impossible.
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn reportable_agreement(endpoint_path: &str, call_path: &str) -> Option<u32> {
+    match match_verdict(endpoint_path, call_path) {
+        MatchVerdict::Matched => match_agreement(endpoint_path, call_path),
+        _ => None,
+    }
 }
 
 /// A segment that carries literal, comparable text: non-empty after
@@ -542,5 +630,97 @@ mod tests {
         assert!(!is_catch_all_path("/files/*slug"));
         // Mid-path single-segment wildcard is not a catch-all.
         assert!(!is_catch_all_path("/api/*/users"));
+    }
+
+    /// #537: the consumer-side gap. A call whose path never resolved to a
+    /// literal segment names no operation, whatever it looks like.
+    #[test]
+    fn unknown_call_paths_are_the_ones_with_no_literal_segment() {
+        assert!(is_unknown_call_path(""));
+        assert!(is_unknown_call_path("/"));
+        assert!(is_unknown_call_path("*"));
+        assert!(is_unknown_call_path("/*"));
+        assert!(is_unknown_call_path("/**"));
+        assert!(is_unknown_call_path("/(.*)"));
+        // A template-literal URL whose every segment interpolated.
+        assert!(is_unknown_call_path("/:base/:rest"));
+        assert!(is_unknown_call_path("   "));
+
+        assert!(!is_unknown_call_path("/api"));
+        assert!(!is_unknown_call_path("/api/v1/auth/universal-auth/login"));
+        assert!(!is_unknown_call_path("/users/:id"));
+    }
+
+    /// #537 defect 2, both halves: an unknown consumer path never matches
+    /// anything, and a bare catch-all producer never absorbs a call. Each
+    /// rejection names itself.
+    #[test]
+    fn unknown_call_path_and_bare_catch_all_are_never_reportable() {
+        // Wildcard on both sides — the exact-equality shortcut used to score
+        // this Some(0), which reads as a match to anything that only asks
+        // `paths_match`.
+        assert_eq!(match_verdict("/*", "/*"), MatchVerdict::UnknownCallPath);
+        assert_eq!(reportable_agreement("/*", "/*"), None);
+
+        // Unknown call path against a perfectly concrete route.
+        assert_eq!(
+            match_verdict("/api/v1/auth/login", "/*"),
+            MatchVerdict::UnknownCallPath
+        );
+        assert_eq!(reportable_agreement("/api/v1/auth/login", "/*"), None);
+
+        // Bare catch-all producer against a concrete call: the call is routed
+        // by the fallback but corroborated by nothing.
+        assert_eq!(
+            match_verdict("/*", "/api/v1/auth/login"),
+            MatchVerdict::CatchAllRoute
+        );
+        assert_eq!(reportable_agreement("/*", "/api/v1/auth/login"), None);
+        assert_eq!(
+            match_verdict("/(.*)", "/api/v1/auth/login"),
+            MatchVerdict::CatchAllRoute
+        );
+
+        // `paths_match` still answers ROUTING truth for both — the split the
+        // crate documents is deliberate and must not silently close.
+        assert!(paths_match("/*", "/api/v1/auth/login"));
+        assert_eq!(match_agreement("/*", "/api/v1/auth/login"), Some(0));
+    }
+
+    /// A catch-all with a literal prefix is a real mount, not a fallback: it
+    /// still corroborates the segments it names, so it stays reportable.
+    #[test]
+    fn prefixed_catch_all_and_concrete_routes_stay_reportable() {
+        assert_eq!(
+            match_verdict("/files/**", "/files/report/pdf"),
+            MatchVerdict::Matched
+        );
+        assert_eq!(
+            reportable_agreement("/files/**", "/files/report/pdf"),
+            Some(1)
+        );
+
+        assert_eq!(
+            match_verdict("/users/:id", "/users/123"),
+            MatchVerdict::Matched
+        );
+        assert_eq!(reportable_agreement("/users/:id", "/users/123"), Some(1));
+    }
+
+    /// The two non-degenerate rejections keep their own names, so a surface
+    /// can tell "nothing serves this" apart from "something covers it but
+    /// vouches for nothing".
+    #[test]
+    fn no_route_match_and_no_literal_agreement_are_distinct() {
+        assert_eq!(
+            match_verdict("/api/orders", "/api/invoices"),
+            MatchVerdict::NoRouteMatch
+        );
+        // Param-only route covering a concrete one-segment call.
+        assert_eq!(
+            match_verdict("/:slug", "/about"),
+            MatchVerdict::NoLiteralAgreement
+        );
+        assert_eq!(reportable_agreement("/:slug", "/about"), None);
     }
 }

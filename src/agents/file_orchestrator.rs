@@ -20,8 +20,8 @@ use crate::{
     agent_service::AgentService,
     agents::{
         file_analyzer_agent::{
-            EmissionStyle, EndpointResult, FileAnalysisResult, FileAnalyzerAgent, MountResult,
-            PubsubOperation,
+            DataCallResult, EmissionStyle, EndpointResult, FileAnalysisResult, FileAnalyzerAgent,
+            MountResult, PubsubOperation,
         },
         framework_guidance_agent::ProtocolGuidance,
     },
@@ -3407,6 +3407,7 @@ impl FileOrchestrator {
                     data_call.line_number = candidate.line_number as i32;
                     data_call.call_expression_span_start = Some(candidate.span_start);
                     data_call.call_expression_span_end = Some(candidate.span_end);
+                    Self::reanchor_data_call(&mut data_call, candidate, file_path);
                 } else {
                     dropped_count += 1;
                 }
@@ -3494,6 +3495,53 @@ impl FileOrchestrator {
             endpoint.path, canon_literal, file_path, candidate.line_number
         );
         endpoint.path = canon_literal;
+    }
+
+    /// Overrule the model's `target` and `method` with the structural request
+    /// spec, for the calls that carry one (#537).
+    ///
+    /// `client({ method: "post", url: "/api/v1/login" })` states its method
+    /// and its path as data. Both are AST facts, so neither is the model's to
+    /// decide, and when the model has to guess at this shape it guesses badly:
+    /// the observed failure was a wildcard path on every such call, which then
+    /// matched a producer's SPA fallback.
+    ///
+    /// The one thing the model may know better is the BASE. A client built
+    /// with a configured `baseURL` gives targets like `${API_URL}/api/v1/login`
+    /// — the same path with the host the normalizer needs for internal/external
+    /// classification in front of it. So a target that already ends with the
+    /// spec's URL at a segment boundary is kept as-is; anything else is
+    /// replaced. This is the same baked-prefix rule
+    /// [`Self::reanchor_endpoint_path`] applies on the producer side.
+    fn reanchor_data_call(
+        data_call: &mut DataCallResult,
+        candidate: &CandidateTarget,
+        file_path: &str,
+    ) {
+        let Some(spec) = candidate.request_spec.as_ref() else {
+            return;
+        };
+
+        if data_call.method.as_deref().map(str::trim) != Some(spec.method.as_str()) {
+            data_call.method = Some(spec.method.clone());
+        }
+
+        let target = data_call.target.trim();
+        let carries_spec_url = match target.strip_suffix(spec.url.as_str()) {
+            // The whole target IS the literal, or the literal is the tail of a
+            // longer target that ends at a segment boundary.
+            Some(prefix) => prefix.is_empty() || !prefix.ends_with('/'),
+            None => false,
+        };
+        if carries_spec_url {
+            return;
+        }
+
+        warn!(
+            "[FileOrchestrator] Re-anchored data call target '{}' to request-spec url '{}' ({}:{})",
+            data_call.target, spec.url, file_path, candidate.line_number
+        );
+        data_call.target = spec.url.clone();
     }
 
     /// Extract the route path from a candidate's first-arg source snippet when
@@ -8363,6 +8411,7 @@ export { routes };
             enclosing_function: None,
             path_snippet: snippet.map(|s| s.to_string()),
             code_snippet: "router.get(...)".to_string(),
+            request_spec: None,
         }
     }
 
@@ -8489,6 +8538,117 @@ export { routes };
         };
         FileOrchestrator::apply_candidate_map(&mut forced, &HashMap::new(), "src/forced.ts");
         assert!(forced.endpoints.is_empty());
+    }
+
+    fn request_spec_candidate(id: &str, method: &str, url: &str) -> CandidateTarget {
+        let mut candidate = candidate_with_snippet(id, Some(&format!("'{url}'")));
+        candidate.callee_object = "apiClient".to_string();
+        candidate.callee_property = None;
+        candidate.request_spec = Some(crate::swc_scanner::RequestSpec {
+            method: method.to_string(),
+            url: url.to_string(),
+        });
+        candidate
+    }
+
+    fn data_call_with(candidate_id: &str, target: &str, method: Option<&str>) -> DataCallResult {
+        DataCallResult {
+            call_kind: None,
+            candidate_id: candidate_id.to_string(),
+            line_number: 1,
+            target: target.to_string(),
+            method: method.map(|m| m.to_string()),
+            pattern_matched: "client(".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            call_expression_text: None,
+            call_expression_line: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+        }
+    }
+
+    /// #537: method and URL written as data on the call's own argument are AST
+    /// facts, so the model's answer never stands against them. The wildcard is
+    /// the observed failure — seven such calls all reported as `/*`, which then
+    /// matched a producer's SPA fallback.
+    #[test]
+    fn request_spec_overrules_the_models_target_and_method() {
+        let mut result = FileAnalysisResult {
+            data_calls: vec![
+                data_call_with("c1", "/*", Some("POST")),
+                data_call_with("c2", "", None),
+            ],
+            ..Default::default()
+        };
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert(
+            "c1".to_string(),
+            request_spec_candidate("c1", "POST", "/api/v1/auth/universal-auth/login"),
+        );
+        candidate_map.insert(
+            "c2".to_string(),
+            request_spec_candidate("c2", "DELETE", "/api/v1/sessions/current"),
+        );
+
+        FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "src/client.ts");
+
+        assert_eq!(
+            result.data_calls[0].target,
+            "/api/v1/auth/universal-auth/login"
+        );
+        assert_eq!(result.data_calls[0].method.as_deref(), Some("POST"));
+        assert_eq!(result.data_calls[1].target, "/api/v1/sessions/current");
+        assert_eq!(result.data_calls[1].method.as_deref(), Some("DELETE"));
+    }
+
+    /// The base is the one thing the model may legitimately know better: a
+    /// client built with a configured `baseURL` yields the same path behind a
+    /// host the normalizer needs for internal/external classification. A target
+    /// that already ends with the structural literal at a segment boundary is
+    /// therefore kept.
+    #[test]
+    fn request_spec_keeps_a_target_that_already_carries_its_url() {
+        let mut result = FileAnalysisResult {
+            data_calls: vec![
+                data_call_with("c1", "${API_URL}/api/v1/status", Some("GET")),
+                data_call_with("c2", "/api/v1/status", Some("GET")),
+            ],
+            ..Default::default()
+        };
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert(
+            "c1".to_string(),
+            request_spec_candidate("c1", "GET", "/api/v1/status"),
+        );
+        candidate_map.insert(
+            "c2".to_string(),
+            request_spec_candidate("c2", "GET", "/api/v1/status"),
+        );
+
+        FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "src/client.ts");
+
+        assert_eq!(result.data_calls[0].target, "${API_URL}/api/v1/status");
+        assert_eq!(result.data_calls[1].target, "/api/v1/status");
+    }
+
+    /// A candidate without a request spec — every positional call shape — is
+    /// untouched, so the model stays the authority where it always was.
+    #[test]
+    fn data_calls_without_a_request_spec_are_left_alone() {
+        let mut result = FileAnalysisResult {
+            data_calls: vec![data_call_with("c1", "${API_URL}/things", Some("GET"))],
+            ..Default::default()
+        };
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", Some("'/x'")));
+
+        FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "src/client.ts");
+
+        assert_eq!(result.data_calls[0].target, "${API_URL}/things");
+        assert_eq!(result.data_calls[0].method.as_deref(), Some("GET"));
     }
 
     /// `collect_pubsub_type_requests` walks a `HashMap<String, _>`, whose
