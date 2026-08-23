@@ -1012,6 +1012,46 @@ export class TypeInferrer {
       return null;
     }
 
+    // The locator resolved to an expression that is NOT the registration, but
+    // the request's line still is one: this is the live producer shape, where
+    // the analyzer reported a payload expression and the scanner sends it as a
+    // text locator in preference to the registration span
+    // (`file_orchestrator.rs`, request-body block). For a forwarding
+    // schema-first route the only request-shaped text in the file is the
+    // handler's request OBJECT (`request`), whose own type is the framework's
+    // request machinery, or the forwarded controller call, whose type is the
+    // RESPONSE. Either resolves to something, so the registration branch above
+    // never runs and the route's declared contract is bypassed — the request
+    // ships as machinery and decays to `any` in the cross-repo surface.
+    //
+    // A DECLARED contract outranks whatever expression the locator picked,
+    // exactly as it does on the response side, so read anchors (a) and (b)
+    // first and fall through to the expression only when the route declares
+    // its request nowhere. The third registration anchor — the typed request
+    // READ inside the handler body — is deliberately not consulted here: that
+    // one is itself an expression, so the locator's own expression stays
+    // authoritative when nothing is declared.
+    const declaredAt = this.registrationAtLine(sourceFile, request.line_number);
+    if (declaredAt) {
+      const declared =
+        this.requestBodyFromHandlerParams(declaredAt.handler) ??
+        this.routeSchemaContractText(declaredAt.registration, 'body');
+      if (declared) {
+        this.log(
+          `Route registration at ${request.file_path}:${request.line_number} declares its ` +
+            'request contract; using the declaration over the located expression'
+        );
+        return this.createInferredType(
+          request,
+          declared,
+          true,
+          this.getNodeLocation(declaredAt.handler),
+          undefined,
+          undefined
+        );
+      }
+    }
+
     // A text locator (Gemini `expression_text` + `expression_line`, as opposed
     // to a byte span) can land on the property itself in `{ body:
     // JSON.stringify(body) }` — either the whole PropertyAssignment (locator
