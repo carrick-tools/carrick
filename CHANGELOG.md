@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.15](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.14...carrick-v0.3.15) (2026-08-23)
+
+
+### Features
+
+* **config:** declare classification once on a shared include root ([#547](https://github.com/carrick-tools/carrick/issues/547)) ([c48c520](https://github.com/carrick-tools/carrick/commit/c48c5208a889d7d9a3e547b5c30a61d4464c5f93))
+
+
+### Bug Fixes
+
+* gate cache drop on staging, cap write retries, send payload digest ([#539](https://github.com/carrick-tools/carrick/issues/539)) ([4d577ee](https://github.com/carrick-tools/carrick/commit/4d577eecb566e644d73abea566c6bc97739a4614))
+* **scanner:** carry a wrapper's fixed method to the sites that delegate to it ([#552](https://github.com/carrick-tools/carrick/issues/552)) ([951e4a2](https://github.com/carrick-tools/carrick/commit/951e4a2ac41aa50d173d3d636629aeacd98da0bd))
+* **scanner:** read config-object request calls, and never match a path-less call ([#541](https://github.com/carrick-tools/carrick/issues/541)) ([1efd9e3](https://github.com/carrick-tools/carrick/commit/1efd9e3a46635bb4ceffe1b39d73efcdcb3eec1f))
+* **scanner:** survive a 3k-file program in the type sidecar, and never lose types quietly ([#551](https://github.com/carrick-tools/carrick/issues/551)) ([9a3f9b9](https://github.com/carrick-tools/carrick/commit/9a3f9b9182db2725a5cb21708f3e5971fb57b885))
+* **sdk:** resolve accessor-returned resources and layered SDK calls ([#546](https://github.com/carrick-tools/carrick/issues/546)) ([f12da8d](https://github.com/carrick-tools/carrick/commit/f12da8db66b88e98c7ec92d2ca8d62e9c4a0224f))
+* **sidecar:** read a route's declared request contract over the located expression ([#542](https://github.com/carrick-tools/carrick/issues/542)) ([7c5c917](https://github.com/carrick-tools/carrick/commit/7c5c9176656a87b8b7cfcd4b7d7492096db0b8ed))
+
 ## [0.3.14](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.13...carrick-v0.3.14) (2026-08-23)
 
 
