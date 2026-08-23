@@ -1,16 +1,21 @@
 name: Carrick
 
-# DISABLED 2026-06-26 (manual-only): the dogfooding self-scan runs the real
-# Carrick Action (Vertex/Gemini inference) on every push/PR. During heavy
-# iteration that's pure wasted inference cost, so it's reduced to on-demand.
-# Re-enable real dogfooding by restoring the triggers below:
-#   push: { branches: [main] }
-#   pull_request: { branches: [main] }
-#   repository_dispatch: { types: [carrick-sibling-updated] }
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Reserved for Carrick Cloud dispatches (currently dormant). Cross-repo
+  # results stay current without it: every scan reads the live index, and
+  # Carrick re-runs affected open PRs when a sibling repo changes.
+  repository_dispatch:
+    types: [carrick-sibling-updated]
+  # Kept so a backfill scan can be forced without pushing to main.
   workflow_dispatch:
 
 permissions:
+  # Mint a short-lived OIDC token Carrick exchanges for keyless upload auth
+  # (no upload secret to configure).
   id-token: write
   contents: read
 

@@ -67,3 +67,7 @@ examples/*/package-lock.json
 
 # Captured scanner output from example runs — never commit
 examples/*/output/
+
+# Local git worktrees created under .claude/ — never committed
+.claude/worktrees/
+.claude/settings.local.json
