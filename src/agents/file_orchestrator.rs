@@ -4225,9 +4225,35 @@ impl FileOrchestrator {
 
         // Second pass: build mount edges with resolved names
         for (file_path, result) in file_results {
+            // Children mounted in THIS file. A parent that is one of them is a
+            // router this file created or imported and then mounted itself, so
+            // it is already a node in the graph and must not be rewritten.
+            let local_children: HashSet<&str> = result
+                .mounts
+                .iter()
+                .map(|mount| mount.child_node.as_str())
+                .collect();
             for mount in &result.mounts {
+                // A mount declared inside a mounted plugin names its parent as
+                // the framework instance the plugin was handed (`server`,
+                // `fastify`) — the same name every other module uses, and one
+                // with no edge to the binding this module was registered
+                // under. Resolved through the same file-first identity as an
+                // endpoint's owner (#517), the chain reaches the root and the
+                // ancestor prefixes survive; left as-is, everything above this
+                // module's own prefix is lost (carrick#535).
+                let parent = if local_children.contains(mount.parent_node.as_str()) {
+                    mount.parent_node.clone()
+                } else {
+                    Self::resolve_endpoint_owner(
+                        &owner_bindings,
+                        &import_map,
+                        &mount.parent_node,
+                        file_path,
+                    )
+                };
                 graph.mounts.push(MountEdge {
-                    parent: mount.parent_node.clone(),
+                    parent,
                     child: mount.child_node.clone(),
                     path_prefix: mount.mount_path.clone(),
                     middleware_stack: Vec::new(),
@@ -4669,21 +4695,104 @@ impl FileOrchestrator {
         }
     }
 
-    /// Resolve full paths for endpoints by traversing the mount graph.
-    fn resolve_endpoint_paths(&self, graph: &mut MountGraph) {
-        // Build owner -> mount path prefixes map. A child mounted under
-        // several prefixes (path aliases, e.g. the same sub-router mounted at
-        // both `/api/v2` and `/api/v2-beta`) serves its routes under EACH of
-        // them, so every prefix is kept separately (#373). Concatenating them
-        // into one string produced junk keys like `/api/v2/api/v2-beta/x` and
-        // silently dropped every alias's endpoint set but the fused one.
-        let mut owner_prefixes: HashMap<String, Vec<String>> = HashMap::new();
-        for mount in &graph.mounts {
-            let prefixes = owner_prefixes.entry(mount.child.clone()).or_default();
-            if !prefixes.contains(&mount.path_prefix) {
-                prefixes.push(mount.path_prefix.clone());
+    /// Every mounted node's full prefix chains, composed from the root down.
+    ///
+    /// `mounts` is a name-keyed edge list, so a node can have several parents
+    /// (the same router name mounted in more than one file) and a chain can
+    /// in principle loop; both are handled by walking each edge with a
+    /// path-local visited set and capping the fan-out. Chains are sorted so
+    /// the emitted paths do not depend on `HashMap` iteration order.
+    fn mount_prefix_chains(
+        mounts: &[crate::mount_graph::MountEdge],
+    ) -> HashMap<String, Vec<String>> {
+        // child -> [(parent, prefix)], deduplicated.
+        let mut by_child: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+        for mount in mounts {
+            let edges = by_child.entry(mount.child.as_str()).or_default();
+            let edge = (mount.parent.as_str(), mount.path_prefix.as_str());
+            if !edges.contains(&edge) {
+                edges.push(edge);
             }
         }
+
+        let mut resolved: HashMap<String, Vec<String>> = HashMap::new();
+        for child in by_child.keys() {
+            let mut visiting: HashSet<&str> = HashSet::new();
+            let mut chains = Self::chains_for(child, &by_child, &mut visiting);
+            chains.sort();
+            chains.dedup();
+            resolved.insert((*child).to_string(), chains);
+        }
+        resolved
+    }
+
+    /// How many prefix chains one node may resolve to. Alias fan-out is
+    /// normally one or two; a name-keyed graph in a large repo can multiply
+    /// them, and past this point the extra chains are noise, not routes.
+    const MAX_PREFIX_CHAINS: usize = 8;
+
+    fn chains_for<'a>(
+        node: &'a str,
+        by_child: &HashMap<&'a str, Vec<(&'a str, &'a str)>>,
+        visiting: &mut HashSet<&'a str>,
+    ) -> Vec<String> {
+        let Some(edges) = by_child.get(node) else {
+            return Vec::new();
+        };
+        if !visiting.insert(node) {
+            return Vec::new(); // cycle: this node is already on the walk
+        }
+        let mut chains: Vec<String> = Vec::new();
+        for (parent, prefix) in edges {
+            // An edge back onto a node already on this walk is a cycle. Drop
+            // the edge rather than the node: composing through it would
+            // invent a prefix the route never carries, and a mount point
+            // whose own ancestry is unresolvable is still the top of this
+            // chain.
+            if visiting.contains(parent) {
+                continue;
+            }
+            let parent_chains = Self::chains_for(parent, by_child, visiting);
+            if parent_chains.is_empty() {
+                chains.push(Self::join_paths(prefix, ""));
+            } else {
+                for parent_chain in parent_chains {
+                    chains.push(Self::join_paths(&parent_chain, prefix));
+                }
+            }
+            if chains.len() >= Self::MAX_PREFIX_CHAINS {
+                debug!(
+                    "Mount chain fan-out for '{}' hit the {} chain cap; extra chains dropped",
+                    node,
+                    Self::MAX_PREFIX_CHAINS
+                );
+                chains.truncate(Self::MAX_PREFIX_CHAINS);
+                break;
+            }
+        }
+        visiting.remove(node);
+        chains
+    }
+
+    /// Resolve full paths for endpoints by traversing the mount graph.
+    fn resolve_endpoint_paths(&self, graph: &mut MountGraph) {
+        // Build owner -> full mount path prefixes. A router's own mount
+        // prefix is only the last hop: routers are routinely registered on a
+        // parent that is itself registered under a prefix
+        // (`app.register(v1, { prefix: "/api/v1" })` with
+        // `v1.register(orders, { prefix: "/orders" })`), and taking the last
+        // hop alone dropped every ancestor — an endpoint declared at `/` in a
+        // router mounted three levels down was indexed as `/`, colliding with
+        // every other router's `/` (carrick#535). Each chain is walked to the
+        // root and composed.
+        //
+        // A child mounted under several prefixes (path aliases, e.g. the same
+        // sub-router mounted at both `/api/v2` and `/api/v2-beta`) serves its
+        // routes under EACH of them, so every chain is kept separately (#373).
+        // Concatenating them into one string produced junk keys like
+        // `/api/v2/api/v2-beta/x` and silently dropped every alias's endpoint
+        // set but the fused one.
+        let owner_prefixes = Self::mount_prefix_chains(&graph.mounts);
 
         // Apply prefixes to endpoints, fanning an endpoint out once per
         // distinct alias prefix. Endpoints whose owner is not mounted keep
@@ -7692,6 +7801,165 @@ export * from "./aFetch.js";"#,
             .collect();
         routes.sort();
         routes
+    }
+
+    fn nested_fixture_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested-plugin-mounts")
+    }
+
+    /// A mount declared inside a plugin: the parent is the framework instance
+    /// the plugin was handed, which every module in the fixture calls
+    /// `server`.
+    fn plugin_mount(line_number: i32, child: &str, prefix: &str, source: &str) -> MountResult {
+        MountResult {
+            line_number,
+            parent_node: "server".to_string(),
+            child_node: child.to_string(),
+            mount_path: prefix.to_string(),
+            import_source: Some(source.to_string()),
+            pattern_matched: ".register(".to_string(),
+        }
+    }
+
+    /// Routers registered two levels down: the root mounts an API plugin at
+    /// `/api/v1`, and that plugin mounts two leaf routers. Both leaf routers
+    /// declare the same relative paths (`/` and `/:id`), so applying only the
+    /// leaf's own mount prefix left them colliding on `POST /` and `GET /:id`
+    /// — the shape that made a real 2.9k-file service drop ~30 endpoints as
+    /// duplicate manifest aliases (carrick#535).
+    #[test]
+    fn test_build_mount_graph_composes_the_whole_mount_chain() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/server.ts".to_string(),
+            FileAnalysisResult {
+                mounts: vec![MountResult {
+                    line_number: 6,
+                    parent_node: "server".to_string(),
+                    child_node: "registerApiRoutes".to_string(),
+                    mount_path: "/api/v1".to_string(),
+                    import_source: Some("./api/index.js".to_string()),
+                    pattern_matched: ".register(".to_string(),
+                }],
+                ..Default::default()
+            },
+        );
+        file_results.insert(
+            "src/api/index.ts".to_string(),
+            FileAnalysisResult {
+                mounts: vec![
+                    plugin_mount(
+                        8,
+                        "registerCatalogRouter",
+                        "/catalog",
+                        "./catalog-router.js",
+                    ),
+                    plugin_mount(
+                        9,
+                        "registerInventoryRouter",
+                        "/inventory",
+                        "./inventory-router.js",
+                    ),
+                ],
+                ..Default::default()
+            },
+        );
+        for module in ["catalog", "inventory"] {
+            file_results.insert(
+                format!("src/api/{module}-router.ts"),
+                FileAnalysisResult {
+                    endpoints: vec![plugin_endpoint("POST", "/"), plugin_endpoint("GET", "/:id")],
+                    ..Default::default()
+                },
+            );
+        }
+
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            &nested_fixture_root(),
+        );
+
+        assert_eq!(
+            resolved_routes(&graph),
+            vec![
+                (
+                    "GET".to_string(),
+                    "/api/v1/catalog/:id".to_string(),
+                    "registerCatalogRouter".to_string()
+                ),
+                (
+                    "GET".to_string(),
+                    "/api/v1/inventory/:id".to_string(),
+                    "registerInventoryRouter".to_string()
+                ),
+                (
+                    "POST".to_string(),
+                    "/api/v1/catalog".to_string(),
+                    "registerCatalogRouter".to_string()
+                ),
+                (
+                    "POST".to_string(),
+                    "/api/v1/inventory".to_string(),
+                    "registerInventoryRouter".to_string()
+                ),
+            ],
+            "every prefix in the chain must be applied, so the two routers' \
+             identical relative paths stay distinct"
+        );
+    }
+
+    /// The chain walk must not double-apply a prefix a router is mounted
+    /// under twice by different names, and must keep alias fan-out (#373):
+    /// one child mounted under two prefixes still serves both.
+    #[test]
+    fn test_mount_prefix_chains_fan_out_and_terminate() {
+        let mounts = vec![
+            MountEdge {
+                parent: "app".to_string(),
+                child: "api".to_string(),
+                path_prefix: "/api".to_string(),
+                middleware_stack: Vec::new(),
+            },
+            MountEdge {
+                parent: "app".to_string(),
+                child: "api".to_string(),
+                path_prefix: "/api-beta".to_string(),
+                middleware_stack: Vec::new(),
+            },
+            MountEdge {
+                parent: "api".to_string(),
+                child: "orders".to_string(),
+                path_prefix: "/orders".to_string(),
+                middleware_stack: Vec::new(),
+            },
+            // Cycle: `app` mounted back under its own descendant. The walk
+            // must terminate rather than compose forever.
+            MountEdge {
+                parent: "orders".to_string(),
+                child: "app".to_string(),
+                path_prefix: "/loop".to_string(),
+                middleware_stack: Vec::new(),
+            },
+        ];
+
+        let chains = FileOrchestrator::mount_prefix_chains(&mounts);
+        assert_eq!(
+            chains.get("orders"),
+            Some(&vec![
+                "/api-beta/orders".to_string(),
+                "/api/orders".to_string()
+            ]),
+            "a child mounted under two aliases serves its routes under both"
+        );
+        assert!(
+            chains.get("app").is_some_and(|c| c.len() <= 8),
+            "the cycle must terminate inside the fan-out cap"
+        );
     }
 
     /// Four plugins registered through ONE barrel: same import specifier for
