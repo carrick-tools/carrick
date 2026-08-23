@@ -1,4 +1,8 @@
-use std::{collections::HashSet, io, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    io,
+    path::PathBuf,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -40,15 +44,54 @@ pub struct Config {
     pub external_domains: HashSet<String>,
 }
 
+/// Call-classification declarations attached to a shared source root.
+///
+/// The same four fields a service carries, minus everything that places a
+/// service in the tree: a shared root is not a service, it is a directory
+/// several services pull in.
+#[derive(Debug, Deserialize, Default, Clone)]
+struct IncludeDeclarations {
+    #[serde(default)]
+    #[serde(rename = "internalEnvVars")]
+    internal_env_vars: HashSet<String>,
+    #[serde(default)]
+    #[serde(rename = "internalDomains")]
+    internal_domains: HashSet<String>,
+    #[serde(default)]
+    #[serde(rename = "externalEnvVars")]
+    external_env_vars: HashSet<String>,
+    #[serde(default)]
+    #[serde(rename = "externalDomains")]
+    external_domains: HashSet<String>,
+}
+
 /// File-level shape of `carrick.json`: either a single flat service (the flat
 /// fields, captured via `flatten`) or an explicit `services` array for a
-/// monorepo. Resolved by [`Config::load_services`].
+/// monorepo, plus an optional `includes` map declaring classification for
+/// shared source roots. Resolved by [`Config::load_services`].
 #[derive(Debug, Deserialize)]
 struct RootConfig {
+    /// Shared source root (the same path a service names in its `include`) ->
+    /// declarations every service that includes it inherits. Lives on the file
+    /// rather than on `Config` deliberately: a shared root is declared once for
+    /// the repo, not once per service that reaches through it.
+    #[serde(default)]
+    includes: BTreeMap<String, IncludeDeclarations>,
     #[serde(default)]
     services: Vec<Config>,
     #[serde(flatten)]
     flat: Config,
+}
+
+/// Compare include paths by what they name, not by how they were typed:
+/// `lambdas/_shared`, `./lambdas/_shared`, and `lambdas/_shared/` are one root.
+/// Used only for matching an `includes` key against a service's `include`; the
+/// raw strings stay untouched for the engine's path-existence check.
+fn normalize_include_path(path: &str) -> String {
+    path.trim()
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
 }
 
 impl Config {
@@ -91,6 +134,13 @@ impl Config {
     /// is present, any sibling flat fields are ignored. Multiple input files
     /// are concatenated.
     ///
+    /// A top-level `includes` map declares call classification for a shared
+    /// source root once (`{"lambdas/_shared": {"externalEnvVars": [...]}}`);
+    /// every service whose `include` names that root inherits those
+    /// declarations, unioned with its own. Inheritance is resolved here, so
+    /// nothing downstream sees the map — a service config is complete on its
+    /// own. A key no service includes is an error, not a silent no-op.
+    ///
     /// This is distinct from [`Config::new`], which merges many repos'
     /// classifiers into one for cross-repo analysis.
     pub fn load_services(file_paths: Vec<PathBuf>) -> Result<Vec<Config>, std::io::Error> {
@@ -99,13 +149,67 @@ impl Config {
             let content = std::fs::read_to_string(path)?;
             let root: RootConfig = serde_json::from_str(&content)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if root.services.is_empty() {
-                services.push(root.flat);
+
+            let includes: BTreeMap<String, IncludeDeclarations> = root
+                .includes
+                .into_iter()
+                .map(|(key, decls)| (normalize_include_path(&key), decls))
+                .collect();
+
+            let mut file_services = if root.services.is_empty() {
+                vec![root.flat]
             } else {
-                services.extend(root.services);
+                root.services
+            };
+
+            let mut inherited: HashSet<String> = HashSet::new();
+            for service in file_services.iter_mut() {
+                for raw in service.include.clone() {
+                    let key = normalize_include_path(&raw);
+                    if let Some(decls) = includes.get(&key) {
+                        service.inherit(decls);
+                        inherited.insert(key);
+                    }
+                }
             }
+
+            // A key no service includes is dead config that reads as if it
+            // applies. Same reasoning as the engine's check on a directory that
+            // does not exist: silently doing nothing is the failure this
+            // feature exists to remove.
+            if let Some(unused) = includes.keys().find(|key| !inherited.contains(*key)) {
+                // `InvalidInput`, not `InvalidData`: the file parsed fine, its
+                // declarations just don't line up. The engine keys off the kind
+                // to report this as itself rather than as a parse failure.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{}: `includes` declares '{}', which no service lists in its \
+                         `include`. Add it to a service's `include`, or remove the entry.",
+                        path.display(),
+                        unused
+                    ),
+                ));
+            }
+
+            services.extend(file_services);
         }
         Ok(services)
+    }
+
+    /// Union a shared root's declarations into this service's own.
+    ///
+    /// Union, not override: a service that also declares a name keeps it, and
+    /// order of application never changes the result.
+    fn inherit(&mut self, decls: &IncludeDeclarations) {
+        self.internal_env_vars
+            .extend(decls.internal_env_vars.iter().cloned());
+        self.internal_domains
+            .extend(decls.internal_domains.iter().cloned());
+        self.external_env_vars
+            .extend(decls.external_env_vars.iter().cloned());
+        self.external_domains
+            .extend(decls.external_domains.iter().cloned());
     }
 
     pub fn is_internal_call(&self, route: &str) -> bool {
@@ -282,6 +386,175 @@ mod tests {
         assert_eq!(second.service_name, Some("dashboard".to_string()));
         assert_eq!(second.directory, Some("app".to_string()));
         assert_eq!(second.tsconfig, Some("tsconfig.json".to_string()));
+    }
+
+    #[test]
+    fn test_includes_declarations_are_inherited_by_including_services() {
+        // The carrick#387 shape: one shared root, declared once, inherited by
+        // every service that pulls it in — and by nothing else.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carrick.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "includes": {
+                    "lambdas/_shared": {
+                        "externalEnvVars": ["GITHUB_API_BASE"],
+                        "externalDomains": ["https://api.github.com"],
+                        "internalEnvVars": ["CARRICK_API_ENDPOINT"],
+                        "internalDomains": ["https://api.carrick.tools"]
+                    }
+                },
+                "services": [
+                    {
+                        "name": "check-or-upload",
+                        "directory": "lambdas/check-or-upload",
+                        "include": ["lambdas/_shared"]
+                    },
+                    {
+                        "name": "mcp-server",
+                        "directory": "lambdas/mcp-server",
+                        "include": ["lambdas/_shared"]
+                    },
+                    {
+                        "name": "dashboard",
+                        "directory": "app"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let services = Config::load_services(vec![path]).unwrap();
+        assert_eq!(services.len(), 3);
+
+        // Every service that includes the root inherits, not just the first.
+        for service in &services[..2] {
+            assert!(service.external_env_vars.contains("GITHUB_API_BASE"));
+            assert!(service.external_domains.contains("https://api.github.com"));
+            assert!(service.internal_env_vars.contains("CARRICK_API_ENDPOINT"));
+            assert!(
+                service
+                    .internal_domains
+                    .contains("https://api.carrick.tools")
+            );
+            assert!(service.is_external_call("ENV_VAR:GITHUB_API_BASE:/repos"));
+        }
+
+        // A service that does not include the root inherits nothing.
+        let dashboard = &services[2];
+        assert!(dashboard.external_env_vars.is_empty());
+        assert!(dashboard.external_domains.is_empty());
+        assert!(dashboard.internal_env_vars.is_empty());
+        assert!(dashboard.internal_domains.is_empty());
+        assert!(!dashboard.is_external_call("ENV_VAR:GITHUB_API_BASE:/repos"));
+    }
+
+    #[test]
+    fn test_includes_declarations_union_with_the_services_own() {
+        // Inherited declarations are added to the service's own, never replace
+        // them, and a name declared in both places is still just declared.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carrick.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "includes": {
+                    "lambdas/_shared": {
+                        "externalEnvVars": ["GITHUB_API_BASE", "SHARED_AND_OWN"]
+                    }
+                },
+                "services": [
+                    {
+                        "name": "check-or-upload",
+                        "directory": "lambdas/check-or-upload",
+                        "include": ["lambdas/_shared"],
+                        "externalEnvVars": ["STRIPE_API", "SHARED_AND_OWN"],
+                        "internalEnvVars": ["CARRICK_API_ENDPOINT"]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let services = Config::load_services(vec![path]).unwrap();
+        let service = &services[0];
+        assert!(service.external_env_vars.contains("GITHUB_API_BASE"));
+        assert!(service.external_env_vars.contains("STRIPE_API"));
+        assert!(service.external_env_vars.contains("SHARED_AND_OWN"));
+        assert_eq!(service.external_env_vars.len(), 3);
+        assert!(service.internal_env_vars.contains("CARRICK_API_ENDPOINT"));
+    }
+
+    #[test]
+    fn test_includes_key_matching_ignores_path_spelling() {
+        // `./lambdas/_shared/` and `lambdas/_shared` name one root.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carrick.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "includes": {
+                    "./lambdas/_shared/": { "externalEnvVars": ["GITHUB_API_BASE"] }
+                },
+                "services": [
+                    { "name": "a", "directory": "lambdas/a", "include": ["lambdas/_shared"] }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let services = Config::load_services(vec![path]).unwrap();
+        assert!(services[0].external_env_vars.contains("GITHUB_API_BASE"));
+    }
+
+    #[test]
+    fn test_includes_apply_to_a_flat_single_service_config() {
+        // A flat config can carry `include` too, so it inherits the same way.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carrick.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "serviceName": "single",
+                "include": ["packages/shared"],
+                "includes": {
+                    "packages/shared": { "externalDomains": ["https://api.github.com"] }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let services = Config::load_services(vec![path]).unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].service_name, Some("single".to_string()));
+        assert!(services[0].is_external_call("https://api.github.com/repos"));
+    }
+
+    #[test]
+    fn test_includes_key_no_service_includes_is_an_error() {
+        // Dead config reads as if it applies; fail loudly instead.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carrick.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "includes": {
+                    "lambdas/_shard": { "externalEnvVars": ["GITHUB_API_BASE"] }
+                },
+                "services": [
+                    { "name": "a", "directory": "lambdas/a", "include": ["lambdas/_shared"] }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let err = Config::load_services(vec![path]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let message = err.to_string();
+        assert!(message.contains("lambdas/_shard"), "{message}");
+        assert!(message.contains("include"), "{message}");
+        assert!(message.contains("carrick.json"), "{message}");
     }
 
     #[test]

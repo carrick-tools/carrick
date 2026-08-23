@@ -2906,12 +2906,20 @@ fn resolve_services(repo_path: &str) -> Result<Vec<Config>, Box<dyn std::error::
     let services = if config_path.is_file() {
         debug!("Found carrick.json: {}", config_path.display());
         Config::load_services(vec![config_path.clone()]).map_err(|e| {
-            format!(
-                "Failed to parse {}: {}. Fix the config or delete it to scan \
-                 the repo as a single zero-config service.",
-                config_path.display(),
-                e
-            )
+            // A config that parsed but declares something inconsistent already
+            // names the file and the offending declaration; wrapping it in the
+            // parse-failure advice would tell the user to delete a file whose
+            // only problem is one line.
+            if e.kind() == std::io::ErrorKind::InvalidInput {
+                e.to_string()
+            } else {
+                format!(
+                    "Failed to parse {}: {}. Fix the config or delete it to scan \
+                     the repo as a single zero-config service.",
+                    config_path.display(),
+                    e
+                )
+            }
         })?
     } else {
         Vec::new()
@@ -5652,6 +5660,62 @@ mod tests {
             err.to_string().contains("Failed to parse"),
             "expected parse error, got: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_services_rejects_unreferenced_includes_key() {
+        // Reported as itself, not wrapped in the parse-failure advice.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("lambdas/api")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("lambdas/_shared")).unwrap();
+        std::fs::write(
+            tmp.path().join("carrick.json"),
+            r#"{
+                "includes": { "lambdas/_shard": { "externalEnvVars": ["GITHUB_API_BASE"] } },
+                "services": [
+                    { "name": "api", "directory": "lambdas/api", "include": ["lambdas/_shared"] }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let err = resolve_services(tmp.path().to_str().unwrap()).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("lambdas/_shard"), "{message}");
+        assert!(
+            !message.contains("Failed to parse"),
+            "a semantic error should not be reported as a parse failure: {message}"
+        );
+    }
+
+    #[test]
+    fn resolve_services_inherits_include_root_declarations() {
+        // The whole engine path: parse, inherit, validate declared paths exist.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("lambdas/api")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("lambdas/worker")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("lambdas/_shared")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("app")).unwrap();
+        std::fs::write(
+            tmp.path().join("carrick.json"),
+            r#"{
+                "includes": {
+                    "lambdas/_shared": { "externalEnvVars": ["GITHUB_API_BASE"] }
+                },
+                "services": [
+                    { "name": "api", "directory": "lambdas/api", "include": ["lambdas/_shared"] },
+                    { "name": "worker", "directory": "lambdas/worker", "include": ["lambdas/_shared"] },
+                    { "name": "web", "directory": "app" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let services = resolve_services(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(services.len(), 3);
+        assert!(services[0].is_external_call("ENV_VAR:GITHUB_API_BASE:/repos"));
+        assert!(services[1].is_external_call("ENV_VAR:GITHUB_API_BASE:/repos"));
+        assert!(!services[2].is_external_call("ENV_VAR:GITHUB_API_BASE:/repos"));
     }
 
     #[test]
