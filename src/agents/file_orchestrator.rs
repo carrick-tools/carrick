@@ -48,6 +48,7 @@ use crate::{
     },
     url_normalizer::UrlNormalizer,
     visitor::{ImportSymbolExtractor, ImportedSymbol, SymbolKind, TypeSymbolExtractor},
+    wrapper_request_shape::{self, WrapperRequestShape},
 };
 use futures::stream::StreamExt;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -115,8 +116,24 @@ pub struct ProcessingStats {
     /// a topic from a wrapper-function NAME (`publishStatusChanged` ->
     /// `status.changed`); the real op lives in the file that holds the literal.
     pub pubsub_phantom_topic_drops: usize,
+    /// Wrapper-resolved data calls whose HTTP method was corrected from what
+    /// extraction gave them to the method their wrapper module hardcodes
+    /// (carrick-cloud#386). A subset of `total_data_calls`.
+    pub wrapper_method_propagations: usize,
     pub total_data_calls: usize,
     pub errors: Vec<String>,
+}
+
+/// A same-repo module that itself performs HTTP and exports a binding — the
+/// shape of a request wrapper another file imports (#369/#370).
+struct WrapperModule {
+    /// The module's source, injected into the importing file's prompt so its
+    /// delegating call sites can be emitted with a resolved target.
+    snippet: String,
+    /// The method (and body presence) every request in the module agrees on,
+    /// read off the AST. `None` when the module parameterizes its method, its
+    /// requests disagree, or none is readable. See `crate::wrapper_request_shape`.
+    request_shape: Option<WrapperRequestShape>,
 }
 
 /// Owner assigned to endpoints declared by file location (file-based routing).
@@ -669,6 +686,14 @@ impl FileOrchestrator {
             /// user message so call sites of an imported wrapper can be emitted
             /// as resolved data calls. Empty for files with no such imports.
             wrapper_context: Vec<String>,
+            /// The request shape every wrapper module behind `wrapper_context`
+            /// agrees on (carrick-cloud#386): the literal HTTP method, and
+            /// whether the request carries a body. `None` — the common case —
+            /// whenever the wrappers parameterize the method, disagree, or this
+            /// file imports none. Propagated onto the resolved call sites after
+            /// the LLM pass, because the delegating site itself carries no
+            /// method and would otherwise default to GET.
+            wrapper_request_shape: Option<WrapperRequestShape>,
             /// Pub/sub operations asserted deterministically from the AST
             /// (carrick#387), merged in after the LLM pass so an extraction
             /// omission cannot lose them. Empty when Signal 7's gates are off.
@@ -955,6 +980,7 @@ impl FileOrchestrator {
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: Vec::new(),
+                wrapper_request_shape: None,
                 pubsub_anchor_ops: scan_result.pubsub_anchor_ops,
             });
         }
@@ -966,7 +992,7 @@ impl FileOrchestrator {
         // (size-capped) file is the context snippet: wrappers are small client
         // modules, and slicing exact function spans buys little over the cap.
         const WRAPPER_SNIPPET_MAX: usize = 4_000;
-        let mut wrapper_map: HashMap<PathBuf, String> = HashMap::new();
+        let mut wrapper_map: HashMap<PathBuf, WrapperModule> = HashMap::new();
         for pf in &pending {
             // Rescued files (graphql/messaging fall-throughs) carry no HTTP
             // candidates and are not wrapper material.
@@ -995,7 +1021,21 @@ impl FileOrchestrator {
             } else {
                 snippet.push_str(&pf.content);
             }
-            wrapper_map.insert(canonical, snippet);
+            // The method the module's own request calls fix, read off the AST
+            // candidates the gatekeeper already raised for it
+            // (carrick-cloud#386). `None` whenever the module parameterizes its
+            // method or its requests disagree, in which case the delegating
+            // site keeps whatever extraction gave it.
+            let request_shape = wrapper_request_shape::fold_module(
+                pf.candidate_map.values().map(|c| &c.request_shape),
+            );
+            wrapper_map.insert(
+                canonical,
+                WrapperModule {
+                    snippet,
+                    request_shape,
+                },
+            );
         }
 
         // Attach wrapper context to files that import a wrapper module via a
@@ -1034,9 +1074,15 @@ impl FileOrchestrator {
                 // wrapper context.
                 matched.sort();
                 matched.dedup();
+                pf.wrapper_request_shape = wrapper_request_shape::fold_wrappers(
+                    matched
+                        .iter()
+                        .filter_map(|path| wrapper_map.get(path))
+                        .map(|module| module.request_shape.as_ref()),
+                );
                 pf.wrapper_context = matched
                     .iter()
-                    .filter_map(|path| wrapper_map.get(path).cloned())
+                    .filter_map(|path| wrapper_map.get(path).map(|m| m.snippet.clone()))
                     .collect();
             }
         }
@@ -1070,9 +1116,15 @@ impl FileOrchestrator {
                 matched.sort();
                 matched.dedup();
             }
+            let rescued_shape = wrapper_request_shape::fold_wrappers(
+                matched
+                    .iter()
+                    .filter_map(|path| wrapper_map.get(path))
+                    .map(|module| module.request_shape.as_ref()),
+            );
             let ctx: Vec<String> = matched
                 .iter()
-                .filter_map(|path| wrapper_map.get(path).cloned())
+                .filter_map(|path| wrapper_map.get(path).map(|m| m.snippet.clone()))
                 .collect();
             if ctx.is_empty() {
                 debug!(
@@ -1115,6 +1167,7 @@ impl FileOrchestrator {
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: ctx,
+                wrapper_request_shape: rescued_shape,
                 // Rescued zero-candidate files by definition raised no Signal 7
                 // candidate, so they can carry no anchor ops either.
                 pubsub_anchor_ops: Vec::new(),
@@ -1190,6 +1243,15 @@ impl FileOrchestrator {
 
                     let mut adjusted = result;
                     Self::apply_candidate_map(&mut adjusted, &pf.candidate_map, &pf.path_str);
+                    // Carry the wrapper's own request shape onto the sites that
+                    // delegate to it (carrick-cloud#386). Runs immediately after
+                    // `apply_candidate_map` because that is what stamps the span
+                    // this reads to tell a delegating site from a real client
+                    // call, and before every downstream method reader.
+                    stats.wrapper_method_propagations += Self::propagate_wrapper_request_shape(
+                        &mut adjusted,
+                        pf.wrapper_request_shape.as_ref(),
+                    );
                     // Collapse inline env-var fallbacks the model rendered
                     // verbatim (`${A ?? "http://localhost"}/p` -> `${A}/p`,
                     // carrick#399) BEFORE alias resolution: a local alias with
@@ -1287,6 +1349,10 @@ impl FileOrchestrator {
             stats.route_descriptor_endpoints
         );
         debug!("  - Total data calls: {}", stats.total_data_calls);
+        debug!(
+            "  - Wrapper method propagations: {}",
+            stats.wrapper_method_propagations
+        );
 
         // STEP 5: Build aggregated mount graph from all file results
         let mount_graph =
@@ -2598,7 +2664,7 @@ impl FileOrchestrator {
     fn wrapper_modules_behind(
         resolved: &Path,
         self_canon: Option<&PathBuf>,
-        wrapper_map: &HashMap<PathBuf, String>,
+        wrapper_map: &HashMap<PathBuf, WrapperModule>,
         reexport_cache: &mut HashMap<PathBuf, Vec<String>>,
         cm: &Lrc<SourceMap>,
         handler: &Handler,
@@ -3636,6 +3702,61 @@ impl FileOrchestrator {
                 data_call.target = normalized;
             }
         }
+    }
+
+    /// Carry an imported wrapper's fixed request shape onto the call sites that
+    /// delegate to it (carrick-cloud#386).
+    ///
+    /// Cross-file wrapper-site resolution (#369/#370) resolves the TARGET of a
+    /// delegating call because the wrapper's source is in the prompt. The METHOD
+    /// is not resolvable that way when the wrapper hardcodes it: the delegating
+    /// site's own arguments carry no method, so extraction emits none and
+    /// `normalize_consumer_method` falls back to `GET`. A POST-only client then
+    /// appears in the index as a set of GETs.
+    ///
+    /// A delegating site is identified exactly as the wrapper-echo suppression
+    /// in `build_mount_graph` identifies it: no `call_expression_span_start`,
+    /// i.e. the deterministic scanner raised no HTTP candidate there, because
+    /// `this.client.load()` is not a client call it recognizes. Using the same
+    /// discriminator is deliberate — a record this pass rewrites is exactly a
+    /// record that pass may collapse, so the two can never disagree about which
+    /// row is the wrapper's echo.
+    ///
+    /// A wrapper that sends no body at all takes the site's payload anchor with
+    /// it: a non-GET method turns on request-body inference downstream
+    /// (`should_infer_request_body`), and a request with no body must not
+    /// acquire a request type from whatever expression extraction pointed at.
+    /// Only a definite `Some(false)` does this; an unreadable argument list
+    /// leaves the anchor alone.
+    fn propagate_wrapper_request_shape(
+        result: &mut FileAnalysisResult,
+        shape: Option<&WrapperRequestShape>,
+    ) -> usize {
+        let Some(shape) = shape else {
+            return 0;
+        };
+        let mut propagated = 0;
+        for data_call in &mut result.data_calls {
+            // Extracted at its own client call site, not through the wrapper —
+            // its method is the one the scanner saw.
+            if data_call.call_expression_span_start.is_some() {
+                continue;
+            }
+            let existing = data_call
+                .method
+                .as_deref()
+                .map(normalize_manifest_method)
+                .unwrap_or_default();
+            if existing != shape.method {
+                data_call.method = Some(shape.method.clone());
+                propagated += 1;
+            }
+            if shape.has_body == Some(false) {
+                data_call.payload_expression_text = None;
+                data_call.payload_expression_line = None;
+            }
+        }
+        propagated
     }
 
     fn resolve_env_var_aliases(result: &mut FileAnalysisResult, env_alias_map: &EnvAliasMap) {
@@ -4889,13 +5010,16 @@ mod tests {
         (cm, handler)
     }
 
-    fn wrapper_map_of(wrappers: &[PathBuf]) -> HashMap<PathBuf, String> {
+    fn wrapper_map_of(wrappers: &[PathBuf]) -> HashMap<PathBuf, WrapperModule> {
         wrappers
             .iter()
             .map(|p| {
                 (
                     p.canonicalize().expect("wrapper must exist"),
-                    format!("--- wrapper module: {} ---\n", p.display()),
+                    WrapperModule {
+                        snippet: format!("--- wrapper module: {} ---\n", p.display()),
+                        request_shape: None,
+                    },
                 )
             })
             .collect()
@@ -6101,6 +6225,203 @@ export * from "./aFetch.js";"#,
             primary_type_symbol: None,
             type_import_source: None,
         }
+    }
+
+    /// A data call with no method at all — what extraction emits for a site
+    /// that only delegates (`this.client.load(id)`), because the site's own
+    /// arguments carry no method.
+    fn methodless_call(line: i32, target: &str, span: Option<u32>) -> DataCallResult {
+        DataCallResult {
+            method: None,
+            pattern_matched: "client.load(".to_string(),
+            ..call_with_span(line, target, span)
+        }
+    }
+
+    /// carrick-cloud#386: a wrapper that hardcodes `method: "POST"` inside its
+    /// own request tells the delegating site nothing, so the site's method is
+    /// empty and `normalize_consumer_method` turns it into a GET. The wrapper's
+    /// method is a structural fact, so it is carried to the site instead.
+    ///
+    /// The wrapper's OWN request call is untouched: it is candidate-backed, so
+    /// its method is the one the scanner saw at a real client call.
+    #[test]
+    fn a_wrapper_hardcoded_method_reaches_the_delegating_site() {
+        let mut result = result_with_data_calls(vec![
+            methodless_call(115, "${CATALOG_API_URL}/catalog/sync", Some(400)),
+            methodless_call(23, "/catalog/sync", None),
+        ]);
+        let shape = WrapperRequestShape {
+            method: "POST".to_string(),
+            has_body: Some(true),
+        };
+
+        let propagated =
+            FileOrchestrator::propagate_wrapper_request_shape(&mut result, Some(&shape));
+
+        assert_eq!(propagated, 1, "only the delegating site is rewritten");
+        assert_eq!(
+            result.data_calls[0].method, None,
+            "the wrapper's own candidate-backed request keeps what extraction gave it"
+        );
+        assert_eq!(result.data_calls[1].method.as_deref(), Some("POST"));
+    }
+
+    /// With no wrapper behind the file — or a wrapper that parameterizes its
+    /// method — nothing is rewritten. This is the majority of files, and the
+    /// case where the delegating site's own argument IS the method.
+    #[test]
+    fn an_unknown_wrapper_shape_rewrites_nothing() {
+        let mut result = result_with_data_calls(vec![methodless_call(23, "/catalog/sync", None)]);
+        assert_eq!(
+            FileOrchestrator::propagate_wrapper_request_shape(&mut result, None),
+            0
+        );
+        assert_eq!(result.data_calls[0].method, None);
+    }
+
+    /// The method flip turns on request-body inference downstream
+    /// (`should_infer_request_body`), so a wrapper that demonstrably sends no
+    /// body must take the site's payload anchor with it — otherwise the site
+    /// acquires a request type for a request that has no request body.
+    #[test]
+    fn a_bodyless_wrapper_clears_the_sites_payload_anchor() {
+        let mut call = methodless_call(23, "/catalog/things/42", None);
+        call.payload_expression_text = Some("{ id }".to_string());
+        call.payload_expression_line = Some(23);
+        let mut result = result_with_data_calls(vec![call]);
+
+        FileOrchestrator::propagate_wrapper_request_shape(
+            &mut result,
+            Some(&WrapperRequestShape {
+                method: "DELETE".to_string(),
+                has_body: Some(false),
+            }),
+        );
+
+        assert_eq!(result.data_calls[0].method.as_deref(), Some("DELETE"));
+        assert_eq!(result.data_calls[0].payload_expression_text, None);
+        assert_eq!(result.data_calls[0].payload_expression_line, None);
+    }
+
+    /// A wrapper whose body presence cannot be read leaves the anchor alone: a
+    /// positional payload the site itself passes is a real request body.
+    #[test]
+    fn an_unreadable_body_presence_leaves_the_payload_anchor_alone() {
+        let mut call = methodless_call(23, "/catalog/things", None);
+        call.payload_expression_text = Some("payload".to_string());
+        call.payload_expression_line = Some(23);
+        let mut result = result_with_data_calls(vec![call]);
+
+        FileOrchestrator::propagate_wrapper_request_shape(
+            &mut result,
+            Some(&WrapperRequestShape {
+                method: "POST".to_string(),
+                has_body: None,
+            }),
+        );
+
+        assert_eq!(
+            result.data_calls[0].payload_expression_text.as_deref(),
+            Some("payload")
+        );
+    }
+
+    /// carrick-cloud#386, second half: a wrapper-resolved site and the
+    /// wrapper's own templated request are ONE outbound operation, and must
+    /// key as one.
+    ///
+    /// They agree on the path already — the wrapper's `${CATALOG_API_URL}` base
+    /// is a declared-internal env var, so `consumer_call_path` strips it to the
+    /// bare route the resolved site reports. What kept them apart was the
+    /// method: the delegating site defaulted to GET against the wrapper's POST,
+    /// so the existing wrapper-echo suppression never saw one key. With the
+    /// method propagated they collapse, and the candidate-backed record — the
+    /// real client call, the only one with spans for the type sidecar — wins.
+    #[test]
+    fn a_resolved_wrapper_site_and_its_template_call_key_as_one_operation() {
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let config = crate::config::Config {
+            internal_env_vars: ["CATALOG_API_URL".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let post = |line: i32, target: &str, span: Option<u32>| DataCallResult {
+            method: Some("POST".to_string()),
+            ..call_with_span(line, target, span)
+        };
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/catalog-client.ts".to_string(),
+            result_with_data_calls(vec![post(
+                115,
+                "${CATALOG_API_URL}/catalog/sync",
+                Some(400),
+            )]),
+        );
+        file_results.insert(
+            "src/tools/sync-catalog.ts".to_string(),
+            result_with_data_calls(vec![post(23, "/catalog/sync", None)]),
+        );
+
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::new(&config),
+            Path::new(""),
+            Path::new(""),
+        );
+
+        assert_eq!(
+            graph.data_calls.len(),
+            1,
+            "one physical request must key as one operation, got {:?}",
+            graph
+                .data_calls
+                .iter()
+                .map(|c| (&c.method, &c.canonical_path, &c.file_location))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(graph.data_calls[0].method, "POST");
+        assert_eq!(graph.data_calls[0].canonical_path, "/catalog/sync");
+        assert_eq!(
+            graph.data_calls[0].file_location, "src/catalog-client.ts:115",
+            "the candidate-backed client call is the record that survives"
+        );
+    }
+
+    /// The counterfactual for the test above: with the delegating site still
+    /// recorded as a GET, the two records carry different keys and both
+    /// survive. This is the state carrick-cloud#386 reported.
+    #[test]
+    fn a_delegating_site_left_as_get_does_not_collapse() {
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let config = crate::config::Config {
+            internal_env_vars: ["CATALOG_API_URL".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/catalog-client.ts".to_string(),
+            result_with_data_calls(vec![DataCallResult {
+                method: Some("POST".to_string()),
+                ..call_with_span(115, "${CATALOG_API_URL}/catalog/sync", Some(400))
+            }]),
+        );
+        file_results.insert(
+            "src/tools/sync-catalog.ts".to_string(),
+            result_with_data_calls(vec![call_with_span(23, "/catalog/sync", None)]),
+        );
+
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::new(&config),
+            Path::new(""),
+            Path::new(""),
+        );
+
+        assert_eq!(graph.data_calls.len(), 2);
     }
 
     /// Reproduction of the cross-service call double-count.
@@ -8412,6 +8733,7 @@ export { routes };
             path_snippet: snippet.map(|s| s.to_string()),
             code_snippet: "router.get(...)".to_string(),
             request_spec: None,
+            request_shape: crate::wrapper_request_shape::RequestShapeSignal::NotARequest,
         }
     }
 

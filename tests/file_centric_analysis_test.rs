@@ -272,6 +272,7 @@ fn test_processing_stats_tracking() {
         files_skipped_no_candidates: 1,
         files_parse_failed: 1,
         files_skipped_unrouted_protocol: 0,
+        wrapper_method_propagations: 0,
         total_mounts: 3,
         total_endpoints: 10,
         file_based_endpoints: 2,
