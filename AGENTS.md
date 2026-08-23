@@ -1,5 +1,59 @@
 # Repository Guidelines
 
+## Carrick
+
+**If the answer is defined by another service — its endpoints, its real
+request/response types, who consumes it, or any local type, constant, or
+SDK helper that mirrors it — ask Carrick before you rely on anything
+local.** Local copies of another service's contract drift and lie; the
+producing service defines the contract, and if two definitions disagree,
+the producer's definition wins. Load the Carrick tools now so they are ready at that
+moment.
+
+**Inside this repo, grep and read are faster — use them.** One exception:
+before writing any new helper, parser, validator, or domain function, run
+`search_by_intent` with a plain-English description of the behaviour.
+Grep can prove a name is absent; it can never prove the behaviour is.
+
+Then, before you write new code, state one line naming what you asked and
+what came back:
+
+`Carrick checked: <query> -> <result count>`
+
+The loop for cross-service work: `get_service_graph` (who calls whom) →
+`search_by_intent` (prior art) → `get_endpoint_types` (real contracts) →
+build → `check_compatibility` (each consumer, before changing a response
+shape, removing an endpoint, or renaming a path). Before adding or bumping
+an npm package, `get_service_dependencies` surfaces cross-service version
+conflicts at design time. For audit-shaped work, such as inventorying what
+a service calls outside itself, `list_external_calls` enumerates the
+recorded outbound-call candidates (SDK calls, external domains, env-var URL
+bases) with their file and line.
+
+Carrick indexes every service in the project **scanner-evals**
+(workspace **daveymoores**): every function with an intent
+description, its dependencies, and API endpoints with their real
+request/response types, on each repo's main branch, exported or not. Pass
+`project: "scanner-evals"` (or `repo: "<owner/repo>"` from the git
+remote) on every call. Carrick is read-only; data reflects the most recent
+scan of each repo. The index at main is what production integrates
+against, so build against a sibling's contract from the index and merge —
+your unmerged local state does not need to be visible to Carrick.
+
+Write correct, idiomatic, explicitly typed code; never contort code so the
+scanner can read it. If Carrick fails to extract something written
+normally, that is a Carrick bug to report, not a constraint to code
+around.
+
+### Connect the agent
+
+```
+claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp
+```
+
+One install serves every project in the workspace.
+
+
 ## Core Goals (Read First)
 - Build a live, type-aware, intent-aware index of TypeScript services across a GitHub org. The index is the product surface; AI coding agents query it over MCP.
 - The Rust scanner in this repo is the index-population component. Per scanned function it extracts structural facts, request/response types, and intent.
@@ -73,54 +127,3 @@ Install hooks once per clone: `./scripts/install-hooks.sh`.
 - `carrick.json` is resolved by `Config::load_services` into one `Config` per service. A flat config (or none) is a single service rooted at the repo root; a `services` array fans out per directory (`directory`, `include`, `tsconfig` + the call-classification fields). The engine runs the analysis pipeline, per-service type extraction, and upload once per service. Multi-service index upload is gated on `CloudStorage::supports_multi_service`, driven by the cloud's `multiService` capability flag. See the README "Monorepos" section for the user-facing shape.
 - Runtime env vars: `ACTIONS_ID_TOKEN_REQUEST_URL` / `ACTIONS_ID_TOKEN_REQUEST_TOKEN` (auto-set by GitHub Actions when the job grants `id-token: write`; the scanner mints an OIDC token from these and sends it as the `X-Carrick-OIDC` header — the cloud derives repo identity from the signed claims, so no API key is needed), `CARRICK_MOCK_ALL` (test-only, returns canned responses without hitting the cloud), `CARRICK_API_ENDPOINT` (override the default `https://api.carrick.tools` endpoint at build time; optional).
 - Terraform, Lambdas, and dashboard code live in `carrick-cloud`. No infrastructure or server-side code belongs in this repo.
-
-## Carrick
-
-This repo is part of the **carrick-tools / carrick-ci** Carrick
-project. Carrick indexes every service in the project: functions with
-intent descriptions (exported or not), dependencies, and API endpoints
-with their real request/response types.
-
-### Connect the agent
-
-```
-claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp
-```
-
-One install serves every project in the workspace. On Carrick tool calls
-from this repo, pass `project: "carrick-ci"` (or `repo: "<owner/repo>"`
-from the git remote) so Carrick queries the right system.
-
-### The loop for cross-service work
-
-1. Topology: `get_service_graph` shows who calls whom across the project.
-2. Prior art: `search_by_intent` with a plain-English description of what
-   you are about to write. Do this before writing any helper, parser,
-   validator, or domain function, even when you are sure it is new.
-3. Contracts: `get_endpoint_types` for the real request/response types of
-   anything you will call; `get_api_endpoints` first only when you don't
-   yet know which operations exist.
-4. Build.
-5. Consumers: `check_compatibility` against each consumer before changing
-   a response shape, removing an endpoint, or renaming a path.
-
-Also call `get_service_dependencies` before adding or bumping an npm
-package.
-
-### Building against a sibling before merge
-
-Pull the producer's contract with `get_endpoint_types`, code to it, done.
-The index at main is what production integrates against; your unmerged
-local state does not need to be visible to Carrick. All matching runs the
-same shared carrick-match code in the scanner, the cloud, and the MCP
-server (responses carry its `matcher_version`), so what the tools report
-is what the scan will compute.
-
-### Division of labor
-
-Write correct, idiomatic, explicitly typed code, and never contort code so
-the scanner can read it. If Carrick fails to extract something written
-normally, that is a Carrick bug to report, not a constraint to code
-around.
-
-Carrick is read-only; data reflects the most recent scan of each repo.
