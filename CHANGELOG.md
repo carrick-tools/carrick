@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.14](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.13...carrick-v0.3.14) (2026-08-23)
+
+
+### Features
+
+* **sdk-edges:** carry the SDK-&gt;producer type verdict onto each edge ([#531](https://github.com/carrick-tools/carrick/issues/531)) ([30c6e2d](https://github.com/carrick-tools/carrick/commit/30c6e2d62254af6f30dd5655e79c7747d904fd43))
+
+
+### Bug Fixes
+
+* **sidecar:** resolve route contracts declared in handler params and route schemas ([#533](https://github.com/carrick-tools/carrick/issues/533)) ([fffb722](https://github.com/carrick-tools/carrick/commit/fffb722c211d2b73f2f22fc754f30c565f871caa))
+
 ## [0.3.13](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.12...carrick-v0.3.13) (2026-08-22)
 
 
