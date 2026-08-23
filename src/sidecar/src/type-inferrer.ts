@@ -341,6 +341,19 @@ export class TypeInferrer {
     request: InferRequestItem,
     extractionConfig?: ExtractionConfig
   ): InferredType | null {
+    // A `function_return` request can point at a route REGISTRATION: that is
+    // the shape the scanner sends for a route whose handler RETURNS its
+    // payload. The containing-function walk below then resolves the function
+    // that registers the route, not the handler — so a registration declaring
+    // its response contract is read from that declaration first.
+    const registration = this.routeRegistrationForRequest(sourceFile, request);
+    if (registration) {
+      const declared = this.declaredResponseInferredType(request, registration);
+      if (declared) {
+        return declared;
+      }
+    }
+
     const func = this.resolveContainingFunction(sourceFile, request);
 
     if (!func) {
@@ -2609,6 +2622,28 @@ export class TypeInferrer {
   // framework, library, or method-name list is involved — a framework whose
   // request object exposes `body` and whose route options carry `schema` is
   // read the same way regardless of which one it is.
+
+  /**
+   * The route registration a request's locator points AT, or undefined when it
+   * points at anything else.
+   *
+   * Deliberately strict: the located node must itself be the registration (a
+   * call registering a handler, or a route-registry object literal), never an
+   * ancestor of it, so an expression inside a handler is not mistaken for the
+   * route it belongs to. A locator that resolves nothing falls back to the
+   * registration on the request's line.
+   */
+  private routeRegistrationForRequest(
+    sourceFile: SourceFile,
+    request: InferRequestItem
+  ): Node | undefined {
+    const located = this.resolveTargetNode(sourceFile, request);
+    if (located) {
+      const node = this.unwrapExpressionNode(located);
+      return this.registrationHandlerAt(node) ? node : undefined;
+    }
+    return this.registrationAtLine(sourceFile, request.line_number)?.registration;
+  }
 
   /**
    * Anchor (b) on the response side: the success-status contract declared in the

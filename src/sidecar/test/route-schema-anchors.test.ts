@@ -82,7 +82,7 @@ function registrationSpan(route: string): {
 async function infer(
   client: SidecarClient,
   route: string,
-  kind: 'request_body' | 'response_body',
+  kind: 'request_body' | 'response_body' | 'function_return',
   alias: string
 ): Promise<string | undefined> {
   const span = registrationSpan(route);
@@ -138,6 +138,24 @@ describe('schema-first route contract anchors', () => {
     assert.match(type, /sizeCm: number/);
     // The declared response schema, not the request schema.
     assert.doesNotMatch(type, /tags/);
+  });
+
+  it('anchor (b): the declared response also answers a function_return locator on the registration', async () => {
+    // The scanner sends `function_return` for a route whose handler returns its
+    // payload. Its containing-function walk resolves the function REGISTERING
+    // the route, so without the anchor this reports that function's return
+    // (`void` here), not the route's contract.
+    const type = await infer(
+      client,
+      '/widgets',
+      'function_return',
+      'WidgetsRet'
+    );
+
+    assert.ok(type, 'expected a resolved response type, got none');
+    assert.notStrictEqual(type, 'void', 'must not report the registering function return');
+    assert.match(type, /id: string/);
+    assert.match(type, /sizeCm: number/);
   });
 
   it('anchor (b): a POST with no typed request parameter falls through to the declared body schema', async () => {
