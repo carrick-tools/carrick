@@ -660,6 +660,7 @@ impl CloudStorage for AwsStorage {
                     package_json_hash: None,
                     cache_version: None,
                     type_extraction_status: None,
+                    types_degraded: None,
                     compat_verdicts: None,
                     capture_stub: None,
                     external_call_candidates: None,
@@ -1005,6 +1006,7 @@ mod tests {
                 libraries: vec![],
                 operations_indexed: false,
             },
+            has_types: true,
         };
         let request = PostPrResultRequest {
             action: "post-pr-result",

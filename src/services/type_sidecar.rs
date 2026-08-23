@@ -618,6 +618,96 @@ pub struct TypeResolutionResult {
 }
 
 // ============================================================================
+// V8 heap sizing
+// ============================================================================
+
+/// Env override for the sidecar's V8 old-space cap, in MB. `0` (or an
+/// unparseable value) means "do not pass the flag at all" — V8's own default.
+pub const MAX_OLD_SPACE_ENV: &str = "CARRICK_SIDECAR_MAX_OLD_SPACE_MB";
+
+/// Floor for the derived cap. Below this the sidecar cannot hold a
+/// mid-sized program's type graph, so a machine this small is better served
+/// failing loudly than being handed a cap that is worse than the default.
+const MIN_OLD_SPACE_MB: u64 = 2048;
+
+/// Ceiling for the derived cap. The sidecar is one of several processes in a
+/// scan (the Rust scanner, and `check_v2`'s spawned installer/compiler), so
+/// it never claims the whole machine.
+const MAX_OLD_SPACE_MB: u64 = 8192;
+
+/// Fraction of physical memory the sidecar's heap may claim.
+const OLD_SPACE_FRACTION_NUMERATOR: u64 = 3;
+const OLD_SPACE_FRACTION_DENOMINATOR: u64 = 4;
+
+/// The V8 old-space cap to hand the sidecar, in MB, given the machine's
+/// physical memory.
+///
+/// V8's default cap is a function of the host, not of the program being
+/// analysed: on a 64-bit machine it lands near 4 GB regardless of how large
+/// the TypeScript program is. A ~3k-file program exhausts it while the
+/// checker materialises types and the process dies with
+/// `FATAL ERROR: Ineffective mark-compacts near heap limit` (carrick#535),
+/// after which the scan continues with no types at all.
+///
+/// Deriving the cap from physical memory rather than hardcoding one keeps a
+/// small CI runner honest: letting V8 grow past the pages the machine can
+/// back trades a JS heap error for an OS OOM kill, which is a worse failure
+/// because it carries no diagnostic. `None` (memory unknown) falls back to
+/// the floor.
+fn old_space_cap_mb(total_memory_mb: Option<u64>) -> u64 {
+    let derived = total_memory_mb
+        .map(|total| total * OLD_SPACE_FRACTION_NUMERATOR / OLD_SPACE_FRACTION_DENOMINATOR)
+        .unwrap_or(MIN_OLD_SPACE_MB);
+    derived.clamp(MIN_OLD_SPACE_MB, MAX_OLD_SPACE_MB)
+}
+
+/// Physical memory in MB, or `None` when this platform's probe fails.
+///
+/// Deliberately dependency-free: one `/proc/meminfo` read on Linux (where CI
+/// runs) and one `sysctl` call on macOS (where it is developed).
+fn total_memory_mb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: u64 = meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix("MemTotal:"))?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        return Some(kb / 1024);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        let bytes: u64 = String::from_utf8(out.stdout).ok()?.trim().parse().ok()?;
+        return Some(bytes / (1024 * 1024));
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// The `--max-old-space-size` argument for this run, or `None` when the
+/// override disables it.
+fn max_old_space_arg() -> Option<String> {
+    match std::env::var(MAX_OLD_SPACE_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(mb) => Some(format!("--max-old-space-size={}", mb)),
+            Err(_) => None,
+        },
+        Err(_) => Some(format!(
+            "--max-old-space-size={}",
+            old_space_cap_mb(total_memory_mb())
+        )),
+    }
+}
+
+// ============================================================================
 // TypeSidecar Implementation
 // ============================================================================
 
@@ -676,8 +766,14 @@ impl TypeSidecar {
 
         debug!("[type_sidecar] Spawning sidecar from: {:?}", sidecar_path);
 
-        // Spawn the Node.js process
-        let mut child = Command::new("node")
+        // Spawn the Node.js process. V8 flags MUST precede the script path,
+        // or node passes them to the script instead of applying them.
+        let mut command = Command::new("node");
+        if let Some(heap_arg) = max_old_space_arg() {
+            debug!("[type_sidecar] Sidecar heap flag: {}", heap_arg);
+            command.arg(heap_arg);
+        }
+        let mut child = command
             .arg(sidecar_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1654,6 +1750,26 @@ impl std::error::Error for SidecarError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cap tracks the machine, with a floor and a ceiling. Without one,
+    /// V8's own default (~4 GB) killed the sidecar on a ~2.9k-file program
+    /// (carrick#535); without the other, a small runner would be handed a
+    /// heap it cannot back with real pages and get OOM-killed instead.
+    #[test]
+    fn old_space_cap_tracks_memory_between_floor_and_ceiling() {
+        // Three quarters of the machine, in the normal range.
+        assert_eq!(old_space_cap_mb(Some(8192)), 6144);
+        // A big machine is still capped: the sidecar shares it with the
+        // scanner and the compiler the check pass spawns.
+        assert_eq!(old_space_cap_mb(Some(65536)), MAX_OLD_SPACE_MB);
+        // A small runner never gets a cap below the floor...
+        assert_eq!(old_space_cap_mb(Some(1024)), MIN_OLD_SPACE_MB);
+        // ...and neither does a host whose memory could not be probed.
+        assert_eq!(old_space_cap_mb(None), MIN_OLD_SPACE_MB);
+        // A 16 GB CI runner (GitHub's current standard) lands at the ceiling
+        // while leaving half the machine to everything else.
+        assert_eq!(old_space_cap_mb(Some(16384)), 8192);
+    }
 
     #[test]
     fn test_infer_kind_serialization() {

@@ -4,7 +4,8 @@ use crate::agents::framework_guidance_agent::{FrameworkGuidanceAgent, ProtocolGu
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{
     CloudRepoData, CloudStorage, INLINE_PAYLOAD_LIMIT_BYTES, ManifestRole, ManifestTypeKind,
-    ManifestTypeState, TypeManifestEntry, get_current_commit_hash, mount_graph_to_api_details,
+    ManifestTypeState, TypeDegradation, TypeManifestEntry, get_current_commit_hash,
+    mount_graph_to_api_details,
 };
 use crate::config::Config;
 use crate::file_finder::find_service_files;
@@ -423,6 +424,13 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         Vec::new()
     };
 
+    // Type extraction is a per-service stage that can fail on its own (a dead
+    // sidecar, a program too large for its heap) while every other stage
+    // succeeds. Collected here, before the blobs move into the analyzer, so a
+    // run that lost its types says so in the report and the PR comment
+    // instead of looking clean (carrick#535).
+    let type_degradations = degraded_type_findings(&current_services_data);
+
     // Same reason as above: project what the SDK-edge join reads before the
     // blobs move into the analyzer. Its other input — the `CrossRepoMatch`
     // edges — only exists after the analysis runs, so the two halves cannot be
@@ -456,6 +464,11 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     logging::finish_spinner(&sp, "Cross-repo analysis complete");
 
     let mut results = analyzer.get_results();
+
+    // A degraded service means no type verdict for anything it owns, so the
+    // whole run's type layer is untrustworthy, not just that service's.
+    let has_types = type_degradations.is_empty();
+    results.findings.extend(type_degradations);
 
     // 6a. Resolve this run's SDK-mediated consumer edges: consumer candidate →
     //     the publishing repo's exported member → the producer endpoint that
@@ -559,6 +572,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
             libraries: results.detected_graphql_libraries.clone(),
             operations_indexed: results.graphql_operations_indexed,
         },
+        has_types,
     });
 
     let formatted = crate::formatter::FormattedOutput::new(results, topology, pr_delta);
@@ -2574,6 +2588,7 @@ fn build_cloud_data_from_mount_graph(
         package_json_hash: None,
         cache_version: None,
         type_extraction_status: None,
+        types_degraded: None,
         compat_verdicts: None,
         capture_stub: None,
         external_call_candidates: None,
@@ -2633,6 +2648,28 @@ fn scope_sidecar_to_service(sidecar: Option<&TypeSidecar>, repo_path: &str, serv
     }
 }
 
+/// One finding per service whose type extraction failed, so the loss is
+/// reported rather than logged (carrick#535). Services that resolved types
+/// normally — including ones with per-symbol failures, which are not a
+/// whole-service degradation — contribute nothing.
+fn degraded_type_findings(services: &[CloudRepoData]) -> Vec<crate::findings::Finding> {
+    services
+        .iter()
+        .filter_map(|data| {
+            let degraded = data.types_degraded.as_ref()?;
+            let service = data
+                .service_name
+                .clone()
+                .unwrap_or_else(|| data.repo_name.clone());
+            Some(crate::findings::Finding::degraded_types(
+                service,
+                degraded.stage.clone(),
+                &degraded.detail,
+            ))
+        })
+        .collect()
+}
+
 /// Resolve types via sidecar if available (shared logic for full and incremental paths).
 #[allow(clippy::too_many_arguments)]
 /// Resolve types through the sidecar and run the v2 capture for this
@@ -2651,11 +2688,14 @@ fn resolve_types_if_available(
     cloud_data: &mut CloudRepoData,
 ) -> Option<PathBuf> {
     let Some(sidecar) = sidecar else {
-        cloud_data.type_extraction_status = Some(
-            "type extraction skipped: sidecar unavailable (not found, failed to start, \
-             or failed to initialize)"
-                .to_string(),
-        );
+        let detail = "sidecar unavailable (not found, failed to start, or failed to \
+                      initialize)"
+            .to_string();
+        cloud_data.type_extraction_status = Some(format!("type extraction skipped: {}", detail));
+        cloud_data.types_degraded = Some(TypeDegradation {
+            stage: "spawn".to_string(),
+            detail,
+        });
         return None;
     };
 
@@ -2729,6 +2769,10 @@ fn resolve_types_if_available(
                     debug!("Continuing without bundled types");
                     cloud_data.type_extraction_status =
                         Some(format!("type resolution failed: {}", e));
+                    cloud_data.types_degraded = Some(TypeDegradation {
+                        stage: "resolve".to_string(),
+                        detail: e.to_string(),
+                    });
                     None
                 }
             }
@@ -2738,6 +2782,10 @@ fn resolve_types_if_available(
             debug!("Skipping type resolution");
             cloud_data.type_extraction_status =
                 Some(format!("type extraction skipped: sidecar not ready: {}", e));
+            cloud_data.types_degraded = Some(TypeDegradation {
+                stage: "init".to_string(),
+                detail: e.to_string(),
+            });
             None
         }
     }
@@ -2807,12 +2855,35 @@ fn run_capture_for_service(
             Some(stub_dir)
         }
         None => {
-            if cloud_data.type_extraction_status.is_none() {
-                cloud_data.type_extraction_status = Some(
-                    "v2 type capture degraded: no stub package was produced; cross-repo \
-                     type compatibility for this service will report unverifiable"
-                        .to_string(),
-                );
+            // A capture degrades benignly when this service simply emitted no
+            // usable stub. A capture that degraded because the sidecar is no
+            // longer running is a different event: everything downstream of it
+            // loses its types too. Probing separates the two — the capture call
+            // itself only reports "no stub".
+            match sidecar.health_check() {
+                Ok(_) => {
+                    if cloud_data.type_extraction_status.is_none() {
+                        cloud_data.type_extraction_status = Some(
+                            "v2 type capture degraded: no stub package was produced; cross-repo \
+                             type compatibility for this service will report unverifiable"
+                                .to_string(),
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Type capture failed and the sidecar is not responding: {}",
+                        e
+                    );
+                    cloud_data.type_extraction_status = Some(format!(
+                        "type capture failed: the type sidecar is no longer running ({})",
+                        e
+                    ));
+                    cloud_data.types_degraded = Some(TypeDegradation {
+                        stage: "capture".to_string(),
+                        detail: e.to_string(),
+                    });
+                }
             }
             None
         }
@@ -3756,6 +3827,67 @@ mod tests {
     use super::*;
     use crate::analyzer::ApiEndpointDetails;
 
+    /// A blank service payload, named, with nothing resolved.
+    fn service_data(repo: &str, service: Option<&str>) -> CloudRepoData {
+        CloudRepoData {
+            repo_name: repo.to_string(),
+            service_name: service.map(str::to_string),
+            endpoints: vec![],
+            calls: vec![],
+            mounts: vec![],
+            apps: HashMap::new(),
+            imported_handlers: vec![],
+            function_definitions: HashMap::new(),
+            config_json: None,
+            package_json: None,
+            packages: None,
+            last_updated: chrono::Utc::now(),
+            commit_hash: String::new(),
+            mount_graph: None,
+            bundled_types: None,
+            type_manifest: None,
+            file_results: None,
+            cached_detection: None,
+            cached_guidance: None,
+            cached_extraction_config: None,
+            package_json_hash: None,
+            cache_version: None,
+            type_extraction_status: None,
+            types_degraded: None,
+            compat_verdicts: None,
+            capture_stub: None,
+            external_call_candidates: None,
+            sdk_surface: None,
+            sdk_edges: None,
+            sdk_unresolved: None,
+        }
+    }
+
+    /// Only a service that actually lost its types produces a finding, and it
+    /// is named by the service, not the repo, so a monorepo says which one
+    /// (carrick#535).
+    #[test]
+    fn degraded_type_findings_name_the_service_that_lost_types() {
+        let mut degraded = service_data("api-server", Some("orders"));
+        degraded.types_degraded = Some(TypeDegradation {
+            stage: "resolve".to_string(),
+            detail: "I/O error: Broken pipe (os error 32)".to_string(),
+        });
+        let healthy = service_data("api-server", Some("billing"));
+
+        let findings = degraded_type_findings(&[degraded, healthy]);
+
+        assert_eq!(
+            findings,
+            vec![crate::findings::Finding::degraded_types(
+                "orders",
+                "resolve",
+                "I/O error: Broken pipe (os error 32)"
+            )]
+        );
+        assert!(degraded_type_findings(&[service_data("api-server", None)]).is_empty());
+    }
+
     #[test]
     fn service_scan_root_joins_declared_directory() {
         let flat = Config::default();
@@ -4031,6 +4163,7 @@ mod tests {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            types_degraded: None,
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: Some(vec![ExternalCallCandidate {
@@ -4175,6 +4308,7 @@ mod tests {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            types_degraded: None,
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
@@ -4221,6 +4355,7 @@ mod tests {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            types_degraded: None,
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
@@ -4304,6 +4439,7 @@ mod tests {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            types_degraded: None,
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
@@ -4905,6 +5041,7 @@ mod tests {
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
+            types_degraded: None,
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
@@ -4956,6 +5093,7 @@ mod tests {
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
+            types_degraded: None,
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
@@ -5018,6 +5156,7 @@ mod tests {
                 package_json_hash: None,
                 cache_version: Some(CACHE_VERSION),
                 type_extraction_status: None,
+                types_degraded: None,
                 compat_verdicts: None,
                 capture_stub: None,
                 external_call_candidates: None,
@@ -5091,6 +5230,7 @@ mod tests {
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
+            types_degraded: None,
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
@@ -5306,6 +5446,7 @@ mod tests {
             package_json_hash: Some("abc123hash".to_string()),
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
+            types_degraded: None,
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
@@ -5376,6 +5517,7 @@ mod tests {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            types_degraded: None,
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
@@ -5473,6 +5615,7 @@ mod tests {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            types_degraded: None,
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
@@ -5578,6 +5721,7 @@ mod tests {
             package_json_hash: None,
             cache_version: Some(CACHE_VERSION),
             type_extraction_status: None,
+            types_degraded: None,
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
@@ -7888,6 +8032,7 @@ mod tests {
             package_json_hash: None,
             cache_version: None,
             type_extraction_status: None,
+            types_degraded: None,
             compat_verdicts: None,
             capture_stub: None,
             external_call_candidates: None,
