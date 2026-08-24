@@ -41,7 +41,9 @@ use crate::{
         ExtractionConfig, InferKind, InferRequestItem, SymbolRequest, TypeResolutionResult,
         TypeSidecar,
     },
-    swc_scanner::{CandidateTarget, PubsubAnchorOp, RouteDescriptorEndpoint, SwcScanner},
+    swc_scanner::{
+        CandidateTarget, PubsubAnchorOp, RouteDescriptorEndpoint, SwcScanner, normalize_path_params,
+    },
     type_manifest::{
         build_call_site_id, build_manifest_type_alias, build_manifest_type_alias_with_call_id,
         is_http_method, normalize_manifest_method, parse_file_location,
@@ -116,6 +118,11 @@ pub struct ProcessingStats {
     /// a topic from a wrapper-function NAME (`publishStatusChanged` ->
     /// `status.changed`); the real op lives in the file that holds the literal.
     pub pubsub_phantom_topic_drops: usize,
+    /// Outbound calls asserted deterministically from a verb-named request
+    /// spec (`client.post({ url: "/v1/things" })`) and merged in because the
+    /// file-analyzer's extraction omitted them (#529). A subset of
+    /// `total_data_calls`.
+    pub request_spec_call_backfills: usize,
     /// Wrapper-resolved data calls whose HTTP method was corrected from what
     /// extraction gave them to the method their wrapper module hardcodes
     /// (carrick-cloud#386). A subset of `total_data_calls`.
@@ -1310,6 +1317,14 @@ impl FileOrchestrator {
                     stats.pubsub_anchor_backfills +=
                         Self::merge_pubsub_anchor_ops(&mut adjusted, pf.pubsub_anchor_ops);
 
+                    // Merge the outbound calls a verb-named request spec states
+                    // outright (`client.post({ url: "/v1/things" })`) and the
+                    // extraction did not report (#529). Runs after
+                    // `apply_candidate_map` so the coverage check reads the
+                    // model's calls already re-anchored to their spec.
+                    stats.request_spec_call_backfills +=
+                        Self::merge_request_spec_calls(&mut adjusted, &pf.candidate_map);
+
                     stats.total_mounts += adjusted.mounts.len();
                     stats.total_endpoints += adjusted.endpoints.len();
                     stats.total_data_calls += adjusted.data_calls.len();
@@ -1349,6 +1364,10 @@ impl FileOrchestrator {
             stats.route_descriptor_endpoints
         );
         debug!("  - Total data calls: {}", stats.total_data_calls);
+        debug!(
+            "  - Request-spec call backfills: {}",
+            stats.request_spec_call_backfills
+        );
         debug!(
             "  - Wrapper method propagations: {}",
             stats.wrapper_method_propagations
@@ -3592,14 +3611,14 @@ impl FileOrchestrator {
             data_call.method = Some(spec.method.clone());
         }
 
-        let target = data_call.target.trim();
-        let carries_spec_url = match target.strip_suffix(spec.url.as_str()) {
-            // The whole target IS the literal, or the literal is the tail of a
-            // longer target that ends at a segment boundary.
-            Some(prefix) => prefix.is_empty() || !prefix.ends_with('/'),
-            None => false,
-        };
-        if carries_spec_url {
+        // Both sides in the router spelling before they are compared: the spec
+        // url already is, and a model that copied an OpenAPI-style `{param}`
+        // out of the source is stating the same path (#529).
+        let target = normalize_path_params(data_call.target.trim());
+        if Self::target_carries_url(&target, &spec.url) {
+            if target != data_call.target {
+                data_call.target = target;
+            }
             return;
         }
 
@@ -3608,6 +3627,111 @@ impl FileOrchestrator {
             data_call.target, spec.url, file_path, candidate.line_number
         );
         data_call.target = spec.url.clone();
+    }
+
+    /// Does `target` already state `url` — either as the whole target, or as
+    /// its tail behind a base (`${API_URL}/v1/things`)? The tail must start at
+    /// a segment boundary, so `/things` does not "carry" `/other-things`.
+    /// Both arguments are expected in the router param spelling.
+    fn target_carries_url(target: &str, url: &str) -> bool {
+        match target.trim().strip_suffix(url) {
+            Some(prefix) => prefix.is_empty() || !prefix.ends_with('/'),
+            None => false,
+        }
+    }
+
+    /// Emit the outbound calls a verb-named request spec states outright, for
+    /// the call sites the file analyzer returned nothing for (#529).
+    ///
+    /// `client.post({ url: "/v1/sessions/{sessionId}/release" })` is how a
+    /// generated OpenAPI client issues an operation, and the method and path
+    /// are both AST facts there — the same standing as a route descriptor's
+    /// `{ method, path }`, which is merged deterministically by #234. When
+    /// extraction misses such a file (a generated client is hundreds of
+    /// near-identical wrappers, and the analyzer routinely returns none of
+    /// them), the consumer side of every one of those operations is lost and
+    /// the producer's endpoints are reported orphaned — the index asserting no
+    /// consumer where one exists.
+    ///
+    /// Only `method_from_callee` specs qualify; see [`RequestSpec`] for why
+    /// the `{ method, url }` object form stays the analyzer's to classify.
+    /// A spec whose site the analyzer DID answer is left alone, and so is one
+    /// whose (method, url) another call in the file already carries — a target
+    /// behind a base URL included, since the base is the one thing the
+    /// analyzer knows and this backfill does not.
+    fn merge_request_spec_calls(
+        result: &mut FileAnalysisResult,
+        candidate_map: &HashMap<String, CandidateTarget>,
+    ) -> usize {
+        let mut specs: Vec<&CandidateTarget> = candidate_map
+            .values()
+            .filter(|candidate| {
+                candidate
+                    .request_spec
+                    .as_ref()
+                    .is_some_and(|spec| spec.method_from_callee)
+            })
+            .collect();
+        // The map iterates in hash order; emit in source order so a scan of the
+        // same file always produces the same rows.
+        specs.sort_by_key(|candidate| candidate.span_start);
+
+        let mut added = 0;
+        for candidate in specs {
+            let Some(spec) = candidate.request_spec.as_ref() else {
+                continue;
+            };
+            let covered = result.data_calls.iter().any(|data_call| {
+                data_call.candidate_id == candidate.candidate_id
+                    || (data_call
+                        .method
+                        .as_deref()
+                        .map(|method| method.trim().to_uppercase())
+                        .as_deref()
+                        == Some(spec.method.as_str())
+                        && Self::target_carries_url(
+                            &normalize_path_params(&data_call.target),
+                            &spec.url,
+                        ))
+            });
+            if covered {
+                continue;
+            }
+            debug!(
+                "Backfilling outbound call the extraction missed: {} {} at line {}",
+                spec.method, spec.url, candidate.line_number
+            );
+            result.data_calls.push(DataCallResult {
+                candidate_id: candidate.candidate_id.clone(),
+                line_number: i32::try_from(candidate.line_number).unwrap_or(i32::MAX),
+                target: spec.url.clone(),
+                method: Some(spec.method.clone()),
+                // Classification is judgment, not an AST fact: the URL is a
+                // bare path with no host to classify from.
+                call_kind: None,
+                pattern_matched: if candidate.callee_object.starts_with('<') {
+                    // The receiver is an expression, not a name (the
+                    // `(options?.client ?? client)` shape).
+                    "http-client".to_string()
+                } else {
+                    candidate.callee_object.clone()
+                },
+                // The span is what the type sidecar anchors on, and it is also
+                // what marks this call candidate-backed downstream.
+                call_expression_span_start: Some(candidate.span_start),
+                call_expression_span_end: Some(candidate.span_end),
+                call_expression_text: None,
+                call_expression_line: Some(
+                    i32::try_from(candidate.line_number).unwrap_or(i32::MAX),
+                ),
+                payload_expression_text: None,
+                payload_expression_line: None,
+                primary_type_symbol: None,
+                type_import_source: None,
+            });
+            added += 1;
+        }
+        added
     }
 
     /// Extract the route path from a candidate's first-arg source snippet when
@@ -9145,7 +9269,20 @@ export { routes };
         candidate.request_spec = Some(crate::swc_scanner::RequestSpec {
             method: method.to_string(),
             url: url.to_string(),
+            method_from_callee: false,
         });
+        candidate
+    }
+
+    /// The #529 form: the verb is the member being invoked, so the spec is one
+    /// the backfill may emit on its own.
+    fn verb_call_candidate(id: &str, method: &str, url: &str) -> CandidateTarget {
+        let mut candidate = request_spec_candidate(id, method, url);
+        candidate.callee_object = "client".to_string();
+        candidate.callee_property = Some(method.to_ascii_lowercase());
+        if let Some(spec) = candidate.request_spec.as_mut() {
+            spec.method_from_callee = true;
+        }
         candidate
     }
 
@@ -9247,6 +9384,128 @@ export { routes };
 
         assert_eq!(result.data_calls[0].target, "${API_URL}/things");
         assert_eq!(result.data_calls[0].method.as_deref(), Some("GET"));
+    }
+
+    /// #529: a generated OpenAPI client is hundreds of near-identical
+    /// wrappers, and extraction routinely returns none of them. The method and
+    /// the path are AST facts at every one of those sites, so the operations
+    /// are emitted deterministically rather than lost — otherwise the producer
+    /// reports its endpoints orphaned while a consumer in the index calls them.
+    #[test]
+    fn merge_request_spec_calls_backfills_operations_extraction_missed() {
+        let mut result = FileAnalysisResult::default();
+        let mut candidate_map = HashMap::new();
+        let mut release = verb_call_candidate("c1", "POST", "/v1/sessions/:sessionId/release");
+        release.span_start = 400;
+        let mut list = verb_call_candidate("c2", "GET", "/v1/sessions");
+        list.span_start = 100;
+        candidate_map.insert("c1".to_string(), release);
+        candidate_map.insert("c2".to_string(), list);
+
+        let added = FileOrchestrator::merge_request_spec_calls(&mut result, &candidate_map);
+
+        assert_eq!(added, 2);
+        // Source order, not hash order: the same file must produce the same
+        // rows on every scan.
+        let emitted: Vec<(&str, Option<&str>)> = result
+            .data_calls
+            .iter()
+            .map(|call| (call.target.as_str(), call.method.as_deref()))
+            .collect();
+        assert_eq!(
+            emitted,
+            vec![
+                ("/v1/sessions", Some("GET")),
+                ("/v1/sessions/:sessionId/release", Some("POST")),
+            ]
+        );
+        // The span makes the backfilled call candidate-backed downstream and is
+        // what the type sidecar anchors on.
+        assert_eq!(result.data_calls[0].call_expression_span_start, Some(100));
+        assert_eq!(result.data_calls[0].call_expression_span_end, Some(140));
+        assert_eq!(result.data_calls[0].line_number, 12);
+    }
+
+    /// The backfill never duplicates an operation the analyzer did report —
+    /// neither at the same site, nor as the same (method, path) behind the base
+    /// URL the analyzer resolved and this pass cannot see.
+    #[test]
+    fn merge_request_spec_calls_skips_operations_already_extracted() {
+        let mut result = FileAnalysisResult {
+            data_calls: vec![
+                data_call_with("c1", "/v1/sessions/:sessionId/release", Some("POST")),
+                data_call_with("other", "${API_URL}/v1/sessions", Some("GET")),
+            ],
+            ..Default::default()
+        };
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert(
+            "c1".to_string(),
+            verb_call_candidate("c1", "POST", "/v1/sessions/:sessionId/release"),
+        );
+        // Same operation, reported against another candidate id with the base
+        // in front of it.
+        candidate_map.insert(
+            "c2".to_string(),
+            verb_call_candidate("c2", "GET", "/v1/sessions"),
+        );
+        // A different operation on the same path prefix must still be emitted.
+        candidate_map.insert(
+            "c3".to_string(),
+            verb_call_candidate("c3", "DELETE", "/v1/sessions"),
+        );
+
+        let added = FileOrchestrator::merge_request_spec_calls(&mut result, &candidate_map);
+
+        assert_eq!(added, 1);
+        assert_eq!(result.data_calls.len(), 3);
+        assert_eq!(result.data_calls[2].target, "/v1/sessions");
+        assert_eq!(result.data_calls[2].method.as_deref(), Some("DELETE"));
+    }
+
+    /// A `{ method, url }` object states a request and a route registration
+    /// identically, so only the verb-named form — where the verb is the
+    /// operation being performed — is emitted without the analyzer. The config
+    /// form keeps its #537 anchoring role and nothing more.
+    #[test]
+    fn merge_request_spec_calls_ignores_config_object_specs() {
+        let mut result = FileAnalysisResult::default();
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert(
+            "c1".to_string(),
+            request_spec_candidate("c1", "GET", "/v1/health"),
+        );
+
+        let added = FileOrchestrator::merge_request_spec_calls(&mut result, &candidate_map);
+
+        assert_eq!(added, 0);
+        assert!(result.data_calls.is_empty());
+    }
+
+    /// An OpenAPI-style path the model copied verbatim states the same route as
+    /// the spec, so it is normalized in place rather than stripped of the base.
+    #[test]
+    fn request_spec_normalizes_a_target_written_with_openapi_params() {
+        let mut result = FileAnalysisResult {
+            data_calls: vec![data_call_with(
+                "c1",
+                "${API_URL}/v1/sessions/{sessionId}/release",
+                Some("POST"),
+            )],
+            ..Default::default()
+        };
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert(
+            "c1".to_string(),
+            verb_call_candidate("c1", "POST", "/v1/sessions/:sessionId/release"),
+        );
+
+        FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "src/client.ts");
+
+        assert_eq!(
+            result.data_calls[0].target,
+            "${API_URL}/v1/sessions/:sessionId/release"
+        );
     }
 
     /// `collect_pubsub_type_requests` walks a `HashMap<String, _>`, whose

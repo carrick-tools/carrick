@@ -86,10 +86,53 @@ pub struct CandidateTarget {
 /// named anywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestSpec {
-    /// The `method` literal, upper-cased and known to be an HTTP verb.
+    /// The HTTP verb, upper-cased. Read from the object's `method` literal, or
+    /// from the invoked member name when the object carries only a `url` (see
+    /// `method_from_callee`).
     pub method: String,
-    /// The `url` (or `path`) literal, verbatim.
+    /// The `url` (or `path`) literal, with OpenAPI-style `{param}` segments
+    /// rewritten to the router spelling `:param` (see
+    /// [`normalize_path_params`]).
     pub url: String,
+    /// True when the verb came from the invoked member name
+    /// (`client.post({ url: "/v1/things" })`) rather than a `method` property.
+    ///
+    /// That form is unambiguously a REQUEST: the verb is the operation being
+    /// performed, and `url` is the request-side spelling of the target (a
+    /// declarative route registration spells it `path` and carries a handler).
+    /// The consumer backfill emits only this form deterministically; a
+    /// `{ method, url }` object alone can equally be a producer's route
+    /// descriptor, so it stays an anchor for the analyzer's answer.
+    pub method_from_callee: bool,
+}
+
+/// Rewrite OpenAPI-style path parameters (`/v1/sessions/{sessionId}/release`)
+/// to the router spelling the rest of Carrick keys on (`/v1/sessions/:sessionId/release`),
+/// so a call written in the OpenAPI spelling joins the producer route that
+/// declares the same path.
+///
+/// Whole segments only: `${BASE}` and `foo{bar}baz` are left alone, so a
+/// target that interpolates an env-var base survives untouched.
+pub fn normalize_path_params(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for (i, segment) in path.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        let inner = segment
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .map(str::trim)
+            .filter(|inner| !inner.is_empty() && !inner.contains(['{', '}']));
+        match inner {
+            Some(inner) => {
+                out.push(':');
+                out.push_str(inner);
+            }
+            None => out.push_str(segment),
+        }
+    }
+    out
 }
 
 impl CandidateTarget {
@@ -1182,8 +1225,10 @@ impl CandidateVisitor {
 
     /// The request spec of a call that declares its method and URL as data on
     /// its first argument (`client({ method: "post", url: "/api/v1/login" })`,
-    /// `axios({ ... })`, `client.request({ ... })`). `None` for every other
-    /// call shape.
+    /// `axios({ ... })`, `client.request({ ... })`), or that names its method
+    /// as the member it invokes and carries the URL on that object
+    /// (`client.post({ url: "/v1/things" })`, see
+    /// [`Self::verb_call_request_spec`]). `None` for every other call shape.
     ///
     /// This is the config-object form of an outbound HTTP call, and nothing in
     /// the candidate layer could see it before (#537): no argument is a
@@ -1206,7 +1251,83 @@ impl CandidateVisitor {
         let Expr::Object(obj) = &*arg.expr else {
             return None;
         };
-        Self::request_spec(obj)
+        if let Some(spec) = Self::request_spec(obj) {
+            return Some(spec);
+        }
+        // The verb-named form: the method is the member being invoked and the
+        // object carries only the URL (#529).
+        let Callee::Expr(callee) = &call.callee else {
+            return None;
+        };
+        let verb = Self::callee_member_prop(callee)?;
+        Self::verb_call_request_spec(&verb, obj)
+    }
+
+    /// The request spec of `client.post({ url: "/v1/things" })` — a verb-named
+    /// method on a receiver, handed one object literal that carries the URL.
+    /// This is how generated OpenAPI clients issue every operation, and until
+    /// #529 nothing saw them: the object is the only argument, so no string
+    /// argument exists for the URL-scheme or stringish signals to read, and
+    /// the receiver is routinely an expression (`(options?.client ?? client)`)
+    /// rather than a name the receiver heuristics recognise.
+    ///
+    /// Three structural guards keep this off producer-side route
+    /// registrations, which are the one other thing that puts a route literal
+    /// on an object argument of a verb-named method:
+    ///
+    /// - the URL key must be `url`, the request-side spelling — a declarative
+    ///   route spells it `path` (and #241 pins that a `{ method, path }`
+    ///   object is never a deterministic route by itself);
+    /// - the object may carry no `handler` property and no function value —
+    ///   both are the registration side declaring what answers the route,
+    ///   which a request has no use for;
+    /// - the URL must be route-shaped, so an options bag whose `url` holds a
+    ///   bare token is not a request.
+    ///
+    /// Structural throughout: the shape is the whole signal and no client
+    /// library, generator, or framework is named.
+    fn verb_call_request_spec(verb: &str, obj: &ObjectLit) -> Option<RequestSpec> {
+        if !crate::type_manifest::is_http_method(verb) {
+            return None;
+        }
+
+        let mut url = None;
+        for prop in &obj.props {
+            // A spread (`{ ...options, url: "/x" }`) carries no key to read and
+            // no handler to fear; the generated clients all pass one.
+            let PropOrSpread::Prop(prop) = prop else {
+                continue;
+            };
+            let Prop::KeyValue(kv) = &**prop else {
+                continue;
+            };
+            if matches!(&*kv.value, Expr::Arrow(_) | Expr::Fn(_)) {
+                return None;
+            }
+            let key = match &kv.key {
+                PropName::Ident(id) => id.sym.to_string(),
+                PropName::Str(s) => s.value.to_string(),
+                _ => continue,
+            };
+            if key == "handler" {
+                return None;
+            }
+            if key == "url"
+                && let Expr::Lit(Lit::Str(value)) = &*kv.value
+            {
+                url = Some(value.value.to_string());
+            }
+        }
+
+        let url = url?;
+        if !RouteDescriptorVisitor::is_route_shaped_path(&url) {
+            return None;
+        }
+        Some(RequestSpec {
+            method: verb.trim().to_uppercase(),
+            url: normalize_path_params(&url),
+            method_from_callee: true,
+        })
     }
 
     /// The `{ method, url }` pair of an object literal, when both are string
@@ -1257,7 +1378,8 @@ impl CandidateVisitor {
         }
         Some(RequestSpec {
             method: method.trim().to_uppercase(),
-            url,
+            url: normalize_path_params(&url),
+            method_from_callee: false,
         })
     }
 
@@ -2744,6 +2866,126 @@ export function register(server) {
         let spec = candidate.request_spec.as_ref().expect("checked above");
         assert_eq!((spec.method.as_str(), spec.url.as_str()), ("GET", "/*"));
         assert_eq!(candidate.path_snippet.as_deref(), Some("'/*'"));
+    }
+
+    /// #529: a generated OpenAPI client issues every operation as a verb-named
+    /// method handed one object that carries the URL, on a receiver that is an
+    /// expression rather than a name. No argument is a string and the callee
+    /// heuristics have nothing to read, so before this the call raised no
+    /// candidate carrying its path and the operation never reached the index.
+    #[test]
+    fn verb_named_object_call_yields_a_candidate_carrying_method_and_url() {
+        let content = r#"
+export const releaseSession = <ThrowOnError extends boolean = false>(options?: Options) => {
+  return (options?.client ?? client).post<ReleaseResponse, ReleaseError, ThrowOnError>({
+    ...options,
+    url: "/v1/sessions/{sessionId}/release",
+  });
+};
+"#;
+        let result = scan_test_content(content);
+        let candidate = result
+            .candidates
+            .iter()
+            .find(|c| c.request_spec.is_some())
+            .unwrap_or_else(|| {
+                panic!(
+                    "verb-named object call must raise a candidate: {:#?}",
+                    result.candidates
+                )
+            });
+
+        let spec = candidate.request_spec.as_ref().expect("checked above");
+        assert_eq!(spec.method, "POST");
+        // OpenAPI `{param}` placeholders arrive in the router spelling so the
+        // call joins the route the producer declares.
+        assert_eq!(spec.url, "/v1/sessions/:sessionId/release");
+        assert!(spec.method_from_callee);
+        // The hint must show the URL, not the object's opening brace.
+        assert_eq!(
+            candidate.path_snippet.as_deref(),
+            Some("'/v1/sessions/:sessionId/release'")
+        );
+    }
+
+    /// The same shape on a plainly named receiver, with and without the
+    /// leading spread. Structural, so the callee spelling is irrelevant.
+    #[test]
+    fn verb_named_object_call_is_recognised_whatever_the_callee_is() {
+        let content = r#"
+export async function run() {
+  await client.get({ ...options, url: "/v1/sessions" });
+  await sdk.http.delete({ url: "/v1/sessions/{sessionId}" });
+}
+"#;
+        let result = scan_test_content(content);
+        let mut seen: Vec<(String, String)> = result
+            .candidates
+            .iter()
+            .filter_map(|c| {
+                c.request_spec
+                    .as_ref()
+                    .map(|s| (s.method.clone(), s.url.clone()))
+            })
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("DELETE".to_string(), "/v1/sessions/:sessionId".to_string()),
+                ("GET".to_string(), "/v1/sessions".to_string()),
+            ]
+        );
+    }
+
+    /// The guards that keep the verb-named form off route registrations and
+    /// ordinary options bags.
+    #[test]
+    fn non_request_verb_named_object_calls_carry_no_spec() {
+        let cases = [
+            // `path`, not `url`: the declarative route-registration spelling.
+            r#"await router.get({ path: "/v1/things", handler: onThings });"#,
+            // Carries a handler, so it registers a route rather than issuing one.
+            r#"await api.get({ url: "/v1/things", handler: onThings });"#,
+            r#"await api.get({ url: "/v1/things", onError: (e) => log(e) });"#,
+            // The member is not an HTTP verb.
+            r#"await queue.send({ url: "/v1/things" });"#,
+            // `url` is a bare token, not a route.
+            r#"await client.post({ url: "queue-name" });"#,
+            // Shorthand property: no literal to read.
+            r#"await client.post({ url });"#,
+            // Template literal, so no unambiguous literal to anchor.
+            r#"await client.post({ url: `${base}/things` });"#,
+        ];
+        for case in cases {
+            let content = format!("export async function run() {{ {case} }}");
+            let result = scan_test_content(&content);
+            assert!(
+                result.candidates.iter().all(|c| c.request_spec.is_none()),
+                "must carry no request spec: {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_path_params_rewrites_whole_segments_only() {
+        assert_eq!(
+            normalize_path_params("/v1/sessions/{sessionId}/release"),
+            "/v1/sessions/:sessionId/release"
+        );
+        // Already in the router spelling, and idempotent.
+        assert_eq!(
+            normalize_path_params("/v1/sessions/:id"),
+            "/v1/sessions/:id"
+        );
+        // An interpolated base is not a path param.
+        assert_eq!(
+            normalize_path_params("${API_URL}/v1/sessions/{id}"),
+            "${API_URL}/v1/sessions/:id"
+        );
+        // Partial-segment braces are left alone.
+        assert_eq!(normalize_path_params("/v1/a{b}c"), "/v1/a{b}c");
+        assert_eq!(normalize_path_params("/v1/{}"), "/v1/{}");
     }
 
     #[test]
