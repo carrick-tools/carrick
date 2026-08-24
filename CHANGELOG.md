@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.16](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.15...carrick-v0.3.16) (2026-08-24)
+
+
+### Bug Fixes
+
+* extract outbound calls written as verb-named object requests ([#560](https://github.com/carrick-tools/carrick/issues/560)) ([9bb924b](https://github.com/carrick-tools/carrick/commit/9bb924bc4713e8e4b9f31b6ac9ff3f93addf438f)), closes [#529](https://github.com/carrick-tools/carrick/issues/529)
+
 ## [0.3.15](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.14...carrick-v0.3.15) (2026-08-23)
 
 
