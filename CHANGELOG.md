@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.17](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.16...carrick-v0.3.17) (2026-08-26)
+
+
+### Features
+
+* **scanner:** keep the raw dependency spec alongside the cleaned version ([#567](https://github.com/carrick-tools/carrick/issues/567)) ([d2e555a](https://github.com/carrick-tools/carrick/commit/d2e555a9ac287638710a66ba6cf9939a24b126f9))
+
+
+### Bug Fixes
+
+* **scanner:** read a service's package.json from its root, not the last one walked ([#569](https://github.com/carrick-tools/carrick/issues/569)) ([03c7d6b](https://github.com/carrick-tools/carrick/commit/03c7d6b258fcfe2924dcd331461df1f95ce9f3e1))
+
 ## [0.3.16](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.15...carrick-v0.3.16) (2026-08-24)
 
 
