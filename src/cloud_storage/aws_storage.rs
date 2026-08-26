@@ -1,4 +1,4 @@
-use crate::cloud_storage::{CloudRepoData, CloudStorage, StorageError};
+use crate::cloud_storage::{CloudRepoData, CloudStorage, StorageError, UploadOutcome};
 use crate::oidc::OidcProvider;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -195,12 +195,18 @@ struct PostPrResultRequest<'a> {
     payload: &'a crate::findings::PrResultPayload,
 }
 
-#[derive(Deserialize)]
-struct StoreMetadataResponse {
-    #[allow(dead_code)]
-    success: bool,
-    #[allow(dead_code)]
-    message: String,
+/// The 200 body of either write action (`store-metadata` / `complete-upload`).
+/// Both also return `success` / `message` (and complete-upload an `s3Url` +
+/// `metadata`), none of which the scanner reads — only whether the cloud
+/// short-circuited. Every field is defaulted so a body that omits any of them
+/// still parses.
+#[derive(Deserialize, Default)]
+struct WriteActionResponse {
+    /// True when the cloud found a stored row already carrying this commit
+    /// hash AND this scanner version, so it skipped re-indexing. Absent on
+    /// clouds deployed before the check existed, which reads as "it indexed".
+    #[serde(default)]
+    already_current: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -447,7 +453,7 @@ impl AwsStorage {
         data: &CloudRepoData,
         s3_url: &str,
         staged: Option<&StagedPayload>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<UploadOutcome, StorageError> {
         let request = LambdaRequest {
             action: "store-metadata".to_string(),
             repo: data.repo_name.clone(),
@@ -462,10 +468,12 @@ impl AwsStorage {
             payload_size: staged.map(|s| s.size),
         };
 
-        let _response: StoreMetadataResponse = self.call_lambda(&request).await?;
+        let response: WriteActionResponse = self.call_lambda(&request).await?;
         debug!("Successfully stored metadata for {}", data.repo_name);
 
-        Ok(())
+        Ok(UploadOutcome {
+            already_current: response.already_current.unwrap_or(false),
+        })
     }
 
     /// Stage an oversized serialized CloudRepoData to the presigned URL from
@@ -500,7 +508,7 @@ impl AwsStorage {
 
 #[async_trait]
 impl CloudStorage for AwsStorage {
-    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<(), StorageError> {
+    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<UploadOutcome, StorageError> {
         let repo = &data.repo_name;
 
         // Payload staging decision (carrick#486): measure the serialized
@@ -563,24 +571,25 @@ impl CloudStorage for AwsStorage {
                     payload_size: staged.as_ref().map(|s| s.size),
                 };
 
-                let _complete_response: serde_json::Value =
+                let complete_response: WriteActionResponse =
                     self.call_lambda(&complete_request).await?;
                 debug!("Successfully completed upload and stored metadata");
+                Ok(UploadOutcome {
+                    already_current: complete_response.already_current.unwrap_or(false),
+                })
             } else {
                 debug!(
                     "No bundled types available for {}; storing metadata only",
                     repo
                 );
                 self.store_repo_metadata(data, &lambda_response.s3_url, staged.as_ref())
-                    .await?;
+                    .await
             }
         } else {
             debug!("Type file already exists, just updating metadata");
             self.store_repo_metadata(data, &lambda_response.s3_url, staged.as_ref())
-                .await?;
+                .await
         }
-
-        Ok(())
     }
 
     async fn upload_type_file(
@@ -667,6 +676,7 @@ impl CloudStorage for AwsStorage {
                     sdk_surface: None,
                     sdk_edges: None,
                     sdk_unresolved: None,
+                    scanner_version: None,
                 };
                 repo_s3_urls.insert(adjacent.repo.clone(), adjacent.s3_url);
                 all_repo_data.push(repo_data);
@@ -871,6 +881,41 @@ mod tests {
     /// the cloud reads, and are omitted on every request that does not stage —
     /// the inline body is itself the authenticated payload, so there is no
     /// second hop to verify.
+    /// Both write actions answer 200 either way, so `already_current` is the
+    /// only thing separating "the cloud re-indexed" from "the cloud skipped".
+    /// It is snake_case on the wire (matching `scanner_version` on the payload,
+    /// not the camelCase request fields), and its absence — an older cloud, or
+    /// a body that carries only `success`/`message` — must read as "indexed".
+    #[test]
+    fn write_action_response_reads_already_current_and_defaults_to_indexed() {
+        let skipped: WriteActionResponse = serde_json::from_str(
+            r#"{"success":true,"message":"Metadata stored successfully","already_current":true}"#,
+        )
+        .expect("a short-circuit body parses");
+        assert_eq!(skipped.already_current, Some(true));
+
+        let indexed: WriteActionResponse = serde_json::from_str(
+            r#"{"success":true,"message":"Metadata stored successfully","already_current":false}"#,
+        )
+        .expect("an explicit false parses");
+        assert_eq!(indexed.already_current, Some(false));
+
+        // Absent (older cloud, or the complete-upload body with its extra
+        // fields): parses, and `unwrap_or(false)` reads it as "indexed".
+        let legacy: WriteActionResponse = serde_json::from_str(
+            r#"{"success":true,"message":"done","s3Url":"s3://b/k","metadata":{"pk":"w","sk":"p"}}"#,
+        )
+        .expect("a body without the field still parses");
+        assert!(legacy.already_current.is_none());
+        assert!(!legacy.already_current.unwrap_or(false));
+
+        // And a body with neither field — the write actions have carried
+        // different shapes over time and none of them may be dropped.
+        let bare: WriteActionResponse =
+            serde_json::from_str("{}").expect("an empty body still parses");
+        assert!(bare.already_current.is_none());
+    }
+
     #[test]
     fn integrity_fields_serialize_by_name_and_omit_when_none() {
         let inline = LambdaRequest {

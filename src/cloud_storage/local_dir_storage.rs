@@ -16,7 +16,7 @@
 //! `CARRICK_LOCAL_STORAGE_DIR` env var (see `main.rs`). The engine never learns
 //! it is in eval mode — same contract as `MockStorage`.
 
-use crate::cloud_storage::{CloudRepoData, CloudStorage, StorageError};
+use crate::cloud_storage::{CloudRepoData, CloudStorage, StorageError, UploadOutcome};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -73,7 +73,7 @@ impl LocalDirStorage {
 
 #[async_trait]
 impl CloudStorage for LocalDirStorage {
-    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<(), StorageError> {
+    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<UploadOutcome, StorageError> {
         let path = self.cache_path(&data.repo_name, data.service_name.as_deref());
         debug!(
             "LOCAL: Uploading repo data for {} (service: {:?}) -> {}",
@@ -86,7 +86,11 @@ impl CloudStorage for LocalDirStorage {
         std::fs::write(&path, json).map_err(|e| {
             StorageError::ConnectionError(format!("Failed to write {}: {e}", path.display()))
         })?;
-        Ok(())
+        // The cache file is rewritten unconditionally — there is no freshness
+        // check to short-circuit on.
+        Ok(UploadOutcome {
+            already_current: false,
+        })
     }
 
     // Cache files are keyed by (repo, service), so each service of a

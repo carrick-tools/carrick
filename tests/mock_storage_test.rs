@@ -55,6 +55,7 @@ fn create_test_repo_data(repo_name: &str, commit_hash: &str) -> CloudRepoData {
         sdk_surface: None,
         sdk_edges: None,
         sdk_unresolved: None,
+        scanner_version: None,
     }
 }
 

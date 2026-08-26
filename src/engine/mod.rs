@@ -4,7 +4,7 @@ use crate::agents::framework_guidance_agent::{FrameworkGuidanceAgent, ProtocolGu
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{
     CloudRepoData, CloudStorage, INLINE_PAYLOAD_LIMIT_BYTES, ManifestRole, ManifestTypeKind,
-    ManifestTypeState, TypeDegradation, TypeManifestEntry, get_current_commit_hash,
+    ManifestTypeState, TypeDegradation, TypeManifestEntry, UploadOutcome, get_current_commit_hash,
     mount_graph_to_api_details,
 };
 use crate::config::Config;
@@ -713,28 +713,47 @@ async fn upload_service_payloads<T: CloudStorage>(
     payloads: &[CloudRepoData],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let sp = logging::spinner("Uploading results...");
+    let mut outcomes: Vec<UploadOutcome> = Vec::with_capacity(payloads.len());
     for (i, payload) in payloads.iter().enumerate() {
-        if let Err(e) = storage.upload_repo_data(payload).await {
-            let uploaded: Vec<&str> = payloads[..i]
-                .iter()
-                .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
-                .collect();
-            let not_uploaded: Vec<&str> = payloads[i..]
-                .iter()
-                .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
-                .collect();
-            return Err(format!(
-                "Failed to upload repo data: {}. Uploaded: [{}]; not uploaded: [{}]. \
-                 The index is mixed-generation for this repo until a successful re-run.",
-                e,
-                uploaded.join(", "),
-                not_uploaded.join(", ")
-            )
-            .into());
+        match storage.upload_repo_data(payload).await {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(e) => {
+                let uploaded: Vec<&str> = payloads[..i]
+                    .iter()
+                    .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
+                    .collect();
+                let not_uploaded: Vec<&str> = payloads[i..]
+                    .iter()
+                    .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
+                    .collect();
+                return Err(format!(
+                    "Failed to upload repo data: {}. Uploaded: [{}]; not uploaded: [{}]. \
+                     The index is mixed-generation for this repo until a successful re-run.",
+                    e,
+                    uploaded.join(", "),
+                    not_uploaded.join(", ")
+                )
+                .into());
+            }
         }
     }
-    logging::finish_spinner(&sp, "Uploaded results to Carrick Cloud");
+    logging::finish_spinner(&sp, upload_finish_message(&outcomes));
     Ok(())
+}
+
+/// What the upload spinner says once every payload has landed.
+///
+/// "Uploaded" is a lie when the cloud short-circuited: it already held a row
+/// for this commit hash and this scanner version, so nothing this run computed
+/// was stored. Only claim that when EVERY service was skipped — a partial skip
+/// in a multi-service repo did re-index something, and an empty slice never
+/// uploaded anything to call current.
+fn upload_finish_message(outcomes: &[UploadOutcome]) -> &'static str {
+    if !outcomes.is_empty() && outcomes.iter().all(|o| o.already_current) {
+        "Index already current for this commit and scanner version; nothing re-indexed"
+    } else {
+        "Uploaded results to Carrick Cloud"
+    }
 }
 
 /// Remove AST nodes from CloudRepoData for serialization, then run the payload
@@ -2598,6 +2617,10 @@ fn build_cloud_data_from_mount_graph(
         sdk_surface: None,
         sdk_edges: None,
         sdk_unresolved: None,
+        // Stamp the release that produced this blob so the cloud can tell
+        // "same commit, same scanner" (skip) from "same commit, newer
+        // scanner" (re-index).
+        scanner_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     }
 }
 
@@ -3838,6 +3861,58 @@ mod tests {
     use super::*;
     use crate::analyzer::ApiEndpointDetails;
 
+    /// The incremental upload path stamps the running release, same as the
+    /// full-analysis path. Miss it here and every incremental scan — the common
+    /// case — uploads an unattributed blob the cloud can never re-index.
+    #[test]
+    fn incremental_cloud_data_stamps_the_running_scanner_version() {
+        let data = build_cloud_data_from_mount_graph(
+            "orders-service",
+            ".",
+            &MountGraph::new(),
+            &Config::default(),
+            &crate::packages::Packages::default(),
+            HashMap::new(),
+        );
+
+        assert_eq!(
+            data.scanner_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// "Uploaded" would be a lie when the cloud short-circuited every payload,
+    /// and "already current" would be a lie when it re-indexed any of them.
+    #[test]
+    fn upload_finish_message_only_claims_current_when_every_payload_was_skipped() {
+        let skipped = UploadOutcome {
+            already_current: true,
+        };
+        let indexed = UploadOutcome {
+            already_current: false,
+        };
+
+        assert_eq!(
+            upload_finish_message(&[skipped, skipped]),
+            "Index already current for this commit and scanner version; nothing re-indexed"
+        );
+        // A multi-service repo where one service did get re-indexed uploaded
+        // something, so it must not claim otherwise.
+        assert_eq!(
+            upload_finish_message(&[skipped, indexed]),
+            "Uploaded results to Carrick Cloud"
+        );
+        assert_eq!(
+            upload_finish_message(&[indexed]),
+            "Uploaded results to Carrick Cloud"
+        );
+        // Vacuously "all skipped" — but nothing was uploaded to call current.
+        assert_eq!(
+            upload_finish_message(&[]),
+            "Uploaded results to Carrick Cloud"
+        );
+    }
+
     /// A blank service payload, named, with nothing resolved.
     fn service_data(repo: &str, service: Option<&str>) -> CloudRepoData {
         CloudRepoData {
@@ -3871,6 +3946,7 @@ mod tests {
             sdk_surface: None,
             sdk_edges: None,
             sdk_unresolved: None,
+            scanner_version: None,
         }
     }
 
@@ -4201,6 +4277,7 @@ mod tests {
             }]),
             sdk_edges: None,
             sdk_unresolved: None,
+            scanner_version: None,
         };
 
         relativize_cloud_paths(&mut data, repo_path);
@@ -4332,6 +4409,7 @@ mod tests {
             sdk_surface: None,
             sdk_edges: None,
             sdk_unresolved: None,
+            scanner_version: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -4379,6 +4457,7 @@ mod tests {
             sdk_surface: None,
             sdk_edges: None,
             sdk_unresolved: None,
+            scanner_version: None,
         }];
 
         // Test Config merging
@@ -4463,6 +4542,7 @@ mod tests {
             sdk_surface: None,
             sdk_edges: None,
             sdk_unresolved: None,
+            scanner_version: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -5065,6 +5145,7 @@ mod tests {
             sdk_surface: None,
             sdk_edges: None,
             sdk_unresolved: None,
+            scanner_version: None,
         };
 
         // Staging unavailable: the request body has to carry the payload, so
@@ -5117,6 +5198,7 @@ mod tests {
             sdk_surface: None,
             sdk_edges: None,
             sdk_unresolved: None,
+            scanner_version: None,
         };
 
         let stripped = strip_ast_nodes(data, true);
@@ -5180,6 +5262,7 @@ mod tests {
                 sdk_surface: None,
                 sdk_edges: None,
                 sdk_unresolved: None,
+                scanner_version: None,
             }
         }
 
@@ -5254,6 +5337,7 @@ mod tests {
             sdk_surface: None,
             sdk_edges: None,
             sdk_unresolved: None,
+            scanner_version: None,
         };
 
         // Size the file_results filler so the payload lands just UNDER the 5MB
@@ -5470,6 +5554,7 @@ mod tests {
             sdk_surface: None,
             sdk_edges: None,
             sdk_unresolved: None,
+            scanner_version: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -5541,6 +5626,7 @@ mod tests {
             sdk_surface: None,
             sdk_edges: None,
             sdk_unresolved: None,
+            scanner_version: None,
         };
 
         attach_external_call_candidates(&mut data, &fixture_str, &files, &service);
@@ -5639,6 +5725,7 @@ mod tests {
             sdk_surface: None,
             sdk_edges: None,
             sdk_unresolved: None,
+            scanner_version: None,
         };
 
         attach_external_call_candidates(&mut data, &fixture_str, &files, &service);
@@ -5745,6 +5832,7 @@ mod tests {
             sdk_surface: None,
             sdk_edges: None,
             sdk_unresolved: None,
+            scanner_version: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -8112,6 +8200,7 @@ mod tests {
             sdk_surface: None,
             sdk_edges: None,
             sdk_unresolved: None,
+            scanner_version: None,
         }
     }
 }
