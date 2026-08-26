@@ -1,4 +1,4 @@
-use crate::cloud_storage::{CloudRepoData, CloudStorage, StorageError};
+use crate::cloud_storage::{CloudRepoData, CloudStorage, StorageError, UploadOutcome};
 use crate::packages::{PackageJson, Packages};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -29,13 +29,17 @@ impl MockStorage {
 
 #[async_trait]
 impl CloudStorage for MockStorage {
-    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<(), StorageError> {
+    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<UploadOutcome, StorageError> {
         debug!(
             "MOCK: Uploading repo data for repo: {} (service: {:?})",
             data.repo_name, data.service_name
         );
         self.data.lock().unwrap().push(data.clone());
-        Ok(())
+        // The mock always stores what it is given — it has no freshness check
+        // to short-circuit on.
+        Ok(UploadOutcome {
+            already_current: false,
+        })
     }
 
     // In-memory store keyed per uploaded entry — safe to hold many services
@@ -125,6 +129,7 @@ impl CloudStorage for MockStorage {
                     sdk_surface: None,
                     sdk_edges: None,
                     sdk_unresolved: None,
+                    scanner_version: None,
                 },
                 CloudRepoData {
                     repo_name: "repo-b".to_string(),
@@ -157,6 +162,7 @@ impl CloudStorage for MockStorage {
                     sdk_surface: None,
                     sdk_edges: None,
                     sdk_unresolved: None,
+                    scanner_version: None,
                 },
             ];
             result.extend(mock_repos);

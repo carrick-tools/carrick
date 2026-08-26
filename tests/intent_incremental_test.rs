@@ -5,7 +5,9 @@
 //! `intent` absent.
 
 use async_trait::async_trait;
-use carrick::cloud_storage::{CloudRepoData, CloudStorage, MockStorage, StorageError};
+use carrick::cloud_storage::{
+    CloudRepoData, CloudStorage, MockStorage, StorageError, UploadOutcome,
+};
 use carrick::engine::run_analysis_engine_with_sidecar;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -17,7 +19,7 @@ struct SharedMock(Arc<MockStorage>);
 
 #[async_trait]
 impl CloudStorage for SharedMock {
-    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<(), StorageError> {
+    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<UploadOutcome, StorageError> {
         self.0.upload_repo_data(data).await
     }
     async fn download_all_repo_data(
@@ -57,9 +59,9 @@ struct StubStorage {
 
 #[async_trait]
 impl CloudStorage for StubStorage {
-    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<(), StorageError> {
+    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<UploadOutcome, StorageError> {
         self.repos.lock().unwrap().push(data.clone());
-        Ok(())
+        Ok(UploadOutcome::default())
     }
     async fn download_all_repo_data(
         &self,

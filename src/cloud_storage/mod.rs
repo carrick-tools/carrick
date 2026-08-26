@@ -338,6 +338,21 @@ pub struct CloudRepoData {
     /// "no SDK calls".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sdk_unresolved: Option<Vec<SdkUnresolved>>,
+    /// The scanner release (`CARGO_PKG_VERSION`) that produced this upload.
+    /// The cloud treats a stored row as current only when the commit hash AND
+    /// the `scanner_version` match, so a scanner release re-indexes an
+    /// unchanged repo once instead of being short-circuited forever by the hash
+    /// alone. Without it, a release that fixes extraction could never refresh a
+    /// repo whose code had not moved: the run printed "Uploaded" and the index
+    /// kept the rows the previous scanner wrote.
+    ///
+    /// Additive and optional: blobs written before the field existed carry
+    /// `None`. Set on every production upload; test fixtures leave it `None`,
+    /// and it is deliberately absent from the placeholder blob the download
+    /// path builds for an adjacent repo with no metadata — that row is someone
+    /// else's scan, not this scanner's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanner_version: Option<String>,
 }
 
 /// Version of the v2 capture stub artifact schema. Bumped on incompatible
@@ -499,6 +514,10 @@ impl CloudRepoData {
             sdk_surface: None,
             sdk_edges: None,
             sdk_unresolved: None,
+            // Stamp the release that produced this blob so the cloud can tell
+            // "same commit, same scanner" (skip) from "same commit, newer
+            // scanner" (re-index).
+            scanner_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         }
     }
 }
@@ -580,9 +599,19 @@ impl std::fmt::Display for StorageError {
 
 impl Error for StorageError {}
 
+/// What the cloud did with one uploaded payload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UploadOutcome {
+    /// The cloud already held a row for this (repo, service) carrying both this
+    /// commit hash and this scanner version, so it skipped re-indexing and
+    /// nothing this run computed was stored. Only ever true for `AwsStorage`;
+    /// the mock and local-dir backends always write, so they report `false`.
+    pub already_current: bool,
+}
+
 #[async_trait]
 pub trait CloudStorage {
-    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<(), StorageError>;
+    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<UploadOutcome, StorageError>;
 
     /// Whether this backend can store more than one service per git repo
     /// without collision. The production index keys on
@@ -732,6 +761,69 @@ mod tests {
     use super::*;
     use crate::services::type_sidecar::InferKind;
 
+    /// The cloud compares the stored row's scanner version against this field,
+    /// so it has to survive the wire under exactly that name — and stay absent
+    /// (not `null`) when unset, so a blob written by an older scanner still
+    /// deserializes into `None` rather than failing the whole download.
+    #[test]
+    fn scanner_version_rides_the_wire_and_is_omitted_when_unset() {
+        let mut repo = empty_repo("orders-service", None);
+        repo.scanner_version = Some("1.2.3".to_string());
+
+        let json = serde_json::to_value(&repo).unwrap();
+        assert_eq!(json["scanner_version"], "1.2.3");
+
+        let back: CloudRepoData = serde_json::from_str(&serde_json::to_string(&repo).unwrap())
+            .expect("a stamped blob round-trips");
+        assert_eq!(back.scanner_version.as_deref(), Some("1.2.3"));
+
+        // Unset: the key is absent from the payload, which is exactly the
+        // shape of every blob the cloud stored before this field existed.
+        let unstamped = empty_repo("orders-service", None);
+        let json = serde_json::to_string(&unstamped).unwrap();
+        assert!(
+            !json.contains("scanner_version"),
+            "an unset scanner_version must be omitted, not serialized as null"
+        );
+        let back: CloudRepoData =
+            serde_json::from_str(&json).expect("old cloud data (no field) still deserializes");
+        assert!(back.scanner_version.is_none());
+    }
+
+    /// The full-analysis upload path stamps the running release. Without this
+    /// the cloud can never tell "same commit, newer scanner" from "same commit,
+    /// same scanner" and a release would never re-index an unchanged repo.
+    #[test]
+    fn from_multi_agent_results_stamps_the_running_scanner_version() {
+        let analysis_result = MultiAgentAnalysisResult {
+            framework_detection: DetectionResult {
+                frameworks: vec![],
+                data_fetchers: vec![],
+                messaging_clients: vec![],
+                notes: String::new(),
+            },
+            framework_guidance: ProtocolGuidance::new(),
+            mount_graph: MountGraph::new(),
+            file_results: HashMap::new(),
+            stats: Default::default(),
+        };
+
+        let data = CloudRepoData::from_multi_agent_results(
+            "orders-service".to_string(),
+            ".",
+            &analysis_result,
+            None,
+            None,
+            None,
+            HashMap::new(),
+        );
+
+        assert_eq!(
+            data.scanner_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
     /// The flattened key is the wire contract with the manifest matcher:
     /// entries must serialize with flat `protocol`/`method`/`path` fields,
     /// and round-trip back into the tagged key.
@@ -836,6 +928,7 @@ mod tests {
             sdk_surface: None,
             sdk_edges: None,
             sdk_unresolved: None,
+            scanner_version: None,
         }
     }
 
