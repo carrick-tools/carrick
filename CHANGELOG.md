@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.20](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.19...carrick-v0.3.20) (2026-08-26)
+
+
+### Features
+
+* **scanner:** stamp the scanner version on uploads and report an already-current index ([#576](https://github.com/carrick-tools/carrick/issues/576)) ([326f352](https://github.com/carrick-tools/carrick/commit/326f352fb015cc279cddbae05cf629ed5b532523))
+
 ## [0.3.19](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.18...carrick-v0.3.19) (2026-08-26)
 
 
