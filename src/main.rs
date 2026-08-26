@@ -311,6 +311,7 @@ fn is_deno_native_project(repo_root: &Path) -> bool {
     // depth() == 0 keeps the scan root traversable even when its own basename
     // matches a skip dir (a service directory named `build` is still a repo).
     let walker = walkdir::WalkDir::new(repo_root)
+        .sort_by_file_name()
         .into_iter()
         .filter_entry(|e| {
             e.depth() == 0

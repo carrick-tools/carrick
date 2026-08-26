@@ -155,7 +155,11 @@ pub fn find_files(dir: &str, ignore_patterns: &[&str]) -> (Vec<PathBuf>, Option<
     let mut config_file = None;
     let root_path = Path::new(dir);
 
+    // Sorted so the walk is the same on every host: readdir order differs
+    // between APFS and ext4, and any "first/last one wins" over an unsorted
+    // walk is a host-dependent result (#569 found one).
     for entry in WalkDir::new(dir)
+        .sort_by_file_name()
         .follow_links(true)
         .into_iter()
         .filter_map(|e| e.ok())
