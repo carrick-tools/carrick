@@ -559,10 +559,13 @@ fn member_spans(member: &SdkMember) -> impl Iterator<Item = (&str, u32, u32)> {
 pub fn attach_sdk_edges(payloads: &mut [CloudRepoData], join: &SdkJoin) {
     for payload in payloads.iter_mut() {
         let id = service_id(payload);
-        let edges = join.edges_for(&id);
-        let unresolved = join.unresolved_for(&id);
-        payload.sdk_edges = (!edges.is_empty()).then_some(edges);
-        payload.sdk_unresolved = (!unresolved.is_empty()).then_some(unresolved);
+        // Always `Some`, even when empty: presence is how the cloud tells
+        // "the join ran and found nothing" from "this blob predates the join"
+        // (`sdkJoinRan` in the MCP server). Emitting `None` for an empty
+        // result left every service without SDK edges permanently listed as
+        // `sdk_consumers_unknown`, and no rescan could clear it.
+        payload.sdk_edges = Some(join.edges_for(&id));
+        payload.sdk_unresolved = Some(join.unresolved_for(&id));
     }
 }
 
@@ -840,8 +843,10 @@ mod tests {
         let mut payloads = vec![producer(), sdk_repo(), blob("checkout")];
         attach_sdk_edges(&mut payloads, &joined);
 
-        assert!(payloads[0].sdk_edges.is_none());
-        assert!(payloads[1].sdk_edges.is_none());
+        // Ran and found nothing is `Some(empty)`, never `None`: the cloud
+        // reads `None` as "never ran" and reports the service as unknown.
+        assert_eq!(payloads[0].sdk_edges.as_deref(), Some(&[][..]));
+        assert_eq!(payloads[1].sdk_edges.as_deref(), Some(&[][..]));
         assert_eq!(payloads[2].sdk_edges.as_ref().map(Vec::len), Some(1));
     }
 
