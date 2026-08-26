@@ -3656,6 +3656,61 @@ mod tests {
         assert!(cross_repo_matches.is_empty());
     }
 
+    /// The `externalDomains` half of the same rule: a literal absolute URL to a
+    /// declared host reaches matching with its origin intact (see
+    /// `UrlNormalizer::consumer_call_path`) and is excluded — no missing
+    /// endpoint, no cross-repo edge. Had the origin been stripped to
+    /// `/v1/charges`, the declaration would be invisible here and the call
+    /// would report as a gap in the service graph.
+    #[test]
+    fn external_domain_calls_stay_excluded_and_silent() {
+        let config = Config {
+            external_domains: ["https://api.vendor.test".to_string()]
+                .into_iter()
+                .collect(),
+            ..Config::default()
+        };
+        let mut analyzer = Analyzer::new(config);
+        for route in [
+            "https://api.vendor.test/v1/charges",
+            "https://undeclared.test/v1/orders",
+        ] {
+            analyzer.calls.push(ApiEndpointDetails {
+                owner: None,
+                key: OperationKey::http("GET", route),
+                params: vec![],
+                request_body: None,
+                response_body: None,
+                handler_name: None,
+                request_type: None,
+                response_type: None,
+                file_path: PathBuf::from("src/client.ts"),
+                repo_name: None,
+                service_name: None,
+                provenance: Default::default(),
+            });
+        }
+
+        let (findings, verified, cross_repo_matches) =
+            analyzer.analyze_matches_with_mount_graph(&MountGraph::new());
+
+        let missing: Vec<&str> = findings
+            .iter()
+            .filter_map(|f| match f {
+                Finding::MissingEndpoint { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            missing,
+            vec!["/v1/orders"],
+            "only the UNDECLARED host reports a gap: {:?}",
+            findings
+        );
+        assert!(verified.is_empty());
+        assert!(cross_repo_matches.is_empty());
+    }
+
     /// A consumer call whose path exists in the index under a different verb
     /// must surface exactly once, as a method-mismatch risk — not as a
     /// missing-endpoint + orphaned-endpoint pair.
