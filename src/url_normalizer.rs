@@ -577,9 +577,8 @@ impl UrlNormalizer {
     pub fn consumer_call_path(&self, url: &str) -> String {
         let trimmed = url.trim_matches(|c| c == '`' || c == '"' || c == '\'');
         let is_relative_path = trimmed.starts_with('/') && !trimmed.starts_with("//");
-        let is_absolute_url = trimmed.starts_with("http://")
-            || trimmed.starts_with("https://")
-            || trimmed.starts_with("//");
+        let has_scheme = trimmed.starts_with("http://") || trimmed.starts_with("https://");
+        let is_absolute_url = has_scheme || trimmed.starts_with("//");
         let normalized = self.normalize(url);
         if normalized.is_internal {
             return normalized.path;
@@ -594,7 +593,13 @@ impl UrlNormalizer {
         // not raw: `canonical_path_has_literal_segment` and
         // `is_valid_route_shape` gate on a bare `http(s)://` prefix, so a
         // surviving source quote would drop the call as noise instead.
-        if normalized.is_external && is_absolute_url {
+        //
+        // Scheme-prefixed only, not every `is_absolute_url` shape: a
+        // protocol-relative `//host/path` key would fail the same `http(s)://`
+        // prefix test that every reader of this key applies, so keeping it
+        // whole would produce a shape nothing downstream recognises as
+        // external. That shape keeps its existing strip.
+        if normalized.is_external && has_scheme {
             return trimmed.to_string();
         }
         if is_relative_path || is_absolute_url {
@@ -1177,6 +1182,24 @@ mod tests {
         assert_eq!(
             normalizer.consumer_call_path("`https://api.github.com/user`"),
             "https://api.github.com/user"
+        );
+
+        // A query string rides along on the key. Every reader tolerates it —
+        // `canonical_path_has_literal_segment` cuts at `?` before its prefix
+        // test, `is_valid_route_shape`'s cleanliness test permits it — and it
+        // is part of the verbatim target, so it is retained rather than
+        // trimmed to a bare path.
+        assert_eq!(
+            normalizer.consumer_call_path("https://api.github.com/user/emails?per_page=100"),
+            "https://api.github.com/user/emails?per_page=100"
+        );
+
+        // A protocol-relative origin is NOT kept whole even when declared: the
+        // key would fail the `http(s)://` test every reader applies, so it
+        // keeps its existing strip rather than gaining an unrecognised shape.
+        assert_eq!(
+            normalizer.consumer_call_path("//api.github.com/user"),
+            "/user"
         );
 
         // Unchanged: an UNDECLARED absolute origin is still a structural prefix
