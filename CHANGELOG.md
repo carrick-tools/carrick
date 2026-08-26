@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.19](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.18...carrick-v0.3.19) (2026-08-26)
+
+
+### Features
+
+* **formatter:** orphaned endpoints are informational, never a gap ([#573](https://github.com/carrick-tools/carrick/issues/573)) ([3e32f5b](https://github.com/carrick-tools/carrick/commit/3e32f5b6b16159301b94654be5291efe2db48b22))
+
+
+### Bug Fixes
+
+* **scanner:** honour declared externalDomains for literal absolute URLs ([#574](https://github.com/carrick-tools/carrick/issues/574)) ([a8fa906](https://github.com/carrick-tools/carrick/commit/a8fa906d8ad275da4b9127f5ce6c2fb44143f297))
+
 ## [0.3.18](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.17...carrick-v0.3.18) (2026-08-26)
 
 

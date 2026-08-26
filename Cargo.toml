@@ -1,6 +1,6 @@
 [package]
 name = "carrick"
-version = "0.3.18"
+version = "0.3.19"
 edition = "2024"
 
 # Non-virtual workspace on purpose: release-please's rust strategy edits this
