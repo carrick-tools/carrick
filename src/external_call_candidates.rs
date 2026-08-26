@@ -889,7 +889,7 @@ impl Workspace {
     fn parse(repo_root: &Path, index: &WorkspaceIndex, service_files: &[PathBuf]) -> Workspace {
         // The same walk the per-service scan uses, so the two see one file set
         // and one set of exclusions.
-        let (mut absolute, _, _) = find_files(&repo_root.to_string_lossy(), &MANIFEST_SKIP_DIRS);
+        let (mut absolute, _) = find_files(&repo_root.to_string_lossy(), &MANIFEST_SKIP_DIRS);
 
         // Those exclusions are relative to the walk root, so a service rooted
         // at a directory named after a build artifact (`packages/build`) is

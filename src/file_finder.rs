@@ -144,13 +144,15 @@ pub fn endpoint_provenance(path: &Path, root_dir: &Path) -> EndpointProvenance {
 /// Find all JavaScript and TypeScript files in a directory
 /// Also looks for carrick.json configuration file
 /// Returns (js_ts_files, config_file_option)
-pub fn find_files(
-    dir: &str,
-    ignore_patterns: &[&str],
-) -> (Vec<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
+///
+/// Deliberately does NOT report a `package.json`: the walk visits every
+/// manifest below `dir` (test fixtures, examples, nested workers) in
+/// filesystem readdir order, so "the" manifest it found was whichever came
+/// last on that host. A service's manifest is the one at its root and nowhere
+/// else — see [`find_service_files`].
+pub fn find_files(dir: &str, ignore_patterns: &[&str]) -> (Vec<PathBuf>, Option<PathBuf>) {
     let mut js_ts_files = Vec::new();
     let mut config_file = None;
-    let mut package_json = None;
     let root_path = Path::new(dir);
 
     for entry in WalkDir::new(dir)
@@ -173,11 +175,6 @@ pub fn find_files(
             continue;
         }
 
-        if path.file_name().is_some_and(|name| name == "package.json") {
-            package_json = Some(path.to_path_buf());
-            continue;
-        }
-
         if let Some(extension) = path.extension() {
             let ext_str = extension.to_string_lossy().to_lowercase();
             if matches!(ext_str.as_str(), "js" | "ts" | "jsx" | "tsx") {
@@ -189,13 +186,16 @@ pub fn find_files(
         }
     }
 
-    (js_ts_files, config_file, package_json)
+    (js_ts_files, config_file)
 }
 
 /// Find JS/TS files for a single service, scoped to its `directory` plus any
 /// extra `include` source roots (e.g. shared libraries copied in at build
 /// time), all relative to `repo_path`. Also returns that service's
-/// `package.json` from the service directory, if present.
+/// `package.json`: the file at the service root itself, if present. Nested
+/// manifests (fixtures, examples, a sibling service under a `directory: "."`
+/// root) are never candidates — a scan must pick the same manifest on every
+/// host, and the root is the only one that is unambiguously the service's.
 ///
 /// A service with `directory: None` scopes to the whole repo, so the
 /// single-service path behaves exactly like a plain [`find_files`] walk.
@@ -212,12 +212,14 @@ pub fn find_service_files(
 
     // The carrick.json lives at the repo root, not per service directory, so the
     // config returned here is ignored — config resolution is handled separately.
-    let (mut files, _config, package_json) =
-        find_files(&service_root.to_string_lossy(), ignore_patterns);
+    let (mut files, _config) = find_files(&service_root.to_string_lossy(), ignore_patterns);
+
+    let manifest = service_root.join("package.json");
+    let package_json = manifest.is_file().then_some(manifest);
 
     for inc in &service.include {
         let inc_path = root.join(inc);
-        let (inc_files, _, _) = find_files(&inc_path.to_string_lossy(), ignore_patterns);
+        let (inc_files, _) = find_files(&inc_path.to_string_lossy(), ignore_patterns);
         files.extend(inc_files);
     }
 
@@ -253,11 +255,10 @@ mod tests {
         File::create(&config_path).expect("config file");
         File::create(&package_path).expect("package file");
 
-        let (files, config, package) = find_files(root.to_str().unwrap(), &[]);
+        let (files, config) = find_files(root.to_str().unwrap(), &[]);
 
         assert_eq!(files, vec![source_file]);
         assert_eq!(config, Some(config_path));
-        assert_eq!(package, Some(package_path));
     }
 
     #[test]
@@ -280,11 +281,10 @@ mod tests {
         File::create(&config_path).expect("config file");
         File::create(&package_path).expect("package file");
 
-        let (files, config, package) = find_files(root.to_str().unwrap(), &[]);
+        let (files, config) = find_files(root.to_str().unwrap(), &[]);
 
         assert_eq!(files, vec![normal_file]);
         assert_eq!(config, Some(config_path));
-        assert_eq!(package, Some(package_path));
     }
 
     #[test]
@@ -309,7 +309,7 @@ mod tests {
             File::create(f).expect("file");
         }
 
-        let (mut files, _, _) = find_files(root.to_str().unwrap(), &[]);
+        let (mut files, _) = find_files(root.to_str().unwrap(), &[]);
         files.sort();
 
         let mut expected = vec![component, real_module];
@@ -335,11 +335,10 @@ mod tests {
         File::create(&package_path).expect("package file");
 
         // Pass the "fixtures" directory as the root
-        let (files, config, package) = find_files(root.to_str().unwrap(), &[]);
+        let (files, config) = find_files(root.to_str().unwrap(), &[]);
 
         assert_eq!(files, vec![source_file]);
         assert_eq!(config, Some(config_path));
-        assert_eq!(package, Some(package_path));
     }
 
     const ARTIFACT_IGNORES: &[&str] = &["node_modules", "dist", "build", ".next"];
@@ -367,7 +366,7 @@ mod tests {
             File::create(f).expect("file");
         }
 
-        let (mut files, _, _) = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
+        let (mut files, _) = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
         files.sort();
 
         let mut expected = vec![
@@ -398,11 +397,9 @@ mod tests {
         File::create(root.join("build/app.js")).expect("build file");
         File::create(root.join(".next/server/page.js")).expect(".next file");
 
-        let (files, _, package) = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
+        let (files, _) = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
 
         assert_eq!(files, vec![kept]);
-        // The package.json inside node_modules must not be picked up either.
-        assert_eq!(package, None);
     }
 
     #[test]
@@ -416,15 +413,12 @@ mod tests {
         fs::create_dir_all(root.join("node_modules").join("dep")).expect("node_modules dir");
 
         let kept = root.join("src").join("index.ts");
-        let pkg = root.join("package.json");
         File::create(&kept).expect("kept file");
-        File::create(&pkg).expect("package file");
         File::create(root.join("node_modules/dep/index.ts")).expect("dep file");
 
-        let (files, _, package) = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
+        let (files, _) = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
 
         assert_eq!(files, vec![kept]);
-        assert_eq!(package, Some(pkg));
     }
 
     #[test]
@@ -602,9 +596,85 @@ mod tests {
         // directory: None => whole-repo scope, identical to find_files.
         let service = Config::default();
         let (svc_files, svc_pkg) = find_service_files(root.to_str().unwrap(), &service, &[]);
-        let (files, _, pkg) = find_files(root.to_str().unwrap(), &[]);
+        let (files, _) = find_files(root.to_str().unwrap(), &[]);
 
         assert_eq!(svc_files, files);
-        assert_eq!(svc_pkg, pkg);
+        assert_eq!(svc_pkg, Some(root.join("package.json")));
+    }
+
+    // The manifest is the one at the service root — never one found by
+    // walking. Before this, the walk assigned every package.json it met, so a
+    // service got whichever manifest its host's readdir order visited last:
+    // a repo scanned from macOS and from ubuntu-latest indexed different
+    // dependency sets for the same commit.
+
+    #[test]
+    fn find_service_files_ignores_nested_fixture_manifest() {
+        use crate::config::Config;
+
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("svc/src")).expect("src dir");
+        fs::create_dir_all(root.join("svc/test/fixtures/installed")).expect("fixture dir");
+        File::create(root.join("svc/src/app.ts")).expect("source file");
+        let root_pkg = root.join("svc/package.json");
+        File::create(&root_pkg).expect("root package");
+        File::create(root.join("svc/test/fixtures/installed/package.json"))
+            .expect("fixture package");
+
+        let service = Config {
+            directory: Some("svc".to_string()),
+            ..Default::default()
+        };
+        let (_, package) = find_service_files(root.to_str().unwrap(), &service, &[]);
+
+        assert_eq!(package, Some(root_pkg));
+    }
+
+    #[test]
+    fn find_service_files_ignores_sibling_service_manifest_under_repo_root() {
+        use crate::config::Config;
+
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+
+        // A root service (`directory: "."`) whose tree also contains a second
+        // service's directory — the site + its worker layout.
+        fs::create_dir_all(root.join("src")).expect("src dir");
+        fs::create_dir_all(root.join("workers/proxy")).expect("worker dir");
+        File::create(root.join("src/app.ts")).expect("source file");
+        let root_pkg = root.join("package.json");
+        File::create(&root_pkg).expect("root package");
+        File::create(root.join("workers/proxy/package.json")).expect("worker package");
+
+        let service = Config {
+            directory: Some(".".to_string()),
+            ..Default::default()
+        };
+        let (_, package) = find_service_files(root.to_str().unwrap(), &service, &[]);
+
+        assert_eq!(package, Some(root_pkg));
+    }
+
+    #[test]
+    fn find_service_files_reports_no_manifest_when_root_has_none() {
+        use crate::config::Config;
+
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+
+        // Only a nested manifest exists: it must not be promoted to the
+        // service's own.
+        fs::create_dir_all(root.join("svc/examples/demo")).expect("example dir");
+        File::create(root.join("svc/examples/demo/package.json")).expect("example package");
+
+        let service = Config {
+            directory: Some("svc".to_string()),
+            ..Default::default()
+        };
+        let (_, package) = find_service_files(root.to_str().unwrap(), &service, &[]);
+
+        assert_eq!(package, None);
     }
 }
