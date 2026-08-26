@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.18](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.17...carrick-v0.3.18) (2026-08-26)
+
+
+### Bug Fixes
+
+* **ci:** run every integration test, build the sidecar in the hook, sort walks ([#570](https://github.com/carrick-tools/carrick/issues/570)) ([8905843](https://github.com/carrick-tools/carrick/commit/890584316e3573d23b7410f0d55620347b3ecd7e))
+
 ## [0.3.17](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.16...carrick-v0.3.17) (2026-08-26)
 
 
