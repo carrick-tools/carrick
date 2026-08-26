@@ -76,12 +76,18 @@ pub fn format_analysis_results(
     let categorized = categorize_findings(&result.findings);
     let has_baseline = topology.has_baseline();
     // Headline rule (mirrored by the cloud renderer): risks always count;
-    // connectivity gaps count only with a baseline (a lone single-service repo
+    // missing endpoints count only with a baseline (a lone single-service repo
     // has nothing to match against, so they are listed as informational);
     // major dependency conflicts count; advisory findings (env-var
     // suggestions, unparseable version pins) never do.
+    //
+    // Orphaned endpoints never count, with or without a baseline. "No indexed
+    // service calls this" is an inventory fact, not a defect: browsers, agents
+    // and other external clients are not in the index, so on a system that
+    // serves them orphans are most of its endpoints. And an orphan cannot
+    // break anything — nothing calls it. They get their own section instead.
     let connectivity_in_headline = if has_baseline {
-        categorized.connectivity_len()
+        categorized.missing.len()
     } else {
         0
     };
@@ -137,10 +143,9 @@ pub fn format_analysis_results(
         output.push_str(&format_critical_section(&categorized.risks));
         output.push_str("\n\n");
     }
-    if !categorized.connectivity_is_empty() {
+    if !categorized.missing.is_empty() {
         output.push_str(&format_connectivity_section(
             &categorized.missing,
-            &categorized.orphaned,
             has_baseline,
         ));
         output.push_str("\n\n");
@@ -171,6 +176,15 @@ pub fn format_analysis_results(
     }
     if !result.verified_endpoints.is_empty() {
         output.push_str(&format_verified_section(&result.verified_endpoints));
+        output.push_str("\n\n");
+    }
+    // Dead last: informational, and usually the longest list on a system that
+    // serves browsers or agents.
+    if !categorized.orphaned.is_empty() {
+        output.push_str(&format_unconsumed_section(
+            &categorized.orphaned,
+            has_baseline,
+        ));
         output.push_str("\n\n");
     }
 
@@ -295,7 +309,7 @@ fn format_verdict(
             plural(categorized.risks.len())
         ));
     }
-    if !categorized.connectivity_is_empty() {
+    if !categorized.missing.is_empty() {
         let noun = if has_baseline {
             "connectivity gap"
         } else {
@@ -303,9 +317,18 @@ fn format_verdict(
         };
         parts.push(format!(
             "{} {}{}",
-            categorized.connectivity_len(),
+            categorized.missing.len(),
             noun,
-            plural(categorized.connectivity_len())
+            plural(categorized.missing.len())
+        ));
+    }
+    // Named separately from the counted items: an endpoint nothing in the
+    // index calls is inventory, not a gap.
+    if !categorized.orphaned.is_empty() {
+        parts.push(format!(
+            "{} endpoint{} without an indexed consumer",
+            categorized.orphaned.len(),
+            plural(categorized.orphaned.len())
         ));
     }
     if !categorized.dependencies_is_empty() {
@@ -728,10 +751,10 @@ struct CategorizedFindings<'a> {
 }
 
 impl CategorizedFindings<'_> {
-    fn connectivity_len(&self) -> usize {
-        self.missing.len() + self.orphaned.len()
-    }
-
+    /// Whether the connectivity *family* is empty — missing and orphaned
+    /// together, counted or not. Deliberately not missing-only: its one caller
+    /// decides whether the first-repo framing note applies, and that note
+    /// frames both kinds. Everything that counts uses `missing` directly.
     fn connectivity_is_empty(&self) -> bool {
         self.missing.is_empty() && self.orphaned.is_empty()
     }
@@ -921,11 +944,7 @@ fn code_span(value: &str) -> String {
         .to_string()
 }
 
-fn format_connectivity_section(
-    missing: &[&Finding],
-    orphaned: &[&Finding],
-    has_baseline: bool,
-) -> String {
+fn format_connectivity_section(missing: &[&Finding], has_baseline: bool) -> String {
     let mut output = String::new();
 
     let heading = if has_baseline {
@@ -936,14 +955,10 @@ fn format_connectivity_section(
     output.push_str(&format!(
         "<details>\n<summary><strong>{} ({})</strong></summary>\n\n",
         heading,
-        missing.len() + orphaned.len()
+        missing.len()
     ));
 
-    output.push_str("> Orphaned endpoints have no consumer in the indexed services. Missing endpoints have a consumer call but no producer.\n\n");
-
-    if !has_baseline {
-        output.push_str("> **First repo indexed for this project.** With nothing else to match against, every endpoint without a same-repo consumer is listed below; most resolve once you connect the repos that call them.\n\n");
-    }
+    output.push_str("> Missing endpoints have a consumer call but no producer.\n\n");
 
     if !missing.is_empty() {
         output.push_str(&format!("**Missing ({})**\n\n", missing.len()));
@@ -973,64 +988,83 @@ fn format_connectivity_section(
         output.push('\n');
     }
 
-    if !orphaned.is_empty() {
-        output.push_str(&format!("**Orphaned ({})**\n\n", orphaned.len()));
-        type OrphanRow<'a> = (&'a String, &'a String, &'a Option<String>, &'static str);
-        fn orphan_row(finding: &Finding) -> Option<OrphanRow<'_>> {
-            match finding {
-                Finding::OrphanedEndpoint {
-                    method,
-                    path,
-                    service,
-                    provenance,
-                } => {
-                    // Mark mock/test-handler producers: an orphaned mock is
-                    // expected (its consumers are usually not scanned), so the
-                    // row should not read like a dead product route (#380).
-                    let marker = if provenance.is_mock() {
-                        " (mock handler)"
-                    } else {
-                        ""
-                    };
-                    Some((method, path, service, marker))
-                }
-                _ => None,
+    output.push_str("\n</details>");
+    output
+}
+
+/// Orphaned endpoints, outside the headline and last in the report. The index
+/// only sees service-to-service calls, so routes served to browsers, agents and
+/// other external clients land here by design. Listed so a genuinely dead route
+/// can be found, never counted as a problem.
+fn format_unconsumed_section(orphaned: &[&Finding], has_baseline: bool) -> String {
+    let mut output = String::new();
+
+    output.push_str(&format!(
+        "<details>\n<summary><strong>Endpoints without an indexed consumer ({})</strong></summary>\n\n",
+        orphaned.len()
+    ));
+
+    output.push_str("> No indexed service calls these. Routes served to browsers, agents or other external clients belong here; nothing to fix unless you expected a service to call one of them.\n\n");
+
+    if !has_baseline {
+        output.push_str("> **First repo indexed for this project.** With nothing else to match against, every endpoint without a same-repo consumer is listed below; most resolve once you connect the repos that call them.\n\n");
+    }
+
+    type OrphanRow<'a> = (&'a String, &'a String, &'a Option<String>, &'static str);
+    fn orphan_row(finding: &Finding) -> Option<OrphanRow<'_>> {
+        match finding {
+            Finding::OrphanedEndpoint {
+                method,
+                path,
+                service,
+                provenance,
+            } => {
+                // Mark mock/test-handler producers: an orphaned mock is
+                // expected (its consumers are usually not scanned), so the
+                // row should not read like a dead product route (#380).
+                let marker = if provenance.is_mock() {
+                    " (mock handler)"
+                } else {
+                    ""
+                };
+                Some((method, path, service, marker))
             }
+            _ => None,
         }
-        // Show the owning-service column only when at least one orphan is
-        // attributed (single-repo runs have none, so the column is dropped).
-        if orphaned
-            .iter()
-            .filter_map(|f| orphan_row(f))
-            .any(|(_, _, service, _)| service.is_some())
-        {
-            output.push_str("| Method | Path | Service |\n| :--- | :--- | :--- |\n");
-            for (method, path, service, marker) in orphaned.iter().filter_map(|f| orphan_row(f)) {
-                // A row can be unattributed even when the column is shown (e.g.
-                // a GraphQL orphan alongside an attributed HTTP one); use a dash
-                // rather than an empty cell.
-                let service = service
-                    .as_deref()
-                    .map(|s| format!("`{}`", code_cell(s)))
-                    .unwrap_or_else(|| "-".to_string());
-                output.push_str(&format!(
-                    "| `{}` | `{}`{} | {} |\n",
-                    code_cell(method),
-                    code_cell(path),
-                    marker,
-                    service
-                ));
-            }
-        } else {
-            output.push_str("| Method | Path |\n| :--- | :--- |\n");
-            for (method, path, _, marker) in orphaned.iter().filter_map(|f| orphan_row(f)) {
-                output.push_str(&format!(
-                    "| `{}` | `{}`{} |\n",
-                    code_cell(method),
-                    code_cell(path),
-                    marker
-                ));
-            }
+    }
+    // Show the owning-service column only when at least one orphan is
+    // attributed (single-repo runs have none, so the column is dropped).
+    if orphaned
+        .iter()
+        .filter_map(|f| orphan_row(f))
+        .any(|(_, _, service, _)| service.is_some())
+    {
+        output.push_str("| Method | Path | Service |\n| :--- | :--- | :--- |\n");
+        for (method, path, service, marker) in orphaned.iter().filter_map(|f| orphan_row(f)) {
+            // A row can be unattributed even when the column is shown (e.g.
+            // a GraphQL orphan alongside an attributed HTTP one); use a dash
+            // rather than an empty cell.
+            let service = service
+                .as_deref()
+                .map(|s| format!("`{}`", code_cell(s)))
+                .unwrap_or_else(|| "-".to_string());
+            output.push_str(&format!(
+                "| `{}` | `{}`{} | {} |\n",
+                code_cell(method),
+                code_cell(path),
+                marker,
+                service
+            ));
+        }
+    } else {
+        output.push_str("| Method | Path |\n| :--- | :--- |\n");
+        for (method, path, _, marker) in orphaned.iter().filter_map(|f| orphan_row(f)) {
+            output.push_str(&format!(
+                "| `{}` | `{}`{} |\n",
+                code_cell(method),
+                code_cell(path),
+                marker
+            ));
         }
     }
 
@@ -1873,15 +1907,17 @@ mod tests {
     fn test_no_baseline_excludes_connectivity_from_headline_count() {
         // First repo indexed (has_baseline = false): connectivity findings are
         // inconclusive (no peers to match against) so they must be kept OUT of
-        // the headline CARRICK_ISSUE_COUNT, yet the section must still render —
-        // framed as informational "Observations".
+        // the headline CARRICK_ISSUE_COUNT, yet the sections must still render —
+        // the missing one framed as informational "Observations", the orphans
+        // in their own always-informational section.
         let findings = vec![
+            Finding::missing_endpoint("GET", "/api/invoices", None, vec![]),
             Finding::orphaned_endpoint("GET", "/api/users", None),
             Finding::orphaned_endpoint("PUT", "/api/sessions", None),
         ];
         let output = format_analysis_results(result_with(findings), &topology_first_repo(), None);
 
-        // Headline count excludes the two connectivity findings → zero issues.
+        // Headline count excludes the connectivity findings → zero issues.
         assert!(
             output.contains("<!-- CARRICK_ISSUE_COUNT:0 -->"),
             "first-run connectivity findings must not inflate the headline count, got:\n{}",
@@ -1893,6 +1929,19 @@ mod tests {
             "connectivity section must still render as informational observations, got:\n{}",
             output
         );
+        // The orphans are listed apart from it, never inside its count.
+        assert!(
+            output.contains(
+                "<summary><strong>Endpoints without an indexed consumer (2)</strong></summary>"
+            ),
+            "orphans must render in their own section, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("Connectivity Observations (1)"),
+            "the connectivity heading counts missing only, got:\n{}",
+            output
+        );
         assert!(
             output.contains("First repo indexed"),
             "first-run observations must carry the informational framing, got:\n{}",
@@ -1901,10 +1950,15 @@ mod tests {
         // The orphaned endpoints are rendered as Method/Path table rows.
         assert!(output.contains("`/api/users`"));
         assert!(output.contains("`/api/sessions`"));
-        // Headline phrasing reflects the informational framing, not "gaps".
-        assert!(output.contains("connectivity observations"));
+        // Headline phrasing reflects the informational framing, not "gaps",
+        // and the orphans get their own clause rather than swelling that one.
+        assert!(output.contains("1 connectivity observation"));
+        assert!(output.contains("2 endpoints without an indexed consumer"));
     }
 
+    /// With a baseline, a missing endpoint counts. An orphan alongside it does
+    /// not: it is named in its own verdict clause and its own section, and
+    /// stays out of both the headline count and the connectivity heading.
     #[test]
     fn test_baseline_counts_connectivity_gaps() {
         let findings = vec![
@@ -1912,9 +1966,13 @@ mod tests {
             Finding::orphaned_endpoint("POST", "/b", None),
         ];
         let output = format_analysis_results(result_with(findings), &topology_baseline(), None);
-        assert!(output.contains("<!-- CARRICK_ISSUE_COUNT:2 -->"));
-        assert!(output.contains("connectivity gaps"));
+        assert!(output.contains("<!-- CARRICK_ISSUE_COUNT:1 -->"));
+        assert!(output.contains("1 connectivity gap"));
+        assert!(output.contains("1 endpoint without an indexed consumer"));
         assert!(output.contains("> [!WARNING]"));
+        // The connectivity heading counts the missing endpoint only.
+        assert!(output.contains("<summary><strong>Connectivity (1)</strong></summary>"));
+        assert!(!output.contains("Orphaned ("));
     }
 
     #[test]
@@ -2052,8 +2110,8 @@ mod tests {
 
     #[test]
     fn test_orphaned_endpoints_show_service_when_attributed() {
-        // When orphans carry an owning service, the connectivity table gains a
-        // Service column naming where each lives.
+        // When orphans carry an owning service, the unconsumed-endpoints table
+        // gains a Service column naming where each lives.
         let findings = vec![
             Finding::orphaned_endpoint("GET", "/users", Some("auth".to_string())),
             Finding::orphaned_endpoint("POST", "/charges", Some("billing".to_string())),
@@ -2100,6 +2158,111 @@ mod tests {
         assert!(output.contains("| `GET` | `/users` | `auth` |"));
         // Unattributed row → dash, and the pipe in the path is escaped.
         assert!(output.contains("| `QUERY` | `weird\\|field` | - |"));
+    }
+
+    /// Orphans alone are inventory, not issues: even with a full baseline the
+    /// headline stays at zero, and they render in their own section rather
+    /// than under "Connectivity".
+    #[test]
+    fn test_orphans_alone_are_informational_and_never_counted() {
+        let findings = vec![
+            Finding::orphaned_endpoint("GET", "/users", Some("auth".to_string())),
+            Finding::orphaned_endpoint("POST", "/charges", Some("billing".to_string())),
+        ];
+        let output = format_analysis_results(result_with(findings), &topology_baseline(), None);
+
+        assert!(
+            output.contains("<!-- CARRICK_ISSUE_COUNT:0 -->"),
+            "orphans must never reach the headline count, got:\n{}",
+            output
+        );
+        assert!(output.contains(
+            "<summary><strong>Endpoints without an indexed consumer (2)</strong></summary>"
+        ));
+        assert!(output.contains(
+            "> No indexed service calls these. Routes served to browsers, agents or other \
+             external clients belong here; nothing to fix unless you expected a service to call \
+             one of them."
+        ));
+        // The old sub-block under "Connectivity" is gone entirely.
+        assert!(
+            !output.contains("Orphaned ("),
+            "orphans must not render as a Connectivity sub-block, got:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("<summary><strong>Connectivity"),
+            "no missing endpoints means no Connectivity section at all, got:\n{}",
+            output
+        );
+        // Zero counted issues, but findings exist — so this is the NOTE path,
+        // not the clean-run TIP.
+        assert!(output.contains("> [!NOTE]"));
+        assert!(!output.contains("All cross-service calls match the indexed contracts"));
+    }
+
+    /// Only one of the two connectivity kinds counts. The verdict must say
+    /// both, in separate clauses, so "1 gap" is never read as "2 problems".
+    #[test]
+    fn test_verdict_names_missing_and_orphans_in_separate_clauses() {
+        let findings = vec![
+            Finding::missing_endpoint("GET", "/a", None, vec!["src/a.ts:1".to_string()]),
+            Finding::orphaned_endpoint("POST", "/b", None),
+        ];
+        let output = format_analysis_results(result_with(findings), &topology_baseline(), None);
+
+        assert!(output.contains("<!-- CARRICK_ISSUE_COUNT:1 -->"));
+        assert!(output.contains("1 connectivity gap"));
+        assert!(output.contains("1 endpoint without an indexed consumer"));
+        // Singular clause, so the plural form must not leak in.
+        assert!(!output.contains("1 connectivity gaps"));
+        assert!(!output.contains("1 endpoints without an indexed consumer"));
+    }
+
+    /// The unconsumed section is dead last: informational, and usually the
+    /// longest list on a system that serves browsers or agents.
+    #[test]
+    fn test_unconsumed_section_renders_after_every_other_section() {
+        let findings = vec![
+            major_conflict_finding(),
+            Finding::env_var_call(
+                "GET",
+                "/orders",
+                "ORDER_SERVICE_URL",
+                vec!["src/orders.ts:3".to_string()],
+            ),
+            Finding::orphaned_endpoint("GET", "/users", Some("auth".to_string())),
+        ];
+        let mut result = result_with(findings);
+        result.verified_endpoints = vec![crate::analyzer::VerifiedEndpointEntry {
+            method: "GET".to_string(),
+            path: "/api/users".to_string(),
+            provenance: EndpointProvenance::Route,
+            type_verdict: None,
+        }];
+        let output = format_analysis_results(result, &topology_baseline(), None);
+
+        let unconsumed_at = output
+            .find("Endpoints without an indexed consumer")
+            .expect("unconsumed section");
+        for earlier in [
+            "Major version conflicts",
+            "Configuration suggestions",
+            "Verified (",
+        ] {
+            let at = output
+                .find(earlier)
+                .unwrap_or_else(|| panic!("missing section {earlier} in:\n{output}"));
+            assert!(
+                at < unconsumed_at,
+                "{earlier} must render before the unconsumed section, got:\n{output}"
+            );
+        }
+        // And still inside the machine-readable envelope.
+        let end_at = output
+            .find("<!-- CARRICK_OUTPUT_END -->")
+            .expect("end marker");
+        assert!(unconsumed_at < end_at);
     }
 
     #[test]
