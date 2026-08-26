@@ -6444,6 +6444,58 @@ export * from "./aFetch.js";"#,
         );
     }
 
+    /// A call to a DECLARED external domain keeps its origin on
+    /// `canonical_path` — the key `mount_graph_to_api_details` uploads and the
+    /// matcher looks up. Stripping it there is what made a declared third-party
+    /// call arrive at matching as a bare `/user`, indistinguishable from an
+    /// internal call and reported as a missing endpoint.
+    #[test]
+    fn declared_external_absolute_url_keeps_its_host_on_the_match_key() {
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let config = crate::config::Config {
+            external_domains: ["https://api.vendor.test".to_string()]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/service.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![
+                    call_with_span(12, "https://api.vendor.test/v1/charges", Some(200)),
+                    call_with_span(18, "https://orders.undeclared.test/orders", Some(210)),
+                ],
+                graphql_operations: vec![],
+                pubsub_operations: vec![],
+            },
+        );
+
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::new(&config),
+            Path::new(""),
+            Path::new(""),
+        );
+
+        let mut keys: Vec<&str> = graph
+            .data_calls
+            .iter()
+            .map(|call| call.canonical_path.as_str())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["/orders", "https://api.vendor.test/v1/charges"],
+            "a declared-external host survives on the key; an undeclared origin \
+             is still stripped so a self-call can match"
+        );
+    }
+
     /// A data call as the fifth pass sees it. `span` carries the
     /// `apply_candidate_map` stamp: `Some` when the model's `candidate_id`
     /// joined a real SWC HTTP candidate, `None` when the model reported an

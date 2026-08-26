@@ -544,6 +544,13 @@ impl UrlNormalizer {
     /// path and match its own endpoint (a literal origin that survived into the
     /// key could match nothing and evaded the self-call / decoy checks).
     ///
+    /// The one exception is a host DECLARED in `externalDomains`: it is kept
+    /// VERBATIM, like a declared-external env-var base. For a declared host the
+    /// origin is not incidental prefix, it is the classification — stripped, the
+    /// key is a bare path that reads exactly like an internal call, and the
+    /// declaration can no longer exclude it from matching. `internalDomains`
+    /// still wins for a host named in both.
+    ///
     /// An UNKNOWN/undeclared ENV-VAR base (`${SOME_URL}/charges`,
     /// `${process.env.STRIPE_URL}/charges` — not in `internalEnvVars`) is still
     /// returned VERBATIM: there is no concrete origin to strip, so keeping the
@@ -570,11 +577,32 @@ impl UrlNormalizer {
     pub fn consumer_call_path(&self, url: &str) -> String {
         let trimmed = url.trim_matches(|c| c == '`' || c == '"' || c == '\'');
         let is_relative_path = trimmed.starts_with('/') && !trimmed.starts_with("//");
-        let is_absolute_url = trimmed.starts_with("http://")
-            || trimmed.starts_with("https://")
-            || trimmed.starts_with("//");
+        let has_scheme = trimmed.starts_with("http://") || trimmed.starts_with("https://");
+        let is_absolute_url = has_scheme || trimmed.starts_with("//");
         let normalized = self.normalize(url);
-        if normalized.is_internal || is_relative_path || is_absolute_url {
+        if normalized.is_internal {
+            return normalized.path;
+        }
+        // A host the service DECLARED in `externalDomains` keeps its origin,
+        // even though a literal absolute origin is otherwise a structural
+        // prefix to strip. The origin IS the classification here: stripped, the
+        // key is a bare `/user` that no longer carries the declaration, so
+        // every downstream consumer of the key (`find_matching_endpoints_with_
+        // normalizer`, the uploaded call in `mount_graph_to_api_details`) reads
+        // the call as internal and reports it as a missing endpoint. Trimmed,
+        // not raw: `canonical_path_has_literal_segment` and
+        // `is_valid_route_shape` gate on a bare `http(s)://` prefix, so a
+        // surviving source quote would drop the call as noise instead.
+        //
+        // Scheme-prefixed only, not every `is_absolute_url` shape: a
+        // protocol-relative `//host/path` key would fail the same `http(s)://`
+        // prefix test that every reader of this key applies, so keeping it
+        // whole would produce a shape nothing downstream recognises as
+        // external. That shape keeps its existing strip.
+        if normalized.is_external && has_scheme {
+            return trimmed.to_string();
+        }
+        if is_relative_path || is_absolute_url {
             return normalized.path;
         }
         // A base the user DECLARED external stays verbatim whatever its shape —
@@ -1094,6 +1122,110 @@ mod tests {
         assert!(
             !param.contains("process.env"),
             "internal base var must be stripped, got {param}"
+        );
+    }
+
+    /// A literal absolute URL whose host the service DECLARED in
+    /// `externalDomains` keeps its origin on the match key.
+    ///
+    /// The origin strip exists so a self-call over `http://localhost:PORT/...`
+    /// canonicalizes to a bare path; applying it to a declared-external host
+    /// destroys the only evidence downstream has that the call leaves the
+    /// system — the key becomes `/user`, indistinguishable from an internal
+    /// call to a producer nobody declares, and the call is reported missing.
+    #[test]
+    fn consumer_call_path_keeps_declared_external_absolute_url_verbatim() {
+        // Written as full URLs, exactly as carrick.json allows.
+        let config = Config {
+            external_domains: [
+                "https://api.github.com".to_string(),
+                "https://github.com".to_string(),
+                "https://api.resend.com".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let normalizer = UrlNormalizer::new(&config);
+
+        assert_eq!(
+            normalizer.consumer_call_path("https://api.github.com/user"),
+            "https://api.github.com/user"
+        );
+        assert_eq!(
+            normalizer.consumer_call_path("https://github.com/login/oauth/access_token"),
+            "https://github.com/login/oauth/access_token"
+        );
+        // A declared-external host with `${...}` PATH segments stays whole too.
+        assert_eq!(
+            normalizer.consumer_call_path(
+                "https://api.github.com/user/installations/${installationId}/repositories"
+            ),
+            "https://api.github.com/user/installations/${installationId}/repositories"
+        );
+
+        // A module-level const base (`const RESEND_ENDPOINT = "https://…"`)
+        // reaches here already resolved to its literal URL, so it is the same
+        // case — no separate const resolution runs in this crate.
+        assert_eq!(
+            normalizer.consumer_call_path("https://api.resend.com/emails"),
+            "https://api.resend.com/emails"
+        );
+
+        // Source quoting must not survive: `canonical_path_has_literal_segment`
+        // and `is_valid_route_shape` both gate on a bare `http(s)://` prefix, so
+        // a retained wrapper quote would silently drop the call as noise.
+        assert_eq!(
+            normalizer.consumer_call_path("\"https://api.github.com/user\""),
+            "https://api.github.com/user"
+        );
+        assert_eq!(
+            normalizer.consumer_call_path("`https://api.github.com/user`"),
+            "https://api.github.com/user"
+        );
+
+        // A query string rides along on the key. Every reader tolerates it —
+        // `canonical_path_has_literal_segment` cuts at `?` before its prefix
+        // test, `is_valid_route_shape`'s cleanliness test permits it — and it
+        // is part of the verbatim target, so it is retained rather than
+        // trimmed to a bare path.
+        assert_eq!(
+            normalizer.consumer_call_path("https://api.github.com/user/emails?per_page=100"),
+            "https://api.github.com/user/emails?per_page=100"
+        );
+
+        // A protocol-relative origin is NOT kept whole even when declared: the
+        // key would fail the `http(s)://` test every reader applies, so it
+        // keeps its existing strip rather than gaining an unrecognised shape.
+        assert_eq!(
+            normalizer.consumer_call_path("//api.github.com/user"),
+            "/user"
+        );
+
+        // Unchanged: an UNDECLARED absolute origin is still a structural prefix
+        // and is still stripped, which is what lets a self-call match.
+        assert_eq!(
+            normalizer.consumer_call_path("http://localhost:4002/warehouses/${wid}"),
+            "/warehouses/:wid"
+        );
+        assert_eq!(
+            normalizer.consumer_call_path("https://orders.internal/api/orders"),
+            "/api/orders"
+        );
+    }
+
+    /// `internalDomains` still wins over `externalDomains` for a host named in
+    /// both, so the fix cannot silently reclassify an internal call.
+    #[test]
+    fn consumer_call_path_internal_declaration_wins_over_external() {
+        let config = Config {
+            internal_domains: ["api.company.com".to_string()].into_iter().collect(),
+            external_domains: ["api.company.com".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            UrlNormalizer::new(&config).consumer_call_path("https://api.company.com/users"),
+            "/users"
         );
     }
 
