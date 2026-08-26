@@ -4113,6 +4113,7 @@ mod tests {
             PackageInfo {
                 name: "express".to_string(),
                 version: "4.18.0".to_string(),
+                spec: "^4.18.0".to_string(),
                 source_path: PathBuf::from(abs("package.json")),
             },
         );
