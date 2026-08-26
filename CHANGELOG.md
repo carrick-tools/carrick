@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.21](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.20...carrick-v0.3.21) (2026-08-26)
+
+
+### Bug Fixes
+
+* **sdk-edges:** an empty SDK join is Some(empty), not None ([#578](https://github.com/carrick-tools/carrick/issues/578)) ([277ab01](https://github.com/carrick-tools/carrick/commit/277ab01994df70058f07348781707f8517a6d138))
+
 ## [0.3.20](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.19...carrick-v0.3.20) (2026-08-26)
 
 
