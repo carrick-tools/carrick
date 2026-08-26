@@ -40,7 +40,17 @@ pub struct PackageJson {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageInfo {
     pub name: String,
+    /// The cleaned version: range operators stripped and ranges collapsed to a
+    /// single version (see `clean_version_spec`). Lossy by design — `^3.0.0`
+    /// and a `3.0.0` pin both clean to `3.0.0`.
     pub version: String,
+    /// The dependency specifier exactly as written in package.json (`^3.0.0`,
+    /// `~1.2.3`, `>=2 <3`, `workspace:*`, a git URL). The cloud uses this raw
+    /// form for semver-range conflict analysis, which `version` cannot answer
+    /// because the operators are already gone by then. `default` for payloads
+    /// serialised before the field existed.
+    #[serde(default)]
+    pub spec: String,
     pub source_path: PathBuf,
 }
 
@@ -166,6 +176,7 @@ impl Packages {
                                     PackageInfo {
                                         name: name.clone(),
                                         version: clean_version,
+                                        spec: version_spec.clone(),
                                         source_path: source_path.clone(),
                                     },
                                 );
@@ -177,6 +188,7 @@ impl Packages {
                                 PackageInfo {
                                     name: name.clone(),
                                     version: clean_version,
+                                    spec: version_spec.clone(),
                                     source_path: source_path.clone(),
                                 },
                             );
@@ -288,6 +300,78 @@ mod tests {
             !names.contains("koa"),
             "node_modules packages are not internal"
         );
+    }
+
+    /// `version` is the lossy cleaned form; `spec` must carry the declaration
+    /// byte-for-byte so the cloud can tell a caret range from a pin. Expected
+    /// versions are hardcoded rather than re-derived from `clean_version_spec`,
+    /// so a regression in the cleaning is caught here too.
+    #[test]
+    fn resolve_dependencies_keeps_the_raw_spec_beside_the_cleaned_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        std::fs::write(
+            &manifest,
+            r#"{
+                "name": "svc",
+                "dependencies": {
+                    "a": "^3.0.0",
+                    "b": "~1.2.3",
+                    "c": "1.0.0 - 2.0.0",
+                    "d": "workspace:*"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let packages = Packages::new(vec![manifest]).unwrap();
+        let expected = [
+            ("a", "3.0.0", "^3.0.0"),
+            ("b", "1.2.3", "~1.2.3"),
+            ("c", "2.0.0", "1.0.0 - 2.0.0"),
+            ("d", "workspace:*", "workspace:*"),
+        ];
+        for (name, version, spec) in expected {
+            let info = packages
+                .merged_dependencies
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} missing from merged_dependencies"));
+            assert_eq!(info.version, version, "cleaned version for {name}");
+            assert_eq!(info.spec, spec, "raw spec for {name}");
+        }
+    }
+
+    /// When two manifests declare the same package the higher version wins —
+    /// and `spec` must follow the winner, in both file orders (the update
+    /// branch and the keep-existing branch).
+    #[test]
+    fn resolve_dependencies_keeps_the_winning_manifests_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let low = dir.path().join("low/package.json");
+        let high = dir.path().join("high/package.json");
+        std::fs::create_dir_all(low.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(high.parent().unwrap()).unwrap();
+        std::fs::write(
+            &low,
+            r#"{ "name": "low", "dependencies": { "lodash": "^4.17.20" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &high,
+            r#"{ "name": "high", "dependencies": { "lodash": "~4.17.30" } }"#,
+        )
+        .unwrap();
+
+        for paths in [
+            vec![low.clone(), high.clone()],
+            vec![high.clone(), low.clone()],
+        ] {
+            let packages = Packages::new(paths.clone()).unwrap();
+            let info = packages.merged_dependencies.get("lodash").unwrap();
+            assert_eq!(info.version, "4.17.30", "order {paths:?}");
+            assert_eq!(info.spec, "~4.17.30", "order {paths:?}");
+            assert_eq!(info.source_path, high, "order {paths:?}");
+        }
     }
 
     /// Regression anchor on the real corpus-3 fixture: the workspace member
