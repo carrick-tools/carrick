@@ -95,6 +95,20 @@ fi
 rm -f /tmp/carrick-clippy-output.txt
 echo "✅ Clippy checks passed!"
 
+# Build the type sidecar first: several integration tests spawn
+# src/sidecar/dist and either fail against a stale build or skip silently
+# when there is none, so a green run on an old dist proves nothing.
+if [ -f src/sidecar/package.json ]; then
+    echo ""
+    echo "Building type sidecar..."
+    if ! (cd src/sidecar && npm run build --silent); then
+        echo ""
+        echo "❌ Sidecar build failed. Run: cd src/sidecar && npm ci && npm run build"
+        exit 1
+    fi
+    echo "✅ Sidecar built"
+fi
+
 # Run Rust tests
 echo ""
 echo "Running Rust test suite..."

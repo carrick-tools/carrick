@@ -122,6 +122,12 @@ async fn incremental_path_populates_intent() {
     // depends on these vars.
     unsafe {
         std::env::set_var("CARRICK_MOCK_ALL", "1");
+        // The engine refuses to upload from a pull_request run or a
+        // non-main ref (anti-pollution guard). This scan targets a temp repo
+        // and a mock store, so the runner's GitHub context must not apply —
+        // in CI on a PR it made scan #1 upload nothing.
+        std::env::remove_var("GITHUB_EVENT_NAME");
+        std::env::remove_var("GITHUB_REF");
     }
 
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/koa-api");
@@ -211,6 +217,12 @@ async fn incremental_path_populates_intent() {
 async fn incremental_path_reuses_intents_from_previous_scan() {
     unsafe {
         std::env::set_var("CARRICK_MOCK_ALL", "1");
+        // The engine refuses to upload from a pull_request run or a
+        // non-main ref (anti-pollution guard). This scan targets a temp repo
+        // and a mock store, so the runner's GitHub context must not apply —
+        // in CI on a PR it made scan #1 upload nothing.
+        std::env::remove_var("GITHUB_EVENT_NAME");
+        std::env::remove_var("GITHUB_REF");
     }
 
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/koa-api");

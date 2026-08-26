@@ -84,6 +84,7 @@ pub fn collect_internal_package_names(
 ) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
     let walker = walkdir::WalkDir::new(repo_root)
+        .sort_by_file_name()
         .into_iter()
         .filter_entry(|e| {
             e.depth() == 0

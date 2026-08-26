@@ -256,6 +256,7 @@ impl WorkspaceIndex {
 /// hands back.
 fn manifest_paths(repo_root: &Path) -> Vec<PathBuf> {
     let walker = walkdir::WalkDir::new(repo_root)
+        .sort_by_file_name()
         .follow_links(true)
         .into_iter()
         .filter_entry(|e| {

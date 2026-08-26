@@ -291,6 +291,7 @@ pub fn scan_repo(scan_roots: &[PathBuf], service_files: &[PathBuf]) -> GraphqlEx
     let mut seen_sdl: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for root in scan_roots {
         for entry in WalkDir::new(root)
+            .sort_by_file_name()
             .into_iter()
             .filter_entry(|e| {
                 !e.file_name()
