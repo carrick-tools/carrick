@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.22](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.21...carrick-v0.3.22) (2026-08-31)
+
+
+### Bug Fixes
+
+* **scanner:** class-controller route extraction - producer path guard and imported-controller resolution ([#580](https://github.com/carrick-tools/carrick/issues/580)) ([#585](https://github.com/carrick-tools/carrick/issues/585)) ([9d6a906](https://github.com/carrick-tools/carrick/commit/9d6a90673907ce03b9596cd4213aa27f23d22640))
+* **scanner:** resolve callee lists from the AST, not body text ([#581](https://github.com/carrick-tools/carrick/issues/581)) ([#583](https://github.com/carrick-tools/carrick/issues/583)) ([4e545a9](https://github.com/carrick-tools/carrick/commit/4e545a93fab16180111e8636eb1392c87b6eed9b))
+* **scanner:** same-named definitions in different files keep distinct rows ([#582](https://github.com/carrick-tools/carrick/issues/582)) ([#587](https://github.com/carrick-tools/carrick/issues/587)) ([17fae26](https://github.com/carrick-tools/carrick/commit/17fae263973c4d8583dbf9ceafd2cfd045bb8fad))
+
 ## [0.3.21](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.20...carrick-v0.3.21) (2026-08-26)
 
 
