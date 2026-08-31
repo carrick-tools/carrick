@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.23](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.22...carrick-v0.3.23) (2026-08-31)
+
+
+### Features
+
+* **scanner:** emit per-function retrieval tokens ([#589](https://github.com/carrick-tools/carrick/issues/589)) ([0c00da7](https://github.com/carrick-tools/carrick/commit/0c00da76c43b1810c4eeea8eb642cb206dac0fad))
+
 ## [0.3.22](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.21...carrick-v0.3.22) (2026-08-31)
 
 
