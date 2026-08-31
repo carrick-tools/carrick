@@ -11,7 +11,7 @@
 //! serves as the index; GitHub is the source of truth for code.
 
 use crate::agent_service::{AgentCallError, AgentService, rate_limit_tripped};
-use crate::visitor::{FunctionCallRef, FunctionDefinition, ImportedSymbol};
+use crate::visitor::{FunctionDefinition, ImportedSymbol};
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -85,62 +85,32 @@ fn is_trivial_body(body: &str) -> bool {
     !trimmed.contains('\n') && trimmed.chars().count() <= TRIVIAL_BODY_MAX_CHARS
 }
 
-/// True when `body` references `name` as a standalone JS identifier.
+/// The local functions `def` calls, as definition keys.
 ///
-/// A plain `contains` over-matches short names — `id` inside `userId`, `get`
-/// inside `getUser`, names inside comments notwithstanding — which fabricates
-/// call-graph edges: callers fold phantom callees' intents into their content
-/// hash (needless regeneration) and phantom back-edges create cycles that dump
-/// real functions into the unordered final topological level (#55, #141). A
-/// match counts only when not flanked by identifier characters (`[A-Za-z0-9_$]`).
-fn body_references_identifier(body: &str, name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    let is_ident_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
-    let mut search_from = 0;
-    while let Some(pos) = body[search_from..].find(name) {
-        let start = search_from + pos;
-        let end = start + name.len();
-        let before_ok = !body[..start].chars().next_back().is_some_and(is_ident_char);
-        let after_ok = !body[end..].chars().next().is_some_and(is_ident_char);
-        if before_ok && after_ok {
-            return true;
-        }
-        // Overlap-safe: re-search from the next character of this match.
-        search_from = start + name.chars().next().map_or(1, |c| c.len_utf8());
-    }
-    false
-}
-
-/// Does `body` (the body of the function keyed `caller_key`) reference the
-/// local function keyed `candidate_key`?
+/// Reads the call edges `crate::call_graph` resolved at discovery time (from
+/// the AST, through the calling file's imports) rather than re-deriving
+/// anything from body text. Text matching is what put `$`, `skeleton` and
+/// `ask` in the callee list of a formatter whose body only mentions them
+/// inside a template literal (#581).
 ///
-/// Class members are keyed as `Class.member` (see FunctionDefinitionExtractor;
-/// a static colliding with a same-named instance member is `Class.static.member`),
-/// but call sites reference the bare member name (`foo(...)`, `this.foo(...)`,
-/// `Class.foo(...)`) — never the dotted key as one identifier. So identifier
-/// matching runs on the bare name (the LAST segment), and a method callee
-/// additionally requires class evidence from the FIRST segment: either the same
-/// enclosing class as the caller (the `this.foo()` case) or a reference to its
-/// class name in the body (the `Class.foo()` case).
-/// Module-level functions keep the exact pre-existing behaviour.
-fn is_local_callee(caller_key: &str, body: &str, candidate_key: &str) -> bool {
-    fn bare_name(key: &str) -> &str {
-        key.rsplit_once('.').map_or(key, |(_, tail)| tail)
-    }
-    fn class_of(key: &str) -> Option<&str> {
-        key.split_once('.').map(|(head, _)| head)
-    }
-    candidate_key != caller_key
-        && body_references_identifier(body, bare_name(candidate_key))
-        && match class_of(candidate_key) {
-            None => true,
-            Some(callee_class) => {
-                class_of(caller_key) == Some(callee_class)
-                    || body_references_identifier(body, callee_class)
-            }
-        }
+/// An edge counts only when the merged map holds a row under that key AND
+/// that file. The map is keyed by definition name alone, so a same-named
+/// function in another file collapses onto one row (#582); without the file
+/// check a caller would take its dependency ordering, and its callee intent
+/// context, from an unrelated function.
+fn resolved_callees(
+    def: &FunctionDefinition,
+    function_definitions: &HashMap<String, FunctionDefinition>,
+) -> Vec<String> {
+    def.calls
+        .iter()
+        .filter(|call| {
+            function_definitions
+                .get(&call.name)
+                .is_some_and(|callee| callee.file_path.to_string_lossy() == call.file_path)
+        })
+        .map(|call| call.name.clone())
+        .collect()
 }
 
 /// A cache-miss function awaiting its `/generate-intent` call: everything the
@@ -258,50 +228,22 @@ pub async fn generate_function_intents(
 
     debug!("Generating intents for {} function(s)", eligible.len());
 
-    // Build a local call graph: for each function, which other local functions does it reference?
-    let local_fn_names: HashSet<&str> = function_definitions.keys().map(|s| s.as_str()).collect();
+    // Dependency order comes from the call edges resolved at discovery
+    // (`crate::call_graph`), which are already on each definition's `calls`.
+    // Leaves first, so a caller's prompt carries its callees' intents.
     let mut deps: HashMap<String, Vec<String>> = HashMap::new();
-
     for name in &eligible {
-        if let Some(def) = function_definitions.get(name)
-            && let Some(ref body) = def.body_source
-        {
-            let called: Vec<String> = local_fn_names
-                .iter()
-                .filter(|&&fn_name| is_local_callee(name, body, fn_name))
-                .map(|&s| s.to_string())
-                .collect();
-            deps.insert(name.clone(), called);
-        }
-    }
-
-    // Populate the `calls` field on each function with references to callees
-    for name in &eligible {
-        if let Some(called) = deps.get(name) {
-            let call_refs: Vec<FunctionCallRef> = called
-                .iter()
-                .filter_map(|callee_name| {
-                    function_definitions
-                        .get(callee_name)
-                        .map(|callee_def| FunctionCallRef {
-                            name: callee_name.clone(),
-                            file_path: callee_def.file_path.to_string_lossy().to_string(),
-                            line_number: callee_def.line_number,
-                        })
-                })
-                .collect();
-            if let Some(def) = function_definitions.get_mut(name) {
-                def.calls = call_refs;
-            }
+        if let Some(def) = function_definitions.get(name) {
+            deps.insert(name.clone(), resolved_callees(def, function_definitions));
         }
     }
 
     // CARRICK_SKIP_INTENTS: stop before any /generate-intent lambda call.
     // Intents are one LLM call per eligible function — the dominant cost of
     // scanning a large repo — and feed only the MCP index; no cross-repo
-    // analysis or eval dimension consumes them. Everything deterministic has
-    // already happened above (`calls` is populated), and body_source is still
-    // stripped (source stays in GitHub, not AWS).
+    // analysis or eval dimension consumes them. Nothing deterministic is lost:
+    // `calls` was resolved at discovery, before this function was reached, and
+    // body_source is still stripped (source stays in GitHub, not AWS).
     if std::env::var("CARRICK_SKIP_INTENTS").is_ok() {
         debug!(
             "CARRICK_SKIP_INTENTS set — skipping intent generation for {} function(s)",
@@ -581,58 +523,32 @@ fn topological_levels(names: &[String], deps: &HashMap<String, Vec<String>>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::visitor::FunctionCallRef;
 
+    /// Dependency order comes from the resolved call edges, not from body
+    /// text. `processId` contains "id" as a substring and `id`'s body names
+    /// `processId` in a comment; under the old text matcher that pair formed
+    /// a fake cycle that dumped both functions into the unordered cycle level
+    /// (#55, #141, #581).
     #[test]
-    fn identifier_match_requires_word_boundaries() {
-        // Substrings of longer identifiers are not references (#55, #141).
-        assert!(!body_references_identifier("return userId;", "id"));
-        assert!(!body_references_identifier("return getUser();", "get"));
-        assert!(!body_references_identifier("run_all();", "run"));
-        assert!(!body_references_identifier("fetchData$();", "fetchData"));
-
-        // Real references still match.
-        assert!(body_references_identifier("return id;", "id"));
-        assert!(body_references_identifier("const x = get();", "get"));
-        assert!(body_references_identifier("await helper(1)", "helper"));
-        // Passed as a callback — still a dependency for intent purposes.
-        assert!(body_references_identifier("arr.map(helper)", "helper"));
-        // Boundary positions: start and end of the body.
-        assert!(body_references_identifier("helper()", "helper"));
-        assert!(body_references_identifier("return helper", "helper"));
-    }
-
-    #[test]
-    fn identifier_match_finds_later_occurrence_after_substring_hit() {
-        // First occurrence is embedded in a longer identifier; a later
-        // standalone occurrence must still be found.
-        assert!(body_references_identifier("getUser(); get();", "get"));
-        // Overlap-safety: "aa" inside "aaa" — no standalone "aa" with
-        // boundaries on both sides.
-        assert!(!body_references_identifier("aaab", "aa"));
-    }
-
-    #[test]
-    fn phantom_substring_edges_no_longer_create_cycles() {
-        // `processId` contains "id"; with substring matching, `id` ← processId
-        // plus a real processId ← id edge formed a fake cycle that dumped both
-        // functions into the unordered cycle level.
+    fn deps_come_from_resolved_edges_not_body_text() {
         let names = vec!["id".to_string(), "processId".to_string()];
         let mut defs = HashMap::new();
-        defs.insert("id".to_string(), def_with_body("id", "return 1;"));
+        defs.insert(
+            "id".to_string(),
+            def_with_body("id", "// processId calls this\nreturn 1;"),
+        );
         defs.insert(
             "processId".to_string(),
-            def_with_body("processId", "return id();"),
+            with_calls(
+                def_with_body("processId", "const n = id();\nreturn n;"),
+                vec![call_ref("id", "test.ts", 1, 1)],
+            ),
         );
 
         let mut deps = HashMap::new();
         for name in &names {
-            let body = defs[name].body_source.as_ref().unwrap();
-            let called: Vec<String> = names
-                .iter()
-                .filter(|n| n.as_str() != name && body_references_identifier(body, n))
-                .cloned()
-                .collect();
-            deps.insert(name.clone(), called);
+            deps.insert(name.clone(), resolved_callees(&defs[name], &defs));
         }
 
         assert_eq!(deps["id"], Vec::<String>::new());
@@ -642,6 +558,34 @@ mod tests {
         assert_eq!(levels.len(), 2, "leaf level then caller level, no cycle");
         assert_eq!(levels[0], vec!["id".to_string()]);
         assert_eq!(levels[1], vec!["processId".to_string()]);
+    }
+
+    /// An edge counts as a dependency only when the merged map holds a row
+    /// under that key AND that file. A key that collapsed onto another file's
+    /// definition (#582), or that has no row at all, is dropped rather than
+    /// folded into the caller's intent context.
+    #[test]
+    fn resolved_callees_require_a_matching_row_and_file() {
+        let mut defs = HashMap::new();
+        defs.insert("helper".to_string(), def_with_body("helper", "return 1;"));
+        defs.insert(
+            "main".to_string(),
+            with_calls(
+                def_with_body("main", "return helper();"),
+                vec![
+                    call_ref("helper", "test.ts", 1, 1),
+                    // Same key, another file: the row we hold is not this one.
+                    call_ref("helper", "other.ts", 4, 2),
+                    // No row at all.
+                    call_ref("vanished", "gone.ts", 7, 3),
+                ],
+            ),
+        );
+
+        assert_eq!(
+            resolved_callees(&defs["main"], &defs),
+            vec!["helper".to_string()]
+        );
     }
 
     #[test]
@@ -825,6 +769,19 @@ mod tests {
     /// points.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    fn call_ref(name: &str, file: &str, line: u32, call_site: u32) -> FunctionCallRef {
+        FunctionCallRef {
+            name: name.to_string(),
+            file_path: file.to_string(),
+            line_number: line,
+            call_site_line: call_site,
+        }
+    }
+
+    fn with_calls(def: FunctionDefinition, calls: Vec<FunctionCallRef>) -> FunctionDefinition {
+        FunctionDefinition { calls, ..def }
+    }
+
     fn def_with_body(name: &str, body: &str) -> FunctionDefinition {
         FunctionDefinition {
             name: name.to_string(),
@@ -857,7 +814,13 @@ mod tests {
         let main_body = "const base = order.subtotal;\nreturn helper(base);";
         let mut defs = HashMap::new();
         defs.insert("helper".to_string(), def_with_body("helper", helper_body));
-        defs.insert("main".to_string(), def_with_body("main", main_body));
+        defs.insert(
+            "main".to_string(),
+            with_calls(
+                def_with_body("main", main_body),
+                vec![call_ref("helper", "test.ts", 1, 2)],
+            ),
+        );
 
         // Reconstruct the exact hashes the generator will compute.
         let helper_intent = "applies the regional rate to a base amount";
@@ -938,8 +901,8 @@ mod tests {
     }
 
     /// CARRICK_SKIP_INTENTS stops intent generation before any lambda call
-    /// while keeping the deterministic parts: `calls` is populated and
-    /// body_source is stripped. Both cases run inside one test (sequentially)
+    /// while keeping the deterministic parts: the `calls` edges resolved at
+    /// discovery survive and body_source is stripped. Both cases run inside one test (sequentially)
     /// because env vars are process-global. Under CARRICK_MOCK_ALL the lambda
     /// path returns a mock intent, so pre-fix the skip case would record
     /// `Some("Mock intent: …")` and fail the `None` assertions.
@@ -951,7 +914,15 @@ mod tests {
         let make_defs = || {
             let mut defs = HashMap::new();
             defs.insert("helper".to_string(), def_with_body("helper", helper_body));
-            defs.insert("main".to_string(), def_with_body("main", main_body));
+            // Call edges are resolved at discovery (crate::call_graph), so a
+            // definition reaching the generator already carries them.
+            defs.insert(
+                "main".to_string(),
+                with_calls(
+                    def_with_body("main", main_body),
+                    vec![call_ref("helper", "test.ts", 1, 2)],
+                ),
+            );
             defs
         };
         let agent = AgentService::new();
@@ -985,9 +956,11 @@ mod tests {
         assert!(defs["helper"].intent.is_none());
         assert!(defs["main"].intent.is_none());
         assert!(defs["helper"].intent_input_hash.is_none());
-        // Deterministic outputs are intact: caller→callee edge + stripping.
+        // Deterministic outputs are intact: the caller→callee edge survives
+        // the early exit, and bodies are still stripped.
         assert_eq!(defs["main"].calls.len(), 1);
         assert_eq!(defs["main"].calls[0].name, "helper");
+        assert_eq!(defs["main"].calls[0].call_site_line, 2);
         assert!(defs["helper"].body_source.is_none());
         assert!(defs["main"].body_source.is_none());
 
@@ -1017,82 +990,6 @@ mod tests {
             Some("Mock intent: function does something.")
         );
         assert!(defs["main"].intent_input_hash.is_some());
-    }
-
-    #[test]
-    fn method_callee_matches_this_calls_within_the_same_class() {
-        // `Presenter.toJson` calls `this.isFinished(...)`: same class, so the
-        // bare-name match is enough.
-        assert!(is_local_callee(
-            "Presenter.toJson",
-            "return { done: this.isFinished(status) };",
-            "Presenter.isFinished"
-        ));
-        // Private members work the same way (`this.#reload()`).
-        assert!(is_local_callee(
-            "Job.run",
-            "await this.#reload();",
-            "Job.#reload"
-        ));
-    }
-
-    #[test]
-    fn method_callee_matches_static_calls_via_class_name() {
-        assert!(is_local_callee(
-            "serialiseRun",
-            "return Presenter.isFinished(status);",
-            "Presenter.isFinished"
-        ));
-    }
-
-    #[test]
-    fn method_callee_requires_class_evidence_across_classes() {
-        // Another class has a same-named method; a bare `this.create(...)`
-        // in an unrelated class must not link to it.
-        assert!(!is_local_callee(
-            "OrderController.submit",
-            "return this.create(payload);",
-            "UserService.create"
-        ));
-        // ...but naming the class is evidence enough.
-        assert!(is_local_callee(
-            "OrderController.submit",
-            "return UserService.create(payload);",
-            "UserService.create"
-        ));
-    }
-
-    #[test]
-    fn collision_qualified_static_keys_resolve_class_from_first_segment() {
-        // `Counter.static.create` (a static colliding with an instance member):
-        // bare name is the LAST segment, class evidence the FIRST.
-        assert!(is_local_callee(
-            "main",
-            "return Counter.create(1);",
-            "Counter.static.create"
-        ));
-        // Same-class caller links too.
-        assert!(is_local_callee(
-            "Counter.report",
-            "return Counter.create(1);",
-            "Counter.static.create"
-        ));
-        // No class evidence, no edge.
-        assert!(!is_local_callee(
-            "Other.run",
-            "return this.create(1);",
-            "Counter.static.create"
-        ));
-    }
-
-    #[test]
-    fn module_level_callees_keep_pre_existing_behaviour() {
-        assert!(is_local_callee("main", "return helper();", "helper"));
-        assert!(!is_local_callee("main", "return userHelper();", "helper"));
-        // Self-reference is never an edge.
-        assert!(!is_local_callee("helper", "return helper();", "helper"));
-        // A method body referencing a module-level function links normally.
-        assert!(is_local_callee("Svc.run", "return helper();", "helper"));
     }
 
     fn pending(name: &str) -> Pending {
