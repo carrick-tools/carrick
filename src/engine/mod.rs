@@ -2950,22 +2950,53 @@ fn discover_files_and_symbols(
     // Extract imported symbols and function definitions by parsing files
     let mut all_imported_symbols = HashMap::new();
     let mut all_function_definitions = HashMap::new();
+    // Per-file call-resolution inputs, kept beside the merged map because the
+    // merged map is keyed by definition name alone: two same-named functions
+    // in different files collapse onto one row (#582), and resolving edges
+    // against that would make a correct edge depend on walk order. Keyed by
+    // CANONICAL path, which is what import specifiers resolve to — a repo
+    // reached through a symlink would otherwise miss every cross-file lookup
+    // with no error.
+    let mut per_file_calls: HashMap<PathBuf, crate::call_graph::FileCallIndex> = HashMap::new();
 
     for file_path in &files {
         if let Some(module) = parse_file(file_path, &cm, &handler) {
             // Extract import symbols
             let mut import_extractor = ImportSymbolExtractor::new();
             module.visit_with(&mut import_extractor);
-            all_imported_symbols.extend(import_extractor.imported_symbols);
+            let file_imports = import_extractor.imported_symbols;
+            all_imported_symbols.extend(file_imports.clone());
 
             // Extract function definitions with type annotations and source text
             let mut func_extractor =
                 FunctionDefinitionExtractor::new(file_path.clone(), cm.clone());
             module.visit_with(&mut func_extractor);
             func_extractor.finalize_exports();
+
+            let canonical = file_path
+                .canonicalize()
+                .unwrap_or_else(|_| file_path.clone());
+            per_file_calls.insert(
+                canonical,
+                crate::call_graph::FileCallIndex {
+                    path: file_path.clone(),
+                    definitions: func_extractor
+                        .function_definitions
+                        .iter()
+                        .map(|(key, def)| (key.clone(), def.line_number))
+                        .collect(),
+                    callees: func_extractor.callee_refs,
+                    imports: file_imports,
+                },
+            );
             all_function_definitions.extend(func_extractor.function_definitions);
         }
     }
+
+    // Resolve the collected call sites into `FunctionDefinition::calls` while
+    // the per-file scopes are still in hand. Deterministic and LLM-free, so it
+    // runs on every path, `CARRICK_SKIP_INTENTS` included.
+    crate::call_graph::resolve_call_edges(&mut all_function_definitions, &per_file_calls);
 
     debug!(
         "Extracted {} imported symbols and {} function definitions from {} files",
@@ -4023,6 +4054,7 @@ mod tests {
                     name: "helper".to_string(),
                     file_path: "/home/runner/work/acme/acme/src/lib/helper.ts".to_string(),
                     line_number: 9,
+                    call_site_line: 4,
                 }],
                 return_type: None,
                 return_is_explicit: false,
@@ -6032,6 +6064,43 @@ mod tests {
         assert!(
             err.to_string().contains("No JS/TS source files"),
             "expected empty-scan error, got: {err}"
+        );
+    }
+
+    /// Discovery resolves call edges on a real checkout, not just in the
+    /// resolver's own unit tests. `Ledger.scrape` (src/index.ts:27) calls
+    /// `auditLog`, imported from `./util/audit.js` — so this covers the whole
+    /// production path: the walked file list, the canonical-path keying the
+    /// import lookup depends on, and the NodeNext `.js` → `.ts` rewrite.
+    /// Unit tests over hand-built maps cannot tell "resolution works" apart
+    /// from "resolution silently returns nothing here".
+    #[test]
+    fn discovery_resolves_call_edges_on_a_real_fixture() {
+        let repo = format!("{}/tests/fixtures/sdk-surface", env!("CARGO_MANIFEST_DIR"));
+        let cm: Lrc<SourceMap> = Default::default();
+
+        let (_files, _imports, definitions, _repo_name) =
+            discover_files_and_symbols(&repo, &Config::default(), cm).unwrap();
+
+        let scrape = definitions
+            .get("Ledger.scrape")
+            .expect("Ledger.scrape indexed");
+        let audit = scrape
+            .calls
+            .iter()
+            .find(|c| c.name == "auditLog")
+            .unwrap_or_else(|| panic!("no auditLog edge, got {:?}", scrape.calls));
+        assert!(
+            audit.file_path.ends_with("src/util/audit.ts"),
+            "edge must point at the imported module, got {}",
+            audit.file_path
+        );
+        assert_eq!(audit.line_number, 1, "auditLog is defined on line 1");
+        assert_eq!(audit.call_site_line, 27, "called on line 27 of index.ts");
+        assert!(
+            !scrape.calls.iter().any(|c| c.name == "chargeCard"),
+            "chargeCard is imported but never called by scrape, got {:?}",
+            scrape.calls
         );
     }
 

@@ -153,7 +153,136 @@ fn is_zero_u32(n: &u32) -> bool {
 pub struct FunctionCallRef {
     pub name: String,
     pub file_path: String,
+    /// Line the CALLEE is defined on, in `file_path`.
     pub line_number: u32,
+    /// Line the call is written on, in the CALLER's file. Zero when unknown.
+    /// Serde-defaulted so an index cached by an older scanner still
+    /// deserialises (it reports 0 until the next scan rewrites it).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub call_site_line: u32,
+}
+
+/// How a call site names its callee. Resolution differs per shape: a bare name
+/// is a module-scope binding, `this.x` is scoped to the enclosing class, and
+/// `obj.x` means nothing until `obj` itself is resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalleeShape {
+    /// `foo(...)`
+    Bare,
+    /// `this.foo(...)` / `this.#foo(...)`, inside the named class.
+    ThisMember(String),
+    /// `obj.foo(...)`, where `obj` is a plain identifier.
+    Member(String),
+}
+
+/// One call site inside a function body, as written in the AST.
+///
+/// Collected structurally, so a name that appears only in a string literal, a
+/// template literal or a comment is never recorded (#581). Resolution to a
+/// definition happens later, in [`crate::call_graph`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalleeRef {
+    /// The called member/binding name — `foo` in all three shapes.
+    pub name: String,
+    pub shape: CalleeShape,
+    /// Line the call is written on, in the caller's file.
+    pub line: u32,
+}
+
+/// Walks a function body and records every call expression's callee.
+///
+/// Nested functions and arrows are walked too: their calls sit inside the
+/// enclosing function's body and count as its dependencies. Entering a nested
+/// class clears the `this` context, so a `this.x()` written inside a class
+/// declared in the body resolves to nothing rather than to the outer class.
+struct CalleeCollector<'a> {
+    source_map: &'a swc_common::SourceMap,
+    enclosing_class: Option<String>,
+    out: Vec<CalleeRef>,
+}
+
+impl CalleeCollector<'_> {
+    /// Strip the wrappers that sit between a callee position and the
+    /// identifier it names — `(foo)()`, `foo!()`, `(foo as F)()`.
+    fn unwrap_expr(expr: &Expr) -> &Expr {
+        match expr {
+            Expr::Paren(paren) => Self::unwrap_expr(&paren.expr),
+            Expr::TsNonNull(non_null) => Self::unwrap_expr(&non_null.expr),
+            Expr::TsAs(as_expr) => Self::unwrap_expr(&as_expr.expr),
+            Expr::TsSatisfies(sat) => Self::unwrap_expr(&sat.expr),
+            Expr::TsTypeAssertion(assertion) => Self::unwrap_expr(&assertion.expr),
+            other => other,
+        }
+    }
+
+    fn line(&self, span: swc_common::Span) -> u32 {
+        if span.is_dummy() {
+            return 0;
+        }
+        self.source_map.lookup_char_pos(span.lo).line as u32
+    }
+
+    /// Record the callee of one call site. Anything that is not a bare
+    /// identifier or a single-level member access on an identifier or `this`
+    /// (`a.b.c()`, `super.x()`, `getHandler()()`) is deliberately dropped: it
+    /// cannot be resolved to a definition without type information, and a
+    /// guess here is exactly the false edge this pass exists to remove.
+    fn record(&mut self, callee: &Expr, span: swc_common::Span) {
+        let line = self.line(span);
+        match Self::unwrap_expr(callee) {
+            Expr::Ident(ident) => self.out.push(CalleeRef {
+                name: ident.sym.to_string(),
+                shape: CalleeShape::Bare,
+                line,
+            }),
+            Expr::Member(member) => {
+                let name = match &member.prop {
+                    MemberProp::Ident(prop) => prop.sym.to_string(),
+                    MemberProp::PrivateName(prop) => format!("#{}", prop.name),
+                    MemberProp::Computed(_) => return,
+                };
+                match Self::unwrap_expr(&member.obj) {
+                    Expr::This(_) => {
+                        if let Some(class) = self.enclosing_class.clone() {
+                            self.out.push(CalleeRef {
+                                name,
+                                shape: CalleeShape::ThisMember(class),
+                                line,
+                            });
+                        }
+                    }
+                    Expr::Ident(obj) => self.out.push(CalleeRef {
+                        name,
+                        shape: CalleeShape::Member(obj.sym.to_string()),
+                        line,
+                    }),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Visit for CalleeCollector<'_> {
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if let Callee::Expr(expr) = &call.callee {
+            self.record(expr, call.span);
+        }
+        call.visit_children_with(self);
+    }
+
+    /// `a?.b()` and `foo?.()` parse as an optional call, not a `CallExpr`.
+    fn visit_opt_call(&mut self, call: &OptCall) {
+        self.record(&call.callee, call.span);
+        call.visit_children_with(self);
+    }
+
+    fn visit_class(&mut self, class: &Class) {
+        let prev = self.enclosing_class.take();
+        class.visit_children_with(self);
+        self.enclosing_class = prev;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -304,6 +433,12 @@ impl Visit for TypeSymbolExtractor {
 /// Used to extract handler functions for type resolution in the multi-agent pipeline.
 pub struct FunctionDefinitionExtractor {
     pub function_definitions: HashMap<String, FunctionDefinition>,
+    /// Definition key → the call sites inside that definition's body, as
+    /// written in the AST. Kept beside `function_definitions` rather than on
+    /// `FunctionDefinition` because it is scan-local: `crate::call_graph`
+    /// consumes it immediately after discovery to populate
+    /// `FunctionDefinition::calls`, and nothing downstream sees it.
+    pub callee_refs: HashMap<String, Vec<CalleeRef>>,
     current_file_path: PathBuf,
     source_map: swc_common::sync::Lrc<swc_common::SourceMap>,
     /// Names of functions that are exported (populated by visit_export_decl / visit_named_export)
@@ -325,12 +460,45 @@ impl FunctionDefinitionExtractor {
     ) -> Self {
         Self {
             function_definitions: HashMap::new(),
+            callee_refs: HashMap::new(),
             current_file_path: file_path,
             source_map,
             exported_names: HashSet::new(),
             current_class: None,
             current_class_collisions: HashSet::new(),
         }
+    }
+
+    /// Every call site inside `node`, with the enclosing class (if any) so
+    /// `this.x()` can be resolved later. `node` is a function body, never the
+    /// whole file, so only that function's calls are recorded.
+    fn collect_callees<'a, N>(&'a self, node: &N) -> Vec<CalleeRef>
+    where
+        N: VisitWith<CalleeCollector<'a>>,
+    {
+        let mut collector = CalleeCollector {
+            source_map: &self.source_map,
+            enclosing_class: self.current_class.clone(),
+            out: Vec::new(),
+        };
+        node.visit_with(&mut collector);
+        collector.out
+    }
+
+    /// Record the call sites of a `Function` node (declaration, method,
+    /// function expression) under `key`.
+    fn record_fn_callees(&mut self, key: &str, function: &Function) {
+        let refs = match function.body.as_ref() {
+            Some(body) => self.collect_callees(body),
+            None => Vec::new(),
+        };
+        self.callee_refs.insert(key.to_string(), refs);
+    }
+
+    /// Record the call sites of an arrow function under `key`.
+    fn record_arrow_callees(&mut self, key: &str, arrow: &ArrowExpr) {
+        let refs = self.collect_callees(&*arrow.body);
+        self.callee_refs.insert(key.to_string(), refs);
     }
 
     /// Extract source text from a span, capped at 2000 chars
@@ -559,6 +727,7 @@ impl FunctionDefinitionExtractor {
     /// node is wrapped as an anonymous `FnExpr` so every downstream consumer
     /// of `FunctionNodeType` works unchanged.
     fn insert_method_definition(&mut self, name: String, function: &Function) {
+        self.record_fn_callees(&name, function);
         let arguments = self.extract_arguments(&function.params);
         let body_source = function
             .body
@@ -597,6 +766,7 @@ impl FunctionDefinitionExtractor {
     /// Insert a definition for an arrow-initialized class prop
     /// (`handle = () => { ... }`).
     fn insert_arrow_definition(&mut self, name: String, arrow: &ArrowExpr) {
+        self.record_arrow_callees(&name, arrow);
         let arguments = self.extract_arrow_arguments(&arrow.params);
         let body_source = self.extract_source(arrow.span);
         let line_number = self.line_number(arrow.span);
@@ -658,6 +828,7 @@ impl Visit for FunctionDefinitionExtractor {
                     let name = ident.sym.to_string();
                     self.exported_names.insert(name.clone());
                     // Capture the function since visit_fn_decl won't fire for default exports
+                    self.record_fn_callees(&name, &fn_expr.function);
                     let arguments = self.extract_arguments(&fn_expr.function.params);
                     let body_source = fn_expr
                         .function
@@ -730,6 +901,7 @@ impl Visit for FunctionDefinitionExtractor {
 
     fn visit_fn_decl(&mut self, fn_decl: &FnDecl) {
         let name = fn_decl.ident.sym.to_string();
+        self.record_fn_callees(&name, &fn_decl.function);
         let arguments = self.extract_arguments(&fn_decl.function.params);
         let body_source = fn_decl
             .function
@@ -777,6 +949,7 @@ impl Visit for FunctionDefinitionExtractor {
             if let Some(init) = &var_decl.init {
                 match &**init {
                     Expr::Arrow(arrow) => {
+                        self.record_arrow_callees(&name, arrow);
                         let arguments = self.extract_arrow_arguments(&arrow.params);
                         let body_source = self.extract_source(arrow.span);
                         let line_number = self.line_number(arrow.span);
@@ -806,6 +979,7 @@ impl Visit for FunctionDefinitionExtractor {
                         );
                     }
                     Expr::Fn(fn_expr) => {
+                        self.record_fn_callees(&name, &fn_expr.function);
                         let arguments = self.extract_arguments(&fn_expr.function.params);
                         let body_source = fn_expr
                             .function
@@ -938,6 +1112,7 @@ impl Visit for FunctionDefinitionExtractor {
                             derive_handler_name(&method_name, first_str_arg.as_deref());
                         // Don't overwrite named functions already captured
                         if !self.function_definitions.contains_key(&synthetic_name) {
+                            self.record_arrow_callees(&synthetic_name, arrow);
                             let arguments = self.extract_arrow_arguments(&arrow.params);
                             let body_source = self.extract_source(arrow.span);
                             let line_number = self.line_number(arrow.span);
@@ -973,6 +1148,7 @@ impl Visit for FunctionDefinitionExtractor {
                         let synthetic_name =
                             derive_handler_name(&method_name, first_str_arg.as_deref());
                         if !self.function_definitions.contains_key(&synthetic_name) {
+                            self.record_fn_callees(&synthetic_name, &fn_expr.function);
                             let arguments = self.extract_arguments(&fn_expr.function.params);
                             let body_source = fn_expr
                                 .function
