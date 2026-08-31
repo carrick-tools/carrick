@@ -6113,6 +6113,48 @@ mod tests {
         );
     }
 
+    /// The re-keying #582 introduced happens inside discovery, so the file
+    /// qualifier has to be repo-RELATIVE on the real path shapes discovery
+    /// sees: `repo_path` as the caller typed it (here a temp dir, which is a
+    /// symlink on macOS) and file paths as the walker yields them. An absolute
+    /// path in a key would ship a CI checkout prefix to the index, and
+    /// `relativize_function_definition_paths` rewrites values, never keys, so
+    /// nothing downstream would strip it.
+    #[test]
+    fn discovery_rekeys_same_named_definitions_with_a_relative_path() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        for (name, source) in [
+            (
+                "login/mfa.ts",
+                "export class MFAController {\n  post(url: string) {\n    return url;\n  }\n}\n",
+            ),
+            (
+                "register/mfa.ts",
+                "export class MFAController {\n  post(user: string) {\n    return user;\n  }\n}\n",
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+            std::fs::write(&path, source).expect("write");
+        }
+
+        let cm: Lrc<SourceMap> = Default::default();
+        let (_files, _imports, definitions, _repo_name) =
+            discover_files_and_symbols(&dir.path().to_string_lossy(), &Config::default(), cm)
+                .unwrap();
+
+        let mut keys: Vec<&String> = definitions.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "MFAController.post@login/mfa.ts",
+                "MFAController.post@register/mfa.ts"
+            ],
+            "both rows survive, each qualified by its repo-relative path"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Type-state enrichment / placeholder handling (#235)
     // -----------------------------------------------------------------------
