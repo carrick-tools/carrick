@@ -307,3 +307,47 @@ async fn test_packages_preserved_in_upload_download_cycle() {
         );
     }
 }
+
+/// The upload payload is exactly `serde_json::to_string(&CloudRepoData)`
+/// (`cloud_storage/aws_storage.rs`), so serialising one built from a real
+/// fixture parse is the end-to-end check that `tokens` reaches the cloud.
+/// `eval_output::EvalProjection` carries no function rows, so this is the only
+/// path the field travels.
+#[test]
+fn uploaded_json_carries_tokens_on_a_function_row() {
+    use carrick::parser::parse_file;
+    use carrick::visitor::FunctionDefinitionExtractor;
+    use swc_common::SourceMap;
+    use swc_common::errors::{ColorConfig, Handler};
+    use swc_common::sync::Lrc;
+    use swc_ecma_visit::VisitWith;
+
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/class-controller-api/src/controllers/report.ts");
+    let cm: Lrc<SourceMap> = Default::default();
+    let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
+    let module = parse_file(&fixture, &cm, &handler).expect("fixture parses");
+    let mut extractor = FunctionDefinitionExtractor::new(fixture.clone(), cm.clone());
+    module.visit_with(&mut extractor);
+    extractor.finalize_exports();
+
+    let mut data = create_test_repo_data("acme/reports", "abc123");
+    data.function_definitions = extractor.function_definitions;
+
+    let json: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&data).expect("serialize")).expect("parse");
+    let row = &json["function_definitions"]["ReportController.exportCsv"];
+    let tokens: Vec<&str> = row["tokens"]
+        .as_array()
+        .expect("tokens present on the uploaded row")
+        .iter()
+        .map(|t| t.as_str().expect("token is a string"))
+        .collect();
+    assert_eq!(tokens[0], "ctx", "parameter name leads the uploaded tokens");
+    for expected in ["response", "buildRows", "text/csv"] {
+        assert!(
+            tokens.contains(&expected),
+            "{expected} missing from uploaded tokens: {tokens:?}"
+        );
+    }
+}

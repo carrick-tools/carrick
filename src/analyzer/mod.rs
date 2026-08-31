@@ -2684,6 +2684,7 @@ mod tests {
             end_line: 0,
             intent: None,
             calls: vec![],
+            tokens: vec![],
             return_type: None,
             return_is_explicit: false,
             signature: None,

@@ -136,6 +136,23 @@ pub struct FunctionDefinition {
     /// until the signature pass runs. The MCP layer surfaces this verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// Literal retrieval tokens drawn from this function's own AST: parameter
+    /// names, literal parameter defaults, identifiers and property names read
+    /// in the body, and the string/numeric literals it contains
+    /// (carrick-cloud#434). Deduplicated, first-occurrence order, capped — see
+    /// `build_tokens` for the cap and the priority between the three groups.
+    ///
+    /// The cloud's lexical retrieval leg indexes name and intent only, so a
+    /// question asked in code words cannot reach the function that holds
+    /// `budgetBytes = 1500`: the default is dropped from the stored signature
+    /// and the body is never stored. These tokens are the smallest thing that
+    /// puts those words in the index without shipping source.
+    ///
+    /// Serde-defaulted and skipped when empty, so an index cached by an older
+    /// scanner still deserialises and a function with nothing notable costs no
+    /// payload bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tokens: Vec<String>,
     /// Content hash of the exact inputs that produced `intent` (cache version +
     /// function body + callees' intents). Lets a later scan reuse the cached
     /// intent when nothing affecting it changed, and regenerate it when a
@@ -189,7 +206,162 @@ pub struct CalleeRef {
     pub line: u32,
 }
 
-/// Walks a function body and records every call expression's callee.
+/// Most retrieval tokens one function may contribute (see
+/// `FunctionDefinition::tokens`).
+///
+/// Chosen against a measurement rather than picked: over a 1,061-function
+/// TypeScript service the mean function emits 20 tokens and 246 bytes of
+/// serialised JSON, and 1% of functions reach 120. So the cap costs a
+/// thousand-function repo well under a megabyte on an upload path that
+/// already stages anything sizeable through S3, while binding the tail. The
+/// functions that do hit it are the long switch-heavy bodies whose hundredth
+/// identifier carries no retrieval signal anyway.
+const MAX_FUNCTION_TOKENS: usize = 120;
+
+/// Ceiling for parameters plus body identifiers together, leaving the rest of
+/// `MAX_FUNCTION_TOKENS` for literals. Without a reserved floor a long body
+/// spends the whole budget on identifiers and its literals never appear —
+/// which would lose exactly the case this field exists for (a query naming a
+/// constant) on exactly the large functions where retrieval matters most.
+const IDENTIFIER_TOKEN_CEILING: usize = 90;
+
+/// Longest literal kept as a token. A longer string is dropped rather than
+/// truncated: half a sentence is a term nobody will ever type. Identifiers are
+/// not length-capped — a parameter name must survive whatever its length.
+const MAX_LITERAL_TOKEN_LEN: usize = 40;
+
+/// Trim a string-ish literal into a token, or drop it. `None` for anything
+/// empty, whitespace-only, or longer than `MAX_LITERAL_TOKEN_LEN`.
+fn string_literal_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_LITERAL_TOKEN_LEN {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// A literal's token form, or `None` for kinds that carry no retrieval signal
+/// (booleans, `null`, regexes, JSX text).
+///
+/// Numbers keep their source text when the parser preserved it, so `0x1f` and
+/// `1_500` index as written rather than as a reconstruction of their value.
+fn literal_token(lit: &Lit) -> Option<String> {
+    match lit {
+        Lit::Str(s) => string_literal_token(&s.value),
+        Lit::Num(n) => Some(match &n.raw {
+            Some(raw) => raw.to_string(),
+            None if n.value.fract() == 0.0 && n.value.abs() < 1e15 => {
+                format!("{}", n.value as i64)
+            }
+            None => format!("{}", n.value),
+        }),
+        Lit::BigInt(b) => Some(match &b.raw {
+            Some(raw) => raw.to_string(),
+            None => b.value.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// The token for a literal used as a default value, if it is one. Unwraps the
+/// type-level and parenthesis wrappers, and reads `-1` as a literal rather
+/// than as an operator applied to `1`.
+fn default_value_token(expr: &Expr) -> Option<String> {
+    match CalleeCollector::unwrap_expr(expr) {
+        Expr::Lit(lit) => literal_token(lit),
+        Expr::Unary(unary) if unary.op == UnaryOp::Minus => {
+            match CalleeCollector::unwrap_expr(&unary.arg) {
+                Expr::Lit(lit @ (Lit::Num(_) | Lit::BigInt(_))) => {
+                    literal_token(lit).map(|t| format!("-{t}"))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Every name a parameter pattern binds, plus its literal defaults, in source
+/// order. Destructuring is walked to its leaves, so `{ budgetBytes = 1500 }`
+/// contributes both parts exactly as a plain defaulted parameter does.
+fn collect_pat_tokens(pat: &Pat, out: &mut Vec<String>) {
+    match pat {
+        Pat::Ident(ident) => out.push(ident.id.sym.to_string()),
+        Pat::Rest(rest) => collect_pat_tokens(&rest.arg, out),
+        Pat::Assign(assign) => {
+            collect_pat_tokens(&assign.left, out);
+            if let Some(token) = default_value_token(&assign.right) {
+                out.push(token);
+            }
+        }
+        Pat::Array(arr) => {
+            for elem in arr.elems.iter().flatten() {
+                collect_pat_tokens(elem, out);
+            }
+        }
+        Pat::Object(obj) => {
+            for prop in &obj.props {
+                match prop {
+                    ObjectPatProp::Assign(assign) => {
+                        out.push(assign.key.sym.to_string());
+                        if let Some(value) = &assign.value
+                            && let Some(token) = default_value_token(value)
+                        {
+                            out.push(token);
+                        }
+                    }
+                    ObjectPatProp::KeyValue(kv) => {
+                        match &kv.key {
+                            PropName::Ident(ident) => out.push(ident.sym.to_string()),
+                            PropName::Str(s) => {
+                                if let Some(token) = string_literal_token(&s.value) {
+                                    out.push(token);
+                                }
+                            }
+                            _ => {}
+                        }
+                        collect_pat_tokens(&kv.value, out);
+                    }
+                    ObjectPatProp::Rest(rest) => collect_pat_tokens(&rest.arg, out),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Fuse the three token groups into the field's final value: parameters and
+/// their defaults first, then body identifiers, then literals, deduplicated on
+/// first occurrence so the result is byte-identical across extractions of the
+/// same source.
+///
+/// Priority is the cap's tie-breaker, not a ranking the cloud sees — a
+/// truncated function keeps the parameters that name it over the hundredth
+/// identifier of its body. See `IDENTIFIER_TOKEN_CEILING` for the floor that
+/// keeps literals reachable.
+fn build_tokens(params: &[String], identifiers: &[String], literals: &[String]) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for (group, ceiling) in [
+        (params, MAX_FUNCTION_TOKENS),
+        (identifiers, IDENTIFIER_TOKEN_CEILING),
+        (literals, MAX_FUNCTION_TOKENS),
+    ] {
+        for token in group {
+            if out.len() >= ceiling {
+                break;
+            }
+            if seen.insert(token.clone()) {
+                out.push(token.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Walks a function body and records every call expression's callee, plus the
+/// raw material for `FunctionDefinition::tokens` — every identifier and
+/// property name read, and every string or numeric literal written.
 ///
 /// Nested functions and arrows are walked too: their calls sit inside the
 /// enclosing function's body and count as its dependencies. Entering a nested
@@ -199,6 +371,10 @@ struct CalleeCollector<'a> {
     source_map: &'a swc_common::SourceMap,
     enclosing_class: Option<String>,
     out: Vec<CalleeRef>,
+    /// Identifiers and property names, in source order, before dedupe.
+    identifiers: Vec<String>,
+    /// String and numeric literals, in source order, before dedupe.
+    literals: Vec<String>,
 }
 
 impl CalleeCollector<'_> {
@@ -282,6 +458,43 @@ impl Visit for CalleeCollector<'_> {
         let prev = self.enclosing_class.take();
         class.visit_children_with(self);
         self.enclosing_class = prev;
+    }
+
+    /// Every binding, reference and type name written in the body.
+    fn visit_ident(&mut self, ident: &Ident) {
+        self.identifiers.push(ident.sym.to_string());
+        ident.visit_children_with(self);
+    }
+
+    /// Property positions — `a.budgetBytes`, `{ budgetBytes: 1 }` — parse as
+    /// `IdentName`, not `Ident`, so they need their own arm to be seen.
+    fn visit_ident_name(&mut self, ident: &IdentName) {
+        self.identifiers.push(ident.sym.to_string());
+        ident.visit_children_with(self);
+    }
+
+    fn visit_lit(&mut self, lit: &Lit) {
+        if let Some(token) = literal_token(lit) {
+            self.literals.push(token);
+        }
+        lit.visit_children_with(self);
+    }
+
+    /// Template literals carry paths, URLs and header names as often as plain
+    /// string literals do, and their static chunks are literals by any other
+    /// name. The interpolations are ordinary expressions and are picked up by
+    /// the arms above.
+    fn visit_tpl(&mut self, tpl: &Tpl) {
+        for quasi in &tpl.quasis {
+            let raw = match &quasi.cooked {
+                Some(cooked) => cooked.as_str(),
+                None => quasi.raw.as_str(),
+            };
+            if let Some(token) = string_literal_token(raw) {
+                self.literals.push(token);
+            }
+        }
+        tpl.visit_children_with(self);
     }
 }
 
@@ -469,10 +682,11 @@ impl FunctionDefinitionExtractor {
         }
     }
 
-    /// Every call site inside `node`, with the enclosing class (if any) so
-    /// `this.x()` can be resolved later. `node` is a function body, never the
-    /// whole file, so only that function's calls are recorded.
-    fn collect_callees<'a, N>(&'a self, node: &N) -> Vec<CalleeRef>
+    /// Walk one function body once, for both of the things a body is read for:
+    /// its call sites (with the enclosing class, if any, so `this.x()` can be
+    /// resolved later) and its retrieval tokens. `node` is a function body,
+    /// never the whole file, so only that function's own material is recorded.
+    fn walk_body<'a, N>(&'a self, node: &N) -> CalleeCollector<'a>
     where
         N: VisitWith<CalleeCollector<'a>>,
     {
@@ -480,25 +694,45 @@ impl FunctionDefinitionExtractor {
             source_map: &self.source_map,
             enclosing_class: self.current_class.clone(),
             out: Vec::new(),
+            identifiers: Vec::new(),
+            literals: Vec::new(),
         };
         node.visit_with(&mut collector);
-        collector.out
+        collector
     }
 
     /// Record the call sites of a `Function` node (declaration, method,
-    /// function expression) under `key`.
-    fn record_fn_callees(&mut self, key: &str, function: &Function) {
-        let refs = match function.body.as_ref() {
-            Some(body) => self.collect_callees(body),
-            None => Vec::new(),
+    /// function expression) under `key`, and return its retrieval tokens (see
+    /// `FunctionDefinition::tokens`). A body-less node — an overload signature,
+    /// an abstract method — still yields its parameter tokens.
+    fn record_fn_callees(&mut self, key: &str, function: &Function) -> Vec<String> {
+        let mut params = Vec::new();
+        for param in &function.params {
+            collect_pat_tokens(&param.pat, &mut params);
+        }
+        let body = function.body.as_ref().map(|body| self.walk_body(body));
+        let (refs, tokens) = match body {
+            Some(collector) => (
+                collector.out,
+                build_tokens(&params, &collector.identifiers, &collector.literals),
+            ),
+            None => (Vec::new(), build_tokens(&params, &[], &[])),
         };
         self.callee_refs.insert(key.to_string(), refs);
+        tokens
     }
 
-    /// Record the call sites of an arrow function under `key`.
-    fn record_arrow_callees(&mut self, key: &str, arrow: &ArrowExpr) {
-        let refs = self.collect_callees(&*arrow.body);
-        self.callee_refs.insert(key.to_string(), refs);
+    /// Record the call sites of an arrow function under `key`, and return its
+    /// retrieval tokens.
+    fn record_arrow_callees(&mut self, key: &str, arrow: &ArrowExpr) -> Vec<String> {
+        let mut params = Vec::new();
+        for pat in &arrow.params {
+            collect_pat_tokens(pat, &mut params);
+        }
+        let collector = self.walk_body(&*arrow.body);
+        let tokens = build_tokens(&params, &collector.identifiers, &collector.literals);
+        self.callee_refs.insert(key.to_string(), collector.out);
+        tokens
     }
 
     /// Extract source text from a span, capped at 2000 chars
@@ -727,7 +961,7 @@ impl FunctionDefinitionExtractor {
     /// node is wrapped as an anonymous `FnExpr` so every downstream consumer
     /// of `FunctionNodeType` works unchanged.
     fn insert_method_definition(&mut self, name: String, function: &Function) {
-        self.record_fn_callees(&name, function);
+        let tokens = self.record_fn_callees(&name, function);
         let arguments = self.extract_arguments(&function.params);
         let body_source = function
             .body
@@ -755,6 +989,7 @@ impl FunctionDefinitionExtractor {
                 end_line,
                 intent: None,
                 calls: vec![],
+                tokens,
                 return_is_explicit: return_type.is_some(),
                 return_type,
                 signature: None,
@@ -766,7 +1001,7 @@ impl FunctionDefinitionExtractor {
     /// Insert a definition for an arrow-initialized class prop
     /// (`handle = () => { ... }`).
     fn insert_arrow_definition(&mut self, name: String, arrow: &ArrowExpr) {
-        self.record_arrow_callees(&name, arrow);
+        let tokens = self.record_arrow_callees(&name, arrow);
         let arguments = self.extract_arrow_arguments(&arrow.params);
         let body_source = self.extract_source(arrow.span);
         let line_number = self.line_number(arrow.span);
@@ -788,6 +1023,7 @@ impl FunctionDefinitionExtractor {
                 end_line,
                 intent: None,
                 calls: vec![],
+                tokens,
                 return_is_explicit: return_type.is_some(),
                 return_type,
                 signature: None,
@@ -828,7 +1064,7 @@ impl Visit for FunctionDefinitionExtractor {
                     let name = ident.sym.to_string();
                     self.exported_names.insert(name.clone());
                     // Capture the function since visit_fn_decl won't fire for default exports
-                    self.record_fn_callees(&name, &fn_expr.function);
+                    let tokens = self.record_fn_callees(&name, &fn_expr.function);
                     let arguments = self.extract_arguments(&fn_expr.function.params);
                     let body_source = fn_expr
                         .function
@@ -857,6 +1093,7 @@ impl Visit for FunctionDefinitionExtractor {
                             end_line,
                             intent: None,
                             calls: vec![],
+                            tokens,
                             return_is_explicit: return_type.is_some(),
                             return_type,
                             signature: None,
@@ -901,7 +1138,7 @@ impl Visit for FunctionDefinitionExtractor {
 
     fn visit_fn_decl(&mut self, fn_decl: &FnDecl) {
         let name = fn_decl.ident.sym.to_string();
-        self.record_fn_callees(&name, &fn_decl.function);
+        let tokens = self.record_fn_callees(&name, &fn_decl.function);
         let arguments = self.extract_arguments(&fn_decl.function.params);
         let body_source = fn_decl
             .function
@@ -929,6 +1166,7 @@ impl Visit for FunctionDefinitionExtractor {
                 end_line,
                 intent: None,
                 calls: vec![],
+                tokens,
                 return_is_explicit: return_type.is_some(),
                 return_type,
                 signature: None,
@@ -949,7 +1187,7 @@ impl Visit for FunctionDefinitionExtractor {
             if let Some(init) = &var_decl.init {
                 match &**init {
                     Expr::Arrow(arrow) => {
-                        self.record_arrow_callees(&name, arrow);
+                        let tokens = self.record_arrow_callees(&name, arrow);
                         let arguments = self.extract_arrow_arguments(&arrow.params);
                         let body_source = self.extract_source(arrow.span);
                         let line_number = self.line_number(arrow.span);
@@ -971,6 +1209,7 @@ impl Visit for FunctionDefinitionExtractor {
                                 end_line,
                                 intent: None,
                                 calls: vec![],
+                                tokens,
                                 return_is_explicit: return_type.is_some(),
                                 return_type,
                                 signature: None,
@@ -979,7 +1218,7 @@ impl Visit for FunctionDefinitionExtractor {
                         );
                     }
                     Expr::Fn(fn_expr) => {
-                        self.record_fn_callees(&name, &fn_expr.function);
+                        let tokens = self.record_fn_callees(&name, &fn_expr.function);
                         let arguments = self.extract_arguments(&fn_expr.function.params);
                         let body_source = fn_expr
                             .function
@@ -1008,6 +1247,7 @@ impl Visit for FunctionDefinitionExtractor {
                                 end_line,
                                 intent: None,
                                 calls: vec![],
+                                tokens,
                                 return_is_explicit: return_type.is_some(),
                                 return_type,
                                 signature: None,
@@ -1112,7 +1352,7 @@ impl Visit for FunctionDefinitionExtractor {
                             derive_handler_name(&method_name, first_str_arg.as_deref());
                         // Don't overwrite named functions already captured
                         if !self.function_definitions.contains_key(&synthetic_name) {
-                            self.record_arrow_callees(&synthetic_name, arrow);
+                            let tokens = self.record_arrow_callees(&synthetic_name, arrow);
                             let arguments = self.extract_arrow_arguments(&arrow.params);
                             let body_source = self.extract_source(arrow.span);
                             let line_number = self.line_number(arrow.span);
@@ -1136,6 +1376,7 @@ impl Visit for FunctionDefinitionExtractor {
                                     end_line,
                                     intent: None,
                                     calls: vec![],
+                                    tokens,
                                     return_is_explicit: return_type.is_some(),
                                     return_type,
                                     signature: None,
@@ -1148,7 +1389,7 @@ impl Visit for FunctionDefinitionExtractor {
                         let synthetic_name =
                             derive_handler_name(&method_name, first_str_arg.as_deref());
                         if !self.function_definitions.contains_key(&synthetic_name) {
-                            self.record_fn_callees(&synthetic_name, &fn_expr.function);
+                            let tokens = self.record_fn_callees(&synthetic_name, &fn_expr.function);
                             let arguments = self.extract_arguments(&fn_expr.function.params);
                             let body_source = fn_expr
                                 .function
@@ -1177,6 +1418,7 @@ impl Visit for FunctionDefinitionExtractor {
                                     end_line,
                                     intent: None,
                                     calls: vec![],
+                                    tokens,
                                     return_is_explicit: return_type.is_some(),
                                     return_type,
                                     signature: None,
@@ -1991,6 +2233,168 @@ mod tests {
         assert!(
             defs.get("UsersController.findAll").unwrap().is_exported,
             "exported controller's methods are exported"
+        );
+    }
+
+    /// The motivating case for `tokens` (carrick-cloud#434): the constant a
+    /// question is asked in lives in a default parameter value, which the
+    /// stored signature drops and the stripped body never carried.
+    #[test]
+    fn literal_default_param_yields_both_the_name_and_the_value() {
+        let defs = extract(
+            "export function formatOrientation(indexMd: string, budgetBytes = 1500) {\n\
+             \x20 return indexMd.slice(0, budgetBytes);\n\
+             }\n",
+        );
+        let tokens = &defs.get("formatOrientation").expect("definition").tokens;
+        assert!(
+            tokens.contains(&"budgetBytes".to_string()),
+            "parameter name missing: {tokens:?}"
+        );
+        assert!(
+            tokens.contains(&"1500".to_string()),
+            "literal default missing: {tokens:?}"
+        );
+        // Parameters come first, so a truncated function keeps them.
+        assert_eq!(tokens[0], "indexMd", "params lead the vec: {tokens:?}");
+    }
+
+    /// Destructured defaults are the same shape written differently, and the
+    /// options-bag idiom puts them there far more often than in a plain param.
+    #[test]
+    fn destructured_default_yields_both_the_name_and_the_value() {
+        let defs = extract(
+            "export const trim = ({ maxBytes = 2048, label = \"orientation\" }) => maxBytes;\n",
+        );
+        let tokens = &defs.get("trim").expect("definition").tokens;
+        for expected in ["maxBytes", "2048", "label", "orientation"] {
+            assert!(
+                tokens.contains(&expected.to_string()),
+                "{expected} missing: {tokens:?}"
+            );
+        }
+    }
+
+    /// Negative defaults read as one literal, not as an operator applied to a
+    /// number, so `-1` is queryable as written.
+    #[test]
+    fn negative_literal_default_keeps_its_sign() {
+        let defs = extract("function seek(offset = -1) { return offset; }\n");
+        let tokens = &defs.get("seek").expect("definition").tokens;
+        assert!(
+            tokens.contains(&"-1".to_string()),
+            "signed default missing: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn body_identifiers_and_property_names_are_collected() {
+        let defs = extract(
+            "function readBudget(config) {\n\
+             \x20 const ceiling = config.budgetBytes;\n\
+             \x20 return clampToCeiling(ceiling);\n\
+             }\n",
+        );
+        let tokens = &defs.get("readBudget").expect("definition").tokens;
+        for expected in ["config", "ceiling", "budgetBytes", "clampToCeiling"] {
+            assert!(
+                tokens.contains(&expected.to_string()),
+                "{expected} missing: {tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn string_and_numeric_literals_are_collected_within_the_length_cap() {
+        let long = "x".repeat(MAX_LITERAL_TOKEN_LEN + 1);
+        let source = format!(
+            "function emit() {{\n\
+             \x20 const header = \"x-carrick-run\";\n\
+             \x20 const padded = \"  spaced  \";\n\
+             \x20 const blank = \"\";\n\
+             \x20 const whitespace = \"   \";\n\
+             \x20 const oversized = \"{long}\";\n\
+             \x20 const path = `/v1/orientation`;\n\
+             \x20 return [header, padded, blank, whitespace, oversized, path, 1500, 0.5];\n\
+             }}\n"
+        );
+        let defs = extract(&source);
+        let tokens = &defs.get("emit").expect("definition").tokens;
+        for expected in ["x-carrick-run", "spaced", "/v1/orientation", "1500", "0.5"] {
+            assert!(
+                tokens.contains(&expected.to_string()),
+                "{expected} missing: {tokens:?}"
+            );
+        }
+        for rejected in ["", "   ", "  spaced  ", long.as_str()] {
+            assert!(
+                !tokens.contains(&rejected.to_string()),
+                "{rejected:?} should not be a token: {tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tokens_are_deduplicated_and_byte_stable_across_extractions() {
+        let source = "function repeat(name) {\n\
+                      \x20 log(name, \"retry\");\n\
+                      \x20 log(name, \"retry\");\n\
+                      \x20 return name;\n\
+                      }\n";
+        let first = extract(source);
+        let second = extract(source);
+        let tokens = &first.get("repeat").expect("definition").tokens;
+        let mut unique = tokens.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), tokens.len(), "duplicate tokens: {tokens:?}");
+        assert_eq!(
+            tokens,
+            &second.get("repeat").expect("definition").tokens,
+            "two extractions of one source must be byte-equal"
+        );
+    }
+
+    #[test]
+    fn a_function_with_nothing_notable_has_no_tokens_and_serialises_none() {
+        let defs = extract("function noop() {}\n");
+        let def = defs.get("noop").expect("definition");
+        assert!(def.tokens.is_empty(), "unexpected tokens: {:?}", def.tokens);
+        let json = serde_json::to_value(def).expect("serialize");
+        assert!(
+            json.get("tokens").is_none(),
+            "an empty vec must serialise away, not ship as []"
+        );
+    }
+
+    /// A body big enough to exhaust the budget must still surface its
+    /// literals — the identifier ceiling exists precisely so the constant a
+    /// question names is not crowded out by the four hundredth local.
+    #[test]
+    fn cap_is_enforced_and_reserves_room_for_literals() {
+        let mut body = String::new();
+        for i in 0..400 {
+            body.push_str(&format!("  const local{i} = other{i};\n"));
+        }
+        // The literal a question would name, written AFTER the identifier
+        // flood that would otherwise consume the whole budget.
+        body.push_str("  const marker = \"needle-token\";\n");
+        for i in 0..200 {
+            body.push_str(&format!("  send({});\n", 9000 + i));
+        }
+        let source = format!("function pathological(seed) {{\n{body}}}\n");
+        let defs = extract(&source);
+        let tokens = &defs.get("pathological").expect("definition").tokens;
+        assert_eq!(
+            tokens.len(),
+            MAX_FUNCTION_TOKENS,
+            "cap not enforced: {}",
+            tokens.len()
+        );
+        assert_eq!(tokens[0], "seed", "params keep priority under the cap");
+        assert!(
+            tokens.contains(&"needle-token".to_string()),
+            "literal crowded out by identifiers: {tokens:?}"
         );
     }
 }
