@@ -257,6 +257,60 @@ fn react_jsx_fixture_captures_fetch_calls() {
 }
 
 // ---------------------------------------------------------------------------
+// Class controllers — routes bound in a route table, handlers in another file
+// ---------------------------------------------------------------------------
+
+/// #580: the two halves of a class-controller route, read off the fixture
+/// through the public scanner surface. Neither file states a route on its own:
+/// the table has the path and no method, the controller has the method and no
+/// path.
+#[test]
+fn class_controller_fixture_binds_paths_to_imported_controllers() {
+    let table = fixture_path("class-controller-api/src/routes.ts");
+    let content = fs::read_to_string(&table).expect("route table is readable");
+    let bindings = SwcScanner::new().controller_route_bindings(&table, &content);
+
+    let bound: Vec<(&str, &str)> = bindings
+        .iter()
+        .map(|b| (b.path.as_str(), b.binding.as_str()))
+        .collect();
+    assert_eq!(
+        bound,
+        vec![
+            ("/", "root"),
+            // Middleware in front: the handler is the last argument.
+            ("/token", "token"),
+            ("/widget", "widget"),
+            ("/widget/:id", "widgetItem"),
+            ("/report", "report"),
+            ("/session", "session"),
+            ("/profile", "profile"),
+            ("/health", "health"),
+        ]
+    );
+}
+
+/// #580: a controller's route methods. `@method('GET')` names the method of a
+/// handler that is not verb-named; `@accept('text/csv')` names a content type
+/// and contributes nothing; the helper below them is not a route.
+#[test]
+fn class_controller_fixture_reads_verb_named_and_decorated_methods() {
+    let file = fixture_path("class-controller-api/src/controllers/report.ts");
+    let content = fs::read_to_string(&file).expect("controller is readable");
+    let controller = SwcScanner::new()
+        .default_export_controller_class(&file, &content)
+        .expect("report.ts default-exports a controller class");
+
+    assert_eq!(controller.name, "ReportController");
+    let methods: Vec<(&str, &str)> = controller
+        .methods
+        .iter()
+        .map(|m| (m.name.as_str(), m.http_method.as_str()))
+        .collect();
+    assert_eq!(methods, vec![("exportCsv", "GET")]);
+}
+
+// ---------------------------------------------------------------------------
 // End-to-end (LLM-dependent) acceptance
 // ---------------------------------------------------------------------------
 //

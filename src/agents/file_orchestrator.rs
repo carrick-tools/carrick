@@ -42,8 +42,8 @@ use crate::{
         TypeSidecar,
     },
     swc_scanner::{
-        CandidateTarget, PubsubAnchorOp, RouteDescriptorEndpoint, SwcScanner,
-        is_producer_route_path, normalize_path_params,
+        CandidateTarget, ControllerRouteBinding, PubsubAnchorOp, RouteDescriptorEndpoint,
+        SwcScanner, is_producer_route_path, normalize_path_params,
     },
     type_manifest::{
         build_call_site_id, build_manifest_type_alias, build_manifest_type_alias_with_call_id,
@@ -108,6 +108,10 @@ pub struct ProcessingStats {
     /// (`{ method, path, handler }` in a registry array) rather than from the
     /// file-analyzer LLM. A subset of `total_endpoints`. See #234.
     pub route_descriptor_endpoints: usize,
+    /// Endpoints derived deterministically by joining a route table's bound
+    /// path to the controller class the binding resolves to, across files. A
+    /// subset of `total_endpoints`. See #580.
+    pub class_controller_endpoints: usize,
     /// Pub/sub operations asserted deterministically from the AST and merged in
     /// because the file-analyzer's extraction omitted them (carrick#387). The
     /// anchors themselves are computed for every gated file; only the ones the
@@ -157,6 +161,10 @@ const ROUTE_DESCRIPTOR_OWNER: &str = "__route_descriptor__";
 /// `pattern_matched` tag for endpoints emitted deterministically from
 /// route-descriptor data (#234).
 const ROUTE_DESCRIPTOR_PATTERN: &str = "route-descriptor";
+
+/// `pattern_matched` tag for endpoints emitted deterministically from a route
+/// table that binds a path to an imported controller instance (#580).
+const CLASS_CONTROLLER_PATTERN: &str = "class-controller-route";
 
 type EndpointLookup = HashMap<(String, u32), Vec<(String, String)>>;
 type DataCallLookup = HashMap<(String, u32), Vec<(String, String, String)>>;
@@ -725,6 +733,11 @@ impl FileOrchestrator {
         // work list of files that actually need an LLM call. Zero-cost skips are recorded here.
         let mut pending: Vec<PendingFile> = Vec::new();
         let mut deferred_zero_candidates: Vec<DeferredZeroCandidate> = Vec::new();
+        // Route tables that bind a path to an imported handler (#580 part b).
+        // Collected here, where the file's content is already in hand, and
+        // resolved after the whole pass: the endpoints belong to the CONTROLLER
+        // modules, whose own results are not final until then.
+        let mut controller_route_bindings: Vec<(PathBuf, Vec<ControllerRouteBinding>)> = Vec::new();
         for file_path in files {
             let path_str = file_path.to_string_lossy().to_string();
 
@@ -835,6 +848,28 @@ impl FileOrchestrator {
                 .into_iter()
                 .filter(|c| !descriptor_spans.contains(&(c.span_start, c.span_end)))
                 .collect();
+
+            // Class-controller routes (#580 part b): a route table binding a
+            // literal path to an imported handler. Collected before any of the
+            // skip branches below, because a route table is usually a file with
+            // no candidates of its own — the `router(...)` calls are plain
+            // function calls, not framework method calls. Resolution needs
+            // every file's result, so it happens after the pass; only the
+            // bindings are held here, not the content.
+            //
+            // Pre-filtered on the source containing a string literal that
+            // opens with `/`, which every such binding must (the path is the
+            // first argument and it is a plain string literal). A necessary
+            // condition, checked without parsing, so the extra parse is paid
+            // only by files that could possibly carry a route table.
+            if content.contains("\"/") || content.contains("'/") {
+                let bindings = self
+                    .swc_scanner
+                    .controller_route_bindings(file_path, &content);
+                if !bindings.is_empty() {
+                    controller_route_bindings.push((file_path.clone(), bindings));
+                }
+            }
 
             // GraphQL resolver routing (Stage B2): a resolver file is loose
             // exported functions with no HTTP route candidate, so the
@@ -1341,6 +1376,39 @@ impl FileOrchestrator {
             }
         }
 
+        // PHASE 4 (#580 part b): join each route table's paths to the
+        // controller classes they bind. Cross-file, so it runs once every
+        // file's own result is in — a controller's rows must survive the pass
+        // that analyses the controller file. Sorted by (route table, line,
+        // path) because `file_results` is a HashMap and the bindings' order
+        // decides which of two identical rows is kept.
+        controller_route_bindings.sort_by(|(a_file, _), (b_file, _)| a_file.cmp(b_file));
+        let mut resolver = BindingResolver::new();
+        let mut class_controller_rows: Vec<(PathBuf, EndpointResult)> = Vec::new();
+        for (router_file, bindings) in &mut controller_route_bindings {
+            bindings.sort_by(|a, b| {
+                a.line_number
+                    .cmp(&b.line_number)
+                    .then_with(|| a.path.cmp(&b.path))
+            });
+            // `BindingResolver` resolves relative to the importer and answers
+            // with canonical paths; a non-canonical importer resolves to a
+            // path that matches no analysed file (`/var` vs `/private/var`).
+            let Ok(canonical) = router_file.canonicalize() else {
+                continue;
+            };
+            class_controller_rows.extend(Self::class_controller_endpoints(
+                &self.swc_scanner,
+                &mut resolver,
+                &canonical,
+                bindings,
+            ));
+        }
+        let class_controller_added =
+            Self::merge_class_controller_endpoints(&mut file_results, files, class_controller_rows);
+        stats.class_controller_endpoints += class_controller_added;
+        stats.total_endpoints += class_controller_added;
+
         debug!("\n=== FILE PROCESSING COMPLETE ===");
         debug!("  - Files processed (LLM calls): {}", stats.files_processed);
         debug!("  - Files skipped (total): {}", stats.files_skipped);
@@ -1363,6 +1431,10 @@ impl FileOrchestrator {
         debug!(
             "  - Route-descriptor endpoints: {}",
             stats.route_descriptor_endpoints
+        );
+        debug!(
+            "  - Class-controller endpoints: {}",
+            stats.class_controller_endpoints
         );
         debug!("  - Total data calls: {}", stats.total_data_calls);
         debug!(
@@ -3309,6 +3381,142 @@ impl FileOrchestrator {
                 }
             })
             .collect()
+    }
+
+    /// Build the endpoints a route table declares by binding a path to an
+    /// imported controller instance (#580 part b).
+    ///
+    /// A class-controller service splits every route across two files: the
+    /// route table holds the path (`router('/widget', widget)`) and the
+    /// controller module holds the method and the handler, naming its own path
+    /// nowhere. Neither file states a route on its own, so the single-file
+    /// analyzer — LLM or scanner — cannot see one, and the routes are simply
+    /// absent from the index. Joining the two halves is the same cross-file job
+    /// `resolve_mount_bindings` already does for an imported router, through
+    /// the same [`BindingResolver`], so it is done the same way: resolve the
+    /// bound identifier to the module that DECLARES it, never to whatever the
+    /// importing file happened to call it.
+    ///
+    /// Returns `(controller file, endpoint)` pairs. The endpoint belongs to the
+    /// controller's file, not the route table's: that is where the handler is,
+    /// and it is what a reader following the index needs to open. Emitted with
+    /// a sentinel-free owner — the class name — which matches no mount, so the
+    /// bound path is used as-is (like a file-based or descriptor route).
+    ///
+    /// Silent on anything it cannot resolve structurally: a non-relative
+    /// specifier, a module that default-exports something other than a class
+    /// declared in it, or a class with no method answering an HTTP method.
+    fn class_controller_endpoints(
+        scanner: &SwcScanner,
+        resolver: &mut BindingResolver,
+        // The route table, canonicalized: `BindingResolver` resolves relative
+        // to the importer and returns canonical paths, and on macOS a
+        // non-canonical importer resolves to a path that matches nothing
+        // (`/var` vs `/private/var`).
+        router_file: &Path,
+        bindings: &[ControllerRouteBinding],
+    ) -> Vec<(PathBuf, EndpointResult)> {
+        let mut endpoints = Vec::new();
+        for binding in bindings {
+            let Some(resolved) =
+                resolver.resolve(router_file, &binding.import_source, &binding.binding)
+            else {
+                continue;
+            };
+            let Ok(content) = std::fs::read_to_string(&resolved.file) else {
+                continue;
+            };
+            let Some(controller) =
+                scanner.default_export_controller_class(&resolved.file, &content)
+            else {
+                debug!(
+                    "Route {} binds {} at {}:{}, but its module default-exports no controller \
+                     class: no endpoint emitted",
+                    binding.path,
+                    binding.binding,
+                    resolved.file.display(),
+                    binding.line_number
+                );
+                continue;
+            };
+            for method in controller.methods {
+                endpoints.push((
+                    resolved.file.clone(),
+                    EndpointResult {
+                        candidate_id: format!(
+                            "class-controller:{}:{}",
+                            method.http_method, method.span_start
+                        ),
+                        line_number: i32::try_from(method.line_number).unwrap_or(0),
+                        owner_node: controller.name.clone(),
+                        method: method.http_method,
+                        path: binding.path.clone(),
+                        handler_name: method.name,
+                        pattern_matched: CLASS_CONTROLLER_PATTERN.to_string(),
+                        call_expression_span_start: Some(method.span_start),
+                        call_expression_span_end: Some(method.span_end),
+                        payload_expression_text: None,
+                        payload_expression_line: None,
+                        response_expression_text: None,
+                        response_expression_line: None,
+                        emission_style: None,
+                        primary_type_symbol: None,
+                        type_import_source: None,
+                    },
+                ));
+            }
+        }
+        endpoints
+    }
+
+    /// Merge the class-controller endpoints of a whole pass into `file_results`,
+    /// keyed by the controller module each one belongs to (#580 part b).
+    ///
+    /// Runs after every file's own result is in, so a controller's rows are
+    /// never overwritten by the pass that analyses that controller file. The
+    /// `file_results` key for a controller is the key its own file was analysed
+    /// under — resolved canonically, because a key and a resolved import can
+    /// name the same file by different paths — so a controller that also
+    /// carries call-site endpoints keeps one entry, not two.
+    ///
+    /// Returns the number of endpoints added.
+    fn merge_class_controller_endpoints(
+        file_results: &mut HashMap<String, FileAnalysisResult>,
+        // The files this pass scanned, so a controller module that produced no
+        // result of its own is still keyed the way every other file is.
+        scanned_files: &[PathBuf],
+        endpoints: Vec<(PathBuf, EndpointResult)>,
+    ) -> usize {
+        let mut key_by_canonical: HashMap<PathBuf, String> = HashMap::new();
+        for file in scanned_files {
+            if let Ok(canonical) = file.canonicalize() {
+                key_by_canonical.insert(canonical, file.to_string_lossy().to_string());
+            }
+        }
+
+        let mut added = 0;
+        for (controller_file, endpoint) in endpoints {
+            let key = key_by_canonical
+                .get(&controller_file)
+                .cloned()
+                .unwrap_or_else(|| controller_file.to_string_lossy().to_string());
+            let result = file_results.entry(key).or_default();
+            // Deduped on method + path + line, not method + path: one class
+            // legitimately serves the same method at several paths, and the
+            // line is what distinguishes this row's handler from another
+            // extraction of the same route. A row already at this exact
+            // position is the same fact twice.
+            let duplicate = result.endpoints.iter().any(|existing| {
+                existing.method.eq_ignore_ascii_case(&endpoint.method)
+                    && existing.path == endpoint.path
+                    && existing.line_number == endpoint.line_number
+            });
+            if !duplicate {
+                result.endpoints.push(endpoint);
+                added += 1;
+            }
+        }
+        added
     }
 
     /// Append structurally derived endpoints (file-based routes and
@@ -6224,6 +6432,274 @@ export * from "./aFetch.js";"#,
         assert!(
             graph.endpoints.iter().all(|e| e.path.starts_with('/')),
             "no endpoint row may carry a non-absolute path"
+        );
+    }
+
+    fn class_controller_fixture_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/class-controller-api")
+    }
+
+    /// Every file the class-controller fixture would be scanned with, in the
+    /// same shape `analyze_files` receives them (paths as found on disk).
+    fn class_controller_fixture_files() -> Vec<PathBuf> {
+        let src = class_controller_fixture_root().join("src");
+        let mut files = vec![src.join("routes.ts"), src.join("framework.ts")];
+        for entry in std::fs::read_dir(src.join("controllers")).expect("controllers dir") {
+            files.push(entry.expect("dir entry").path());
+        }
+        files.push(src.join("middleware/error-handler.ts"));
+        files.sort();
+        files
+    }
+
+    /// Resolve the fixture's route table to its endpoints, the way a scan
+    /// does: scan the table for bindings, then join each to the controller
+    /// module it names.
+    fn class_controller_fixture_endpoints() -> Vec<(PathBuf, EndpointResult)> {
+        let routes = class_controller_fixture_root()
+            .join("src/routes.ts")
+            .canonicalize()
+            .expect("the fixture route table exists");
+        let content = std::fs::read_to_string(&routes).expect("route table is readable");
+        let scanner = SwcScanner::new();
+        let bindings = scanner.controller_route_bindings(&routes, &content);
+        assert_eq!(
+            bindings.len(),
+            8,
+            "the fixture binds eight paths, one behind middleware: {bindings:?}"
+        );
+        let mut resolver = BindingResolver::new();
+        FileOrchestrator::class_controller_endpoints(&scanner, &mut resolver, &routes, &bindings)
+    }
+
+    /// #580 part b: the recall half. A route table binds a literal path to an
+    /// imported controller instance and the controller module never names its
+    /// own path, so neither file states a route and single-file analysis finds
+    /// none. Joined across the two, every bound path appears with the method,
+    /// owner and handler the controller declares, located at the controller's
+    /// own file and line.
+    #[test]
+    fn class_controller_endpoints_join_every_bound_path_to_its_controller() {
+        let controllers = class_controller_fixture_root()
+            .join("src/controllers")
+            .canonicalize()
+            .expect("the fixture controllers directory exists");
+
+        let mut routes: Vec<(String, String, String, String, String)> =
+            class_controller_fixture_endpoints()
+                .into_iter()
+                .map(|(file, endpoint)| {
+                    let located = file
+                        .strip_prefix(&controllers)
+                        .expect("every route resolves to a controller module")
+                        .display()
+                        .to_string();
+                    (
+                        endpoint.method,
+                        endpoint.path,
+                        endpoint.owner_node,
+                        endpoint.handler_name,
+                        format!("{}:{}", located, endpoint.line_number),
+                    )
+                })
+                .collect();
+        routes.sort();
+
+        let expected: Vec<(String, String, String, String, String)> = [
+            (
+                "DELETE",
+                "/session",
+                "SessionController",
+                "delete",
+                "session.ts:8",
+            ),
+            (
+                "DELETE",
+                "/widget/:id",
+                "WidgetItemController",
+                "delete",
+                "widget-item.ts:12",
+            ),
+            ("GET", "/", "RootController", "get", "root.ts:4"),
+            ("GET", "/health", "HealthController", "get", "health.ts:5"),
+            (
+                "GET",
+                "/profile",
+                "ProfileController",
+                "get",
+                "profile.ts:4",
+            ),
+            // Not verb-named: the method comes from the `@method('GET')`
+            // literal, and the row is located at the handler, not at the
+            // decorator above it.
+            (
+                "GET",
+                "/report",
+                "ReportController",
+                "exportCsv",
+                "report.ts:7",
+            ),
+            (
+                "GET",
+                "/session",
+                "SessionController",
+                "get",
+                "session.ts:4",
+            ),
+            ("GET", "/widget", "WidgetController", "get", "widget.ts:4"),
+            (
+                "GET",
+                "/widget/:id",
+                "WidgetItemController",
+                "get",
+                "widget-item.ts:4",
+            ),
+            (
+                "PATCH",
+                "/profile",
+                "ProfileController",
+                "patch",
+                "profile.ts:8",
+            ),
+            // Middleware sits in front of the controller; the handler is the
+            // LAST argument.
+            ("POST", "/token", "TokenController", "post", "token.ts:4"),
+            ("POST", "/widget", "WidgetController", "post", "widget.ts:8"),
+            (
+                "PUT",
+                "/widget/:id",
+                "WidgetItemController",
+                "put",
+                "widget-item.ts:8",
+            ),
+        ]
+        .into_iter()
+        .map(|(method, path, owner, handler, location)| {
+            (
+                method.to_string(),
+                path.to_string(),
+                owner.to_string(),
+                handler.to_string(),
+                location.to_string(),
+            )
+        })
+        .collect();
+
+        assert_eq!(routes, expected);
+    }
+
+    /// #580: the fixture's negatives. A schema `$id` URL passed to a
+    /// validator, a `@accept('text/csv')` content type, and a helper method
+    /// that is neither verb-named nor verb-decorated all sit inside
+    /// controllers that DO serve routes — so each has to be rejected
+    /// individually, not by suppressing the file.
+    #[test]
+    fn class_controller_endpoints_emit_nothing_for_non_routes() {
+        let endpoints = class_controller_fixture_endpoints();
+
+        assert!(
+            endpoints.iter().all(|(_, e)| e.path.starts_with('/')),
+            "no row may carry a path that is not absolute: {:?}",
+            endpoints
+                .iter()
+                .map(|(_, e)| &e.path)
+                .collect::<Vec<&String>>()
+        );
+        let handlers: Vec<&str> = endpoints
+            .iter()
+            .map(|(_, e)| e.handler_name.as_str())
+            .collect();
+        assert!(
+            !handlers.contains(&"buildRows"),
+            "a method that is neither verb-named nor verb-decorated is not a route"
+        );
+        assert!(
+            !endpoints
+                .iter()
+                .any(|(file, _)| file.ends_with("error-handler.ts")),
+            "the middleware in front of /token must own no route"
+        );
+    }
+
+    /// #580 part b end to end: the emitted rows survive the mount graph — the
+    /// absolute-path gate part (a) added, and owner resolution, which must not
+    /// rewrite a controller class into some other node.
+    #[test]
+    fn build_mount_graph_keeps_every_class_controller_route() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+        let files = class_controller_fixture_files();
+
+        let mut file_results = HashMap::new();
+        let added = FileOrchestrator::merge_class_controller_endpoints(
+            &mut file_results,
+            &files,
+            class_controller_fixture_endpoints(),
+        );
+        assert_eq!(added, 13, "eight bound paths, thirteen handler methods");
+
+        // Each controller's rows land under the key its own file was scanned
+        // with, so a controller that also carries call-site endpoints keeps
+        // one entry rather than two.
+        let widget = class_controller_fixture_root()
+            .join("src/controllers/widget.ts")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            file_results
+                .get(&widget)
+                .map(|r| r.endpoints.len())
+                .unwrap_or_default(),
+            2,
+            "WidgetController serves GET and POST at /widget"
+        );
+
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        assert_eq!(graph.endpoints.len(), 13);
+        assert!(
+            graph.endpoints.iter().all(|e| e.path.starts_with('/')),
+            "part (a)'s gate must pass every real route through"
+        );
+
+        let mut paths: Vec<&str> = graph
+            .endpoints
+            .iter()
+            .map(|e| e.full_path.as_str())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        assert_eq!(
+            paths,
+            vec![
+                "/",
+                "/health",
+                "/profile",
+                "/report",
+                "/session",
+                "/token",
+                "/widget",
+                "/widget/:id",
+            ],
+            "the bound path is used as-is: a controller owns no mount prefix"
+        );
+
+        let token = graph
+            .endpoints
+            .iter()
+            .find(|e| e.full_path == "/token")
+            .expect("the middleware-fronted route resolves to its controller");
+        assert_eq!(token.method, "POST");
+        assert_eq!(token.owner, "TokenController");
+        assert_eq!(token.handler.as_deref(), Some("post"));
+        assert!(
+            token.file_location.ends_with("controllers/token.ts:4"),
+            "located at the handler, not at the route table: {}",
+            token.file_location
         );
     }
 

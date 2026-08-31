@@ -193,6 +193,66 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
     Ok(())
 }
 
+/// #580 part b: a route table binding literal paths to imported controller
+/// instances. Every route is split across two files — the table has the path,
+/// the controller has the method and the handler — so before the cross-file
+/// join none of them reached the index. Eight bound paths, thirteen handler
+/// methods; the schema `$id` URL, the content-type decorator and the plain
+/// helper in those same controllers contribute nothing.
+#[test]
+fn test_class_controller_route_resolution() {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let test_project_path = temp_dir.path().join("test_project");
+
+    let fixture_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/class-controller-api");
+    copy_dir_recursive(&fixture_path, &test_project_path).expect("Failed to copy test fixture");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
+        .arg(test_project_path.to_str().unwrap())
+        .env("CARRICK_MOCK_ALL", "1")
+        .output()
+        .expect("Failed to execute carrick");
+
+    let stdout = String::from_utf8(output.stdout).expect("Invalid UTF-8 in stdout");
+    if !output.status.success() {
+        let stderr = String::from_utf8(output.stderr).expect("Invalid UTF-8 in stderr");
+        eprintln!("STDOUT:\n{}", stdout);
+        eprintln!("STDERR:\n{}", stderr);
+    }
+    assert!(output.status.success(), "Carrick command failed");
+
+    let test_output = TestOutput::parse(&stdout);
+    assert!(
+        test_output.has_success,
+        "Should have successful CARRICK analysis output. Output: {}",
+        stdout
+    );
+    assert!(
+        test_output.endpoint_count >= 13,
+        "Expected at least 13 endpoints from the class-controller fixture, found {}. \
+         This suggests the route table was not joined to its controllers. Output: {}",
+        test_output.endpoint_count,
+        stdout
+    );
+    for path in [
+        "/token",
+        "/widget",
+        "/widget/:id",
+        "/report",
+        "/session",
+        "/profile",
+        "/health",
+    ] {
+        assert!(
+            test_output.contains_endpoint(path),
+            "bound path {} is missing from the index. Output: {}",
+            path,
+            stdout
+        );
+    }
+}
+
 #[test]
 fn test_no_duplicate_processing_regression() {
     // This test specifically checks that the same imported router file
