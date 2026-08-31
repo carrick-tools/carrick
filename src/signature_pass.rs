@@ -253,6 +253,7 @@ mod tests {
             end_line: 0,
             intent: None,
             calls: vec![],
+            tokens: vec![],
             return_type: return_type.map(|t| t.to_string()),
             return_is_explicit: return_type.is_some(),
             signature: None,

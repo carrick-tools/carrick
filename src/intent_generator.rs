@@ -706,6 +706,7 @@ mod tests {
                 end_line: 0,
                 intent: Some("returns one".to_string()),
                 calls: vec![],
+                tokens: vec!["budgetBytes".to_string(), "1500".to_string()],
                 return_type: None,
                 return_is_explicit: false,
                 signature: None,
@@ -716,6 +717,13 @@ mod tests {
         assert!(defs.get("foo").unwrap().body_source.is_none());
         // Intent should be preserved
         assert!(defs.get("foo").unwrap().intent.is_some());
+        // So must the retrieval tokens (carrick-cloud#434). They are collected
+        // during extraction, not from `body_source`, and they are the only
+        // thing left carrying the body's words once the source goes.
+        assert_eq!(
+            defs.get("foo").unwrap().tokens,
+            vec!["budgetBytes".to_string(), "1500".to_string()]
+        );
     }
 
     #[test]
@@ -772,6 +780,7 @@ mod tests {
             end_line: 0,
             intent: None,
             calls: vec![],
+            tokens: vec![],
             return_type: None,
             return_is_explicit: false,
             signature: None,
@@ -845,6 +854,7 @@ mod tests {
             end_line: 0,
             intent: None,
             calls: vec![],
+            tokens: vec![],
             return_type: None,
             return_is_explicit: false,
             signature: None,

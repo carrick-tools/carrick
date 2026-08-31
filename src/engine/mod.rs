@@ -4065,6 +4065,7 @@ mod tests {
                     line_number: 9,
                     call_site_line: 4,
                 }],
+                tokens: vec![],
                 return_type: None,
                 return_is_explicit: false,
                 signature: Some(
@@ -4089,6 +4090,7 @@ mod tests {
                 end_line: 0,
                 intent: None,
                 calls: vec![],
+                tokens: vec![],
                 return_type: None,
                 return_is_explicit: false,
                 signature: None,
@@ -4211,6 +4213,7 @@ mod tests {
                 end_line: 24,
                 intent: None,
                 calls: vec![],
+                tokens: vec![],
                 return_type: None,
                 return_is_explicit: false,
                 signature: Some(format!(
@@ -5835,6 +5838,7 @@ mod tests {
                 end_line: 0,
                 intent: Some("fetches a user by id".to_string()),
                 calls: vec![],
+                tokens: vec![],
                 return_type: None,
                 return_is_explicit: false,
                 signature: None,
