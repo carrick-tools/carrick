@@ -24,10 +24,13 @@
 //!   else produces no edge.
 //!
 //! Resolution is keyed on **(file, definition key)** throughout, taken from the
-//! per-file extractor output rather than from the merged function map. The
-//! merged map is keyed by definition name alone, so two same-named functions
-//! in different files collapse onto one row (#582); resolving against it would
-//! make a correct call edge depend on which file happened to be walked last.
+//! per-file extractor output rather than from the merged function map, so a
+//! correct call edge never depends on which file happened to be walked last.
+//!
+//! The same per-file output is what [`merge_definitions`] merges into the one
+//! map the rest of the scan reads. That merge is collision-aware (#582): two
+//! files defining the same key each keep a row, instead of the second silently
+//! overwriting the first.
 
 use crate::agents::file_orchestrator::FileOrchestrator;
 use crate::import_bindings::{BindingResolver, ResolvedBinding};
@@ -36,6 +39,7 @@ use crate::visitor::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tracing::debug;
 
 /// The export name a default export is published under (mirrors
 /// `import_bindings`; not a valid identifier, so it cannot collide).
@@ -67,6 +71,136 @@ struct Target<'a> {
     line: u32,
 }
 
+/// The merged definition map, plus the table that translates a
+/// (definition key, defining file) pair into the key the map actually holds.
+pub struct MergedDefinitions {
+    pub definitions: HashMap<String, FunctionDefinition>,
+    pub keys: RekeyIndex,
+}
+
+/// Merged-map keys for the definition keys that more than one file defines.
+///
+/// Empty on almost every scan: an entry appears only when two files define the
+/// same `foo` or `Class.member`.
+#[derive(Debug, Default)]
+pub struct RekeyIndex {
+    by_key: HashMap<String, HashMap<PathBuf, String>>,
+}
+
+impl RekeyIndex {
+    /// The key the merged map holds for `key` as defined in `file`. Returns
+    /// `key` unchanged when nothing collided with it, which is the case for
+    /// every definition on a repo with no same-named functions.
+    pub fn merged_key<'a>(&'a self, key: &'a str, file: &Path) -> &'a str {
+        self.by_key
+            .get(key)
+            .and_then(|by_file| by_file.get(file))
+            .map(String::as_str)
+            .unwrap_or(key)
+    }
+}
+
+/// The separator between a colliding definition key and the file that
+/// disambiguates it. `@` cannot occur in a definition key (identifiers and the
+/// `.` that joins a class to its member), so `<key>@<path>` is injective and a
+/// plain key can never be mistaken for a re-keyed one.
+const FILE_QUALIFIER: char = '@';
+
+/// Merge the per-file definition maps into the single map the rest of the scan
+/// reads, giving every same-named definition its own row.
+///
+/// The map used to be a plain `extend` per file, keyed by definition key alone
+/// (`foo`, `Class.member`). Two files defining `foo` — or two `MFAController`
+/// classes in a controller-per-resource layout — collapsed onto one row, last
+/// writer wins, and the loser's methods vanished from the index along with
+/// their call edges (#582).
+///
+/// A key claimed by more than one file is re-keyed PER FILE as
+/// `<key>@<repo-relative path>`, the incumbent included, so neither row wins by
+/// walk order. A key claimed by one file — nearly every key, on nearly every
+/// repo — is stored byte-identically to before, so the intent cache, the
+/// embedding sidecar and the cloud rows keyed by it do not churn.
+///
+/// `FunctionDefinition::name` deliberately keeps the PLAIN key even when the
+/// row is re-keyed. That field is what the index displays, filters and embeds,
+/// and `get_callers` matches a qualified name only when it matches whole — so
+/// a path-bearing name would make the row unfindable by the name it has in the
+/// source. Two rows sharing a name are told apart there by `file_path`, which
+/// those tools already compare. The same holds for `FunctionCallRef`: a callee
+/// ref is a `(name, file_path)` locator, never a merged-map key. Use
+/// [`RekeyIndex::merged_key`] to go from a locator to a key.
+pub fn merge_definitions(
+    per_file: Vec<(PathBuf, HashMap<String, FunctionDefinition>)>,
+    repo_root: &str,
+) -> MergedDefinitions {
+    // Sorted so the merged map, and the log line below, never depend on the
+    // order files came off the walker.
+    let mut per_file = per_file;
+    per_file.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut owners: HashMap<&str, Vec<&Path>> = HashMap::new();
+    for (path, definitions) in &per_file {
+        for key in definitions.keys() {
+            owners.entry(key.as_str()).or_default().push(path.as_path());
+        }
+    }
+
+    let mut colliding: HashMap<String, Vec<PathBuf>> = owners
+        .into_iter()
+        .filter(|(_, files)| files.len() > 1)
+        .map(|(key, files)| {
+            (
+                key.to_string(),
+                files.into_iter().map(Path::to_path_buf).collect(),
+            )
+        })
+        .collect();
+
+    let mut keys = RekeyIndex::default();
+    let mut definitions: HashMap<String, FunctionDefinition> = HashMap::new();
+    for (path, file_definitions) in per_file {
+        let relative = crate::engine::repo_relative(&path.to_string_lossy(), repo_root);
+        for (key, definition) in file_definitions {
+            if colliding.contains_key(&key) {
+                let merged = format!("{key}{FILE_QUALIFIER}{relative}");
+                keys.by_key
+                    .entry(key)
+                    .or_default()
+                    .insert(path.clone(), merged.clone());
+                definitions.insert(merged, definition);
+            } else {
+                definitions.insert(key, definition);
+            }
+        }
+    }
+
+    if !colliding.is_empty() {
+        let mut collided: Vec<(String, Vec<PathBuf>)> = colliding.drain().collect();
+        collided.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut rekeyed = 0usize;
+        for (key, files) in &collided {
+            rekeyed += files.len();
+            debug!(
+                "Definition key '{}' is defined in {} files: {}",
+                key,
+                files.len(),
+                files
+                    .iter()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        debug!(
+            "re-keyed {} colliding definitions across {} definition keys",
+            rekeyed,
+            collided.len()
+        );
+    }
+
+    MergedDefinitions { definitions, keys }
+}
+
 /// Resolve every collected call site and write the results onto
 /// `FunctionDefinition::calls`.
 ///
@@ -74,11 +208,13 @@ struct Target<'a> {
 /// canonical paths, and a repo reached through a symlinked directory would
 /// otherwise miss every cross-file lookup silently.
 ///
-/// A definition whose merged row belongs to a different file (the #582
-/// collapse) is skipped rather than given another file's edges.
+/// `keys` comes from [`merge_definitions`]: a caller whose definition key
+/// collided with another file's is stored under a re-keyed row, and looking it
+/// up under its plain key would find nothing and silently drop its edges.
 pub fn resolve_call_edges(
     function_definitions: &mut HashMap<String, FunctionDefinition>,
     per_file: &HashMap<PathBuf, FileCallIndex>,
+    keys: &RekeyIndex,
 ) {
     let mut resolver = CallResolver::new(per_file);
 
@@ -93,9 +229,12 @@ pub fn resolve_call_edges(
         callers.sort();
 
         for caller_key in callers {
-            // Only definitions that survived the merge under this file's name
-            // get edges; the rest have no row to hang them on.
-            match function_definitions.get(caller_key) {
+            // The row this file's definition was merged under — its plain key,
+            // or the re-keyed one when another file defines the same key. The
+            // file check is the invariant that makes the translation right, not
+            // a filter: a row reached this way is always this file's.
+            let caller_row = keys.merged_key(caller_key, &index.path);
+            match function_definitions.get(caller_row) {
                 Some(def) if def.file_path == index.path => {}
                 _ => continue,
             }
@@ -120,7 +259,7 @@ pub fn resolve_call_edges(
 
             dedupe_edges(&mut edges);
 
-            if let Some(def) = function_definitions.get_mut(caller_key) {
+            if let Some(def) = function_definitions.get_mut(caller_row) {
                 def.calls = edges;
             }
         }
@@ -314,7 +453,8 @@ mod tests {
 
         let cm: Lrc<SourceMap> = Default::default();
         let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
-        let mut definitions: HashMap<String, FunctionDefinition> = HashMap::new();
+        let mut per_file_definitions: Vec<(PathBuf, HashMap<String, FunctionDefinition>)> =
+            Vec::new();
         let mut per_file: HashMap<PathBuf, FileCallIndex> = HashMap::new();
 
         for path in &paths {
@@ -338,10 +478,17 @@ mod tests {
                 imports: imports.imported_symbols,
             };
             per_file.insert(path.clone(), index);
-            definitions.extend(functions.function_definitions);
+            per_file_definitions.push((path.clone(), functions.function_definitions));
         }
 
-        resolve_call_edges(&mut definitions, &per_file);
+        // The same merge discovery runs, so a test can never pass against a
+        // merge production does not perform.
+        let MergedDefinitions {
+            mut definitions,
+            keys,
+        } = merge_definitions(per_file_definitions, &root.to_string_lossy());
+
+        resolve_call_edges(&mut definitions, &per_file, &keys);
         (dir, definitions)
     }
 
@@ -376,9 +523,11 @@ mod tests {
         ]);
 
         let root = dir.path().canonicalize().unwrap();
-        // The merged map is keyed by name, so the later file's `helper` is the
-        // row it holds (#582). The edge must still point at the imported one.
-        assert_eq!(defs["helper"].file_path, root.join("beta.ts"));
+        // Two files define `helper`, so each keeps its own row (#582) and the
+        // plain key is gone. The edge must point at the imported one.
+        assert!(!defs.contains_key("helper"));
+        assert_eq!(defs["helper@alpha.ts"].file_path, root.join("alpha.ts"));
+        assert_eq!(defs["helper@beta.ts"].file_path, root.join("beta.ts"));
 
         let calls = &defs["useHelper"].calls;
         assert_eq!(calls.len(), 1, "exactly one edge, got {calls:?}");
@@ -387,6 +536,97 @@ mod tests {
             PathBuf::from(&calls[0].file_path),
             root.join("alpha.ts"),
             "the edge must point at the IMPORTED helper"
+        );
+    }
+
+    /// Two files, each with a class of the same name — the controller-per-
+    /// resource layout #582 was found in. Both classes' methods keep a row of
+    /// their own, with their own file and line, and each method's edges stay
+    /// inside its own file. Before the collision-aware merge the index held one
+    /// `MFAController.post`, and the caller inside the losing one was invisible
+    /// to every reverse-caller answer.
+    #[test]
+    fn same_named_classes_in_two_files_both_keep_rows() {
+        let (dir, defs) = scan(&[
+            (
+                "login/mfa.ts",
+                "export function isValidRedirect(url: string) {\n                   return url.startsWith(\"/\");\n}\n                 export class MFAController {\n                   post(url: string) {\n    return isValidRedirect(url);\n  }\n}\n",
+            ),
+            (
+                "register/mfa.ts",
+                "export function isRegistered(user: string) {\n                   return user.length > 0;\n}\n\n                 export class MFAController {\n                   post(user: string) {\n    return isRegistered(user);\n  }\n}\n",
+            ),
+        ]);
+
+        let root = dir.path().canonicalize().unwrap();
+        assert!(
+            !defs.contains_key("MFAController.post"),
+            "a key two files claim is held per file, never under the bare key"
+        );
+
+        let login = &defs["MFAController.post@login/mfa.ts"];
+        let register = &defs["MFAController.post@register/mfa.ts"];
+        assert_eq!(login.file_path, root.join("login/mfa.ts"));
+        assert_eq!(register.file_path, root.join("register/mfa.ts"));
+        assert_eq!(login.line_number, 5);
+        assert_eq!(register.line_number, 6, "each row carries its own line");
+        assert_eq!(
+            (login.name.as_str(), register.name.as_str()),
+            ("MFAController.post", "MFAController.post"),
+            "the NAME stays plain: it is what the index displays, filters and \
+             embeds, and it is compared against `file_path` to tell the two apart"
+        );
+
+        assert_eq!(
+            callee_names(&defs, "MFAController.post@login/mfa.ts"),
+            vec!["isValidRedirect".to_string()],
+            "a re-keyed row still gets its edges"
+        );
+        assert_eq!(
+            callee_names(&defs, "MFAController.post@register/mfa.ts"),
+            vec!["isRegistered".to_string()]
+        );
+        assert_eq!(
+            PathBuf::from(&defs["MFAController.post@login/mfa.ts"].calls[0].file_path),
+            root.join("login/mfa.ts"),
+        );
+
+        // Nothing else collided, so every other key is byte-identical to what
+        // the old merge produced — the property that keeps cached intents,
+        // embedding vectors and cloud rows from churning.
+        assert!(defs.contains_key("isValidRedirect"));
+        assert!(defs.contains_key("isRegistered"));
+        assert_eq!(
+            defs.keys().filter(|k| k.contains('@')).count(),
+            2,
+            "only the colliding key is re-keyed; got {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The same collapse, with free functions rather than class members: two
+    /// files defining `helper` are two functions, not one.
+    #[test]
+    fn same_named_free_functions_both_keep_rows() {
+        let (dir, defs) = scan(&[
+            (
+                "a.ts",
+                "export function helper(n: number) {\n  return n + 1;\n}\n",
+            ),
+            (
+                "nested/b.ts",
+                "export function helper(n: number) {\n  return n - 1;\n}\n",
+            ),
+        ]);
+
+        let root = dir.path().canonicalize().unwrap();
+        assert_eq!(defs.len(), 2, "got {:?}", defs.keys().collect::<Vec<_>>());
+        assert_eq!(defs["helper@a.ts"].file_path, root.join("a.ts"));
+        assert_eq!(
+            defs["helper@nested/b.ts"].file_path,
+            root.join("nested/b.ts"),
+            "the qualifier is the repo-relative path, so it survives the \
+             relativization the cloud payload goes through"
         );
     }
 

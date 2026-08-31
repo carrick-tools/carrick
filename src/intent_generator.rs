@@ -15,6 +15,7 @@ use crate::visitor::{FunctionDefinition, ImportedSymbol};
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use tracing::{debug, warn};
 
 /// Bump when the `/generate-intent` model or prompt template changes so that
@@ -93,23 +94,38 @@ fn is_trivial_body(body: &str) -> bool {
 /// `ask` in the callee list of a formatter whose body only mentions them
 /// inside a template literal (#581).
 ///
-/// An edge counts only when the merged map holds a row under that key AND
-/// that file. The map is keyed by definition name alone, so a same-named
-/// function in another file collapses onto one row (#582); without the file
-/// check a caller would take its dependency ordering, and its callee intent
-/// context, from an unrelated function.
-fn resolved_callees(
+/// A callee ref is a `(name, file_path)` locator, not a merged-map key: a
+/// definition whose name another file also defines is stored under a re-keyed
+/// row (#582), and its ref still names it plainly. So resolve through
+/// [`definitions_by_location`] rather than by key, and return the map keys the
+/// dependency ordering and intent context below are stated in.
+///
+/// An edge counts only when the map holds a row at that name AND that file.
+/// Without the file check a caller would take its dependency ordering, and its
+/// callee intent context, from an unrelated same-named function.
+fn resolved_callees<'a>(
     def: &FunctionDefinition,
-    function_definitions: &HashMap<String, FunctionDefinition>,
+    by_location: &HashMap<(&'a str, &'a Path), &'a str>,
 ) -> Vec<String> {
     def.calls
         .iter()
-        .filter(|call| {
-            function_definitions
-                .get(&call.name)
-                .is_some_and(|callee| callee.file_path.to_string_lossy() == call.file_path)
+        .filter_map(|call| {
+            by_location
+                .get(&(call.name.as_str(), Path::new(call.file_path.as_str())))
+                .map(|key| (*key).to_string())
         })
-        .map(|call| call.name.clone())
+        .collect()
+}
+
+/// Every definition indexed by where it is defined: `(name, file)` → map key.
+/// The pair is unique — two rows sharing a name are in different files by
+/// construction, which is exactly what the re-keying at merge time guarantees.
+fn definitions_by_location(
+    function_definitions: &HashMap<String, FunctionDefinition>,
+) -> HashMap<(&str, &Path), &str> {
+    function_definitions
+        .iter()
+        .map(|(key, def)| ((def.name.as_str(), def.file_path.as_path()), key.as_str()))
         .collect()
 }
 
@@ -232,9 +248,12 @@ pub async fn generate_function_intents(
     // (`crate::call_graph`), which are already on each definition's `calls`.
     // Leaves first, so a caller's prompt carries its callees' intents.
     let mut deps: HashMap<String, Vec<String>> = HashMap::new();
-    for name in &eligible {
-        if let Some(def) = function_definitions.get(name) {
-            deps.insert(name.clone(), resolved_callees(def, function_definitions));
+    {
+        let by_location = definitions_by_location(function_definitions);
+        for name in &eligible {
+            if let Some(def) = function_definitions.get(name) {
+                deps.insert(name.clone(), resolved_callees(def, &by_location));
+            }
         }
     }
 
@@ -548,7 +567,10 @@ mod tests {
 
         let mut deps = HashMap::new();
         for name in &names {
-            deps.insert(name.clone(), resolved_callees(&defs[name], &defs));
+            deps.insert(
+                name.clone(),
+                resolved_callees(&defs[name], &definitions_by_location(&defs)),
+            );
         }
 
         assert_eq!(deps["id"], Vec::<String>::new());
@@ -560,10 +582,10 @@ mod tests {
         assert_eq!(levels[1], vec!["processId".to_string()]);
     }
 
-    /// An edge counts as a dependency only when the merged map holds a row
-    /// under that key AND that file. A key that collapsed onto another file's
-    /// definition (#582), or that has no row at all, is dropped rather than
-    /// folded into the caller's intent context.
+    /// An edge counts as a dependency only when the map holds a row with that
+    /// name AND that file. An edge into a file that was not indexed, or that
+    /// has no row at all, is dropped rather than folded into the caller's
+    /// intent context.
     #[test]
     fn resolved_callees_require_a_matching_row_and_file() {
         let mut defs = HashMap::new();
@@ -583,8 +605,37 @@ mod tests {
         );
 
         assert_eq!(
-            resolved_callees(&defs["main"], &defs),
+            resolved_callees(&defs["main"], &definitions_by_location(&defs)),
             vec!["helper".to_string()]
+        );
+    }
+
+    /// A callee whose name another file also defines is stored under a re-keyed
+    /// row (#582) while its ref still names it plainly. The dependency has to
+    /// come back as the MAP KEY, because that is what the level ordering and
+    /// the `intents` map below are keyed by — a plain name would silently drop
+    /// the callee's intent out of its caller's prompt.
+    #[test]
+    fn resolved_callees_return_the_rekeyed_map_key() {
+        let mut defs = HashMap::new();
+        let mut here = def_with_body("helper", "return 1;");
+        here.file_path = "a.ts".into();
+        let mut there = def_with_body("helper", "return 2;");
+        there.file_path = "b.ts".into();
+        defs.insert("helper@a.ts".to_string(), here);
+        defs.insert("helper@b.ts".to_string(), there);
+        defs.insert(
+            "main".to_string(),
+            with_calls(
+                def_with_body("main", "return helper();"),
+                vec![call_ref("helper", "b.ts", 1, 1)],
+            ),
+        );
+
+        assert_eq!(
+            resolved_callees(&defs["main"], &definitions_by_location(&defs)),
+            vec!["helper@b.ts".to_string()],
+            "the edge names the file it resolved to, so it must pick that row"
         );
     }
 
