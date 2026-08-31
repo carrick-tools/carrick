@@ -260,6 +260,55 @@ pub struct RouteDescriptorEndpoint {
     pub span_end: u32,
 }
 
+/// A route bound to an imported handler in a route table
+/// (`router('/widget', widget)`), #580.
+///
+/// Half a route: the path is here, the method and handler are in the module
+/// `binding` was imported from. See
+/// [`SwcScanner::controller_route_bindings`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerRouteBinding {
+    /// The route path literal (`/widget/:id`), verbatim from the call.
+    pub path: String,
+    /// Local name of the LAST argument — the handler, whatever middleware
+    /// precedes it.
+    pub binding: String,
+    /// Module specifier `binding` was imported from, to be resolved through
+    /// the module graph.
+    pub import_source: String,
+    /// 1-based line number of the binding call.
+    pub line_number: usize,
+    /// Start byte offset of the binding call.
+    pub span_start: u32,
+    /// End byte offset of the binding call.
+    pub span_end: u32,
+}
+
+/// A controller-class method that answers an HTTP method (#580).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerMethod {
+    /// The method's own name (`get`, `exportCsv`) — the route's handler.
+    pub name: String,
+    /// The HTTP method it answers, uppercased.
+    pub http_method: String,
+    /// 1-based line number of the method, in the controller's own file.
+    pub line_number: usize,
+    /// Start byte offset of the method.
+    pub span_start: u32,
+    /// End byte offset of the method.
+    pub span_end: u32,
+}
+
+/// The controller class a module default-exports (#580). Only the methods that
+/// answer an HTTP method are carried; a class with none is not a controller and
+/// contributes no routes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerClass {
+    /// The class name — the owner of every route bound to this controller.
+    pub name: String,
+    pub methods: Vec<ControllerMethod>,
+}
+
 /// Lightweight SWC-based scanner for detecting potential API patterns.
 ///
 /// This scanner looks for method call expressions that match common
@@ -569,41 +618,8 @@ impl SwcScanner {
         file_path: &Path,
         content: &str,
     ) -> Vec<RouteDescriptorEndpoint> {
-        use swc_common::FileName;
-        use swc_ecma_parser::{Parser, StringInput, Syntax, lexer::Lexer};
-
-        let syntax = match file_path.extension().and_then(|e| e.to_str()) {
-            Some("ts") => Syntax::Typescript(TsSyntax {
-                decorators: true,
-                ..Default::default()
-            }),
-            Some("tsx") => Syntax::Typescript(TsSyntax {
-                tsx: true,
-                decorators: true,
-                ..Default::default()
-            }),
-            Some("jsx") => Syntax::Es(EsSyntax {
-                jsx: true,
-                ..Default::default()
-            }),
-            _ => Syntax::Es(Default::default()),
-        };
-
-        let sm: Lrc<SourceMap> = Default::default();
-        let source_file = sm.new_source_file(
-            Lrc::new(FileName::Real(file_path.to_path_buf())),
-            content.to_string(),
-        );
-        let lexer = Lexer::new(
-            syntax,
-            Default::default(),
-            StringInput::from(&*source_file),
-            None,
-        );
-        let mut parser = Parser::new_from(lexer);
-        let module = match parser.parse_module() {
-            Ok(m) => m,
-            Err(_) => return Vec::new(),
+        let Some((sm, module)) = parse_standalone_module(file_path, content) else {
+            return Vec::new();
         };
 
         let mut visitor = RouteDescriptorVisitor {
@@ -613,6 +629,393 @@ impl SwcScanner {
         module.visit_with(&mut visitor);
         visitor.endpoints
     }
+
+    /// Collect every `router('/path', …, controller)` binding in `content`
+    /// (#580 part b).
+    ///
+    /// A class-controller service keeps its paths in one route table and its
+    /// handlers in controller modules that never name their own path, so
+    /// single-file analysis can see neither half of a route. This is the
+    /// route-table half: the literal path, and the local binding the path was
+    /// bound to, with the module specifier that binding was imported from so
+    /// the caller can follow it.
+    ///
+    /// The shape is recognised structurally, with no framework names involved:
+    ///
+    /// * the callee is a *bare identifier this file imported* — a route binder
+    ///   is a callable another module supplies, not a method on an object and
+    ///   not a local closure;
+    /// * the first argument is a string literal that is a producer path (see
+    ///   [`is_producer_route_path`]);
+    /// * the last argument is a bare identifier this file imported, which is
+    ///   the handler even when middleware sits in front of it
+    ///   (`router('/token', errorHandler, token)`).
+    ///
+    /// Recognising the *shape* is deliberately not the whole gate: what makes
+    /// this a route is that the binding resolves to a module default-exporting
+    /// a controller class (see
+    /// [`default_export_controller_class`](Self::default_export_controller_class)),
+    /// which is the caller's step. A call that merely looks like this but
+    /// binds something else emits nothing.
+    pub fn controller_route_bindings(
+        &self,
+        file_path: &Path,
+        content: &str,
+    ) -> Vec<ControllerRouteBinding> {
+        let Some((sm, module)) = parse_standalone_module(file_path, content) else {
+            return Vec::new();
+        };
+
+        let mut visitor = ControllerRouteVisitor {
+            source_map: sm,
+            imports: collect_import_locals(&module),
+            bindings: Vec::new(),
+        };
+        module.visit_with(&mut visitor);
+        visitor.bindings
+    }
+
+    /// The controller class `content` default-exports, with the methods that
+    /// answer an HTTP method (#580 part b).
+    ///
+    /// The controller half of a class-controller route. Three default-export
+    /// shapes reach a class, and nothing else does:
+    ///
+    /// * `export default class Foo {}` — the class itself;
+    /// * `export default new Foo()` — an instance of a class declared here;
+    /// * `export default foo` where `foo` is a local binding for either of the
+    ///   above (`const foo = new Foo(); export default foo;`).
+    ///
+    /// A default export that is a function, an object, an instance of a class
+    /// from another module, or an anonymous class returns `None`: without a
+    /// class declared in this module there is no method list to enumerate and
+    /// no name to own the routes.
+    ///
+    /// A method answers an HTTP method when its NAME is an HTTP verb
+    /// (`get`, `post`, …) or when it carries a decorator whose single argument
+    /// is a string literal naming one (`@method('GET')`). The two tests are
+    /// deliberately asymmetric: a name is weak evidence, so only the seven
+    /// verbs a handler is realistically named after count, while an explicit
+    /// literal is a declaration and is taken at face value for any method
+    /// [`crate::type_manifest::is_http_method`] accepts. Reading the literal
+    /// rather than the decorator's name is what keeps this framework-agnostic
+    /// AND rejects `@accept('text/csv')`, whose literal is a content type.
+    pub fn default_export_controller_class(
+        &self,
+        file_path: &Path,
+        content: &str,
+    ) -> Option<ControllerClass> {
+        let (sm, module) = parse_standalone_module(file_path, content)?;
+        let (name, class) = default_exported_class(&module)?;
+        let methods = class
+            .body
+            .iter()
+            .filter_map(|member| match member {
+                ClassMember::Method(method) => controller_method(method, &sm),
+                _ => None,
+            })
+            .collect();
+        Some(ControllerClass { name, methods })
+    }
+}
+
+/// Parse `content` as a module with its OWN source map, so a caller that only
+/// needs an AST (and the line numbers that go with it) is not entangled with
+/// the scanner's own map. Returns `None` when the file does not parse; every
+/// deterministic pass built on this treats a parse failure as "no facts here",
+/// which is what the scanner's candidate pass does too.
+fn parse_standalone_module(file_path: &Path, content: &str) -> Option<(Lrc<SourceMap>, Module)> {
+    use swc_common::FileName;
+    use swc_ecma_parser::{Parser, StringInput, Syntax, lexer::Lexer};
+
+    let syntax = match file_path.extension().and_then(|e| e.to_str()) {
+        Some("ts") => Syntax::Typescript(TsSyntax {
+            decorators: true,
+            ..Default::default()
+        }),
+        Some("tsx") => Syntax::Typescript(TsSyntax {
+            tsx: true,
+            decorators: true,
+            ..Default::default()
+        }),
+        Some("jsx") => Syntax::Es(EsSyntax {
+            jsx: true,
+            ..Default::default()
+        }),
+        _ => Syntax::Es(Default::default()),
+    };
+
+    let sm: Lrc<SourceMap> = Default::default();
+    let source_file = sm.new_source_file(
+        Lrc::new(FileName::Real(file_path.to_path_buf())),
+        content.to_string(),
+    );
+    let lexer = Lexer::new(
+        syntax,
+        Default::default(),
+        StringInput::from(&*source_file),
+        None,
+    );
+    let mut parser = Parser::new_from(lexer);
+    parser.parse_module().ok().map(|module| (sm, module))
+}
+
+/// Local binding name -> the module specifier it was imported from, for every
+/// value import in `module`. Type-only imports bind nothing at runtime, so a
+/// route can never be bound to one.
+fn collect_import_locals(module: &Module) -> HashMap<String, String> {
+    let mut imports = HashMap::new();
+    for item in &module.body {
+        let ModuleItem::ModuleDecl(ModuleDecl::Import(decl)) = item else {
+            continue;
+        };
+        if decl.type_only {
+            continue;
+        }
+        let specifier = decl.src.value.to_string();
+        for spec in &decl.specifiers {
+            let local = match spec {
+                ImportSpecifier::Default(s) => s.local.sym.to_string(),
+                ImportSpecifier::Named(s) if !s.is_type_only => s.local.sym.to_string(),
+                // `import * as ns from` binds a namespace OBJECT, which is not
+                // a callable a route can be bound to.
+                _ => continue,
+            };
+            imports.insert(local, specifier.clone());
+        }
+    }
+    imports
+}
+
+/// The class a module default-exports, as `(name, class)`, following a local
+/// binding and a `new` expression to the declaration in the SAME module. See
+/// [`SwcScanner::default_export_controller_class`] for the shapes covered.
+fn default_exported_class(module: &Module) -> Option<(String, &Class)> {
+    let mut classes: HashMap<String, &ClassDecl> = HashMap::new();
+    let mut locals: HashMap<String, &Expr> = HashMap::new();
+    let mut default_export: Option<&Expr> = None;
+
+    for item in &module.body {
+        let decl = match item {
+            ModuleItem::Stmt(Stmt::Decl(decl)) => Some(decl),
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => Some(&export.decl),
+            // `export default class Foo {}` — the class is the export. An
+            // anonymous default class has no name to own the routes it would
+            // serve, so it is not a controller here.
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(export)) => {
+                if let DefaultDecl::Class(class) = &export.decl
+                    && let Some(ident) = &class.ident
+                {
+                    return Some((ident.sym.to_string(), &class.class));
+                }
+                None
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export)) => {
+                default_export = Some(&export.expr);
+                None
+            }
+            _ => None,
+        };
+        match decl {
+            Some(Decl::Class(class)) => {
+                classes.insert(class.ident.sym.to_string(), class);
+            }
+            Some(Decl::Var(var)) => {
+                for declarator in &var.decls {
+                    if let Pat::Ident(ident) = &declarator.name
+                        && let Some(init) = &declarator.init
+                    {
+                        locals.insert(ident.id.sym.to_string(), init);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Depth cap: a default export chained through more local bindings than
+    // this is indistinguishable from a mis-resolution, and each hop is a
+    // guess about a value we cannot evaluate.
+    const MAX_BINDING_HOPS: usize = 4;
+    let mut expr = default_export?;
+    for _ in 0..MAX_BINDING_HOPS {
+        match unwrap_expr(expr) {
+            // `export default new Foo()`
+            Expr::New(new_expr) => {
+                let Expr::Ident(ident) = unwrap_expr(&new_expr.callee) else {
+                    return None;
+                };
+                let class = classes.get(&ident.sym.to_string())?;
+                return Some((class.ident.sym.to_string(), &class.class));
+            }
+            // `export default Foo` (the class) or `export default foo` (a
+            // local binding for one).
+            Expr::Ident(ident) => {
+                let name = ident.sym.to_string();
+                if let Some(class) = classes.get(&name) {
+                    return Some((class.ident.sym.to_string(), &class.class));
+                }
+                expr = locals.get(&name)?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Strip the wrappers that do not change which value an expression names, so
+/// `export default (new Foo() as Controller)` reads like `new Foo()`.
+fn unwrap_expr(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(inner) => unwrap_expr(&inner.expr),
+        Expr::TsAs(inner) => unwrap_expr(&inner.expr),
+        Expr::TsNonNull(inner) => unwrap_expr(&inner.expr),
+        Expr::TsSatisfies(inner) => unwrap_expr(&inner.expr),
+        other => other,
+    }
+}
+
+/// The HTTP method a controller method answers, or `None` when it answers
+/// none — a helper, not a route. See
+/// [`SwcScanner::default_export_controller_class`] for the rule.
+fn controller_method(
+    method: &ClassMethod,
+    source_map: &Lrc<SourceMap>,
+) -> Option<ControllerMethod> {
+    // Constructors, getters and setters are not request handlers.
+    if method.kind != MethodKind::Method {
+        return None;
+    }
+    let name = match &method.key {
+        PropName::Ident(id) => id.sym.to_string(),
+        PropName::Str(s) => s.value.to_string(),
+        _ => return None,
+    };
+    let http_method = declared_http_method(&method.function.decorators).or_else(|| {
+        VERB_NAMED_METHODS
+            .contains(&name.as_str())
+            .then(|| name.to_uppercase())
+    })?;
+    let span = method.span;
+    Some(ControllerMethod {
+        name,
+        http_method,
+        // The method's NAME, not its span: a decorated method's span opens at
+        // the first decorator, which would report the route a line or two
+        // above the handler a reader is being sent to.
+        line_number: source_map.lookup_char_pos(method.key.span().lo).line,
+        span_start: span.lo.0,
+        span_end: span.hi.0,
+    })
+}
+
+/// The HTTP method a decorator declares outright: a call with exactly one
+/// argument, a plain string literal, naming an HTTP method. One argument is
+/// required so a multi-argument decorator (`@roles('GET', 'admin')`) cannot
+/// contribute a method by accident.
+fn declared_http_method(decorators: &[Decorator]) -> Option<String> {
+    decorators.iter().find_map(|decorator| {
+        let Expr::Call(call) = &*decorator.expr else {
+            return None;
+        };
+        let [arg] = call.args.as_slice() else {
+            return None;
+        };
+        if arg.spread.is_some() {
+            return None;
+        }
+        let Expr::Lit(Lit::Str(literal)) = &*arg.expr else {
+            return None;
+        };
+        let value = literal.value.to_string();
+        crate::type_manifest::is_http_method(&value).then(|| value.trim().to_uppercase())
+    })
+}
+
+/// Method names that are strong enough evidence on their own to make a
+/// controller method a route. Deliberately the seven verbs a handler is
+/// realistically named after — not every method
+/// [`crate::type_manifest::is_http_method`] accepts, because a class is far
+/// more likely to have a `connect` or `trace` helper than to serve one.
+const VERB_NAMED_METHODS: &[&str] = &["get", "post", "put", "patch", "delete", "head", "options"];
+
+/// Collects `router('/path', …, controller)` bindings. See
+/// [`SwcScanner::controller_route_bindings`] for the shape and why it is gated
+/// on imports rather than on any framework name.
+struct ControllerRouteVisitor {
+    source_map: Lrc<SourceMap>,
+    /// Local binding name -> module specifier, for this file's value imports.
+    imports: HashMap<String, String>,
+    bindings: Vec<ControllerRouteBinding>,
+}
+
+impl Visit for ControllerRouteVisitor {
+    fn visit_call_expr(&mut self, node: &CallExpr) {
+        node.visit_children_with(self);
+
+        let Callee::Expr(callee) = &node.callee else {
+            return;
+        };
+        // The binder is a callable another module supplies.
+        let Expr::Ident(callee_ident) = unwrap_expr(callee) else {
+            return;
+        };
+        if !self.imports.contains_key(&callee_ident.sym.to_string()) {
+            return;
+        }
+        // `binder(path, handler)` at minimum; middleware may sit between them.
+        let ([first, .., last], false) = (
+            node.args.as_slice(),
+            node.args.iter().any(|arg| arg.spread.is_some()),
+        ) else {
+            return;
+        };
+        let Expr::Lit(Lit::Str(path)) = &*first.expr else {
+            return;
+        };
+        let path = path.value.to_string();
+        if !is_producer_route_path(&path) {
+            return;
+        }
+        let Expr::Ident(handler) = unwrap_expr(&last.expr) else {
+            return;
+        };
+        let binding = handler.sym.to_string();
+        let Some(import_source) = self.imports.get(&binding).cloned() else {
+            return;
+        };
+        let span = node.span;
+        self.bindings.push(ControllerRouteBinding {
+            path,
+            binding,
+            import_source,
+            line_number: self.source_map.lookup_char_pos(span.lo).line,
+            span_start: span.lo.0,
+            span_end: span.hi.0,
+        });
+    }
+}
+
+/// Whether `path` can be the path of a PRODUCER — a route this service serves.
+///
+/// A served route is a path on this origin, so it is absolute: it starts with
+/// `/`. A template literal counts when its *static head* does
+/// (`` `/orders/${id}` ``), which is what the leading-backtick strip covers.
+///
+/// The contrast with [`RouteDescriptorVisitor::is_route_shaped_path`] is the
+/// whole point of having two predicates, and it is directional (#580). A
+/// CONSUMER names someone else's origin, so a full `http(s)://` URL is a
+/// legitimate outbound target. A producer never serves one: a string that is
+/// a full URL under a server-side route call is a schema `$id`, a redirect
+/// target, or a validator argument — never the path the route is mounted at.
+/// Bare tokens are rejected on the same reasoning (`GET` is a method literal,
+/// `text/csv` a content type; neither is a path).
+pub fn is_producer_route_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    trimmed
+        .strip_prefix('`')
+        .unwrap_or(trimmed)
+        .starts_with('/')
 }
 
 /// Collects deterministic route descriptors (`{ method, path, handler }` with
@@ -621,9 +1024,10 @@ impl SwcScanner {
 /// [`CandidateVisitor::route_descriptor`], but the deterministic gate is
 /// strictly narrower (#241): a descriptor is emitted only when it is a *direct
 /// element of an array literal* (a routes registry, not a standalone config
-/// object) and its path is *route-shaped* (leading `/` or an http(s) URL, not a
-/// bare token like `some-message`). Anything failing this gate is left for the
-/// LLM extraction path; only genuine route registries are authoritative.
+/// object) and its path is *producer-route-shaped* (leading `/`, not a bare
+/// token like `some-message` and not a full URL, #580). Anything failing this
+/// gate is left for the LLM extraction path; only genuine route registries are
+/// authoritative.
 struct RouteDescriptorVisitor {
     source_map: Lrc<SourceMap>,
     endpoints: Vec<RouteDescriptorEndpoint>,
@@ -633,6 +1037,9 @@ impl RouteDescriptorVisitor {
     /// A path is route-shaped when it is an absolute path (`/widgets`) or an
     /// http(s) URL. This rejects bare tokens (`some-message`), RPC method names,
     /// and other non-route strings that happen to sit under a `path` key.
+    ///
+    /// CONSUMER-side only. A producer's path must additionally be absolute —
+    /// see [`is_producer_route_path`], which owns that direction.
     fn is_route_shaped_path(path: &str) -> bool {
         let trimmed = path.trim();
         trimmed.starts_with('/')
@@ -654,8 +1061,10 @@ impl RouteDescriptorVisitor {
         };
         // #241: reject non-route paths (bare tokens, RPC method names) so a
         // config object that merely carries `method`/`path` keys is not
-        // fabricated as an endpoint.
-        if !Self::is_route_shaped_path(&path) {
+        // fabricated as an endpoint. #580: this is the PRODUCER side, so a
+        // full URL is rejected too — it is never the path a route is served
+        // at.
+        if !is_producer_route_path(&path) {
             return;
         }
         let span = node.span;
@@ -2719,8 +3128,11 @@ export { handlers };
     }
 
     #[test]
-    fn registry_descriptor_with_url_path_is_a_deterministic_endpoint() {
-        // #241: an http(s) URL is route-shaped and qualifies inside a registry.
+    fn registry_descriptor_with_url_path_is_not_a_producer_endpoint() {
+        // #580 (revises #241): an http(s) URL names someone else's origin, so
+        // it can be a CONSUMER target but never the path a producer serves its
+        // route at. In a registry it is a webhook target being called out to, a
+        // schema `$id`, or a redirect — not a route this service answers.
         let content = r#"
 const routes = [
   { method: 'POST', path: 'https://api.example.com/webhook', handler: onHook },
@@ -2729,10 +3141,225 @@ export { routes };
 "#;
         let scanner = SwcScanner::new();
         let endpoints = scanner.route_descriptor_endpoints(&PathBuf::from("routes.ts"), content);
-        assert_eq!(endpoints.len(), 1);
-        assert_eq!(endpoints[0].method, "POST");
-        assert_eq!(endpoints[0].path, "https://api.example.com/webhook");
-        assert_eq!(endpoints[0].handler.as_deref(), Some("onHook"));
+        assert!(
+            endpoints.is_empty(),
+            "an absolute URL must not be emitted as a producer route path, got {endpoints:?}"
+        );
+    }
+
+    #[test]
+    fn producer_route_path_requires_a_leading_slash() {
+        // #580: the three shapes the OAuth2-server scan mis-emitted as paths.
+        assert!(!is_producer_route_path("GET"), "a method literal");
+        assert!(!is_producer_route_path("text/csv"), "a content type");
+        assert!(
+            !is_producer_route_path("https://example.invalid/schemas/x.json"),
+            "a schema $id URL"
+        );
+        assert!(!is_producer_route_path("http://example.invalid/x"));
+        assert!(!is_producer_route_path(""));
+
+        // Absolute paths, including a template literal whose static head is
+        // absolute, are producer paths.
+        assert!(is_producer_route_path("/"));
+        assert!(is_producer_route_path("/users/:id"));
+        assert!(is_producer_route_path("  /users  "), "surrounding space");
+        assert!(is_producer_route_path("`/orders/${id}`"));
+        assert!(
+            !is_producer_route_path("`https://x.invalid/${id}`"),
+            "a template whose static head is a URL is still not a producer path"
+        );
+    }
+
+    #[test]
+    fn consumer_request_spec_still_accepts_an_absolute_url() {
+        // #580 guard: splitting the producer predicate must not narrow the
+        // CONSUMER side, where a full URL is the ordinary outbound target.
+        let content = r#"
+const response = await client.post({
+  url: 'https://api.example.com/v1/things',
+  body: payload,
+});
+"#;
+        let result = scan_test_content(content);
+        let spec = result
+            .candidates
+            .iter()
+            .find_map(|c| c.request_spec.as_ref())
+            .expect("an absolute-URL request spec must still be captured");
+        assert_eq!(spec.method, "POST");
+        assert_eq!(spec.url, "https://api.example.com/v1/things");
+    }
+
+    #[test]
+    fn controller_route_bindings_take_the_last_argument() {
+        // #580 part b: the handler is the LAST argument, whatever middleware
+        // sits in front of it. Taking the first identifier argument would
+        // attribute `/token` to the error handler — and fail silently, because
+        // a middleware module has no controller class to enumerate.
+        let content = r#"
+import { router } from './framework';
+import errorHandler from './middleware/error-handler';
+import token from './controllers/token';
+import widget from './controllers/widget';
+
+export default [
+  router('/widget', widget),
+  router('/token', errorHandler, token),
+];
+"#;
+        let scanner = SwcScanner::new();
+        let bindings = scanner.controller_route_bindings(&PathBuf::from("routes.ts"), content);
+        let bound: Vec<(&str, &str, &str)> = bindings
+            .iter()
+            .map(|b| {
+                (
+                    b.path.as_str(),
+                    b.binding.as_str(),
+                    b.import_source.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            bound,
+            vec![
+                ("/widget", "widget", "./controllers/widget"),
+                ("/token", "token", "./controllers/token"),
+            ]
+        );
+    }
+
+    #[test]
+    fn controller_route_bindings_reject_non_route_shapes() {
+        // Each call below fails exactly one leg of the gate. None is a route.
+        let content = r#"
+import { router } from './framework';
+import widget from './controllers/widget';
+
+const local = (path, handler) => handler;
+
+export default [
+  // path is not absolute
+  router('widget', widget),
+  // handler is not an imported binding
+  router('/inline', (ctx) => ctx),
+  // the binder is a local closure, not an imported callable
+  local('/local', widget),
+  // the binder is a method on an object
+  suite.describe('/described', widget),
+  // one argument only: nothing is bound
+  router('/lonely'),
+];
+"#;
+        let scanner = SwcScanner::new();
+        assert_eq!(
+            scanner.controller_route_bindings(&PathBuf::from("routes.ts"), content),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn default_export_controller_class_follows_every_class_shape() {
+        // #580 part b: the three default-export shapes that reach a class
+        // declared in the same module.
+        let scanner = SwcScanner::new();
+        let class_of = |content: &str| {
+            scanner
+                .default_export_controller_class(&PathBuf::from("controller.ts"), content)
+                .map(|c| c.name)
+        };
+
+        assert_eq!(
+            class_of("export default class Health { get(ctx) {} }"),
+            Some("Health".to_string()),
+            "the class itself"
+        );
+        assert_eq!(
+            class_of("class Widget { get(ctx) {} }\nexport default new Widget();"),
+            Some("Widget".to_string()),
+            "an instance of a local class"
+        );
+        assert_eq!(
+            class_of(
+                "class Session { get(ctx) {} }\nconst session = new Session();\nexport default session;"
+            ),
+            Some("Session".to_string()),
+            "an instance through a local binding"
+        );
+        assert_eq!(
+            class_of("class Widget { get(ctx) {} }\nexport default Widget;"),
+            Some("Widget".to_string()),
+            "the class through a local binding"
+        );
+
+        // Everything else emits nothing: there is no method list to enumerate
+        // and no class name to own the routes.
+        assert_eq!(
+            class_of(
+                "const errorHandler = async (ctx, next) => next();\nexport default errorHandler;"
+            ),
+            None,
+            "a middleware function"
+        );
+        assert_eq!(
+            class_of("import Widget from './widget';\nexport default new Widget();"),
+            None,
+            "an instance of a class from another module"
+        );
+        assert_eq!(
+            class_of("export default class { get(ctx) {} }"),
+            None,
+            "an anonymous class has no name to own a route"
+        );
+        assert_eq!(class_of("export const widget = 1;"), None, "no default");
+    }
+
+    #[test]
+    fn controller_methods_are_verb_named_or_verb_decorated() {
+        // #580 part b: `@method('GET')` declares the method of a handler that
+        // is not verb-named; `@accept('text/csv')` declares a content type and
+        // must contribute nothing; a plain helper is not a route at all.
+        let content = r#"
+import { Controller, accept, method } from '../framework';
+
+class ReportController extends Controller {
+  get(ctx) {}
+
+  @method('GET')
+  @accept('text/csv')
+  exportCsv(ctx) {}
+
+  buildRows() { return []; }
+
+  @accept('text/csv')
+  renderCsv(ctx) {}
+
+  @roles('GET', 'admin')
+  audit(ctx) {}
+
+  constructor() { super(); }
+}
+
+export default new ReportController();
+"#;
+        let scanner = SwcScanner::new();
+        let class = scanner
+            .default_export_controller_class(&PathBuf::from("report.ts"), content)
+            .expect("a default-exported controller class");
+        assert_eq!(class.name, "ReportController");
+        let methods: Vec<(&str, &str)> = class
+            .methods
+            .iter()
+            .map(|m| (m.name.as_str(), m.http_method.as_str()))
+            .collect();
+        assert_eq!(
+            methods,
+            vec![("get", "GET"), ("exportCsv", "GET")],
+            "only a verb-named method and a verb-decorated one are routes"
+        );
+        // The decorated method is reported at its own line, not at the first
+        // decorator's, so the index points at the handler.
+        assert_eq!(class.methods[1].line_number, 9);
     }
 
     /// #537: the config-object call form. The client is a bare binding (here a

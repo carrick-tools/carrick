@@ -277,6 +277,7 @@ fn test_processing_stats_tracking() {
         total_endpoints: 10,
         file_based_endpoints: 2,
         route_descriptor_endpoints: 1,
+        class_controller_endpoints: 0,
         pubsub_anchor_backfills: 0,
         pubsub_phantom_topic_drops: 0,
         request_spec_call_backfills: 0,
