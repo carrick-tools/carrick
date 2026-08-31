@@ -2949,14 +2949,16 @@ fn discover_files_and_symbols(
 
     // Extract imported symbols and function definitions by parsing files
     let mut all_imported_symbols = HashMap::new();
-    let mut all_function_definitions = HashMap::new();
-    // Per-file call-resolution inputs, kept beside the merged map because the
-    // merged map is keyed by definition name alone: two same-named functions
-    // in different files collapse onto one row (#582), and resolving edges
-    // against that would make a correct edge depend on walk order. Keyed by
-    // CANONICAL path, which is what import specifiers resolve to — a repo
-    // reached through a symlink would otherwise miss every cross-file lookup
-    // with no error.
+    // Definitions stay per file until every file has been parsed: the merge is
+    // collision-aware (#582) and can only tell a colliding key from a unique
+    // one once it can see them all.
+    let mut per_file_definitions: Vec<(PathBuf, HashMap<String, FunctionDefinition>)> = Vec::new();
+    // Per-file call-resolution inputs, kept beside the merged map because a
+    // definition key means something only within its own file: resolving edges
+    // against the merged map would make a correct edge depend on walk order.
+    // Keyed by CANONICAL path, which is what import specifiers resolve to — a
+    // repo reached through a symlink would otherwise miss every cross-file
+    // lookup with no error.
     let mut per_file_calls: HashMap<PathBuf, crate::call_graph::FileCallIndex> = HashMap::new();
 
     for file_path in &files {
@@ -2989,14 +2991,21 @@ fn discover_files_and_symbols(
                     imports: file_imports,
                 },
             );
-            all_function_definitions.extend(func_extractor.function_definitions);
+            per_file_definitions.push((file_path.clone(), func_extractor.function_definitions));
         }
     }
+
+    // One row per definition, with same-named definitions in different files
+    // re-keyed rather than collapsed onto each other (#582).
+    let crate::call_graph::MergedDefinitions {
+        definitions: mut all_function_definitions,
+        keys,
+    } = crate::call_graph::merge_definitions(per_file_definitions, repo_path);
 
     // Resolve the collected call sites into `FunctionDefinition::calls` while
     // the per-file scopes are still in hand. Deterministic and LLM-free, so it
     // runs on every path, `CARRICK_SKIP_INTENTS` included.
-    crate::call_graph::resolve_call_edges(&mut all_function_definitions, &per_file_calls);
+    crate::call_graph::resolve_call_edges(&mut all_function_definitions, &per_file_calls, &keys);
 
     debug!(
         "Extracted {} imported symbols and {} function definitions from {} files",

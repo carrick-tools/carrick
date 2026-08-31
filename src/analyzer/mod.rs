@@ -869,6 +869,30 @@ pub fn is_valid_route_shape(route: &str) -> bool {
     false
 }
 
+/// The definition row a handler name refers to, given the file the route was
+/// registered in.
+///
+/// The plain key is tried first, so a handler whose name nothing else claims
+/// resolves exactly as it always did. On a miss the name may still be indexed
+/// under a re-keyed row: a definition key two files both define is stored per
+/// file (#582), and inline handlers make that ordinary — they are indexed under
+/// a synthetic name derived from the route (`get_users_handler`), so two files
+/// registering the same route produce the same key. Fall back to the row
+/// defined in the endpoint's own file, which is where an inline handler is, and
+/// give up rather than guess between same-named handlers elsewhere.
+fn definition_for_handler<'a>(
+    function_definitions: &'a HashMap<String, FunctionDefinition>,
+    handler_name: &str,
+    file_path: &std::path::Path,
+) -> Option<&'a FunctionDefinition> {
+    if let Some(def) = function_definitions.get(handler_name) {
+        return Some(def);
+    }
+    function_definitions
+        .values()
+        .find(|def| def.name == handler_name && def.file_path == file_path)
+}
+
 pub struct Analyzer {
     // <Route, http_method, handler_name, source>
     pub imported_handlers: Vec<(String, String, String, String)>,
@@ -1415,7 +1439,11 @@ impl Analyzer {
                 continue;
             };
             if let Some(handler_name) = &endpoint.handler_name
-                && let Some(func_def) = self.function_definitions.get(handler_name)
+                && let Some(func_def) = definition_for_handler(
+                    &self.function_definitions,
+                    handler_name,
+                    &endpoint.file_path,
+                )
                 && func_def.arguments.len() >= 2
             {
                 // Process Request Type (argument 0)
@@ -2638,6 +2666,54 @@ impl Analyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A handler name nothing else claims resolves by key, exactly as before.
+    /// One that two files both define is stored per file (#582), so the key
+    /// lookup misses and the endpoint's own file decides — which is where an
+    /// inline handler always is. Nothing is guessed when neither holds.
+    #[test]
+    fn handler_lookup_falls_back_to_the_endpoints_own_file() {
+        let row = |name: &str, file: &str| FunctionDefinition {
+            name: name.to_string(),
+            file_path: std::path::PathBuf::from(file),
+            node_type: Default::default(),
+            arguments: vec![],
+            body_source: None,
+            is_exported: false,
+            line_number: 1,
+            end_line: 0,
+            intent: None,
+            calls: vec![],
+            return_type: None,
+            return_is_explicit: false,
+            signature: None,
+            intent_input_hash: None,
+        };
+
+        let mut defs = HashMap::new();
+        defs.insert("listUsers".to_string(), row("listUsers", "src/users.ts"));
+        defs.insert(
+            "get_health_handler@src/a.ts".to_string(),
+            row("get_health_handler", "src/a.ts"),
+        );
+        defs.insert(
+            "get_health_handler@src/b.ts".to_string(),
+            row("get_health_handler", "src/b.ts"),
+        );
+
+        let plain = definition_for_handler(&defs, "listUsers", Path::new("src/routes.ts"))
+            .expect("a handler defined once resolves by key, from any file");
+        assert_eq!(plain.file_path, PathBuf::from("src/users.ts"));
+
+        let inline = definition_for_handler(&defs, "get_health_handler", Path::new("src/b.ts"))
+            .expect("the row defined in the endpoint's own file");
+        assert_eq!(inline.file_path, PathBuf::from("src/b.ts"));
+
+        assert!(
+            definition_for_handler(&defs, "get_health_handler", Path::new("src/c.ts")).is_none(),
+            "no row in that file, and two candidates elsewhere: no guess"
+        );
+    }
 
     /// Regression for #334: a duplicated producer manifest entry made ts_check
     /// emit the same mismatch once per duplicate, which reached the PR comment

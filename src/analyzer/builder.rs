@@ -53,6 +53,12 @@ impl AnalyzerBuilder {
             analyzer
                 .imported_handlers
                 .extend(repo_data.imported_handlers);
+            // Keys are unique within a repo (`call_graph::merge_definitions`
+            // re-keys same-named definitions per file, #582) but not across
+            // repos, so a `foo` defined in two repos still collapses here.
+            // This map is never uploaded and feeds only handler-field
+            // resolution, so the cross-repo case is left as it is rather than
+            // given a second key shape.
             analyzer
                 .function_definitions
                 .extend(repo_data.function_definitions);
