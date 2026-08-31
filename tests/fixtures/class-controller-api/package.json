@@ -1,0 +1,7 @@
+{
+  "name": "class-controller-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fixture: routes bound to imported controller instances (carrick#580)",
+  "main": "src/routes.ts"
+}

@@ -42,7 +42,8 @@ use crate::{
         TypeSidecar,
     },
     swc_scanner::{
-        CandidateTarget, PubsubAnchorOp, RouteDescriptorEndpoint, SwcScanner, normalize_path_params,
+        CandidateTarget, PubsubAnchorOp, RouteDescriptorEndpoint, SwcScanner,
+        is_producer_route_path, normalize_path_params,
     },
     type_manifest::{
         build_call_site_id, build_manifest_type_alias, build_manifest_type_alias_with_call_id,
@@ -4531,6 +4532,30 @@ impl FileOrchestrator {
                     continue; // Skip non-HTTP methods (e.g., "use", empty)
                 }
 
+                // #580: a producer path is absolute. Every candidate call the
+                // scanner raises is a *possible* route, and the analyzer will
+                // answer with the literal it found there — so a decorator
+                // argument (`@method('GET')`, `@accept('text/csv')`) or a
+                // schema `$id` URL passed to a validator can arrive here
+                // wearing the shape of an endpoint. None of them is a path
+                // this service serves. Dropped at the point rows enter the
+                // graph, which is the single choke point both callers of
+                // `build_mount_graph` (the live pass and the engine's cached
+                // rebuild) go through.
+                //
+                // Only the endpoint is dropped, not the owner node the first
+                // pass registered for it: that node may also own real routes,
+                // and it is inert without an endpoint attached.
+                if !is_producer_route_path(&endpoint.path) {
+                    debug!(
+                        "Dropping endpoint {} {:?} at {}:{}: a served route's path starts with \
+                         '/', so this literal is not one (decorator argument, content type, or \
+                         absolute URL)",
+                        method, endpoint.path, file_path, endpoint.line_number
+                    );
+                    continue;
+                }
+
                 // Try to resolve the owner using import information
                 let resolved_owner = Self::resolve_endpoint_owner(
                     &owner_bindings,
@@ -6137,6 +6162,69 @@ export * from "./aFetch.js";"#,
         assert_eq!(graph.mounts[0].parent, "app");
         assert_eq!(graph.mounts[0].child, "userRouter");
         assert_eq!(graph.mounts[0].path_prefix, "/users");
+    }
+
+    /// #580: an analyzer row whose path is not absolute is not a route this
+    /// service serves. The reported shapes are a decorator argument
+    /// (`@method('GET')` -> `GET`, `@accept('text/csv')` -> `text/csv`) and a
+    /// JSON-schema `$id` passed to a validator, all of which reached the
+    /// endpoint list on a real scan. The real `GET /health` in the same file
+    /// must survive, so this is a drop and not a whole-file suppression.
+    #[test]
+    fn build_mount_graph_drops_endpoint_rows_whose_path_is_not_absolute() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+
+        let endpoint = |line_number: i32, method: &str, path: &str| EndpointResult {
+            candidate_id: format!("span:{line_number}"),
+            line_number,
+            owner_node: "SettingsController".to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            handler_name: "get".to_string(),
+            pattern_matched: ".get(".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+        };
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/settings/controller.ts".to_string(),
+            FileAnalysisResult {
+                endpoints: vec![
+                    endpoint(10, "GET", "GET"),
+                    endpoint(22, "GET", "text/csv"),
+                    endpoint(15, "POST", "https://example.invalid/schemas/start.json"),
+                    endpoint(30, "GET", "/settings"),
+                ],
+                ..Default::default()
+            },
+        );
+
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+
+        let paths: Vec<&str> = graph.endpoints.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["/settings"],
+            "only the absolute path is a served route"
+        );
+        assert!(
+            graph.endpoints.iter().all(|e| e.path.starts_with('/')),
+            "no endpoint row may carry a non-absolute path"
+        );
     }
 
     /// #373: a sub-router mounted under multiple path aliases serves its routes

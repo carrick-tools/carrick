@@ -615,15 +615,38 @@ impl SwcScanner {
     }
 }
 
+/// Whether `path` can be the path of a PRODUCER — a route this service serves.
+///
+/// A served route is a path on this origin, so it is absolute: it starts with
+/// `/`. A template literal counts when its *static head* does
+/// (`` `/orders/${id}` ``), which is what the leading-backtick strip covers.
+///
+/// The contrast with [`RouteDescriptorVisitor::is_route_shaped_path`] is the
+/// whole point of having two predicates, and it is directional (#580). A
+/// CONSUMER names someone else's origin, so a full `http(s)://` URL is a
+/// legitimate outbound target. A producer never serves one: a string that is
+/// a full URL under a server-side route call is a schema `$id`, a redirect
+/// target, or a validator argument — never the path the route is mounted at.
+/// Bare tokens are rejected on the same reasoning (`GET` is a method literal,
+/// `text/csv` a content type; neither is a path).
+pub fn is_producer_route_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    trimmed
+        .strip_prefix('`')
+        .unwrap_or(trimmed)
+        .starts_with('/')
+}
+
 /// Collects deterministic route descriptors (`{ method, path, handler }` with
 /// literal method + path) for the no-LLM emission path (#234). The shape guard
 /// is shared with the recall-boost candidate via
 /// [`CandidateVisitor::route_descriptor`], but the deterministic gate is
 /// strictly narrower (#241): a descriptor is emitted only when it is a *direct
 /// element of an array literal* (a routes registry, not a standalone config
-/// object) and its path is *route-shaped* (leading `/` or an http(s) URL, not a
-/// bare token like `some-message`). Anything failing this gate is left for the
-/// LLM extraction path; only genuine route registries are authoritative.
+/// object) and its path is *producer-route-shaped* (leading `/`, not a bare
+/// token like `some-message` and not a full URL, #580). Anything failing this
+/// gate is left for the LLM extraction path; only genuine route registries are
+/// authoritative.
 struct RouteDescriptorVisitor {
     source_map: Lrc<SourceMap>,
     endpoints: Vec<RouteDescriptorEndpoint>,
@@ -633,6 +656,9 @@ impl RouteDescriptorVisitor {
     /// A path is route-shaped when it is an absolute path (`/widgets`) or an
     /// http(s) URL. This rejects bare tokens (`some-message`), RPC method names,
     /// and other non-route strings that happen to sit under a `path` key.
+    ///
+    /// CONSUMER-side only. A producer's path must additionally be absolute —
+    /// see [`is_producer_route_path`], which owns that direction.
     fn is_route_shaped_path(path: &str) -> bool {
         let trimmed = path.trim();
         trimmed.starts_with('/')
@@ -654,8 +680,10 @@ impl RouteDescriptorVisitor {
         };
         // #241: reject non-route paths (bare tokens, RPC method names) so a
         // config object that merely carries `method`/`path` keys is not
-        // fabricated as an endpoint.
-        if !Self::is_route_shaped_path(&path) {
+        // fabricated as an endpoint. #580: this is the PRODUCER side, so a
+        // full URL is rejected too — it is never the path a route is served
+        // at.
+        if !is_producer_route_path(&path) {
             return;
         }
         let span = node.span;
@@ -2719,8 +2747,11 @@ export { handlers };
     }
 
     #[test]
-    fn registry_descriptor_with_url_path_is_a_deterministic_endpoint() {
-        // #241: an http(s) URL is route-shaped and qualifies inside a registry.
+    fn registry_descriptor_with_url_path_is_not_a_producer_endpoint() {
+        // #580 (revises #241): an http(s) URL names someone else's origin, so
+        // it can be a CONSUMER target but never the path a producer serves its
+        // route at. In a registry it is a webhook target being called out to, a
+        // schema `$id`, or a redirect — not a route this service answers.
         let content = r#"
 const routes = [
   { method: 'POST', path: 'https://api.example.com/webhook', handler: onHook },
@@ -2729,10 +2760,54 @@ export { routes };
 "#;
         let scanner = SwcScanner::new();
         let endpoints = scanner.route_descriptor_endpoints(&PathBuf::from("routes.ts"), content);
-        assert_eq!(endpoints.len(), 1);
-        assert_eq!(endpoints[0].method, "POST");
-        assert_eq!(endpoints[0].path, "https://api.example.com/webhook");
-        assert_eq!(endpoints[0].handler.as_deref(), Some("onHook"));
+        assert!(
+            endpoints.is_empty(),
+            "an absolute URL must not be emitted as a producer route path, got {endpoints:?}"
+        );
+    }
+
+    #[test]
+    fn producer_route_path_requires_a_leading_slash() {
+        // #580: the three shapes the OAuth2-server scan mis-emitted as paths.
+        assert!(!is_producer_route_path("GET"), "a method literal");
+        assert!(!is_producer_route_path("text/csv"), "a content type");
+        assert!(
+            !is_producer_route_path("https://example.invalid/schemas/x.json"),
+            "a schema $id URL"
+        );
+        assert!(!is_producer_route_path("http://example.invalid/x"));
+        assert!(!is_producer_route_path(""));
+
+        // Absolute paths, including a template literal whose static head is
+        // absolute, are producer paths.
+        assert!(is_producer_route_path("/"));
+        assert!(is_producer_route_path("/users/:id"));
+        assert!(is_producer_route_path("  /users  "), "surrounding space");
+        assert!(is_producer_route_path("`/orders/${id}`"));
+        assert!(
+            !is_producer_route_path("`https://x.invalid/${id}`"),
+            "a template whose static head is a URL is still not a producer path"
+        );
+    }
+
+    #[test]
+    fn consumer_request_spec_still_accepts_an_absolute_url() {
+        // #580 guard: splitting the producer predicate must not narrow the
+        // CONSUMER side, where a full URL is the ordinary outbound target.
+        let content = r#"
+const response = await client.post({
+  url: 'https://api.example.com/v1/things',
+  body: payload,
+});
+"#;
+        let result = scan_test_content(content);
+        let spec = result
+            .candidates
+            .iter()
+            .find_map(|c| c.request_spec.as_ref())
+            .expect("an absolute-URL request spec must still be captured");
+        assert_eq!(spec.method, "POST");
+        assert_eq!(spec.url, "https://api.example.com/v1/things");
     }
 
     /// #537: the config-object call form. The client is a bare binding (here a
