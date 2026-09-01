@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.24](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.23...carrick-v0.3.24) (2026-09-01)
+
+
+### Bug Fixes
+
+* **scanner:** resolve same-file request-wrapper call sites ([#588](https://github.com/carrick-tools/carrick/issues/588)) ([#591](https://github.com/carrick-tools/carrick/issues/591)) ([ede633b](https://github.com/carrick-tools/carrick/commit/ede633b5514ad28b09bf7ab484316450d444b630))
+
 ## [0.3.23](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.22...carrick-v0.3.23) (2026-08-31)
 
 
