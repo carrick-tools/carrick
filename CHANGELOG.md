@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.26](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.25...carrick-v0.3.26) (2026-09-01)
+
+
+### Bug Fixes
+
+* **cache:** bump CACHE_VERSION to 6 so the wrapper-call backfill reaches unchanged files ([#588](https://github.com/carrick-tools/carrick/issues/588)) ([#597](https://github.com/carrick-tools/carrick/issues/597)) ([08b120c](https://github.com/carrick-tools/carrick/commit/08b120cdfddcb6bef1175f343687061a4c1cceea))
+
 ## [0.3.25](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.24...carrick-v0.3.25) (2026-09-01)
 
 
