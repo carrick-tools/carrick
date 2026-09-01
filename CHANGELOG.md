@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.25](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.24...carrick-v0.3.25) (2026-09-01)
+
+
+### Bug Fixes
+
+* **cloud-client:** follow staged get-cross-repo-data reads (carrick-cloud[#456](https://github.com/carrick-tools/carrick/issues/456)) ([#595](https://github.com/carrick-tools/carrick/issues/595)) ([f91d40a](https://github.com/carrick-tools/carrick/commit/f91d40a537ee087bb7d5fb5cec880e2026ef1cd1))
+
 ## [0.3.24](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.23...carrick-v0.3.24) (2026-09-01)
 
 
