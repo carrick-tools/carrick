@@ -56,7 +56,15 @@ mod type_compat_v2;
 /// 5: routing/extraction changes (file-based route conventions from declared
 /// dependencies, wrapper barrel-following, injected-base canonical keys) alter
 /// what unchanged files produce; cached skips from ≤0.3.4 must not pin them.
-const CACHE_VERSION: u32 = 5;
+/// 6: same-file wrapper call backfill (#591 / carrick-cloud#456's sibling,
+/// carrick#588 defect 6) adds rows for unchanged files; v5 caches would pin
+/// every already-indexed repo to the pre-backfill row set forever. Found
+/// live: a 0.3.25 full re-scan of an unchanged tree reused every cached
+/// file_result and emitted none of the new wrapper rows. The rule this
+/// encodes: ANY change to what per-file analysis emits — deterministic
+/// backfills included — must bump this constant, or deployed indexes never
+/// see it.
+const CACHE_VERSION: u32 = 6;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
