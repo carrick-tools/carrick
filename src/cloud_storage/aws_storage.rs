@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Total per-request deadline. Generous because uploads can carry multi-MB
 /// payloads over slow CI links, but bounded so a hung connection can't stall
@@ -225,7 +225,20 @@ struct AdjacentRepo {
 
 #[derive(Deserialize)]
 struct CrossRepoResponse {
+    /// Absent (and defaulted empty) on a staged response — the cloud omits it
+    /// deliberately so an older scanner fails loudly instead of proceeding
+    /// with an empty sibling set; this scanner checks `staged_url` FIRST and
+    /// only reads `repos` off the followed body.
+    #[serde(default)]
     repos: Vec<AdjacentRepo>,
+    /// Staged read (carrick-cloud#456): when the project aggregate outgrows
+    /// the Lambda response cap, the cloud parks the real CrossRepoResponse
+    /// JSON in S3 and returns `staged: true` plus this short-lived presigned
+    /// GET URL instead of the body.
+    #[serde(default)]
+    staged: bool,
+    #[serde(default)]
+    staged_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -632,8 +645,35 @@ impl CloudStorage for AwsStorage {
             action: "get-cross-repo-data".to_string(),
         };
 
-        let response: CrossRepoResponse =
+        let mut response: CrossRepoResponse =
             self.call_lambda_generic(&request.action, &request).await?;
+
+        // Staged read (carrick-cloud#456): the aggregate outgrew the Lambda
+        // response cap, so the body is behind a presigned GET. Plain request,
+        // no Authorization header — the URL carries its own auth and S3
+        // rejects a request presenting both.
+        if response.staged {
+            let url = response.staged_url.as_deref().ok_or_else(|| {
+                StorageError::ConnectionError(
+                    "staged cross-repo response carried no staged_url".to_string(),
+                )
+            })?;
+            info!("Cross-repo data staged to S3 by the cloud; following presigned URL");
+            let staged = self.http_client.get(url).send().await.map_err(|e| {
+                StorageError::ConnectionError(format!("staged cross-repo fetch failed: {e}"))
+            })?;
+            if !staged.status().is_success() {
+                return Err(StorageError::ConnectionError(format!(
+                    "staged cross-repo fetch returned {}",
+                    staged.status()
+                )));
+            }
+            response = staged.json::<CrossRepoResponse>().await.map_err(|e| {
+                StorageError::SerializationError(format!(
+                    "staged cross-repo body failed to parse: {e}"
+                ))
+            })?;
+        }
 
         let mut all_repo_data = Vec::new();
         let mut repo_s3_urls = HashMap::new();
@@ -1144,5 +1184,33 @@ mod tests {
                 .any(|l| l.starts_with("accept-encoding:") && l.contains("gzip")),
             "client did not advertise gzip; the reqwest `gzip` feature is off: {request}"
         );
+    }
+
+    /// Staged read (carrick-cloud#456): a response with `staged: true` and a
+    /// `staged_url` deserializes with an empty `repos` (the cloud omits the
+    /// key on purpose), and a plain response without the fields stays exactly
+    /// as before. Pins the serde defaults the follow logic keys on.
+    #[test]
+    fn cross_repo_response_staged_shape_deserializes() {
+        let staged: CrossRepoResponse = serde_json::from_str(
+            r#"{"staged":true,"staged_url":"https://bucket.s3/k?sig=x","raw_bytes":25638735,"repo_count":43}"#,
+        )
+        .unwrap();
+        assert!(staged.staged);
+        assert_eq!(
+            staged.staged_url.as_deref(),
+            Some("https://bucket.s3/k?sig=x")
+        );
+        assert!(staged.repos.is_empty());
+
+        let plain: CrossRepoResponse = serde_json::from_str(r#"{"repos":[]}"#).unwrap();
+        assert!(!plain.staged);
+        assert!(plain.staged_url.is_none());
+
+        // A staged flag with no URL is the malformed case the follow logic
+        // must refuse rather than treat as an empty project.
+        let malformed: CrossRepoResponse = serde_json::from_str(r#"{"staged":true}"#).unwrap();
+        assert!(malformed.staged);
+        assert!(malformed.staged_url.is_none());
     }
 }
