@@ -25,6 +25,7 @@ use swc_ecma_ast::*;
 use swc_ecma_parser::{EsSyntax, TsSyntax};
 use swc_ecma_visit::{Visit, VisitWith};
 
+use crate::local_http_wrapper::{LocalWrapperCall, collect_local_wrapper_calls};
 use crate::operation::{Protocol, PubsubRole};
 use crate::parser::parse_file;
 use crate::wrapper_request_shape::{RequestShapeSignal, call_request_shape};
@@ -183,6 +184,12 @@ pub struct ScanResult {
     /// authoritative-structural-facts contract as file-based route endpoints.
     /// Empty whenever Signal 7's messaging-client gates are off.
     pub pubsub_anchor_ops: Vec<PubsubAnchorOp>,
+    /// Outbound calls that reach their endpoint through a request wrapper
+    /// declared in THIS file, with the path passed in as an argument
+    /// (carrick#588). The site raises no candidate of its own and the wrapper's
+    /// own URL resolves to nothing, so the join is read off the AST and merged
+    /// into the file's extraction afterwards. See `crate::local_http_wrapper`.
+    pub local_wrapper_calls: Vec<LocalWrapperCall>,
 }
 
 /// A pub/sub operation asserted deterministically from the AST (carrick#387):
@@ -357,6 +364,7 @@ impl SwcScanner {
                     parse_failed: true,
                     import_sources: Vec::new(),
                     pubsub_anchor_ops: Vec::new(),
+                    local_wrapper_calls: Vec::new(),
                 };
             }
         };
@@ -372,6 +380,7 @@ impl SwcScanner {
         } else {
             HashMap::new()
         };
+        let local_wrapper_calls = collect_local_wrapper_calls(&module, &self.source_map);
         let mut visitor = CandidateVisitor::new(
             self.source_map.clone(),
             package_import_locals(&module, data_fetchers),
@@ -387,6 +396,7 @@ impl SwcScanner {
             parse_failed: false,
             import_sources,
             pubsub_anchor_ops: visitor.pubsub_anchor_ops,
+            local_wrapper_calls,
         }
     }
 
@@ -466,6 +476,7 @@ impl SwcScanner {
                     parse_failed: true,
                     import_sources: Vec::new(),
                     pubsub_anchor_ops: Vec::new(),
+                    local_wrapper_calls: Vec::new(),
                 };
             }
         };
@@ -489,6 +500,7 @@ impl SwcScanner {
         } else {
             HashMap::new()
         };
+        let local_wrapper_calls = collect_local_wrapper_calls(&module, &file_source_map);
         let mut visitor = CandidateVisitor::new(
             file_source_map,
             package_import_locals(&module, data_fetchers),
@@ -504,6 +516,7 @@ impl SwcScanner {
             parse_failed: false,
             import_sources,
             pubsub_anchor_ops: visitor.pubsub_anchor_ops,
+            local_wrapper_calls,
         }
     }
 

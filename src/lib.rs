@@ -19,6 +19,7 @@ pub mod framework_detector;
 pub mod graphql;
 pub mod import_bindings;
 pub mod intent_generator;
+pub mod local_http_wrapper;
 pub mod logging;
 pub mod mount_graph;
 pub mod multi_agent_orchestrator;

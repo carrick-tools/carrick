@@ -281,6 +281,7 @@ fn test_processing_stats_tracking() {
         pubsub_anchor_backfills: 0,
         pubsub_phantom_topic_drops: 0,
         request_spec_call_backfills: 0,
+        local_wrapper_call_backfills: 0,
         total_data_calls: 4,
         errors: vec!["Test error".to_string()],
     };
