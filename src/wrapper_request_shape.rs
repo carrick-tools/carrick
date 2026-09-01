@@ -63,7 +63,7 @@ pub enum RequestShapeSignal {
 /// (`client.post(url, body)`). `is_http_method` is the single definition of
 /// what an HTTP method is; `connect`/`trace` are excluded because a bare
 /// `.connect(...)` is overwhelmingly a transport/database call, not a request.
-fn verb_from_callee_property(prop: Option<&str>) -> Option<String> {
+pub(crate) fn verb_from_callee_property(prop: Option<&str>) -> Option<String> {
     let prop = prop?;
     let upper = prop.to_uppercase();
     if matches!(
@@ -78,7 +78,7 @@ fn verb_from_callee_property(prop: Option<&str>) -> Option<String> {
 
 /// The literal string an expression evaluates to, or `None` when it is not a
 /// literal (an identifier, a member expression, an interpolated template).
-fn literal_string(expr: &Expr) -> Option<String> {
+pub(crate) fn literal_string(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
         Expr::Tpl(tpl) if tpl.exprs.is_empty() && tpl.quasis.len() == 1 => {
@@ -114,7 +114,7 @@ fn prop_key_name(prop: &PropOrSpread) -> Option<String> {
 /// The value expression of an object-literal member named `name`, or `None`
 /// when the member is absent or a shorthand (`{ method }` — present, but its
 /// value is a binding, not a literal).
-fn prop_value<'a>(obj: &'a ObjectLit, name: &str) -> Option<Option<&'a Expr>> {
+pub(crate) fn prop_value<'a>(obj: &'a ObjectLit, name: &str) -> Option<Option<&'a Expr>> {
     for prop in &obj.props {
         if prop_key_name(prop).as_deref() != Some(name) {
             continue;
@@ -132,7 +132,7 @@ fn prop_value<'a>(obj: &'a ObjectLit, name: &str) -> Option<Option<&'a Expr>> {
 
 /// Whether an object literal looks like a request-options bag: it carries at
 /// least one of the four keys every HTTP client spells the same way.
-fn is_request_options(obj: &ObjectLit) -> bool {
+pub(crate) fn is_request_options(obj: &ObjectLit) -> bool {
     obj.props.iter().any(|prop| {
         matches!(
             prop_key_name(prop).as_deref(),
@@ -144,7 +144,7 @@ fn is_request_options(obj: &ObjectLit) -> bool {
 /// The object literal among a call's arguments, when exactly one argument is
 /// one. Two object-literal arguments (a payload plus an options bag) is not a
 /// shape this reads.
-fn sole_object_literal(call: &CallExpr) -> Option<(usize, &ObjectLit)> {
+pub(crate) fn sole_object_literal(call: &CallExpr) -> Option<(usize, &ObjectLit)> {
     let mut found: Option<(usize, &ObjectLit)> = None;
     for (index, arg) in call.args.iter().enumerate() {
         if arg.spread.is_some() {

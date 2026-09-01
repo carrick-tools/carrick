@@ -34,6 +34,7 @@ use crate::{
     file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
     framework_detector::DetectionResult,
     import_bindings::BindingResolver,
+    local_http_wrapper::LocalWrapperCall,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
     operation::{OperationKey, Protocol},
     parser::parse_file,
@@ -128,6 +129,10 @@ pub struct ProcessingStats {
     /// file-analyzer's extraction omitted them (#529). A subset of
     /// `total_data_calls`.
     pub request_spec_call_backfills: usize,
+    /// Outbound calls resolved through a request wrapper declared in the same
+    /// file and merged in because their call sites raise no candidate for the
+    /// file-analyzer to answer (carrick#588). A subset of `total_data_calls`.
+    pub local_wrapper_call_backfills: usize,
     /// Wrapper-resolved data calls whose HTTP method was corrected from what
     /// extraction gave them to the method their wrapper module hardcodes
     /// (carrick-cloud#386). A subset of `total_data_calls`.
@@ -714,6 +719,11 @@ impl FileOrchestrator {
             /// (carrick#387), merged in after the LLM pass so an extraction
             /// omission cannot lose them. Empty when Signal 7's gates are off.
             pubsub_anchor_ops: Vec<PubsubAnchorOp>,
+            /// Outbound calls resolved through a request wrapper declared in
+            /// this same file (carrick#588), merged in after the LLM pass.
+            /// Their sites raise no candidate, so without this the endpoints
+            /// they reach are absent from the index entirely.
+            local_wrapper_calls: Vec<LocalWrapperCall>,
         }
 
         /// A zero-candidate file whose skip decision is deferred until the
@@ -1025,6 +1035,7 @@ impl FileOrchestrator {
                 wrapper_context: Vec::new(),
                 wrapper_request_shape: None,
                 pubsub_anchor_ops: scan_result.pubsub_anchor_ops,
+                local_wrapper_calls: scan_result.local_wrapper_calls,
             });
         }
 
@@ -1214,6 +1225,9 @@ impl FileOrchestrator {
                 // Rescued zero-candidate files by definition raised no Signal 7
                 // candidate, so they can carry no anchor ops either.
                 pubsub_anchor_ops: Vec::new(),
+                // Nor any same-file wrapper: a file with no HTTP candidate
+                // issues no request of its own for one to be built out of.
+                local_wrapper_calls: Vec::new(),
             });
         }
 
@@ -1295,6 +1309,18 @@ impl FileOrchestrator {
                         &mut adjusted,
                         pf.wrapper_request_shape.as_ref(),
                     );
+                    // Merge the outbound calls that reach their endpoint
+                    // through a request wrapper declared in this same file
+                    // (carrick#588). Their sites raise no candidate, so
+                    // extraction was never asked about them and without this
+                    // the endpoints they reach are absent from the index
+                    // entirely. Merged HERE, before the fold below, so these
+                    // rows go through the same normalization the analyzer's
+                    // do: a wrapper that interpolates an env-var base emits
+                    // `${ALIAS}/things`, and alias resolution is what turns
+                    // that into the `process.env` name matching keys on.
+                    stats.local_wrapper_call_backfills +=
+                        Self::merge_local_wrapper_calls(&mut adjusted, pf.local_wrapper_calls);
                     // Collapse inline env-var fallbacks the model rendered
                     // verbatim (`${A ?? "http://localhost"}/p` -> `${A}/p`,
                     // carrick#399) BEFORE alias resolution: a local alias with
@@ -1440,6 +1466,10 @@ impl FileOrchestrator {
         debug!(
             "  - Request-spec call backfills: {}",
             stats.request_spec_call_backfills
+        );
+        debug!(
+            "  - Same-file wrapper call backfills: {}",
+            stats.local_wrapper_call_backfills
         );
         debug!(
             "  - Wrapper method propagations: {}",
@@ -3933,6 +3963,94 @@ impl FileOrchestrator {
                 call_expression_line: Some(
                     i32::try_from(candidate.line_number).unwrap_or(i32::MAX),
                 ),
+                payload_expression_text: None,
+                payload_expression_line: None,
+                primary_type_symbol: None,
+                type_import_source: None,
+            });
+            added += 1;
+        }
+        added
+    }
+
+    /// Emit the outbound calls that reach their endpoint through a request
+    /// wrapper declared in the SAME file, with the path passed in as an
+    /// argument (carrick#588).
+    ///
+    /// `requestJson(base, "/api/v1/widgets", token)` delegating to a local
+    /// `requestJson(base, path, token)` that does the `fetch` is one HTTP call
+    /// to `/api/v1/widgets`, and every part of that is an AST fact. Neither
+    /// half is extractable alone: the wrapper's own request interpolates a
+    /// parameter, so its URL resolves to nothing, and the site raises no
+    /// candidate at all (its callee is a local identifier and its path is not
+    /// the first argument), so the analyzer is never asked about it. The
+    /// endpoints reached this way are therefore absent from the index — not
+    /// wrong rows, no rows — which is what makes this a deterministic emission
+    /// rather than a prompt problem. #369/#370 resolve the same indirection
+    /// across files, where the wrapper's source has to be injected before the
+    /// model can join it; same-file needs no injection and no judgment.
+    ///
+    /// A site extraction DID answer is left alone: same span, same line, or a
+    /// call already carrying the same path with a compatible method.
+    fn merge_local_wrapper_calls(
+        result: &mut FileAnalysisResult,
+        wrapper_calls: Vec<LocalWrapperCall>,
+    ) -> usize {
+        // Only rows extraction produced can cover a site. Reading the vector
+        // as it grows would let the first backfill of a line suppress its
+        // siblings — two wrapper sites on one line (a `Promise.all` of them,
+        // say) are two calls.
+        let extracted = result.data_calls.len();
+        let mut added = 0;
+        for call in wrapper_calls {
+            let line = i32::try_from(call.line_number).unwrap_or(i32::MAX);
+            let ours = normalize_path_params(&call.target);
+            let covered = result.data_calls[..extracted].iter().any(|data_call| {
+                if data_call.call_expression_span_start == Some(call.span_start)
+                    || data_call.line_number == line
+                    || data_call.call_expression_line == Some(line)
+                {
+                    return true;
+                }
+                let method_agrees = match (data_call.method.as_deref(), call.method.as_deref()) {
+                    (Some(theirs), Some(mine)) => theirs.trim().eq_ignore_ascii_case(mine),
+                    // An unstated method on either side cannot separate them.
+                    _ => true,
+                };
+                let theirs = normalize_path_params(&data_call.target);
+                // An empty target states no path, so it carries nothing: the
+                // suffix test would otherwise read it as covering everything.
+                !theirs.trim().is_empty()
+                    && method_agrees
+                    && (Self::target_carries_url(&theirs, &ours)
+                        || Self::target_carries_url(&ours, &theirs))
+            });
+            if covered {
+                continue;
+            }
+            debug!(
+                "Backfilling same-file wrapper call the extraction was never offered: {} {} at line {}",
+                call.method.as_deref().unwrap_or("<unstated>"),
+                call.target,
+                call.line_number
+            );
+            result.data_calls.push(DataCallResult {
+                candidate_id: format!("local-wrapper:{}-{}", call.span_start, call.span_end),
+                line_number: line,
+                target: call.target,
+                method: call.method,
+                // Classification is judgment, not an AST fact: the target is
+                // the wrapper's own URL expression, with no host to classify
+                // from beyond what the wrapper closes over.
+                call_kind: None,
+                pattern_matched: call.wrapper_name,
+                // The span is the SITE's, which is what the type sidecar
+                // anchors on and what marks this call candidate-backed
+                // downstream.
+                call_expression_span_start: Some(call.span_start),
+                call_expression_span_end: Some(call.span_end),
+                call_expression_text: None,
+                call_expression_line: Some(line),
                 payload_expression_text: None,
                 payload_expression_line: None,
                 primary_type_symbol: None,
@@ -10096,6 +10214,105 @@ export { routes };
 
         assert_eq!(added, 0);
         assert!(result.data_calls.is_empty());
+    }
+
+    fn wrapper_call(
+        line: usize,
+        span_start: u32,
+        target: &str,
+        method: Option<&str>,
+    ) -> LocalWrapperCall {
+        LocalWrapperCall {
+            span_start,
+            span_end: span_start + 40,
+            line_number: line,
+            wrapper_name: "requestJson".to_string(),
+            target: target.to_string(),
+            method: method.map(|method| method.to_string()),
+        }
+    }
+
+    /// carrick#588: a site that delegates to a same-file request wrapper raises
+    /// no candidate, so extraction is never asked about it and the endpoint it
+    /// reaches is absent from the index. The join is an AST fact and is merged
+    /// in after the pass.
+    #[test]
+    fn merge_local_wrapper_calls_backfills_sites_never_offered_to_extraction() {
+        let mut result = FileAnalysisResult::default();
+        let calls = vec![
+            wrapper_call(31, 100, "${base}/api/v1/widgets", None),
+            wrapper_call(37, 300, "${base}/api/v1/widgets/${id}", Some("DELETE")),
+        ];
+
+        let added = FileOrchestrator::merge_local_wrapper_calls(&mut result, calls);
+
+        assert_eq!(added, 2);
+        let emitted: Vec<(&str, Option<&str>)> = result
+            .data_calls
+            .iter()
+            .map(|call| (call.target.as_str(), call.method.as_deref()))
+            .collect();
+        assert_eq!(
+            emitted,
+            vec![
+                ("${base}/api/v1/widgets", None),
+                ("${base}/api/v1/widgets/${id}", Some("DELETE")),
+            ],
+            "the wrapper's base is kept verbatim, and an unstated method is left \
+             unset rather than asserted as GET"
+        );
+        // The span is the SITE's: it anchors the type sidecar and marks the call
+        // candidate-backed downstream.
+        assert_eq!(result.data_calls[0].call_expression_span_start, Some(100));
+        assert_eq!(result.data_calls[0].call_expression_span_end, Some(140));
+        assert_eq!(result.data_calls[0].line_number, 31);
+        assert_eq!(result.data_calls[0].pattern_matched, "requestJson");
+    }
+
+    /// Two sites on one source line (a `Promise.all` of them) are two calls:
+    /// the first backfill must not suppress its siblings.
+    #[test]
+    fn merge_local_wrapper_calls_keeps_siblings_on_one_line() {
+        let mut result = FileAnalysisResult::default();
+        let calls = vec![
+            wrapper_call(88, 100, "${base}/api/v1/widgets", None),
+            wrapper_call(88, 200, "${base}/api/v1/gadgets", None),
+        ];
+
+        let added = FileOrchestrator::merge_local_wrapper_calls(&mut result, calls);
+
+        assert_eq!(added, 2);
+        assert_eq!(result.data_calls[1].target, "${base}/api/v1/gadgets");
+    }
+
+    /// A site extraction DID answer keeps the analyzer's row: same span, same
+    /// line, or the same path already carried behind a base.
+    #[test]
+    fn merge_local_wrapper_calls_skips_sites_extraction_already_answered() {
+        let mut by_span = data_call_with("c1", "/api/v1/widgets", Some("GET"));
+        by_span.line_number = 90;
+        by_span.call_expression_span_start = Some(100);
+        let mut by_line = data_call_with("c2", "/unrelated", Some("GET"));
+        by_line.line_number = 37;
+        let mut by_path = data_call_with("c3", "${base}/api/v1/things", Some("POST"));
+        by_path.line_number = 91;
+
+        let mut result = FileAnalysisResult {
+            data_calls: vec![by_span, by_line, by_path],
+            ..Default::default()
+        };
+        let calls = vec![
+            wrapper_call(31, 100, "${base}/api/v1/widgets", None),
+            wrapper_call(37, 300, "${base}/api/v1/widgets/${id}", Some("DELETE")),
+            wrapper_call(44, 500, "${base}/api/v1/things", Some("POST")),
+            wrapper_call(51, 700, "${base}/api/v1/things", Some("DELETE")),
+        ];
+
+        let added = FileOrchestrator::merge_local_wrapper_calls(&mut result, calls);
+
+        assert_eq!(added, 1, "only the site nothing already covers is emitted");
+        assert_eq!(result.data_calls[3].target, "${base}/api/v1/things");
+        assert_eq!(result.data_calls[3].method.as_deref(), Some("DELETE"));
     }
 
     /// An OpenAPI-style path the model copied verbatim states the same route as
