@@ -86,7 +86,11 @@ mod type_compat_v2;
 /// not change, so a v9 cache would pin every already-indexed repo to the
 /// phantom default-verb row, which is the row a wrong-method consumer call
 /// matches into a false green edge.
-const CACHE_VERSION: u32 = 10;
+/// 11: `new URL(path, base)` targets (carrick#610) add rows for requests whose
+/// URL was built a statement before the call, and correct the path of those
+/// that had one invented. Same reasoning as 10: unchanged files, so a v10
+/// cache would pin every already-indexed repo to the wrong version forever.
+const CACHE_VERSION: u32 = 11;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<

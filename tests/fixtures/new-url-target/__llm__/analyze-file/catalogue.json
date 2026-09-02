@@ -1,0 +1,58 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:13",
+      "line_number": 13,
+      "target": "${this.baseUrl}/api/v1/token",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${this.baseUrl}/api/v1/token`, { method: \"POST\" })",
+      "call_expression_line": 13,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:18",
+      "line_number": 18,
+      "target": "/api/v1/things",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(new URL(\"/api/v2/things\", this.baseUrl), { method: \"GET\" })",
+      "call_expression_line": 18,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:27",
+      "line_number": 27,
+      "target": "url.href",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(url.href, { method: \"GET\" })",
+      "call_expression_line": 27,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:33",
+      "line_number": 33,
+      "target": "url",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(url, { method: \"POST\" })",
+      "call_expression_line": 33,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}
