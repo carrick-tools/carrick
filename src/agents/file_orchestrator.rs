@@ -145,6 +145,10 @@ pub struct ProcessingStats {
     /// they call, rather than left to extraction to infer from the consumer
     /// file (carrick#588). A subset of `total_data_calls`.
     pub imported_member_resolutions: usize,
+    /// Outbound calls asserted from the imported member they call and merged
+    /// in because extraction returned no row for their site at all
+    /// (carrick#623). A subset of `total_data_calls`.
+    pub imported_member_backfills: usize,
     /// Wrapper-resolved data calls whose HTTP method was corrected from what
     /// extraction gave them to the method their wrapper module hardcodes
     /// (carrick-cloud#386). A subset of `total_data_calls`.
@@ -1431,6 +1435,15 @@ impl FileOrchestrator {
                     // below correct or backfill one of them.
                     stats.imported_member_resolutions +=
                         Self::apply_imported_members(&mut adjusted, &pf.resolved_members);
+                    // Then emit the resolved sites extraction returned no row
+                    // for at all (carrick#623). Immediately after the rewrite
+                    // above, so the coverage test below reads the rows
+                    // extraction produced and nothing a later pass appends.
+                    stats.imported_member_backfills += Self::merge_imported_member_calls(
+                        &mut adjusted,
+                        &pf.resolved_members,
+                        &pf.candidate_map,
+                    );
                     // Carry the wrapper's own request shape onto the sites that
                     // delegate to it (carrick-cloud#386). Runs immediately after
                     // `apply_candidate_map` because that is what stamps the span
@@ -1616,6 +1629,10 @@ impl FileOrchestrator {
         debug!(
             "  - Imported-member resolutions: {}",
             stats.imported_member_resolutions
+        );
+        debug!(
+            "  - Imported-member call backfills: {}",
+            stats.imported_member_backfills
         );
         debug!(
             "  - Wrapper method propagations: {}",
@@ -4475,6 +4492,109 @@ impl FileOrchestrator {
             applied += 1;
         }
         applied
+    }
+
+    /// Emit the resolved members whose call sites extraction returned no row
+    /// for at all (carrick#623).
+    ///
+    /// `apply_imported_members` above only REWRITES a row that already exists,
+    /// so a resolved member is silently dropped whenever the analyzer answered
+    /// nothing for its site. That is the common case, not the rare one: a bare
+    /// `client.createUpload(name)` states no path and no verb, and a consumer
+    /// file that contains no path-shaped text anywhere gives the model nothing
+    /// to answer with, so it answers with nothing. The endpoint the site
+    /// reaches is then absent from the index entirely, and the producer is
+    /// reported orphaned.
+    ///
+    /// The member's method and URL are both literals in the source, and the
+    /// site's span is an AST fact, so the row is asserted rather than inferred
+    /// — the same standing as `merge_local_wrapper_calls`, whose coverage test
+    /// and row shape this mirrors.
+    fn merge_imported_member_calls(
+        result: &mut FileAnalysisResult,
+        resolved: &HashMap<u32, RequestMember>,
+        candidate_map: &HashMap<String, CandidateTarget>,
+    ) -> usize {
+        if resolved.is_empty() {
+            return 0;
+        }
+        // Both maps iterate in hash order; emit in source order so a scan of
+        // the same file always produces the same rows.
+        let mut sites: Vec<(&CandidateTarget, &RequestMember)> = candidate_map
+            .values()
+            .filter_map(|candidate| {
+                resolved
+                    .get(&candidate.span_start)
+                    .map(|member| (candidate, member))
+            })
+            .collect();
+        sites.sort_by_key(|(candidate, _)| candidate.span_start);
+
+        // Only rows extraction produced can cover a site. Reading the vector
+        // as it grows would let the first backfill of a line suppress its
+        // siblings — two resolved sites on one line are two calls.
+        let extracted = result.data_calls.len();
+        let mut added = 0;
+        for (candidate, member) in sites {
+            let line = i32::try_from(candidate.line_number).unwrap_or(i32::MAX);
+            let ours = normalize_path_params(&member.target);
+            let covered = result.data_calls[..extracted].iter().any(|data_call| {
+                if data_call.call_expression_span_start == Some(candidate.span_start)
+                    || data_call.line_number == line
+                    || data_call.call_expression_line == Some(line)
+                {
+                    return true;
+                }
+                let method_agrees = match data_call.method.as_deref() {
+                    Some(theirs) => theirs.trim().eq_ignore_ascii_case(&member.method),
+                    // An unstated method cannot separate them.
+                    None => true,
+                };
+                let theirs = normalize_path_params(&data_call.target);
+                // An empty target states no path, so it carries nothing: the
+                // suffix test would otherwise read it as covering everything.
+                !theirs.trim().is_empty()
+                    && method_agrees
+                    && (Self::target_carries_url(&theirs, &ours)
+                        || Self::target_carries_url(&ours, &theirs))
+            });
+            if covered {
+                continue;
+            }
+            debug!(
+                "Backfilling imported-member call the extraction returned no row for: {} {} at line {}",
+                member.method, member.target, candidate.line_number
+            );
+            result.data_calls.push(DataCallResult {
+                candidate_id: format!(
+                    "imported-member:{}-{}",
+                    candidate.span_start, candidate.span_end
+                ),
+                line_number: line,
+                target: member.target.clone(),
+                method: Some(member.method.clone()),
+                // Classification is judgment, not an AST fact: the target is
+                // the member's own URL expression, with no host to classify
+                // from beyond what the member closes over.
+                call_kind: None,
+                pattern_matched: candidate
+                    .callee_property
+                    .clone()
+                    .unwrap_or_else(|| candidate.callee_object.clone()),
+                // The span is what the type sidecar anchors on, and it is also
+                // what marks this call candidate-backed downstream.
+                call_expression_span_start: Some(candidate.span_start),
+                call_expression_span_end: Some(candidate.span_end),
+                call_expression_text: None,
+                call_expression_line: Some(line),
+                payload_expression_text: None,
+                payload_expression_line: None,
+                primary_type_symbol: None,
+                type_import_source: None,
+            });
+            added += 1;
+        }
+        added
     }
 
     fn propagate_wrapper_request_shape(
