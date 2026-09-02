@@ -744,8 +744,8 @@ mod tests {
     fn flat_routes_bare_dollar_is_a_splat() {
         // An unnamed dynamic segment matches everything that remains.
         assert_eq!(
-            flat_route("app/routes/api.v1.packets.$.ts").unwrap().path,
-            "/api/v1/packets/**"
+            flat_route("app/routes/api.v1.widgets.$.ts").unwrap().path,
+            "/api/v1/widgets/**"
         );
     }
 
