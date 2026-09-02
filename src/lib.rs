@@ -24,6 +24,7 @@ pub mod local_http_wrapper;
 pub mod logging;
 pub mod mount_graph;
 pub mod multi_agent_orchestrator;
+pub mod new_url_target;
 pub mod oidc;
 pub mod operation;
 pub mod packages;

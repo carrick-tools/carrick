@@ -26,6 +26,7 @@ use swc_ecma_parser::{EsSyntax, TsSyntax};
 use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::local_http_wrapper::{LocalWrapperCall, collect_local_wrapper_calls};
+use crate::new_url_target::{NewUrlPathMap, collect_new_url_paths};
 use crate::operation::{Protocol, PubsubRole};
 use crate::parser::parse_file;
 use crate::type_manifest::is_http_method;
@@ -70,6 +71,15 @@ pub struct CandidateTarget {
     /// facts are used to overrule the model's answer after it replies (#537).
     #[serde(skip)]
     pub request_spec: Option<RequestSpec>,
+    /// The path stated by the `new URL(path, base)` that supplies this call's
+    /// target, whether the constructor is written at the argument itself or a
+    /// binding away (carrick#610). The base is deliberately not read: it is an
+    /// opaque value, and the path alone is what the source states. Read twice
+    /// downstream, as the candidate's path hint and to overrule the model's
+    /// target after it replies. Not serialized, for the same reason as
+    /// `request_spec`.
+    #[serde(skip)]
+    pub new_url_path: Option<String>,
     /// What this call site says about the request shape of the module it lives
     /// in — the literal HTTP method and body presence, when they are readable
     /// off the AST (carrick-cloud#386). Read only when this module is another
@@ -388,11 +398,13 @@ impl SwcScanner {
             HashMap::new()
         };
         let local_wrapper_calls = collect_local_wrapper_calls(&module, &self.source_map);
+        let new_url_paths = collect_new_url_paths(&module, &self.source_map);
         let mut visitor = CandidateVisitor::new(
             self.source_map.clone(),
             package_import_locals(&module, data_fetchers),
             imports_messaging_client,
             const_string_values,
+            new_url_paths,
             repo_has_messaging_clients,
             package_import_locals(&module, messaging_clients),
         );
@@ -508,11 +520,13 @@ impl SwcScanner {
             HashMap::new()
         };
         let local_wrapper_calls = collect_local_wrapper_calls(&module, &file_source_map);
+        let new_url_paths = collect_new_url_paths(&module, &file_source_map);
         let mut visitor = CandidateVisitor::new(
             file_source_map,
             package_import_locals(&module, data_fetchers),
             imports_messaging_client,
             const_string_values,
+            new_url_paths,
             repo_has_messaging_clients,
             package_import_locals(&module, messaging_clients),
         );
@@ -1378,6 +1392,7 @@ struct CandidateVisitor {
     /// topics to their literal strings. Only string-literal initializers are
     /// recorded; this is a recall booster, not a full constant-folder.
     const_string_values: HashMap<String, String>,
+    new_url_paths: NewUrlPathMap,
     /// True while visiting a call expression that sits directly in a
     /// statement-expression (`nc.publish(SUBJECT, payload);`) or a variable
     /// initializer (`const sub = nc.subscribe("topic");`). Signal 7 only fires
@@ -1414,6 +1429,7 @@ impl CandidateVisitor {
         network_import_locals: HashSet<String>,
         file_imports_messaging_client: bool,
         const_string_values: HashMap<String, String>,
+        new_url_paths: NewUrlPathMap,
         repo_has_messaging_clients: bool,
         messaging_import_locals: HashSet<String>,
     ) -> Self {
@@ -1426,6 +1442,7 @@ impl CandidateVisitor {
             await_depth: 0,
             file_imports_messaging_client,
             const_string_values,
+            new_url_paths,
             in_pubsub_call_position: false,
             repo_has_messaging_clients,
             pubsub_anchor_ops: Vec::new(),
@@ -1772,9 +1789,16 @@ impl CandidateVisitor {
         // Its raw first-arg snippet is the opening brace of the object, so the
         // literal has to come off the AST or the candidate anchors nothing.
         let request_spec = Self::call_request_spec(call);
-        let path_snippet = match &request_spec {
-            Some(spec) => Some(format!("'{}'", spec.url)),
-            None => self.extract_first_arg_snippet(call),
+        // A `new URL(path, base)` target states its path in the constructor's
+        // first argument, which the raw first-arg snippet either buries inside
+        // a constructor expression or misses entirely when the URL was built a
+        // statement earlier. Hand the model the path itself so it has no
+        // reason to reach for a version from elsewhere in the file.
+        let new_url_path = self.new_url_paths.get(&call.span.lo.0).cloned();
+        let path_snippet = match (&request_spec, &new_url_path) {
+            (Some(spec), _) => Some(format!("'{}'", spec.url)),
+            (None, Some(path)) => Some(format!("'{}'", path)),
+            (None, None) => self.extract_first_arg_snippet(call),
         };
         // What this site says about its own module's request shape, for when
         // another file imports this module as its HTTP wrapper
@@ -1793,6 +1817,7 @@ impl CandidateVisitor {
             path_snippet,
             code_snippet,
             request_spec,
+            new_url_path,
             request_shape,
         });
     }
@@ -1829,6 +1854,7 @@ impl CandidateVisitor {
             code_snippet,
             request_spec: None,
             // Not a call expression, so there are no request arguments to read.
+            new_url_path: None,
             request_shape: RequestShapeSignal::NotARequest,
         });
     }
@@ -4144,6 +4170,7 @@ async function fetchUser(id: string) {
             path_snippet: Some("'/users'".to_string()),
             code_snippet: "app.get('/users', handler)".to_string(),
             request_spec: None,
+            new_url_path: None,
             request_shape: RequestShapeSignal::NotARequest,
         };
 
@@ -4154,6 +4181,79 @@ async function fetchUser(id: string) {
         assert!(hint.contains("handler"));
         assert!(hint.contains("[path: '/users']"));
         assert!(hint.contains("app.get('/users', handler)"));
+    }
+
+    /// carrick#610: the candidate hands the analyzer the path the URL
+    /// constructor states, rather than the constructor expression or the bare
+    /// binding the request was written with.
+    #[test]
+    fn new_url_target_supplies_the_candidate_path_hint() {
+        let result = scan_test_content(
+            r#"
+export class Client {
+  constructor(private readonly baseUrl: string) {}
+
+  async listThings() {
+    return fetch(new URL("/api/v2/things", this.baseUrl), { method: "GET" });
+  }
+
+  async findThings(q: string) {
+    const url = new URL("/api/v2/things/search", this.baseUrl);
+    url.searchParams.append("q", q);
+    return fetch(url.href, { method: "GET" });
+  }
+}
+"#,
+        );
+
+        let hints: Vec<(Option<&str>, Option<&str>)> = result
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.callee_object == "fetch")
+            .map(|candidate| {
+                (
+                    candidate.path_snippet.as_deref(),
+                    candidate.new_url_path.as_deref(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            hints,
+            vec![
+                (Some("'/api/v2/things'"), Some("/api/v2/things")),
+                (
+                    Some("'/api/v2/things/search'"),
+                    Some("/api/v2/things/search")
+                ),
+            ],
+            "both forms carry the constructor's path: {:#?}",
+            result.candidates
+        );
+    }
+
+    /// A request that states its own path is untouched: no `new URL` fact, and
+    /// the first-argument snippet it always had.
+    #[test]
+    fn a_target_written_at_the_call_site_carries_no_new_url_path() {
+        let result = scan_test_content(
+            r#"
+async function run(baseUrl: string) {
+  return fetch(`${baseUrl}/api/v1/token`, { method: "POST" });
+}
+"#,
+        );
+
+        let candidate = result
+            .candidates
+            .iter()
+            .find(|candidate| candidate.callee_object == "fetch")
+            .expect("the fetch call raises a candidate");
+        assert_eq!(candidate.new_url_path, None);
+        assert_eq!(
+            candidate.path_snippet.as_deref(),
+            Some("`${baseUrl}/api/v1/token`")
+        );
     }
 
     #[test]

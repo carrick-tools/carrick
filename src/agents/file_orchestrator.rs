@@ -3971,6 +3971,7 @@ impl FileOrchestrator {
         file_path: &str,
     ) {
         let Some(spec) = candidate.request_spec.as_ref() else {
+            Self::reanchor_new_url_call(data_call, candidate, file_path);
             return;
         };
 
@@ -3994,6 +3995,42 @@ impl FileOrchestrator {
             data_call.target, spec.url, file_path, candidate.line_number
         );
         data_call.target = spec.url.clone();
+    }
+
+    /// Anchor a call whose target is built as `new URL(path, base)` to the
+    /// path that constructor states (carrick#610).
+    ///
+    /// The value the request receives is a binding, or a `.href` off one, so
+    /// the site itself is not route-shaped and extraction has nothing to read
+    /// the path off. What it wrote down is therefore either unusable (the
+    /// binding name, dropped downstream for want of a route shape) or lifted
+    /// from somewhere else in the file, which is how a client calling `v2` came
+    /// to be recorded calling `v1`.
+    ///
+    /// Only the path is asserted. The base stays opaque, so the call matches by
+    /// route path like every other host-free call, and a target that already
+    /// carries the path behind a base it read for itself is left alone.
+    fn reanchor_new_url_call(
+        data_call: &mut DataCallResult,
+        candidate: &CandidateTarget,
+        file_path: &str,
+    ) {
+        let Some(path) = candidate.new_url_path.as_deref() else {
+            return;
+        };
+        let target = normalize_path_params(data_call.target.trim());
+        if Self::target_carries_url(&target, path) {
+            if target != data_call.target {
+                data_call.target = target;
+            }
+            return;
+        }
+
+        warn!(
+            "[FileOrchestrator] Re-anchored data call target '{}' to the path its URL constructor states, '{}' ({}:{})",
+            data_call.target, path, file_path, candidate.line_number
+        );
+        data_call.target = path.to_string();
     }
 
     /// Does `target` already state `url` — either as the whole target, or as
@@ -10110,6 +10147,7 @@ export { routes };
             path_snippet: snippet.map(|s| s.to_string()),
             code_snippet: "router.get(...)".to_string(),
             request_spec: None,
+            new_url_path: None,
             request_shape: crate::wrapper_request_shape::RequestShapeSignal::NotARequest,
         }
     }

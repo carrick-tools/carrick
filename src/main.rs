@@ -24,6 +24,7 @@ mod local_http_wrapper;
 mod logging;
 mod mount_graph;
 mod multi_agent_orchestrator;
+mod new_url_target;
 mod oidc;
 mod operation;
 mod packages;
