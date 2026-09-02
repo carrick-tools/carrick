@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.27](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.26...carrick-v0.3.27) (2026-09-02)
+
+
+### Bug Fixes
+
+* **scanner:** read a call site's method and path off the client method it calls ([#603](https://github.com/carrick-tools/carrick/issues/603)) ([83d076b](https://github.com/carrick-tools/carrick/commit/83d076ba4f5719780bfc32dca90c8c24bc092384)), closes [#588](https://github.com/carrick-tools/carrick/issues/588)
+* **scanner:** record a request whose whole URL is read from an env var ([#604](https://github.com/carrick-tools/carrick/issues/604)) ([74da422](https://github.com/carrick-tools/carrick/commit/74da422ddb72f3fd0c4eeafc250c3f393ee733d9)), closes [#572](https://github.com/carrick-tools/carrick/issues/572)
+
 ## [0.3.26](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.25...carrick-v0.3.26) (2026-09-01)
 
 
