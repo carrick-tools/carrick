@@ -145,6 +145,10 @@ pub struct ProcessingStats {
     /// they call, rather than left to extraction to infer from the consumer
     /// file (carrick#588). A subset of `total_data_calls`.
     pub imported_member_resolutions: usize,
+    /// Outbound calls asserted from the imported member they call and merged
+    /// in because extraction returned no row for their site at all
+    /// (carrick#623). A subset of `total_data_calls`.
+    pub imported_member_backfills: usize,
     /// Wrapper-resolved data calls whose HTTP method was corrected from what
     /// extraction gave them to the method their wrapper module hardcodes
     /// (carrick-cloud#386). A subset of `total_data_calls`.
@@ -1431,6 +1435,15 @@ impl FileOrchestrator {
                     // below correct or backfill one of them.
                     stats.imported_member_resolutions +=
                         Self::apply_imported_members(&mut adjusted, &pf.resolved_members);
+                    // Then emit the resolved sites extraction returned no row
+                    // for at all (carrick#623). Immediately after the rewrite
+                    // above, so the coverage test below reads the rows
+                    // extraction produced and nothing a later pass appends.
+                    stats.imported_member_backfills += Self::merge_imported_member_calls(
+                        &mut adjusted,
+                        &pf.resolved_members,
+                        &pf.candidate_map,
+                    );
                     // Carry the wrapper's own request shape onto the sites that
                     // delegate to it (carrick-cloud#386). Runs immediately after
                     // `apply_candidate_map` because that is what stamps the span
@@ -1616,6 +1629,10 @@ impl FileOrchestrator {
         debug!(
             "  - Imported-member resolutions: {}",
             stats.imported_member_resolutions
+        );
+        debug!(
+            "  - Imported-member call backfills: {}",
+            stats.imported_member_backfills
         );
         debug!(
             "  - Wrapper method propagations: {}",
@@ -4475,6 +4492,133 @@ impl FileOrchestrator {
             applied += 1;
         }
         applied
+    }
+
+    /// Emit the resolved members whose call sites extraction returned no row
+    /// for at all (carrick#623).
+    ///
+    /// `apply_imported_members` above only REWRITES a row that already exists,
+    /// so a resolved member is silently dropped whenever the analyzer answered
+    /// nothing for its site. That is the common case, not the rare one: a bare
+    /// `client.createUpload(name)` states no path and no verb, and a consumer
+    /// file that contains no path-shaped text anywhere gives the model nothing
+    /// to answer with, so it answers with nothing. The endpoint the site
+    /// reaches is then absent from the index entirely, and the producer is
+    /// reported orphaned.
+    ///
+    /// The member's method and URL are both literals in the source, and the
+    /// site's span is an AST fact, so the row is asserted rather than inferred
+    /// — the same standing as `merge_local_wrapper_calls`, whose coverage test
+    /// and row shape this mirrors.
+    fn merge_imported_member_calls(
+        result: &mut FileAnalysisResult,
+        resolved: &HashMap<u32, RequestMember>,
+        candidate_map: &HashMap<String, CandidateTarget>,
+    ) -> usize {
+        if resolved.is_empty() {
+            return 0;
+        }
+        // Both maps iterate in hash order; emit in source order so a scan of
+        // the same file always produces the same rows.
+        //
+        // A request member is an HTTP request, so only an HTTP candidate can
+        // be a site that reaches one. The name join is by member name with no
+        // receiver constraint where the receiver is a local, which is the
+        // shape this pass exists for, so a `client.publish(topic, payload)`
+        // would otherwise join to an imported member called `publish`.
+        // Rewriting a row could never act on that (a pub/sub site has no HTTP
+        // row at its span); emitting one could.
+        let mut sites: Vec<(&CandidateTarget, &RequestMember)> = candidate_map
+            .values()
+            .filter(|candidate| candidate.protocol == Protocol::Http)
+            .filter_map(|candidate| {
+                resolved
+                    .get(&candidate.span_start)
+                    .map(|member| (candidate, member))
+            })
+            .collect();
+        sites.sort_by_key(|(candidate, _)| candidate.span_start);
+
+        // Only rows extraction produced can cover a site. Reading the vector
+        // as it grows would let the first backfill of a line suppress its
+        // siblings — two resolved sites on one line are two calls.
+        let extracted = result.data_calls.len();
+        let mut added = 0;
+        for (candidate, member) in sites {
+            // A site extraction answered as an ENDPOINT is answered. One
+            // candidate map holds both, and a route definition whose verb
+            // happens to name an imported request member (`app.get(...)`
+            // against a client's `get`) resolves like any other bare call:
+            // the receiver is a local, so no import constrains the join.
+            // Rewriting could never reach it, because there is no data-call
+            // row at its span to rewrite; emitting one would invent a
+            // consumer for a route the file DEFINES.
+            if result
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.call_expression_span_start == Some(candidate.span_start))
+            {
+                continue;
+            }
+            let line = i32::try_from(candidate.line_number).unwrap_or(i32::MAX);
+            let ours = normalize_path_params(&member.target);
+            let covered = result.data_calls[..extracted].iter().any(|data_call| {
+                if data_call.call_expression_span_start == Some(candidate.span_start)
+                    || data_call.line_number == line
+                    || data_call.call_expression_line == Some(line)
+                {
+                    return true;
+                }
+                let method_agrees = match data_call.method.as_deref() {
+                    Some(theirs) => theirs.trim().eq_ignore_ascii_case(&member.method),
+                    // An unstated method cannot separate them.
+                    None => true,
+                };
+                let theirs = normalize_path_params(&data_call.target);
+                // An empty target states no path, so it carries nothing: the
+                // suffix test would otherwise read it as covering everything.
+                !theirs.trim().is_empty()
+                    && method_agrees
+                    && (Self::target_carries_url(&theirs, &ours)
+                        || Self::target_carries_url(&ours, &theirs))
+            });
+            if covered {
+                continue;
+            }
+            debug!(
+                "Backfilling imported-member call the extraction returned no row for: {} {} at line {}",
+                member.method, member.target, candidate.line_number
+            );
+            result.data_calls.push(DataCallResult {
+                candidate_id: format!(
+                    "imported-member:{}-{}",
+                    candidate.span_start, candidate.span_end
+                ),
+                line_number: line,
+                target: member.target.clone(),
+                method: Some(member.method.clone()),
+                // Classification is judgment, not an AST fact: the target is
+                // the member's own URL expression, with no host to classify
+                // from beyond what the member closes over.
+                call_kind: None,
+                pattern_matched: candidate
+                    .callee_property
+                    .clone()
+                    .unwrap_or_else(|| candidate.callee_object.clone()),
+                // The span is what the type sidecar anchors on, and it is also
+                // what marks this call candidate-backed downstream.
+                call_expression_span_start: Some(candidate.span_start),
+                call_expression_span_end: Some(candidate.span_end),
+                call_expression_text: None,
+                call_expression_line: Some(line),
+                payload_expression_text: None,
+                payload_expression_line: None,
+                primary_type_symbol: None,
+                type_import_source: None,
+            });
+            added += 1;
+        }
+        added
     }
 
     fn propagate_wrapper_request_shape(
@@ -10626,6 +10770,111 @@ export { routes };
         assert_eq!(added, 1, "only the site nothing already covers is emitted");
         assert_eq!(result.data_calls[3].target, "${base}/api/v1/things");
         assert_eq!(result.data_calls[3].method.as_deref(), Some("DELETE"));
+    }
+
+    fn resolved_member(span: u32, method: &str, target: &str) -> HashMap<u32, RequestMember> {
+        HashMap::from([(
+            span,
+            RequestMember {
+                method: method.to_string(),
+                target: target.to_string(),
+            },
+        )])
+    }
+
+    /// carrick#623: `apply_imported_members` can only rewrite a row that
+    /// already exists, so a resolved member whose site extraction answered
+    /// nothing for was dropped and the endpoint it reaches was absent from the
+    /// index entirely.
+    #[test]
+    fn merge_imported_member_calls_emits_a_site_extraction_returned_no_row_for() {
+        let mut result = FileAnalysisResult::default();
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
+        let resolved = resolved_member(100, "PUT", "${this.baseUrl}/api/v2/things/${id}");
+
+        let added =
+            FileOrchestrator::merge_imported_member_calls(&mut result, &resolved, &candidate_map);
+
+        assert_eq!(added, 1);
+        assert_eq!(
+            result.data_calls[0].target, "${this.baseUrl}/api/v2/things/${id}",
+            "everything the member closes over is kept verbatim"
+        );
+        assert_eq!(result.data_calls[0].method.as_deref(), Some("PUT"));
+        assert_eq!(result.data_calls[0].candidate_id, "imported-member:100-140");
+        // The span is the SITE's: it anchors the type sidecar and marks the
+        // call candidate-backed downstream.
+        assert_eq!(result.data_calls[0].call_expression_span_start, Some(100));
+        assert_eq!(result.data_calls[0].call_expression_span_end, Some(140));
+        assert_eq!(result.data_calls[0].line_number, 12);
+    }
+
+    /// A site extraction DID answer keeps the analyzer's row (which
+    /// `apply_imported_members` has already corrected by this point): same
+    /// span, same line, or the same path already carried behind a base.
+    #[test]
+    fn merge_imported_member_calls_skips_sites_extraction_already_answered() {
+        let mut answered = data_call_with("c1", "${base}/api/v2/things/${id}", Some("PUT"));
+        answered.call_expression_span_start = Some(100);
+        let mut result = FileAnalysisResult {
+            data_calls: vec![answered],
+            ..Default::default()
+        };
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
+        let resolved = resolved_member(100, "PUT", "${this.baseUrl}/api/v2/things/${id}");
+
+        let added =
+            FileOrchestrator::merge_imported_member_calls(&mut result, &resolved, &candidate_map);
+
+        assert_eq!(added, 0);
+        assert_eq!(result.data_calls.len(), 1);
+    }
+
+    /// One candidate map holds route registrations as well as calls, and the
+    /// name join is unconstrained where the receiver is a local, so a route
+    /// whose verb names an imported request member (`app.get(...)` against a
+    /// client's `get`) resolves like any bare call. Rewriting could never
+    /// reach it; emitting would invent a consumer for a route the file
+    /// DEFINES.
+    #[test]
+    fn merge_imported_member_calls_leaves_a_route_registration_alone() {
+        let mut endpoint = endpoint_with_candidate("/things", "c1");
+        endpoint.call_expression_span_start = Some(100);
+        let mut result = FileAnalysisResult {
+            endpoints: vec![endpoint],
+            ..Default::default()
+        };
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
+        let resolved = resolved_member(100, "GET", "${this.baseUrl}/api/v2/things/${id}");
+
+        let added =
+            FileOrchestrator::merge_imported_member_calls(&mut result, &resolved, &candidate_map);
+
+        assert_eq!(added, 0);
+        assert!(result.data_calls.is_empty());
+    }
+
+    /// A request member is an HTTP request, so only an HTTP candidate can be a
+    /// site that reaches one. A `client.publish(topic, payload)` sharing a
+    /// name with an imported `publish` member joins to nothing.
+    #[test]
+    fn merge_imported_member_calls_ignores_a_non_http_candidate() {
+        let mut result = FileAnalysisResult::default();
+        let mut candidate = candidate_with_snippet("c1", None);
+        candidate.protocol = crate::operation::Protocol::Pubsub;
+        candidate.callee_property = Some("publish".to_string());
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert("c1".to_string(), candidate);
+        let resolved = resolved_member(100, "POST", "${this.baseUrl}/api/v2/events");
+
+        let added =
+            FileOrchestrator::merge_imported_member_calls(&mut result, &resolved, &candidate_map);
+
+        assert_eq!(added, 0);
+        assert!(result.data_calls.is_empty());
     }
 
     /// An OpenAPI-style path the model copied verbatim states the same route as

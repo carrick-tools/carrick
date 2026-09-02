@@ -61,7 +61,7 @@ fn call_at_line(calls: &[serde_json::Value], line: i64) -> &serde_json::Value {
 #[test]
 fn client_method_states_the_verb_and_the_version_for_its_call_sites() {
     let calls = calls("imported-request-member");
-    assert_eq!(calls.len(), 3, "one row per call site: {calls:#?}");
+    assert_eq!(calls.len(), 5, "one row per call site: {calls:#?}");
 
     // `client.createArtifactUrl(name)` reaches a PUT to /api/v2. The cassette
     // says POST, and says v2 only because the error message four lines below
@@ -90,4 +90,34 @@ fn client_method_states_the_verb_and_the_version_for_its_call_sites() {
     let local = call_at_line(&calls, 21);
     assert_eq!(local["method"], "GET");
     assert_eq!(local["target_url"], "/legacy/handles");
+}
+
+/// carrick#623: the same two members, called from a file whose cassette holds
+/// no row for either site.
+///
+/// This is the shape the live index showed: with nothing to rewrite, the
+/// resolved members were dropped and the consumer rows were absent altogether,
+/// not merely wrong. `uploads.json` freezes an empty `data_calls` array, which
+/// is what the analyzer returns for a file whose call sites state neither a
+/// path nor a verb, so the two rows below exist only if the scanner emits them
+/// deterministically.
+#[test]
+fn a_resolved_member_is_emitted_when_extraction_returned_no_row_at_all() {
+    let calls = calls("imported-request-member");
+
+    let push = call_at_line(&calls, 7);
+    assert_eq!(push["method"], "PUT");
+    assert_eq!(push["path"], "/api/v2/artifacts/:encoded");
+    assert_eq!(
+        push["target_url"],
+        "${this.baseUrl}/api/v2/artifacts/${encoded}"
+    );
+
+    let pull = call_at_line(&calls, 11);
+    assert_eq!(pull["method"], "GET");
+    assert_eq!(pull["path"], "/api/v1/artifacts/:encoded");
+    assert_eq!(
+        pull["target_url"],
+        "${this.baseUrl}/api/v1/artifacts/${encoded}"
+    );
 }

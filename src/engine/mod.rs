@@ -90,7 +90,10 @@ mod type_compat_v2;
 /// URL was built a statement before the call, and correct the path of those
 /// that had one invented. Same reasoning as 10: unchanged files, so a v10
 /// cache would pin every already-indexed repo to the wrong version forever.
-const CACHE_VERSION: u32 = 11;
+/// 12: imported-member call sites extraction returned no row for (carrick#623)
+/// are now emitted, so an unchanged consumer file has consumer rows where a v11
+/// cache has none at all.
+const CACHE_VERSION: u32 = 12;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
