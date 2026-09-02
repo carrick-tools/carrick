@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.30](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.29...carrick-v0.3.30) (2026-09-02)
+
+
+### Bug Fixes
+
+* **scanner:** emit a resolved imported member when extraction returned no row ([#625](https://github.com/carrick-tools/carrick/issues/625)) ([9a8d07b](https://github.com/carrick-tools/carrick/commit/9a8d07b26d5fc3912bd0a6a95ffa9cf53d176448))
+* **scanner:** read method guards written as a call on the member ([#624](https://github.com/carrick-tools/carrick/issues/624)) ([384c700](https://github.com/carrick-tools/carrick/commit/384c700ff46d297f41a9add7c1d72a960739d15a))
+
 ## [0.3.29](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.28...carrick-v0.3.29) (2026-09-02)
 
 
