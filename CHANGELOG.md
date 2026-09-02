@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.29](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.28...carrick-v0.3.29) (2026-09-02)
+
+
+### Bug Fixes
+
+* **scanner:** refresh the OIDC token before it expires and fail runs that lose analyzer results ([#618](https://github.com/carrick-tools/carrick/issues/618)) ([dce526b](https://github.com/carrick-tools/carrick/commit/dce526bdc2bf269badde0f0f4421d0f4dfad063b)), closes [#461](https://github.com/carrick-tools/carrick/issues/461)
+
 ## [0.3.28](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.27...carrick-v0.3.28) (2026-09-02)
 
 
