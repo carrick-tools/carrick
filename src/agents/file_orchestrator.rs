@@ -3449,34 +3449,41 @@ impl FileOrchestrator {
             MethodSource::ExportName => scanner
                 .exported_handlers(file_path, content)
                 .into_iter()
-                .filter_map(|h| {
+                .flat_map(|h| {
                     // An export named for a method *is* that method; a
                     // convention whose route modules name their handlers for a
                     // role instead (a read export, a write export) maps those
-                    // names itself. Either way the endpoint is anchored on the
-                    // export's own span, so an exported binding initialized
-                    // from a call — a handler built by a route-builder factory
-                    // rather than declared as a function — anchors exactly like
-                    // a function declaration does (carrick#473).
-                    let method = route.http_method_for_export(&h.name)?;
-                    Some(EndpointResult {
-                        candidate_id: format!("file-route:{}:{}", method, h.span_start),
-                        line_number: h.line_number as i32,
-                        owner_node: FILE_BASED_ROUTE_OWNER.to_string(),
-                        method,
-                        path: route.path.clone(),
-                        handler_name: h.name.clone(),
-                        pattern_matched: route.convention.clone(),
-                        call_expression_span_start: Some(h.span_start),
-                        call_expression_span_end: Some(h.span_end),
-                        payload_expression_text: None,
-                        payload_expression_line: None,
-                        response_expression_text: None,
-                        response_expression_line: None,
-                        emission_style: None,
-                        primary_type_symbol: None,
-                        type_import_source: None,
-                    })
+                    // names itself, and a method guard inside the body narrows
+                    // that default to the verbs actually served (carrick#601).
+                    // Either way the endpoint is anchored on the export's own
+                    // span, so an exported binding initialized from a call — a
+                    // handler built by a route-builder factory rather than
+                    // declared as a function — anchors exactly like a function
+                    // declaration does (carrick#473). The anchor stays the
+                    // export span, never the guard line: the sidecar's
+                    // return-type lookup is keyed on it.
+                    let methods = route.http_methods_for_export(&h.name, &h.method_guards);
+                    methods
+                        .into_iter()
+                        .map(|method| EndpointResult {
+                            candidate_id: format!("file-route:{}:{}", method, h.span_start),
+                            line_number: h.line_number as i32,
+                            owner_node: FILE_BASED_ROUTE_OWNER.to_string(),
+                            method,
+                            path: route.path.clone(),
+                            handler_name: h.name.clone(),
+                            pattern_matched: route.convention.clone(),
+                            call_expression_span_start: Some(h.span_start),
+                            call_expression_span_end: Some(h.span_end),
+                            payload_expression_text: None,
+                            payload_expression_line: None,
+                            response_expression_text: None,
+                            response_expression_line: None,
+                            emission_style: None,
+                            primary_type_symbol: None,
+                            type_import_source: None,
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .collect(),
             // Pages-router style: a single default export serves every method. The

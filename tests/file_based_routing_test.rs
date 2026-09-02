@@ -290,3 +290,36 @@ fn astro_convention_rejects_a_non_astro_layout() {
         "astro conventions must not match app-router files, got {routes:?}"
     );
 }
+
+/// carrick#601: a route module that exports a generic write handler and
+/// narrows the HTTP method with a guard inside the body serves exactly the
+/// guarded verb. Emitting the convention's default verb as well produces a
+/// phantom row — an endpoint nothing serves — and a consumer call extracted
+/// with the wrong method matches it and reads as a confident green edge. So
+/// the guard, where one exists, is the only row; where none exists, the
+/// convention's default stands.
+#[test]
+fn method_guard_replaces_the_convention_default_verb() {
+    let routes = synthesized_routes(
+        "flat-routes-method-guard",
+        &builtin_conventions(&["Remix".to_string()], &[]),
+    );
+
+    let expected: BTreeSet<String> = [
+        // Guarded on PUT: the default (POST) is never served, so it is absent.
+        "PUT /api/v1/items/:itemId",
+        // Guarded on GET through a destructured local binding.
+        "GET /api/v1/items/:itemId/status",
+        // No guard: the convention's default for a write export stands.
+        "POST /api/v1/items",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    assert_eq!(
+        routes, expected,
+        "a method-guarded handler should yield exactly the guarded verb and no \
+         phantom default-verb row"
+    );
+}

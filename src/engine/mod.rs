@@ -80,7 +80,13 @@ mod type_compat_v2;
 /// git diff is available, and the rule above is that any change to what
 /// per-file analysis emits bumps this constant. The bump makes the first scan
 /// after the release a full one on every already-indexed repo.
-const CACHE_VERSION: u32 = 9;
+/// 10: method-guarded file-based routes (carrick#601). A route module that
+/// exports a generic handler and narrows the HTTP method inside the body now
+/// yields the guarded verb instead of the convention's default. Those files do
+/// not change, so a v9 cache would pin every already-indexed repo to the
+/// phantom default-verb row, which is the row a wrong-method consumer call
+/// matches into a false green edge.
+const CACHE_VERSION: u32 = 10;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
