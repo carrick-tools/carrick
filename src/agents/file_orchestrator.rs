@@ -5794,7 +5794,7 @@ mod tests {
         std::fs::create_dir_all(root.join("lib/client")).unwrap();
         std::fs::write(root.join("nodes/GenericFunctions.ts"), "export {}").unwrap();
         std::fs::write(root.join("lib/client/index.ts"), "export {}").unwrap();
-        let importer = root.join("nodes/Formbricks.node.ts");
+        let importer = root.join("nodes/Survey.node.ts");
         std::fs::write(&importer, "import {} from './GenericFunctions';").unwrap();
 
         // Extension-less sibling specifier → .ts file.
