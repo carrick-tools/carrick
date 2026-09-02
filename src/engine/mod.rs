@@ -73,7 +73,14 @@ mod type_compat_v2;
 /// binding. A separate bump from 7 on purpose: an index rebuilt on 7 has
 /// already spent its one free pass, so without its own the new rows never
 /// reach it.
-const CACHE_VERSION: u32 = 8;
+/// 9: end-to-end harness sources are no longer discovered (carrick#588 defect
+/// 1), so the routes an `e2e/` stub registered stop being producer rows. The
+/// incremental merge would shed them on its own — a cached result whose file
+/// is no longer in the discovered set is dropped — but that only runs when a
+/// git diff is available, and the rule above is that any change to what
+/// per-file analysis emits bumps this constant. The bump makes the first scan
+/// after the release a full one on every already-indexed repo.
+const CACHE_VERSION: u32 = 9;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<

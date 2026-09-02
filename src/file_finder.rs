@@ -9,6 +9,25 @@ const TEST_DIR_NAMES: &[&str] = &[
     "tests",
     "test",
     "fixtures",
+    // An end-to-end suite and its harness. Same class as `tests/`, and missed
+    // until #588: an e2e harness commonly stands up a stub of the collector or
+    // sibling service it is testing against, so its route registrations were
+    // being emitted as producer rows for the package that owns the suite. A
+    // real consumer elsewhere in the workspace then matched the stub, and the
+    // index answered "served here" about a service that serves nothing of the
+    // sort. `e2e` is an ecosystem-wide directory convention, not a runner or
+    // library name.
+    //
+    // The structurally stronger signal is program membership: a harness of
+    // this shape usually sits outside the package's compiled program (not
+    // reachable from its tsconfig `include`/`files`). It is deliberately not
+    // used here. TypeScript's default `include` is `**/*`, so a package that
+    // never narrows it reports the harness as in-program and the conventions
+    // below would still have to carry the case; resolving `include`/`exclude`
+    // properly means `extends` chains, `files` precedence, implicit
+    // extensions and the default excludes, which is a subsystem rather than a
+    // guard. Tracked as follow-up on #588; until then this list is the signal.
+    "e2e",
     // Storybook config/preview files live under .storybook/ — tooling, not
     // product source (same reasoning as the .stories.* suffixes below).
     ".storybook",
@@ -450,6 +469,63 @@ mod tests {
 
         assert_eq!(files, vec![kept]);
         assert_eq!(package, Some(pkg));
+    }
+
+    /// carrick#588 defect 1: an end-to-end harness that stands up a stub on
+    /// the same path the package really serves was being scanned like product
+    /// source, so the stub's registration became a producer row and a real
+    /// consumer elsewhere matched it. Discovery is where that is decided, and
+    /// it is decided for both sides of the file at once: nothing under `e2e/`
+    /// is analysed at all, so the harness contributes neither endpoints nor
+    /// calls, exactly as `tests/` and `__tests__/` already behave.
+    ///
+    /// Deterministic end to end: the fixture is checked in, and this asserts
+    /// on the discovered file list, with no LLM in the loop.
+    #[test]
+    fn find_service_files_skips_the_e2e_harness_that_stubs_a_real_route() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/e2e-scaffolding");
+        let service = crate::config::Config {
+            directory: Some("packages/reports-api".to_string()),
+            ..Default::default()
+        };
+
+        let (files, package_json) =
+            find_service_files(&root.to_string_lossy(), &service, &["node_modules"]);
+
+        let service_root = root.join("packages/reports-api");
+        assert_eq!(
+            files,
+            vec![service_root.join("src/routes.ts")],
+            "only the real route file is product source; the e2e harness registering a stub on \
+             the same path must not be scanned"
+        );
+        assert_eq!(package_json, Some(service_root.join("package.json")));
+    }
+
+    /// The other half of the same guard: should an `e2e/` file ever reach
+    /// extraction through a configured `include` root, its endpoints are
+    /// tagged rather than passed off as real routes.
+    #[test]
+    fn endpoint_provenance_tags_e2e_harness_sources() {
+        use crate::operation::EndpointProvenance;
+
+        assert_eq!(
+            endpoint_provenance(
+                Path::new("packages/reports-api/e2e/utils.ts"),
+                Path::new("")
+            ),
+            EndpointProvenance::Mock
+        );
+        // A file named after the convention is not a harness tree, and a
+        // product directory whose name merely starts with it is untouched.
+        assert_eq!(
+            endpoint_provenance(Path::new("src/api/e2e.ts"), Path::new("")),
+            EndpointProvenance::Route
+        );
+        assert_eq!(
+            endpoint_provenance(Path::new("src/e2ee/session.ts"), Path::new("")),
+            EndpointProvenance::Route
+        );
     }
 
     #[test]
