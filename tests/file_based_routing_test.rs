@@ -318,6 +318,17 @@ fn method_guard_replaces_the_convention_default_verb() {
         // A switch on the case-folded method serves the verbs it branches on.
         "PATCH /api/v1/items/:itemId/settings",
         "DELETE /api/v1/items/:itemId/settings",
+        // carrick#628: a branch on OPTIONS is a CORS preflight the handler
+        // answers, not the verb it serves, so it never displaces the read
+        // export's default. Both spellings of the branch read the same.
+        "GET /api/v1/items/:itemId/preflight",
+        "GET /api/v1/items/:itemId/preflightFolded",
+        // A preflight branch alongside a real narrowing leaves the narrowing
+        // alone, and still no OPTIONS row.
+        "PUT /api/v1/items/:itemId/preflightWrite",
+        // HEAD is protocol plumbing too, so a handler branching only on it
+        // reads as unguarded and the write export's default stands.
+        "POST /api/v1/items/:itemId/probe",
         // No guard: the convention's default for a write export stands.
         "POST /api/v1/items",
     ]

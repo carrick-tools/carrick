@@ -93,7 +93,11 @@ mod type_compat_v2;
 /// 12: imported-member call sites extraction returned no row for (carrick#623)
 /// are now emitted, so an unchanged consumer file has consumer rows where a v11
 /// cache has none at all.
-const CACHE_VERSION: u32 = 12;
+/// 13: a handler's branch on OPTIONS or HEAD no longer displaces the
+/// convention's default verb (carrick#628), so an unchanged route module has
+/// its real verb back where a v12 cache pins it to the preflight verb and drops
+/// the row every consumer of that route matches.
+const CACHE_VERSION: u32 = 13;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<

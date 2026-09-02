@@ -115,6 +115,11 @@ pub struct DerivedRoute {
     pub method_exports: BTreeMap<String, String>,
 }
 
+/// Methods a handler may branch on without that branch being the verb it
+/// serves, so they never narrow a role-named export (carrick#628). See
+/// [`DerivedRoute::http_methods_for_export`] for the reasoning.
+const NON_NARROWING_METHODS: &[&str] = &["OPTIONS", "HEAD"];
+
 impl DerivedRoute {
     /// The HTTP methods an exported binding serves, empty when the export is
     /// not a route handler under this convention.
@@ -138,6 +143,18 @@ impl DerivedRoute {
     /// A guard cannot contradict an export *named* for a method: there the name
     /// is the declaration, not a default, and a body that also branches on the
     /// method is doing something else.
+    ///
+    /// OPTIONS and HEAD never narrow (carrick#628). A handler that answers a
+    /// CORS preflight inline opens with a branch on OPTIONS and then serves its
+    /// real verb; a handler that answers HEAD is serving the protocol's
+    /// read-without-a-body for a resource it also serves under another verb.
+    /// Both are plumbing the handler deals with rather than the operation the
+    /// route offers, so neither displaces the convention's default, and a guard
+    /// naming only them reads as no guard at all. Nor is a row emitted for
+    /// them: preflight is not an operation a consumer calls. The rule lives
+    /// here rather than in the guard collector because the collector's answer
+    /// is a fact about the source, "these are the literals the body compares
+    /// the method against", and this is the routing judgement laid over it.
     pub fn http_methods_for_export(&self, export: &str, method_guards: &[String]) -> Vec<String> {
         if is_http_method(export) {
             return vec![export.to_uppercase()];
@@ -156,6 +173,9 @@ impl DerivedRoute {
                 continue;
             }
             let guard = guard.trim().to_uppercase();
+            if NON_NARROWING_METHODS.contains(&guard.as_str()) {
+                continue;
+            }
             if !guarded.contains(&guard) {
                 guarded.push(guard);
             }
@@ -958,9 +978,51 @@ mod tests {
             vec!["PUT"]
         );
         assert_eq!(
-            r.http_methods_for_export("loader", &guards(&["HEAD"])),
-            vec!["HEAD"]
+            r.http_methods_for_export("loader", &guards(&["DELETE"])),
+            vec!["DELETE"]
         );
+    }
+
+    // --- Protocol verbs never narrow (carrick#628) ---
+
+    #[test]
+    fn a_preflight_branch_leaves_the_convention_default_standing() {
+        // The regression: a read handler that answers a CORS preflight inline
+        // branches on OPTIONS, which is not the verb it serves. Letting it
+        // narrow drops the route's only real row.
+        let r = flat_route("app/routes/api.v1.widgets.ts").unwrap();
+        assert_eq!(
+            r.http_methods_for_export("loader", &guards(&["OPTIONS"])),
+            vec!["GET"]
+        );
+        assert_eq!(
+            r.http_methods_for_export("action", &guards(&["HEAD"])),
+            vec!["POST"]
+        );
+        assert_eq!(
+            r.http_methods_for_export("loader", &guards(&["OPTIONS", "HEAD"])),
+            vec!["GET"]
+        );
+    }
+
+    #[test]
+    fn a_preflight_branch_does_not_disturb_a_real_narrowing() {
+        // The protocol verbs drop out and the rest of the guard decides, so
+        // neither the default nor an OPTIONS row survives.
+        let r = flat_route("app/routes/api.v1.widgets.ts").unwrap();
+        assert_eq!(
+            r.http_methods_for_export("action", &guards(&["OPTIONS", "PUT"])),
+            vec!["PUT"]
+        );
+    }
+
+    #[test]
+    fn a_method_named_options_export_is_still_its_own_method() {
+        // The rule is scoped to role-named exports, where the convention
+        // supplies a default. An export *named* OPTIONS declares itself.
+        let r = route("app/users/route.ts").unwrap();
+        assert_eq!(r.http_methods_for_export("OPTIONS", &[]), vec!["OPTIONS"]);
+        assert_eq!(r.http_methods_for_export("HEAD", &[]), vec!["HEAD"]);
     }
 
     #[test]
