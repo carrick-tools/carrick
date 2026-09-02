@@ -1,0 +1,45 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:5",
+      "line_number": 5,
+      "target": "/api/v2/artifacts/${name}",
+      "method": "POST",
+      "pattern_matched": "client.createArtifactUrl(",
+      "call_expression_text": "client.createArtifactUrl(name)",
+      "call_expression_line": 5,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:16",
+      "line_number": 16,
+      "target": "/api/v2/artifacts",
+      "method": "GET",
+      "pattern_matched": "client.readArtifactUrl(",
+      "call_expression_text": "client.readArtifactUrl(name)",
+      "call_expression_line": 16,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:21",
+      "line_number": 21,
+      "target": "/legacy/handles",
+      "method": "GET",
+      "pattern_matched": "apiClient.createArtifactUrl(",
+      "call_expression_text": "apiClient.createArtifactUrl(name)",
+      "call_expression_line": 21,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

@@ -18,6 +18,7 @@ mod formatter;
 mod framework_detector;
 mod graphql;
 mod import_bindings;
+mod imported_request_member;
 mod intent_generator;
 mod local_http_wrapper;
 mod logging;

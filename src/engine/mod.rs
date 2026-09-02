@@ -64,7 +64,11 @@ mod type_compat_v2;
 /// encodes: ANY change to what per-file analysis emits — deterministic
 /// backfills included — must bump this constant, or deployed indexes never
 /// see it.
-const CACHE_VERSION: u32 = 6;
+/// 7: imported-request-member resolution (carrick#588) rewrites the method and
+/// target of call sites that reach an endpoint through a client method in
+/// another module. Those files do not change, so v6 caches would pin every
+/// already-indexed repo to the wrong verb and the wrong API version.
+const CACHE_VERSION: u32 = 7;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
