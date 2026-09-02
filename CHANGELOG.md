@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.28](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.27...carrick-v0.3.28) (2026-09-02)
+
+
+### Bug Fixes
+
+* **scanner:** read a handler's method guard so file-based routes stop emitting a phantom verb ([#601](https://github.com/carrick-tools/carrick/issues/601)) ([#611](https://github.com/carrick-tools/carrick/issues/611)) ([02703e1](https://github.com/carrick-tools/carrick/commit/02703e119a79376c4cdbcde58ae1d27adfa7a541))
+* **scanner:** read the path a `new URL(path, base)` target states ([#610](https://github.com/carrick-tools/carrick/issues/610)) ([#613](https://github.com/carrick-tools/carrick/issues/613)) ([9c530ec](https://github.com/carrick-tools/carrick/commit/9c530ec97035e30720460d301b579cda7e4bb60b))
+* **scanner:** stop indexing e2e harness routes as producers ([#588](https://github.com/carrick-tools/carrick/issues/588)) ([#609](https://github.com/carrick-tools/carrick/issues/609)) ([9514f64](https://github.com/carrick-tools/carrick/commit/9514f647dd283ca3315fdfb08ec5d3e08e103588))
+
 ## [0.3.27](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.26...carrick-v0.3.27) (2026-09-02)
 
 
