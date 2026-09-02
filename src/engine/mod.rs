@@ -4167,7 +4167,7 @@ mod tests {
         use crate::packages::PackageInfo;
         use crate::visitor::FunctionDefinition;
 
-        let repo_path = "/home/runner/work/bench-sbx-app/bench-sbx-app";
+        let repo_path = "/home/runner/work/acme-app/acme-app";
         let abs = |rel: &str| format!("{}/{}", repo_path, rel);
 
         let op = |file: &str| ApiEndpointDetails {
@@ -4279,7 +4279,7 @@ mod tests {
         );
 
         let mut data = CloudRepoData {
-            repo_name: "bench-sbx-app".to_string(),
+            repo_name: "acme-app".to_string(),
             service_name: None,
             endpoints: vec![op("src/routes/orders.ts:18")],
             calls: vec![op("src/providers/search.ts:313")],

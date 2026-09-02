@@ -3914,7 +3914,7 @@ mod tests {
             request_type: None,
             response_type: None,
             file_path: PathBuf::from(
-                "/home/runner/work/bench-sbx-app/bench-sbx-app/src/providers/search.ts:313",
+                "/home/runner/work/acme-app/acme-app/src/providers/search.ts:313",
             ),
             repo_name: None,
             service_name: None,
