@@ -290,22 +290,75 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
 
         current_services_data.push(data);
     }
-    logging::finish_spinner(
-        &sp,
-        &format!("Analyzed {} ({} service(s))", repo_name, services.len()),
-    );
+
+    // What the analysis actually achieved decides what the spinner is allowed
+    // to claim. A run that lost files to failed analyzer calls indexed less
+    // than it was asked to, and a tick next to "Analyzed" is the first half of
+    // reporting success on a partial index (#461).
+    let lost_files = crate::scan_health::lost_file_count();
+    if lost_files > 0 {
+        logging::finish_spinner_warn(
+            &sp,
+            &format!(
+                "Analyzed {} ({} service(s)); {} of {} files were not analysed",
+                repo_name,
+                services.len(),
+                lost_files,
+                crate::scan_health::attempted_count()
+            ),
+        );
+    } else {
+        logging::finish_spinner(
+            &sp,
+            &format!("Analyzed {} ({} service(s))", repo_name, services.len()),
+        );
+    }
 
     // If the LLM quota was exhausted at any point during analysis, the per-call
     // circuit breaker tripped and the remaining files/functions failed fast — so
     // the results above are partial. Abort before uploading (or producing any
     // cross-repo/PR output) so a quota-degraded scan can't overwrite the existing
     // index with a half-empty one. (Run-log upload still happens in the caller.)
+    //
+    // Checked before the lost-file gate below because it is the more specific
+    // cause: the files that failed before the breaker tripped are recorded
+    // there too, and "the backend is out of quota" is the useful sentence.
     if crate::agent_service::rate_limit_tripped() {
         return Err(
             "Carrick Cloud LLM quota was exhausted mid-scan; the analysis is \
                     incomplete, so aborting before upload to avoid overwriting the existing \
                     index with partial results. Re-run after the quota resets."
                 .into(),
+        );
+    }
+
+    // Files the cloud never answered for are absent from the results above:
+    // their endpoints, their outbound calls, and the matches on the other side
+    // of them. Uploading that overwrites a good index with a thinner one and
+    // says nothing, which is how a service went from 11 indexed endpoints to 4
+    // while the run reported success (#461). Same shape as the quota abort
+    // above: stop before the upload, so the index stays stale rather than
+    // becoming wrong, and fail the run so CI says so. The lost files are absent
+    // from the incremental cache too, so the next run re-analyses exactly them.
+    //
+    // `CARRICK_ALLOW_PARTIAL_ANALYSIS` is the deliberate opt-out for someone
+    // who wants the partial index anyway; the loss is reported either way.
+    if let Some(summary) = crate::scan_health::summary_line() {
+        let allow_partial = crate::scan_health::allow_partial_from_env();
+        if crate::scan_health::should_fail_run(lost_files, allow_partial) {
+            return Err(format!(
+                "{}. Aborting before upload so the existing index is not overwritten with \
+                 partial results. Re-run to index the missing files, or set {} to upload \
+                 this run anyway.",
+                summary,
+                crate::scan_health::ALLOW_PARTIAL_ENV
+            )
+            .into());
+        }
+        warn!(
+            "{}. Continuing anyway: {} is set",
+            summary,
+            crate::scan_health::ALLOW_PARTIAL_ENV
         );
     }
 

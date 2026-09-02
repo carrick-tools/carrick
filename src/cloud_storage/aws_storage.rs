@@ -1,3 +1,4 @@
+use crate::agent_service::is_oidc_rejection;
 use crate::cloud_storage::{CloudRepoData, CloudStorage, StorageError, UploadOutcome};
 use crate::oidc::OidcProvider;
 use async_trait::async_trait;
@@ -285,8 +286,10 @@ impl AwsStorage {
     }
 
     /// POSTs a JSON body to the upload endpoint with the OIDC bearer header,
-    /// returning the raw response body on success. OIDC tokens are short-lived,
-    /// so on a 401 (token likely expired mid-run) we re-mint once and retry.
+    /// returning the raw response body on success. OIDC tokens are short-lived
+    /// and a large scan outlives one, so the token is read per attempt (the
+    /// provider re-mints as it nears expiry) and a 401 still gets one reactive
+    /// re-mint and retry.
     /// Transient failures (network errors, 408/429/5xx) are retried with
     /// exponential backoff, up to [`max_retries_for_action`] times for the
     /// named action — the full budget for reads, one retry for the actions
@@ -298,14 +301,20 @@ impl AwsStorage {
         let max_retries = max_retries_for_action(action);
         let provider =
             OidcProvider::global().map_err(|e| StorageError::ConnectionError(e.to_string()))?;
-        let mut token = provider
-            .token()
-            .await
-            .map_err(|e| StorageError::ConnectionError(e.to_string()))?;
 
         let mut reminted = false;
         let mut retries = 0u32;
         loop {
+            // Per attempt, not once per call: the upload is the last thing a
+            // scan does, and on a long scan the token minted at the start has
+            // expired by the time an upload retry goes out (#461). The provider
+            // serves the cached token until it nears its own expiry, so this
+            // costs a lock, not a request.
+            let token = provider
+                .token()
+                .await
+                .map_err(|e| StorageError::ConnectionError(e.to_string()))?;
+
             let transient_error = match self
                 .http_client
                 .post(&self.lambda_url)
@@ -318,12 +327,20 @@ impl AwsStorage {
                     let status = response.status();
                     match response.text().await {
                         Ok(response_text) => {
-                            if status.as_u16() == 401 && !reminted {
+                            if is_oidc_rejection(status.as_u16(), &response_text) {
+                                if reminted {
+                                    return Err(StorageError::ConnectionError(format!(
+                                        "Carrick Cloud rejected a freshly minted OIDC token \
+                                         (status {}): {}",
+                                        status, response_text
+                                    )));
+                                }
                                 warn!(
-                                    "Upload returned 401; re-minting OIDC token and retrying once"
+                                    "Upload returned {}; the OIDC token was rejected, re-minting and retrying",
+                                    status
                                 );
-                                token = provider
-                                    .remint()
+                                provider
+                                    .remint(&token)
                                     .await
                                     .map_err(|e| StorageError::ConnectionError(e.to_string()))?;
                                 reminted = true;

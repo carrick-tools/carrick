@@ -222,6 +222,7 @@ name = "carrick"
 version = "0.3.28"
 dependencies = [
  "async-trait",
+ "base64",
  "carrick-match",
  "chrono",
  "dirs",

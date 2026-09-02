@@ -271,6 +271,7 @@ fn test_processing_stats_tracking() {
         files_skipped: 2,
         files_skipped_no_candidates: 1,
         files_parse_failed: 1,
+        files_analysis_failed: 0,
         files_skipped_unrouted_protocol: 0,
         imported_member_resolutions: 0,
         wrapper_method_propagations: 0,

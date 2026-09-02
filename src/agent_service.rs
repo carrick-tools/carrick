@@ -181,6 +181,34 @@ fn jitter_seed() -> u32 {
         .unwrap_or(0)
 }
 
+/// Whether a response says the OIDC token was rejected.
+///
+/// A 401 is the direct signal. The indirect one matters just as much: the
+/// gateway in front of the cloud can answer a rejected token with a 5xx and a
+/// body that is not an error envelope, and that is indistinguishable from a
+/// backend overload unless the body is read (#461). Bodies are only sniffed on
+/// non-2xx responses, so an analysis result that quotes the code out of scanned
+/// source can never be read as a rejection.
+pub(crate) fn is_oidc_rejection(status: u16, body: &str) -> bool {
+    status == 401 || (!(200..300).contains(&status) && body.contains("oidc_invalid"))
+}
+
+/// A short, single-line excerpt of a response body, for a log line or an error
+/// message. Bodies can be large and can carry newlines; neither belongs in a
+/// warning.
+fn body_excerpt(body: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > MAX_CHARS {
+        let head: String = collapsed.chars().take(MAX_CHARS).collect();
+        format!("{}...", head)
+    } else if collapsed.is_empty() {
+        "<empty body>".to_string()
+    } else {
+        collapsed
+    }
+}
+
 /// Reusable service for making Agent API calls
 #[derive(Debug, Clone)]
 pub struct AgentService {
@@ -248,29 +276,35 @@ impl AgentService {
             return Ok(generate_mock_for_task(task_path, body, mock_seed));
         }
 
-        self.post_with_retry(task_path, body).await
+        let provider = OidcProvider::global()
+            .map_err(|e| AgentCallError::permanent("oidc_unavailable", e.to_string()))?;
+        self.post_with_retry(provider, env!("CARRICK_API_ENDPOINT"), task_path, body)
+            .await
     }
 
     /// Shared HTTP + retry implementation for all lambda calls. Sends
     /// the version header, parses the structured error envelope, and
     /// only consumes a backoff attempt when the error is marked
     /// retriable=true (or on bare network failures).
-    async fn post_with_retry<B>(&self, path: &str, body: &B) -> Result<String, AgentCallError>
+    ///
+    /// `provider` and `api_base` are parameters rather than the globals the
+    /// public entry point reads, so the retry loop can be driven against a
+    /// stub in tests.
+    async fn post_with_retry<B>(
+        &self,
+        provider: &OidcProvider,
+        api_base: &str,
+        path: &str,
+        body: &B,
+    ) -> Result<String, AgentCallError>
     where
         B: Serialize + ?Sized,
     {
-        let api_base = env!("CARRICK_API_ENDPOINT");
         let endpoint = format!("{}{}", api_base, path);
 
-        // Mint the OIDC token once up front; the cloud derives identity from
-        // its signed claims. Tokens are short-lived, so on a 401 we re-mint
-        // once mid-loop (long scans can outlive a token).
-        let provider = OidcProvider::global()
-            .map_err(|e| AgentCallError::permanent("oidc_unavailable", e.to_string()))?;
-        let mut token = provider
-            .token()
-            .await
-            .map_err(|e| AgentCallError::permanent("oidc_unavailable", e.to_string()))?;
+        // Whether this call has already answered a rejected token with a fresh
+        // mint. A second rejection after that is not an expiry, so it is fatal
+        // rather than something to keep retrying with the same credential.
         let mut reminted = false;
 
         // Retry logic for transient failures with jittered exponential
@@ -291,6 +325,16 @@ impl AgentService {
                 return Err(rate_limit_abort_error());
             }
 
+            // Read the token per attempt, not once per call. A scan of a
+            // large repo outlives a token, and the provider mints a fresh one
+            // as soon as the cached one nears its expiry — so the retry that
+            // happens ten minutes into a call chain carries a valid credential
+            // instead of the one this call started with (#461).
+            let token = provider
+                .token()
+                .await
+                .map_err(|e| AgentCallError::permanent("oidc_unavailable", e.to_string()))?;
+
             let request_builder = self
                 .client
                 .post(&endpoint)
@@ -304,12 +348,57 @@ impl AgentService {
                 Ok(response) => {
                     let status = response.status();
 
-                    // A 401 mid-run almost certainly means the OIDC token
-                    // expired. Re-mint once and retry immediately without
-                    // consuming a backoff sleep.
-                    if status.as_u16() == 401 && !reminted {
-                        warn!("Agent proxy returned 401; re-minting OIDC token and retrying once");
-                        token = provider.remint().await.map_err(|e| {
+                    // Read the body as text once. Going through `.json()`
+                    // discarded it, so a non-envelope response was logged as
+                    // "error decoding response body" with no trace of what the
+                    // body said — which is how an auth rejection wrapped in a
+                    // gateway status read as a plain overload (#461).
+                    let response_text = match response.text().await {
+                        Ok(text) => text,
+                        Err(e) => {
+                            // The response never arrived in full: transport, not
+                            // application, so it is retriable by definition.
+                            if attempt < max_retries {
+                                let wait_time = backoff_delay(attempt, jitter_seed());
+                                warn!(
+                                    "Failed to read agent proxy response ({}): {}. Retrying in {:?} (attempt {}/{})",
+                                    status, e, wait_time, attempt, max_retries
+                                );
+                                sleep(wait_time).await;
+                                continue;
+                            }
+                            return Err(AgentCallError::transient(
+                                "network_error",
+                                format!("Failed to read agent proxy response {}: {}", status, e),
+                            ));
+                        }
+                    };
+
+                    // An expired token is not always a 401 at the client: the
+                    // gateway can wrap the rejection in a 5xx whose body is not
+                    // an envelope, which the retry loop then spends its whole
+                    // budget on as if it were an overload. Read the rejection
+                    // out of the body as well as the status, mint a fresh
+                    // token, and retry immediately. Only non-2xx bodies are
+                    // sniffed, so a successful analysis of a file that happens
+                    // to mention the code is never mistaken for one.
+                    if is_oidc_rejection(status.as_u16(), &response_text) {
+                        if reminted {
+                            return Err(AgentCallError::permanent(
+                                "oidc_rejected",
+                                format!(
+                                    "Agent proxy rejected a freshly minted OIDC token (status {}): {}.                                      The scan cannot authenticate to Carrick Cloud.",
+                                    status,
+                                    body_excerpt(&response_text)
+                                ),
+                            ));
+                        }
+                        warn!(
+                            "Agent proxy rejected the OIDC token (status {}: {}); re-minting and retrying",
+                            status,
+                            body_excerpt(&response_text)
+                        );
+                        provider.remint(&token).await.map_err(|e| {
                             AgentCallError::permanent("oidc_unavailable", e.to_string())
                         })?;
                         reminted = true;
@@ -319,7 +408,7 @@ impl AgentService {
                     let is_transient_gateway_status =
                         matches!(status.as_u16(), 429 | 502 | 503 | 504);
 
-                    let body: AgentResponse = match response.json().await {
+                    let body: AgentResponse = match serde_json::from_str(&response_text) {
                         Ok(b) => b,
                         Err(e) => {
                             // Body wasn't a parseable envelope. If the status
@@ -328,15 +417,22 @@ impl AgentService {
                             if is_transient_gateway_status && attempt < max_retries {
                                 let wait_time = backoff_delay(attempt, jitter_seed());
                                 warn!(
-                                    "Gateway status {} with non-envelope body: {}. Retrying in {:?} (attempt {}/{})",
-                                    status, e, wait_time, attempt, max_retries
+                                    "Gateway status {} with non-envelope body ({}): {}. Retrying in {:?} (attempt {}/{})",
+                                    status,
+                                    e,
+                                    body_excerpt(&response_text),
+                                    wait_time,
+                                    attempt,
+                                    max_retries
                                 );
                                 sleep(wait_time).await;
                                 continue;
                             }
                             let message = format!(
-                                "Agent proxy returned status {} with unparseable body: {}",
-                                status, e
+                                "Agent proxy returned status {} with unparseable body ({}): {}",
+                                status,
+                                e,
+                                body_excerpt(&response_text)
                             );
                             return Err(if is_transient_gateway_status {
                                 AgentCallError::transient("gateway_error", message)
@@ -1666,5 +1762,211 @@ mod tests {
         assert!(backoff_delay(3, 0) > backoff_delay(2, 0));
         // A large attempt number cannot overflow into a tiny (or huge) sleep.
         assert_eq!(backoff_delay(64, u32::MAX), RETRY_MAX_DELAY);
+    }
+
+    /// A single-shot HTTP stub: answers each connection with the next canned
+    /// response and records the request it received. Reads the whole request
+    /// (headers plus `Content-Length` body) before replying, because reqwest
+    /// treats a response that arrives mid-upload as a transport failure.
+    fn stub_server(
+        responses: Vec<(u16, String)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    raw.extend_from_slice(&buf[..n]);
+                    if n == 0 {
+                        break;
+                    }
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    let Some(header_end) = text.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    let content_length = text[..header_end]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                seen.push(String::from_utf8_lossy(&raw).to_string());
+                let response = format!(
+                    "HTTP/1.1 {} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+            seen
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    /// A stub GitHub token endpoint that hands out each token in turn.
+    fn stub_token_endpoint(tokens: Vec<String>) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for token in tokens {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf).unwrap();
+                let body = serde_json::json!({ "value": token }).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        (format!("http://{}/token?api-version=2.0", addr), handle)
+    }
+
+    /// The header value the request carried, for asserting which token was sent.
+    fn oidc_header(request: &str) -> String {
+        request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("x-carrick-oidc")
+                    .then(|| value.trim().to_string())
+            })
+            .unwrap_or_default()
+    }
+
+    /// A 401 is a rejection whatever the body says; a gateway 5xx is one only
+    /// when the body names the code; a 200 never is, so an analysis result
+    /// that quotes the code out of scanned source is not mistaken for one.
+    #[test]
+    fn oidc_rejection_reads_status_and_body() {
+        assert!(is_oidc_rejection(401, ""));
+        assert!(is_oidc_rejection(
+            503,
+            r#"{"code":"oidc_invalid","reason":"token expired"}"#
+        ));
+        assert!(!is_oidc_rejection(503, "upstream connect error"));
+        assert!(!is_oidc_rejection(
+            200,
+            r#"{"success":true,"text":"the file handles oidc_invalid errors"}"#
+        ));
+    }
+
+    #[test]
+    fn body_excerpt_is_short_and_single_line() {
+        assert_eq!(body_excerpt("  a\n  b  "), "a b");
+        assert_eq!(body_excerpt("   "), "<empty body>");
+        let long = "x".repeat(500);
+        let excerpt = body_excerpt(&long);
+        assert_eq!(excerpt.chars().count(), 203);
+        assert!(excerpt.ends_with("..."));
+    }
+
+    /// The #461 path end to end: the cloud rejects the token behind a gateway
+    /// 503 whose body is not an envelope, which the retry loop used to spend
+    /// its whole budget on. Now the rejection is read out of the body, a fresh
+    /// token is minted, and the retry carries it.
+    #[tokio::test]
+    async fn a_rejected_token_is_reminted_and_the_retry_carries_the_new_one() {
+        // Distinct expiries so the two tokens are distinguishable on the wire.
+        let (token_url, token_server) = stub_token_endpoint(vec![
+            crate::oidc::tests::jwt_with_exp(unix_now() + 3600),
+            crate::oidc::tests::jwt_with_exp(unix_now() + 7200),
+        ]);
+        let provider = OidcProvider::for_test(token_url, "request-token".to_string());
+
+        let (api_base, api_server) = stub_server(vec![
+            (
+                503,
+                r#"{"code":"oidc_invalid","reason":"token expired"}"#.to_string(),
+            ),
+            (200, r#"{"success":true,"text":"analysed"}"#.to_string()),
+        ]);
+
+        let service = AgentService::new();
+        let result = service
+            .post_with_retry(
+                &provider,
+                &api_base,
+                "/analyze-file",
+                &serde_json::json!({}),
+            )
+            .await;
+        assert_eq!(result.unwrap(), "analysed");
+
+        let requests = api_server.join().unwrap();
+        token_server.join().unwrap();
+        assert_eq!(requests.len(), 2, "expected exactly one retry");
+        let first = oidc_header(&requests[0]);
+        let second = oidc_header(&requests[1]);
+        assert!(!first.is_empty(), "first request carried no OIDC header");
+        assert_ne!(
+            first, second,
+            "the retry re-sent the token that was just rejected"
+        );
+    }
+
+    /// A rejection that survives a fresh mint is not an expiry, so it fails
+    /// loudly and permanently instead of burning the retry budget on a
+    /// credential the cloud will keep refusing.
+    #[tokio::test]
+    async fn a_rejection_after_reminting_is_permanent() {
+        // Distinct expiries so the two tokens are distinguishable on the wire.
+        let (token_url, token_server) = stub_token_endpoint(vec![
+            crate::oidc::tests::jwt_with_exp(unix_now() + 3600),
+            crate::oidc::tests::jwt_with_exp(unix_now() + 7200),
+        ]);
+        let provider = OidcProvider::for_test(token_url, "request-token".to_string());
+
+        let (api_base, api_server) = stub_server(vec![
+            (401, r#"{"code":"oidc_invalid"}"#.to_string()),
+            (401, r#"{"code":"oidc_invalid"}"#.to_string()),
+        ]);
+
+        let service = AgentService::new();
+        let err = service
+            .post_with_retry(
+                &provider,
+                &api_base,
+                "/analyze-file",
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, "oidc_rejected");
+        assert!(!err.retriable, "a rejected fresh token is not transient");
+        assert_eq!(api_server.join().unwrap().len(), 2);
+        token_server.join().unwrap();
+    }
+
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     }
 }

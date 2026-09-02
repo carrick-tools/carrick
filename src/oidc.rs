@@ -8,15 +8,20 @@
 //! identity (owner, repo, repo id) from the signed claims, so no API key is
 //! needed.
 //!
-//! Tokens are short-lived (~minutes). We mint once and cache for the run; on a
-//! 401 mid-run (long scans can outlive a token) callers re-mint via
-//! [`OidcProvider::remint`] and retry once. The cloud allows ~30s clock skew.
+//! Tokens are short-lived, and a scan of a large repo outlives one. The
+//! provider therefore caches a token together with the expiry its own `exp`
+//! claim declares, and mints a fresh one as soon as the cached token is within
+//! [`REFRESH_MARGIN`] of that expiry. Callers get the refresh for free by
+//! calling [`OidcProvider::token`] before every attempt rather than once per
+//! request. A 401 that still slips through (clock skew, a token revoked early)
+//! is handled reactively: callers re-mint via [`OidcProvider::remint`] and
+//! retry. The cloud allows ~30s clock skew.
 
 use std::env;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Audience the cloud requires in the OIDC token's `aud` claim.
 const AUDIENCE: &str = "https://api.carrick.tools";
@@ -28,6 +33,22 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Retries after the first attempt for transient mint failures (transport
 /// errors, 5xx from the GitHub token endpoint).
 const MAX_FETCH_RETRIES: u32 = 2;
+
+/// How close to its declared expiry a cached token may get before the next
+/// [`OidcProvider::token`] call mints a replacement.
+///
+/// It has to cover the whole life of a request that is handed the token: the
+/// analyzer call's own 60s timeout, plus the time the cloud spends validating
+/// on arrival. 60s is one such request end to end, and GitHub's token
+/// endpoint is cheap enough that erring long costs nothing but a few extra
+/// mints on a long scan.
+const REFRESH_MARGIN: Duration = Duration::from_secs(60);
+
+/// Assumed lifetime for a token whose `exp` claim could not be read (a payload
+/// that is not the JWT we expect). Deliberately short: caching a token of
+/// unknown lifetime for the length of a scan is the failure this module exists
+/// to prevent, and an unnecessary re-mint is cheap.
+const FALLBACK_LIFETIME: Duration = Duration::from_secs(240);
 
 #[derive(Debug)]
 pub enum OidcError {
@@ -65,7 +86,28 @@ pub struct OidcProvider {
     client: reqwest::Client,
     request_url: String,
     request_token: String,
-    cached: Mutex<Option<String>>,
+    cached: Mutex<Option<CachedToken>>,
+}
+
+/// A minted token and the moment it stops being usable.
+#[derive(Clone, Debug)]
+struct CachedToken {
+    value: String,
+    /// From the token's own `exp` claim, or `mint time + FALLBACK_LIFETIME`
+    /// when that claim could not be read.
+    expires_at: SystemTime,
+}
+
+impl CachedToken {
+    /// Whether this token is close enough to expiry that a request started now
+    /// might be rejected before it lands.
+    fn is_expiring(&self, now: SystemTime) -> bool {
+        match self.expires_at.duration_since(now) {
+            Ok(remaining) => remaining <= REFRESH_MARGIN,
+            // `expires_at` is already in the past.
+            Err(_) => true,
+        }
+    }
 }
 
 static PROVIDER: OnceLock<Option<OidcProvider>> = OnceLock::new();
@@ -95,24 +137,70 @@ impl OidcProvider {
         })
     }
 
-    /// Returns the cached token, minting it on first use.
+    /// Returns a token that is good for at least [`REFRESH_MARGIN`] longer,
+    /// minting one on first use and whenever the cached token is close to its
+    /// declared expiry.
+    ///
+    /// Call this before every attempt, not once per request: on a scan long
+    /// enough to outlive a token, the whole point is that the second attempt
+    /// carries a different token from the first. The lock is held across the
+    /// mint so twenty workers that all find the token expiring produce one
+    /// token request between them, not twenty.
     pub async fn token(&self) -> Result<String, OidcError> {
         let mut guard = self.cached.lock().await;
-        if let Some(token) = guard.as_ref() {
-            return Ok(token.clone());
+        if let Some(cached) = guard.as_ref()
+            && !cached.is_expiring(SystemTime::now())
+        {
+            return Ok(cached.value.clone());
         }
-        let token = self.fetch().await?;
-        *guard = Some(token.clone());
-        Ok(token)
+        self.mint_into(&mut guard).await
     }
 
     /// Forces a fresh mint, replacing the cache. Call after a 401 when the
-    /// cached token may have expired mid-run.
-    pub async fn remint(&self) -> Result<String, OidcError> {
+    /// token that was actually sent may have expired mid-run.
+    ///
+    /// `used` is the token the failed request carried. If the cache no longer
+    /// holds it, a sibling worker has already re-minted for the same reason
+    /// and its token is returned instead — twenty concurrent 401s cost one
+    /// token request, not twenty.
+    pub async fn remint(&self, used: &str) -> Result<String, OidcError> {
         let mut guard = self.cached.lock().await;
-        let token = self.fetch().await?;
-        *guard = Some(token.clone());
-        Ok(token)
+        if let Some(cached) = guard.as_ref()
+            && cached.value != used
+            && !cached.is_expiring(SystemTime::now())
+        {
+            return Ok(cached.value.clone());
+        }
+        self.mint_into(&mut guard).await
+    }
+
+    /// Mints a token and stores it in the held cache guard.
+    async fn mint_into(&self, guard: &mut Option<CachedToken>) -> Result<String, OidcError> {
+        let value = self.fetch().await?;
+        let now = SystemTime::now();
+        let expires_at = expiry_from_jwt(&value).unwrap_or_else(|| {
+            warn!(
+                "Minted OIDC token carries no readable `exp` claim; assuming a {}s lifetime",
+                FALLBACK_LIFETIME.as_secs()
+            );
+            now + FALLBACK_LIFETIME
+        });
+        // The lifetime GitHub actually grants is not documented in a form we
+        // can rely on, and it is the single number that decides whether a long
+        // scan survives. Log what this run was given, so the next incident can
+        // be read off the run log instead of guessed at.
+        if let Ok(remaining) = expires_at.duration_since(now) {
+            debug!(
+                "Minted OIDC token valid for a further {}s (refreshing within {}s of expiry)",
+                remaining.as_secs(),
+                REFRESH_MARGIN.as_secs()
+            );
+        }
+        *guard = Some(CachedToken {
+            value: value.clone(),
+            expires_at,
+        });
+        Ok(value)
     }
 
     async fn fetch(&self) -> Result<String, OidcError> {
@@ -177,25 +265,49 @@ impl OidcProvider {
     }
 }
 
+/// Reads the `exp` claim out of a JWT without verifying it.
+///
+/// Verification is the cloud's job — it holds GitHub's public keys. All the
+/// scanner needs is the expiry, so this decodes the payload segment and reads
+/// one number. Anything unexpected (wrong segment count, payload that is not
+/// base64url JSON, no numeric `exp`) returns `None` and the caller falls back
+/// to [`FALLBACK_LIFETIME`]; a malformed token must never be treated as
+/// long-lived.
+fn expiry_from_jwt(token: &str) -> Option<SystemTime> {
+    use base64::Engine as _;
+
+    let payload = token.split('.').nth(1)?;
+    // JWT segments are base64url and unpadded.
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let exp = claims.get("exp")?.as_u64()?;
+    Some(UNIX_EPOCH + Duration::from_secs(exp))
+}
+
 #[cfg(test)]
-mod tests {
+impl OidcProvider {
+    /// Test-only constructor pointing the provider at an arbitrary endpoint.
+    /// `pub(crate)` so the callers that thread a provider through their retry
+    /// loop can be tested against a stub token endpoint too.
+    pub(crate) fn for_test(request_url: String, request_token: String) -> Self {
+        OidcProvider {
+            // no_proxy so CI proxy env vars can't intercept the localhost call.
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            request_url,
+            request_token,
+            cached: Mutex::new(None),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
-
-    impl OidcProvider {
-        /// Test-only constructor pointing the provider at an arbitrary endpoint.
-        fn for_test(request_url: String, request_token: String) -> Self {
-            OidcProvider {
-                // no_proxy so CI proxy env vars can't intercept the localhost call.
-                client: reqwest::Client::builder().no_proxy().build().unwrap(),
-                request_url,
-                request_token,
-                cached: Mutex::new(None),
-            }
-        }
-    }
 
     /// Verifies the exact contract the cloud expects: the audience is appended
     /// to the runner-provided request URL (preserving its existing query),
@@ -317,6 +429,165 @@ mod tests {
             matches!(&err, OidcError::BadResponse(msg) if msg.contains("403")),
             "expected permanent 403 error, got: {err}"
         );
+        server.join().unwrap();
+    }
+
+    /// Builds a JWT whose payload carries a known `exp` (and `iat`), signed
+    /// with nothing — the scanner only ever decodes it.
+    pub(crate) fn jwt_with_exp(exp: u64) -> String {
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let header = engine.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = engine.encode(
+            serde_json::json!({
+                "aud": AUDIENCE,
+                "iat": exp.saturating_sub(300),
+                "exp": exp,
+            })
+            .to_string(),
+        );
+        format!("{header}.{payload}.not-a-real-signature")
+    }
+
+    /// Seconds since the epoch, as the `exp` claim counts them.
+    fn unix_now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// The expiry is read from the token's own claims, to the second.
+    #[test]
+    fn expiry_is_read_from_the_exp_claim() {
+        let token = jwt_with_exp(1_700_000_000);
+        assert_eq!(
+            expiry_from_jwt(&token),
+            Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+        );
+    }
+
+    /// Anything that is not a JWT with a numeric `exp` yields no expiry, so
+    /// the caller applies the short fallback lifetime instead of caching a
+    /// token of unknown life for the whole scan.
+    #[test]
+    fn malformed_tokens_yield_no_expiry() {
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let no_exp = format!("h.{}.s", engine.encode(br#"{"aud":"x"}"#));
+        let exp_not_a_number = format!("h.{}.s", engine.encode(br#"{"exp":"soon"}"#));
+
+        for token in [
+            "",
+            "not-a-jwt",
+            "only.two",
+            "h.!!!not-base64!!!.s",
+            &no_exp,
+            &exp_not_a_number,
+        ] {
+            assert_eq!(expiry_from_jwt(token), None, "token: {token}");
+        }
+    }
+
+    /// The margin, at its boundary: a token with more than `REFRESH_MARGIN`
+    /// left is reused, one with exactly the margin or less is not.
+    #[test]
+    fn expiring_is_decided_by_the_refresh_margin() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let cached = |remaining: u64| CachedToken {
+            value: "t".to_string(),
+            expires_at: now + Duration::from_secs(remaining),
+        };
+
+        assert!(!cached(REFRESH_MARGIN.as_secs() + 1).is_expiring(now));
+        assert!(cached(REFRESH_MARGIN.as_secs()).is_expiring(now));
+        assert!(cached(1).is_expiring(now));
+        assert!(
+            CachedToken {
+                value: "t".to_string(),
+                expires_at: now - Duration::from_secs(1),
+            }
+            .is_expiring(now)
+        );
+    }
+
+    /// The regression this module exists for: a token minted at the start of a
+    /// long scan is replaced once it nears expiry, rather than being sent
+    /// until the cloud rejects it. A token with plenty of life left is reused.
+    #[tokio::test]
+    async fn token_refreshes_when_the_cached_one_nears_expiry() {
+        let near_expiry = jwt_with_exp(unix_now() + 30);
+        let fresh = jwt_with_exp(unix_now() + 3600);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = [near_expiry.clone(), fresh.clone()];
+        let server = thread::spawn(move || {
+            for value in served {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf).unwrap();
+                let body = serde_json::json!({ "value": value }).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let url = format!("http://{}/token?api-version=2.0", addr);
+        let provider = OidcProvider::for_test(url, "request-token-xyz".to_string());
+
+        // First use mints; it expires inside the margin, so the next use mints
+        // again rather than handing back the same token.
+        assert_eq!(provider.token().await.unwrap(), near_expiry);
+        assert_eq!(provider.token().await.unwrap(), fresh);
+        // The fresh one has an hour left, so it is served from cache. The stub
+        // has no third response to give, so a third mint would not return this.
+        assert_eq!(provider.token().await.unwrap(), fresh);
+
+        server.join().unwrap();
+    }
+
+    /// A worker whose request was rejected re-mints, but only if no sibling
+    /// already did: the token in the cache is not the one it sent, so it takes
+    /// that instead of asking GitHub again. The stub answers exactly once, so
+    /// a second mint would hang the test's first assertion.
+    #[tokio::test]
+    async fn remint_reuses_a_token_a_sibling_already_minted() {
+        let fresh = jwt_with_exp(unix_now() + 3600);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = fresh.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf).unwrap();
+            let body = serde_json::json!({ "value": served }).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let url = format!("http://{}/token?api-version=2.0", addr);
+        let provider = OidcProvider::for_test(url, "request-token-xyz".to_string());
+
+        // The sibling's mint.
+        assert_eq!(provider.token().await.unwrap(), fresh);
+        // This worker sent the older token and got a 401; the cache already
+        // holds a newer one, so it is handed that without a second mint.
+        assert_eq!(provider.remint("stale.token.value").await.unwrap(), fresh);
+
         server.join().unwrap();
     }
 }

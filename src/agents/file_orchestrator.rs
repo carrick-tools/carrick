@@ -98,6 +98,11 @@ pub struct ProcessingStats {
     /// from zero-cost skips: a parse failure silently removes the file's
     /// endpoints from the index. A subset of `files_skipped`.
     pub files_parse_failed: usize,
+    /// Files the analyzer was asked about and never answered for (the call
+    /// failed after its retries were spent). A subset of `files_skipped`, and
+    /// unlike a parse failure it is not a repeatable limitation of the scanner
+    /// — it is index loss this run caused. See [`crate::scan_health`].
+    pub files_analysis_failed: usize,
     /// Files whose only candidates belong to protocols without a registered
     /// analyze-file prompt (e.g. raw WebSocket constructors). Skipped instead
     /// of being fed to the HTTP prompt, which couldn't classify them.
@@ -1367,6 +1372,10 @@ impl FileOrchestrator {
 
         // STEP 4: Call the file analyzer with Full File + Patterns + Candidate Targets +
         // richer AST-derived import table (Move 3, §9.3 of framework-coverage.md).
+        // Every file dispatched here is one the index expects an answer for, so
+        // the count is registered before the calls go out and each failure is
+        // registered as it happens (#461).
+        crate::scan_health::record_files_attempted(pending.len());
         let analyzed: Vec<(PendingFile, Result<FileAnalysisResult, String>)> =
             futures::stream::iter(pending.into_iter().map(|pf| async move {
                 let result = self
@@ -1383,7 +1392,23 @@ impl FileOrchestrator {
                         &pf.wrapper_context,
                     )
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|e| {
+                        // Recorded here, where the error is still typed: this
+                        // file has no analysis in the index, and the run must
+                        // not call itself a success. A call the quota breaker
+                        // aborted is excluded — it was never attempted, and
+                        // the breaker already fails the run on its own terms.
+                        let quota_abort = e
+                            .downcast_ref::<crate::agent_service::AgentCallError>()
+                            .is_some_and(|err| err.is_quota_abort());
+                        if !quota_abort {
+                            crate::scan_health::record_unanalysed_file(
+                                &pf.path_str,
+                                &crate::scan_health::analysis_failure_reason(e.as_ref()),
+                            );
+                        }
+                        e.to_string()
+                    });
                 (pf, result)
             }))
             .buffer_unordered(concurrency)
@@ -1504,10 +1529,17 @@ impl FileOrchestrator {
                     file_results.insert(pf.path_str, adjusted);
                 }
                 Err(e) => {
+                    // The file is absent from `file_results`, so its endpoints
+                    // and calls are absent from the index. Warn rather than
+                    // collect quietly: `stats.errors` is only ever printed at
+                    // debug, which is how this loss stayed invisible (#461).
+                    // The run-level verdict is in `scan_health`.
+                    warn!("Failed to analyze {}: {}", pf.path_str, e);
                     stats
                         .errors
                         .push(format!("Failed to analyze {}: {}", pf.path_str, e));
                     stats.files_skipped += 1;
+                    stats.files_analysis_failed += 1;
                 }
             }
         }

@@ -29,6 +29,7 @@ pub mod oidc;
 pub mod operation;
 pub mod packages;
 pub mod parser;
+pub mod scan_health;
 pub mod sdk_edges;
 pub mod sdk_surface;
 pub mod services;
