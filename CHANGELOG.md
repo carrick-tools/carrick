@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.31](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.30...carrick-v0.3.31) (2026-09-02)
+
+
+### Bug Fixes
+
+* **scanner:** a preflight branch no longer displaces a route's default verb ([#629](https://github.com/carrick-tools/carrick/issues/629)) ([3f41265](https://github.com/carrick-tools/carrick/commit/3f41265507a25bf13d38eb5ea6164134c4093435)), closes [#628](https://github.com/carrick-tools/carrick/issues/628)
+
 ## [0.3.30](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.29...carrick-v0.3.30) (2026-09-02)
 
 
