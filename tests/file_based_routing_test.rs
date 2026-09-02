@@ -310,6 +310,14 @@ fn method_guard_replaces_the_convention_default_verb() {
         "PUT /api/v1/items/:itemId",
         // Guarded on GET through a destructured local binding.
         "GET /api/v1/items/:itemId/status",
+        // carrick#622: the guard is a comparison against a call on the member
+        // (`request.method.toUpperCase()`), which narrows the same way.
+        "PUT /api/v1/items/:itemId/archive",
+        // The mirror: case-folded down, with a lowercase literal to match.
+        "GET /api/v1/items/:itemId/labels",
+        // A switch on the case-folded method serves the verbs it branches on.
+        "PATCH /api/v1/items/:itemId/settings",
+        "DELETE /api/v1/items/:itemId/settings",
         // No guard: the convention's default for a write export stands.
         "POST /api/v1/items",
     ]

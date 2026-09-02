@@ -823,6 +823,12 @@ impl SwcScanner {
 /// `const { method } = request`) counts as the same expression, because a
 /// handler that destructures first is doing the same narrowing.
 ///
+/// A handler that case-folds or trims the method before comparing it is still
+/// comparing the method, so those calls are transparent here (carrick#622):
+/// `request.method.toUpperCase() !== "PUT"` reads as a PUT guard, and the
+/// literal is case-folded on the way in, so the mirrored
+/// `request.method.toLowerCase() !== "put"` reads the same.
+///
 /// Deliberately NOT required: that the non-matching branch rejects. Detecting
 /// "rejects" means enumerating throw/`405`/early-return spellings across
 /// frameworks, which is the brittleness this module exists to avoid. The cost
@@ -864,6 +870,39 @@ fn is_method_member(expr: &Expr) -> bool {
     }
 }
 
+/// The receiver of a call that leaves the method it is applied to intact for
+/// guard purposes (carrick#622), if the expression is such a call.
+///
+/// Case-folding and trimming do not change *which* method is being compared,
+/// and neither does stringifying it, so a guard written on the result of one
+/// of these is still a guard on the method. Read structurally: a zero-argument
+/// `.toUpperCase()`, `.toLowerCase()` or `.trim()`, or `String(x)`. Anything
+/// else (a `.slice()`, a call carrying arguments) can change the value, so it
+/// is not seen through.
+fn method_preserving_call(expr: &Expr) -> Option<&Expr> {
+    let Expr::Call(call) = unwrap_expr(expr) else {
+        return None;
+    };
+    let Callee::Expr(callee) = &call.callee else {
+        return None;
+    };
+    match unwrap_expr(callee) {
+        Expr::Member(member) => {
+            let folds = matches!(
+                &member.prop,
+                MemberProp::Ident(i)
+                    if matches!(i.sym.as_ref(), "toUpperCase" | "toLowerCase" | "trim")
+            );
+            (folds && call.args.is_empty()).then_some(&*member.obj)
+        }
+        Expr::Ident(id) if id.sym.as_ref() == "String" && call.args.len() == 1 => {
+            let arg = &call.args[0];
+            arg.spread.is_none().then_some(&*arg.expr)
+        }
+        _ => None,
+    }
+}
+
 /// The HTTP-method literal an expression denotes, uppercased.
 fn method_literal(expr: &Expr) -> Option<String> {
     let text = match unwrap_expr(expr) {
@@ -877,10 +916,14 @@ fn method_literal(expr: &Expr) -> Option<String> {
 
 impl MethodGuardVisitor {
     /// `true` when the expression denotes the request's method, either
-    /// directly or through a local binding taken from it.
+    /// directly, through a local binding taken from it, or through a call that
+    /// leaves the method intact.
     fn denotes_method(&self, expr: &Expr) -> bool {
         if is_method_member(expr) {
             return true;
+        }
+        if let Some(receiver) = method_preserving_call(expr) {
+            return self.denotes_method(receiver);
         }
         match unwrap_expr(expr) {
             Expr::Ident(id) => self.aliases.contains(id.sym.as_ref()),
@@ -903,8 +946,11 @@ impl MethodGuardVisitor {
             return;
         };
         match &node.name {
-            // `const m = req.method`
-            Pat::Ident(id) if is_method_member(init) => {
+            // `const m = req.method`, and equally
+            // `const m = req.method.toLowerCase()` or a binding taken from an
+            // earlier binding: whatever denotes the method denotes it under a
+            // new name too.
+            Pat::Ident(id) if self.denotes_method(init) => {
                 self.aliases.insert(id.id.sym.to_string());
             }
             // `const { method } = request` / `const { method: verb } = request`
@@ -3054,6 +3100,90 @@ export async function action({ request }: { request: Request }) {
 export async function action({ request }: { request: Request }) {
   if (request.method !== "QUERY") throw new Response(null, { status: 405 });
   return Response.json({});
+}
+"#;
+        assert!(handler_guards(content, "action").is_empty());
+    }
+
+    // --- Method guards written as a call on the member (carrick#622) ---
+
+    #[test]
+    fn method_guard_read_through_an_uppercasing_call() {
+        let content = r#"
+export async function action({ request }: { request: Request }) {
+  if (request.method.toUpperCase() !== "PUT") {
+    throw new Response("Method Not Allowed", { status: 405 });
+  }
+  return Response.json({});
+}
+"#;
+        assert_eq!(handler_guards(content, "action"), vec!["PUT"]);
+    }
+
+    #[test]
+    fn method_guard_read_through_a_lowercasing_call_on_a_destructured_local() {
+        // The literal is lowercase to match, so the guard is only read if the
+        // literal is case-folded on the way in.
+        let content = r#"
+export async function action({ request }: { request: Request }) {
+  const { method } = request;
+  if (method.toLowerCase() === "get") return Response.json({});
+  throw new Response(null, { status: 405 });
+}
+"#;
+        assert_eq!(handler_guards(content, "action"), vec!["GET"]);
+    }
+
+    #[test]
+    fn method_guard_read_through_a_stringifying_call() {
+        let content = r#"
+export async function action({ request }: { request: Request }) {
+  if (String(request.method) !== "DELETE") throw new Response(null, { status: 405 });
+  return new Response(null, { status: 204 });
+}
+"#;
+        assert_eq!(handler_guards(content, "action"), vec!["DELETE"]);
+    }
+
+    #[test]
+    fn method_guard_read_through_a_local_bound_from_a_case_folding_call() {
+        // The binding is initialized from a call on the member, so the binding
+        // denotes the method too.
+        let content = r#"
+export async function action({ request }: { request: Request }) {
+  const verb = request.method.toLowerCase().trim();
+  if (verb === "patch") return Response.json({});
+  throw new Response(null, { status: 405 });
+}
+"#;
+        assert_eq!(handler_guards(content, "action"), vec!["PATCH"]);
+    }
+
+    #[test]
+    fn method_guard_read_from_a_switch_on_a_case_folding_call() {
+        let content = r#"
+export async function action({ request }: { request: Request }) {
+  switch (request.method.toUpperCase()) {
+    case "PUT":
+      return Response.json({});
+    case "DELETE":
+      return new Response(null, { status: 204 });
+    default:
+      throw new Response(null, { status: 405 });
+  }
+}
+"#;
+        assert_eq!(handler_guards(content, "action"), vec!["PUT", "DELETE"]);
+    }
+
+    #[test]
+    fn a_call_that_can_change_the_method_is_not_seen_through() {
+        // Only calls that leave the method intact are transparent. A slice can
+        // compare something other than the method, so it is not a guard.
+        let content = r#"
+export async function action({ request }: { request: Request }) {
+  if (request.method.slice(0, 3) === "PUT") return Response.json({});
+  throw new Response(null, { status: 405 });
 }
 "#;
         assert!(handler_guards(content, "action").is_empty());
