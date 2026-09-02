@@ -34,6 +34,9 @@ use crate::{
     file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
     framework_detector::DetectionResult,
     import_bindings::BindingResolver,
+    imported_request_member::{
+        RequestMember, RequestMemberIndex, collect_request_members, fold_indexes,
+    },
     local_http_wrapper::LocalWrapperCall,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
     operation::{OperationKey, Protocol},
@@ -133,6 +136,10 @@ pub struct ProcessingStats {
     /// file and merged in because their call sites raise no candidate for the
     /// file-analyzer to answer (carrick#588). A subset of `total_data_calls`.
     pub local_wrapper_call_backfills: usize,
+    /// Data calls whose method and target were read off the imported member
+    /// they call, rather than left to extraction to infer from the consumer
+    /// file (carrick#588). A subset of `total_data_calls`.
+    pub imported_member_resolutions: usize,
     /// Wrapper-resolved data calls whose HTTP method was corrected from what
     /// extraction gave them to the method their wrapper module hardcodes
     /// (carrick-cloud#386). A subset of `total_data_calls`.
@@ -724,6 +731,15 @@ impl FileOrchestrator {
             /// Their sites raise no candidate, so without this the endpoints
             /// they reach are absent from the index entirely.
             local_wrapper_calls: Vec<LocalWrapperCall>,
+            /// This file's OWN request members, keyed by name (carrick#588).
+            /// Read for the files that import it, never for itself.
+            request_members: RequestMemberIndex,
+            /// Call sites whose callee names a request member of an imported
+            /// same-repo module, keyed by the site's call-expression start
+            /// offset (carrick#588). The member states the whole request, so
+            /// its method and URL are applied to the site after the LLM pass.
+            /// Empty for files that import no such module.
+            resolved_members: HashMap<u32, RequestMember>,
         }
 
         /// A zero-candidate file whose skip decision is deferred until the
@@ -1017,7 +1033,7 @@ impl FileOrchestrator {
                 .map(|candidate| (candidate.candidate_id.clone(), candidate.clone()))
                 .collect();
 
-            let (symbol_table, env_alias_map) =
+            let (symbol_table, env_alias_map, request_members) =
                 Self::extract_symbol_table(file_path, &cm, &handler);
 
             pending.push(PendingFile {
@@ -1036,6 +1052,8 @@ impl FileOrchestrator {
                 wrapper_request_shape: None,
                 pubsub_anchor_ops: scan_result.pubsub_anchor_ops,
                 local_wrapper_calls: scan_result.local_wrapper_calls,
+                request_members,
+                resolved_members: HashMap::new(),
             });
         }
 
@@ -1099,19 +1117,47 @@ impl FileOrchestrator {
         // repo (#472): the follow only runs on a `wrapper_map` miss, which is the
         // common case, so without this a scan would re-parse the same barrels
         // once per importing file.
+        // The request members a module declares, keyed by canonical path
+        // (carrick#588), filled on demand as importers ask for it. Deliberately
+        // NOT the `wrapper_map` set: that one is gated on the module raising an
+        // HTTP candidate, and a client class whose requests go through a helper
+        // raises none, which is exactly the module a consumer needs read for
+        // it. Seeded from the files already parsed for their symbol tables, so
+        // the on-demand parse only runs for a module no analyzed file was.
+        let mut member_cache: HashMap<PathBuf, RequestMemberIndex> = HashMap::new();
+        for pf in &pending {
+            if let Ok(canonical) = Path::new(&pf.path_str).canonicalize() {
+                member_cache.insert(canonical, pf.request_members.clone());
+            }
+        }
+
         let mut reexport_cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
-        if !wrapper_map.is_empty() {
+        {
             for pf in &mut pending {
                 let importer = Path::new(&pf.path_str).to_path_buf();
                 let self_canon = importer.canonicalize().ok();
                 let mut seen: HashSet<PathBuf> = HashSet::new();
                 let mut matched: Vec<PathBuf> = Vec::new();
+                // Where each imported local name comes from, so a member's
+                // receiver can be checked against the module that declared it.
+                // `None` is a package import: a real binding, no same-repo
+                // module behind it.
+                let mut import_owners: HashMap<String, Option<PathBuf>> = HashMap::new();
+                for (local_name, symbol) in &pf.symbol_table.imported_symbols {
+                    import_owners.insert(
+                        local_name.clone(),
+                        Self::resolve_relative_import(&importer, &symbol.source),
+                    );
+                }
                 for symbol in pf.symbol_table.imported_symbols.values() {
                     let Some(resolved) = Self::resolve_relative_import(&importer, &symbol.source)
                     else {
                         continue;
                     };
                     if self_canon.as_ref() == Some(&resolved) || !seen.insert(resolved.clone()) {
+                        continue;
+                    }
+                    if wrapper_map.is_empty() {
                         continue;
                     }
                     matched.extend(Self::wrapper_modules_behind(
@@ -1138,6 +1184,32 @@ impl FileOrchestrator {
                     .iter()
                     .filter_map(|path| wrapper_map.get(path).map(|m| m.snippet.clone()))
                     .collect();
+                // Members reached directly by a relative import, plus those
+                // behind a re-export barrel the wrapper pass already followed.
+                // Only a file with candidates can have a site to resolve, so a
+                // rescued or candidate-less file triggers no parse.
+                if !pf.candidate_map.is_empty() {
+                    let reachable: BTreeSet<PathBuf> =
+                        seen.iter().chain(matched.iter()).cloned().collect();
+                    for path in &reachable {
+                        if member_cache.contains_key(path) {
+                            continue;
+                        }
+                        let index = parse_file(path, &cm, &handler)
+                            .map(|module| collect_request_members(&module, &cm))
+                            .unwrap_or_default();
+                        member_cache.insert(path.clone(), index);
+                    }
+                    pf.resolved_members = Self::resolve_imported_members(
+                        &pf.candidate_map,
+                        reachable.iter().filter_map(|path| {
+                            member_cache
+                                .get(path)
+                                .map(|index| (path.clone(), index.clone()))
+                        }),
+                        &import_owners,
+                    );
+                }
             }
         }
 
@@ -1206,7 +1278,7 @@ impl FileOrchestrator {
                 file_results.insert(deferred.path_str, FileAnalysisResult::default());
                 continue;
             };
-            let (symbol_table, env_alias_map) =
+            let (symbol_table, env_alias_map, _) =
                 Self::extract_symbol_table(&deferred.file_path, &cm, &handler);
             pending.push(PendingFile {
                 path_str: deferred.path_str,
@@ -1228,6 +1300,10 @@ impl FileOrchestrator {
                 // Nor any same-file wrapper: a file with no HTTP candidate
                 // issues no request of its own for one to be built out of.
                 local_wrapper_calls: Vec::new(),
+                // A rescued file raised no candidate of its own, so it is not
+                // read as anybody's wrapper and nothing joins onto it either.
+                request_members: RequestMemberIndex::default(),
+                resolved_members: HashMap::new(),
             });
         }
 
@@ -1300,6 +1376,13 @@ impl FileOrchestrator {
 
                     let mut adjusted = result;
                     Self::apply_candidate_map(&mut adjusted, &pf.candidate_map, &pf.path_str);
+                    // Read the method and target of a site that calls an
+                    // imported module's request member off that member
+                    // (carrick#588). Runs first among the post-extraction
+                    // passes: it states both facts outright, where the ones
+                    // below correct or backfill one of them.
+                    stats.imported_member_resolutions +=
+                        Self::apply_imported_members(&mut adjusted, &pf.resolved_members);
                     // Carry the wrapper's own request shape onto the sites that
                     // delegate to it (carrick-cloud#386). Runs immediately after
                     // `apply_candidate_map` because that is what stamps the span
@@ -1470,6 +1553,10 @@ impl FileOrchestrator {
         debug!(
             "  - Same-file wrapper call backfills: {}",
             stats.local_wrapper_call_backfills
+        );
+        debug!(
+            "  - Imported-member resolutions: {}",
+            stats.imported_member_resolutions
         );
         debug!(
             "  - Wrapper method propagations: {}",
@@ -2866,9 +2953,13 @@ impl FileOrchestrator {
         file_path: &Path,
         cm: &Lrc<SourceMap>,
         handler: &Handler,
-    ) -> (SymbolTable, EnvAliasMap) {
+    ) -> (SymbolTable, EnvAliasMap, RequestMemberIndex) {
         let Some(module) = parse_file(file_path, cm, handler) else {
-            return (SymbolTable::default(), EnvAliasMap::default());
+            return (
+                SymbolTable::default(),
+                EnvAliasMap::default(),
+                RequestMemberIndex::default(),
+            );
         };
 
         let mut import_extractor = ImportSymbolExtractor::new();
@@ -2878,6 +2969,11 @@ impl FileOrchestrator {
         module.visit_with(&mut type_extractor);
 
         let env_alias_map = EnvAliasExtractor::build(&module);
+        // Read on this parse rather than a second one: every file is a
+        // candidate wrapper for some other file, and a client module whose
+        // requests go through a helper raises no HTTP candidate of its own, so
+        // the wrapper map's candidate gate is the wrong filter for this.
+        let request_members = collect_request_members(&module, cm);
 
         (
             SymbolTable {
@@ -2885,6 +2981,7 @@ impl FileOrchestrator {
                 imported_symbols: import_extractor.imported_symbols,
             },
             env_alias_map,
+            request_members,
         )
     }
 
@@ -4179,6 +4276,107 @@ impl FileOrchestrator {
     /// acquire a request type from whatever expression extraction pointed at.
     /// Only a definite `Some(false)` does this; an unreadable argument list
     /// leaves the anchor alone.
+    /// Join a file's candidate call sites onto the request members of the
+    /// same-repo modules it imports (carrick#588).
+    ///
+    /// A site like `client.createUpload(name)` states neither a path nor a
+    /// method. Its own file states neither either, so extraction has only the
+    /// file's other text to read them off, and what it reads off is whatever
+    /// happens to look like a path — a name, a comment, a literal inside an
+    /// error message. The member it calls states both, and
+    /// `crate::imported_request_member` has already read them.
+    ///
+    /// The join is by name: the candidate's callee property
+    /// (`client.createArtifactUrl`), or its callee object when the call is a
+    /// bare identifier. A name no imported module declares, or one two of them
+    /// declare differently, resolves to nothing.
+    ///
+    /// A name alone would be too wide — `list`, `get` and `create` are what
+    /// every client calls its methods — so the receiver constrains it.
+    /// `import_owners` maps each of the file's imported local names to the
+    /// same-repo module it resolves to, or to `None` for a package import.
+    /// Where the call's receiver is one of those names it must have come from
+    /// the very module the member did. A receiver that is a parameter or a
+    /// local carries no such constraint, which is the shape this pass exists
+    /// for; a receiver imported from a package matches no module and joins to
+    /// nothing.
+    fn resolve_imported_members(
+        candidate_map: &HashMap<String, CandidateTarget>,
+        indexes: impl IntoIterator<Item = (PathBuf, RequestMemberIndex)>,
+        import_owners: &HashMap<String, Option<PathBuf>>,
+    ) -> HashMap<u32, RequestMember> {
+        let members = fold_indexes(indexes);
+        if members.is_empty() {
+            return HashMap::new();
+        }
+        let mut resolved = HashMap::new();
+        for candidate in candidate_map.values() {
+            let name = candidate
+                .callee_property
+                .as_deref()
+                .unwrap_or(&candidate.callee_object);
+            let Some(owned) = members.get(name) else {
+                continue;
+            };
+            if let Some(receiver_source) = import_owners.get(&candidate.callee_object)
+                && receiver_source.as_ref() != Some(&owned.module)
+            {
+                continue;
+            }
+            resolved.insert(candidate.span_start, owned.member.clone());
+        }
+        resolved
+    }
+
+    /// Apply the resolved members to the sites that called them.
+    ///
+    /// This OVERWRITES the method and target extraction gave the site, which
+    /// nothing else in this pass does. It is warranted because the two are not
+    /// evidence of the same quality: the member's request is a literal in the
+    /// source, and the site's own file contains no statement of either. The
+    /// same reasoning already licenses `reanchor_data_call` to overrule a
+    /// target from a request spec read off the AST.
+    ///
+    /// Runs immediately after `apply_candidate_map`, which is what stamps the
+    /// span this joins on, and before every downstream reader of method or
+    /// target.
+    fn apply_imported_members(
+        result: &mut FileAnalysisResult,
+        resolved: &HashMap<u32, RequestMember>,
+    ) -> usize {
+        if resolved.is_empty() {
+            return 0;
+        }
+        let mut applied = 0;
+        for data_call in &mut result.data_calls {
+            let Some(span) = data_call.call_expression_span_start else {
+                continue;
+            };
+            let Some(member) = resolved.get(&span) else {
+                continue;
+            };
+            let method_agrees = data_call
+                .method
+                .as_deref()
+                .map(normalize_manifest_method)
+                .is_some_and(|method| method == member.method);
+            if method_agrees && data_call.target == member.target {
+                continue;
+            }
+            debug!(
+                "Resolving call site through its imported member: {} {} (was {} {})",
+                member.method,
+                member.target,
+                data_call.method.as_deref().unwrap_or("<unstated>"),
+                data_call.target,
+            );
+            data_call.method = Some(member.method.clone());
+            data_call.target = member.target.clone();
+            applied += 1;
+        }
+        applied
+    }
+
     fn propagate_wrapper_request_shape(
         result: &mut FileAnalysisResult,
         shape: Option<&WrapperRequestShape>,
@@ -8658,7 +8856,8 @@ export * from "./aFetch.js";"#,
         .expect("write file");
         let cm: Lrc<SourceMap> = Default::default();
         let handler = Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(cm.clone()));
-        let (symbol_table, _) = FileOrchestrator::extract_symbol_table(&file_path, &cm, &handler);
+        let (symbol_table, _, _) =
+            FileOrchestrator::extract_symbol_table(&file_path, &cm, &handler);
         assert!(
             symbol_table.local_types.contains("OrderPlacedEvent"),
             "class declarations must be collected as local types"

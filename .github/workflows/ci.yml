@@ -97,6 +97,7 @@ jobs:
           --test file_based_routing_test
           --test framework_coverage_test
           --test graphql_extraction_test
+          --test imported_request_member_test
           --test intent_incremental_test
           --test llm_mock_pipeline_test
           --test route_request_anchor_test
