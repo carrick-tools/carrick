@@ -28,8 +28,8 @@ use crate::{
     cloud_storage::{ManifestRole, ManifestTypeKind},
     config::Config,
     env_alias::{
-        EnvAliasExtractor, EnvAliasMap, exported_env_aliases, merge_imported_env_aliases,
-        resolve_target_env_alias,
+        EnvAliasExtractor, EnvAliasMap, WholeUrlPathMap, exported_env_aliases,
+        merge_imported_env_aliases, resolve_target_env_alias, resolve_whole_url_target,
     },
     file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
     framework_detector::DetectionResult,
@@ -185,6 +185,24 @@ type DataCallLookup = HashMap<(String, u32), Vec<(String, String, String)>>;
 struct SymbolTable {
     local_types: HashSet<String>,
     imported_symbols: HashMap<String, ImportedSymbol>,
+}
+
+/// Everything one parse of a source file yields for the passes that follow.
+///
+/// A struct rather than a tuple because two of the fields are the same type —
+/// `EnvAliasMap` and `WholeUrlPathMap` are both `HashMap<String, String>` — and
+/// a positional swap between them would compile and be wrong everywhere at once.
+#[derive(Default)]
+struct FileSymbols {
+    table: SymbolTable,
+    /// Local bindings that alias a `process.env` variable (#218).
+    env_aliases: EnvAliasMap,
+    /// Paths stated by the `??` fallback of a binding holding a whole request
+    /// URL (carrick#572).
+    whole_url_paths: WholeUrlPathMap,
+    /// The file's own request members, read for the files that import it
+    /// (carrick#588).
+    request_members: RequestMemberIndex,
 }
 
 /// Reduce a TS type annotation to its primary symbol, stripping the same
@@ -689,6 +707,11 @@ impl FileOrchestrator {
             /// through a local const, so the real env-var name reaches
             /// classification and cross-repo matching. See `crate::env_alias`.
             env_alias_map: EnvAliasMap,
+            /// Paths stated by the `??` fallback of a binding that holds a
+            /// WHOLE request URL read from an environment variable
+            /// (carrick#572). Per-file: the shape is a local const passed
+            /// straight to a request, never an imported config property.
+            whole_url_paths: WholeUrlPathMap,
             /// Endpoints derived from file-based routing conventions, merged in
             /// after the LLM pass. Empty for non-route files.
             route_endpoints: Vec<EndpointResult>,
@@ -1033,8 +1056,7 @@ impl FileOrchestrator {
                 .map(|candidate| (candidate.candidate_id.clone(), candidate.clone()))
                 .collect();
 
-            let (symbol_table, env_alias_map, request_members) =
-                Self::extract_symbol_table(file_path, &cm, &handler);
+            let symbols = Self::extract_symbol_table(file_path, &cm, &handler);
 
             pending.push(PendingFile {
                 path_str,
@@ -1042,8 +1064,9 @@ impl FileOrchestrator {
                 candidate_hints,
                 candidate_contexts,
                 candidate_map,
-                symbol_table,
-                env_alias_map,
+                symbol_table: symbols.table,
+                env_alias_map: symbols.env_aliases,
+                whole_url_paths: symbols.whole_url_paths,
                 route_endpoints,
                 descriptor_endpoints,
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
@@ -1052,7 +1075,7 @@ impl FileOrchestrator {
                 wrapper_request_shape: None,
                 pubsub_anchor_ops: scan_result.pubsub_anchor_ops,
                 local_wrapper_calls: scan_result.local_wrapper_calls,
-                request_members,
+                request_members: symbols.request_members,
                 resolved_members: HashMap::new(),
             });
         }
@@ -1278,16 +1301,16 @@ impl FileOrchestrator {
                 file_results.insert(deferred.path_str, FileAnalysisResult::default());
                 continue;
             };
-            let (symbol_table, env_alias_map, _) =
-                Self::extract_symbol_table(&deferred.file_path, &cm, &handler);
+            let symbols = Self::extract_symbol_table(&deferred.file_path, &cm, &handler);
             pending.push(PendingFile {
                 path_str: deferred.path_str,
                 content,
                 candidate_hints: Vec::new(),
                 candidate_contexts: Vec::new(),
                 candidate_map: HashMap::new(),
-                symbol_table,
-                env_alias_map,
+                symbol_table: symbols.table,
+                env_alias_map: symbols.env_aliases,
+                whole_url_paths: symbols.whole_url_paths,
                 route_endpoints: Vec::new(),
                 descriptor_endpoints: Vec::new(),
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
@@ -1414,7 +1437,11 @@ impl FileOrchestrator {
                     // env-var classification, uploads) sees one normalized
                     // form.
                     Self::normalize_fallback_targets(&mut adjusted);
-                    Self::resolve_env_var_aliases(&mut adjusted, &pf.env_alias_map);
+                    Self::resolve_env_var_aliases(
+                        &mut adjusted,
+                        &pf.env_alias_map,
+                        &pf.whole_url_paths,
+                    );
                     Self::validate_type_hints(&mut adjusted, &pf.symbol_table);
                     Self::normalize_unusable_types(&mut adjusted, &framework_detection.frameworks);
 
@@ -2953,13 +2980,9 @@ impl FileOrchestrator {
         file_path: &Path,
         cm: &Lrc<SourceMap>,
         handler: &Handler,
-    ) -> (SymbolTable, EnvAliasMap, RequestMemberIndex) {
+    ) -> FileSymbols {
         let Some(module) = parse_file(file_path, cm, handler) else {
-            return (
-                SymbolTable::default(),
-                EnvAliasMap::default(),
-                RequestMemberIndex::default(),
-            );
+            return FileSymbols::default();
         };
 
         let mut import_extractor = ImportSymbolExtractor::new();
@@ -2968,21 +2991,22 @@ impl FileOrchestrator {
         let mut type_extractor = TypeSymbolExtractor::new();
         module.visit_with(&mut type_extractor);
 
-        let env_alias_map = EnvAliasExtractor::build(&module);
+        let (env_aliases, whole_url_paths) = EnvAliasExtractor::build_with_paths(&module);
         // Read on this parse rather than a second one: every file is a
         // candidate wrapper for some other file, and a client module whose
         // requests go through a helper raises no HTTP candidate of its own, so
         // the wrapper map's candidate gate is the wrong filter for this.
         let request_members = collect_request_members(&module, cm);
 
-        (
-            SymbolTable {
+        FileSymbols {
+            table: SymbolTable {
                 local_types: type_extractor.type_symbols,
                 imported_symbols: import_extractor.imported_symbols,
             },
-            env_alias_map,
+            env_aliases,
+            whole_url_paths,
             request_members,
-        )
+        }
     }
 
     /// Strip a trailing TypeScript/JavaScript source-file extension from a module
@@ -4408,11 +4432,25 @@ impl FileOrchestrator {
         propagated
     }
 
-    fn resolve_env_var_aliases(result: &mut FileAnalysisResult, env_alias_map: &EnvAliasMap) {
-        if env_alias_map.is_empty() {
+    fn resolve_env_var_aliases(
+        result: &mut FileAnalysisResult,
+        env_alias_map: &EnvAliasMap,
+        whole_url_paths: &WholeUrlPathMap,
+    ) {
+        if env_alias_map.is_empty() && whole_url_paths.is_empty() {
             return;
         }
         for data_call in &mut result.data_calls {
+            // The whole-URL rule first (carrick#572): it fires only on a target
+            // that states nothing but the binding, which the leading-`${}`
+            // rewrite would leave without a path and every downstream gate
+            // would then drop.
+            if let Some(resolved) =
+                resolve_whole_url_target(&data_call.target, env_alias_map, whole_url_paths)
+            {
+                data_call.target = resolved;
+                continue;
+            }
             if let Some(resolved) = resolve_target_env_alias(&data_call.target, env_alias_map) {
                 data_call.target = resolved;
             }
@@ -8856,8 +8894,7 @@ export * from "./aFetch.js";"#,
         .expect("write file");
         let cm: Lrc<SourceMap> = Default::default();
         let handler = Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(cm.clone()));
-        let (symbol_table, _, _) =
-            FileOrchestrator::extract_symbol_table(&file_path, &cm, &handler);
+        let symbol_table = FileOrchestrator::extract_symbol_table(&file_path, &cm, &handler).table;
         assert!(
             symbol_table.local_types.contains("OrderPlacedEvent"),
             "class declarations must be collected as local types"

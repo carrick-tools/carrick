@@ -93,6 +93,7 @@ jobs:
       - name: Run fixture-driven extraction tests
         run: >-
           cargo test --verbose
+          --test env_var_whole_url_test
           --test extraction_config_test
           --test file_based_routing_test
           --test framework_coverage_test

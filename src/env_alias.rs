@@ -60,6 +60,18 @@ use swc_ecma_visit::{Visit, VisitWith};
 /// it was initialized from (e.g. `ORDERS_SERVICE_URL`).
 pub type EnvAliasMap = HashMap<String, String>;
 
+/// Maps a binding name — and the `process.env` variable behind it — to the
+/// path stated by the `??`/`||` fallback URL literal it was declared with
+/// (`/api/answer` for `process.env.HELPDESK_URL ?? "http://localhost:7100/api/answer"`).
+///
+/// The fallback is otherwise discarded: for a base URL the env-var name is all
+/// the classifier needs, and the local default's host says nothing about the
+/// deployed one. It matters for exactly one shape, the one this map exists
+/// for: a binding that holds a WHOLE URL, passed to a request as-is. The call
+/// site then states no path, so the request has no path anywhere except inside
+/// that literal, and without it the call is dropped for having no route shape.
+pub type WholeUrlPathMap = HashMap<String, String>;
+
 /// Visitor that collects `const/let/var X = process.env.NAME [?? default]`
 /// bindings — and object-literal config properties
 /// (`const config = { url: process.env.NAME }`, recorded under the dotted key
@@ -73,14 +85,20 @@ pub type EnvAliasMap = HashMap<String, String>;
 #[derive(Default)]
 pub struct EnvAliasExtractor {
     pub aliases: EnvAliasMap,
+    pub whole_url_paths: WholeUrlPathMap,
 }
 
 impl EnvAliasExtractor {
     /// Build the alias map for a parsed module.
     pub fn build(module: &Module) -> EnvAliasMap {
+        Self::build_with_paths(module).0
+    }
+
+    /// Build the alias map and the whole-URL fallback paths together.
+    pub fn build_with_paths(module: &Module) -> (EnvAliasMap, WholeUrlPathMap) {
         let mut extractor = EnvAliasExtractor::default();
         module.visit_with(&mut extractor);
-        extractor.aliases
+        (extractor.aliases, extractor.whole_url_paths)
     }
 }
 
@@ -97,6 +115,18 @@ impl Visit for EnvAliasExtractor {
             };
 
             if let Some(env_name) = process_env_name(init) {
+                // `const url = process.env.X ?? "http://host:port/api/answer"`.
+                // The whole URL comes from the env var, so the binding is not
+                // a base a path is appended to and the call site interpolates
+                // nothing after it. The only path the source states for this
+                // URL is the fallback's, so record it against both the local
+                // name and the env-var name; `resolve_whole_url_target` reads
+                // it back for a target that states no path at all.
+                if let Some(path) = fallback_url_path(init) {
+                    self.whole_url_paths
+                        .insert(binding.id.sym.to_string(), path.clone());
+                    self.whole_url_paths.insert(env_name.clone(), path);
+                }
                 // SWC resolver gives each binding a unique SyntaxContext, but the
                 // call target the LLM emits is just the bare symbol text. Key on
                 // the symbol so `${ORDERS_BASE}` resolves. A name shadowed in a
@@ -403,6 +433,75 @@ pub fn resolve_target_env_alias(target: &str, aliases: &EnvAliasMap) -> Option<S
     ))
 }
 
+/// The path stated by an env read's fallback URL literal, when the fallback is
+/// an absolute URL that carries one.
+///
+/// `process.env.X ?? "http://localhost:7100/api/answer"` yields `/api/answer`. A
+/// fallback with no path (`"http://localhost:7100"`), a relative one, or a
+/// non-literal yields `None`: there is nothing to state.
+fn fallback_url_path(expr: &Expr) -> Option<String> {
+    let Expr::Bin(bin) = unwrap_transparent(expr) else {
+        return None;
+    };
+    if !matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr) {
+        return None;
+    }
+    let literal = string_literal(&bin.right)?;
+    let after_scheme = literal
+        .strip_prefix("http://")
+        .or_else(|| literal.strip_prefix("https://"))?;
+    let slash = after_scheme.find('/')?;
+    let path = &after_scheme[slash..];
+    (path.len() > 1).then(|| path.to_string())
+}
+
+/// The value of a plain string literal, ignoring template literals: a fallback
+/// URL that interpolates something is not a literal statement of a path.
+fn string_literal(expr: &Expr) -> Option<String> {
+    match unwrap_transparent(expr) {
+        Expr::Lit(Lit::Str(s)) => Some(s.value.to_string()),
+        _ => None,
+    }
+}
+
+/// Rewrite a call target that is nothing but an env-var-backed binding into
+/// that env var plus the path its fallback literal states.
+///
+/// `fetch(url, …)` where `const url = process.env.HELPDESK_URL ?? "http://localhost:7100/api/answer"`
+/// gives extraction nothing to write down but the binding. A bare identifier
+/// is not route-shaped, so the call is dropped before it becomes a row of any
+/// kind: not a matched edge, not an unmatched call, not an egress candidate.
+/// The request is real and its path is written down in the file, just inside
+/// the fallback rather than at the call site.
+///
+/// Fires only when the target states no path of its own — `url`, `${url}`, or
+/// `${process.env.HELPDESK_URL}` once the inline-fallback fold has run — so
+/// a base with a path behind it is never touched. What it asserts is the
+/// source's own statement about that URL, and no more: the env var supplies
+/// the origin, the fallback supplies the path.
+pub fn resolve_whole_url_target(
+    target: &str,
+    aliases: &EnvAliasMap,
+    paths: &WholeUrlPathMap,
+) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    let trimmed = target.trim().trim_matches(['`', '"', '\'']).trim();
+    // `${NAME}` and a bare `NAME` are the same statement here.
+    let name = trimmed
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or(trimmed)
+        .trim();
+    let env_name = match name.strip_prefix("process.env.") {
+        Some(env_name) => env_name,
+        None => aliases.get(name).map(String::as_str)?,
+    };
+    let path = paths.get(name).or_else(|| paths.get(env_name))?;
+    Some(format!("${{process.env.{env_name}}}{path}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +522,59 @@ mod tests {
         let module = parse_file(&file_path, &cm, &handler).expect("parsed module");
 
         EnvAliasExtractor::build(&module)
+    }
+
+    fn build_both(source: &str) -> (EnvAliasMap, WholeUrlPathMap) {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = tmp_dir.path().join("input.ts");
+        std::fs::write(&file_path, source).expect("write file");
+
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(cm.clone()));
+        let module = parse_file(&file_path, &cm, &handler).expect("parsed module");
+
+        EnvAliasExtractor::build_with_paths(&module)
+    }
+
+    #[test]
+    fn whole_url_target_takes_its_path_from_the_fallback_literal() {
+        let (aliases, paths) = build_both(
+            r#"const url = process.env.HELPDESK_URL ?? "http://localhost:7100/api/answer";"#,
+        );
+        for target in ["url", "${url}", "${process.env.HELPDESK_URL}", "`${url}`"] {
+            assert_eq!(
+                resolve_whole_url_target(target, &aliases, &paths).as_deref(),
+                Some("${process.env.HELPDESK_URL}/api/answer"),
+                "target {target} states nothing but the binding"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_url_rule_leaves_a_target_that_states_its_own_path_alone() {
+        let (aliases, paths) = build_both(
+            r#"const url = process.env.HELPDESK_URL ?? "http://localhost:7100/api/answer";"#,
+        );
+        assert_eq!(
+            resolve_whole_url_target("${url}/api/other", &aliases, &paths),
+            None,
+            "a base with a path behind it is the existing shape, not this one"
+        );
+    }
+
+    #[test]
+    fn whole_url_rule_needs_a_path_in_the_fallback() {
+        let (aliases, paths) = build_both(
+            r#"const base = process.env.CATALOG_URL ?? "http://localhost:4001";
+               const other = process.env.OTHER_URL;
+               const templated = process.env.T_URL ?? `http://localhost:${port}/api/x`;"#,
+        );
+        assert!(
+            paths.is_empty(),
+            "a fallback with no path, no fallback at all, and an interpolated \
+             one all state nothing: {paths:?}"
+        );
+        assert_eq!(resolve_whole_url_target("base", &aliases, &paths), None);
     }
 
     #[test]
