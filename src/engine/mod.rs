@@ -68,7 +68,12 @@ mod type_compat_v2;
 /// target of call sites that reach an endpoint through a client method in
 /// another module. Those files do not change, so v6 caches would pin every
 /// already-indexed repo to the wrong verb and the wrong API version.
-const CACHE_VERSION: u32 = 7;
+/// 8: whole-URL env-var recall (carrick#572) adds a row for a request whose
+/// URL is read from an environment variable and passed to `fetch` as a
+/// binding. A separate bump from 7 on purpose: an index rebuilt on 7 has
+/// already spent its one free pass, so without its own the new rows never
+/// reach it.
+const CACHE_VERSION: u32 = 8;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<

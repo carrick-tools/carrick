@@ -1,0 +1,32 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:7",
+      "line_number": 7,
+      "target": "url",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(url, { method: \"POST\" })",
+      "call_expression_line": 7,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:20",
+      "line_number": 20,
+      "target": "${base}/api/v1/items",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${base}/api/v1/items`, { method: \"GET\" })",
+      "call_expression_line": 20,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}
