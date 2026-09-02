@@ -3206,6 +3206,38 @@ export async function action({ request }: { request: Request }) {
         assert_eq!(handler_guards(content, "action"), vec!["PUT"]);
     }
 
+    // --- Protocol verbs are collected, then discarded downstream
+    //     (carrick#628) ---
+
+    #[test]
+    fn a_preflight_branch_is_collected_like_any_other_comparison() {
+        // The collector reports what the body compares the method against and
+        // nothing more. That a branch on OPTIONS must not displace the
+        // convention's default verb is a routing decision, so it is applied in
+        // `DerivedRoute::http_methods_for_export` rather than here.
+        let content = r#"
+export async function loader({ request }: { request: Request }) {
+  if (request.method.toUpperCase() === "OPTIONS") {
+    return new Response(null, { status: 204 });
+  }
+  return Response.json({});
+}
+"#;
+        assert_eq!(handler_guards(content, "loader"), vec!["OPTIONS"]);
+    }
+
+    #[test]
+    fn a_preflight_branch_beside_a_narrowing_collects_both() {
+        let content = r#"
+export async function action({ request }: { request: Request }) {
+  if (request.method === "OPTIONS") return new Response(null, { status: 204 });
+  if (request.method !== "PUT") throw new Response(null, { status: 405 });
+  return Response.json({});
+}
+"#;
+        assert_eq!(handler_guards(content, "action"), vec!["OPTIONS", "PUT"]);
+    }
+
     #[test]
     fn exported_handlers_finds_app_router_methods() {
         let content = r#"
