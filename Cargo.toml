@@ -11,6 +11,10 @@ members = ["crates/carrick-match"]
 
 [dependencies]
 async-trait = "0.1"
+# Decoding the OIDC JWT's payload to read its `exp` claim. Decode only: the
+# scanner never verifies the signature (the cloud does), so no crypto is
+# needed. Already in the tree via reqwest, so this adds no build cost.
+base64 = "0.22"
 carrick-match = { path = "crates/carrick-match", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"

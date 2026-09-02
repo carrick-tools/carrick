@@ -29,6 +29,7 @@ mod oidc;
 mod operation;
 mod packages;
 mod parser;
+mod scan_health;
 mod sdk_edges;
 mod sdk_surface;
 mod services;
@@ -128,6 +129,11 @@ ENVIRONMENT VARIABLES:
                                     Lower it if a large repo loses intents to
                                     backend overload; capped by
                                     CARRICK_CONCURRENCY_LIMIT
+    CARRICK_ALLOW_PARTIAL_ANALYSIS  Upload and exit 0 even when files were not
+                                    analysed. Off by default: a run that lost
+                                    analyzer results is reported and fails,
+                                    rather than overwriting the index with a
+                                    thinner one
 "#
         );
     }
