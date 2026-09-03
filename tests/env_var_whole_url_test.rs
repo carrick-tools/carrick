@@ -46,7 +46,7 @@ fn calls() -> Vec<serde_json::Value> {
 #[test]
 fn a_whole_url_read_from_an_env_var_is_recorded() {
     let calls = calls();
-    assert_eq!(calls.len(), 2, "one row per call site: {calls:#?}");
+    assert_eq!(calls.len(), 3, "one row per call site: {calls:#?}");
 
     let ask = calls
         .iter()
@@ -68,5 +68,26 @@ fn a_whole_url_read_from_an_env_var_is_recorded() {
     assert_eq!(
         items["target_url"],
         "${process.env.CATALOG_URL}/api/v1/items"
+    );
+}
+
+/// carrick#632: the same URL at a site the extraction returns no row for. The
+/// resolution above is a rewrite, so it had nothing to act on and the call was
+/// absent from the index entirely, not merely wrong.
+#[test]
+fn a_whole_url_site_the_extraction_answered_nothing_for_is_recorded() {
+    let calls = calls();
+
+    let ask = calls
+        .iter()
+        .find(|call| call["line"].as_i64() == Some(12))
+        .unwrap_or_else(|| panic!("no row for the unanswered env-var URL call: {calls:#?}"));
+    assert_eq!(
+        ask["method"], "POST",
+        "the method is the literal in the call's own options bag"
+    );
+    assert_eq!(
+        ask["target_url"], "${process.env.SERVICE_ASK_URL}/api/ask",
+        "the env var supplies the origin and the fallback literal supplies the path"
     );
 }

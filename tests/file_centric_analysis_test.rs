@@ -275,6 +275,7 @@ fn test_processing_stats_tracking() {
         files_skipped_unrouted_protocol: 0,
         imported_member_resolutions: 0,
         imported_member_backfills: 0,
+        whole_url_env_backfills: 0,
         wrapper_method_propagations: 0,
         total_mounts: 3,
         total_endpoints: 10,
