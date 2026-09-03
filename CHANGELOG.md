@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.33](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.32...carrick-v0.3.33) (2026-09-03)
+
+
+### Bug Fixes
+
+* **scanner:** key a whole-URL env-var call on the route it requests ([#644](https://github.com/carrick-tools/carrick/issues/644)) ([8d26b74](https://github.com/carrick-tools/carrick/commit/8d26b7469dd4ddb7e0ed5b85f80774fd2f101213))
+* **sidecar:** run the response-payload recovery when a wrapper rule verified the transport type ([#643](https://github.com/carrick-tools/carrick/issues/643)) ([8cf89ed](https://github.com/carrick-tools/carrick/commit/8cf89ed5b7cd214b3f5621b86ea07b969e4e5679))
+
 ## [0.3.32](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.31...carrick-v0.3.32) (2026-09-03)
 
 
