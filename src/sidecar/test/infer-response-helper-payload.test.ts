@@ -178,7 +178,7 @@ describe('carrick#631 response helper argument recovery', () => {
     fs.rmSync(repoDir, { recursive: true, force: true });
   });
 
-  async function inferReturn(alias: string, line: number) {
+  async function inferReturn(alias: string, line: number, extractionConfig?: unknown) {
     const res = await client.send<InferShape>({
       action: 'infer',
       request_id: alias,
@@ -190,6 +190,7 @@ describe('carrick#631 response helper argument recovery', () => {
           alias,
         },
       ],
+      ...(extractionConfig ? { extraction_config: extractionConfig } : {}),
     });
     return (res.inferred_types ?? []).find((t) => t.alias === alias);
   }
@@ -261,6 +262,34 @@ describe('carrick#631 response helper argument recovery', () => {
       );
       assert.strictEqual(collapse(inferred.type_string), 'any');
     }
+  });
+
+  it('recovers the payload when a wrapper rule verified the transport type', async () => {
+    // The live shape the offline fixtures missed. Every scan carries an
+    // agent-generated extraction config, and a rule that names the transport
+    // type and gates it on its origin matches this handler's awaited return,
+    // finds no payload inside it (transport carries none), and collapses to
+    // `unknown` — which counted as a successful unwrap and routed the whole
+    // recovery below out of reach. A verified-machinery collapse is the same
+    // verdict as the structural machinery check, so the recovery must still
+    // run and read the argument the handler handed the helper.
+    const inferred = await inferReturn('Endpoint_Ruled_Response', ITEMS_LINE, {
+      rules: [
+        {
+          wrapperSymbols: ['Response'],
+          machineryIndicators: ['headers', 'status', 'statusText', 'ok', 'body'],
+          originModuleGlobs: ['typescript/lib/*'],
+          unwrapRecursively: false,
+        },
+      ],
+    });
+    assert.ok(inferred, 'must resolve a response contract, not abstain to unknown');
+    assert.strictEqual(
+      collapse(inferred.type_string),
+      '{ items: { id: string; label: string; }[]; total: number; }'
+    );
+    // The wrapper's own symbol must never anchor the contract.
+    assert.notStrictEqual(inferred.primary_type_symbol, 'Response');
   });
 
   it('does not report a redirect location as the response contract', async () => {
