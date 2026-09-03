@@ -28,8 +28,9 @@ use crate::{
     cloud_storage::{ManifestRole, ManifestTypeKind},
     config::Config,
     env_alias::{
-        EnvAliasExtractor, EnvAliasMap, WholeUrlPathMap, exported_env_aliases,
-        merge_imported_env_aliases, resolve_target_env_alias, resolve_whole_url_target,
+        EnvAliasExtractor, EnvAliasMap, LiteralBaseMap, WholeUrlPathMap, exported_env_aliases,
+        merge_imported_env_aliases, resolve_target_env_alias, resolve_target_literal_base,
+        resolve_whole_url_target,
     },
     file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
     framework_detector::DetectionResult,
@@ -209,6 +210,8 @@ struct FileSymbols {
     /// Paths stated by the `??` fallback of a binding holding a whole request
     /// URL (carrick#572).
     whole_url_paths: WholeUrlPathMap,
+    /// Absolute URL literals the file declares as bases (carrick#627).
+    literal_bases: LiteralBaseMap,
     /// The file's own request members, read for the files that import it
     /// (carrick#588).
     request_members: RequestMemberIndex,
@@ -721,6 +724,11 @@ impl FileOrchestrator {
             /// (carrick#572). Per-file: the shape is a local const passed
             /// straight to a request, never an imported config property.
             whole_url_paths: WholeUrlPathMap,
+            /// Absolute URL literals the file declares as bases, for a target
+            /// that interpolates one as its leading segment (carrick#627).
+            /// Per-file for the same reason as `whole_url_paths`: the shape is
+            /// a module-level const of this file, read at its own call sites.
+            literal_bases: LiteralBaseMap,
             /// Endpoints derived from file-based routing conventions, merged in
             /// after the LLM pass. Empty for non-route files.
             route_endpoints: Vec<EndpointResult>,
@@ -1076,6 +1084,7 @@ impl FileOrchestrator {
                 symbol_table: symbols.table,
                 env_alias_map: symbols.env_aliases,
                 whole_url_paths: symbols.whole_url_paths,
+                literal_bases: symbols.literal_bases,
                 route_endpoints,
                 descriptor_endpoints,
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
@@ -1320,6 +1329,7 @@ impl FileOrchestrator {
                 symbol_table: symbols.table,
                 env_alias_map: symbols.env_aliases,
                 whole_url_paths: symbols.whole_url_paths,
+                literal_bases: symbols.literal_bases,
                 route_endpoints: Vec::new(),
                 descriptor_endpoints: Vec::new(),
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
@@ -1475,10 +1485,11 @@ impl FileOrchestrator {
                     // env-var classification, uploads) sees one normalized
                     // form.
                     Self::normalize_fallback_targets(&mut adjusted);
-                    Self::resolve_env_var_aliases(
+                    Self::resolve_target_bases(
                         &mut adjusted,
                         &pf.env_alias_map,
                         &pf.whole_url_paths,
+                        &pf.literal_bases,
                     );
                     Self::validate_type_hints(&mut adjusted, &pf.symbol_table);
                     Self::normalize_unusable_types(&mut adjusted, &framework_detection.frameworks);
@@ -3040,7 +3051,7 @@ impl FileOrchestrator {
         let mut type_extractor = TypeSymbolExtractor::new();
         module.visit_with(&mut type_extractor);
 
-        let (env_aliases, whole_url_paths) = EnvAliasExtractor::build_with_paths(&module);
+        let bindings = EnvAliasExtractor::build_bindings(&module);
         // Read on this parse rather than a second one: every file is a
         // candidate wrapper for some other file, and a client module whose
         // requests go through a helper raises no HTTP candidate of its own, so
@@ -3052,8 +3063,9 @@ impl FileOrchestrator {
                 local_types: type_extractor.type_symbols,
                 imported_symbols: import_extractor.imported_symbols,
             },
-            env_aliases,
-            whole_url_paths,
+            env_aliases: bindings.aliases,
+            whole_url_paths: bindings.whole_url_paths,
+            literal_bases: bindings.literal_bases,
             request_members,
         }
     }
@@ -4652,12 +4664,17 @@ impl FileOrchestrator {
         propagated
     }
 
-    fn resolve_env_var_aliases(
+    /// Resolve the binding a call target names in its base slot: the
+    /// `process.env` variable behind it (#218), the whole URL it holds
+    /// (carrick#572), or the absolute URL literal it was declared with
+    /// (carrick#627).
+    fn resolve_target_bases(
         result: &mut FileAnalysisResult,
         env_alias_map: &EnvAliasMap,
         whole_url_paths: &WholeUrlPathMap,
+        literal_bases: &LiteralBaseMap,
     ) {
-        if env_alias_map.is_empty() && whole_url_paths.is_empty() {
+        if env_alias_map.is_empty() && whole_url_paths.is_empty() && literal_bases.is_empty() {
             return;
         }
         for data_call in &mut result.data_calls {
@@ -4672,6 +4689,14 @@ impl FileOrchestrator {
                 continue;
             }
             if let Some(resolved) = resolve_target_env_alias(&data_call.target, env_alias_map) {
+                data_call.target = resolved;
+                continue;
+            }
+            // A base the file declares as a literal (carrick#627). Last,
+            // because the two rules above read a binding backed by the
+            // environment and this one reads a binding backed by nothing but
+            // its own initializer; a name cannot be both.
+            if let Some(resolved) = resolve_target_literal_base(&data_call.target, literal_bases) {
                 data_call.target = resolved;
             }
         }
