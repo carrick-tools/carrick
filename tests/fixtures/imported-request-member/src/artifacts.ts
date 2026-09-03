@@ -20,3 +20,7 @@ export async function loadArtifact(name: string, client: ApiClient) {
 export async function localHandle(name: string) {
   return apiClient.createArtifactUrl(name);
 }
+
+export async function sessionSummary(client: ApiClient) {
+  return client.describeSession();
+}

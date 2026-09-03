@@ -193,8 +193,17 @@ pub fn call_request_shape(call: &CallExpr, callee_property: Option<&str>) -> Req
                 None => return RequestShapeSignal::Unreadable,
             },
             // No `method` key at all. The verb the call was spelled with is the
-            // method; without one the request's method is a library default
-            // this must not guess at.
+            // method; without one this module's shape stays unknown, even
+            // though a bag with no `method` is a GET everywhere it is written.
+            //
+            // The two readers of that fact want different things. Here the fold
+            // propagates a method AND a body-presence to delegating sites that
+            // state no URL of their own, so a wrong `GET` also strips their
+            // payload anchor, and the sites are only reachable through a module
+            // whose other requests may disagree. `imported_request_member`
+            // reads one member's own call, which has already stated a URL and a
+            // request-options object beside it, so there the same absence is
+            // read as the GET it is.
             None => match verb {
                 Some(verb) => verb,
                 None => return RequestShapeSignal::Unreadable,
