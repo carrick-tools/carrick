@@ -21,17 +21,27 @@ to a factory call, and nothing in the file states a path outside the fallback
 literal. Its cassette holds no row for the site, so the row exists only if the
 scanner emits it itself.
 
+`src/answered.ts` holds the same buried shape at a site the analyzer DOES answer
+for, paraphrasing the binding as the bare env-var name. That is what the live
+index held for the call carrick#632 was filed from, and it is the case the #633
+emission never reached: the row covered the site, so nothing was emitted, and
+the call stayed keyed on an env-var origin.
+
 ## The answer key
 
-| site | truth |
-|---|---|
-| `helpdesk.ts:7` | `POST ${process.env.HELPDESK_URL}/api/answer` |
-| `helpdesk.ts:20` | `GET ${process.env.CATALOG_URL}/api/v1/items` |
-| `toolset.ts:12` | `POST ${process.env.SERVICE_ASK_URL}/api/ask` |
+| site | target | key |
+|---|---|---|
+| `helpdesk.ts:7` | `POST ${process.env.HELPDESK_URL}/api/answer` | `/api/answer` |
+| `helpdesk.ts:20` | `GET ${process.env.CATALOG_URL}/api/v1/items` | `${process.env.CATALOG_URL}/api/v1/items` |
+| `toolset.ts:12` | `POST ${process.env.SERVICE_ASK_URL}/api/ask` | `/api/ask` |
+| `answered.ts:11` | `POST ${process.env.KNOWLEDGE_URL}/api/lookup` | `/api/lookup` |
 
-All three env vars are undeclared in this fixture, so all three are unmatched
-calls with an env-var base. That is the honest representation the schema already
-has, and no match is claimed for any of them.
+Every env var here is undeclared, so every row is an unmatched call and no match
+is claimed for any of them. The three whole-URL calls key on the route they
+request, because their fallback states a loopback origin and that is a
+structural prefix — the same key `fetch("http://localhost:7100/api/answer")`
+already gets. `helpdesk.ts:20` states its own path behind an opaque base, so
+nothing states its origin and the key stays verbatim.
 
 ## The cassette
 
@@ -49,5 +59,11 @@ call was absent from the index rather than merely wrong. The file must exist eve
 though it is empty: with no cassette for a file the mock falls back to a
 schema-generated response, and the test would stop measuring the scanner.
 
-Line numbers in the cassette's `@line:` placeholders reference exact source
-lines in `src/helpdesk.ts`. Re-count them after any edit to that file.
+`__llm__/analyze-file/answered.json` holds the answer the live index carried for
+this shape: the right line and the right method, with the binding paraphrased as
+`${KNOWLEDGE_URL}/api/lookup`. Nothing about it is a hallucination — it is simply
+not the spelling the pipeline resolves env vars through, and it carries nothing
+about the origin the source defaults to.
+
+Line numbers in each cassette's `@line:` placeholders reference exact source
+lines in the file it answers for. Re-count them after any edit to those files.

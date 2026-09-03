@@ -28,9 +28,9 @@ use crate::{
     cloud_storage::{ManifestRole, ManifestTypeKind},
     config::Config,
     env_alias::{
-        EnvAliasExtractor, EnvAliasMap, LiteralBaseMap, WholeUrlPathMap, exported_env_aliases,
+        EnvAliasExtractor, EnvAliasMap, LiteralBaseMap, WholeUrlFallbackMap, exported_env_aliases,
         merge_imported_env_aliases, resolve_target_env_alias, resolve_target_literal_base,
-        resolve_whole_url_target,
+        resolve_whole_url_target, whole_url_local_default,
     },
     file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
     framework_detector::DetectionResult,
@@ -154,6 +154,10 @@ pub struct ProcessingStats {
     /// merged in because extraction returned no row for their site at all
     /// (carrick#632). A subset of `total_data_calls`.
     pub whole_url_env_backfills: usize,
+    /// Whole-URL env-var calls extraction DID answer, whose row was corrected
+    /// to what the binding's own AST states (carrick#632). A subset of
+    /// `total_data_calls`.
+    pub whole_url_env_corrections: usize,
     /// Wrapper-resolved data calls whose HTTP method was corrected from what
     /// extraction gave them to the method their wrapper module hardcodes
     /// (carrick-cloud#386). A subset of `total_data_calls`.
@@ -204,7 +208,7 @@ struct SymbolTable {
 /// Everything one parse of a source file yields for the passes that follow.
 ///
 /// A struct rather than a tuple because two of the fields are the same type —
-/// `EnvAliasMap` and `WholeUrlPathMap` are both `HashMap<String, String>` — and
+/// `EnvAliasMap` and `WholeUrlFallbackMap` are both `HashMap<String, String>` — and
 /// a positional swap between them would compile and be wrong everywhere at once.
 #[derive(Default)]
 struct FileSymbols {
@@ -213,7 +217,7 @@ struct FileSymbols {
     env_aliases: EnvAliasMap,
     /// Paths stated by the `??` fallback of a binding holding a whole request
     /// URL (carrick#572).
-    whole_url_paths: WholeUrlPathMap,
+    whole_url_fallbacks: WholeUrlFallbackMap,
     /// Absolute URL literals the file declares as bases (carrick#627).
     literal_bases: LiteralBaseMap,
     /// The file's own request members, read for the files that import it
@@ -727,10 +731,10 @@ impl FileOrchestrator {
             /// WHOLE request URL read from an environment variable
             /// (carrick#572). Per-file: the shape is a local const passed
             /// straight to a request, never an imported config property.
-            whole_url_paths: WholeUrlPathMap,
+            whole_url_fallbacks: WholeUrlFallbackMap,
             /// Absolute URL literals the file declares as bases, for a target
             /// that interpolates one as its leading segment (carrick#627).
-            /// Per-file for the same reason as `whole_url_paths`: the shape is
+            /// Per-file for the same reason as `whole_url_fallbacks`: the shape is
             /// a module-level const of this file, read at its own call sites.
             literal_bases: LiteralBaseMap,
             /// Endpoints derived from file-based routing conventions, merged in
@@ -1087,7 +1091,7 @@ impl FileOrchestrator {
                 candidate_map,
                 symbol_table: symbols.table,
                 env_alias_map: symbols.env_aliases,
-                whole_url_paths: symbols.whole_url_paths,
+                whole_url_fallbacks: symbols.whole_url_fallbacks,
                 literal_bases: symbols.literal_bases,
                 route_endpoints,
                 descriptor_endpoints,
@@ -1332,7 +1336,7 @@ impl FileOrchestrator {
                 candidate_map: HashMap::new(),
                 symbol_table: symbols.table,
                 env_alias_map: symbols.env_aliases,
-                whole_url_paths: symbols.whole_url_paths,
+                whole_url_fallbacks: symbols.whole_url_fallbacks,
                 literal_bases: symbols.literal_bases,
                 route_endpoints: Vec::new(),
                 descriptor_endpoints: Vec::new(),
@@ -1492,7 +1496,7 @@ impl FileOrchestrator {
                     Self::resolve_target_bases(
                         &mut adjusted,
                         &pf.env_alias_map,
-                        &pf.whole_url_paths,
+                        &pf.whole_url_fallbacks,
                         &pf.literal_bases,
                     );
                     // Then emit the whole-URL sites that resolution had no row
@@ -1508,12 +1512,14 @@ impl FileOrchestrator {
                     // silent about it, which is the more common failure and
                     // the one that leaves the endpoint absent from the index
                     // rather than merely mis-stated.
-                    stats.whole_url_env_backfills += Self::merge_whole_url_env_calls(
+                    let (backfilled, corrected) = Self::merge_whole_url_env_calls(
                         &mut adjusted,
                         &pf.candidate_map,
                         &pf.env_alias_map,
-                        &pf.whole_url_paths,
+                        &pf.whole_url_fallbacks,
                     );
+                    stats.whole_url_env_backfills += backfilled;
+                    stats.whole_url_env_corrections += corrected;
                     Self::validate_type_hints(&mut adjusted, &pf.symbol_table);
                     Self::normalize_unusable_types(&mut adjusted, &framework_detection.frameworks);
 
@@ -1671,6 +1677,10 @@ impl FileOrchestrator {
         debug!(
             "  - Whole-URL env-var call backfills: {}",
             stats.whole_url_env_backfills
+        );
+        debug!(
+            "  - Whole-URL env-var call corrections: {}",
+            stats.whole_url_env_corrections
         );
         debug!(
             "  - Wrapper method propagations: {}",
@@ -2092,7 +2102,7 @@ impl FileOrchestrator {
                 };
                 // Same canonicalization the mount-graph loop above and the cloud
                 // projection use, so this fallback path keys identically.
-                let target_path = normalizer.consumer_call_path(&data_call.target);
+                let target_path = Self::canonical_call_path(&normalizer, data_call);
                 let (method, path, call_id) = data_call_lookup
                     .get(&lookup_key)
                     .and_then(|entries| {
@@ -3091,7 +3101,7 @@ impl FileOrchestrator {
                 imported_symbols: import_extractor.imported_symbols,
             },
             env_aliases: bindings.aliases,
-            whole_url_paths: bindings.whole_url_paths,
+            whole_url_fallbacks: bindings.whole_url_fallbacks,
             literal_bases: bindings.literal_bases,
             request_members,
         }
@@ -4220,6 +4230,8 @@ impl FileOrchestrator {
                 payload_expression_line: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+
+                loopback_default_url: None,
             });
             added += 1;
         }
@@ -4308,6 +4320,8 @@ impl FileOrchestrator {
                 payload_expression_line: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+
+                loopback_default_url: None,
             });
             added += 1;
         }
@@ -4654,6 +4668,8 @@ impl FileOrchestrator {
                 payload_expression_line: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+
+                loopback_default_url: None,
             });
             added += 1;
         }
@@ -4690,18 +4706,29 @@ impl FileOrchestrator {
     ///   (`fetch(url, { headers })`, or a parameterized `{ method }`) is left
     ///   alone rather than emitted with a guessed verb. That shape stays
     ///   extraction's to answer.
+    ///
+    /// The row extraction produced for the site is CORRECTED rather than left
+    /// alone. Emitting only where extraction was silent is what #633 shipped,
+    /// and it left the live case unfixed: the model does answer this shape
+    /// often enough, paraphrasing the binding as `${KNOWLEDGE_URL}/api/ask`, and
+    /// that spelling is not the one the rest of the pipeline resolves env vars
+    /// through, nor does it carry the fallback the canonical key needs. Same
+    /// span is identity — `apply_candidate_map` stamps the candidate's own
+    /// span on the row answered for it — so the row is this call and every
+    /// field the AST states outright belongs on it. A row on the same line
+    /// with a DIFFERENT span is a different call and still covers the site.
     fn merge_whole_url_env_calls(
         result: &mut FileAnalysisResult,
         candidate_map: &HashMap<String, CandidateTarget>,
         aliases: &EnvAliasMap,
-        paths: &WholeUrlPathMap,
-    ) -> usize {
+        paths: &WholeUrlFallbackMap,
+    ) -> (usize, usize) {
         if paths.is_empty() {
-            return 0;
+            return (0, 0);
         }
         // The map iterates in hash order; emit in source order so a scan of
         // the same file always produces the same rows.
-        let mut sites: Vec<(&CandidateTarget, String, String)> = candidate_map
+        let mut sites: Vec<(&CandidateTarget, String, String, Option<String>)> = candidate_map
             .values()
             .filter(|candidate| candidate.protocol == Protocol::Http)
             .filter_map(|candidate| {
@@ -4709,19 +4736,21 @@ impl FileOrchestrator {
                 let RequestShapeSignal::Known(shape) = &candidate.request_shape else {
                     return None;
                 };
-                let target =
-                    resolve_whole_url_target(candidate.path_snippet.as_deref()?, aliases, paths)?;
-                Some((candidate, shape.method.clone(), target))
+                let snippet = candidate.path_snippet.as_deref()?;
+                let target = resolve_whole_url_target(snippet, aliases, paths)?;
+                let local_default = whole_url_local_default(snippet, aliases, paths);
+                Some((candidate, shape.method.clone(), target, local_default))
             })
             .collect();
-        sites.sort_by_key(|(candidate, _, _)| candidate.span_start);
+        sites.sort_by_key(|(candidate, _, _, _)| candidate.span_start);
 
         // Only rows extraction produced can cover a site. Reading the vector
         // as it grows would let the first backfill of a line suppress its
         // siblings — two resolved sites on one line are two calls.
         let extracted = result.data_calls.len();
         let mut added = 0;
-        for (candidate, method, target) in sites {
+        let mut corrected = 0;
+        for (candidate, method, target, local_default) in sites {
             // A site extraction answered as an ENDPOINT is answered. One
             // candidate map holds route registrations as well as calls, and a
             // route mounted at a whole URL read from an environment variable
@@ -4735,11 +4764,29 @@ impl FileOrchestrator {
             }
             let line = i32::try_from(candidate.line_number).unwrap_or(i32::MAX);
             let ours = normalize_path_params(&target);
+            // The row extraction answered for THIS call, if it answered one.
+            // Either the candidate's own span, or a row on the line that is
+            // anchored to no span at all — a second request on the line would
+            // have raised its own candidate and carried its own span, so an
+            // unanchored row on it is this one.
+            let mine = result.data_calls[..extracted].iter().position(|data_call| {
+                data_call.call_expression_span_start == Some(candidate.span_start)
+                    || (data_call.call_expression_span_start.is_none()
+                        && (data_call.line_number == line
+                            || data_call.call_expression_line == Some(line)))
+            });
+            if let Some(index) = mine {
+                corrected += Self::correct_whole_url_row(
+                    &mut result.data_calls[index],
+                    candidate,
+                    &method,
+                    target,
+                    local_default,
+                );
+                continue;
+            }
             let covered = result.data_calls[..extracted].iter().any(|data_call| {
-                if data_call.call_expression_span_start == Some(candidate.span_start)
-                    || data_call.line_number == line
-                    || data_call.call_expression_line == Some(line)
-                {
+                if data_call.line_number == line || data_call.call_expression_line == Some(line) {
                     return true;
                 }
                 let method_agrees = match data_call.method.as_deref() {
@@ -4788,10 +4835,84 @@ impl FileOrchestrator {
                 payload_expression_line: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+                loopback_default_url: local_default,
             });
             added += 1;
         }
-        added
+        (added, corrected)
+    }
+
+    /// The path a data call is KEYED on — the one canonicalization every reader
+    /// of the key shares (the mount-graph loop, the type-request join, the
+    /// uploaded projection).
+    ///
+    /// Normally that is `consumer_call_path` over the target the row states.
+    /// A whole-URL env-var call is keyed on the LOOPBACK default the source
+    /// states for it instead (`loopback_default_url`), because the target's
+    /// origin is an env var and an undeclared env-var base is kept verbatim,
+    /// which would leave `${process.env.HELPDESK_URL}` standing in the key as a
+    /// leading path segment. The call would then be absent from the operation
+    /// it requests: `fetch("http://localhost:7100/api/answer")` keys
+    /// `/api/answer` and putting an env-var override in front of the same
+    /// literal would drop it out of the index. The target itself is untouched,
+    /// so the row still displays the deployed origin.
+    ///
+    /// The key IS the classification for the local report. A call keyed on a
+    /// bare route goes to the matcher rather than raising the "declare this env
+    /// var" suggestion, so this shape becomes a missing endpoint wherever
+    /// nothing in the project serves the route. That is what declaring the
+    /// variable in `internalEnvVars` would already have done, read out of the
+    /// source instead of asked for.
+    fn canonical_call_path(normalizer: &UrlNormalizer, data_call: &DataCallResult) -> String {
+        let url = data_call
+            .loopback_default_url
+            .as_deref()
+            .unwrap_or(&data_call.target);
+        normalizer.consumer_call_path(url)
+    }
+
+    /// Put on the row extraction answered for a whole-URL env-var call what the
+    /// binding's own AST states: the resolved target, the method the call's
+    /// options bag spells out, and the loopback default the canonical key is
+    /// computed from. Returns 1 when anything changed.
+    ///
+    /// The target is overwritten rather than merged. This rule fires only where
+    /// the call site states no path of its own, so every path in an extracted
+    /// row for it came from reading the same fallback literal — deterministically
+    /// here, by paraphrase there.
+    fn correct_whole_url_row(
+        data_call: &mut DataCallResult,
+        candidate: &CandidateTarget,
+        method: &str,
+        target: String,
+        local_default: Option<String>,
+    ) -> usize {
+        let mut changed = false;
+        if data_call.target != target {
+            debug!(
+                "Correcting whole-URL env-var call target at line {}: {} -> {}",
+                candidate.line_number, data_call.target, target
+            );
+            data_call.target = target;
+            changed = true;
+        }
+        if data_call.loopback_default_url != local_default {
+            data_call.loopback_default_url = local_default;
+            changed = true;
+        }
+        // Only where extraction stated none: a stated verb is the model reading
+        // the same options bag, and disagreeing with it is a separate question
+        // from resolving the URL.
+        if data_call.method.as_deref().is_none_or(str::is_empty) {
+            data_call.method = Some(method.to_string());
+            changed = true;
+        }
+        if data_call.call_expression_span_start.is_none() {
+            data_call.call_expression_span_start = Some(candidate.span_start);
+            data_call.call_expression_span_end = Some(candidate.span_end);
+            changed = true;
+        }
+        usize::from(changed)
     }
 
     fn propagate_wrapper_request_shape(
@@ -4832,10 +4953,10 @@ impl FileOrchestrator {
     fn resolve_target_bases(
         result: &mut FileAnalysisResult,
         env_alias_map: &EnvAliasMap,
-        whole_url_paths: &WholeUrlPathMap,
+        whole_url_fallbacks: &WholeUrlFallbackMap,
         literal_bases: &LiteralBaseMap,
     ) {
-        if env_alias_map.is_empty() && whole_url_paths.is_empty() && literal_bases.is_empty() {
+        if env_alias_map.is_empty() && whole_url_fallbacks.is_empty() && literal_bases.is_empty() {
             return;
         }
         for data_call in &mut result.data_calls {
@@ -4844,8 +4965,14 @@ impl FileOrchestrator {
             // rewrite would leave without a path and every downstream gate
             // would then drop.
             if let Some(resolved) =
-                resolve_whole_url_target(&data_call.target, env_alias_map, whole_url_paths)
+                resolve_whole_url_target(&data_call.target, env_alias_map, whole_url_fallbacks)
             {
+                // The loopback default alongside it, for the same reason the
+                // backfill carries one: the resolved target's origin is an env
+                // var, and only the fallback says where the request goes when
+                // nothing is configured. See `canonical_call_path`.
+                data_call.loopback_default_url =
+                    whole_url_local_default(&data_call.target, env_alias_map, whole_url_fallbacks);
                 data_call.target = resolved;
                 continue;
             }
@@ -5587,7 +5714,7 @@ impl FileOrchestrator {
                 // can never join a producer key, so they are pure index noise
                 // (#307) — typically a wrapper's internal fetch, whose resolved
                 // call-site emissions are extracted separately and do match.
-                let canonical_path = normalizer.consumer_call_path(&data_call.target);
+                let canonical_path = Self::canonical_call_path(normalizer, data_call);
                 if !UrlNormalizer::canonical_path_has_literal_segment(&canonical_path) {
                     debug!(
                         "Skipping data call with no literal path segment: {} ({})",
@@ -7686,6 +7813,8 @@ export * from "./aFetch.js";"#,
                     payload_expression_line: None,
                     primary_type_symbol: None,
                     type_import_source: None,
+
+                    loopback_default_url: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -7841,6 +7970,7 @@ export * from "./aFetch.js";"#,
             payload_expression_line: None,
             primary_type_symbol: None,
             type_import_source: None,
+            loopback_default_url: None,
         }
     }
 
@@ -8189,6 +8319,8 @@ export * from "./aFetch.js";"#,
                 payload_expression_line: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+
+                loopback_default_url: None,
             }],
             ..Default::default()
         };
@@ -8274,6 +8406,8 @@ export * from "./aFetch.js";"#,
             payload_expression_line: None,
             primary_type_symbol: None,
             type_import_source: None,
+
+            loopback_default_url: None,
         };
 
         let mut file_results = HashMap::new();
@@ -8380,6 +8514,8 @@ export * from "./aFetch.js";"#,
             payload_expression_line: None,
             primary_type_symbol: None,
             type_import_source: None,
+
+            loopback_default_url: None,
         };
 
         let mut file_results = HashMap::new();
@@ -8469,6 +8605,8 @@ export * from "./aFetch.js";"#,
             payload_expression_line: None,
             primary_type_symbol: None,
             type_import_source: None,
+
+            loopback_default_url: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -8534,6 +8672,8 @@ export * from "./aFetch.js";"#,
                         payload_expression_line: None,
                         primary_type_symbol: None,
                         type_import_source: None,
+
+                        loopback_default_url: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -8550,6 +8690,8 @@ export * from "./aFetch.js";"#,
                         payload_expression_line: None,
                         primary_type_symbol: None,
                         type_import_source: None,
+
+                        loopback_default_url: None,
                     },
                 ],
                 graphql_operations: vec![],
@@ -8597,6 +8739,8 @@ export * from "./aFetch.js";"#,
                     payload_expression_line: None,
                     primary_type_symbol: None,
                     type_import_source: None,
+
+                    loopback_default_url: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -8646,6 +8790,8 @@ export * from "./aFetch.js";"#,
                         payload_expression_line: None,
                         primary_type_symbol: None,
                         type_import_source: None,
+
+                        loopback_default_url: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -8662,6 +8808,8 @@ export * from "./aFetch.js";"#,
                         payload_expression_line: None,
                         primary_type_symbol: None,
                         type_import_source: None,
+
+                        loopback_default_url: None,
                     },
                 ],
                 graphql_operations: vec![],
@@ -9001,6 +9149,8 @@ export * from "./aFetch.js";"#,
                 payload_expression_line: None,
                 primary_type_symbol: Some("LocalType".to_string()),
                 type_import_source: None,
+
+                loopback_default_url: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -9094,6 +9244,8 @@ export * from "./aFetch.js";"#,
                 payload_expression_line: None,
                 primary_type_symbol: Some("OrderPlacedEvent".to_string()),
                 type_import_source: Some("../types/events.tsx".to_string()),
+
+                loopback_default_url: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![
@@ -9441,6 +9593,8 @@ export * from "./aFetch.js";"#,
                 // Local type with a claimed import source: HTTP must null.
                 primary_type_symbol: Some("LocalType".to_string()),
                 type_import_source: Some("./local".to_string()),
+
+                loopback_default_url: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -10679,6 +10833,7 @@ export { routes };
             payload_expression_line: None,
             primary_type_symbol: None,
             type_import_source: None,
+            loopback_default_url: None,
         }
     }
 
@@ -11127,12 +11282,16 @@ export { routes };
         HashMap::from([("c1".to_string(), candidate)])
     }
 
-    fn whole_url_maps(binding: &str, env_name: &str, path: &str) -> (EnvAliasMap, WholeUrlPathMap) {
+    fn whole_url_maps(
+        binding: &str,
+        env_name: &str,
+        fallback: &str,
+    ) -> (EnvAliasMap, WholeUrlFallbackMap) {
         (
             EnvAliasMap::from([(binding.to_string(), env_name.to_string())]),
-            WholeUrlPathMap::from([
-                (binding.to_string(), path.to_string()),
-                (env_name.to_string(), path.to_string()),
+            WholeUrlFallbackMap::from([
+                (binding.to_string(), fallback.to_string()),
+                (env_name.to_string(), fallback.to_string()),
             ]),
         )
     }
@@ -11145,19 +11304,25 @@ export { routes };
     fn merge_whole_url_env_calls_emits_a_site_extraction_returned_no_row_for() {
         let mut result = FileAnalysisResult::default();
         let candidate_map = whole_url_site("askUrl", "POST");
-        let (aliases, paths) = whole_url_maps("askUrl", "SERVICE_ASK_URL", "/api/ask");
+        let (aliases, paths) =
+            whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
 
-        let added = FileOrchestrator::merge_whole_url_env_calls(
+        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
             &mut result,
             &candidate_map,
             &aliases,
             &paths,
         );
 
-        assert_eq!(added, 1);
+        assert_eq!((added, corrected), (1, 0));
         assert_eq!(
             result.data_calls[0].target, "${process.env.SERVICE_ASK_URL}/api/ask",
             "the env var supplies the origin and the fallback literal the path"
+        );
+        assert_eq!(
+            result.data_calls[0].loopback_default_url.as_deref(),
+            Some("http://localhost:3939/api/ask"),
+            "the loopback default is what the canonical key is computed from"
         );
         assert_eq!(result.data_calls[0].method.as_deref(), Some("POST"));
         assert_eq!(result.data_calls[0].candidate_id, "whole-url-env:100-140");
@@ -11169,30 +11334,128 @@ export { routes };
         assert_eq!(result.data_calls[0].pattern_matched, "fetch");
     }
 
-    /// A site extraction DID answer keeps the analyzer's row, which the
-    /// resolution has already corrected by this point: same span, same line,
-    /// or the same path already carried behind a base.
+    /// carrick#632 (live shape): extraction DOES answer this site often enough,
+    /// paraphrasing the binding as `${SERVICE_ASK_URL}/api/ask`. #633 read that
+    /// row as covering the site and emitted nothing, so the resolved target
+    /// never reached the index and the call stayed keyed on an env-var origin.
+    /// The row is this call — it carries the candidate's own span — so it is
+    /// corrected rather than left.
     #[test]
-    fn merge_whole_url_env_calls_skips_sites_extraction_already_answered() {
-        let mut answered =
-            data_call_with("c1", "${process.env.SERVICE_ASK_URL}/api/ask", Some("POST"));
+    fn merge_whole_url_env_calls_corrects_the_row_extraction_answered_for_the_site() {
+        let mut answered = data_call_with("c1", "${SERVICE_ASK_URL}/api/ask", Some("POST"));
         answered.call_expression_span_start = Some(100);
         let mut result = FileAnalysisResult {
             data_calls: vec![answered],
             ..Default::default()
         };
         let candidate_map = whole_url_site("askUrl", "POST");
-        let (aliases, paths) = whole_url_maps("askUrl", "SERVICE_ASK_URL", "/api/ask");
+        let (aliases, paths) =
+            whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
 
-        let added = FileOrchestrator::merge_whole_url_env_calls(
+        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
             &mut result,
             &candidate_map,
             &aliases,
             &paths,
         );
 
-        assert_eq!(added, 0);
+        assert_eq!((added, corrected), (0, 1), "one call, one row");
         assert_eq!(result.data_calls.len(), 1);
+        assert_eq!(
+            result.data_calls[0].target, "${process.env.SERVICE_ASK_URL}/api/ask",
+            "the spelling the rest of the pipeline resolves env vars through"
+        );
+        assert_eq!(
+            result.data_calls[0].loopback_default_url.as_deref(),
+            Some("http://localhost:3939/api/ask")
+        );
+    }
+
+    /// A row already carrying everything the AST states is left exactly as it
+    /// is: correcting is not rewriting for its own sake.
+    #[test]
+    fn merge_whole_url_env_calls_leaves_an_already_correct_row_alone() {
+        let mut answered =
+            data_call_with("c1", "${process.env.SERVICE_ASK_URL}/api/ask", Some("POST"));
+        answered.call_expression_span_start = Some(100);
+        answered.loopback_default_url = Some("http://localhost:3939/api/ask".to_string());
+        let mut result = FileAnalysisResult {
+            data_calls: vec![answered],
+            ..Default::default()
+        };
+        let candidate_map = whole_url_site("askUrl", "POST");
+        let (aliases, paths) =
+            whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
+
+        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
+            &mut result,
+            &candidate_map,
+            &aliases,
+            &paths,
+        );
+
+        assert_eq!((added, corrected), (0, 0));
+        assert_eq!(result.data_calls.len(), 1);
+    }
+
+    /// A row on the same line with a span of its OWN is a different call — a
+    /// second request on the line raises its own candidate — so it covers the
+    /// site and neither corrects it nor suppresses the emission for it.
+    #[test]
+    fn merge_whole_url_env_calls_leaves_a_different_call_on_the_same_line_alone() {
+        let mut sibling = data_call_with("c2", "${process.env.OTHER_URL}/api/other", Some("GET"));
+        sibling.call_expression_span_start = Some(200);
+        sibling.line_number = 12;
+        let mut result = FileAnalysisResult {
+            data_calls: vec![sibling],
+            ..Default::default()
+        };
+        let candidate_map = whole_url_site("askUrl", "POST");
+        let (aliases, paths) =
+            whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
+
+        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
+            &mut result,
+            &candidate_map,
+            &aliases,
+            &paths,
+        );
+
+        assert_eq!((added, corrected), (0, 0));
+        assert_eq!(
+            result.data_calls[0].target, "${process.env.OTHER_URL}/api/other",
+            "the sibling call is untouched"
+        );
+    }
+
+    /// A fallback on a third-party origin states nothing about this machine, so
+    /// the call keeps the verbatim env-var key an undeclared base gets.
+    #[test]
+    fn merge_whole_url_env_calls_keys_a_third_party_fallback_verbatim() {
+        let mut result = FileAnalysisResult::default();
+        let candidate_map = whole_url_site("askUrl", "POST");
+        let (aliases, paths) = whole_url_maps(
+            "askUrl",
+            "SERVICE_ASK_URL",
+            "https://api.example.com/v1/ask",
+        );
+
+        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
+            &mut result,
+            &candidate_map,
+            &aliases,
+            &paths,
+        );
+
+        assert_eq!((added, corrected), (1, 0));
+        assert_eq!(
+            result.data_calls[0].target, "${process.env.SERVICE_ASK_URL}/v1/ask",
+            "the path still comes from the fallback"
+        );
+        assert_eq!(
+            result.data_calls[0].loopback_default_url, None,
+            "no loopback default, so nothing to key on but the env var"
+        );
     }
 
     /// The binding is passed to plenty of things that are not requests
@@ -11207,16 +11470,17 @@ export { routes };
             .get_mut("c1")
             .expect("candidate")
             .request_shape = RequestShapeSignal::NotARequest;
-        let (aliases, paths) = whole_url_maps("askUrl", "SERVICE_ASK_URL", "/api/ask");
+        let (aliases, paths) =
+            whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
 
-        let added = FileOrchestrator::merge_whole_url_env_calls(
+        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
             &mut result,
             &candidate_map,
             &aliases,
             &paths,
         );
 
-        assert_eq!(added, 0);
+        assert_eq!((added, corrected), (0, 0));
         assert!(result.data_calls.is_empty());
     }
 
@@ -11231,16 +11495,17 @@ export { routes };
             .get_mut("c1")
             .expect("candidate")
             .request_shape = RequestShapeSignal::Unreadable;
-        let (aliases, paths) = whole_url_maps("askUrl", "SERVICE_ASK_URL", "/api/ask");
+        let (aliases, paths) =
+            whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
 
-        let added = FileOrchestrator::merge_whole_url_env_calls(
+        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
             &mut result,
             &candidate_map,
             &aliases,
             &paths,
         );
 
-        assert_eq!(added, 0);
+        assert_eq!((added, corrected), (0, 0));
         assert!(result.data_calls.is_empty());
     }
 
@@ -11256,16 +11521,17 @@ export { routes };
             ..Default::default()
         };
         let candidate_map = whole_url_site("askUrl", "POST");
-        let (aliases, paths) = whole_url_maps("askUrl", "SERVICE_ASK_URL", "/api/ask");
+        let (aliases, paths) =
+            whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
 
-        let added = FileOrchestrator::merge_whole_url_env_calls(
+        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
             &mut result,
             &candidate_map,
             &aliases,
             &paths,
         );
 
-        assert_eq!(added, 0);
+        assert_eq!((added, corrected), (0, 0));
         assert!(result.data_calls.is_empty());
     }
 
@@ -11276,16 +11542,17 @@ export { routes };
     fn merge_whole_url_env_calls_leaves_a_base_plus_path_site_alone() {
         let mut result = FileAnalysisResult::default();
         let candidate_map = whole_url_site("`${askUrl}/api/other`", "POST");
-        let (aliases, paths) = whole_url_maps("askUrl", "SERVICE_ASK_URL", "/api/ask");
+        let (aliases, paths) =
+            whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
 
-        let added = FileOrchestrator::merge_whole_url_env_calls(
+        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
             &mut result,
             &candidate_map,
             &aliases,
             &paths,
         );
 
-        assert_eq!(added, 0);
+        assert_eq!((added, corrected), (0, 0));
         assert!(result.data_calls.is_empty());
     }
 
@@ -11583,6 +11850,7 @@ export function publishWrapped(order: OrderPlaced): void {
             payload_expression_line: Some(line_number),
             primary_type_symbol: primary_type_symbol.map(str::to_string),
             type_import_source: type_import_source.map(str::to_string),
+            loopback_default_url: None,
         }
     }
 

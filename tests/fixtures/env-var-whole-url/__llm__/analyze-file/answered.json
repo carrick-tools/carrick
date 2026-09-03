@@ -1,0 +1,20 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:11",
+      "line_number": 11,
+      "target": "${KNOWLEDGE_URL}/api/lookup",
+      "method": "POST",
+      "call_kind": "internal_http",
+      "pattern_matched": "fetch",
+      "call_expression_text": null,
+      "call_expression_line": 11,
+      "payload_expression_text": null,
+      "payload_expression_line": 12,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}
