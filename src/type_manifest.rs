@@ -1,5 +1,8 @@
 use crate::cloud_storage::{ManifestRole, ManifestTypeKind};
 use crate::operation::OperationKey;
+use swc_common::errors::Handler;
+use swc_common::{SourceMap, sync::Lrc};
+use swc_ecma_ast::{Decl, ModuleDecl, ModuleItem, Stmt};
 
 pub fn normalize_manifest_method(method: &str) -> String {
     let trimmed = method.trim();
@@ -149,9 +152,100 @@ fn fnv1a_hash(input: &str) -> u64 {
     hash
 }
 
+/// The 1-based line at which `file` DECLARES `symbol`, or `None` when it
+/// declares no such type (carrick#649).
+///
+/// Type-space declarations only — an interface, a type alias, a class, or an
+/// enum, exported or not — because that is what a manifest anchor names. A
+/// re-export (`export { Foo } from "./foo"`) is deliberately not a declaration
+/// here: the file states where the symbol comes from, not what it is, and
+/// following the chain would need the module resolution the sidecar does. The
+/// answer is then `None`, which is the honest one.
+pub fn type_declaration_line(
+    file: &std::path::Path,
+    symbol: &str,
+    cm: &Lrc<SourceMap>,
+    handler: &Handler,
+) -> Option<u32> {
+    let module = crate::parser::parse_file(file, cm, handler)?;
+    module.body.iter().find_map(|item| {
+        let decl = match item {
+            ModuleItem::Stmt(Stmt::Decl(decl)) => decl,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => &export.decl,
+            _ => return None,
+        };
+        let span = match decl {
+            Decl::TsInterface(d) if d.id.sym == *symbol => d.span,
+            Decl::TsTypeAlias(d) if d.id.sym == *symbol => d.span,
+            Decl::Class(d) if d.ident.sym == *symbol => d.class.span,
+            Decl::TsEnum(d) if d.id.sym == *symbol => d.span,
+            _ => return None,
+        };
+        u32::try_from(cm.lookup_char_pos(span.lo).line).ok()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use swc_common::errors::ColorConfig;
+
+    /// Write a source file and ask where it declares `symbol`.
+    fn declaration_line(source: &str, symbol: &str) -> Option<u32> {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let file = tmp_dir.path().join("input.ts");
+        std::fs::write(&file, source).expect("write file");
+
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
+        type_declaration_line(&file, symbol, &cm, &handler)
+    }
+
+    #[test]
+    fn every_type_space_declaration_shape_reports_its_line() {
+        let source = "export interface LedgerEntry {\n  id: string;\n}\n\
+                      type LedgerId = string;\n\
+                      export class LedgerClient {}\n\
+                      export enum LedgerState { Open }\n";
+        assert_eq!(declaration_line(source, "LedgerEntry"), Some(1));
+        assert_eq!(
+            declaration_line(source, "LedgerId"),
+            Some(4),
+            "a declaration the file does not export is still where the type lives"
+        );
+        assert_eq!(declaration_line(source, "LedgerClient"), Some(5));
+        assert_eq!(declaration_line(source, "LedgerState"), Some(6));
+    }
+
+    #[test]
+    fn a_re_export_is_not_a_declaration() {
+        assert_eq!(
+            declaration_line(r#"export { LedgerEntry } from "./ledger";"#, "LedgerEntry"),
+            None,
+            "the file says where the symbol comes from, not what it is"
+        );
+        assert_eq!(
+            declaration_line(r#"export * from "./ledger";"#, "LedgerEntry"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_value_binding_is_not_a_type_declaration() {
+        assert_eq!(
+            declaration_line(r#"export const LedgerEntry = { id: "" };"#, "LedgerEntry"),
+            None,
+            "a manifest anchor names a type, and a const is not one"
+        );
+    }
+
+    #[test]
+    fn a_symbol_the_file_does_not_declare_reports_nothing() {
+        assert_eq!(
+            declaration_line("export interface Other { id: string }", "LedgerEntry"),
+            None
+        );
+    }
 
     #[test]
     fn test_build_manifest_type_alias_with_call_id() {

@@ -110,7 +110,7 @@ mod type_compat_v2;
 /// fallback's route (carrick#644), so unchanged route and consumer files
 /// carry a contract and an operation key a v14 cache pins to `unknown` and to
 /// an unkeyed target.
-const CACHE_VERSION: u32 = 15;
+const CACHE_VERSION: u32 = 16;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
@@ -613,6 +613,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
             &results,
             &eval_type_manifest,
             &analyzer.call_raw_targets(),
+            &analyzer.call_bases(),
         );
         println!("{}", serde_json::to_string_pretty(&projection)?);
         return Ok(());
@@ -1380,7 +1381,7 @@ async fn analyze_current_repo_incremental(
 
             // Build type manifest
             let mut manifest_entries = build_type_manifest_entries(&mount_graph, config, repo_path);
-            stamp_manifest_anchor_symbols(&mut manifest_entries, &merged_results);
+            stamp_manifest_anchor_symbols(&mut manifest_entries, &merged_results, repo_path);
             append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
             append_pubsub_manifest_entries(
                 &mut manifest_entries,
@@ -2353,6 +2354,7 @@ fn add_protocol_manifest_entry(
         resolved_definition: None,
         expanded_definition: None,
         primary_type_symbol,
+        defined_in: None,
     });
 }
 
@@ -3401,38 +3403,120 @@ fn build_type_manifest_entries(
 /// (`parse_file_location`): a non-positive/missing line collapses to `1`. Keying
 /// a line-0 anchor at `0` would never join a manifest entry (always `>= 1`), so
 /// the anchor would silently fall back to the hashed `type_alias`.
+/// The anchor a file-analyzer result stated for one source site: the symbol,
+/// and the import specifier the file brought it in through.
+struct AnchorAtSite {
+    symbol: String,
+    import_source: Option<String>,
+}
+
 fn stamp_manifest_anchor_symbols(
     manifest: &mut [TypeManifestEntry],
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    repo_path: &str,
 ) {
     // Mirror `parse_file_location`'s `Some(0) | None => 1` normalization so the
     // join keys line up on both sides.
     let normalize_line = |line: i32| -> u32 { if line <= 0 { 1 } else { line as u32 } };
-    // (file_path, line_number) -> primary_type_symbol, from endpoints and calls.
-    let mut symbols: HashMap<(String, u32), String> = HashMap::new();
+    // (file_path, line_number) -> the anchor, from endpoints and calls.
+    let mut symbols: HashMap<(String, u32), AnchorAtSite> = HashMap::new();
     for (file_path, result) in file_results {
         for endpoint in &result.endpoints {
             if let Some(symbol) = endpoint.primary_type_symbol.as_ref() {
                 symbols
                     .entry((file_path.clone(), normalize_line(endpoint.line_number)))
-                    .or_insert_with(|| symbol.clone());
+                    .or_insert_with(|| AnchorAtSite {
+                        symbol: symbol.clone(),
+                        import_source: endpoint.type_import_source.clone(),
+                    });
             }
         }
         for call in &result.data_calls {
             if let Some(symbol) = call.primary_type_symbol.as_ref() {
                 symbols
                     .entry((file_path.clone(), normalize_line(call.line_number)))
-                    .or_insert_with(|| symbol.clone());
+                    .or_insert_with(|| AnchorAtSite {
+                        symbol: symbol.clone(),
+                        import_source: call.type_import_source.clone(),
+                    });
             }
         }
     }
     if symbols.is_empty() {
         return;
     }
+    // One parse of a declaring file serves every entry anchored in it, and one
+    // failed resolution is remembered as a failure rather than retried.
+    let mut homes: HashMap<(String, String), Option<crate::cloud_storage::TypeHome>> =
+        HashMap::new();
+    let cm: Lrc<SourceMap> = Default::default();
+    let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
     for entry in manifest.iter_mut() {
-        if let Some(symbol) = symbols.get(&(entry.file_path.clone(), entry.line_number)) {
-            entry.primary_type_symbol = Some(symbol.clone());
-        }
+        let Some(anchor) = symbols.get(&(entry.file_path.clone(), entry.line_number)) else {
+            continue;
+        };
+        entry.primary_type_symbol = Some(anchor.symbol.clone());
+        entry.defined_in = homes
+            .entry((entry.file_path.clone(), anchor.symbol.clone()))
+            .or_insert_with(|| {
+                anchor_declaration_site(&entry.file_path, anchor, repo_path, &cm, &handler)
+            })
+            .clone();
+    }
+}
+
+/// Where the file that USES an anchor says the anchor is declared, confirmed
+/// against the declaring file's own AST (carrick#649).
+///
+/// The import specifier the analyzer recorded is resolved exactly as the type
+/// sidecar's own `SymbolRequest` resolves it (`resolve_import_path`), so the
+/// two agree on which file the symbol was expected in. A specifier that names
+/// no file on disk resolves to a path that does not exist and is dropped here
+/// rather than reported; so is a file that turns out not to declare the symbol,
+/// which is what a barrel re-export looks like from the outside.
+///
+/// With no import specifier the symbol is declared in the using file itself, if
+/// anywhere — and the declaration line is still worth stating, because the
+/// entry's own `line_number` is the operation's line, not the type's.
+fn anchor_declaration_site(
+    using_file: &str,
+    anchor: &AnchorAtSite,
+    repo_path: &str,
+    cm: &Lrc<SourceMap>,
+    handler: &Handler,
+) -> Option<crate::cloud_storage::TypeHome> {
+    let using_absolute = absolute_source_path(using_file, repo_path);
+    let declaring = match anchor.import_source.as_deref() {
+        Some(source) => PathBuf::from(
+            crate::agents::file_orchestrator::FileOrchestrator::resolve_import_path(
+                &using_absolute.to_string_lossy(),
+                source,
+            ),
+        ),
+        None => using_absolute,
+    };
+    if !declaring.is_file() {
+        return None;
+    }
+    let line =
+        crate::type_manifest::type_declaration_line(&declaring, &anchor.symbol, cm, handler)?;
+    Some(crate::cloud_storage::TypeHome {
+        file_path: repo_relative(&declaring.to_string_lossy(), repo_path),
+        line_number: line,
+        symbol: anchor.symbol.clone(),
+    })
+}
+
+/// A manifest `file_path` as an absolute path on disk. The manifest carries
+/// whatever form the mount graph's `file_location` had, which is repo-relative
+/// for an uploaded blob and absolute for a live pass; joining an already
+/// absolute path onto the root is a no-op, so one branch covers both.
+fn absolute_source_path(file_path: &str, repo_path: &str) -> PathBuf {
+    let path = Path::new(file_path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        Path::new(repo_path).join(path)
     }
 }
 
@@ -3481,6 +3565,7 @@ fn add_manifest_pair(
             // Threaded on after the fact by `stamp_manifest_anchor_symbols`,
             // which joins the LLM's real anchor symbol by `(file_path, line)`.
             primary_type_symbol: None,
+            defined_in: None,
         });
     }
 }
@@ -3775,7 +3860,11 @@ async fn analyze_current_repo(
 
     let mut manifest_entries =
         build_type_manifest_entries(&analysis_result.mount_graph, config, repo_path);
-    stamp_manifest_anchor_symbols(&mut manifest_entries, &analysis_result.file_results);
+    stamp_manifest_anchor_symbols(
+        &mut manifest_entries,
+        &analysis_result.file_results,
+        repo_path,
+    );
     append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
     append_pubsub_manifest_entries(
         &mut manifest_entries,
@@ -4304,6 +4393,7 @@ mod tests {
             service_name: None,
             host: None,
             line: Some(313),
+            base: None,
         });
 
         let mut function_definitions = HashMap::new();
@@ -4394,6 +4484,7 @@ mod tests {
                 )),
                 expanded_definition: Some(format!("import(\"{}\").Order", abs("src/types/order"))),
                 primary_type_symbol: None,
+                defined_in: None,
             }]),
             file_results: Some(file_results),
             cached_detection: None,
@@ -4760,6 +4851,7 @@ mod tests {
                     type_import_source: None,
 
                     loopback_default_url: None,
+                    base: None,
                 })
                 .collect(),
             graphql_operations: vec![],
@@ -4801,6 +4893,7 @@ mod tests {
                 service_name: None,
                 host: None,
                 line: None,
+                base: None,
             }
         };
         let mut mount_graph = MountGraph::new();
@@ -4937,6 +5030,7 @@ mod tests {
             service_name: None,
             host: None,
             line: None,
+            base: None,
         }];
 
         let entries = build_type_manifest_entries(&mount_graph, &config, ".");
@@ -5832,6 +5926,7 @@ mod tests {
                 service_name: None,
                 host: Some("api.vendor.test".to_string()),
                 line: Some(12),
+                base: None,
             },
             crate::mount_graph::DataFetchingCall {
                 method: "GET".to_string(),
@@ -5844,6 +5939,7 @@ mod tests {
                 service_name: None,
                 host: None,
                 line: Some(7),
+                base: None,
             },
         ];
 
@@ -6295,6 +6391,7 @@ mod tests {
             resolved_definition: None,
             expanded_definition: None,
             primary_type_symbol: None,
+            defined_in: None,
         }
     }
 
@@ -6594,6 +6691,7 @@ mod tests {
             service_name: None,
             host: None,
             line: None,
+            base: None,
         }
     }
 
@@ -6647,6 +6745,7 @@ mod tests {
             service_name: None,
             host: None,
             line: None,
+            base: None,
         }];
         let graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],

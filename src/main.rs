@@ -2,6 +2,7 @@ mod agent_service;
 mod agents;
 mod analyzer;
 mod app_context;
+mod call_base;
 mod call_graph;
 mod call_site_extractor;
 mod cloud_storage;

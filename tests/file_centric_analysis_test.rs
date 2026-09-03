@@ -147,6 +147,7 @@ fn test_file_analysis_result_structures() {
         type_import_source: None,
 
         loopback_default_url: None,
+        base: None,
     };
     assert_eq!(data_call.target, "https://api.example.com/users");
     assert_eq!(data_call.method, Some("POST".to_string()));
@@ -229,6 +230,7 @@ fn test_file_analysis_result_serialization() {
             type_import_source: None,
 
             loopback_default_url: None,
+            base: None,
         }],
     };
 
@@ -540,6 +542,7 @@ fn test_data_call_extraction() {
                 type_import_source: None,
 
                 loopback_default_url: None,
+                base: None,
             },
             DataCallResult {
                 call_kind: None,
@@ -558,6 +561,7 @@ fn test_data_call_extraction() {
                 type_import_source: None,
 
                 loopback_default_url: None,
+                base: None,
             },
             DataCallResult {
                 call_kind: None,
@@ -576,6 +580,7 @@ fn test_data_call_extraction() {
                 type_import_source: None,
 
                 loopback_default_url: None,
+                base: None,
             },
         ],
     };

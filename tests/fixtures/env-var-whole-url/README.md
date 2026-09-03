@@ -1,7 +1,9 @@
 # `env-var-whole-url`
 
 Fixture for carrick#572: a request whose WHOLE URL is read from an environment
-variable, passed to `fetch` as a binding.
+variable, passed to `fetch` as a binding. Extended for carrick#649, which needs
+the same rows to say how each call's base RESOLVES and where an anchor type is
+DECLARED.
 
 ## The shape
 
@@ -27,6 +29,19 @@ index held for the call carrick#632 was filed from, and it is the case the #633
 emission never reached: the row covered the site, so nothing was emitted, and
 the call stayed keyed on an env-var origin.
 
+`src/ledger.ts` holds the four base shapes carrick#649 needs told apart, one per
+call: a base injected as a constructor option, a bare relative path, an
+environment variable defaulting to a THIRD-PARTY origin, and an environment
+variable the repo's schema declares optional with no default. The first also
+anchors an imported response type, for the declaration-site half of that issue.
+
+`src/config/env.ts` is the environment schema those declarations live in. It
+defines no route and makes no request, so it raises no candidate and the
+analyzer never sees it — the declarations reach a call in another file only
+because the schema read is repo-wide. `src/types.ts` declares `LedgerEntry` for
+the same reason: the anchor has to be somewhere other than the call site for the
+declaration site to be a different answer from the operation's own.
+
 ## The answer key
 
 | site | target | key |
@@ -35,6 +50,27 @@ the call stayed keyed on an env-var origin.
 | `helpdesk.ts:20` | `GET ${process.env.CATALOG_URL}/api/v1/items` | `${process.env.CATALOG_URL}/api/v1/items` |
 | `toolset.ts:12` | `POST ${process.env.SERVICE_ASK_URL}/api/ask` | `/api/ask` |
 | `answered.ts:11` | `POST ${process.env.SUPPORT_ASK_URL}/api/ask` | `/api/ask` |
+| `ledger.ts:12` | `GET ${this.opts.lookupUrl}/api/lookup` | `/api/lookup` |
+| `ledger.ts:22` | `GET /api/entries` | `/api/entries` |
+| `ledger.ts:31` | `POST ${process.env.GATEWAY_URL}/v1/quote` | `${process.env.GATEWAY_URL}/v1/quote` |
+| `ledger.ts:40` | `POST ${process.env.KNOWLEDGE_URL}/api/knowledge` | `${process.env.KNOWLEDGE_URL}/api/knowledge` |
+
+The `base` each row carries, which changes no key:
+
+| site | kind | env var | fallback | loopback | declared optional |
+|---|---|---|---|---|---|
+| `helpdesk.ts:7` | env | `HELPDESK_URL` | `http://localhost:7100/api/answer` | yes | — |
+| `helpdesk.ts:20` | env | `CATALOG_URL` | `http://localhost:4001` | yes | — |
+| `toolset.ts:12` | env | `SERVICE_ASK_URL` | `http://localhost:3939/api/ask` | yes | — |
+| `answered.ts:11` | env | `SUPPORT_ASK_URL` | `http://localhost:3939/api/ask` | yes | — |
+| `ledger.ts:12` | injected | — | — | no | — |
+| `ledger.ts:22` | relative | — | — | no | — |
+| `ledger.ts:31` | env | `GATEWAY_URL` | `https://api.example.com/v1/quote` | no | no |
+| `ledger.ts:40` | env | `KNOWLEDGE_URL` | — | no | yes |
+
+`ledger.ts:12`'s manifest anchor is `LedgerEntry`, used at `src/ledger.ts:12`
+and DECLARED at `src/types.ts:4`. Those are two different answers, which is the
+point.
 
 Every env var here is undeclared, so every row is an unmatched call and no match
 is claimed for any of them. The three whole-URL calls key on the route they
@@ -64,6 +100,16 @@ this shape: the right line and the right method, with the binding paraphrased as
 `${SUPPORT_ASK_URL}/api/ask`. Nothing about it is a hallucination — it is simply
 not the spelling the pipeline resolves env vars through, and it carries nothing
 about the origin the source defaults to.
+
+`__llm__/analyze-file/ledger.json` holds an ordinary answer for all four of that
+file's calls — nothing about the base is the model's to state, so the cassette
+says only what any extraction would. Its first row carries the anchor symbol and
+the import specifier, which is where the declaration site is resolved from.
+
+`__llm__/analyze-file/env.json` and `__llm__/analyze-file/types.json` are empty
+for the same reason `toolset.json` must exist at all: with no cassette for a
+file the mock falls back to a schema-generated response, and the test would stop
+measuring the scanner.
 
 Line numbers in each cassette's `@line:` placeholders reference exact source
 lines in the file it answers for. Re-count them after any edit to those files.

@@ -106,6 +106,33 @@ pub struct TypeManifestEntry {
     /// model emitted no anchor for this op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_type_symbol: Option<String>,
+    /// Where the entry's anchor symbol is DECLARED (carrick#649).
+    ///
+    /// `file_path`/`line_number` above are the site the operation was extracted
+    /// at — a route file's `satisfies GetLookupResponseBody`, or the import line
+    /// that brought the symbol in. That is where the type is USED, and a reader
+    /// answering "where is this type defined" from it answers wrongly. This
+    /// states the declaration itself, resolved from the import the file wrote
+    /// and confirmed against the declaring file's own AST.
+    ///
+    /// `None` whenever the scanner cannot see a declaration: an anchor with no
+    /// symbol, an import that resolves to no file on disk (a package, a
+    /// tsconfig path the scanner does not follow), a barrel re-export, or a
+    /// symbol the resolved file does not itself declare. Never a guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defined_in: Option<TypeHome>,
+}
+
+/// The declaration site of a manifest entry's anchor symbol (carrick#649).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TypeHome {
+    /// Repo-root-relative path of the file that DECLARES the symbol, in the
+    /// same form the rest of the manifest's paths take.
+    pub file_path: String,
+    /// 1-based line of the declaration.
+    pub line_number: u32,
+    /// The declared symbol, named as the declaring file names it.
+    pub symbol: String,
 }
 
 /// A persisted per-pair type-compatibility verdict, keyed by CANONICAL pair
@@ -851,6 +878,7 @@ mod tests {
             resolved_definition: None,
             expanded_definition: None,
             primary_type_symbol: None,
+            defined_in: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&entry).unwrap();

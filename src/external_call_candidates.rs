@@ -3439,6 +3439,7 @@ mod tests {
                 service_name: None,
                 host: host.map(str::to_string),
                 line,
+                base: None,
             }
         }
 

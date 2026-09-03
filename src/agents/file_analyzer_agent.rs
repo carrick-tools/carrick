@@ -203,6 +203,17 @@ pub struct DataCallResult {
     /// [`crate::env_alias::whole_url_local_default`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loopback_default_url: Option<String>,
+    /// How this call's BASE resolves (carrick#649): the expression it was
+    /// written against, whether that expression reads the environment, and the
+    /// default the source states for it.
+    ///
+    /// Never from the model — stamped by `stamp_call_bases` from the file's own
+    /// AST once every base-resolution pass has run, so it reads the SAME target
+    /// the row persists. Absent when the target's base is not one the scanner
+    /// reads (a literal absolute origin, an unreadable base slot). See
+    /// [`crate::call_base::CallBaseResolution`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<crate::call_base::CallBaseResolution>,
 }
 
 /// A GraphQL resolver the file-analyzer found: the schema field it answers and
@@ -1501,6 +1512,7 @@ mod tests {
             type_import_source: None,
 
             loopback_default_url: None,
+            base: None,
         };
 
         let json = serde_json::to_string(&data_call).unwrap();
@@ -1552,6 +1564,7 @@ mod tests {
                 type_import_source: Some("bad import (oops)".to_string()),
 
                 loopback_default_url: None,
+                base: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -1909,6 +1922,7 @@ mod tests {
                 type_import_source: None,
 
                 loopback_default_url: None,
+                base: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -1961,6 +1975,7 @@ mod tests {
             primary_type_symbol: None,
             type_import_source: None,
             loopback_default_url: None,
+            base: None,
         }
     }
 
