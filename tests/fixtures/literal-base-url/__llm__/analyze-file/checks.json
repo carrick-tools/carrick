@@ -1,0 +1,32 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:8",
+      "line_number": 8,
+      "target": "${ADMIN_API}/status",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${ADMIN_API}/status`)",
+      "call_expression_line": 8,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:10",
+      "line_number": 10,
+      "target": "${APP_URL}/api/v1/whoami",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${APP_URL}/api/v1/whoami`, { headers })",
+      "call_expression_line": 10,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

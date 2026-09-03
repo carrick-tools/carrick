@@ -72,6 +72,24 @@ pub type EnvAliasMap = HashMap<String, String>;
 /// that literal, and without it the call is dropped for having no route shape.
 pub type WholeUrlPathMap = HashMap<String, String>;
 
+/// Maps a module-level binding name to the absolute URL literal it was declared
+/// with (`https://api.example.com` for `const BASE = "https://api.example.com"`).
+///
+/// A base declared once as a plain literal and interpolated at the call
+/// (`fetch(`${BASE}/api/v1/whoami`)`) is the only base shape the scanner left
+/// unresolved: an env-var base resolves through [`EnvAliasMap`] and a member
+/// expression (`${this.baseUrl}/…`) is carried as-is, but the identifier kept
+/// its `${BASE}` prefix, so the canonical key never reduced to the route path
+/// and the call matched nothing (carrick#627).
+pub type LiteralBaseMap = HashMap<String, String>;
+
+/// The URL-shaped bindings one module declares, all read off the same walk.
+pub struct UrlBindings {
+    pub aliases: EnvAliasMap,
+    pub whole_url_paths: WholeUrlPathMap,
+    pub literal_bases: LiteralBaseMap,
+}
+
 /// Visitor that collects `const/let/var X = process.env.NAME [?? default]`
 /// bindings — and object-literal config properties
 /// (`const config = { url: process.env.NAME }`, recorded under the dotted key
@@ -91,15 +109,55 @@ pub struct EnvAliasExtractor {
 impl EnvAliasExtractor {
     /// Build the alias map for a parsed module.
     pub fn build(module: &Module) -> EnvAliasMap {
-        Self::build_with_paths(module).0
+        Self::build_bindings(module).aliases
     }
 
-    /// Build the alias map and the whole-URL fallback paths together.
-    pub fn build_with_paths(module: &Module) -> (EnvAliasMap, WholeUrlPathMap) {
+    /// Build every URL-shaped binding the module declares.
+    pub fn build_bindings(module: &Module) -> UrlBindings {
         let mut extractor = EnvAliasExtractor::default();
         module.visit_with(&mut extractor);
-        (extractor.aliases, extractor.whole_url_paths)
+        UrlBindings {
+            aliases: extractor.aliases,
+            whole_url_paths: extractor.whole_url_paths,
+            literal_bases: module_literal_bases(module),
+        }
     }
+}
+
+/// The absolute URL literals a module declares at its TOP LEVEL, exported or
+/// not (carrick#627).
+///
+/// Module level, and not one statement deeper, because the map is keyed on the
+/// binding name alone and a name is only unambiguous where there is one of it.
+/// A URL literal held in a function-local `const url = "https://…"` is common
+/// enough that two functions in one file will each have their own, and a flat
+/// map would resolve one function's call against the other's host. A
+/// module-level const is the base every call in the file shares, which is the
+/// shape this reads and the only one where the name settles the value.
+fn module_literal_bases(module: &Module) -> LiteralBaseMap {
+    let mut bases = LiteralBaseMap::new();
+    for item in &module.body {
+        let var_decl = match item {
+            ModuleItem::Stmt(Stmt::Decl(Decl::Var(var_decl))) => var_decl,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => match &export.decl {
+                Decl::Var(var_decl) => var_decl,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        for decl in &var_decl.decls {
+            let Pat::Ident(binding) = &decl.name else {
+                continue;
+            };
+            let Some(init) = &decl.init else {
+                continue;
+            };
+            if let Some(base) = absolute_url_literal(init) {
+                bases.insert(binding.id.sym.to_string(), base);
+            }
+        }
+    }
+    bases
 }
 
 impl Visit for EnvAliasExtractor {
@@ -433,6 +491,46 @@ pub fn resolve_target_env_alias(target: &str, aliases: &EnvAliasMap) -> Option<S
     ))
 }
 
+/// Rewrite a leading `${BASE}` in a call target to the absolute URL literal
+/// `BASE` was declared with, so the target states the same request the
+/// absolute-host form does (carrick#627).
+///
+/// `const BASE = "https://api.example.com"` followed by
+/// `fetch(`${BASE}/api/v1/whoami`)` is one request to `/api/v1/whoami` on a
+/// host the file names outright. Left unresolved, the `${BASE}` prefix stays in
+/// the target, the canonical key never reduces to the route path, and the call
+/// matches no producer and reaches no query surface.
+///
+/// Same walk as [`resolve_target_env_alias`], and the same restriction to the
+/// LEADING interpolation: that is the base-URL slot, where a mid-path `${id}`
+/// is a path parameter. Only a base declared in the same file is read; one
+/// imported from another module is not, for the same reason re-export chains
+/// are not followed. Returns `None` when nothing was rewritten.
+pub fn resolve_target_literal_base(target: &str, bases: &LiteralBaseMap) -> Option<String> {
+    if bases.is_empty() {
+        return None;
+    }
+
+    // The analyzer/normalizer trim wrapper backticks/quotes themselves, but the
+    // base sits at the very front, so peek past any leading wrapper char.
+    let trimmed = target.trim_start_matches(['`', '"', '\'']);
+    let rest = trimmed.strip_prefix("${")?;
+    let end = rest.find('}')?;
+    let base = bases.get(&rest[..end])?;
+
+    let prefix_len = target.len() - trimmed.len();
+    let after_brace = &rest[end + 1..];
+    // One slash at the join. A base written with a trailing slash and a path
+    // written with a leading one is the same URL either way; anything else is
+    // concatenated exactly as the source concatenates it.
+    let base = if after_brace.starts_with('/') {
+        base.trim_end_matches('/')
+    } else {
+        base.as_str()
+    };
+    Some(format!("{}{}{}", &target[..prefix_len], base, after_brace))
+}
+
 /// The path stated by an env read's fallback URL literal, when the fallback is
 /// an absolute URL that carries one.
 ///
@@ -453,6 +551,22 @@ fn fallback_url_path(expr: &Expr) -> Option<String> {
     let slash = after_scheme.find('/')?;
     let path = &after_scheme[slash..];
     (path.len() > 1).then(|| path.to_string())
+}
+
+/// The value of an initializer that is an absolute URL string literal.
+///
+/// Narrow on purpose. A scheme and a host is what makes the value unambiguously
+/// an origin, so splicing it into the base slot of a target says exactly what
+/// the source says. Any other literal (`"/api/v1"`, a flag, a name) would be
+/// spliced into the same slot on the strength of the binding's position alone,
+/// which is a guess, and an interpolated literal states no fixed origin at all.
+fn absolute_url_literal(expr: &Expr) -> Option<String> {
+    let literal = string_literal(expr)?;
+    let after_scheme = literal
+        .strip_prefix("http://")
+        .or_else(|| literal.strip_prefix("https://"))?;
+    // A scheme with no host behind it is not an origin.
+    (!after_scheme.trim().is_empty() && !after_scheme.starts_with('/')).then_some(literal)
 }
 
 /// The value of a plain string literal, ignoring template literals: a fallback
@@ -524,6 +638,89 @@ mod tests {
         EnvAliasExtractor::build(&module)
     }
 
+    fn build_literal_bases(source: &str) -> LiteralBaseMap {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = tmp_dir.path().join("input.ts");
+        std::fs::write(&file_path, source).expect("write file");
+
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(cm.clone()));
+        let module = parse_file(&file_path, &cm, &handler).expect("parsed module");
+
+        EnvAliasExtractor::build_bindings(&module).literal_bases
+    }
+
+    #[test]
+    fn a_literal_base_resolves_to_the_url_it_was_declared_with() {
+        let bases = build_literal_bases(r#"const BASE = "https://api.example.com";"#);
+        assert_eq!(
+            resolve_target_literal_base("`${BASE}/api/v1/whoami`", &bases).as_deref(),
+            Some("`https://api.example.com/api/v1/whoami`"),
+            "the base slot states an origin, and the rest of the target is verbatim"
+        );
+    }
+
+    #[test]
+    fn a_literal_base_joins_on_one_slash() {
+        let bases = build_literal_bases(r#"const BASE = "http://localhost:30303/";"#);
+        assert_eq!(
+            resolve_target_literal_base("${BASE}/api/v1/whoami", &bases).as_deref(),
+            Some("http://localhost:30303/api/v1/whoami")
+        );
+        assert_eq!(
+            resolve_target_literal_base("${BASE}api/v1/whoami", &bases).as_deref(),
+            Some("http://localhost:30303/api/v1/whoami"),
+            "a path with no leading slash is concatenated as the source concatenates it"
+        );
+    }
+
+    #[test]
+    fn only_an_absolute_url_literal_is_read_as_a_base() {
+        let bases = build_literal_bases(
+            r#"const PREFIX = "/api/v1";
+               const NAME = "orders-service";
+               const SCHEME_ONLY = "https://";
+               const TEMPLATED = `https://${host}`;"#,
+        );
+        assert!(
+            bases.is_empty(),
+            "a path, a name, a scheme with no host, and an interpolated literal \
+             all state no origin: {bases:?}"
+        );
+    }
+
+    #[test]
+    fn a_function_local_url_literal_is_not_read_as_a_base() {
+        let bases = build_literal_bases(
+            r#"export function first() { const url = "https://one.example.com"; return url; }
+               export function second() { const url = "https://two.example.com"; return url; }"#,
+        );
+        assert!(
+            bases.is_empty(),
+            "the map is keyed on the name alone, and a function-local name is \
+             not unique in a file: {bases:?}"
+        );
+    }
+
+    #[test]
+    fn an_exported_module_level_literal_is_read_as_a_base() {
+        let bases = build_literal_bases(r#"export const BASE = "https://api.example.com";"#);
+        assert_eq!(
+            bases.get("BASE").map(String::as_str),
+            Some("https://api.example.com")
+        );
+    }
+
+    #[test]
+    fn a_literal_base_rule_leaves_a_mid_path_interpolation_alone() {
+        let bases = build_literal_bases(r#"const BASE = "https://api.example.com";"#);
+        assert_eq!(
+            resolve_target_literal_base("/api/v1/things/${BASE}", &bases),
+            None,
+            "only the leading interpolation is the base slot"
+        );
+    }
+
     fn build_both(source: &str) -> (EnvAliasMap, WholeUrlPathMap) {
         let tmp_dir = tempfile::tempdir().expect("tempdir");
         let file_path = tmp_dir.path().join("input.ts");
@@ -533,7 +730,8 @@ mod tests {
         let handler = Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(cm.clone()));
         let module = parse_file(&file_path, &cm, &handler).expect("parsed module");
 
-        EnvAliasExtractor::build_with_paths(&module)
+        let bindings = EnvAliasExtractor::build_bindings(&module);
+        (bindings.aliases, bindings.whole_url_paths)
     }
 
     #[test]
