@@ -55,7 +55,7 @@ use crate::{
     },
     url_normalizer::UrlNormalizer,
     visitor::{ImportSymbolExtractor, ImportedSymbol, SymbolKind, TypeSymbolExtractor},
-    wrapper_request_shape::{self, WrapperRequestShape},
+    wrapper_request_shape::{self, RequestShapeSignal, WrapperRequestShape},
 };
 use futures::stream::StreamExt;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -149,6 +149,10 @@ pub struct ProcessingStats {
     /// in because extraction returned no row for their site at all
     /// (carrick#623). A subset of `total_data_calls`.
     pub imported_member_backfills: usize,
+    /// Outbound calls whose whole URL is read from an environment variable and
+    /// merged in because extraction returned no row for their site at all
+    /// (carrick#632). A subset of `total_data_calls`.
+    pub whole_url_env_backfills: usize,
     /// Wrapper-resolved data calls whose HTTP method was corrected from what
     /// extraction gave them to the method their wrapper module hardcodes
     /// (carrick-cloud#386). A subset of `total_data_calls`.
@@ -1480,6 +1484,25 @@ impl FileOrchestrator {
                         &pf.env_alias_map,
                         &pf.whole_url_paths,
                     );
+                    // Then emit the whole-URL sites that resolution had no row
+                    // to rewrite (carrick#632). Immediately after the rewrite
+                    // above, so both sides of the coverage test are in the
+                    // resolved `${process.env.NAME}/path` form and nothing a
+                    // later pass appends is read as covering a site.
+                    //
+                    // The general rule these three backfills share: a pass
+                    // that fully resolves a candidate must EMIT, not only
+                    // patch. Patching is enough while extraction is wrong
+                    // about a site; it does nothing at all when extraction is
+                    // silent about it, which is the more common failure and
+                    // the one that leaves the endpoint absent from the index
+                    // rather than merely mis-stated.
+                    stats.whole_url_env_backfills += Self::merge_whole_url_env_calls(
+                        &mut adjusted,
+                        &pf.candidate_map,
+                        &pf.env_alias_map,
+                        &pf.whole_url_paths,
+                    );
                     Self::validate_type_hints(&mut adjusted, &pf.symbol_table);
                     Self::normalize_unusable_types(&mut adjusted, &framework_detection.frameworks);
 
@@ -1633,6 +1656,10 @@ impl FileOrchestrator {
         debug!(
             "  - Imported-member call backfills: {}",
             stats.imported_member_backfills
+        );
+        debug!(
+            "  - Whole-URL env-var call backfills: {}",
+            stats.whole_url_env_backfills
         );
         debug!(
             "  - Wrapper method propagations: {}",
@@ -4600,6 +4627,140 @@ impl FileOrchestrator {
                 // Classification is judgment, not an AST fact: the target is
                 // the member's own URL expression, with no host to classify
                 // from beyond what the member closes over.
+                call_kind: None,
+                pattern_matched: candidate
+                    .callee_property
+                    .clone()
+                    .unwrap_or_else(|| candidate.callee_object.clone()),
+                // The span is what the type sidecar anchors on, and it is also
+                // what marks this call candidate-backed downstream.
+                call_expression_span_start: Some(candidate.span_start),
+                call_expression_span_end: Some(candidate.span_end),
+                call_expression_text: None,
+                call_expression_line: Some(line),
+                payload_expression_text: None,
+                payload_expression_line: None,
+                primary_type_symbol: None,
+                type_import_source: None,
+            });
+            added += 1;
+        }
+        added
+    }
+
+    /// Emit the whole-URL environment-variable calls whose sites extraction
+    /// returned no row for at all (carrick#632).
+    ///
+    /// `resolve_env_var_aliases` above only REWRITES a row that already
+    /// exists, so the resolution #604 added is lost whenever the analyzer
+    /// answered nothing for the site. That happens wherever the request is
+    /// buried — an arrow function that is a property of an object literal
+    /// handed to a factory call, say — because the site states no path and the
+    /// file may state none anywhere outside the fallback literal, so there is
+    /// nothing for the model to answer with. The call is then absent from the
+    /// index entirely: not a matched edge, not an unmatched call, not an
+    /// egress candidate.
+    ///
+    /// Every part of the row is a literal in the source. The binding's env var
+    /// and the path inside its `??` fallback are what
+    /// [`resolve_whole_url_target`] reads, the method is the literal in the
+    /// call's own options bag, and the span is an AST fact — the same standing
+    /// as `merge_local_wrapper_calls` and `merge_imported_member_calls`, whose
+    /// coverage test and row shape this mirrors.
+    ///
+    /// Two narrowings keep it to what the source states outright:
+    ///
+    /// - Only a call the AST reads as a REQUEST with a literal method
+    ///   qualifies. A bare binding is passed to plenty of things that are not
+    ///   requests (`new URL(url)`, a logger), and joining on the binding name
+    ///   alone would invent a call at every one of them.
+    /// - A request whose method cannot be read as a literal
+    ///   (`fetch(url, { headers })`, or a parameterized `{ method }`) is left
+    ///   alone rather than emitted with a guessed verb. That shape stays
+    ///   extraction's to answer.
+    fn merge_whole_url_env_calls(
+        result: &mut FileAnalysisResult,
+        candidate_map: &HashMap<String, CandidateTarget>,
+        aliases: &EnvAliasMap,
+        paths: &WholeUrlPathMap,
+    ) -> usize {
+        if paths.is_empty() {
+            return 0;
+        }
+        // The map iterates in hash order; emit in source order so a scan of
+        // the same file always produces the same rows.
+        let mut sites: Vec<(&CandidateTarget, String, String)> = candidate_map
+            .values()
+            .filter(|candidate| candidate.protocol == Protocol::Http)
+            .filter_map(|candidate| {
+                // The method has to be the call's own literal: see above.
+                let RequestShapeSignal::Known(shape) = &candidate.request_shape else {
+                    return None;
+                };
+                let target =
+                    resolve_whole_url_target(candidate.path_snippet.as_deref()?, aliases, paths)?;
+                Some((candidate, shape.method.clone(), target))
+            })
+            .collect();
+        sites.sort_by_key(|(candidate, _, _)| candidate.span_start);
+
+        // Only rows extraction produced can cover a site. Reading the vector
+        // as it grows would let the first backfill of a line suppress its
+        // siblings — two resolved sites on one line are two calls.
+        let extracted = result.data_calls.len();
+        let mut added = 0;
+        for (candidate, method, target) in sites {
+            // A site extraction answered as an ENDPOINT is answered. One
+            // candidate map holds route registrations as well as calls, and a
+            // route mounted at a whole URL read from an environment variable
+            // is a route the file DEFINES, not a call it makes.
+            if result
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.call_expression_span_start == Some(candidate.span_start))
+            {
+                continue;
+            }
+            let line = i32::try_from(candidate.line_number).unwrap_or(i32::MAX);
+            let ours = normalize_path_params(&target);
+            let covered = result.data_calls[..extracted].iter().any(|data_call| {
+                if data_call.call_expression_span_start == Some(candidate.span_start)
+                    || data_call.line_number == line
+                    || data_call.call_expression_line == Some(line)
+                {
+                    return true;
+                }
+                let method_agrees = match data_call.method.as_deref() {
+                    Some(theirs) => theirs.trim().eq_ignore_ascii_case(&method),
+                    // An unstated method cannot separate them.
+                    None => true,
+                };
+                let theirs = normalize_path_params(&data_call.target);
+                // An empty target states no path, so it carries nothing: the
+                // suffix test would otherwise read it as covering everything.
+                !theirs.trim().is_empty()
+                    && method_agrees
+                    && (Self::target_carries_url(&theirs, &ours)
+                        || Self::target_carries_url(&ours, &theirs))
+            });
+            if covered {
+                continue;
+            }
+            debug!(
+                "Backfilling whole-URL env-var call the extraction returned no row for: {} {} at line {}",
+                method, target, candidate.line_number
+            );
+            result.data_calls.push(DataCallResult {
+                candidate_id: format!(
+                    "whole-url-env:{}-{}",
+                    candidate.span_start, candidate.span_end
+                ),
+                line_number: line,
+                target,
+                method: Some(method),
+                // Classification is judgment, not an AST fact: the origin is
+                // whatever the environment supplies, and the fallback's host
+                // says nothing about the deployed one.
                 call_kind: None,
                 pattern_matched: candidate
                     .callee_property
@@ -10872,6 +11033,181 @@ export { routes };
 
         let added =
             FileOrchestrator::merge_imported_member_calls(&mut result, &resolved, &candidate_map);
+
+        assert_eq!(added, 0);
+        assert!(result.data_calls.is_empty());
+    }
+
+    /// A site that passes a whole-URL env-var binding straight to a request,
+    /// with the method stated as a literal in its own options bag.
+    fn whole_url_site(binding: &str, method: &str) -> HashMap<String, CandidateTarget> {
+        let mut candidate = candidate_with_snippet("c1", Some(binding));
+        candidate.callee_object = "fetch".to_string();
+        candidate.callee_property = None;
+        candidate.request_shape = RequestShapeSignal::Known(WrapperRequestShape {
+            method: method.to_string(),
+            has_body: Some(true),
+        });
+        HashMap::from([("c1".to_string(), candidate)])
+    }
+
+    fn whole_url_maps(binding: &str, env_name: &str, path: &str) -> (EnvAliasMap, WholeUrlPathMap) {
+        (
+            EnvAliasMap::from([(binding.to_string(), env_name.to_string())]),
+            WholeUrlPathMap::from([
+                (binding.to_string(), path.to_string()),
+                (env_name.to_string(), path.to_string()),
+            ]),
+        )
+    }
+
+    /// carrick#632: `resolve_env_var_aliases` can only rewrite a row that
+    /// already exists, so a whole-URL env-var call whose site extraction
+    /// answered nothing for was dropped and the endpoint it reaches was absent
+    /// from the index entirely.
+    #[test]
+    fn merge_whole_url_env_calls_emits_a_site_extraction_returned_no_row_for() {
+        let mut result = FileAnalysisResult::default();
+        let candidate_map = whole_url_site("askUrl", "POST");
+        let (aliases, paths) = whole_url_maps("askUrl", "SERVICE_ASK_URL", "/api/ask");
+
+        let added = FileOrchestrator::merge_whole_url_env_calls(
+            &mut result,
+            &candidate_map,
+            &aliases,
+            &paths,
+        );
+
+        assert_eq!(added, 1);
+        assert_eq!(
+            result.data_calls[0].target, "${process.env.SERVICE_ASK_URL}/api/ask",
+            "the env var supplies the origin and the fallback literal the path"
+        );
+        assert_eq!(result.data_calls[0].method.as_deref(), Some("POST"));
+        assert_eq!(result.data_calls[0].candidate_id, "whole-url-env:100-140");
+        // The span is the SITE's: it anchors the type sidecar and marks the
+        // call candidate-backed downstream.
+        assert_eq!(result.data_calls[0].call_expression_span_start, Some(100));
+        assert_eq!(result.data_calls[0].call_expression_span_end, Some(140));
+        assert_eq!(result.data_calls[0].line_number, 12);
+        assert_eq!(result.data_calls[0].pattern_matched, "fetch");
+    }
+
+    /// A site extraction DID answer keeps the analyzer's row, which the
+    /// resolution has already corrected by this point: same span, same line,
+    /// or the same path already carried behind a base.
+    #[test]
+    fn merge_whole_url_env_calls_skips_sites_extraction_already_answered() {
+        let mut answered =
+            data_call_with("c1", "${process.env.SERVICE_ASK_URL}/api/ask", Some("POST"));
+        answered.call_expression_span_start = Some(100);
+        let mut result = FileAnalysisResult {
+            data_calls: vec![answered],
+            ..Default::default()
+        };
+        let candidate_map = whole_url_site("askUrl", "POST");
+        let (aliases, paths) = whole_url_maps("askUrl", "SERVICE_ASK_URL", "/api/ask");
+
+        let added = FileOrchestrator::merge_whole_url_env_calls(
+            &mut result,
+            &candidate_map,
+            &aliases,
+            &paths,
+        );
+
+        assert_eq!(added, 0);
+        assert_eq!(result.data_calls.len(), 1);
+    }
+
+    /// The binding is passed to plenty of things that are not requests
+    /// (`new URL(url)`, a logger). Joining on the binding name alone would
+    /// invent a call at every one of them, so a candidate the AST does not
+    /// read as a request is left alone.
+    #[test]
+    fn merge_whole_url_env_calls_ignores_a_site_that_is_not_a_request() {
+        let mut result = FileAnalysisResult::default();
+        let mut candidate_map = whole_url_site("askUrl", "POST");
+        candidate_map
+            .get_mut("c1")
+            .expect("candidate")
+            .request_shape = RequestShapeSignal::NotARequest;
+        let (aliases, paths) = whole_url_maps("askUrl", "SERVICE_ASK_URL", "/api/ask");
+
+        let added = FileOrchestrator::merge_whole_url_env_calls(
+            &mut result,
+            &candidate_map,
+            &aliases,
+            &paths,
+        );
+
+        assert_eq!(added, 0);
+        assert!(result.data_calls.is_empty());
+    }
+
+    /// A request whose method is not a literal (`fetch(url, { headers })`, or
+    /// a parameterized `{ method }`) would be emitted with a guessed verb.
+    /// That shape stays extraction's to answer.
+    #[test]
+    fn merge_whole_url_env_calls_ignores_a_site_with_no_readable_method() {
+        let mut result = FileAnalysisResult::default();
+        let mut candidate_map = whole_url_site("askUrl", "POST");
+        candidate_map
+            .get_mut("c1")
+            .expect("candidate")
+            .request_shape = RequestShapeSignal::Unreadable;
+        let (aliases, paths) = whole_url_maps("askUrl", "SERVICE_ASK_URL", "/api/ask");
+
+        let added = FileOrchestrator::merge_whole_url_env_calls(
+            &mut result,
+            &candidate_map,
+            &aliases,
+            &paths,
+        );
+
+        assert_eq!(added, 0);
+        assert!(result.data_calls.is_empty());
+    }
+
+    /// One candidate map holds route registrations as well as calls. A route
+    /// mounted at a whole URL the environment supplies is a route the file
+    /// DEFINES, not a call it makes.
+    #[test]
+    fn merge_whole_url_env_calls_leaves_a_route_registration_alone() {
+        let mut endpoint = endpoint_with_candidate("/api/ask", "c1");
+        endpoint.call_expression_span_start = Some(100);
+        let mut result = FileAnalysisResult {
+            endpoints: vec![endpoint],
+            ..Default::default()
+        };
+        let candidate_map = whole_url_site("askUrl", "POST");
+        let (aliases, paths) = whole_url_maps("askUrl", "SERVICE_ASK_URL", "/api/ask");
+
+        let added = FileOrchestrator::merge_whole_url_env_calls(
+            &mut result,
+            &candidate_map,
+            &aliases,
+            &paths,
+        );
+
+        assert_eq!(added, 0);
+        assert!(result.data_calls.is_empty());
+    }
+
+    /// A target that states a path of its own is the base-plus-path shape,
+    /// which already resolves. The whole-URL rule must not fire on it, or the
+    /// path at the call site would be replaced by the fallback's.
+    #[test]
+    fn merge_whole_url_env_calls_leaves_a_base_plus_path_site_alone() {
+        let mut result = FileAnalysisResult::default();
+        let candidate_map = whole_url_site("`${askUrl}/api/other`", "POST");
+        let (aliases, paths) = whole_url_maps("askUrl", "SERVICE_ASK_URL", "/api/ask");
+
+        let added = FileOrchestrator::merge_whole_url_env_calls(
+            &mut result,
+            &candidate_map,
+            &aliases,
+            &paths,
+        );
 
         assert_eq!(added, 0);
         assert!(result.data_calls.is_empty());
