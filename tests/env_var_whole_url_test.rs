@@ -54,7 +54,7 @@ fn call_at(calls: &[serde_json::Value], file: &str, line: i64) -> serde_json::Va
 #[test]
 fn a_whole_url_read_from_an_env_var_is_recorded() {
     let calls = calls();
-    assert_eq!(calls.len(), 4, "one row per call site: {calls:#?}");
+    assert_eq!(calls.len(), 8, "one row per call site: {calls:#?}");
 
     let ask = call_at(&calls, "src/helpdesk.ts", 7);
     assert_eq!(ask["method"], "POST");
@@ -120,4 +120,129 @@ fn a_whole_url_site_the_extraction_answered_wrongly_is_corrected() {
         "the call is findable under the route it requests, the way the same \
          fetch against the fallback literal already was"
     );
+}
+
+/// carrick#649 gap 1: every persisted row says how its base RESOLVES.
+///
+/// The rows below have the same shape as each other on `path` and `target_url`
+/// and different truths about where they go, which is the whole reason the
+/// field exists. Nothing here may change a `path`: the assertions above are the
+/// regression check that the canonical key is untouched.
+#[test]
+fn every_call_states_how_its_base_resolves() {
+    let calls = calls();
+
+    // An environment variable with a LOOPBACK default: the source says the
+    // unconfigured request stays on this machine.
+    let ask = call_at(&calls, "src/helpdesk.ts", 7);
+    assert_eq!(
+        ask["base"],
+        serde_json::json!({
+            "written": "${process.env.HELPDESK_URL}",
+            "kind": "env",
+            "env_var": "HELPDESK_URL",
+            "fallback": "http://localhost:7100/api/answer",
+            "fallback_is_loopback": true,
+        })
+    );
+
+    // The same shape whose fallback carries no path at all — the whole-URL map
+    // drops it, and the base still states it.
+    let items = call_at(&calls, "src/helpdesk.ts", 20);
+    assert_eq!(
+        items["base"],
+        serde_json::json!({
+            "written": "${process.env.CATALOG_URL}",
+            "kind": "env",
+            "env_var": "CATALOG_URL",
+            "fallback": "http://localhost:4001",
+            "fallback_is_loopback": true,
+        })
+    );
+
+    // An environment variable whose default names a THIRD PARTY, and which the
+    // repo's schema declares with a default — so it is never absent.
+    let quote = call_at(&calls, "src/ledger.ts", 31);
+    assert_eq!(
+        quote["base"],
+        serde_json::json!({
+            "written": "${process.env.GATEWAY_URL}",
+            "kind": "env",
+            "env_var": "GATEWAY_URL",
+            "fallback": "https://api.example.com/v1/quote",
+            "fallback_is_loopback": false,
+            "declared_optional": false,
+        }),
+        "the `??` literal is what the call falls back to; the schema's own \
+         default is the second place the source could have said it"
+    );
+
+    // An environment variable the repo's schema declares OPTIONAL with no
+    // default, in a file that makes no call of its own.
+    let knowledge = call_at(&calls, "src/ledger.ts", 40);
+    assert_eq!(
+        knowledge["base"],
+        serde_json::json!({
+            "written": "${process.env.KNOWLEDGE_URL}",
+            "kind": "env",
+            "env_var": "KNOWLEDGE_URL",
+            "fallback_is_loopback": false,
+            "declared_optional": true,
+        }),
+        "the declaration is a repo-wide fact, read from a config file with no \
+         route and no call"
+    );
+
+    // A base handed in as an option: the expression is all the scanner sees.
+    let lookup = call_at(&calls, "src/ledger.ts", 12);
+    assert_eq!(
+        lookup["base"],
+        serde_json::json!({
+            "written": "${this.opts.lookupUrl}",
+            "kind": "injected",
+            "fallback_is_loopback": false,
+        })
+    );
+
+    // A bare relative path states no base at all.
+    let entries = call_at(&calls, "src/ledger.ts", 22);
+    assert_eq!(
+        entries["base"],
+        serde_json::json!({
+            "written": "",
+            "kind": "relative",
+            "fallback_is_loopback": false,
+        })
+    );
+}
+
+/// carrick#649 gap 2: a manifest anchor states where the type is DECLARED, not
+/// only where the operation was extracted.
+///
+/// `LedgerEntry` is imported at the call site, so the op's own `file`/`line`
+/// point at the `fetch`. Answering "where is this type defined" from those is
+/// how an agent gets it wrong.
+#[test]
+fn an_imported_anchor_states_its_declaring_file_and_line() {
+    let calls = calls();
+
+    let lookup = call_at(&calls, "src/ledger.ts", 12);
+    assert_eq!(lookup["primary_type_symbol"], "LedgerEntry");
+    assert_eq!(lookup["file"], "src/ledger.ts");
+    assert_eq!(lookup["line"], 12);
+    assert_eq!(
+        lookup["defined_in"],
+        serde_json::json!({
+            "file_path": "src/types.ts",
+            "line_number": 4,
+            "symbol": "LedgerEntry",
+        }),
+        "the import the file wrote, resolved and confirmed against the \
+         declaring file's own AST"
+    );
+
+    // A call with no anchor symbol has no declaration to state, and says so by
+    // omitting the field rather than pointing at its own site.
+    let entries = call_at(&calls, "src/ledger.ts", 22);
+    assert_eq!(entries["defined_in"], serde_json::Value::Null);
 }

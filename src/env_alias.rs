@@ -78,6 +78,57 @@ pub type EnvAliasMap = HashMap<String, String>;
 /// when nothing is configured. [`whole_url_local_default`] reads it back.
 pub type WholeUrlFallbackMap = HashMap<String, String>;
 
+/// Maps a binding name — and the `process.env` variable behind it — to the
+/// WHOLE `??`/`||` string literal it was declared with, whatever that literal
+/// says.
+///
+/// [`WholeUrlFallbackMap`] above is gated on the fallback being an absolute URL
+/// that carries a path, because that gate is what makes a route safe to READ
+/// OUT of the fallback. This map resolves nothing and states no route: it is
+/// the literal the source wrote next to the env read, kept verbatim so a call's
+/// persisted base can say what the request falls back to when the environment
+/// supplies nothing. `?? "https://api.example.com/v1/ask"` is as much a fact
+/// about the call as `?? "http://localhost:3939/api/lookup"` is; only the
+/// second is safe to key on, and both are worth recording (carrick#649).
+///
+/// Deliberately a separate, additive map: widening the whole-URL map to hold
+/// path-less and third-party literals would change which targets
+/// [`resolve_whole_url_target`] rewrites.
+pub type EnvFallbackMap = HashMap<String, String>;
+
+/// What a validation schema in the scanned source declares about one
+/// environment variable.
+///
+/// Read structurally, from an object-literal property whose key is a
+/// SCREAMING_SNAKE name and whose value is a builder chain — the shape an env
+/// block has in every schema library, with no library name anywhere in the
+/// read. The property key has to equal an environment variable the call's base
+/// named independently, so a non-env schema field can only collide by being
+/// literally named after one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvSchemaDeclaration {
+    /// The chain calls `.optional()` and states no default — so the source
+    /// says outright that this variable may be absent at runtime with nothing
+    /// standing in for it.
+    ///
+    /// `false` whenever a `.default(…)` is present, whether or not
+    /// `.optional()` is too: a variable with a default is never absent.
+    pub optional: bool,
+    /// The string literal a `.default("…")` in the chain states, when it
+    /// states one. `None` for a non-literal default (`.default(computePort())`)
+    /// as well as for no default at all — see `optional` for which it was.
+    pub default_literal: Option<String>,
+}
+
+/// Environment-variable name -> what the scanned source declares about it.
+///
+/// Repo-wide rather than per-file, because an environment variable IS
+/// process-global: the name is the same fact wherever it is read, and the file
+/// that declares the schema is usually not the file that makes the call. Two
+/// DIFFERENT declarations of one name state nothing decidable, so
+/// [`merge_env_schema`] drops such a name rather than picking one.
+pub type EnvSchemaMap = HashMap<String, EnvSchemaDeclaration>;
+
 /// Maps a module-level binding name to the absolute URL literal it was declared
 /// with (`https://api.example.com` for `const BASE = "https://api.example.com"`).
 ///
@@ -93,6 +144,8 @@ pub type LiteralBaseMap = HashMap<String, String>;
 pub struct UrlBindings {
     pub aliases: EnvAliasMap,
     pub whole_url_fallbacks: WholeUrlFallbackMap,
+    /// Every `??`/`||` string-literal default, gated on nothing.
+    pub env_fallbacks: EnvFallbackMap,
     pub literal_bases: LiteralBaseMap,
 }
 
@@ -110,6 +163,7 @@ pub struct UrlBindings {
 pub struct EnvAliasExtractor {
     pub aliases: EnvAliasMap,
     pub whole_url_fallbacks: WholeUrlFallbackMap,
+    pub env_fallbacks: EnvFallbackMap,
 }
 
 impl EnvAliasExtractor {
@@ -125,6 +179,7 @@ impl EnvAliasExtractor {
         UrlBindings {
             aliases: extractor.aliases,
             whole_url_fallbacks: extractor.whole_url_fallbacks,
+            env_fallbacks: extractor.env_fallbacks,
             literal_bases: module_literal_bases(module),
         }
     }
@@ -190,6 +245,15 @@ impl Visit for EnvAliasExtractor {
                     self.whole_url_fallbacks
                         .insert(binding.id.sym.to_string(), fallback.clone());
                     self.whole_url_fallbacks.insert(env_name.clone(), fallback);
+                }
+                // The same `??`/`||` literal, ungated (carrick#649). Recorded
+                // for what it says about the call's base rather than to read a
+                // route out of, so a path-less origin and a third-party one are
+                // kept exactly as a loopback route is.
+                if let Some(fallback) = fallback_literal(init) {
+                    self.env_fallbacks
+                        .insert(binding.id.sym.to_string(), fallback.clone());
+                    self.env_fallbacks.insert(env_name.clone(), fallback);
                 }
                 // SWC resolver gives each binding a unique SyntaxContext, but the
                 // call target the LLM emits is just the bare symbol text. Key on
@@ -554,6 +618,23 @@ fn fallback_url_literal(expr: &Expr) -> Option<String> {
     (!url_literal_path(&literal)?.is_empty()).then_some(literal)
 }
 
+/// An env read's `??`/`||` fallback string literal, whatever it says
+/// (carrick#649).
+///
+/// [`fallback_url_literal`] above gates on the literal being an absolute URL
+/// with a path, because a route is read out of it. Nothing is read out of this
+/// one: it is reported verbatim as what the source states the request falls
+/// back to. A non-literal default (a template, a function call, another
+/// binding) still yields `None` — there is no written literal to report.
+fn fallback_literal(expr: &Expr) -> Option<String> {
+    let Expr::Bin(bin) = unwrap_transparent(expr) else {
+        return None;
+    };
+    matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr)
+        .then(|| string_literal(&bin.right))
+        .flatten()
+}
+
 /// The path of an absolute `http(s)` URL literal, empty when it states none.
 /// `None` when the literal is not an absolute URL at all.
 fn url_literal_path(literal: &str) -> Option<&str> {
@@ -569,7 +650,7 @@ fn url_literal_path(literal: &str) -> Option<&str> {
 
 /// Whether an absolute URL literal's host is a LOOPBACK address — this machine,
 /// under any of the spellings a developer writes.
-fn is_loopback_origin(literal: &str) -> bool {
+pub fn is_loopback_origin(literal: &str) -> bool {
     let Some(after_scheme) = literal
         .strip_prefix("http://")
         .or_else(|| literal.strip_prefix("https://"))
@@ -665,6 +746,157 @@ pub fn whole_url_local_default(
 ) -> Option<String> {
     let (_, fallback) = whole_url_binding(target, aliases, fallbacks)?;
     is_loopback_origin(fallback).then(|| fallback.to_string())
+}
+
+/// What every validation schema in the scanned repo declares about the
+/// environment (carrick#649), folded one module at a time.
+///
+/// A name that two modules declare DIFFERENTLY is dropped, not arbitrated: the
+/// source states two things and the scanner has no basis for picking one, so
+/// the honest answer downstream is "no declaration found". Dropping is also
+/// what makes the index independent of the order files are walked in.
+#[derive(Default, Debug)]
+pub struct EnvSchemaIndex {
+    declarations: EnvSchemaMap,
+    /// Names seen with two different declarations. Kept so a third module
+    /// restating one of the two cannot resurrect it.
+    ambiguous: std::collections::HashSet<String>,
+}
+
+impl EnvSchemaIndex {
+    /// Fold one module's declarations in.
+    pub fn merge_module(&mut self, module_declarations: EnvSchemaMap) {
+        for (name, declaration) in module_declarations {
+            if self.ambiguous.contains(&name) {
+                continue;
+            }
+            match self.declarations.get(&name) {
+                Some(existing) if *existing != declaration => {
+                    self.declarations.remove(&name);
+                    self.ambiguous.insert(name);
+                }
+                Some(_) => {}
+                None => {
+                    self.declarations.insert(name, declaration);
+                }
+            }
+        }
+    }
+
+    /// What the source declares about one environment variable, or `None` when
+    /// nothing in the scanned files declares it (or two files disagree).
+    pub fn get(&self, env_var: &str) -> Option<&EnvSchemaDeclaration> {
+        self.declarations.get(env_var)
+    }
+}
+
+/// The environment-variable declarations one module's validation schemas state.
+///
+/// Structural and library-agnostic: any object-literal property whose key is a
+/// SCREAMING_SNAKE name and whose value is a builder chain that calls
+/// `.optional()` or `.default(…)`. A chain stating NEITHER is not recorded —
+/// there is nothing about optionality to report, and inventing "required" from
+/// a chain that never said so would be a guess.
+pub fn module_env_schema(module: &Module) -> EnvSchemaMap {
+    let mut extractor = EnvSchemaExtractor::default();
+    module.visit_with(&mut extractor);
+    extractor.declarations
+}
+
+#[derive(Default)]
+struct EnvSchemaExtractor {
+    declarations: EnvSchemaMap,
+}
+
+impl Visit for EnvSchemaExtractor {
+    fn visit_object_lit(&mut self, obj: &ObjectLit) {
+        for prop in &obj.props {
+            let PropOrSpread::Prop(prop) = prop else {
+                continue;
+            };
+            let Prop::KeyValue(kv) = &**prop else {
+                continue;
+            };
+            let name = match &kv.key {
+                PropName::Ident(ident) => ident.sym.to_string(),
+                PropName::Str(s) => s.value.to_string(),
+                _ => continue,
+            };
+            if !is_env_var_name(&name) {
+                continue;
+            }
+            if let Some(declaration) = schema_chain_declaration(&kv.value) {
+                // First declaration in the module wins; the repo-wide fold
+                // above is what resolves a name declared twice.
+                self.declarations.entry(name).or_insert(declaration);
+            }
+        }
+        obj.visit_children_with(self);
+    }
+}
+
+/// Whether a name is spelled the way environment variables are: SCREAMING_SNAKE
+/// with at least one letter (`KNOWLEDGE_URL`, `PORT`). This is the whole
+/// discriminator between an env block and any other object literal, and it is
+/// only ever consulted for a name the call's base already produced.
+pub(crate) fn is_env_var_name(name: &str) -> bool {
+    name.len() >= 2
+        && name.chars().any(|c| c.is_ascii_uppercase())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Read `.optional()` and `.default(…)` off a builder chain, walking from the
+/// outermost call down to whatever the chain starts at.
+///
+/// Returns `None` when the chain states neither — see [`module_env_schema`].
+fn schema_chain_declaration(expr: &Expr) -> Option<EnvSchemaDeclaration> {
+    let mut optional = false;
+    let mut has_default = false;
+    let mut default_literal: Option<String> = None;
+    let mut current = unwrap_transparent(expr);
+
+    loop {
+        match current {
+            Expr::Call(call) => {
+                let Callee::Expr(callee) = &call.callee else {
+                    break;
+                };
+                let callee = unwrap_transparent(callee);
+                let Expr::Member(member) = callee else {
+                    current = callee;
+                    continue;
+                };
+                if let MemberProp::Ident(method) = &member.prop {
+                    match method.sym.as_ref() {
+                        "optional" => optional = true,
+                        "default" => {
+                            has_default = true;
+                            // The outermost `.default` wins, which is the one
+                            // whose value the chain actually yields.
+                            if default_literal.is_none() {
+                                default_literal = call
+                                    .args
+                                    .first()
+                                    .filter(|arg| arg.spread.is_none())
+                                    .and_then(|arg| string_literal(&arg.expr));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                current = unwrap_transparent(&member.obj);
+            }
+            Expr::Member(member) => current = unwrap_transparent(&member.obj),
+            _ => break,
+        }
+    }
+
+    (optional || has_default).then_some(EnvSchemaDeclaration {
+        optional: optional && !has_default,
+        default_literal,
+    })
 }
 
 /// The `(env var name, fallback URL literal)` behind a target that is nothing
@@ -860,7 +1092,7 @@ mod tests {
             "[::1]:3939",
         ] {
             let (aliases, paths) = build_both(&format!(
-                r#"const url = process.env.SUPPORT_ASK_URL ?? "http://{host}/api/ask";"#
+                r#"const url = process.env.SERVICE_ASK_URL ?? "http://{host}/api/ask";"#
             ));
             assert_eq!(
                 whole_url_local_default("url", &aliases, &paths).as_deref(),

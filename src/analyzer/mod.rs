@@ -2505,6 +2505,31 @@ impl Analyzer {
             .unwrap_or_default()
     }
 
+    /// How each consumer call's base resolves (carrick#649), keyed exactly as
+    /// [`Self::call_raw_targets`] is — `(canonical key, file location)` — so
+    /// the eval projection can attach the field the persisted row carries
+    /// without the mount-graph row and the projection row having to be the
+    /// same type.
+    pub fn call_bases(&self) -> HashMap<(String, String), crate::call_base::CallBaseResolution> {
+        self.mount_graph
+            .as_ref()
+            .map(|g| {
+                g.get_data_calls()
+                    .iter()
+                    .filter_map(|c| {
+                        Some((
+                            (
+                                OperationKey::http(&c.method, c.canonical_path.clone()).canonical(),
+                                c.file_location.clone(),
+                            ),
+                            c.base.clone()?,
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Overlay the type-compatibility verdict onto each captured cross-repo
     /// edge, keyed by the producer's `(METHOD, identity)` AND the consumer's
     /// source location — so each `(producer, consumer)` pair gets ITS OWN
@@ -4098,6 +4123,7 @@ mod tests {
             service_name: None,
             host: None,
             line: None,
+            base: None,
         });
 
         let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -4203,6 +4229,7 @@ mod tests {
             service_name: None,
             host: None,
             line: None,
+            base: None,
         });
         analyzer
             .calls
@@ -4277,6 +4304,7 @@ mod tests {
             service_name: None,
             host: None,
             line: None,
+            base: None,
         });
         analyzer
             .calls
@@ -4334,6 +4362,7 @@ mod tests {
             service_name: None,
             host: None,
             line: None,
+            base: None,
         });
         analyzer.calls.push(http_call(
             "POST",
@@ -5416,6 +5445,7 @@ mod tests {
             service_name: None,
             host: None,
             line: None,
+            base: None,
         }
     }
 

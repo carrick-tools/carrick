@@ -112,6 +112,23 @@ pub struct DataFetchingCall {
     /// reported a line that is not a positive integer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
+    /// How this call's base RESOLVES (carrick#649).
+    ///
+    /// `target_url` states the base expression and `canonical_path` states the
+    /// route, and neither says where the base goes. That is the deciding fact
+    /// for "who serves this call": an optional environment variable with no
+    /// default and an injected option defaulting to a loopback URL produce the
+    /// same-shaped row and opposite truths. This carries what the AST states
+    /// about the base — the expression as written, whether it reads the
+    /// environment, the literal default beside it, and what a validation schema
+    /// in the scanned files declares — and nothing it does not.
+    ///
+    /// Purely additive: the matching key (`canonical_path`) is unchanged by
+    /// this field existing, and nothing here classifies a call as internal or
+    /// external. `None` where the base is a literal absolute origin (the `host`
+    /// field above already states that) or cannot be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<crate::call_base::CallBaseResolution>,
 }
 
 /// The complete mount and endpoint graph
@@ -493,6 +510,7 @@ mod tests {
             service_name: None,
             host: None,
             line: None,
+            base: None,
         };
         assert_eq!(
             serde_json::to_value(&call).unwrap(),
@@ -1115,6 +1133,7 @@ mod tests {
                 service_name: None,
                 host: None,
                 line: None,
+                base: None,
             });
         let merged = MountGraph::merge_from_repos(&[repo]);
         assert_eq!(merged.data_calls.len(), 1);

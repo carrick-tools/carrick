@@ -55,6 +55,11 @@ pub struct EvalOp {
     /// producer ops and for calls with no mount-graph raw target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_url: Option<String>,
+    /// Consumer ops only: how the call's base resolves (carrick#649), the same
+    /// value the persisted row carries. `path` is the route and `target_url` is
+    /// the expression; this is the only field that says where the base goes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<crate::call_base::CallBaseResolution>,
     pub file: String,
     pub line: u32,
     // --- Type-manifest fields (contract §3), joined by OperationKey ---
@@ -82,6 +87,12 @@ pub struct EvalOp {
     /// no real anchor was extracted for the op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_type_symbol: Option<String>,
+    /// Where `primary_type_symbol` is DECLARED (carrick#649), from the manifest
+    /// entry. `file`/`line` on this op are the operation's own site — a route's
+    /// annotation, or an import line — so this is the only field that answers
+    /// "where is this type defined".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defined_in: Option<crate::cloud_storage::TypeHome>,
 }
 
 /// A structured producer→consumer edge (contract §2 FROZEN field set).
@@ -142,6 +153,7 @@ impl EvalProjection {
         result: &ApiAnalysisResult,
         type_manifest: &[TypeManifestEntry],
         raw_targets: &HashMap<(String, String), String>,
+        call_bases: &HashMap<(String, String), crate::call_base::CallBaseResolution>,
     ) -> Self {
         let manifest_index = ManifestIndex::build(type_manifest);
         // Canonical ordering so the projection is deterministic across runs:
@@ -212,12 +224,12 @@ impl EvalProjection {
                 .filter(|d| !is_self_loop_op(d))
                 .map(|d| {
                     let mut op = EvalOp::from_details(d, &manifest_index, ManifestRole::Consumer);
-                    op.target_url = raw_targets
-                        .get(&(
-                            d.key.canonical(),
-                            d.file_path.to_string_lossy().into_owned(),
-                        ))
-                        .cloned();
+                    let site = (
+                        d.key.canonical(),
+                        d.file_path.to_string_lossy().into_owned(),
+                    );
+                    op.target_url = raw_targets.get(&site).cloned();
+                    op.base = call_bases.get(&site).cloned();
                     op
                 })
                 .collect(),
@@ -284,6 +296,9 @@ struct ManifestFields {
     /// time. Distinct from `type_alias` (the synthetic hashed
     /// `Endpoint_<hash>_Response` name); the anchor metric scores against this.
     primary_type_symbol: Option<String>,
+    /// Where the anchor symbol is DECLARED (carrick#649), as opposed to
+    /// `file`/`line` on the op, which are where it is used.
+    defined_in: Option<crate::cloud_storage::TypeHome>,
 }
 
 /// One manifest entry, kept whole (kind + site discriminators intact) so the
@@ -298,6 +313,7 @@ struct ManifestRecord {
     expanded_definition: Option<String>,
     is_explicit: bool,
     primary_type_symbol: Option<String>,
+    defined_in: Option<crate::cloud_storage::TypeHome>,
 }
 
 impl ManifestRecord {
@@ -346,6 +362,7 @@ impl ManifestIndex {
                     expanded_definition: entry.expanded_definition.clone(),
                     is_explicit: entry.is_explicit,
                     primary_type_symbol: entry.primary_type_symbol.clone(),
+                    defined_in: entry.defined_in.clone(),
                 });
         }
         Self { by_key }
@@ -403,7 +420,14 @@ impl ManifestIndex {
             .primary_type_symbol
             .clone()
             .or_else(|| site.iter().find_map(|r| r.primary_type_symbol.clone()));
+        // Same rule as the anchor above, for the same reason: the declaration
+        // site belongs to whichever entry carries the symbol.
+        let defined_in = definition_record
+            .defined_in
+            .clone()
+            .or_else(|| site.iter().find_map(|r| r.defined_in.clone()));
         Some(ManifestFields {
+            defined_in,
             type_alias: Some(definition_record.type_alias.clone()),
             type_state: Some(definition_record.type_state.clone()),
             resolved_definition: definition_record.resolved_definition.clone(),
@@ -457,6 +481,10 @@ impl EvalOp {
             protocol,
             method,
             path,
+            // Consumer-only, attached by the caller from the mount graph, for
+            // the same reason `target_url` is: the details type carries
+            // neither.
+            base: None,
             handler: d.handler_name.clone(),
             request_type: d
                 .request_type
@@ -481,7 +509,11 @@ impl EvalOp {
             // is genuinely `None`. Substituting the synthetic `Endpoint_<hash>`
             // alias there fabricates an anchor the source never declared and mis-
             // scores against an expected `None`.
-            primary_type_symbol: fields.and_then(|f| f.primary_type_symbol.clone()),
+            primary_type_symbol: fields.as_ref().and_then(|f| f.primary_type_symbol.clone()),
+            // Where that anchor is DECLARED (carrick#649). `file`/`line` above
+            // are the operation's site; a reader answering "where is this type
+            // defined" from them answers wrongly.
+            defined_in: fields.and_then(|f| f.defined_in.clone()),
         }
     }
 }
@@ -631,6 +663,7 @@ mod tests {
             resolved_definition: resolved.map(String::from),
             expanded_definition: None,
             primary_type_symbol: primary_type_symbol.map(String::from),
+            defined_in: None,
         }
     }
 
@@ -720,7 +753,8 @@ mod tests {
             cross_repo_matches: vec![],
         };
 
-        let projection = EvalProjection::from_results(&result, &[], &HashMap::new());
+        let projection =
+            EvalProjection::from_results(&result, &[], &HashMap::new(), &HashMap::new());
         let endpoint_keys: Vec<&str> = projection
             .endpoints
             .iter()
@@ -782,7 +816,8 @@ mod tests {
             cross_repo_matches: vec![],
         };
 
-        let projection = EvalProjection::from_results(&result, &[], &HashMap::new());
+        let projection =
+            EvalProjection::from_results(&result, &[], &HashMap::new(), &HashMap::new());
         let surviving: Vec<(&str, &str)> = projection
             .endpoints
             .iter()
@@ -892,7 +927,8 @@ mod tests {
             Some("OrderResponse"),
         )];
 
-        let projection = EvalProjection::from_results(&result, &manifest, &HashMap::new());
+        let projection =
+            EvalProjection::from_results(&result, &manifest, &HashMap::new(), &HashMap::new());
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
 
@@ -969,7 +1005,8 @@ mod tests {
             cross_repo_matches: vec![],
         };
 
-        let projection = EvalProjection::from_results(&result, &[], &HashMap::new());
+        let projection =
+            EvalProjection::from_results(&result, &[], &HashMap::new(), &HashMap::new());
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
         let op = &json["endpoints"].as_array().unwrap()[0];
@@ -1044,7 +1081,8 @@ mod tests {
             Some("Payment"),
         )];
 
-        let projection = EvalProjection::from_results(&result, &manifest, &HashMap::new());
+        let projection =
+            EvalProjection::from_results(&result, &manifest, &HashMap::new(), &HashMap::new());
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
         let op = &json["calls"].as_array().unwrap()[0];
@@ -1123,7 +1161,8 @@ mod tests {
             ),
         ];
 
-        let projection = EvalProjection::from_results(&result, &manifest, &HashMap::new());
+        let projection =
+            EvalProjection::from_results(&result, &manifest, &HashMap::new(), &HashMap::new());
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
 
@@ -1200,7 +1239,8 @@ mod tests {
             ),
         ];
 
-        let projection = EvalProjection::from_results(&result, &manifest, &HashMap::new());
+        let projection =
+            EvalProjection::from_results(&result, &manifest, &HashMap::new(), &HashMap::new());
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
         let op = &json["endpoints"].as_array().unwrap()[0];
@@ -1259,7 +1299,8 @@ mod tests {
             None,
         )];
 
-        let projection = EvalProjection::from_results(&result, &manifest, &HashMap::new());
+        let projection =
+            EvalProjection::from_results(&result, &manifest, &HashMap::new(), &HashMap::new());
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
         let op = &json["calls"].as_array().unwrap()[0];
@@ -1338,7 +1379,8 @@ mod tests {
             ),
         ];
 
-        let projection = EvalProjection::from_results(&result, &manifest, &HashMap::new());
+        let projection =
+            EvalProjection::from_results(&result, &manifest, &HashMap::new(), &HashMap::new());
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
         let calls = json["calls"].as_array().unwrap();

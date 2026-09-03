@@ -1102,6 +1102,7 @@ mod tests {
             resolved_definition: None,
             expanded_definition: None,
             primary_type_symbol: None,
+            defined_in: None,
         }
     }
 

@@ -25,12 +25,14 @@ use crate::{
         },
         framework_guidance_agent::ProtocolGuidance,
     },
+    call_base::resolve_call_base,
     cloud_storage::{ManifestRole, ManifestTypeKind},
     config::Config,
     env_alias::{
-        EnvAliasExtractor, EnvAliasMap, LiteralBaseMap, WholeUrlFallbackMap, exported_env_aliases,
-        merge_imported_env_aliases, resolve_target_env_alias, resolve_target_literal_base,
-        resolve_whole_url_target, whole_url_local_default,
+        EnvAliasExtractor, EnvAliasMap, EnvFallbackMap, EnvSchemaIndex, LiteralBaseMap,
+        WholeUrlFallbackMap, exported_env_aliases, merge_imported_env_aliases, module_env_schema,
+        resolve_target_env_alias, resolve_target_literal_base, resolve_whole_url_target,
+        whole_url_local_default,
     },
     file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
     framework_detector::DetectionResult,
@@ -218,6 +220,10 @@ struct FileSymbols {
     /// Paths stated by the `??` fallback of a binding holding a whole request
     /// URL (carrick#572).
     whole_url_fallbacks: WholeUrlFallbackMap,
+    /// Every `??`/`||` string-literal default an env read in this file was
+    /// declared with, ungated (carrick#649). Read for what it says about a
+    /// call's base, never to resolve a target.
+    env_fallbacks: EnvFallbackMap,
     /// Absolute URL literals the file declares as bases (carrick#627).
     literal_bases: LiteralBaseMap,
     /// The file's own request members, read for the files that import it
@@ -732,6 +738,11 @@ impl FileOrchestrator {
             /// (carrick#572). Per-file: the shape is a local const passed
             /// straight to a request, never an imported config property.
             whole_url_fallbacks: WholeUrlFallbackMap,
+            /// Every `??`/`||` string-literal default an env read in this file
+            /// was declared with (carrick#649). Per-file for the same reason
+            /// `whole_url_fallbacks` is, and read by the base-stamping pass
+            /// only — it resolves no target and changes no key.
+            env_fallbacks: EnvFallbackMap,
             /// Absolute URL literals the file declares as bases, for a target
             /// that interpolates one as its leading segment (carrick#627).
             /// Per-file for the same reason as `whole_url_fallbacks`: the shape is
@@ -812,6 +823,13 @@ impl FileOrchestrator {
         // resolved after the whole pass: the endpoints belong to the CONTROLLER
         // modules, whose own results are not final until then.
         let mut controller_route_bindings: Vec<(PathBuf, Vec<ControllerRouteBinding>)> = Vec::new();
+        // What the repo's validation schemas declare about the environment
+        // (carrick#649), folded across every parseable file. Repo-wide because
+        // an environment variable is process-global and the file declaring the
+        // schema is almost never the file making the call — and because such a
+        // file usually raises no HTTP candidate at all, so the per-file maps
+        // the analyzed files carry would never see it.
+        let mut env_schema = EnvSchemaIndex::default();
         for file_path in files {
             let path_str = file_path.to_string_lossy().to_string();
 
@@ -859,6 +877,21 @@ impl FileOrchestrator {
                 // Store empty result so incremental cache knows this file was processed
                 file_results.insert(path_str, FileAnalysisResult::default());
                 continue;
+            }
+
+            // Environment-variable declarations (carrick#649). Collected here,
+            // before every skip branch below, because the file that declares
+            // the env schema is typically a config module with no route and no
+            // call — exactly the file the candidate-less skip drops.
+            //
+            // Pre-filtered on the source containing a `.optional()` or
+            // `.default(` call, which any such declaration must, so the extra
+            // parse is paid only by files that could carry one. Same shape as
+            // the controller-route pre-check below.
+            if (content.contains(".optional()") || content.contains(".default("))
+                && let Some(module) = parse_file(file_path, &cm, &handler)
+            {
+                env_schema.merge_module(module_env_schema(&module));
             }
 
             // Pub/sub Part B: a pub/sub-only file (e.g. NATS `nc.publish(...)`)
@@ -1092,6 +1125,7 @@ impl FileOrchestrator {
                 symbol_table: symbols.table,
                 env_alias_map: symbols.env_aliases,
                 whole_url_fallbacks: symbols.whole_url_fallbacks,
+                env_fallbacks: symbols.env_fallbacks,
                 literal_bases: symbols.literal_bases,
                 route_endpoints,
                 descriptor_endpoints,
@@ -1337,6 +1371,7 @@ impl FileOrchestrator {
                 symbol_table: symbols.table,
                 env_alias_map: symbols.env_aliases,
                 whole_url_fallbacks: symbols.whole_url_fallbacks,
+                env_fallbacks: symbols.env_fallbacks,
                 literal_bases: symbols.literal_bases,
                 route_endpoints: Vec::new(),
                 descriptor_endpoints: Vec::new(),
@@ -1531,6 +1566,20 @@ impl FileOrchestrator {
                     let file_path = Path::new(&pf.path_str);
                     Self::suppress_borrowed_request_types(&mut adjusted, file_path);
                     Self::rewrite_graphql_document_targets(&mut adjusted, file_path);
+
+                    // Read how each call's base resolves (carrick#649). LAST
+                    // among the passes that touch a target, because it must
+                    // read the SAME target the row persists: an env-var base
+                    // rewritten to `${process.env.NAME}` above is the spelling
+                    // this reports, and a graphql target rewritten just above
+                    // is the one this reads. Stamps `base` and nothing else —
+                    // no target, no method, no key.
+                    Self::stamp_call_bases(
+                        &mut adjusted,
+                        &pf.env_alias_map,
+                        &pf.env_fallbacks,
+                        &env_schema,
+                    );
 
                     // Canonicalize LLM-emitted endpoint paths to colon-style params
                     // (`/w/[slug]` -> `/w/:slug`) so they dedupe against the file-based
@@ -3102,6 +3151,7 @@ impl FileOrchestrator {
             },
             env_aliases: bindings.aliases,
             whole_url_fallbacks: bindings.whole_url_fallbacks,
+            env_fallbacks: bindings.env_fallbacks,
             literal_bases: bindings.literal_bases,
             request_members,
         }
@@ -4232,6 +4282,7 @@ impl FileOrchestrator {
                 type_import_source: None,
 
                 loopback_default_url: None,
+                base: None,
             });
             added += 1;
         }
@@ -4322,6 +4373,7 @@ impl FileOrchestrator {
                 type_import_source: None,
 
                 loopback_default_url: None,
+                base: None,
             });
             added += 1;
         }
@@ -4670,6 +4722,7 @@ impl FileOrchestrator {
                 type_import_source: None,
 
                 loopback_default_url: None,
+                base: None,
             });
             added += 1;
         }
@@ -4836,6 +4889,7 @@ impl FileOrchestrator {
                 primary_type_symbol: None,
                 type_import_source: None,
                 loopback_default_url: local_default,
+                base: None,
             });
             added += 1;
         }
@@ -4938,6 +4992,33 @@ impl FileOrchestrator {
             }
         }
         propagated
+    }
+
+    /// Record how each call's base resolves (carrick#649).
+    ///
+    /// Reads the target the row will persist and states what the AST says
+    /// about its base slot: the expression as written, whether it reads the
+    /// environment, the literal default beside it, and what a validation
+    /// schema in the scanned files declares about the variable. Writes only
+    /// `base` — the target, the method and the canonical key are untouched, so
+    /// this cannot move a call into or out of an operation.
+    ///
+    /// A row already carrying a base is left alone: nothing upstream sets one
+    /// today, and if something starts to, the pass that read the call site is
+    /// the better witness than this re-reading of its target.
+    fn stamp_call_bases(
+        result: &mut FileAnalysisResult,
+        aliases: &EnvAliasMap,
+        env_fallbacks: &EnvFallbackMap,
+        env_schema: &EnvSchemaIndex,
+    ) {
+        for data_call in &mut result.data_calls {
+            if data_call.base.is_some() {
+                continue;
+            }
+            data_call.base =
+                resolve_call_base(&data_call.target, aliases, env_fallbacks, env_schema);
+        }
     }
 
     /// Resolve the binding a call target names in its base slot: the
@@ -5184,7 +5265,7 @@ impl FileOrchestrator {
     /// when `baseUrl` is set. If neither relative nor baseUrl resolution
     /// finds a real file, the original specifier is returned unchanged so
     /// node_modules packages like `react` still pass through.
-    fn resolve_import_path(current_file: &str, import_source: &str) -> String {
+    pub(crate) fn resolve_import_path(current_file: &str, import_source: &str) -> String {
         use std::path::Path;
 
         let current_dir = Path::new(current_file).parent().unwrap_or(Path::new(""));
@@ -5726,6 +5807,10 @@ impl FileOrchestrator {
                         // `file_location`). Neither field is read by matching.
                         host: normalizer.absolute_host(&data_call.target),
                         line: u32::try_from(data_call.line_number).ok().filter(|l| *l > 0),
+                        // How the base resolves (carrick#649), read off the
+                        // same target this row states. Retention only, like
+                        // `host` and `line`: nothing in matching reads it.
+                        base: data_call.base.clone(),
                     },
                     data_call.call_expression_span_start.is_some(),
                 ));
@@ -7803,6 +7888,7 @@ export * from "./aFetch.js";"#,
                     type_import_source: None,
 
                     loopback_default_url: None,
+                    base: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -7959,6 +8045,7 @@ export * from "./aFetch.js";"#,
             primary_type_symbol: None,
             type_import_source: None,
             loopback_default_url: None,
+            base: None,
         }
     }
 
@@ -8309,6 +8396,7 @@ export * from "./aFetch.js";"#,
                 type_import_source: None,
 
                 loopback_default_url: None,
+                base: None,
             }],
             ..Default::default()
         };
@@ -8396,6 +8484,7 @@ export * from "./aFetch.js";"#,
             type_import_source: None,
 
             loopback_default_url: None,
+            base: None,
         };
 
         let mut file_results = HashMap::new();
@@ -8504,6 +8593,7 @@ export * from "./aFetch.js";"#,
             type_import_source: None,
 
             loopback_default_url: None,
+            base: None,
         };
 
         let mut file_results = HashMap::new();
@@ -8595,6 +8685,7 @@ export * from "./aFetch.js";"#,
             type_import_source: None,
 
             loopback_default_url: None,
+            base: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -8662,6 +8753,7 @@ export * from "./aFetch.js";"#,
                         type_import_source: None,
 
                         loopback_default_url: None,
+                        base: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -8680,6 +8772,7 @@ export * from "./aFetch.js";"#,
                         type_import_source: None,
 
                         loopback_default_url: None,
+                        base: None,
                     },
                 ],
                 graphql_operations: vec![],
@@ -8729,6 +8822,7 @@ export * from "./aFetch.js";"#,
                     type_import_source: None,
 
                     loopback_default_url: None,
+                    base: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -8780,6 +8874,7 @@ export * from "./aFetch.js";"#,
                         type_import_source: None,
 
                         loopback_default_url: None,
+                        base: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -8798,6 +8893,7 @@ export * from "./aFetch.js";"#,
                         type_import_source: None,
 
                         loopback_default_url: None,
+                        base: None,
                     },
                 ],
                 graphql_operations: vec![],
@@ -9139,6 +9235,7 @@ export * from "./aFetch.js";"#,
                 type_import_source: None,
 
                 loopback_default_url: None,
+                base: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -9234,6 +9331,7 @@ export * from "./aFetch.js";"#,
                 type_import_source: Some("../types/events.tsx".to_string()),
 
                 loopback_default_url: None,
+                base: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![
@@ -9583,6 +9681,7 @@ export * from "./aFetch.js";"#,
                 type_import_source: Some("./local".to_string()),
 
                 loopback_default_url: None,
+                base: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -10822,6 +10921,7 @@ export { routes };
             primary_type_symbol: None,
             type_import_source: None,
             loopback_default_url: None,
+            base: None,
         }
     }
 
@@ -11839,6 +11939,7 @@ export function publishWrapped(order: OrderPlaced): void {
             primary_type_symbol: primary_type_symbol.map(str::to_string),
             type_import_source: type_import_source.map(str::to_string),
             loopback_default_url: None,
+            base: None,
         }
     }
 

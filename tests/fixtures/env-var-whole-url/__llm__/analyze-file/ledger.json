@@ -1,0 +1,58 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:12",
+      "line_number": 12,
+      "target": "${this.opts.lookupUrl}/api/lookup",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${this.opts.lookupUrl}/api/lookup`, { method: \"GET\" })",
+      "call_expression_line": 12,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "LedgerEntry",
+      "type_import_source": "./types"
+    },
+    {
+      "candidate_id": "@line:22",
+      "line_number": 22,
+      "target": "/api/entries",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(\"/api/entries\", { method: \"GET\" })",
+      "call_expression_line": 22,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:31",
+      "line_number": 31,
+      "target": "quoteUrl",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(quoteUrl, { method: \"POST\" })",
+      "call_expression_line": 31,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:40",
+      "line_number": 40,
+      "target": "${knowledgeUrl}/api/knowledge",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${knowledgeUrl}/api/knowledge`, { method: \"POST\" })",
+      "call_expression_line": 40,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

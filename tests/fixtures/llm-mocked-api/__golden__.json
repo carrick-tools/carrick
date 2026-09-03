@@ -15,7 +15,12 @@
       "resolved_definition": "export type Endpoint_a9cce7d0d8d0d9e6_Response = import('./src/types').User[];",
       "expanded_definition": "{ id: number; name: string; email: string; }[]",
       "is_explicit": true,
-      "primary_type_symbol": "User"
+      "primary_type_symbol": "User",
+      "defined_in": {
+        "file_path": "src/types.ts",
+        "line_number": 1,
+        "symbol": "User"
+      }
     },
     {
       "key": "http|GET|/export",
@@ -98,7 +103,12 @@
       "resolved_definition": "export interface Order {\n    id: number;\n    userId: number;\n    total: number;\n}",
       "expanded_definition": "{ id: number; userId: number; total: number; }",
       "is_explicit": true,
-      "primary_type_symbol": "Order"
+      "primary_type_symbol": "Order",
+      "defined_in": {
+        "file_path": "src/types.ts",
+        "line_number": 7,
+        "symbol": "Order"
+      }
     }
   ],
   "cross_repo_matches": [],

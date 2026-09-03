@@ -659,6 +659,7 @@ mod tests {
             service_name: None,
             host: None,
             line: Some(32),
+            base: None,
         }];
         data.mount_graph = Some(graph);
         data
@@ -780,6 +781,7 @@ mod tests {
             service_name: None,
             host: None,
             line: Some(3),
+            base: None,
         }];
         data.mount_graph = Some(graph);
         data
