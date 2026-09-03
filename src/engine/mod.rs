@@ -104,7 +104,13 @@ mod type_compat_v2;
 /// argument (carrick#631), helper calls whose built query string failed the
 /// route-shape gate (carrick#588 finding 6), and imported members that build
 /// their URL with `new URL()` or state no method (carrick#588 finding 3).
-const CACHE_VERSION: u32 = 14;
+/// 15: the response-payload recovery now runs where a wrapper rule verified the
+/// transport type (carrick#643), and a whole-URL env-var call extraction
+/// answered by paraphrase is corrected in place and keyed on its loopback
+/// fallback's route (carrick#644), so unchanged route and consumer files
+/// carry a contract and an operation key a v14 cache pins to `unknown` and to
+/// an unkeyed target.
+const CACHE_VERSION: u32 = 15;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
