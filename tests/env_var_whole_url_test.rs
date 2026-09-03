@@ -43,31 +43,42 @@ fn calls() -> Vec<serde_json::Value> {
         .clone()
 }
 
+fn call_at(calls: &[serde_json::Value], file: &str, line: i64) -> serde_json::Value {
+    calls
+        .iter()
+        .find(|call| call["file"] == file && call["line"].as_i64() == Some(line))
+        .unwrap_or_else(|| panic!("no row at {file}:{line}: {calls:#?}"))
+        .clone()
+}
+
 #[test]
 fn a_whole_url_read_from_an_env_var_is_recorded() {
     let calls = calls();
-    assert_eq!(calls.len(), 3, "one row per call site: {calls:#?}");
+    assert_eq!(calls.len(), 4, "one row per call site: {calls:#?}");
 
-    let ask = calls
-        .iter()
-        .find(|call| call["line"].as_i64() == Some(7))
-        .unwrap_or_else(|| panic!("no row for the env-var URL call: {calls:#?}"));
+    let ask = call_at(&calls, "src/helpdesk.ts", 7);
     assert_eq!(ask["method"], "POST");
     assert_eq!(
         ask["target_url"], "${process.env.HELPDESK_URL}/api/answer",
         "the env var supplies the origin and the fallback literal supplies the path"
     );
+    assert_eq!(
+        ask["path"], "/api/answer",
+        "the loopback default states the origin, so the key is the route it requests"
+    );
 
     // The base-plus-path shape that already resolved must be untouched: the
     // whole-URL rule fires only where the target states no path of its own.
-    let items = calls
-        .iter()
-        .find(|call| call["line"].as_i64() == Some(20))
-        .unwrap_or_else(|| panic!("no row for the base-URL call: {calls:#?}"));
+    let items = call_at(&calls, "src/helpdesk.ts", 20);
     assert_eq!(items["method"], "GET");
     assert_eq!(
         items["target_url"],
         "${process.env.CATALOG_URL}/api/v1/items"
+    );
+    assert_eq!(
+        items["path"], "${process.env.CATALOG_URL}/api/v1/items",
+        "an undeclared env-var BASE is still kept verbatim: the whole-URL rule \
+         reads the fallback, and this target states its own path"
     );
 }
 
@@ -78,10 +89,7 @@ fn a_whole_url_read_from_an_env_var_is_recorded() {
 fn a_whole_url_site_the_extraction_answered_nothing_for_is_recorded() {
     let calls = calls();
 
-    let ask = calls
-        .iter()
-        .find(|call| call["line"].as_i64() == Some(12))
-        .unwrap_or_else(|| panic!("no row for the unanswered env-var URL call: {calls:#?}"));
+    let ask = call_at(&calls, "src/toolset.ts", 12);
     assert_eq!(
         ask["method"], "POST",
         "the method is the literal in the call's own options bag"
@@ -89,5 +97,27 @@ fn a_whole_url_site_the_extraction_answered_nothing_for_is_recorded() {
     assert_eq!(
         ask["target_url"], "${process.env.SERVICE_ASK_URL}/api/ask",
         "the env var supplies the origin and the fallback literal supplies the path"
+    );
+    assert_eq!(ask["path"], "/api/ask");
+}
+
+/// carrick#632 (the live shape): the same call at a site extraction DID answer,
+/// paraphrasing the binding as the bare env-var name. #633 read that row as
+/// covering the site and emitted nothing, so the call stayed keyed on an
+/// env-var origin and `get_operation(POST /api/ask)` could not find it.
+#[test]
+fn a_whole_url_site_the_extraction_answered_wrongly_is_corrected() {
+    let calls = calls();
+
+    let ask = call_at(&calls, "src/answered.ts", 11);
+    assert_eq!(ask["method"], "POST");
+    assert_eq!(
+        ask["target_url"], "${process.env.SUPPORT_ASK_URL}/api/ask",
+        "the analyzer's paraphrase is corrected to what the binding states"
+    );
+    assert_eq!(
+        ask["path"], "/api/ask",
+        "the call is findable under the route it requests, the way the same \
+         fetch against the fallback literal already was"
     );
 }

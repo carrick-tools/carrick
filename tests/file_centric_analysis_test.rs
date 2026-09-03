@@ -145,6 +145,8 @@ fn test_file_analysis_result_structures() {
         payload_expression_line: None,
         primary_type_symbol: None,
         type_import_source: None,
+
+        loopback_default_url: None,
     };
     assert_eq!(data_call.target, "https://api.example.com/users");
     assert_eq!(data_call.method, Some("POST".to_string()));
@@ -225,6 +227,8 @@ fn test_file_analysis_result_serialization() {
             payload_expression_line: None,
             primary_type_symbol: None,
             type_import_source: None,
+
+            loopback_default_url: None,
         }],
     };
 
@@ -276,6 +280,7 @@ fn test_processing_stats_tracking() {
         imported_member_resolutions: 0,
         imported_member_backfills: 0,
         whole_url_env_backfills: 0,
+        whole_url_env_corrections: 0,
         wrapper_method_propagations: 0,
         total_mounts: 3,
         total_endpoints: 10,
@@ -533,6 +538,8 @@ fn test_data_call_extraction() {
                 payload_expression_line: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+
+                loopback_default_url: None,
             },
             DataCallResult {
                 call_kind: None,
@@ -549,6 +556,8 @@ fn test_data_call_extraction() {
                 payload_expression_line: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+
+                loopback_default_url: None,
             },
             DataCallResult {
                 call_kind: None,
@@ -565,6 +574,8 @@ fn test_data_call_extraction() {
                 payload_expression_line: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+
+                loopback_default_url: None,
             },
         ],
     };
