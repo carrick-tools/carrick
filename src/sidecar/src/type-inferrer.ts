@@ -414,13 +414,24 @@ export class TypeInferrer {
     } else {
       // No wrapper rule fired, and the resolved return carries no contract of
       // its own — it is transport machinery, or `any`/`unknown` because the
-      // helper that produced it has no installed declaration on a bare
+      // callee that produced it has no installed declaration on a bare
       // checkout. The contract may still be one level in, in the ARGUMENT the
-      // handler handed the helper (carrick#631). Read the handler's own
+      // handler handed the callee (carrick#631). Read the handler's own
       // `return` statements before abstaining.
+      //
+      // How much of the argument is trusted depends on WHY the return carries
+      // nothing. Machinery means the callee is a known transport helper, so
+      // its argument is the payload and any resolved type is read. `any` /
+      // `unknown` means the callee is simply unresolvable, and on a bare
+      // checkout that describes most imported callees — `db.findMany({ where
+      // })`, `client.send(params)` — whose argument is a query, not a
+      // response. There the recovery is restricted to an argument the SOURCE
+      // annotates (`satisfies` / `as` / `<T>`): the developer stated the
+      // contract, so it is a claim rather than a guess.
       const machinery = this.typeIsOrContainsResponseMachinery(awaitedType);
-      if (machinery || awaitedType.isAny() || awaitedType.isUnknown()) {
-        const recovered = this.recoverPayloadFromReturnStatements(func);
+      const unresolvable = awaitedType.isAny() || awaitedType.isUnknown();
+      if (machinery || unresolvable) {
+        const recovered = this.recoverPayloadFromReturnStatements(func, !machinery);
         if (recovered) {
           this.log(
             `Return type at ${request.file_path}:${request.line_number} carries no ` +
@@ -457,8 +468,8 @@ export class TypeInferrer {
         }
         this.log(
           `Return type at ${request.file_path}:${request.line_number} resolved to ` +
-            `${awaitedType.isAny() ? 'any' : 'unknown'} and no returned response ` +
-            'helper carried a readable argument type; leaving it unresolved'
+            `${awaitedType.isAny() ? 'any' : 'unknown'} and no returned call stated ` +
+            'its payload type in source; leaving it unresolved'
         );
       }
       // No wrapper rule fired: the (awaited) return resolved to its own type.
@@ -2185,10 +2196,23 @@ export class TypeInferrer {
    * throughout: no helper, framework or package name is matched anywhere, and
    * the recovery only runs where the existing path already had nothing.
    *
+   * `statedOnly` is the guard for the unresolvable-callee case. A return type
+   * of `any` does not say the callee was a response helper, only that it could
+   * not be resolved, and on a bare checkout that is true of most imported
+   * callees: `return db.findMany({ where })` would otherwise report the query
+   * object as the endpoint's contract, which is a false contract and worse
+   * than `unknown`. With `statedOnly` set, only an argument the source
+   * annotates (`satisfies` / `as` / `<T>`) counts, because there the developer
+   * stated the contract. The machinery case leaves it clear: the callee is
+   * known transport, so its argument is the payload whatever its type.
+   *
    * Returns `null` (a logged limitation, never a guess) when no returned
-   * expression yields a readable argument type.
+   * expression yields an argument type this may read.
    */
-  private recoverPayloadFromReturnStatements(func: FunctionLike): {
+  private recoverPayloadFromReturnStatements(
+    func: FunctionLike,
+    statedOnly: boolean
+  ): {
     typeString: string;
     isExplicit: boolean;
     node: Node;
@@ -2202,7 +2226,7 @@ export class TypeInferrer {
     }> = [];
 
     for (const returned of this.returnedExpressions(func)) {
-      const payloadNode = this.responseHelperPayloadNode(returned, 0);
+      const payloadNode = this.responseHelperPayloadNode(returned, 0, statedOnly);
       if (!payloadNode) continue;
 
       // A `satisfies X` / `as X` on the argument states the contract in source:
@@ -2296,10 +2320,14 @@ export class TypeInferrer {
    * A call whose sibling options object states a >= 400 status is an error
    * branch and contributes nothing: the response contract of an endpoint is the
    * shape it returns when it succeeds.
+   *
+   * `statedOnly` narrows what counts as a payload to an argument the source
+   * annotates; see `recoverPayloadFromReturnStatements`.
    */
   private responseHelperPayloadNode(
     expression: Node,
-    depth: number
+    depth: number,
+    statedOnly: boolean
   ): Node | undefined {
     if (depth > RESPONSE_HELPER_MAX_DEPTH) return undefined;
 
@@ -2312,8 +2340,8 @@ export class TypeInferrer {
 
     for (const arg of args) {
       const candidate = this.unwrapJsonStringifyArg(arg);
-      if (this.nodeCarriesPayloadContract(candidate)) return candidate;
-      const nested = this.responseHelperPayloadNode(candidate, depth + 1);
+      if (this.nodeCarriesPayloadContract(candidate, statedOnly)) return candidate;
+      const nested = this.responseHelperPayloadNode(candidate, depth + 1, statedOnly);
       if (nested) return nested;
     }
     return undefined;
@@ -2328,9 +2356,13 @@ export class TypeInferrer {
    * must never report `"/next"` as the endpoint's contract. A stated
    * `satisfies`/`as` annotation counts even when its declaration is missing:
    * the source says what the contract is.
+   *
+   * Under `statedOnly` the annotation is the ONLY thing that counts, so an
+   * unresolvable callee's arguments never become a contract by accident.
    */
-  private nodeCarriesPayloadContract(node: Node): boolean {
+  private nodeCarriesPayloadContract(node: Node, statedOnly: boolean): boolean {
     if (this.statedTypeNodeOf(node)) return true;
+    if (statedOnly) return false;
 
     const type = this.unwrapPromiseType(node.getType());
     if (

@@ -24,9 +24,16 @@
  * annotation when the source states one. It is structural throughout — no
  * framework, package or helper name is matched anywhere.
  *
- * Guard (c) keeps the recovery from over-reaching: a returned redirect-style
- * helper whose argument is a bare string must stay unresolved, not report the
- * path literal as the response contract.
+ * How much of the argument is trusted depends on WHY the return carries
+ * nothing. Machinery means the callee is known transport, so its argument is
+ * the payload. `any` means the callee was merely unresolvable, which on a bare
+ * checkout is true of most imported callees, so there only an argument the
+ * source annotates counts.
+ *
+ * Two guards keep the recovery from over-reaching: a returned redirect-style
+ * helper whose argument is a bare string must stay unresolved rather than
+ * report the path literal, and an unresolvable callee handed an unannotated
+ * object (a database query) must stay unresolved rather than report the query.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -36,7 +43,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { SidecarClient } from './helpers.js';
 
-const ROUTE_TS = `import { reply } from "framework-runtime-absent";
+const ROUTE_TS = `import { reply, store } from "framework-runtime-absent";
 import { type RemoteListBody } from "shared-contracts-absent";
 
 interface Item {
@@ -95,10 +102,14 @@ export async function loadRedirect({ request }: { request: Request }) {
 
 export async function loadBareStatus({ request }: { request: Request }) {
   if (!request.url) {
-    return reply({ error: "Gone" }, 410);
+    return wrap(request, reply({ error: "Gone" }, 410));
   }
 
-  return reply({ items: listItems(), total: 1 });
+  return wrap(request, reply({ items: listItems(), total: 1 }));
+}
+
+export async function loadUntypedQuery({ request }: { request: Request }) {
+  return store.findMany({ where: { url: request.url }, take: 20 });
 }
 `;
 
@@ -113,6 +124,7 @@ const DETAIL_LINE = lineOf('export async function loadItemDetail');
 const REMOTE_LINE = lineOf('export async function loadRemoteList');
 const REDIRECT_LINE = lineOf('export async function loadRedirect');
 const BARE_STATUS_LINE = lineOf('export async function loadBareStatus');
+const UNTYPED_QUERY_LINE = lineOf('export async function loadUntypedQuery');
 
 interface InferShape {
   status: string;
@@ -234,6 +246,21 @@ describe('carrick#631 response helper argument recovery', () => {
       collapse(inferred.type_string),
       '{ items: { id: string; label: string; }[]; total: number; }'
     );
+  });
+
+  it('does not read an unresolvable callee\'s unannotated argument', async () => {
+    // `store` has no installed declaration, so the return resolves to `any` —
+    // which says the callee was unresolvable, NOT that it was a response
+    // helper. Its argument is a query, and reporting it would be a false
+    // contract, worse than the honest `any` the manifest downgrades to Unknown.
+    const inferred = await inferReturn('Endpoint_Query_Response', UNTYPED_QUERY_LINE);
+    if (inferred) {
+      assert.ok(
+        !/where|take/.test(inferred.type_string),
+        `a query argument is not a response contract, got: ${inferred.type_string}`
+      );
+      assert.strictEqual(collapse(inferred.type_string), 'any');
+    }
   });
 
   it('does not report a redirect location as the response contract', async () => {
