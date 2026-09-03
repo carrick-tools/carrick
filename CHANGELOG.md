@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.32](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.31...carrick-v0.3.32) (2026-09-03)
+
+
+### Bug Fixes
+
+* **scanner:** emit whole-URL env-var calls the extraction returned no row for ([#633](https://github.com/carrick-tools/carrick/issues/633)) ([057a517](https://github.com/carrick-tools/carrick/commit/057a517dc1cb872417d16a837a8a7ce5b283c539))
+* **scanner:** index imported request members that build their URL with new URL() or state no method ([#639](https://github.com/carrick-tools/carrick/issues/639)) ([1d9ec42](https://github.com/carrick-tools/carrick/commit/1d9ec42dfadff6f4a4775019697d6eca62470b9a))
+* **scanner:** judge a call target's route shape on its path, not its query string ([#634](https://github.com/carrick-tools/carrick/issues/634)) ([a6840f7](https://github.com/carrick-tools/carrick/commit/a6840f7faf794cc097c5cbdee012ab42ff576a51))
+* **scanner:** resolve a base declared as a module-level string literal ([#637](https://github.com/carrick-tools/carrick/issues/637)) ([1b2843b](https://github.com/carrick-tools/carrick/commit/1b2843b0f241c84a5632d63cf5f7b3f39edffeb2))
+* **sidecar:** resolve the response helper's argument when the handler's return carries no contract ([#636](https://github.com/carrick-tools/carrick/issues/636)) ([caa3b34](https://github.com/carrick-tools/carrick/commit/caa3b345f456e5a2f9d540df2f881f6e8c609c9b))
+
 ## [0.3.31](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.30...carrick-v0.3.31) (2026-09-02)
 
 
