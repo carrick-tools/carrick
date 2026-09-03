@@ -97,7 +97,14 @@ mod type_compat_v2;
 /// convention's default verb (carrick#628), so an unchanged route module has
 /// its real verb back where a v12 cache pins it to the preflight verb and drops
 /// the row every consumer of that route matches.
-const CACHE_VERSION: u32 = 13;
+/// 14: five passes now emit or resolve where a v13 cache holds nothing or a
+/// wrong value for an unchanged file: whole-URL env-var calls extraction
+/// returned no row for (carrick#632), a base declared as a module-level
+/// string literal (carrick#627), a response contract read off the helper's
+/// argument (carrick#631), helper calls whose built query string failed the
+/// route-shape gate (carrick#588 finding 6), and imported members that build
+/// their URL with `new URL()` or state no method (carrick#588 finding 3).
+const CACHE_VERSION: u32 = 14;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
