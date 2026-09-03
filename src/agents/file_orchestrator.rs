@@ -10726,6 +10726,57 @@ export { routes };
         assert_eq!(result.data_calls[0].pattern_matched, "requestJson");
     }
 
+    /// carrick#588 finding 6: a package that reaches its siblings through one
+    /// helper passes each path as an argument, and some of those paths carry a
+    /// query string the caller builds (`?${params.toString()}`). The site
+    /// resolves, but the parens the built query leaves in the target used to
+    /// fail the route-shape gate in `build_mount_graph`, so those calls were
+    /// dropped between the backfill and the graph and the endpoints they reach
+    /// had no consumer in the index.
+    #[test]
+    fn wrapper_calls_with_a_built_query_string_reach_the_graph() {
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let mut result = FileAnalysisResult::default();
+        let calls = vec![
+            wrapper_call(31, 100, "${base}/api/v1/widgets", None),
+            wrapper_call(35, 300, "${base}/api/v1/widgets?${params.toString()}", None),
+            wrapper_call(
+                39,
+                500,
+                "${base}/api/v1/widgets/${id}/history?since=${encodeURIComponent(at)}",
+                None,
+            ),
+        ];
+
+        let added = FileOrchestrator::merge_local_wrapper_calls(&mut result, calls);
+        assert_eq!(added, 3, "every site is backfilled");
+
+        let mut file_results = HashMap::new();
+        file_results.insert("src/tools.ts".to_string(), result);
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+
+        let mut reached: Vec<(&str, &str)> = graph
+            .data_calls
+            .iter()
+            .map(|call| (call.method.as_str(), call.canonical_path.as_str()))
+            .collect();
+        reached.sort_unstable();
+        assert_eq!(
+            reached,
+            vec![
+                ("GET", "/api/v1/widgets"),
+                ("GET", "/api/v1/widgets"),
+                ("GET", "/api/v1/widgets/:id/history"),
+            ],
+            "the query string is not part of the route and must not drop the call"
+        );
+    }
+
     /// Two sites on one source line (a `Promise.all` of them) are two calls:
     /// the first backfill must not suppress its siblings.
     #[test]

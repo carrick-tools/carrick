@@ -592,6 +592,42 @@ export function buildTools(base: string, token: string) {
         );
     }
 
+    /// A site whose path argument carries a query string built from an
+    /// expression resolves like any other: the query is not part of the route
+    /// and is truncated downstream (carrick#588 finding 6).
+    #[test]
+    fn resolves_a_path_argument_carrying_a_built_query_string() {
+        let calls = collect(
+            r#"
+async function requestJson(base: string, path: string, token: string) {
+  const res = await fetch(`${base}${path}`, { headers: { Authorization: token } });
+  return res.json();
+}
+
+export function buildTools(base: string, token: string) {
+  return {
+    listWidgets: (params: URLSearchParams) =>
+      requestJson(base, `/api/v1/widgets?${params.toString()}`, token),
+    widgetHistory: (id: string, at: string) =>
+      requestJson(base, `/api/v1/widgets/${id}/history?since=${encodeURIComponent(at)}`, token),
+  };
+}
+"#,
+        );
+
+        assert_eq!(
+            targets(&calls),
+            vec![
+                (None, "${base}/api/v1/widgets?${params.toString()}"),
+                (
+                    None,
+                    "${base}/api/v1/widgets/${id}/history?since=${encodeURIComponent(at)}"
+                ),
+            ],
+            "the site's argument is kept verbatim, query string included"
+        );
+    }
+
     /// The whole URL is the parameter, and the helper states its method.
     #[test]
     fn resolves_a_bare_path_parameter_and_a_stated_method() {
