@@ -10,3 +10,7 @@ export async function pushArtifact(name: string, client: ApiClient) {
 export async function pullArtifact(name: string, client: ApiClient) {
   return client.readArtifactUrl(name);
 }
+
+export async function readSession(client: ApiClient) {
+  return client.describeSession();
+}

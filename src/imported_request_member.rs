@@ -51,10 +51,19 @@
 //!   argument carrying at least one of `method` / `headers` / `body` / `data`.
 //!   No client library, framework or helper name appears anywhere here.
 //! - The URL is the request's sole route-shaped string or template argument,
-//!   at whatever position it sits. A request with none, or with two, states no
-//!   single URL and the member is dropped.
-//! - The method must be a literal. A parameterised method belongs to the site,
-//!   not the member.
+//!   at whatever position it sits, or the path a `new URL(<literal>, base)`
+//!   declared in the same function supplies to it (`url.href`, `url.toString()`
+//!   or the binding itself). That second form is read through
+//!   [`crate::new_url_target`], and like everywhere else the base is left
+//!   alone: it is an opaque value, and only the path is asserted. A request
+//!   with no URL, or with two, states no single URL and the member is dropped.
+//! - The method must be a literal, EXCEPT that a request-options bag stating no
+//!   method at all is a `GET`. Every fetch-shaped client defaults to `GET` when
+//!   its options carry no `method`, so a member whose bag holds only headers is
+//!   stating a `GET` as surely as one that spells it. A bag carrying a body is
+//!   not read this way: a payload with no method is a wrapper injecting the
+//!   verb, not a default. A `method` key whose value is not a literal belongs
+//!   to the site, not the member.
 //! - Where the URL interpolates one of the member's own parameters, that
 //!   interpolation must be a whole path segment. A parameter standing for a
 //!   path value (`/api/v1/things/${id}`) is a path parameter and normalises to
@@ -83,6 +92,7 @@ use swc_common::{SourceMap, SourceMapper, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
+use crate::new_url_target::UrlBindings;
 use crate::type_manifest::{is_http_method, normalize_manifest_method};
 use crate::wrapper_request_shape::{
     is_request_options, literal_string, prop_value, sole_object_literal, verb_from_callee_property,
@@ -96,7 +106,10 @@ pub struct RequestMember {
     /// The URL the member builds, kept exactly as written. Everything it
     /// closes over stays an interpolation (`${this.baseUrl}/api/v2/x/${id}`),
     /// so base-URL and env-var classification downstream sees the form it
-    /// always sees.
+    /// always sees. A URL assembled with `new URL(path, base)` is the one
+    /// exception: there the base never reaches the argument as text, so the
+    /// target is the path alone, which is what a host-free call already is
+    /// everywhere else in the scanner.
     pub target: String,
 }
 
@@ -117,6 +130,7 @@ pub struct OwnedMember<Id> {
 pub fn collect_request_members(module: &Module, source_map: &Lrc<SourceMap>) -> RequestMemberIndex {
     let mut collector = MemberCollector {
         source_map,
+        urls: UrlBindings::new(source_map),
         stack: Vec::new(),
         members: HashMap::new(),
         dropped: Vec::new(),
@@ -172,6 +186,10 @@ struct MemberFrame {
 
 struct MemberCollector<'a> {
     source_map: &'a Lrc<SourceMap>,
+    /// The `new URL(path, base)` bindings in scope, on the same walk. A client
+    /// class declares `const url` in every method it has, so the scope walk is
+    /// what keeps one method's path out of the next one's request.
+    urls: UrlBindings<'a>,
     /// The named members enclosing the node being visited, innermost last. A
     /// request is attributed to the innermost one, so a member's own nested
     /// closures count as the member's and a nested named function owns its own.
@@ -220,7 +238,9 @@ impl MemberCollector<'_> {
             request: None,
             ambiguous: false,
         });
+        self.urls.push();
         body.visit_with(self);
+        self.urls.pop();
         self.pop_frame();
     }
 }
@@ -244,6 +264,13 @@ impl Visit for MemberCollector<'_> {
         // A `#private` method is not reachable from another file, so it is a
         // barrier rather than a member.
         self.walk_body(None, Vec::new(), &node.function.body);
+    }
+
+    fn visit_constructor(&mut self, node: &Constructor) {
+        // A constructor is not called by name either. It is walked all the same
+        // so a `const url` it declares stays inside it rather than reaching the
+        // module scope, where a method that declares none could read it.
+        self.walk_body(None, Vec::new(), &node.body);
     }
 
     fn visit_fn_decl(&mut self, node: &FnDecl) {
@@ -280,7 +307,12 @@ impl Visit for MemberCollector<'_> {
                 let params = fn_param_names(&fn_expr.function.params);
                 self.walk_body(Some(name), params, &fn_expr.function.body);
             }
-            _ => node.visit_children_with(self),
+            _ => {
+                // `const url = new URL("/api/v2/things", this.baseUrl)`, so a
+                // request reached through `url.href` states its path.
+                self.urls.declare(node);
+                node.visit_children_with(self);
+            }
         }
     }
 
@@ -313,7 +345,7 @@ impl MemberCollector<'_> {
             return None;
         }
 
-        let target = sole_route_shaped_argument(call, self.source_map)?;
+        let target = self.sole_target_argument(call)?;
         // A URL whose STRUCTURE comes from the member's caller is the shape
         // `local_http_wrapper` joins by substitution. Asserting the member's
         // half alone would replace the site's literal with a parameter name.
@@ -325,36 +357,57 @@ impl MemberCollector<'_> {
             Some((_, obj)) => match prop_value(obj, "method") {
                 // A `method` key that is not a literal belongs to the site.
                 Some(value) => normalize_http_method(&literal_string(value?)?)?,
-                None => verb?,
+                None => match verb {
+                    Some(verb) => verb,
+                    None => default_method(obj)?,
+                },
             },
             None => verb?,
         };
 
         Some(RequestMember { method, target })
     }
+
+    /// The call's single URL argument: a route-shaped string or template as
+    /// written, or the path a `new URL(<literal>, base)` in scope supplies to
+    /// it. `None` when the call has none, or more than one, or when the
+    /// argument sits behind a spread.
+    fn sole_target_argument(&self, call: &CallExpr) -> Option<String> {
+        let mut found: Option<String> = None;
+        for arg in &call.args {
+            if arg.spread.is_some() {
+                continue;
+            }
+            let stated = argument_text(&arg.expr, self.source_map)
+                .filter(|text| is_route_shaped(text))
+                .or_else(|| self.urls.stated_path(&arg.expr));
+            let Some(text) = stated else {
+                continue;
+            };
+            if found.is_some() {
+                return None;
+            }
+            found = Some(text);
+        }
+        found
+    }
 }
 
-/// The call's single route-shaped string or template argument, as written.
-/// `None` when it has none, or more than one, or when the argument sits behind
-/// a spread.
-fn sole_route_shaped_argument(call: &CallExpr, source_map: &Lrc<SourceMap>) -> Option<String> {
-    let mut found: Option<String> = None;
-    for arg in &call.args {
-        if arg.spread.is_some() {
-            continue;
-        }
-        let Some(text) = argument_text(&arg.expr, source_map) else {
-            continue;
-        };
-        if !is_route_shaped(&text) {
-            continue;
-        }
-        if found.is_some() {
-            return None;
-        }
-        found = Some(text);
-    }
-    found
+/// The method a request-options bag that names none states.
+///
+/// `GET`, which is what every fetch-shaped client sends when its options carry
+/// no `method`: a member whose bag holds only headers is stating a `GET` as
+/// surely as one that spells it, and fifteen of one measured client's forty-one
+/// request members are written that way. Reaching this point already means the
+/// call states a URL and carries a request-options object, so the shape is
+/// settled rather than guessed at.
+///
+/// A bag carrying a payload is the exception, and states nothing: a body with
+/// no method is a wrapper injecting the verb, not a library default.
+fn default_method(options: &ObjectLit) -> Option<String> {
+    let carries_payload =
+        prop_value(options, "body").is_some() || prop_value(options, "data").is_some();
+    (!carries_payload).then(|| "GET".to_string())
 }
 
 /// The text a string or template argument contributes: a literal's value, or a
@@ -684,6 +737,98 @@ mod tests {
                 method: "GET".to_string(),
                 target: "${this.base}/api/v1/things".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn a_url_built_with_the_url_constructor_states_the_member_s_path() {
+        let members = index(
+            r#"
+            class C {
+              describeSession() {
+                const url = new URL("/api/v2/session", this.apiURL);
+                return send(Schema, url.href, { headers: this.headers() });
+              }
+              listThings(after?: string) {
+                const url = new URL("/api/v2/things", this.apiURL);
+                if (after) {
+                  url.searchParams.append("after", after);
+                }
+                return send(Schema, url.toString(), { headers: this.headers() });
+              }
+            }
+            "#,
+        );
+        assert_eq!(
+            members.get("describeSession").map(|m| m.target.as_str()),
+            Some("/api/v2/session"),
+            "the path is stated by the `new URL` the request reads through `.href`"
+        );
+        assert_eq!(
+            members.get("listThings").map(|m| m.target.as_str()),
+            Some("/api/v2/things"),
+            "one method's `url` must not be read as the next one's"
+        );
+    }
+
+    #[test]
+    fn a_request_options_bag_that_states_no_method_is_a_get() {
+        let members = index(
+            r#"
+            class C {
+              readThing(id: string) {
+                return send(Schema, `${this.base}/api/v1/things/${id}`, {
+                  headers: this.headers(),
+                });
+              }
+            }
+            "#,
+        );
+        assert_eq!(
+            members.get("readThing"),
+            Some(&RequestMember {
+                method: "GET".to_string(),
+                target: "${this.base}/api/v1/things/${id}".to_string(),
+            }),
+            "a bag holding only headers states the method every client defaults to"
+        );
+    }
+
+    #[test]
+    fn a_bag_carrying_a_payload_and_no_method_states_nothing() {
+        let members = index(
+            r#"
+            class C {
+              writeThing(payload: unknown) {
+                return send(Schema, `${this.base}/api/v1/things`, {
+                  headers: this.headers(),
+                  body: JSON.stringify(payload),
+                });
+              }
+            }
+            "#,
+        );
+        assert!(
+            !members.contains_key("writeThing"),
+            "a body with no method is a wrapper injecting the verb, not a default GET"
+        );
+    }
+
+    #[test]
+    fn two_urls_in_one_request_state_no_single_target() {
+        let members = index(
+            r#"
+            class C {
+              copyThing() {
+                const url = new URL("/api/v2/things", this.base);
+                return send(Schema, url.href, "/api/v2/other", { headers: {} });
+              }
+            }
+            "#,
+        );
+        assert!(
+            !members.contains_key("copyThing"),
+            "a built URL beside a route-shaped literal is two URLs, not one"
         );
     }
 

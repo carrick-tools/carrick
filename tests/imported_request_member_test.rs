@@ -61,7 +61,7 @@ fn call_at_line(calls: &[serde_json::Value], line: i64) -> &serde_json::Value {
 #[test]
 fn client_method_states_the_verb_and_the_version_for_its_call_sites() {
     let calls = calls("imported-request-member");
-    assert_eq!(calls.len(), 5, "one row per call site: {calls:#?}");
+    assert_eq!(calls.len(), 7, "one row per call site: {calls:#?}");
 
     // `client.createArtifactUrl(name)` reaches a PUT to /api/v2. The cassette
     // says POST, and says v2 only because the error message four lines below
@@ -90,6 +90,30 @@ fn client_method_states_the_verb_and_the_version_for_its_call_sites() {
     let local = call_at_line(&calls, 21);
     assert_eq!(local["method"], "GET");
     assert_eq!(local["target_url"], "/legacy/handles");
+}
+
+/// carrick#588 finding 3: the member builds its URL with `new URL(path, base)`
+/// and states no method, which is a GET.
+///
+/// Two independent gates dropped this member before the fix, so the site was
+/// left to extraction, which had only the file's other text to answer with. The
+/// cassette freezes what that produced: the right verb by luck, and a version
+/// the client never requests.
+#[test]
+fn a_member_that_builds_its_url_and_states_no_method_resolves_its_call_sites() {
+    let calls = calls("imported-request-member");
+
+    // `client.describeSession()` in a file whose cassette holds a v1 answer.
+    let summary = call_at_line(&calls, 25);
+    assert_eq!(summary["method"], "GET");
+    assert_eq!(summary["path"], "/api/v2/session");
+    assert_eq!(summary["target_url"], "/api/v2/session");
+
+    // The same member from the consumer whose cassette holds no row at all.
+    let read = call_at_line(&calls, 15);
+    assert_eq!(read["method"], "GET");
+    assert_eq!(read["path"], "/api/v2/session");
+    assert_eq!(read["target_url"], "/api/v2/session");
 }
 
 /// carrick#623: the same two members, called from a file whose cassette holds

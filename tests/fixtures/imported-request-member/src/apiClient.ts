@@ -34,6 +34,13 @@ export class ApiClient {
     );
   }
 
+  describeSession() {
+    const url = new URL("/api/v2/session", this.baseUrl);
+    return send(ArtifactSchema, url.href, {
+      headers: this.headers(),
+    });
+  }
+
   private headers() {
     return { Accept: "application/json" };
   }

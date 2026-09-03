@@ -40,6 +40,19 @@
       "payload_expression_line": null,
       "primary_type_symbol": null,
       "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:25",
+      "line_number": 25,
+      "target": "/api/v1/session",
+      "method": "GET",
+      "pattern_matched": "client.describeSession(",
+      "call_expression_text": "client.describeSession()",
+      "call_expression_line": 25,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
     }
   ]
 }

@@ -62,8 +62,7 @@ pub type NewUrlPathMap = HashMap<u32, String>;
 /// Collect every call whose target is built with `new URL(path, base)`.
 pub fn collect_new_url_paths(module: &Module, source_map: &Lrc<SourceMap>) -> NewUrlPathMap {
     let mut collector = Collector {
-        source_map,
-        scopes: vec![HashMap::new()],
+        bindings: UrlBindings::new(source_map),
         paths: HashMap::new(),
     };
     module.visit_with(&mut collector);
@@ -71,24 +70,72 @@ pub fn collect_new_url_paths(module: &Module, source_map: &Lrc<SourceMap>) -> Ne
 }
 
 struct Collector<'a> {
-    source_map: &'a Lrc<SourceMap>,
-    /// One frame per enclosing function, outermost (module) first. Each maps a
-    /// binding name to the path the `new URL` it was declared from states.
-    scopes: Vec<HashMap<String, String>>,
+    bindings: UrlBindings<'a>,
     paths: NewUrlPathMap,
 }
 
 impl Collector<'_> {
     fn scoped<F: FnOnce(&mut Self)>(&mut self, visit: F) {
-        self.scopes.push(HashMap::new());
+        self.bindings.push();
         visit(self);
+        self.bindings.pop();
+    }
+
+    fn stated_path(&self, expr: &Expr) -> Option<String> {
+        self.bindings.stated_path(expr)
+    }
+}
+
+/// The `new URL(path, base)` bindings a walk can currently see.
+///
+/// Held separately from the visitor that walks them so a second pass reading
+/// the same shape reuses this scope walk rather than repeating it:
+/// [`crate::imported_request_member`] resolves a member's URL through exactly
+/// these bindings, on its own walk of the same module.
+pub(crate) struct UrlBindings<'a> {
+    source_map: &'a Lrc<SourceMap>,
+    /// One frame per enclosing function, outermost (module) first. Each maps a
+    /// binding name to the path the `new URL` it was declared from states.
+    scopes: Vec<HashMap<String, String>>,
+}
+
+impl<'a> UrlBindings<'a> {
+    pub(crate) fn new(source_map: &'a Lrc<SourceMap>) -> Self {
+        Self {
+            source_map,
+            scopes: vec![HashMap::new()],
+        }
+    }
+
+    /// Enter a function's scope. One client class declares `const url` in every
+    /// method it has, and a flat map keyed on `url` would collide on all of them.
+    pub(crate) fn push(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    pub(crate) fn pop(&mut self) {
         self.scopes.pop();
+    }
+
+    /// Record `const url = new URL(path, base)` in the innermost scope. A
+    /// declarator that states no path records nothing.
+    pub(crate) fn declare(&mut self, node: &VarDeclarator) {
+        if let Pat::Ident(binding) = &node.name
+            && let Some(init) = &node.init
+            && let Some(path) = self.stated_path(init)
+        {
+            let frame = self
+                .scopes
+                .last_mut()
+                .expect("the module frame is never popped");
+            frame.insert(binding.id.sym.to_string(), path);
+        }
     }
 
     /// The path an expression handed to a request states, if any: a `new URL`
     /// written inline, or a binding holding one, read directly or through the
     /// accessors a `URL` is normally turned back into a string with.
-    fn stated_path(&self, expr: &Expr) -> Option<String> {
+    pub(crate) fn stated_path(&self, expr: &Expr) -> Option<String> {
         match unwrap_transparent(expr) {
             Expr::New(new_expr) => self.new_url_path(new_expr),
             Expr::Ident(ident) => self.lookup(ident.sym.as_ref()),
@@ -172,16 +219,7 @@ impl Visit for Collector<'_> {
     }
 
     fn visit_var_declarator(&mut self, node: &VarDeclarator) {
-        if let Pat::Ident(binding) = &node.name
-            && let Some(init) = &node.init
-            && let Some(path) = self.stated_path(init)
-        {
-            let frame = self
-                .scopes
-                .last_mut()
-                .expect("the module frame is never popped");
-            frame.insert(binding.id.sym.to_string(), path);
-        }
+        self.bindings.declare(node);
         node.visit_children_with(self);
     }
 
