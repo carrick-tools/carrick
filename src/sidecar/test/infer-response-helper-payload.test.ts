@@ -92,6 +92,14 @@ export async function loadRemoteList({ request }: { request: Request }) {
 export async function loadRedirect({ request }: { request: Request }) {
   return wrap(request, redirectTo("/somewhere-else"));
 }
+
+export async function loadBareStatus({ request }: { request: Request }) {
+  if (!request.url) {
+    return reply({ error: "Gone" }, 410);
+  }
+
+  return reply({ items: listItems(), total: 1 });
+}
 `;
 
 function lineOf(marker: string): number {
@@ -104,6 +112,7 @@ const ITEMS_LINE = lineOf('export async function loadItems');
 const DETAIL_LINE = lineOf('export async function loadItemDetail');
 const REMOTE_LINE = lineOf('export async function loadRemoteList');
 const REDIRECT_LINE = lineOf('export async function loadRedirect');
+const BARE_STATUS_LINE = lineOf('export async function loadBareStatus');
 
 interface InferShape {
   status: string;
@@ -216,6 +225,15 @@ describe('carrick#631 response helper argument recovery', () => {
     assert.ok(inferred, 'must resolve to the stated name, not `any`');
     assert.strictEqual(collapse(inferred.type_string), 'RemoteListBody');
     assert.strictEqual(inferred.is_explicit, true);
+  });
+
+  it('skips a branch whose status is passed as a bare status code', async () => {
+    const inferred = await inferReturn('Endpoint_Bare_Response', BARE_STATUS_LINE);
+    assert.ok(inferred);
+    assert.strictEqual(
+      collapse(inferred.type_string),
+      '{ items: { id: string; label: string; }[]; total: number; }'
+    );
   });
 
   it('does not report a redirect location as the response contract', async () => {

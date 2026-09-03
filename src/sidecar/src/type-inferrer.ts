@@ -2382,7 +2382,8 @@ export class TypeInferrer {
   }
 
   /**
-   * True when an argument is an options object stating a >= 400 status.
+   * True when an argument states a >= 400 status: an options object carrying
+   * `status`/`statusCode`, or a bare status code (`send(body, 404)`).
    *
    * Read from the AST first: `{ status: 400 }` in an argument position widens
    * to `{ status: number }`, so the literal only survives syntactically. The
@@ -2391,6 +2392,10 @@ export class TypeInferrer {
   private statesErrorStatus(node: Node): boolean {
     const isErrorCode = (value: unknown): boolean =>
       typeof value === 'number' && value >= 400;
+
+    if (Node.isNumericLiteral(node)) {
+      return isErrorCode(node.getLiteralValue());
+    }
 
     if (Node.isObjectLiteralExpression(node)) {
       for (const name of STATUS_MEMBER_NAMES) {
