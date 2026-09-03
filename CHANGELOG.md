@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.34](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.33...carrick-v0.3.34) (2026-09-03)
+
+
+### Features
+
+* **scanner:** persist how a call's base resolves and where its type is declared ([#651](https://github.com/carrick-tools/carrick/issues/651)) ([e672919](https://github.com/carrick-tools/carrick/commit/e67291973bc588028b4cf462c48d18cd8b69316c))
+
 ## [0.3.33](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.32...carrick-v0.3.33) (2026-09-03)
 
 
