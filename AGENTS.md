@@ -114,13 +114,18 @@ Install hooks once per clone: `./scripts/install-hooks.sh`.
 - Follow Conventional Commits with optional scopes: `feat(sidecar): ...`, `fix: ...`, `docs: ...`, `refactor(phase4.1): ...`, `chore: ...`, `test: ...`.
 - PRs should include a short summary, rationale, test commands run, and links to relevant issues. Include sample Action output when it changes.
 
+## Ownership Boundary (who does what)
+Agents own the delivery loop end to end: branch, PR, review of the full diff, reading the real CI check conclusions, squash-merge, and cutting the release by merging the release-please PR. Nothing in that loop waits on the owner. Exactly two actions are the owner's and must be requested, never performed by an agent:
+- **Cloud deploys**: `terraform apply` and the lambda/app zips it ships, in `carrick-cloud`. Merged is not deployed; say so explicitly when a change needs a deploy before it can be measured.
+- **Paid eval spend**: any run that makes real LLM calls (Tier-A, cross-repo, OSS evals, corpus sweeps, fleet re-scans). State the estimated cost and get an explicit yes on that number before launching.
+
 ## Estimation Conventions
 - Effort estimates in issues, plans, and design docs use S/M/L defined in agent execution time. Claude agents execute this repo's work, so estimates are not in human developer time.
-  - S: one agent, merged PR in under about an hour of wall clock. Implementation is minutes; CI (~5-10 min per push) and Copilot review dominate.
+  - S: one agent, merged PR in under about an hour of wall clock. Implementation is minutes; CI (~5-10 min per push) dominates.
   - M: one agent working session, roughly 1-3 hours to a merged PR, usually one or two review/rebase cycles.
   - L: a sustained orchestrated session (parallel agents where the work decomposes), roughly a day.
 - Converting older docs or human-calibrated estimates: a human-week of focused work is roughly one L session; a human-month is roughly 3-5 sustained sessions spread over about a week of elapsed time.
-- Elapsed calendar time is set by the serialization points, not implementation speed: CI runs, review latency, dependency chains between work packages, same-release bundles, batched paid eval gates, and owner-gated actions (terraform applies in carrick-cloud, deploys, releases, fleet re-scans). Estimates should name their serialization points.
+- Elapsed calendar time is set by the serialization points, not implementation speed: CI runs, review latency, dependency chains between work packages, same-release bundles, and the two owner-gated actions (cloud deploys via terraform apply, and paid eval spend including fleet re-scans; see Ownership Boundary). Merges and releases are not serialization points: agents perform them. Estimates should name their serialization points.
 - Calibration (2026-07-18/19): nine scoped S/M tickets merged in one overnight session; a six-item tier including an L-sized prototype spike completed in about three hours of wall clock.
 
 ## Configuration & Infrastructure Notes
