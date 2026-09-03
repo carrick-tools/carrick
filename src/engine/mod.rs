@@ -4752,6 +4752,8 @@ mod tests {
                     payload_expression_line: Some(22),
                     primary_type_symbol: None,
                     type_import_source: None,
+
+                    loopback_default_url: None,
                 })
                 .collect(),
             graphql_operations: vec![],

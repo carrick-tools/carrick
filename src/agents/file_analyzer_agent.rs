@@ -189,6 +189,20 @@ pub struct DataCallResult {
     pub primary_type_symbol: Option<String>,
     /// Import path where the type is defined (e.g., "./types/user"), null if inline or same file
     pub type_import_source: Option<String>,
+    /// The concrete URL the SOURCE states this request falls back to when the
+    /// environment supplies nothing, for a target whose whole origin is an
+    /// environment variable with a LOOPBACK fallback
+    /// (`process.env.SUPPORT_URL ?? "http://localhost:3939/api/ask"`).
+    ///
+    /// Never from the model — set by `merge_whole_url_env_calls` from the
+    /// binding's own AST, alongside `target`. `target` states the deployed
+    /// request (the env var supplies the origin) and is what the row displays;
+    /// this states the default, and it is what the canonical key is computed
+    /// from, because a loopback origin is a structural prefix to strip rather
+    /// than an opaque base to keep verbatim. See
+    /// [`crate::env_alias::whole_url_local_default`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loopback_default_url: Option<String>,
 }
 
 /// A GraphQL resolver the file-analyzer found: the schema field it answers and
@@ -1485,6 +1499,8 @@ mod tests {
             payload_expression_line: None,
             primary_type_symbol: Some("Comment".to_string()),
             type_import_source: None,
+
+            loopback_default_url: None,
         };
 
         let json = serde_json::to_string(&data_call).unwrap();
@@ -1534,6 +1550,8 @@ mod tests {
                 payload_expression_line: None,
                 primary_type_symbol: Some("NULL".to_string()),
                 type_import_source: Some("bad import (oops)".to_string()),
+
+                loopback_default_url: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -1889,6 +1907,8 @@ mod tests {
                 payload_expression_line: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+
+                loopback_default_url: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -1940,6 +1960,7 @@ mod tests {
             payload_expression_line: None,
             primary_type_symbol: None,
             type_import_source: None,
+            loopback_default_url: None,
         }
     }
 
