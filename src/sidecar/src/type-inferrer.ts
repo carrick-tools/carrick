@@ -145,6 +145,19 @@ export const MACHINERY_MEMBER_INDICATORS = new Set<string>([
 const MACHINERY_INDICATOR_THRESHOLD = 3;
 
 /**
+ * How far the response-helper recovery (carrick#631) descends through nested
+ * calls looking for the payload argument. `cors(request, json(payload))` needs
+ * two; the bound is a backstop against a pathologically nested return.
+ */
+const RESPONSE_HELPER_MAX_DEPTH = 4;
+
+/**
+ * Members an options object uses to state an HTTP status. A >= 400 status marks
+ * the branch an error path, whose shape is not the endpoint's contract.
+ */
+const STATUS_MEMBER_NAMES = ['status', 'statusCode'] as const;
+
+/**
  * Print a `Type` to its string form WITHOUT the compiler's default truncation.
  *
  * `Type.getText()` truncates large/anonymous object types to ~160 chars and inserts
@@ -399,20 +412,65 @@ export class TypeInferrer {
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
     } else {
-      // No wrapper rule fired. Before treating the raw return as the contract,
-      // reject a wrapper envelope that IS or CONTAINS framework machinery
-      // (carrick#371): `withApiWrapper({ handler: () => ({ response: Response,
-      // error })})` resolves the handler's return to `{ response: Response; ... }`,
-      // which is transport machinery, not a payload. Emitting it manufactures a
-      // false compat mismatch against the consumer's real payload. No rule
-      // recovered a payload here, so abstain (honest `unknown`) — fail-closed.
-      if (this.typeIsOrContainsResponseMachinery(awaitedType)) {
+      // No wrapper rule fired, and the resolved return carries no contract of
+      // its own — it is transport machinery, or `any`/`unknown` because the
+      // callee that produced it has no installed declaration on a bare
+      // checkout. The contract may still be one level in, in the ARGUMENT the
+      // handler handed the callee (carrick#631). Read the handler's own
+      // `return` statements before abstaining.
+      //
+      // How much of the argument is trusted depends on WHY the return carries
+      // nothing. Machinery means the callee is a known transport helper, so
+      // its argument is the payload and any resolved type is read. `any` /
+      // `unknown` means the callee is simply unresolvable, and on a bare
+      // checkout that describes most imported callees — `db.findMany({ where
+      // })`, `client.send(params)` — whose argument is a query, not a
+      // response. There the recovery is restricted to an argument the SOURCE
+      // annotates (`satisfies` / `as` / `<T>`): the developer stated the
+      // contract, so it is a claim rather than a guess.
+      const machinery = this.typeIsOrContainsResponseMachinery(awaitedType);
+      const unresolvable = awaitedType.isAny() || awaitedType.isUnknown();
+      if (machinery || unresolvable) {
+        const recovered = this.recoverPayloadFromReturnStatements(func, !machinery);
+        if (recovered) {
+          this.log(
+            `Return type at ${request.file_path}:${request.line_number} carries no ` +
+              "contract; recovered the payload from the response helper's argument"
+          );
+          const recoveredAnchor = recovered.anchorType
+            ? this.unwrapArrayLevels(recovered.anchorType)
+            : undefined;
+          return this.createInferredType(
+            request,
+            recovered.typeString,
+            recovered.isExplicit,
+            this.getNodeLocation(recovered.node),
+            undefined,
+            recoveredAnchor
+              ? this.primaryTypeSymbol(recoveredAnchor.element)
+              : undefined,
+            recoveredAnchor?.depth
+          );
+        }
+        // Nothing recoverable. Reject a wrapper envelope that IS or CONTAINS
+        // framework machinery (carrick#371): `withApiWrapper({ handler: () =>
+        // ({ response: Response, error })})` resolves the handler's return to
+        // `{ response: Response; ... }`, which is transport machinery, not a
+        // payload. Emitting it manufactures a false compat mismatch against
+        // the consumer's real payload — so abstain (honest `unknown`).
+        if (machinery) {
+          this.log(
+            `Return type at ${request.file_path}:${request.line_number} is or contains ` +
+              'framework machinery (Response/Request-shaped); abstaining rather than ' +
+              'capturing the wrapper envelope as a response contract'
+          );
+          return null;
+        }
         this.log(
-          `Return type at ${request.file_path}:${request.line_number} is or contains ` +
-            'framework machinery (Response/Request-shaped); abstaining rather than ' +
-            'capturing the wrapper envelope as a response contract'
+          `Return type at ${request.file_path}:${request.line_number} resolved to ` +
+            `${awaitedType.isAny() ? 'any' : 'unknown'} and no returned call stated ` +
+            'its payload type in source; leaving it unresolved'
         );
-        return null;
       }
       // No wrapper rule fired: the (awaited) return resolved to its own type.
       // A named object return (`async (): Promise<Payment> => …`) renders as the
@@ -2110,6 +2168,309 @@ export class TypeInferrer {
     } catch {
       return fallback;
     }
+  }
+
+  // ===========================================================================
+  // Response-helper argument recovery (carrick#631)
+  // ===========================================================================
+
+  /**
+   * Recover a response contract from a handler's own `return` statements when
+   * the resolved return type carries none.
+   *
+   * A file-based route `loader`/`action` almost never annotates its return: the
+   * payload goes through a helper — `json(payload)`, `reply(payload, opts)`,
+   * `wrap(request, json(payload))` — and the helper's result is transport, not
+   * contract. Two ways that collapses today:
+   *
+   *   * the helper is typed and returns machinery (`Promise<Response>`), so the
+   *     carrick#371 guard abstains and the manifest reads `unknown`;
+   *   * the helper comes from a package with no installed declaration (the
+   *     scanner reads a bare checkout), so it resolves to `any` and the whole
+   *     response reads `any`.
+   *
+   * In both, the contract is the helper's ARGUMENT — every framework that ships
+   * such a helper is generic over it. This walks the handler's returned
+   * expressions, descends through wrapper calls to the first argument that
+   * carries a payload, and unions the surviving branches. It is structural
+   * throughout: no helper, framework or package name is matched anywhere, and
+   * the recovery only runs where the existing path already had nothing.
+   *
+   * `statedOnly` is the guard for the unresolvable-callee case. A return type
+   * of `any` does not say the callee was a response helper, only that it could
+   * not be resolved, and on a bare checkout that is true of most imported
+   * callees: `return db.findMany({ where })` would otherwise report the query
+   * object as the endpoint's contract, which is a false contract and worse
+   * than `unknown`. With `statedOnly` set, only an argument the source
+   * annotates (`satisfies` / `as` / `<T>`) counts, because there the developer
+   * stated the contract. The machinery case leaves it clear: the callee is
+   * known transport, so its argument is the payload whatever its type.
+   *
+   * Returns `null` (a logged limitation, never a guess) when no returned
+   * expression yields an argument type this may read.
+   */
+  private recoverPayloadFromReturnStatements(
+    func: FunctionLike,
+    statedOnly: boolean
+  ): {
+    typeString: string;
+    isExplicit: boolean;
+    node: Node;
+    anchorType?: Type;
+  } | null {
+    const candidates: Array<{
+      typeString: string;
+      isExplicit: boolean;
+      node: Node;
+      anchorType: Type;
+    }> = [];
+
+    for (const returned of this.returnedExpressions(func)) {
+      const payloadNode = this.responseHelperPayloadNode(returned, 0, statedOnly);
+      if (!payloadNode) continue;
+
+      // A `satisfies X` / `as X` on the argument states the contract in source:
+      // read the ANNOTATION, not the literal the compiler widened it from.
+      // `expandAnnotationTypeNode` keeps the bare name when the declaration is
+      // not resolvable, which is the honest answer on a bare checkout.
+      const stated = this.statedTypeNodeOf(payloadNode);
+      if (stated) {
+        candidates.push({
+          typeString: this.expandAnnotationTypeNode(stated),
+          isExplicit: true,
+          node: payloadNode,
+          anchorType: this.unwrapPromiseType(stated.getType()),
+        });
+        continue;
+      }
+
+      const payloadType = this.unwrapPromiseType(payloadNode.getType());
+      candidates.push({
+        typeString: this.expandResolvedTypeStructural(
+          payloadType,
+          typeText(payloadType, payloadNode)
+        ),
+        isExplicit: false,
+        node: payloadNode,
+        anchorType: payloadType,
+      });
+    }
+
+    if (candidates.length === 0) {
+      return null;
+    }
+
+    // An empty payload (`json({})` on a preflight branch) declares nothing, and
+    // `{}` in a union would swallow the branch that does declare something. Drop
+    // it only when a branch with members survives — a handler whose ONLY payload
+    // is `{}` is honestly reporting an empty body.
+    const isEmptyObject = (text: string): boolean =>
+      text.replace(/\s+/g, '') === '{}';
+    const withMembers = candidates.filter((c) => !isEmptyObject(c.typeString));
+    const kept = withMembers.length > 0 ? withMembers : candidates;
+
+    // Dedupe on the whitespace-collapsed text, preserving source order.
+    const seen = new Set<string>();
+    const distinct = kept.filter((c) => {
+      const key = c.typeString.replace(/\s+/g, ' ').trim();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    const typeString = distinct.map((c) => c.typeString).join(' | ');
+    return {
+      typeString,
+      // Only a contract every surviving branch STATES in source is explicit.
+      isExplicit: distinct.every((c) => c.isExplicit),
+      node: distinct[0].node,
+      // A union joined several payloads, so there is no single anchor — the
+      // same rule the wrapper-unwrap path applies.
+      anchorType: distinct.length === 1 ? distinct[0].anchorType : undefined,
+    };
+  }
+
+  /**
+   * The expressions a function returns, excluding returns belonging to nested
+   * functions (a `.map(x => …)` callback returns a row, not the response).
+   * A concise arrow body is itself the returned expression.
+   */
+  private returnedExpressions(func: FunctionLike): Node[] {
+    const body = func.getBody();
+    if (!body) return [];
+    if (!Node.isBlock(body)) return [body];
+
+    const returned: Node[] = [];
+    for (const statement of body.getDescendantsOfKind(SyntaxKind.ReturnStatement)) {
+      if (this.findContainingFunctionForNode(statement) !== func) continue;
+      const expression = statement.getExpression();
+      if (expression) returned.push(expression);
+    }
+    return returned;
+  }
+
+  /**
+   * The payload argument of a returned response-helper call, or `undefined`.
+   *
+   * Walks the call's arguments in source order: the first whose type reads as a
+   * contract wins; an argument that is itself a call is descended into, which is
+   * what recovers `wrap(request, json(payload))` — the transport wrapper's own
+   * first argument is the request, which never reads as a contract.
+   *
+   * A call whose sibling options object states a >= 400 status is an error
+   * branch and contributes nothing: the response contract of an endpoint is the
+   * shape it returns when it succeeds.
+   *
+   * `statedOnly` narrows what counts as a payload to an argument the source
+   * annotates; see `recoverPayloadFromReturnStatements`.
+   */
+  private responseHelperPayloadNode(
+    expression: Node,
+    depth: number,
+    statedOnly: boolean
+  ): Node | undefined {
+    if (depth > RESPONSE_HELPER_MAX_DEPTH) return undefined;
+
+    const call = this.peelTransparentExpression(expression);
+    if (!Node.isCallExpression(call)) return undefined;
+
+    const args = call.getArguments().map((a) => this.peelTransparentExpression(a));
+    if (args.length === 0) return undefined;
+    if (args.slice(1).some((a) => this.statesErrorStatus(a))) return undefined;
+
+    for (const arg of args) {
+      const candidate = this.unwrapJsonStringifyArg(arg);
+      if (this.nodeCarriesPayloadContract(candidate, statedOnly)) return candidate;
+      const nested = this.responseHelperPayloadNode(candidate, depth + 1, statedOnly);
+      if (nested) return nested;
+    }
+    return undefined;
+  }
+
+  /**
+   * True when a node's type reads as a response payload.
+   *
+   * Object-shaped only (an object literal, a named interface, an array of
+   * either, or a union containing one). A bare primitive argument is a
+   * redirect location, a status code or a body string — `redirectTo("/next")`
+   * must never report `"/next"` as the endpoint's contract. A stated
+   * `satisfies`/`as` annotation counts even when its declaration is missing:
+   * the source says what the contract is.
+   *
+   * Under `statedOnly` the annotation is the ONLY thing that counts, so an
+   * unresolvable callee's arguments never become a contract by accident.
+   */
+  private nodeCarriesPayloadContract(node: Node, statedOnly: boolean): boolean {
+    if (this.statedTypeNodeOf(node)) return true;
+    if (statedOnly) return false;
+
+    const type = this.unwrapPromiseType(node.getType());
+    if (
+      type.isAny() ||
+      type.isUnknown() ||
+      type.isNever() ||
+      type.isVoid() ||
+      type.isUndefined() ||
+      type.isNull()
+    ) {
+      return false;
+    }
+    if (type.getCallSignatures().length > 0) return false;
+    if (this.typeIsOrContainsResponseMachinery(type)) return false;
+    return this.typeIsObjectShaped(type, 0);
+  }
+
+  /** Object, array-of-object, or a union/intersection containing one. */
+  private typeIsObjectShaped(type: Type, depth: number): boolean {
+    if (depth > 2) return false;
+    if (type.isUnion()) {
+      return type.getUnionTypes().some((m) => this.typeIsObjectShaped(m, depth + 1));
+    }
+    if (type.isIntersection()) {
+      return type
+        .getIntersectionTypes()
+        .some((m) => this.typeIsObjectShaped(m, depth + 1));
+    }
+    if (type.isArray()) {
+      const element = type.getArrayElementType();
+      return element ? this.typeIsObjectShaped(element, depth + 1) : false;
+    }
+    return type.isObject() && !type.isTuple();
+  }
+
+  /**
+   * The `satisfies X` / `as X` / `<X>` annotation node on an expression, when
+   * the source states its type. `satisfies` is the shape a route uses to claim
+   * a shared response contract without widening the literal.
+   */
+  private statedTypeNodeOf(node: Node): Node | undefined {
+    if (Node.isSatisfiesExpression(node) || Node.isAsExpression(node)) {
+      return node.getTypeNode();
+    }
+    if (Node.isTypeAssertion(node)) {
+      return node.getTypeNode();
+    }
+    return undefined;
+  }
+
+  /**
+   * True when an argument states a >= 400 status: an options object carrying
+   * `status`/`statusCode`, or a bare status code (`send(body, 404)`).
+   *
+   * Read from the AST first: `{ status: 400 }` in an argument position widens
+   * to `{ status: number }`, so the literal only survives syntactically. The
+   * type check behind it catches `as const` and hoisted option objects.
+   */
+  private statesErrorStatus(node: Node): boolean {
+    const isErrorCode = (value: unknown): boolean =>
+      typeof value === 'number' && value >= 400;
+
+    if (Node.isNumericLiteral(node)) {
+      return isErrorCode(node.getLiteralValue());
+    }
+
+    if (Node.isObjectLiteralExpression(node)) {
+      for (const name of STATUS_MEMBER_NAMES) {
+        const property = node.getProperty(name);
+        if (property && Node.isPropertyAssignment(property)) {
+          const initializer = property.getInitializer();
+          if (initializer && Node.isNumericLiteral(initializer)) {
+            if (isErrorCode(initializer.getLiteralValue())) return true;
+          }
+        }
+      }
+    }
+
+    const type = node.getType();
+    for (const name of STATUS_MEMBER_NAMES) {
+      const property = type.getProperty(name);
+      const declaration = property?.getDeclarations()[0];
+      if (!property || !declaration) continue;
+      const propertyType = property.getTypeAtLocation(declaration);
+      if (
+        propertyType.isNumberLiteral() &&
+        isErrorCode(propertyType.getLiteralValue())
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Peel the wrappers that do not change an expression's payload: parentheses
+   * and `await`. Unlike `unwrapExpressionNode` this KEEPS `as`/`satisfies`,
+   * because the annotation is exactly what the recovery wants to read.
+   */
+  private peelTransparentExpression(node: Node): Node {
+    let current = node;
+    while (
+      Node.isParenthesizedExpression(current) ||
+      Node.isAwaitExpression(current)
+    ) {
+      current = current.getExpression();
+    }
+    return current;
   }
 
   /**
