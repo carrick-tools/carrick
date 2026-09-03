@@ -208,6 +208,15 @@ interface UnwrapResult {
    * or when verified machinery collapsed to `unknown`.
    */
   payloadType?: Type;
+  /**
+   * The unwrap ended in a VERIFIED-MACHINERY collapse: a rule matched the
+   * wrapper's symbol and origin, so the type is known transport, and no rule
+   * could recover a payload from inside it. `typeString` is then the honest
+   * `unknown`, not a contract — callers that have a second way to reach the
+   * payload (the carrick#631 return-statement recovery) must treat this the
+   * same as the structural machinery verdict rather than as a resolved type.
+   */
+  verifiedMachinery?: boolean;
 }
 
 /**
@@ -409,26 +418,31 @@ export class TypeInferrer {
       this.unwrapPromiseType(returnType)
     );
     const unwrapResult = this.unwrapTypeWithConfig(awaitedType, func, extractionConfig);
-    if (unwrapResult.wasUnwrapped) {
+    if (unwrapResult.wasUnwrapped && !unwrapResult.verifiedMachinery) {
       typeString = unwrapResult.typeString;
     } else {
-      // No wrapper rule fired, and the resolved return carries no contract of
-      // its own — it is transport machinery, or `any`/`unknown` because the
-      // callee that produced it has no installed declaration on a bare
-      // checkout. The contract may still be one level in, in the ARGUMENT the
-      // handler handed the callee (carrick#631). Read the handler's own
-      // `return` statements before abstaining.
+      // Either no wrapper rule fired, or one verified the wrapper's identity
+      // and recovered no payload from it. Either way the resolved return
+      // carries no contract of its own — it is transport machinery, or
+      // `any`/`unknown` because the callee that produced it has no installed
+      // declaration on a bare checkout. The contract may still be one level
+      // in, in the ARGUMENT the handler handed the callee (carrick#631). Read
+      // the handler's own `return` statements before abstaining.
       //
       // How much of the argument is trusted depends on WHY the return carries
       // nothing. Machinery means the callee is a known transport helper, so
-      // its argument is the payload and any resolved type is read. `any` /
+      // its argument is the payload and any resolved type is read — whether
+      // the structural check recognised it or a wrapper rule verified the
+      // wrapper's symbol and origin and found no payload inside it. `any` /
       // `unknown` means the callee is simply unresolvable, and on a bare
       // checkout that describes most imported callees — `db.findMany({ where
       // })`, `client.send(params)` — whose argument is a query, not a
       // response. There the recovery is restricted to an argument the SOURCE
       // annotates (`satisfies` / `as` / `<T>`): the developer stated the
       // contract, so it is a claim rather than a guess.
-      const machinery = this.typeIsOrContainsResponseMachinery(awaitedType);
+      const machinery =
+        unwrapResult.verifiedMachinery === true ||
+        this.typeIsOrContainsResponseMachinery(awaitedType);
       const unresolvable = awaitedType.isAny() || awaitedType.isUnknown();
       if (machinery || unresolvable) {
         const recovered = this.recoverPayloadFromReturnStatements(func, !machinery);
@@ -1555,6 +1569,10 @@ export class TypeInferrer {
           typeString: parts.length === 1 ? parts[0] : parts.join(' | '),
           isExplicit: false,
           wasUnwrapped: true,
+          // Every branch collapsed, so the union as a whole recovered no
+          // payload — the same standing as a single verified-machinery
+          // collapse, and the caller's own recovery should still get a turn.
+          verifiedMachinery: informative.length === 0,
         };
       }
     }
@@ -1593,6 +1611,7 @@ export class TypeInferrer {
         typeString: 'unknown',
         isExplicit: false,
         wasUnwrapped: true,
+        verifiedMachinery: true,
       };
     }
 
