@@ -823,8 +823,49 @@ fn top_level_fallback_op(s: &str) -> Option<usize> {
     None
 }
 
+/// Byte index of the `?` that opens a target's query string: the first one
+/// outside every `${…}` interpolation.
+///
+/// A `?` INSIDE an interpolation belongs to the substituted expression —
+/// optional chaining, a ternary, a `??` fallback — and separates nothing, so
+/// `${cfg?.url ?? 'x'}/p` has no query string and is judged whole.
+fn query_string_start(route: &str) -> Option<usize> {
+    let bytes = route.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        if depth == 0 && bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'{') {
+            depth = 1;
+            i += 2;
+            continue;
+        }
+        match bytes[i] {
+            b'{' if depth > 0 => depth += 1,
+            b'}' if depth > 0 => depth -= 1,
+            b'?' if depth == 0 => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 pub fn is_valid_route_shape(route: &str) -> bool {
     let route = route.trim();
+    if route.is_empty() {
+        return false;
+    }
+    // The query string is not part of the route. Every path the target then
+    // travels — `UrlNormalizer::clean_path`, `consumer_call_path`, the call-site
+    // extractor's `extract_path_from_url` — truncates at `?` before anything is
+    // matched on it, so what a caller interpolates into a query VALUE cannot
+    // make the route unresolvable: `/v1/runs?${params.toString()}` reaches
+    // `/v1/runs` exactly as the bare form does. Judge the shape on the path
+    // (carrick#588 finding 6).
+    let route = match query_string_start(route) {
+        Some(index) => route[..index].trim_end(),
+        None => route,
+    };
     if route.is_empty() {
         return false;
     }
@@ -2858,6 +2899,48 @@ mod tests {
             assert!(
                 is_valid_route_shape(route),
                 "expected route to be kept: {route:?}"
+            );
+        }
+    }
+
+    /// carrick#588 finding 6: a caller that builds its query string from an
+    /// expression (`?${params.toString()}`, `?since=${encodeURIComponent(at)}`)
+    /// still states its route outright — the query is truncated before anything
+    /// is matched on it. The parens the expression leaves behind used to fail
+    /// the cleanliness test and the whole call was dropped, so ten sibling
+    /// endpoints reached through one helper produced seven rows.
+    #[test]
+    fn route_shape_judges_the_path_not_the_query_string() {
+        let kept = [
+            "/api/v1/widgets?${params.toString()}",
+            "${base}/api/v1/widgets?${params.toString()}",
+            "${base}/api/v1/widgets/${id}/history?since=${encodeURIComponent(at)}",
+            "https://api.example.com/v1/widgets?limit=10&cursor=${cursor}",
+            "ENV_VAR:WIDGETS_API:/v1/widgets?${params.toString()}",
+        ];
+        for route in kept {
+            assert!(
+                is_valid_route_shape(route),
+                "expected route to be kept: {route:?}"
+            );
+        }
+
+        let dropped = [
+            // The call is in the PATH, so the matched path itself is
+            // unresolved. Left rejected: resolving it needs the argument, not
+            // a shape rule.
+            "${base}/api/v1/widgets/${lookup(id)}/history",
+            // `?` inside an interpolation separates nothing, so these are
+            // judged whole and stay rejected on their whitespace.
+            "${cfg?.url ?? 'x'}/p",
+            "${A ??}/p",
+            // Nothing but a query string is not a route.
+            "?${params.toString()}",
+        ];
+        for route in dropped {
+            assert!(
+                !is_valid_route_shape(route),
+                "expected route to be dropped: {route:?}"
             );
         }
     }
