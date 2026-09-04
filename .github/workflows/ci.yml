@@ -104,6 +104,7 @@ jobs:
           --test llm_mock_pipeline_test
           --test new_url_target_test
           --test route_request_anchor_test
+          --test socket_class_field_test
           --test socket_extraction_test
 
       # Every tests/*.rs must be run by a step above or be listed here with a
