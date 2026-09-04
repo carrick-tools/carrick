@@ -15,9 +15,13 @@
 //! cannot be: the server names it in a `.of(...)` argument that is usually a
 //! variable, and the client names it in the path of the URL it connects with,
 //! built in some other method. Both sides are namespace-blind, so ops are
-//! recorded on a namespace exactly as they are on the default one, and two
-//! namespaces of one server handling the same event produce two rows on one
-//! key (carrick#662).
+//! recorded on a namespace exactly as they are on the default one.
+//!
+//! The imprecision that accepts, stated plainly: two namespaces of one server
+//! handling one event name produce two producer rows on one key. That is the
+//! same imprecision the model already accepts across files and services, where
+//! two listeners for one event have always shared a key, so a file-level skip
+//! bought nothing the key could express and only hid the ops (carrick#662).
 //!
 //! A long-lived socket is usually held on a class field rather than a local
 //! (`private socket?: Socket<…>`; `this.socket = this.#createSocket()`), and
@@ -885,9 +889,11 @@ socket.on(`chat:${kind}`, handler);
         // A file that carves a namespace off its server used to be dropped
         // whole. The key has no namespace component and neither side of the
         // wire can supply one, so the ops are recorded and the namespace is
-        // simply not part of their identity (carrick#662). Two namespaces
-        // handling one event in one file therefore share a key, which is the
-        // imprecision the model already accepts across files.
+        // simply not part of their identity (carrick#662).
+        //
+        // The accepted imprecision: two namespaces of one server handling one
+        // event name produce two producer rows on one key, the same
+        // imprecision the model already accepts across files and services.
         let result = extract(
             r#"
 import type { Namespace } from "socket.io";
@@ -898,6 +904,7 @@ chat.on("connection", (socket) => {
   socket.on("chat:message", handler);
 });
 io.on("connection", (socket) => {
+  socket.on("chat:message", handler);
   socket.on("presence:ping", handler);
 });
 "#,
@@ -905,6 +912,10 @@ io.on("connection", (socket) => {
         assert_eq!(
             keys(&result.listeners),
             vec![
+                // One event name handled on two namespaces: two producer rows,
+                // one key. This is the imprecision above, asserted rather than
+                // avoided.
+                "socket|CLIENT->SERVER|chat:message",
                 "socket|CLIENT->SERVER|chat:message",
                 "socket|CLIENT->SERVER|presence:ping",
             ],
