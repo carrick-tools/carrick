@@ -118,6 +118,9 @@ mod type_compat_v2;
 /// (`this.socket.emit("run:subscribe", …)`) now resolves its socket root and
 /// emits its row (carrick#659), where a v17 cache holds no row at all for an
 /// unchanged file whose socket is built in one method and used in another.
+/// Same version covers carrick#662: a file that carves a custom namespace off
+/// its server is no longer dropped whole, so its listeners and emitters —
+/// namespaced and default alike — have rows a v17 cache also lacks.
 const CACHE_VERSION: u32 = 18;
 
 // Type aliases to reduce complexity
