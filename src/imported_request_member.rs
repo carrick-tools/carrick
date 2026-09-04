@@ -78,6 +78,20 @@
 //! declared by two of them, or twice in one module with different requests, is
 //! dropped rather than picked between.
 //!
+//! The modules searched are two import hops deep, nearest ring first
+//! (carrick#655). A factory that constructs the client and returns it inside a
+//! record (`const { client } = await getProjectClient(ref)`) is the common way
+//! a consumer holds a client it never imports: the consumer imports the
+//! factory's module, and the factory's module imports the client's. The
+//! nearest ring that declares the name decides; a name a nearer ring declares
+//! ambiguously is dropped there, never looked for further out. A receiver
+//! reached off `this` (`this.options.client.list()`) joins like a local: the
+//! chain is a name with no import behind it. What stays out: a receiver that
+//! is itself imported from a module other than the member's — including a
+//! module that constructs the client and exports the instance — because the
+//! name alone cannot say that binding is the client, and the fixpoint that
+//! could (`external_call_candidates`) does not reach same-repo classes.
+//!
 //! A name alone would be too wide, because `list` and `get` and `create` are
 //! what every client calls its methods. So the receiver constrains it: where
 //! the call's receiver is itself an imported binding, it must be imported from
@@ -86,7 +100,7 @@
 //! such constraint, and a receiver imported from a package matches no module
 //! and so joins to nothing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use swc_common::{SourceMap, SourceMapper, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
@@ -142,20 +156,24 @@ pub fn collect_request_members(module: &Module, source_map: &Lrc<SourceMap>) -> 
     collector.members
 }
 
-/// Fold several modules' indexes into the one an importing file resolves
-/// against, keeping which module each name came from. A name two modules both
-/// declare is dropped unless they agree, because nothing at the call site says
-/// which was meant.
-pub fn fold_indexes<Id: Clone + PartialEq>(
+/// Fold several modules' request members into one name-keyed index, also
+/// returning the names dropped for being declared by more than one module, or
+/// twice in one module with different requests. A caller that folds several
+/// rings of modules needs to tell "not declared here" from "declared
+/// ambiguously here", because only the first is a reason to look one ring
+/// further out.
+pub fn fold_indexes_with_conflicts<Id: Clone + PartialEq>(
     indexes: impl IntoIterator<Item = (Id, RequestMemberIndex)>,
-) -> HashMap<String, OwnedMember<Id>> {
+) -> (HashMap<String, OwnedMember<Id>>, HashSet<String>) {
     let mut folded: HashMap<String, OwnedMember<Id>> = HashMap::new();
-    let mut conflicting: Vec<String> = Vec::new();
+    let mut conflicting: HashSet<String> = HashSet::new();
     for (module, index) in indexes {
         for (name, member) in index {
             match folded.get(&name) {
                 Some(existing) if existing.member == member && existing.module == module => {}
-                Some(_) => conflicting.push(name),
+                Some(_) => {
+                    conflicting.insert(name);
+                }
                 None => {
                     folded.insert(
                         name,
@@ -168,10 +186,10 @@ pub fn fold_indexes<Id: Clone + PartialEq>(
             }
         }
     }
-    for name in conflicting {
-        folded.remove(&name);
+    for name in &conflicting {
+        folded.remove(name);
     }
-    folded
+    (folded, conflicting)
 }
 
 /// One function currently being walked. An unnamed one is a barrier: it holds
@@ -839,15 +857,35 @@ mod tests {
         let b =
             index(r#"class B { go() { return fetch(`${this.b}/api/b`, { method: "GET" }); } }"#);
         assert!(
-            fold_indexes([("a", a.clone()), ("b", b)]).is_empty(),
+            fold_indexes_with_conflicts([("a", a.clone()), ("b", b)])
+                .0
+                .is_empty(),
             "nothing at the call site says which module's `go` was meant"
         );
-        let folded = fold_indexes([("a", a.clone()), ("a", a)]);
+        let (folded, conflicting) = fold_indexes_with_conflicts([("a", a.clone()), ("a", a)]);
+        assert!(
+            conflicting.is_empty(),
+            "the same module reached twice is not a conflict"
+        );
         assert_eq!(
             folded.len(),
             1,
             "the same module reached twice is not a conflict"
         );
         assert_eq!(folded["go"].module, "a", "the owning module is kept");
+    }
+
+    /// carrick#655: the conflicting names come back by name, so a caller
+    /// folding several rings can stop at a ring that declares the name
+    /// ambiguously instead of reading it as "not declared here".
+    #[test]
+    fn a_conflicting_name_is_reported_not_merely_dropped() {
+        let a =
+            index(r#"class A { go() { return fetch(`${this.b}/api/a`, { method: "GET" }); } }"#);
+        let b =
+            index(r#"class B { go() { return fetch(`${this.b}/api/b`, { method: "GET" }); } }"#);
+        let (folded, conflicting) = fold_indexes_with_conflicts([("a", a), ("b", b)]);
+        assert!(folded.is_empty());
+        assert!(conflicting.contains("go"));
     }
 }

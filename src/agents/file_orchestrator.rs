@@ -38,7 +38,7 @@ use crate::{
     framework_detector::DetectionResult,
     import_bindings::BindingResolver,
     imported_request_member::{
-        RequestMember, RequestMemberIndex, collect_request_members, fold_indexes,
+        RequestMember, RequestMemberIndex, collect_request_members, fold_indexes_with_conflicts,
     },
     local_http_wrapper::LocalWrapperCall,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
@@ -50,7 +50,7 @@ use crate::{
     },
     swc_scanner::{
         CandidateTarget, ControllerRouteBinding, PubsubAnchorOp, RouteDescriptorEndpoint,
-        SwcScanner, is_producer_route_path, normalize_path_params,
+        SwcScanner, collect_import_sources, is_producer_route_path, normalize_path_params,
     },
     type_manifest::{
         build_call_site_id, build_manifest_type_alias, build_manifest_type_alias_with_call_id,
@@ -1215,6 +1215,10 @@ impl FileOrchestrator {
         }
 
         let mut reexport_cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        // The same-repo modules each module imports, resolved, memoized across
+        // every importer that reaches it: the second ring of the member join
+        // below reads it once per module, not once per consumer.
+        let mut import_cache: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
         {
             for pf in &mut pending {
                 let importer = Path::new(&pf.path_str).to_path_buf();
@@ -1268,30 +1272,48 @@ impl FileOrchestrator {
                     .filter_map(|path| wrapper_map.get(path).map(|m| m.snippet.clone()))
                     .collect();
                 // Members reached directly by a relative import, plus those
-                // behind a re-export barrel the wrapper pass already followed.
-                // Only a file with candidates can have a site to resolve, so a
-                // rescued or candidate-less file triggers no parse.
+                // behind a re-export barrel the wrapper pass already followed,
+                // and then one hop further: the modules those import. A
+                // factory that constructs the client and hands it back inside
+                // a record is the common shape (carrick#655): the consumer
+                // imports the factory's module and never the client's, so the
+                // client is two hops away and the nearer ring declares no
+                // member for the site. Only a file with candidates can have a
+                // site to resolve, so a rescued or candidate-less file
+                // triggers no parse.
                 if !pf.candidate_map.is_empty() {
-                    let reachable: BTreeSet<PathBuf> =
+                    let nearest: BTreeSet<PathBuf> =
                         seen.iter().chain(matched.iter()).cloned().collect();
-                    for path in &reachable {
-                        if member_cache.contains_key(path) {
-                            continue;
+                    let mut further: BTreeSet<PathBuf> = BTreeSet::new();
+                    for path in &nearest {
+                        let targets = import_cache
+                            .entry(path.clone())
+                            .or_insert_with(|| Self::relative_import_targets(path, &cm, &handler));
+                        for target in targets.iter() {
+                            if self_canon.as_ref() == Some(target) || nearest.contains(target) {
+                                continue;
+                            }
+                            further.insert(target.clone());
                         }
-                        let index = parse_file(path, &cm, &handler)
-                            .map(|module| collect_request_members(&module, &cm))
-                            .unwrap_or_default();
-                        member_cache.insert(path.clone(), index);
                     }
-                    pf.resolved_members = Self::resolve_imported_members(
-                        &pf.candidate_map,
-                        reachable.iter().filter_map(|path| {
-                            member_cache
-                                .get(path)
-                                .map(|index| (path.clone(), index.clone()))
-                        }),
-                        &import_owners,
-                    );
+                    let mut rings: Vec<Vec<(PathBuf, RequestMemberIndex)>> = Vec::new();
+                    for ring in [&nearest, &further] {
+                        let mut indexes: Vec<(PathBuf, RequestMemberIndex)> = Vec::new();
+                        for path in ring {
+                            if !member_cache.contains_key(path) {
+                                let index = parse_file(path, &cm, &handler)
+                                    .map(|module| collect_request_members(&module, &cm))
+                                    .unwrap_or_default();
+                                member_cache.insert(path.clone(), index);
+                            }
+                            if let Some(index) = member_cache.get(path) {
+                                indexes.push((path.clone(), index.clone()));
+                            }
+                        }
+                        rings.push(indexes);
+                    }
+                    pf.resolved_members =
+                        Self::resolve_imported_members(&pf.candidate_map, rings, &import_owners);
                 }
             }
         }
@@ -3043,6 +3065,28 @@ impl FileOrchestrator {
     ///
     /// Results are sorted by canonical path so wrapper context is deterministic
     /// regardless of import-table iteration order.
+    /// The same-repo modules `module_path` imports by a relative specifier,
+    /// resolved to source files, sorted and deduplicated. Type-only imports
+    /// count: a consumer that holds the client in a typed field imports it
+    /// that way, and the member join reads the member off the module however
+    /// the binding was declared.
+    fn relative_import_targets(
+        module_path: &Path,
+        cm: &Lrc<SourceMap>,
+        handler: &Handler,
+    ) -> Vec<PathBuf> {
+        let Some(module) = parse_file(module_path, cm, handler) else {
+            return Vec::new();
+        };
+        let mut targets: Vec<PathBuf> = collect_import_sources(&module)
+            .iter()
+            .filter_map(|spec| Self::resolve_relative_import(module_path, spec))
+            .collect();
+        targets.sort();
+        targets.dedup();
+        targets
+    }
+
     fn wrapper_modules_behind(
         resolved: &Path,
         self_canon: Option<&PathBuf>,
@@ -4522,13 +4566,30 @@ impl FileOrchestrator {
     /// local carries no such constraint, which is the shape this pass exists
     /// for; a receiver imported from a package matches no module and joins to
     /// nothing.
+    /// Join each candidate's callee name onto a request member, nearest ring
+    /// first.
+    ///
+    /// `rings` are the module sets in order of distance from the consumer:
+    /// the modules it imports (through barrels), then the modules those
+    /// import. The nearest ring that declares the name decides: a name a
+    /// nearer ring declares ambiguously is dropped there, never looked for
+    /// further out, and a name a nearer ring declares once is taken from it
+    /// even when a further ring declares it too. A receiver that is itself an
+    /// imported binding must have been imported from the member's own module,
+    /// whichever ring that module is in; a receiver that is a parameter, a
+    /// local or a `this` chain carries no such constraint (see the module docs
+    /// of [`crate::imported_request_member`]).
     fn resolve_imported_members(
         candidate_map: &HashMap<String, CandidateTarget>,
-        indexes: impl IntoIterator<Item = (PathBuf, RequestMemberIndex)>,
+        rings: Vec<Vec<(PathBuf, RequestMemberIndex)>>,
         import_owners: &HashMap<String, Option<PathBuf>>,
     ) -> HashMap<u32, RequestMember> {
-        let members = fold_indexes(indexes);
-        if members.is_empty() {
+        let rings: Vec<_> = rings
+            .into_iter()
+            .map(fold_indexes_with_conflicts)
+            .filter(|(members, conflicting)| !members.is_empty() || !conflicting.is_empty())
+            .collect();
+        if rings.is_empty() {
             return HashMap::new();
         }
         let mut resolved = HashMap::new();
@@ -4537,7 +4598,17 @@ impl FileOrchestrator {
                 .callee_property
                 .as_deref()
                 .unwrap_or(&candidate.callee_object);
-            let Some(owned) = members.get(name) else {
+            let mut owned = None;
+            for (members, conflicting) in &rings {
+                if conflicting.contains(name) {
+                    break;
+                }
+                if let Some(member) = members.get(name) {
+                    owned = Some(member);
+                    break;
+                }
+            }
+            let Some(owned) = owned else {
                 continue;
             };
             if let Some(receiver_source) = import_owners.get(&candidate.callee_object)
