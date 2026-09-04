@@ -2192,6 +2192,31 @@ impl CandidateVisitor {
     }
 
     /// Extract callee object name from expression
+    /// The dotted text of a member chain rooted at `this`
+    /// (`this.options.client`), when every step is a plain identifier
+    /// property. A computed step, a call in the chain, or a root that is not
+    /// `this` is `None`: nothing is named that the source does not spell.
+    fn this_receiver_chain(expr: &Expr) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        let mut cursor = expr;
+        loop {
+            match cursor {
+                Expr::This(_) => break,
+                Expr::Member(member) => {
+                    let MemberProp::Ident(prop) = &member.prop else {
+                        return None;
+                    };
+                    parts.push(prop.sym.to_string());
+                    cursor = &member.obj;
+                }
+                _ => return None,
+            }
+        }
+        parts.push("this".to_string());
+        parts.reverse();
+        Some(parts.join("."))
+    }
+
     fn extract_callee_object(expr: &Expr) -> Option<String> {
         match expr {
             Expr::Ident(ident) => Some(ident.sym.to_string()),
@@ -2528,7 +2553,14 @@ impl Visit for CandidateVisitor {
             };
 
             if let Some(method) = method_name {
-                let obj_name = Self::extract_callee_object(&member.obj);
+                // A receiver reached off `this` has no root identifier, so
+                // `extract_callee_object` names nothing for it and the site
+                // was judged on its method name alone. The chain's own text
+                // (`this.options.client`) is the name the receiver has, and
+                // the same suffix test applies to it that applies to a local
+                // called `client` (carrick#655).
+                let obj_name = Self::extract_callee_object(&member.obj)
+                    .or_else(|| Self::this_receiver_chain(&member.obj));
 
                 let is_api_call = match &obj_name {
                     Some(name) => {
@@ -2754,7 +2786,7 @@ impl Visit for CandidateVisitor {
 /// declaration in the module (e.g. `"nats"`, `"@nats-io/nats-core"`). Used by
 /// the file-orchestrator to force-analyze zero-candidate files that import a
 /// recognized messaging-client package (pub/sub Part B).
-fn collect_import_sources(module: &Module) -> Vec<String> {
+pub(crate) fn collect_import_sources(module: &Module) -> Vec<String> {
     module
         .body
         .iter()
@@ -5061,6 +5093,40 @@ bus.subscribe('user.deleted', handlerRef);
         assert!(
             !ops.iter().any(|op| op.topic == "user.deleted"),
             "a function-reference second arg must not anchor, got {ops:?}"
+        );
+    }
+
+    /// carrick#655: a receiver reached off `this` is named by its chain, so
+    /// `this.options.client.getEnvironmentVariables(ref)` raises a candidate
+    /// the way `projectClient.client.getEnvironmentVariables(ref)` does. A
+    /// chain that ends in nothing api-shaped still raises none.
+    #[test]
+    fn a_receiver_reached_off_this_is_named_by_its_chain() {
+        let content = r#"
+class Supervisor {
+  constructor(private readonly options: { client: ApiClient; store: Map<string, string> }) {}
+
+  async sync(ref: string) {
+    const env = await this.options.client.getEnvironmentVariables(ref);
+    const cached = this.options.store.lookup(ref);
+    return [env, cached];
+  }
+}
+"#;
+        let result = scan_test_content(content);
+        let client_site = result
+            .candidates
+            .iter()
+            .find(|c| c.callee_property.as_deref() == Some("getEnvironmentVariables"))
+            .expect("the call through the client field must raise a candidate");
+        assert_eq!(client_site.callee_object, "this.options.client");
+        assert!(
+            !result
+                .candidates
+                .iter()
+                .any(|c| c.callee_property.as_deref() == Some("lookup")),
+            "a chain naming nothing api-shaped raises no candidate: {:?}",
+            result.candidates
         );
     }
 }

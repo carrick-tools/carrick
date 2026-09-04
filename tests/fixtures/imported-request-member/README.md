@@ -28,6 +28,15 @@ method and path live in a client module it imports, and nowhere in its own file.
   It contains no path-shaped text at all, so its cassette holds no row for
   either site, and the rows for it exist only if the scanner emits them itself.
 
+- `src/session.ts` is a factory (carrick#655): it imports the client, constructs
+  it, and hands it back inside a record. `src/envcmd.ts` imports only the
+  factory and calls a method on the record's `client` property, so the client
+  module is two import hops from the site and the file itself names neither
+  the client nor a path nor a verb.
+- `src/supervisor.ts` holds the client in a field of an options record and
+  reaches it off `this` (`this.options.client.describeSession()`), which is a
+  receiver with no root identifier. It imports the client type-only.
+
 ## The answer key
 
 | site | truth |
@@ -39,6 +48,8 @@ method and path live in a client module it imports, and nowhere in its own file.
 | `uploads.ts:7` `client.createArtifactUrl(name)` | `PUT /api/v2/artifacts/:encoded` |
 | `uploads.ts:11` `client.readArtifactUrl(name)` | `GET /api/v1/artifacts/:encoded` |
 | `uploads.ts:15` `client.describeSession()` | `GET /api/v2/session` |
+| `envcmd.ts:8` `projectClient.client.readArtifactUrl(name)` | `GET /api/v1/artifacts/:encoded` |
+| `supervisor.ts:12` `this.options.client.describeSession()` | `GET /api/v2/session` |
 
 ## The cassette
 
@@ -49,6 +60,11 @@ which is the invented-version shape carrick#588's finding 3 was filed for. That
 is what the deployed index recorded for this shape before the fix. Freezing it makes `tests/imported_request_member_test.rs`
 a regression net for the scanner machinery: any change to the resolution has to
 show up as a change in the assertions, and no model behaviour is being measured.
+
+`__llm__/analyze-file/envcmd.json`, `supervisor.json` and `session.json` hold
+no answer either, for the same reason: the two carrick#655 sites state nothing
+their own file could answer from, and the rows exist only if the scanner
+emits them.
 
 `__llm__/analyze-file/uploads.json` holds no answer at all: an empty
 `data_calls` array, which is what the analyzer returns for a file whose call

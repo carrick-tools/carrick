@@ -61,7 +61,7 @@ fn call_at_line(calls: &[serde_json::Value], line: i64) -> &serde_json::Value {
 #[test]
 fn client_method_states_the_verb_and_the_version_for_its_call_sites() {
     let calls = calls("imported-request-member");
-    assert_eq!(calls.len(), 7, "one row per call site: {calls:#?}");
+    assert_eq!(calls.len(), 9, "one row per call site: {calls:#?}");
 
     // `client.createArtifactUrl(name)` reaches a PUT to /api/v2. The cassette
     // says POST, and says v2 only because the error message four lines below
@@ -144,4 +144,30 @@ fn a_resolved_member_is_emitted_when_extraction_returned_no_row_at_all() {
         pull["target_url"],
         "${this.baseUrl}/api/v1/artifacts/${encoded}"
     );
+}
+
+/// carrick#655: two receiver shapes the join could not reach.
+///
+/// `envcmd.ts` imports only a factory; the factory's module is what imports
+/// the client, so the client is two import hops from the site and the nearer
+/// ring declares no member for it. `supervisor.ts` reaches the client through
+/// a field off `this`, a receiver with no root identifier, which raised no
+/// candidate at all. Both cassettes are empty, so each row below exists only
+/// if the scanner resolves the site and emits it.
+#[test]
+fn a_member_reached_through_a_factory_record_or_a_this_field_resolves() {
+    let calls = calls("imported-request-member");
+
+    let through_factory = call_at_line(&calls, 8);
+    assert_eq!(through_factory["method"], "GET");
+    assert_eq!(through_factory["path"], "/api/v1/artifacts/:encoded");
+    assert_eq!(
+        through_factory["target_url"],
+        "${this.baseUrl}/api/v1/artifacts/${encoded}"
+    );
+
+    let through_this = call_at_line(&calls, 12);
+    assert_eq!(through_this["method"], "GET");
+    assert_eq!(through_this["path"], "/api/v2/session");
+    assert_eq!(through_this["target_url"], "/api/v2/session");
 }

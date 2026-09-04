@@ -110,7 +110,11 @@ mod type_compat_v2;
 /// fallback's route (carrick#644), so unchanged route and consumer files
 /// carry a contract and an operation key a v14 cache pins to `unknown` and to
 /// an unkeyed target.
-const CACHE_VERSION: u32 = 16;
+/// 17: a call site that reaches a client method through a factory's record
+/// (two import hops) or through a field off `this` now resolves and emits its
+/// consumer row (carrick#655), where a v16 cache holds no row for an unchanged
+/// consumer file.
+const CACHE_VERSION: u32 = 17;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
