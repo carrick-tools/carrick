@@ -148,6 +148,7 @@ fn test_file_analysis_result_structures() {
 
         loopback_default_url: None,
         base: None,
+        consumers_not_resolved: None,
     };
     assert_eq!(data_call.target, "https://api.example.com/users");
     assert_eq!(data_call.method, Some("POST".to_string()));
@@ -231,6 +232,7 @@ fn test_file_analysis_result_serialization() {
 
             loopback_default_url: None,
             base: None,
+            consumers_not_resolved: None,
         }],
     };
 
@@ -543,6 +545,7 @@ fn test_data_call_extraction() {
 
                 loopback_default_url: None,
                 base: None,
+                consumers_not_resolved: None,
             },
             DataCallResult {
                 call_kind: None,
@@ -562,6 +565,7 @@ fn test_data_call_extraction() {
 
                 loopback_default_url: None,
                 base: None,
+                consumers_not_resolved: None,
             },
             DataCallResult {
                 call_kind: None,
@@ -581,6 +585,7 @@ fn test_data_call_extraction() {
 
                 loopback_default_url: None,
                 base: None,
+                consumers_not_resolved: None,
             },
         ],
     };

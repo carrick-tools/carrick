@@ -38,7 +38,8 @@ use crate::{
     framework_detector::DetectionResult,
     import_bindings::BindingResolver,
     imported_request_member::{
-        RequestMember, RequestMemberIndex, collect_request_members, fold_indexes_with_conflicts,
+        RequestMember, RequestMemberIndex, ResolvedMember, UnfollowedMemberSites,
+        collect_request_members, fold_indexes_with_conflicts,
     },
     local_http_wrapper::LocalWrapperCall,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
@@ -229,6 +230,17 @@ struct FileSymbols {
     /// The file's own request members, read for the files that import it
     /// (carrick#588).
     request_members: RequestMemberIndex,
+}
+
+/// Where one request member is declared (carrick#656).
+///
+/// Keyed by member NAME across the files a scan analyses, so a name two
+/// modules declare is dropped rather than attributed to either. Holds enough
+/// to find the member's own request row again once the analysis is in: the
+/// `file_results` key of its module, and the line the request sits on.
+struct MemberHome {
+    path_str: String,
+    request_line: u32,
 }
 
 /// Reduce a TS type annotation to its primary symbol, stripping the same
@@ -798,7 +810,13 @@ impl FileOrchestrator {
             /// offset (carrick#588). The member states the whole request, so
             /// its method and URL are applied to the site after the LLM pass.
             /// Empty for files that import no such module.
-            resolved_members: HashMap<u32, RequestMember>,
+            resolved_members: HashMap<u32, ResolvedMember>,
+            /// Call sites in this file that named an indexed request member
+            /// and did NOT resolve to it (carrick#656), as (span, member
+            /// name). Aggregated per member once every file's join is in, and
+            /// stamped onto the rows that member DID produce, so a consumer
+            /// listing can state what the join could not follow.
+            unresolved_member_sites: Vec<(u32, String)>,
         }
 
         /// A zero-candidate file whose skip decision is deferred until the
@@ -823,6 +841,13 @@ impl FileOrchestrator {
         // resolved after the whole pass: the endpoints belong to the CONTROLLER
         // modules, whose own results are not final until then.
         let mut controller_route_bindings: Vec<(PathBuf, Vec<ControllerRouteBinding>)> = Vec::new();
+        // carrick#656, filled per file and read once every file is in.
+        // `member_deficits` counts, per member name, the sites that named it
+        // and did not resolve to it; `resolved_member_rows` says which spans in
+        // which file the join DID resolve, and to which member, so the count
+        // can be stamped on exactly those rows.
+        let mut member_deficits: HashMap<String, u32> = HashMap::new();
+        let mut resolved_member_rows: HashMap<String, HashMap<u32, String>> = HashMap::new();
         // What the repo's validation schemas declare about the environment
         // (carrick#649), folded across every parseable file. Repo-wide because
         // an environment variable is process-global and the file declaring the
@@ -1137,6 +1162,7 @@ impl FileOrchestrator {
                 local_wrapper_calls: scan_result.local_wrapper_calls,
                 request_members: symbols.request_members,
                 resolved_members: HashMap::new(),
+                unresolved_member_sites: Vec::new(),
             });
         }
 
@@ -1285,10 +1311,16 @@ impl FileOrchestrator {
                     let nearest: BTreeSet<PathBuf> =
                         seen.iter().chain(matched.iter()).cloned().collect();
                     let mut further: BTreeSet<PathBuf> = BTreeSet::new();
+                    // What each module the file imports imports in turn. The
+                    // second ring is built out of it, and so is the test that
+                    // decides whether a declined receiver is a client this
+                    // module could be holding (carrick#656).
+                    let mut receiver_imports: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
                     for path in &nearest {
                         let targets = import_cache
                             .entry(path.clone())
                             .or_insert_with(|| Self::relative_import_targets(path, &cm, &handler));
+                        receiver_imports.insert(path.clone(), targets.iter().cloned().collect());
                         for target in targets.iter() {
                             if self_canon.as_ref() == Some(target) || nearest.contains(target) {
                                 continue;
@@ -1312,8 +1344,16 @@ impl FileOrchestrator {
                         }
                         rings.push(indexes);
                     }
-                    pf.resolved_members =
-                        Self::resolve_imported_members(&pf.candidate_map, rings, &import_owners);
+                    // The join's outcome, and the sites it declined
+                    // (carrick#656) — both come back from the walk, because
+                    // the module a declined site named is only known there.
+                    (pf.resolved_members, pf.unresolved_member_sites) =
+                        Self::resolve_imported_members(
+                            &pf.candidate_map,
+                            rings,
+                            &import_owners,
+                            &receiver_imports,
+                        );
                 }
             }
         }
@@ -1411,8 +1451,28 @@ impl FileOrchestrator {
                 // read as anybody's wrapper and nothing joins onto it either.
                 request_members: RequestMemberIndex::default(),
                 resolved_members: HashMap::new(),
+                unresolved_member_sites: Vec::new(),
             });
         }
+
+        // Where every request member the scan read is declared (carrick#656).
+        // Built here, after the rescue loop, because a client whose requests go
+        // through a helper raises no candidate of its own and reaches `pending`
+        // only as a rescued file — and its members are in `member_cache`, read
+        // on demand for the consumers that import it, never on its own
+        // `PendingFile`.
+        let member_homes = {
+            let analysed: HashMap<PathBuf, String> = pending
+                .iter()
+                .filter_map(|pf| {
+                    Path::new(&pf.path_str)
+                        .canonicalize()
+                        .ok()
+                        .map(|canonical| (canonical, pf.path_str.clone()))
+                })
+                .collect();
+            Self::member_homes(&member_cache, &analysed)
+        };
 
         // PHASE 1c (#218 — cross-file env-alias resolution). A consumer that
         // builds its URLs from an imported config-object property
@@ -1646,6 +1706,33 @@ impl FileOrchestrator {
                     stats.request_spec_call_backfills +=
                         Self::merge_request_spec_calls(&mut adjusted, &pf.candidate_map);
 
+                    // carrick#656: what the join could not follow in THIS
+                    // file, less the sites that turned out to be route
+                    // definitions. A route registration whose verb happens to
+                    // name a request member (`app.get` against a client's
+                    // `get`) is a producer, not a consumer that went
+                    // unfollowed — the same exclusion `merge_imported_member_calls`
+                    // applies before it emits a row.
+                    for (span, name) in &pf.unresolved_member_sites {
+                        if adjusted
+                            .endpoints
+                            .iter()
+                            .any(|endpoint| endpoint.call_expression_span_start == Some(*span))
+                        {
+                            continue;
+                        }
+                        *member_deficits.entry(name.clone()).or_insert(0) += 1;
+                    }
+                    if !pf.resolved_members.is_empty() {
+                        resolved_member_rows.insert(
+                            pf.path_str.clone(),
+                            pf.resolved_members
+                                .iter()
+                                .map(|(span, resolved)| (*span, resolved.name.clone()))
+                                .collect(),
+                        );
+                    }
+
                     stats.total_mounts += adjusted.mounts.len();
                     stats.total_endpoints += adjusted.endpoints.len();
                     stats.total_data_calls += adjusted.data_calls.len();
@@ -1757,6 +1844,20 @@ impl FileOrchestrator {
             "  - Wrapper method propagations: {}",
             stats.wrapper_method_propagations
         );
+
+        // PHASE 5 (carrick#656): state what the member join could not follow.
+        // Cross-file, so it runs once every file's own result is in: the sites
+        // a member lost are in the consumer files, and the rows that carry the
+        // number are wherever that member resolved.
+        let stamped = Self::stamp_unfollowed_member_sites(
+            &mut file_results,
+            &member_deficits,
+            &resolved_member_rows,
+            &member_homes,
+        );
+        if stamped > 0 {
+            debug!("  - Rows stating unfollowed member call sites: {stamped}");
+        }
 
         // STEP 5: Build aggregated mount graph from all file results
         let mount_graph =
@@ -4327,6 +4428,7 @@ impl FileOrchestrator {
 
                 loopback_default_url: None,
                 base: None,
+                consumers_not_resolved: None,
             });
             added += 1;
         }
@@ -4418,6 +4520,7 @@ impl FileOrchestrator {
 
                 loopback_default_url: None,
                 base: None,
+                consumers_not_resolved: None,
             });
             added += 1;
         }
@@ -4579,25 +4682,36 @@ impl FileOrchestrator {
     /// whichever ring that module is in; a receiver that is a parameter, a
     /// local or a `this` chain carries no such constraint (see the module docs
     /// of [`crate::imported_request_member`]).
+    ///
+    /// Returns the sites it DECLINED as well (carrick#656), so a row can state
+    /// what the join could not follow instead of reading as complete. A
+    /// decline is counted only where the receiver's own module imports the
+    /// member's: that is the shape the join gives up on by design — a client
+    /// constructed in one module and exported as an instance, where the name
+    /// alone cannot say the binding is the client. A receiver imported from a
+    /// module that never imports the client's is a different function that
+    /// happens to share a name, and counting it would send a reader after a
+    /// call site that does not exist. `receiver_imports` supplies that
+    /// relation: each module the file imports, and the same-repo modules IT
+    /// imports.
     fn resolve_imported_members(
         candidate_map: &HashMap<String, CandidateTarget>,
         rings: Vec<Vec<(PathBuf, RequestMemberIndex)>>,
         import_owners: &HashMap<String, Option<PathBuf>>,
-    ) -> HashMap<u32, RequestMember> {
+        receiver_imports: &HashMap<PathBuf, BTreeSet<PathBuf>>,
+    ) -> (HashMap<u32, ResolvedMember>, Vec<(u32, String)>) {
         let rings: Vec<_> = rings
             .into_iter()
             .map(fold_indexes_with_conflicts)
             .filter(|(members, conflicting)| !members.is_empty() || !conflicting.is_empty())
             .collect();
         if rings.is_empty() {
-            return HashMap::new();
+            return (HashMap::new(), Vec::new());
         }
         let mut resolved = HashMap::new();
+        let mut declined: Vec<(u32, String)> = Vec::new();
         for candidate in candidate_map.values() {
-            let name = candidate
-                .callee_property
-                .as_deref()
-                .unwrap_or(&candidate.callee_object);
+            let name = Self::member_call_name(candidate);
             let mut owned = None;
             for (members, conflicting) in &rings {
                 if conflicting.contains(name) {
@@ -4614,11 +4728,74 @@ impl FileOrchestrator {
             if let Some(receiver_source) = import_owners.get(&candidate.callee_object)
                 && receiver_source.as_ref() != Some(&owned.module)
             {
+                if receiver_source.as_ref().is_some_and(|source| {
+                    receiver_imports
+                        .get(source)
+                        .is_some_and(|imports| imports.contains(&owned.module))
+                }) {
+                    declined.push((candidate.span_start, name.to_string()));
+                }
                 continue;
             }
-            resolved.insert(candidate.span_start, owned.member.clone());
+            resolved.insert(
+                candidate.span_start,
+                ResolvedMember {
+                    name: name.to_string(),
+                    member: owned.member.clone(),
+                },
+            );
         }
-        resolved
+        // `candidate_map` iterates in hash order and a count computed from
+        // this is persisted.
+        declined.sort();
+        (resolved, declined)
+    }
+
+    /// The member name a candidate call site names: its callee property
+    /// (`client.createArtifactUrl`), or its callee object when the call is a
+    /// bare identifier. The same name the join keys on, written once so the
+    /// join and the count of what the join missed can never read a site's name
+    /// two different ways.
+    fn member_call_name(candidate: &CandidateTarget) -> &str {
+        candidate
+            .callee_property
+            .as_deref()
+            .unwrap_or(&candidate.callee_object)
+    }
+
+    /// Where each request member the scan read is declared, keyed by name
+    /// (carrick#656).
+    ///
+    /// `member_cache` holds every module a member was read for, canonical path
+    /// to index; `analysed` maps those paths to the `file_results` key of the
+    /// files this scan analysed. A member in a module nothing analysed has no
+    /// row to carry anything and gets no home, but it still makes its name
+    /// ambiguous: a name two modules declare is dropped rather than attributed
+    /// to either, because a site naming it belongs to neither more than the
+    /// other and a count that guessed between them would be worth less than no
+    /// count at all.
+    fn member_homes(
+        member_cache: &HashMap<PathBuf, RequestMemberIndex>,
+        analysed: &HashMap<PathBuf, String>,
+    ) -> HashMap<String, MemberHome> {
+        let mut homes: HashMap<String, MemberHome> = HashMap::new();
+        let mut declared: HashMap<String, usize> = HashMap::new();
+        for (module, index) in member_cache {
+            for (name, member) in index {
+                *declared.entry(name.clone()).or_insert(0) += 1;
+                if let Some(path_str) = analysed.get(module) {
+                    homes.insert(
+                        name.clone(),
+                        MemberHome {
+                            path_str: path_str.clone(),
+                            request_line: member.request_line,
+                        },
+                    );
+                }
+            }
+        }
+        homes.retain(|name, _| declared.get(name) == Some(&1));
+        homes
     }
 
     /// Apply the resolved members to the sites that called them.
@@ -4635,7 +4812,7 @@ impl FileOrchestrator {
     /// target.
     fn apply_imported_members(
         result: &mut FileAnalysisResult,
-        resolved: &HashMap<u32, RequestMember>,
+        resolved: &HashMap<u32, ResolvedMember>,
     ) -> usize {
         if resolved.is_empty() {
             return 0;
@@ -4645,7 +4822,7 @@ impl FileOrchestrator {
             let Some(span) = data_call.call_expression_span_start else {
                 continue;
             };
-            let Some(member) = resolved.get(&span) else {
+            let Some(member) = resolved.get(&span).map(|resolved| &resolved.member) else {
                 continue;
             };
             let method_agrees = data_call
@@ -4688,7 +4865,7 @@ impl FileOrchestrator {
     /// and row shape this mirrors.
     fn merge_imported_member_calls(
         result: &mut FileAnalysisResult,
-        resolved: &HashMap<u32, RequestMember>,
+        resolved: &HashMap<u32, ResolvedMember>,
         candidate_map: &HashMap<String, CandidateTarget>,
     ) -> usize {
         if resolved.is_empty() {
@@ -4710,7 +4887,7 @@ impl FileOrchestrator {
             .filter_map(|candidate| {
                 resolved
                     .get(&candidate.span_start)
-                    .map(|member| (candidate, member))
+                    .map(|resolved| (candidate, &resolved.member))
             })
             .collect();
         sites.sort_by_key(|(candidate, _)| candidate.span_start);
@@ -4794,10 +4971,101 @@ impl FileOrchestrator {
 
                 loopback_default_url: None,
                 base: None,
+                consumers_not_resolved: None,
             });
             added += 1;
         }
         added
+    }
+
+    /// Stamp what the member join could not follow onto the rows that member
+    /// DID produce (carrick#656).
+    ///
+    /// A consumer listing reads as complete whatever the join declined, and
+    /// the shapes it declines are declined by design — a client imported as an
+    /// already-constructed instance, a receiver whose only statement of type is
+    /// a parameter annotation. `unresolved_member_sites` counted those sites;
+    /// this is where the number reaches a persisted row, because only here is
+    /// every file's contribution in.
+    ///
+    /// Two kinds of row carry it, and both are rows the same member is behind:
+    ///
+    /// 1. Every row at a site the join resolved to that member. These are the
+    ///    consumer rows an operation lists, so the count travels with the list
+    ///    it qualifies.
+    /// 2. The member's own request row, inside the client module, found by the
+    ///    line its request is written on. It is the row an operation lists when
+    ///    NO site resolved, which is exactly the state the count describes;
+    ///    without it a member the join followed nowhere would say nothing at
+    ///    all. It is stamped only when a row exists there: a client whose
+    ///    request goes through a helper raises no candidate, so whether
+    ///    extraction answered for that line is not something this pass decides.
+    ///
+    /// Rewrites nothing else, and never writes a zero: the field is absent
+    /// unless a site was really counted.
+    fn stamp_unfollowed_member_sites(
+        file_results: &mut HashMap<String, FileAnalysisResult>,
+        deficits: &HashMap<String, u32>,
+        resolved_rows: &HashMap<String, HashMap<u32, String>>,
+        homes: &HashMap<String, MemberHome>,
+    ) -> usize {
+        if deficits.is_empty() {
+            return 0;
+        }
+        let mut stamped = 0;
+        // 1. The rows the join produced for the member, wherever they are.
+        for (path, spans) in resolved_rows {
+            let Some(result) = file_results.get_mut(path) else {
+                continue;
+            };
+            for data_call in &mut result.data_calls {
+                let Some(span) = data_call.call_expression_span_start else {
+                    continue;
+                };
+                let Some(member) = spans.get(&span) else {
+                    continue;
+                };
+                let Some(count) = deficits.get(member).copied().filter(|count| *count > 0) else {
+                    continue;
+                };
+                data_call.consumers_not_resolved = Some(UnfollowedMemberSites {
+                    member: member.clone(),
+                    count,
+                });
+                stamped += 1;
+            }
+        }
+        // 2. The member's own request row in its module. Sorted so a file
+        //    holding two such members is stamped in one order, not in whatever
+        //    order the map iterates.
+        let mut counted: Vec<(&String, &u32)> =
+            deficits.iter().filter(|(_, count)| **count > 0).collect();
+        counted.sort();
+        for (member, count) in counted {
+            let Some(home) = homes.get(member) else {
+                continue;
+            };
+            let Some(result) = file_results.get_mut(&home.path_str) else {
+                continue;
+            };
+            let Ok(line) = i32::try_from(home.request_line) else {
+                continue;
+            };
+            for data_call in &mut result.data_calls {
+                if data_call.consumers_not_resolved.is_some() {
+                    continue;
+                }
+                if data_call.line_number != line && data_call.call_expression_line != Some(line) {
+                    continue;
+                }
+                data_call.consumers_not_resolved = Some(UnfollowedMemberSites {
+                    member: member.clone(),
+                    count: *count,
+                });
+                stamped += 1;
+            }
+        }
+        stamped
     }
 
     /// Emit the whole-URL environment-variable calls whose sites extraction
@@ -4961,6 +5229,7 @@ impl FileOrchestrator {
                 type_import_source: None,
                 loopback_default_url: local_default,
                 base: None,
+                consumers_not_resolved: None,
             });
             added += 1;
         }
@@ -5882,6 +6151,10 @@ impl FileOrchestrator {
                         // same target this row states. Retention only, like
                         // `host` and `line`: nothing in matching reads it.
                         base: data_call.base.clone(),
+                        // What the member join could not follow for this row's
+                        // client method (carrick#656), carried through so the
+                        // index can state it beside the consumer list.
+                        consumers_not_resolved: data_call.consumers_not_resolved.clone(),
                     },
                     data_call.call_expression_span_start.is_some(),
                 ));
@@ -7960,6 +8233,7 @@ export * from "./aFetch.js";"#,
 
                     loopback_default_url: None,
                     base: None,
+                    consumers_not_resolved: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -8117,6 +8391,7 @@ export * from "./aFetch.js";"#,
             type_import_source: None,
             loopback_default_url: None,
             base: None,
+            consumers_not_resolved: None,
         }
     }
 
@@ -8468,6 +8743,7 @@ export * from "./aFetch.js";"#,
 
                 loopback_default_url: None,
                 base: None,
+                consumers_not_resolved: None,
             }],
             ..Default::default()
         };
@@ -8556,6 +8832,7 @@ export * from "./aFetch.js";"#,
 
             loopback_default_url: None,
             base: None,
+            consumers_not_resolved: None,
         };
 
         let mut file_results = HashMap::new();
@@ -8665,6 +8942,7 @@ export * from "./aFetch.js";"#,
 
             loopback_default_url: None,
             base: None,
+            consumers_not_resolved: None,
         };
 
         let mut file_results = HashMap::new();
@@ -8757,6 +9035,7 @@ export * from "./aFetch.js";"#,
 
             loopback_default_url: None,
             base: None,
+            consumers_not_resolved: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -8825,6 +9104,7 @@ export * from "./aFetch.js";"#,
 
                         loopback_default_url: None,
                         base: None,
+                        consumers_not_resolved: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -8844,6 +9124,7 @@ export * from "./aFetch.js";"#,
 
                         loopback_default_url: None,
                         base: None,
+                        consumers_not_resolved: None,
                     },
                 ],
                 graphql_operations: vec![],
@@ -8894,6 +9175,7 @@ export * from "./aFetch.js";"#,
 
                     loopback_default_url: None,
                     base: None,
+                    consumers_not_resolved: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -8946,6 +9228,7 @@ export * from "./aFetch.js";"#,
 
                         loopback_default_url: None,
                         base: None,
+                        consumers_not_resolved: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -8965,6 +9248,7 @@ export * from "./aFetch.js";"#,
 
                         loopback_default_url: None,
                         base: None,
+                        consumers_not_resolved: None,
                     },
                 ],
                 graphql_operations: vec![],
@@ -9307,6 +9591,7 @@ export * from "./aFetch.js";"#,
 
                 loopback_default_url: None,
                 base: None,
+                consumers_not_resolved: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -9403,6 +9688,7 @@ export * from "./aFetch.js";"#,
 
                 loopback_default_url: None,
                 base: None,
+                consumers_not_resolved: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![
@@ -9753,6 +10039,7 @@ export * from "./aFetch.js";"#,
 
                 loopback_default_url: None,
                 base: None,
+                consumers_not_resolved: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -10993,6 +11280,7 @@ export { routes };
             type_import_source: None,
             loopback_default_url: None,
             base: None,
+            consumers_not_resolved: None,
         }
     }
 
@@ -11323,20 +11611,33 @@ export { routes };
         assert_eq!(result.data_calls[3].method.as_deref(), Some("DELETE"));
     }
 
-    fn resolved_member(span: u32, method: &str, target: &str) -> HashMap<u32, RequestMember> {
+    fn resolved_member(span: u32, method: &str, target: &str) -> HashMap<u32, ResolvedMember> {
         HashMap::from([(
             span,
-            RequestMember {
-                method: method.to_string(),
-                target: target.to_string(),
+            ResolvedMember {
+                name: "member".to_string(),
+                member: ring_member(method, target),
             },
         )])
     }
 
+    /// A member as the ring assertions compare it. `request_line` is
+    /// provenance and outside `RequestMember`'s `PartialEq`, so the value here
+    /// is never read.
     fn ring_member(method: &str, target: &str) -> RequestMember {
         RequestMember {
             method: method.to_string(),
             target: target.to_string(),
+            request_line: 0,
+        }
+    }
+
+    /// The join outcome the ring assertions compare against: the member, under
+    /// the name the site called it by.
+    fn ring_outcome(name: &str, method: &str, target: &str) -> ResolvedMember {
+        ResolvedMember {
+            name: name.to_string(),
+            member: ring_member(method, target),
         }
     }
 
@@ -11377,14 +11678,19 @@ export { routes };
                 "${this.base}/api/v1/things",
             )]),
         ];
-        let resolved = FileOrchestrator::resolve_imported_members(
+        let (resolved, _declined) = FileOrchestrator::resolve_imported_members(
             &site("projectClient", "listThings"),
             rings,
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert_eq!(
             resolved.get(&100),
-            Some(&ring_member("GET", "${this.base}/api/v1/things"))
+            Some(&ring_outcome(
+                "listThings",
+                "GET",
+                "${this.base}/api/v1/things"
+            ))
         );
     }
 
@@ -11396,14 +11702,19 @@ export { routes };
             ring(&[("near.ts", "listThings", "GET", "${this.base}/api/v2/things")]),
             ring(&[("far.ts", "listThings", "GET", "${this.base}/api/v1/things")]),
         ];
-        let resolved = FileOrchestrator::resolve_imported_members(
+        let (resolved, _declined) = FileOrchestrator::resolve_imported_members(
             &site("client", "listThings"),
             rings,
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert_eq!(
             resolved.get(&100),
-            Some(&ring_member("GET", "${this.base}/api/v2/things"))
+            Some(&ring_outcome(
+                "listThings",
+                "GET",
+                "${this.base}/api/v2/things"
+            ))
         );
     }
 
@@ -11418,9 +11729,10 @@ export { routes };
             ]),
             ring(&[("far.ts", "listThings", "GET", "${this.base}/api/v1/things")]),
         ];
-        let resolved = FileOrchestrator::resolve_imported_members(
+        let (resolved, _declined) = FileOrchestrator::resolve_imported_members(
             &site("client", "listThings"),
             rings,
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert!(resolved.is_empty(), "{resolved:?}");
@@ -11441,12 +11753,200 @@ export { routes };
         ];
         let import_owners =
             HashMap::from([("legacy".to_string(), Some(PathBuf::from("legacy.ts")))]);
-        let resolved = FileOrchestrator::resolve_imported_members(
+        let (resolved, _declined) = FileOrchestrator::resolve_imported_members(
             &site("legacy", "listThings"),
             rings,
             &import_owners,
+            &HashMap::new(),
         );
         assert!(resolved.is_empty(), "{resolved:?}");
+    }
+
+    /// carrick#656: a receiver imported from a module that CONSTRUCTS the
+    /// client and exports the instance is a site the join gives up on by
+    /// design, so it is counted and a row can say the list is one short.
+    #[test]
+    fn resolve_imported_members_counts_a_declined_receiver_that_holds_the_client() {
+        let rings = vec![
+            ring(&[]),
+            ring(&[(
+                "client.ts",
+                "listThings",
+                "GET",
+                "${this.base}/api/v1/things",
+            )]),
+        ];
+        let import_owners =
+            HashMap::from([("client".to_string(), Some(PathBuf::from("instance.ts")))]);
+        let receiver_imports = HashMap::from([(
+            PathBuf::from("instance.ts"),
+            BTreeSet::from([PathBuf::from("client.ts")]),
+        )]);
+        let (resolved, declined) = FileOrchestrator::resolve_imported_members(
+            &site("client", "listThings"),
+            rings,
+            &import_owners,
+            &receiver_imports,
+        );
+        assert!(
+            resolved.is_empty(),
+            "the join still declines it: {resolved:?}"
+        );
+        assert_eq!(declined, vec![(100, "listThings".to_string())]);
+    }
+
+    /// A receiver imported from a module that never imports the client's is a
+    /// different function that shares a name. Counting it would send a reader
+    /// after a call site of this member that does not exist.
+    #[test]
+    fn resolve_imported_members_does_not_count_a_name_collision() {
+        let rings = vec![
+            ring(&[]),
+            ring(&[(
+                "client.ts",
+                "createArtifactUrl",
+                "PUT",
+                "${this.base}/api/v2/artifacts",
+            )]),
+        ];
+        let import_owners =
+            HashMap::from([("apiClient".to_string(), Some(PathBuf::from("legacy.ts")))]);
+        let receiver_imports = HashMap::from([(
+            PathBuf::from("legacy.ts"),
+            BTreeSet::from([PathBuf::from("strings.ts")]),
+        )]);
+        let (resolved, declined) = FileOrchestrator::resolve_imported_members(
+            &site("apiClient", "createArtifactUrl"),
+            rings,
+            &import_owners,
+            &receiver_imports,
+        );
+        assert!(resolved.is_empty(), "{resolved:?}");
+        assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// A member two modules declare is attributed to neither: a site naming it
+    /// belongs to one no more than the other.
+    #[test]
+    fn member_homes_drops_a_name_two_modules_declare() {
+        let member_cache = HashMap::from([
+            (
+                PathBuf::from("/repo/client.ts"),
+                RequestMemberIndex::from([(
+                    "listThings".to_string(),
+                    ring_member("GET", "${this.base}/api/v1/things"),
+                )]),
+            ),
+            (
+                PathBuf::from("/repo/other.ts"),
+                RequestMemberIndex::from([
+                    (
+                        "listThings".to_string(),
+                        ring_member("GET", "${this.base}/api/v2/things"),
+                    ),
+                    (
+                        "readThing".to_string(),
+                        ring_member("GET", "${this.base}/api/v1/things/${id}"),
+                    ),
+                ]),
+            ),
+        ]);
+        let analysed = HashMap::from([
+            (PathBuf::from("/repo/client.ts"), "client.ts".to_string()),
+            (PathBuf::from("/repo/other.ts"), "other.ts".to_string()),
+        ]);
+
+        let homes = FileOrchestrator::member_homes(&member_cache, &analysed);
+
+        assert!(!homes.contains_key("listThings"), "declared twice");
+        assert_eq!(
+            homes.get("readThing").map(|home| home.path_str.as_str()),
+            Some("other.ts")
+        );
+    }
+
+    /// The member's own request row carries the count too (carrick#656): it is
+    /// the row an operation lists when NO site resolved, which is exactly the
+    /// state the count describes. Found by the line the request is written on,
+    /// because a client whose request goes through a helper raises no
+    /// candidate and its row carries no span.
+    #[test]
+    fn stamp_unfollowed_member_sites_marks_the_member_s_own_row() {
+        let mut client = FileAnalysisResult::default();
+        client
+            .data_calls
+            .push(call_with_span(18, "${this.baseUrl}/api/v1/things", None));
+        let mut consumer = FileAnalysisResult::default();
+        consumer.data_calls.push(call_with_span(
+            4,
+            "${this.baseUrl}/api/v1/things",
+            Some(100),
+        ));
+        let mut file_results = HashMap::from([
+            ("client.ts".to_string(), client),
+            ("consumer.ts".to_string(), consumer),
+        ]);
+
+        let stamped = FileOrchestrator::stamp_unfollowed_member_sites(
+            &mut file_results,
+            &HashMap::from([("listThings".to_string(), 2)]),
+            &HashMap::from([(
+                "consumer.ts".to_string(),
+                HashMap::from([(100, "listThings".to_string())]),
+            )]),
+            &HashMap::from([(
+                "listThings".to_string(),
+                MemberHome {
+                    path_str: "client.ts".to_string(),
+                    request_line: 18,
+                },
+            )]),
+        );
+
+        assert_eq!(stamped, 2, "the resolved site's row and the member's own");
+        let expected = Some(UnfollowedMemberSites {
+            member: "listThings".to_string(),
+            count: 2,
+        });
+        assert_eq!(
+            file_results["consumer.ts"].data_calls[0].consumers_not_resolved,
+            expected
+        );
+        assert_eq!(
+            file_results["client.ts"].data_calls[0].consumers_not_resolved,
+            expected
+        );
+    }
+
+    /// A member nothing was lost for writes nothing: an absent field says the
+    /// scan counted nothing, and a zero would read as a completeness claim the
+    /// count cannot make.
+    #[test]
+    fn stamp_unfollowed_member_sites_never_writes_a_zero() {
+        let mut consumer = FileAnalysisResult::default();
+        consumer.data_calls.push(call_with_span(
+            4,
+            "${this.baseUrl}/api/v1/things",
+            Some(100),
+        ));
+        let mut file_results = HashMap::from([("consumer.ts".to_string(), consumer)]);
+
+        let stamped = FileOrchestrator::stamp_unfollowed_member_sites(
+            &mut file_results,
+            &HashMap::from([("listThings".to_string(), 0)]),
+            &HashMap::from([(
+                "consumer.ts".to_string(),
+                HashMap::from([(100, "listThings".to_string())]),
+            )]),
+            &HashMap::new(),
+        );
+
+        assert_eq!(stamped, 0);
+        assert!(
+            file_results["consumer.ts"].data_calls[0]
+                .consumers_not_resolved
+                .is_none()
+        );
     }
 
     /// carrick#623: `apply_imported_members` can only rewrite a row that
@@ -12127,6 +12627,7 @@ export function publishWrapped(order: OrderPlaced): void {
             type_import_source: type_import_source.map(str::to_string),
             loopback_default_url: None,
             base: None,
+            consumers_not_resolved: None,
         }
     }
 

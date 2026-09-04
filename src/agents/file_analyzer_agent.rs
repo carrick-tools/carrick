@@ -214,6 +214,17 @@ pub struct DataCallResult {
     /// [`crate::call_base::CallBaseResolution`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<crate::call_base::CallBaseResolution>,
+    /// What the member join could not follow for the client method this row
+    /// reaches (carrick#656): the method's name, and how many call sites named
+    /// it in this service without resolving to it.
+    ///
+    /// Never from the model — stamped by `stamp_unfollowed_member_sites` once
+    /// every file's join outcome is in, on the rows the join produced for that
+    /// member and on the member's own request row. Absent whenever the count is
+    /// zero, which is also what a scan that saw no such site records: absence
+    /// says nothing was counted, never that the consumer list is complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumers_not_resolved: Option<crate::imported_request_member::UnfollowedMemberSites>,
 }
 
 /// A GraphQL resolver the file-analyzer found: the schema field it answers and
@@ -1513,6 +1524,7 @@ mod tests {
 
             loopback_default_url: None,
             base: None,
+            consumers_not_resolved: None,
         };
 
         let json = serde_json::to_string(&data_call).unwrap();
@@ -1565,6 +1577,7 @@ mod tests {
 
                 loopback_default_url: None,
                 base: None,
+                consumers_not_resolved: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -1923,6 +1936,7 @@ mod tests {
 
                 loopback_default_url: None,
                 base: None,
+                consumers_not_resolved: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -1976,6 +1990,7 @@ mod tests {
             type_import_source: None,
             loopback_default_url: None,
             base: None,
+            consumers_not_resolved: None,
         }
     }
 

@@ -129,6 +129,12 @@ pub struct DataFetchingCall {
     /// field above already states that) or cannot be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<crate::call_base::CallBaseResolution>,
+    /// What the member join could not follow for the client method this row
+    /// reaches (carrick#656), carried through from the per-file row so the
+    /// index can state it beside the consumer list. Retention only, like `host`
+    /// and `line`: nothing in matching reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumers_not_resolved: Option<crate::imported_request_member::UnfollowedMemberSites>,
 }
 
 /// The complete mount and endpoint graph
@@ -511,6 +517,7 @@ mod tests {
             host: None,
             line: None,
             base: None,
+            consumers_not_resolved: None,
         };
         assert_eq!(
             serde_json::to_value(&call).unwrap(),
@@ -1134,6 +1141,7 @@ mod tests {
                 host: None,
                 line: None,
                 base: None,
+                consumers_not_resolved: None,
             });
         let merged = MountGraph::merge_from_repos(&[repo]);
         assert_eq!(merged.data_calls.len(), 1);

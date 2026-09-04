@@ -171,3 +171,36 @@ fn a_member_reached_through_a_factory_record_or_a_this_field_resolves() {
     assert_eq!(through_this["path"], "/api/v2/session");
     assert_eq!(through_this["target_url"], "/api/v2/session");
 }
+
+/// carrick#656: a row states what the join could not follow.
+///
+/// `envvars.ts` calls `readArtifactUrl` on a client another module constructed
+/// and exported as an instance. The receiver is an imported binding whose
+/// source is not the member's module, so the join declines it by design — and
+/// counts it, so the three rows the same member DID produce say the list of
+/// its call sites is one short instead of reading as complete.
+#[test]
+fn a_row_states_the_call_sites_the_join_could_not_follow() {
+    let calls = calls("imported-request-member");
+
+    for line in [16, 11, 8] {
+        let row = call_at_line(&calls, line);
+        assert_eq!(
+            row["consumers_not_resolved"],
+            serde_json::json!({ "member": "readArtifactUrl", "count": 1 }),
+            "every row the member produced carries what it lost, at line {line}"
+        );
+    }
+
+    // The collision is NOT a lost call site. `artifacts.ts:21` calls
+    // `createArtifactUrl` on a binding imported from `legacy.ts`, which never
+    // imports the client: a different function that shares a name, and
+    // counting it would send a reader after a call site that does not exist.
+    for line in [5, 7, 25, 15, 12] {
+        let row = call_at_line(&calls, line);
+        assert!(
+            row.get("consumers_not_resolved").is_none(),
+            "nothing was lost for this member, so the field is absent: {row:#?}"
+        );
+    }
+}

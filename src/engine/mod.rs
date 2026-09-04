@@ -121,6 +121,10 @@ mod type_compat_v2;
 /// Same version covers carrick#662: a file that carves a custom namespace off
 /// its server is no longer dropped whole, so its listeners and emitters —
 /// namespaced and default alike — have rows a v17 cache also lacks.
+/// Same version covers carrick#656: a consumer row now states what the member
+/// join could not follow, and the count is stamped on rows in the files a scan
+/// analyses, so a v17 cache holds those rows without the field and an
+/// unchanged service would never acquire it.
 const CACHE_VERSION: u32 = 18;
 
 // Type aliases to reduce complexity
@@ -625,6 +629,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
             &eval_type_manifest,
             &analyzer.call_raw_targets(),
             &analyzer.call_bases(),
+            &analyzer.call_unfollowed_members(),
         );
         println!("{}", serde_json::to_string_pretty(&projection)?);
         return Ok(());
@@ -4405,6 +4410,7 @@ mod tests {
             host: None,
             line: Some(313),
             base: None,
+            consumers_not_resolved: None,
         });
 
         let mut function_definitions = HashMap::new();
@@ -4863,6 +4869,7 @@ mod tests {
 
                     loopback_default_url: None,
                     base: None,
+                    consumers_not_resolved: None,
                 })
                 .collect(),
             graphql_operations: vec![],
@@ -4905,6 +4912,7 @@ mod tests {
                 host: None,
                 line: None,
                 base: None,
+                consumers_not_resolved: None,
             }
         };
         let mut mount_graph = MountGraph::new();
@@ -5042,6 +5050,7 @@ mod tests {
             host: None,
             line: None,
             base: None,
+            consumers_not_resolved: None,
         }];
 
         let entries = build_type_manifest_entries(&mount_graph, &config, ".");
@@ -5938,6 +5947,7 @@ mod tests {
                 host: Some("api.vendor.test".to_string()),
                 line: Some(12),
                 base: None,
+                consumers_not_resolved: None,
             },
             crate::mount_graph::DataFetchingCall {
                 method: "GET".to_string(),
@@ -5951,6 +5961,7 @@ mod tests {
                 host: None,
                 line: Some(7),
                 base: None,
+                consumers_not_resolved: None,
             },
         ];
 
@@ -6703,6 +6714,7 @@ mod tests {
             host: None,
             line: None,
             base: None,
+            consumers_not_resolved: None,
         }
     }
 
@@ -6757,6 +6769,7 @@ mod tests {
             host: None,
             line: None,
             base: None,
+            consumers_not_resolved: None,
         }];
         let graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],

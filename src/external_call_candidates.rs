@@ -3440,6 +3440,7 @@ mod tests {
                 host: host.map(str::to_string),
                 line,
                 base: None,
+                consumers_not_resolved: None,
             }
         }
 

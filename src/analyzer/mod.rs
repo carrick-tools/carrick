@@ -2530,6 +2530,31 @@ impl Analyzer {
             .unwrap_or_default()
     }
 
+    /// What the member join could not follow for each consumer call
+    /// (carrick#656), keyed exactly as [`Self::call_raw_targets`] is, so the
+    /// eval projection can attach the field the persisted row carries.
+    pub fn call_unfollowed_members(
+        &self,
+    ) -> HashMap<(String, String), crate::imported_request_member::UnfollowedMemberSites> {
+        self.mount_graph
+            .as_ref()
+            .map(|g| {
+                g.get_data_calls()
+                    .iter()
+                    .filter_map(|c| {
+                        Some((
+                            (
+                                OperationKey::http(&c.method, c.canonical_path.clone()).canonical(),
+                                c.file_location.clone(),
+                            ),
+                            c.consumers_not_resolved.clone()?,
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Overlay the type-compatibility verdict onto each captured cross-repo
     /// edge, keyed by the producer's `(METHOD, identity)` AND the consumer's
     /// source location — so each `(producer, consumer)` pair gets ITS OWN
@@ -4124,6 +4149,7 @@ mod tests {
             host: None,
             line: None,
             base: None,
+            consumers_not_resolved: None,
         });
 
         let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -4230,6 +4256,7 @@ mod tests {
             host: None,
             line: None,
             base: None,
+            consumers_not_resolved: None,
         });
         analyzer
             .calls
@@ -4305,6 +4332,7 @@ mod tests {
             host: None,
             line: None,
             base: None,
+            consumers_not_resolved: None,
         });
         analyzer
             .calls
@@ -4363,6 +4391,7 @@ mod tests {
             host: None,
             line: None,
             base: None,
+            consumers_not_resolved: None,
         });
         analyzer.calls.push(http_call(
             "POST",
@@ -5446,6 +5475,7 @@ mod tests {
             host: None,
             line: None,
             base: None,
+            consumers_not_resolved: None,
         }
     }
 
