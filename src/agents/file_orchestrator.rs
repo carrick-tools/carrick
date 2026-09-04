@@ -11333,6 +11333,122 @@ export { routes };
         )])
     }
 
+    fn ring_member(method: &str, target: &str) -> RequestMember {
+        RequestMember {
+            method: method.to_string(),
+            target: target.to_string(),
+        }
+    }
+
+    fn ring(entries: &[(&str, &str, &str, &str)]) -> Vec<(PathBuf, RequestMemberIndex)> {
+        let mut by_module: Vec<(PathBuf, RequestMemberIndex)> = Vec::new();
+        for (module, name, method, target) in entries {
+            let path = PathBuf::from(module);
+            let index = match by_module.iter_mut().find(|(p, _)| *p == path) {
+                Some((_, index)) => index,
+                None => {
+                    by_module.push((path, RequestMemberIndex::new()));
+                    &mut by_module.last_mut().unwrap().1
+                }
+            };
+            index.insert(name.to_string(), ring_member(method, target));
+        }
+        by_module
+    }
+
+    fn site(callee_object: &str, callee_property: &str) -> HashMap<String, CandidateTarget> {
+        let mut candidate = candidate_with_snippet("c1", None);
+        candidate.callee_object = callee_object.to_string();
+        candidate.callee_property = Some(callee_property.to_string());
+        HashMap::from([("c1".to_string(), candidate)])
+    }
+
+    /// carrick#655: a member the consumer's own imports do not declare is
+    /// looked for one ring further out, where the factory's module imported
+    /// the client.
+    #[test]
+    fn resolve_imported_members_reads_the_second_ring_when_the_first_declares_nothing() {
+        let rings = vec![
+            ring(&[]),
+            ring(&[(
+                "client.ts",
+                "listThings",
+                "GET",
+                "${this.base}/api/v1/things",
+            )]),
+        ];
+        let resolved = FileOrchestrator::resolve_imported_members(
+            &site("projectClient", "listThings"),
+            rings,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            resolved.get(&100),
+            Some(&ring_member("GET", "${this.base}/api/v1/things"))
+        );
+    }
+
+    /// The nearest ring that declares the name decides, even when a further
+    /// ring declares it too.
+    #[test]
+    fn resolve_imported_members_takes_the_nearest_ring_that_declares_the_name() {
+        let rings = vec![
+            ring(&[("near.ts", "listThings", "GET", "${this.base}/api/v2/things")]),
+            ring(&[("far.ts", "listThings", "GET", "${this.base}/api/v1/things")]),
+        ];
+        let resolved = FileOrchestrator::resolve_imported_members(
+            &site("client", "listThings"),
+            rings,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            resolved.get(&100),
+            Some(&ring_member("GET", "${this.base}/api/v2/things"))
+        );
+    }
+
+    /// A name a nearer ring declares ambiguously is dropped there. It is not
+    /// looked for further out: the ambiguity is the answer.
+    #[test]
+    fn resolve_imported_members_stops_at_a_ring_that_declares_the_name_ambiguously() {
+        let rings = vec![
+            ring(&[
+                ("a.ts", "listThings", "GET", "${this.base}/api/a"),
+                ("b.ts", "listThings", "GET", "${this.base}/api/b"),
+            ]),
+            ring(&[("far.ts", "listThings", "GET", "${this.base}/api/v1/things")]),
+        ];
+        let resolved = FileOrchestrator::resolve_imported_members(
+            &site("client", "listThings"),
+            rings,
+            &HashMap::new(),
+        );
+        assert!(resolved.is_empty(), "{resolved:?}");
+    }
+
+    /// The receiver constraint applies whichever ring the member is in: a
+    /// receiver imported from a module other than the member's joins nothing.
+    #[test]
+    fn resolve_imported_members_keeps_the_receiver_constraint_across_rings() {
+        let rings = vec![
+            ring(&[]),
+            ring(&[(
+                "client.ts",
+                "listThings",
+                "GET",
+                "${this.base}/api/v1/things",
+            )]),
+        ];
+        let import_owners =
+            HashMap::from([("legacy".to_string(), Some(PathBuf::from("legacy.ts")))]);
+        let resolved = FileOrchestrator::resolve_imported_members(
+            &site("legacy", "listThings"),
+            rings,
+            &import_owners,
+        );
+        assert!(resolved.is_empty(), "{resolved:?}");
+    }
+
     /// carrick#623: `apply_imported_members` can only rewrite a row that
     /// already exists, so a resolved member whose site extraction answered
     /// nothing for was dropped and the endpoint it reaches was absent from the
