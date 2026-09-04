@@ -10,6 +10,19 @@
 //! `socket.io` makes server roots, and the first parameter of a
 //! `connection` handler is a per-connection server socket.
 //!
+//! The key carries the event name and the direction, and nothing else. A
+//! custom namespace is therefore not part of operation identity here, and
+//! cannot be: the server names it in a `.of(...)` argument that is usually a
+//! variable, and the client names it in the path of the URL it connects with,
+//! built in some other method. Both sides are namespace-blind, so ops are
+//! recorded on a namespace exactly as they are on the default one.
+//!
+//! The imprecision that accepts, stated plainly: two namespaces of one server
+//! handling one event name produce two producer rows on one key. That is the
+//! same imprecision the model already accepts across files and services, where
+//! two listeners for one event have always shared a key, so a file-level skip
+//! bought nothing the key could express and only hid the ops (carrick#662).
+//!
 //! A long-lived socket is usually held on a class field rather than a local
 //! (`private socket?: Socket<…>`; `this.socket = this.#createSocket()`), and
 //! the emits that carry the contract sit in later methods, on `this.socket`
@@ -17,8 +30,8 @@
 //! not depend on how the field is initialized:
 //! - a binding — class field, private field, constructor parameter property,
 //!   `const`, or parameter — whose declared type is the `Socket` type imported
-//!   from `socket.io-client` (client) or `socket.io` (per-connection server
-//!   socket), and
+//!   from `socket.io-client` (client) or the `Socket`/`Namespace` type
+//!   imported from `socket.io` (server side), and
 //! - `this.<field> = <expr>` where the right-hand side is already a socket
 //!   root (a factory call, `new Server(...)`, or another root binding).
 //!
@@ -26,13 +39,9 @@
 //! - only string-literal event names count; dynamic names are skipped,
 //! - reserved lifecycle events (`connect`, `disconnect`, ...) never become
 //!   contract events,
-//! - files using custom namespaces (`io.of(...)`) are skipped entirely —
-//!   default-namespace identity would be ambiguous there. The guard only sees
-//!   an `of` call on a TRACKED root, so a file whose server root is untracked
-//!   (a function return, say) is not skipped, and a socket the declared-type
-//!   rule reaches inside it is recorded under the plain event key,
-//! - a namespaced server whose root is only ever a `Server`/`Namespace`-typed
-//!   binding stays invisible: the type rule admits the `Socket` type alone,
+//! - a namespace reached only through the `Server` TYPE stays invisible: the
+//!   type rule admits the receivers (`Socket`, `Namespace`), while the server
+//!   root is created by `new Server(...)` alone,
 //! - CommonJS `require("socket.io")` bootstrapping is not traced (coverage
 //!   gap, not a false positive),
 //! - a field assigned the RETURN VALUE of a method that builds a socket
@@ -171,18 +180,9 @@ fn extract_from_ts_file(file_path: &Path) -> SocketExtraction {
             cm: cm.clone(),
             file_path,
             roots: &roots,
-            uses_namespaces: false,
             extraction: SocketExtraction::default(),
         };
         module.visit_with(&mut ops);
-
-        if ops.uses_namespaces {
-            debug!(
-                "Skipping Socket.IO extraction for {} (custom namespaces in use)",
-                file_path.display()
-            );
-            return SocketExtraction::default();
-        }
         ops.extraction
     })
 }
@@ -402,7 +402,11 @@ impl Visit for RootCollector<'_> {
                                 .client_socket_types
                                 .insert(named.local.sym.to_string());
                         }
-                        ("socket.io", "Socket") => {
+                        // `Namespace` is the other server-side receiver: it
+                        // broadcasts server->client and hands per-connection
+                        // sockets to its `connection` handler, exactly as the
+                        // default namespace does (carrick#662).
+                        ("socket.io", "Socket" | "Namespace") => {
                             self.roots
                                 .server_socket_types
                                 .insert(named.local.sym.to_string());
@@ -615,7 +619,6 @@ struct OpCollector<'a> {
     cm: Lrc<SourceMap>,
     file_path: &'a Path,
     roots: &'a SocketRoots,
-    uses_namespaces: bool,
     extraction: SocketExtraction,
 }
 
@@ -700,10 +703,6 @@ impl OpCollector<'_> {
             return;
         };
         let is_socket_root = self.roots.kind_of(&root_name).is_some();
-
-        if is_socket_root && prop.sym.as_ref() == "of" {
-            self.uses_namespaces = true;
-        }
 
         let is_listener = matches!(prop.sym.as_ref(), "on" | "once");
         let is_emitter = prop.sym.as_ref() == "emit";
@@ -886,20 +885,76 @@ socket.on(`chat:${kind}`, handler);
     }
 
     #[test]
-    fn namespace_files_are_skipped_entirely() {
+    fn namespace_files_are_recorded_under_the_plain_event_key() {
+        // A file that carves a namespace off its server used to be dropped
+        // whole. The key has no namespace component and neither side of the
+        // wire can supply one, so the ops are recorded and the namespace is
+        // simply not part of their identity (carrick#662).
+        //
+        // The accepted imprecision: two namespaces of one server handling one
+        // event name produce two producer rows on one key, the same
+        // imprecision the model already accepts across files and services.
         let result = extract(
             r#"
+import type { Namespace } from "socket.io";
 import { Server } from "socket.io";
 const io = new Server(httpServer);
-const chat = io.of("/chat");
+const chat: Namespace = io.of("/chat");
+chat.on("connection", (socket) => {
+  socket.on("chat:message", handler);
+});
 io.on("connection", (socket) => {
   socket.on("chat:message", handler);
+  socket.on("presence:ping", handler);
 });
 "#,
         );
-        assert!(
-            result.is_empty(),
-            "custom namespaces make default-namespace identity ambiguous"
+        assert_eq!(
+            keys(&result.listeners),
+            vec![
+                // One event name handled on two namespaces: two producer rows,
+                // one key. This is the imprecision above, asserted rather than
+                // avoided.
+                "socket|CLIENT->SERVER|chat:message",
+                "socket|CLIENT->SERVER|chat:message",
+                "socket|CLIENT->SERVER|presence:ping",
+            ],
+            "ops on a namespace and on the default namespace are both recorded"
+        );
+    }
+
+    #[test]
+    fn namespace_typed_binding_is_a_server_root() {
+        // The namespace is carved off a server the pass cannot see (a function
+        // return here), so its declared type is the only thing that roots it,
+        // and the connection handler's socket follows from that.
+        let result = extract(
+            r#"
+import type { Namespace, Socket } from "socket.io";
+import { Server } from "socket.io";
+
+function createWorkerNamespace({ io, namespace }: { io: Server; namespace: string }) {
+  const worker: Namespace<ClientToServer, ServerToClient> = io.of(namespace);
+
+  worker.on("connection", async (socket) => {
+    socket.on("run:subscribe", async ({ runIds }) => {});
+    socket.on("disconnect", () => {});
+  });
+
+  worker.emit("run:notify", { version: "1" });
+
+  return worker;
+}
+"#,
+        );
+        assert_eq!(
+            keys(&result.listeners),
+            vec!["socket|CLIENT->SERVER|run:subscribe"]
+        );
+        assert_eq!(
+            keys(&result.emitters),
+            vec!["socket|SERVER->CLIENT|run:notify"],
+            "a namespace broadcast is a server->client consumer"
         );
     }
 

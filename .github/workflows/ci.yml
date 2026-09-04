@@ -106,6 +106,7 @@ jobs:
           --test route_request_anchor_test
           --test socket_class_field_test
           --test socket_extraction_test
+          --test socket_namespace_test
 
       # Every tests/*.rs must be run by a step above or be listed here with a
       # reason. Nine of twenty were silently local-only before this step.
