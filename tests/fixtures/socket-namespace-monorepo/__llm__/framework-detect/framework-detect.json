@@ -1,0 +1,6 @@
+{
+  "frameworks": [],
+  "data_fetchers": [],
+  "messaging_clients": [],
+  "notes": "A worker client and a platform gateway whose only contract is a namespaced Socket.IO event stream."
+}
