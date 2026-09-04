@@ -114,7 +114,11 @@ mod type_compat_v2;
 /// (two import hops) or through a field off `this` now resolves and emits its
 /// consumer row (carrick#655), where a v16 cache holds no row for an unchanged
 /// consumer file.
-const CACHE_VERSION: u32 = 17;
+/// 18: a Socket.IO listener or emitter written on a class field
+/// (`this.socket.emit("run:subscribe", …)`) now resolves its socket root and
+/// emits its row (carrick#659), where a v17 cache holds no row at all for an
+/// unchanged file whose socket is built in one method and used in another.
+const CACHE_VERSION: u32 = 18;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
