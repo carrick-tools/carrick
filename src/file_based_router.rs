@@ -142,7 +142,9 @@ impl DerivedRoute {
     ///
     /// A guard cannot contradict an export *named* for a method: there the name
     /// is the declaration, not a default, and a body that also branches on the
-    /// method is doing something else.
+    /// method is doing something else. Nor can it contradict a verb the
+    /// builder call declared (`declared_methods`, carrick#665), for the same
+    /// reason: that is the route stating its method, not a default.
     ///
     /// OPTIONS and HEAD never narrow (carrick#628). A handler that answers a
     /// CORS preflight inline opens with a branch on OPTIONS and then serves its
@@ -155,7 +157,12 @@ impl DerivedRoute {
     /// here rather than in the guard collector because the collector's answer
     /// is a fact about the source, "these are the literals the body compares
     /// the method against", and this is the routing judgement laid over it.
-    pub fn http_methods_for_export(&self, export: &str, method_guards: &[String]) -> Vec<String> {
+    pub fn http_methods_for_export(
+        &self,
+        export: &str,
+        method_guards: &[String],
+        declared_methods: &[String],
+    ) -> Vec<String> {
         if is_http_method(export) {
             return vec![export.to_uppercase()];
         }
@@ -166,6 +173,21 @@ impl DerivedRoute {
         else {
             return Vec::new();
         };
+
+        // A verb the builder call was given as an option is the route stating
+        // its own method, not a default to be narrowed (carrick#665). It
+        // outranks both the convention's default and any guard: a handler that
+        // also branches on the method inside a route whose verb is declared is
+        // doing something else, the same reasoning that keeps a guard from
+        // contradicting an export NAMED for a method.
+        let declared: Vec<String> = declared_methods
+            .iter()
+            .filter(|m| is_http_method(m))
+            .map(|m| m.trim().to_uppercase())
+            .collect();
+        if !declared.is_empty() {
+            return declared;
+        }
 
         let mut guarded: Vec<String> = Vec::new();
         for guard in method_guards {
@@ -934,7 +956,7 @@ mod tests {
 
     /// Guard-free lookup: the shape every test predating carrick#601 exercised.
     fn methods(r: &DerivedRoute, export: &str) -> Vec<String> {
-        r.http_methods_for_export(export, &[])
+        r.http_methods_for_export(export, &[], &[])
     }
 
     fn guards(list: &[&str]) -> Vec<String> {
@@ -974,12 +996,62 @@ mod tests {
         // matches.
         let r = flat_route("app/routes/api.v1.widgets.ts").unwrap();
         assert_eq!(
-            r.http_methods_for_export("action", &guards(&["PUT"])),
+            r.http_methods_for_export("action", &guards(&["PUT"]), &[]),
             vec!["PUT"]
         );
         assert_eq!(
-            r.http_methods_for_export("loader", &guards(&["DELETE"])),
+            r.http_methods_for_export("loader", &guards(&["DELETE"]), &[]),
             vec!["DELETE"]
+        );
+    }
+
+    // --- Declared methods (carrick#665) ---
+
+    #[test]
+    fn a_declared_method_replaces_the_convention_default_verb() {
+        let r = flat_route("app/routes/api.v1.widgets.ts").unwrap();
+        assert_eq!(
+            r.http_methods_for_export("action", &[], &guards(&["PUT"])),
+            vec!["PUT"]
+        );
+    }
+
+    #[test]
+    fn a_declared_method_outranks_a_guard() {
+        // The verb the builder was given is the route stating its method; a
+        // branch inside the handler is the handler doing something else.
+        let r = flat_route("app/routes/api.v1.widgets.ts").unwrap();
+        assert_eq!(
+            r.http_methods_for_export("action", &guards(&["POST"]), &guards(&["PUT"])),
+            vec!["PUT"]
+        );
+    }
+
+    #[test]
+    fn a_declared_method_list_serves_every_verb_it_names() {
+        let r = flat_route("app/routes/api.v1.widgets.ts").unwrap();
+        assert_eq!(
+            r.http_methods_for_export("action", &[], &guards(&["PATCH", "DELETE"])),
+            vec!["PATCH", "DELETE"]
+        );
+    }
+
+    #[test]
+    fn a_declared_method_cannot_contradict_an_export_named_for_a_method() {
+        // An app-router export named GET is the declaration itself.
+        let r = route("app/widgets/route.ts").unwrap();
+        assert_eq!(
+            r.http_methods_for_export("GET", &[], &guards(&["PUT"])),
+            vec!["GET"]
+        );
+    }
+
+    #[test]
+    fn a_declared_method_that_is_not_a_method_states_nothing() {
+        let r = flat_route("app/routes/api.v1.widgets.ts").unwrap();
+        assert_eq!(
+            r.http_methods_for_export("action", &[], &guards(&["SUBSCRIBE"])),
+            vec!["POST"]
         );
     }
 
@@ -992,15 +1064,15 @@ mod tests {
         // narrow drops the route's only real row.
         let r = flat_route("app/routes/api.v1.widgets.ts").unwrap();
         assert_eq!(
-            r.http_methods_for_export("loader", &guards(&["OPTIONS"])),
+            r.http_methods_for_export("loader", &guards(&["OPTIONS"]), &[]),
             vec!["GET"]
         );
         assert_eq!(
-            r.http_methods_for_export("action", &guards(&["HEAD"])),
+            r.http_methods_for_export("action", &guards(&["HEAD"]), &[]),
             vec!["POST"]
         );
         assert_eq!(
-            r.http_methods_for_export("loader", &guards(&["OPTIONS", "HEAD"])),
+            r.http_methods_for_export("loader", &guards(&["OPTIONS", "HEAD"]), &[]),
             vec!["GET"]
         );
     }
@@ -1011,7 +1083,7 @@ mod tests {
         // neither the default nor an OPTIONS row survives.
         let r = flat_route("app/routes/api.v1.widgets.ts").unwrap();
         assert_eq!(
-            r.http_methods_for_export("action", &guards(&["OPTIONS", "PUT"])),
+            r.http_methods_for_export("action", &guards(&["OPTIONS", "PUT"]), &[]),
             vec!["PUT"]
         );
     }
@@ -1021,14 +1093,17 @@ mod tests {
         // The rule is scoped to role-named exports, where the convention
         // supplies a default. An export *named* OPTIONS declares itself.
         let r = route("app/users/route.ts").unwrap();
-        assert_eq!(r.http_methods_for_export("OPTIONS", &[]), vec!["OPTIONS"]);
-        assert_eq!(r.http_methods_for_export("HEAD", &[]), vec!["HEAD"]);
+        assert_eq!(
+            r.http_methods_for_export("OPTIONS", &[], &[]),
+            vec!["OPTIONS"]
+        );
+        assert_eq!(r.http_methods_for_export("HEAD", &[], &[]), vec!["HEAD"]);
     }
 
     #[test]
     fn no_guard_leaves_the_convention_default_standing() {
         let r = flat_route("app/routes/api.v1.widgets.ts").unwrap();
-        assert_eq!(r.http_methods_for_export("action", &[]), vec!["POST"]);
+        assert_eq!(r.http_methods_for_export("action", &[], &[]), vec!["POST"]);
     }
 
     #[test]
@@ -1037,7 +1112,7 @@ mod tests {
         // The default is still not among them unless the guard names it.
         let r = flat_route("app/routes/api.v1.widgets.ts").unwrap();
         assert_eq!(
-            r.http_methods_for_export("action", &guards(&["PUT", "DELETE"])),
+            r.http_methods_for_export("action", &guards(&["PUT", "DELETE"]), &[]),
             vec!["PUT", "DELETE"]
         );
     }
@@ -1046,7 +1121,7 @@ mod tests {
     fn guard_methods_are_normalized_and_deduplicated() {
         let r = flat_route("app/routes/api.v1.widgets.ts").unwrap();
         assert_eq!(
-            r.http_methods_for_export("action", &guards(&["put", "PUT", " Put "])),
+            r.http_methods_for_export("action", &guards(&["put", "PUT", " Put "]), &[]),
             vec!["PUT"]
         );
     }
@@ -1057,7 +1132,7 @@ mod tests {
         // leaves the convention's default in place rather than inventing a verb.
         let r = flat_route("app/routes/api.v1.widgets.ts").unwrap();
         assert_eq!(
-            r.http_methods_for_export("action", &guards(&["QUERY", ""])),
+            r.http_methods_for_export("action", &guards(&["QUERY", ""]), &[]),
             vec!["POST"]
         );
     }
@@ -1068,7 +1143,7 @@ mod tests {
         // so a body that also branches on the method changes nothing.
         let r = route("app/users/route.ts").unwrap();
         assert_eq!(
-            r.http_methods_for_export("GET", &guards(&["POST"])),
+            r.http_methods_for_export("GET", &guards(&["POST"]), &[]),
             vec!["GET"]
         );
     }
@@ -1079,7 +1154,7 @@ mod tests {
         // does not name is still not a route handler.
         let r = flat_route("app/routes/api.v1.widgets.ts").unwrap();
         assert!(
-            r.http_methods_for_export("config", &guards(&["PUT"]))
+            r.http_methods_for_export("config", &guards(&["PUT"]), &[])
                 .is_empty()
         );
     }

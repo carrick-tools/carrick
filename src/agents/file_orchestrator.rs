@@ -3755,7 +3755,11 @@ impl FileOrchestrator {
                     // declaration does (carrick#473). The anchor stays the
                     // export span, never the guard line: the sidecar's
                     // return-type lookup is keyed on it.
-                    let methods = route.http_methods_for_export(&h.name, &h.method_guards);
+                    let methods = route.http_methods_for_export(
+                        &h.name,
+                        &h.method_guards,
+                        &h.declared_methods,
+                    );
                     methods
                         .into_iter()
                         .map(|method| EndpointResult {

@@ -298,6 +298,55 @@ fn astro_convention_rejects_a_non_astro_layout() {
 /// with the wrong method matches it and reads as a confident green edge. So
 /// the guard, where one exists, is the only row; where none exists, the
 /// convention's default stands.
+/// carrick#665: a route builder that takes the HTTP method as an option
+/// states the route's verb outright. Reading only the convention's default for
+/// the export name records a PUT route as a POST, and the consumer that really
+/// does PUT it then matches nothing — the producer reads as absent while a
+/// route nobody calls reads as present.
+#[test]
+fn a_declared_method_option_replaces_the_convention_default_verb() {
+    let routes = synthesized_routes(
+        "flat-routes-declared-method",
+        &builtin_conventions(&["Remix".to_string()], &[]),
+    );
+
+    let expected: BTreeSet<String> = [
+        // Declared PUT: the write export's default (POST) is never served.
+        "PUT /api/v1/things/:thingId",
+        // A list of verbs is a route serving each of them.
+        "PATCH /api/v1/things/:thingId/labels",
+        "DELETE /api/v1/things/:thingId/labels",
+        // A declared verb outranks a guard in the body.
+        "PUT /api/v1/things/:thingId/status",
+        // Two handlers out of one call: the option says nothing about which,
+        // so both keep the convention's default.
+        "GET /api/v1/things/:thingId/pair",
+        "POST /api/v1/things/:thingId/pair",
+        // A non-literal verb states nothing.
+        "POST /api/v1/things/:thingId/dynamic",
+        // A `method` nested in another option is not the route's verb.
+        "POST /api/v1/things/:thingId/nested",
+        // Exported where it is declared, and still narrowed.
+        "DELETE /api/v1/things/:thingId/inline",
+        // The builder's result parked on a binding, one handler taken off it.
+        "PUT /api/v1/things/:thingId/parked",
+        // Two handlers off one result: the same ambiguity, so neither narrows.
+        "GET /api/v1/things/:thingId/parkedPair",
+        "POST /api/v1/things/:thingId/parkedPair",
+        // One file, two exports, one of them declaring its verb.
+        "GET /api/v1/things",
+        "PUT /api/v1/things",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    assert_eq!(
+        routes, expected,
+        "a route whose builder declares its method should yield exactly that verb"
+    );
+}
+
 #[test]
 fn method_guard_replaces_the_convention_default_verb() {
     let routes = synthesized_routes(
