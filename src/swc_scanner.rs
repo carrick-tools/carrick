@@ -258,6 +258,13 @@ pub struct ExportedHandler {
     /// inside the body serves only the guarded verbs, so the convention's
     /// default verb for that export would be an endpoint nothing serves.
     pub method_guards: Vec<String>,
+    /// HTTP-method literals the call that BUILT this handler was given as an
+    /// option (carrick#665). A route-builder factory takes an options object,
+    /// and a `method` on it is the route's verb stated outright: the module
+    /// says PUT and the convention's default for the export name says POST.
+    /// Empty when the binding is not built by a call, or the call states no
+    /// literal method.
+    pub declared_methods: Vec<String>,
 }
 
 /// A route declared as data in a registry array
@@ -590,6 +597,16 @@ impl SwcScanner {
         // handler declared above an `export { ... }` list reads its guard the
         // same way an inline `export function` does.
         let mut guards_by_binding: HashMap<String, Vec<String>> = HashMap::new();
+        // The verbs the call that built a binding was given as an option
+        // (carrick#665), read per top-level binding for the same reason the
+        // guards are: the builder call and the `export` of its result are
+        // routinely two statements apart.
+        let mut declared_by_binding: HashMap<String, Vec<String>> = HashMap::new();
+        // Bindings taken as a MEMBER of another binding (`const action =
+        // route.action`), with the binding they came off. A route module that
+        // parks the builder's result and exports one handler out of it states
+        // its verb one hop further away than the destructuring form does.
+        let mut handlers_off_a_binding: Vec<(String, String)> = Vec::new();
         for item in &module.body {
             let decl = match item {
                 ModuleItem::Stmt(Stmt::Decl(d)) => d,
@@ -603,29 +620,69 @@ impl SwcScanner {
                 }
                 Decl::Var(var) => {
                     for d in &var.decls {
-                        let (Pat::Ident(ident), Some(init)) = (&d.name, &d.init) else {
+                        let Some(init) = &d.init else {
                             continue;
                         };
-                        guards_by_binding
-                            .insert(ident.id.sym.to_string(), collect_method_guards(&**init));
+                        if let Pat::Ident(ident) = &d.name {
+                            guards_by_binding
+                                .insert(ident.id.sym.to_string(), collect_method_guards(&**init));
+                        }
+                        for (binding, methods) in declared_route_methods(&d.name, init) {
+                            declared_by_binding.insert(binding, methods);
+                        }
+                        if let (Pat::Ident(ident), Some(root)) =
+                            (&d.name, member_root_binding(init))
+                        {
+                            handlers_off_a_binding.push((ident.id.sym.to_string(), root));
+                        }
                     }
                 }
                 _ => {}
             }
         }
 
+        // A builder result one hop away carries its declared verb to the ONE
+        // handler taken off it. Two handlers off the same result are the same
+        // ambiguity the destructuring form has — the option cannot say which of
+        // them it belongs to — so neither is narrowed.
+        for (binding, root) in &handlers_off_a_binding {
+            let Some(methods) = declared_by_binding.get(root) else {
+                continue;
+            };
+            if handlers_off_a_binding
+                .iter()
+                .filter(|(_, other)| other == root)
+                .count()
+                != 1
+            {
+                continue;
+            }
+            let methods = methods.clone();
+            declared_by_binding.insert(binding.clone(), methods);
+        }
+
         let mut out = Vec::new();
-        let mut push = |name: String, span: swc_common::Span, method_guards: Vec<String>| {
+        let mut push = |name: String,
+                        span: swc_common::Span,
+                        method_guards: Vec<String>,
+                        declared_methods: Vec<String>| {
             out.push(ExportedHandler {
                 name,
                 line_number: sm.lookup_char_pos(span.lo).line,
                 span_start: span.lo.0,
                 span_end: span.hi.0,
                 method_guards,
+                declared_methods,
             });
         };
         let guards_of = |binding: &str| -> Vec<String> {
             guards_by_binding.get(binding).cloned().unwrap_or_default()
+        };
+        let declared_of = |binding: &str| -> Vec<String> {
+            declared_by_binding
+                .get(binding)
+                .cloned()
+                .unwrap_or_default()
         };
 
         for item in &module.body {
@@ -638,18 +695,23 @@ impl SwcScanner {
                     Decl::Fn(f) => {
                         let name = f.ident.sym.to_string();
                         let guards = guards_of(&name);
-                        push(name, export.span(), guards);
+                        let declared = declared_of(&name);
+                        push(name, export.span(), guards, declared);
                     }
                     Decl::Class(c) => {
                         let name = c.ident.sym.to_string();
-                        push(name, export.span(), Vec::new());
+                        push(name, export.span(), Vec::new(), Vec::new());
                     }
                     Decl::Var(var) => {
                         for d in &var.decls {
-                            if let Pat::Ident(ident) = &d.name {
-                                let name = ident.id.sym.to_string();
+                            // `export const { action } = builder(...)` exports
+                            // the destructured binding as surely as a named one
+                            // does, and until carrick#665 it yielded no handler
+                            // at all.
+                            for name in destructured_binding_names(&d.name) {
                                 let guards = guards_of(&name);
-                                push(name, export.span(), guards);
+                                let declared = declared_of(&name);
+                                push(name, export.span(), guards, declared);
                             }
                         }
                     }
@@ -666,22 +728,27 @@ impl SwcScanner {
                             };
                             // The guard lives on the *local* binding the
                             // specifier renames, not on the exported alias.
-                            let guards = match &n.orig {
-                                ModuleExportName::Ident(id) => guards_of(id.sym.as_ref()),
-                                ModuleExportName::Str(s) => guards_of(s.value.as_ref()),
+                            let (guards, declared) = match &n.orig {
+                                ModuleExportName::Ident(id) => {
+                                    (guards_of(id.sym.as_ref()), declared_of(id.sym.as_ref()))
+                                }
+                                ModuleExportName::Str(s) => {
+                                    (guards_of(s.value.as_ref()), declared_of(s.value.as_ref()))
+                                }
                             };
-                            push(name, n.span(), guards);
+                            push(name, n.span(), guards, declared);
                         }
                     }
                 }
                 // `export default function () {}` / `export default expr`
                 ModuleDecl::ExportDefaultDecl(d) => {
                     let guards = collect_method_guards(&d.decl);
-                    push("default".to_string(), d.span(), guards);
+                    push("default".to_string(), d.span(), guards, Vec::new());
                 }
                 ModuleDecl::ExportDefaultExpr(e) => {
                     let guards = collect_method_guards(&*e.expr);
-                    push("default".to_string(), e.span(), guards);
+                    let declared = call_declared_methods(&e.expr);
+                    push("default".to_string(), e.span(), guards, declared);
                 }
                 _ => {}
             }
@@ -835,6 +902,150 @@ impl SwcScanner {
 /// is that a handler which merely *branches* on the method reads as guarded on
 /// the methods it branches on — which is still nearer the truth than the
 /// convention's single default verb.
+/// Every binding a declarator pattern introduces at its top level: the name
+/// itself, or the names a destructuring pattern picks out of the initialiser.
+///
+/// Nested patterns and rest elements are not descended into. A route module
+/// names the handler it exports at the top level of the pattern, and a binding
+/// reached any deeper is not the thing the builder returned.
+fn destructured_binding_names(pat: &Pat) -> Vec<String> {
+    match pat {
+        Pat::Ident(ident) => vec![ident.id.sym.to_string()],
+        Pat::Object(object) => object
+            .props
+            .iter()
+            .filter_map(|prop| match prop {
+                ObjectPatProp::Assign(assign) => Some(assign.key.sym.to_string()),
+                ObjectPatProp::KeyValue(kv) => match &*kv.value {
+                    Pat::Ident(ident) => Some(ident.id.sym.to_string()),
+                    _ => None,
+                },
+                ObjectPatProp::Rest(_) => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The HTTP-method literals a call states on an object-literal argument
+/// (carrick#665): `builder({ params, method: "PUT" }, handler)`.
+///
+/// A route builder takes its options as data, and `method` on that data is the
+/// verb the route serves, stated outright. Read structurally, with no builder
+/// or framework named anywhere: any object-literal argument of the call, its
+/// own `method` property, and a value that is a string literal or an array of
+/// them. A value that is anything else — a variable, a conditional — states no
+/// verb, and neither does a `method` nested inside another object.
+///
+/// One `method` per call. Two object arguments that disagree state nothing.
+fn call_declared_methods(init: &Expr) -> Vec<String> {
+    let Expr::Call(call) = init else {
+        return Vec::new();
+    };
+    let mut found: Option<Vec<String>> = None;
+    for arg in &call.args {
+        let Expr::Object(object) = &*arg.expr else {
+            continue;
+        };
+        for prop in &object.props {
+            let PropOrSpread::Prop(prop) = prop else {
+                continue;
+            };
+            let Prop::KeyValue(kv) = &**prop else {
+                continue;
+            };
+            let key = match &kv.key {
+                PropName::Ident(id) => id.sym.to_string(),
+                PropName::Str(s) => s.value.to_string(),
+                _ => continue,
+            };
+            if key != "method" {
+                continue;
+            }
+            let methods = method_literals(&kv.value);
+            if methods.is_empty() {
+                continue;
+            }
+            if found.is_some_and(|existing| existing != methods) {
+                return Vec::new();
+            }
+            found = Some(methods);
+        }
+    }
+    found.unwrap_or_default()
+}
+
+/// The HTTP methods an expression states as literals: one string, or an array
+/// of them (`["PATCH", "DELETE"]`). Anything that is not a method per
+/// [`crate::type_manifest::is_http_method`] makes the whole expression state
+/// nothing, so a half-read list can never narrow a route.
+fn method_literals(expr: &Expr) -> Vec<String> {
+    let one = |expr: &Expr| -> Option<String> {
+        let Expr::Lit(Lit::Str(s)) = expr else {
+            return None;
+        };
+        let value = s.value.to_string();
+        is_http_method(&value).then(|| value.trim().to_uppercase())
+    };
+    match expr {
+        Expr::Array(array) => {
+            let mut methods = Vec::new();
+            for element in &array.elems {
+                let Some(element) = element else {
+                    return Vec::new();
+                };
+                let Some(method) = one(&element.expr) else {
+                    return Vec::new();
+                };
+                if !methods.contains(&method) {
+                    methods.push(method);
+                }
+            }
+            methods
+        }
+        other => one(other).into_iter().collect(),
+    }
+}
+
+/// The binding a member-access initialiser is taken off: `route` in `const
+/// action = route.action`. `None` for anything else, including a call — a
+/// handler the module CALLS to build states its own options, and those are
+/// read where the call is.
+fn member_root_binding(init: &Expr) -> Option<String> {
+    let Expr::Member(member) = init else {
+        return None;
+    };
+    let mut cursor = &*member.obj;
+    loop {
+        match cursor {
+            Expr::Ident(ident) => return Some(ident.sym.to_string()),
+            Expr::Member(inner) => cursor = &inner.obj,
+            Expr::Paren(paren) => cursor = &paren.expr,
+            Expr::TsNonNull(non_null) => cursor = &non_null.expr,
+            _ => return None,
+        }
+    }
+}
+
+/// The declared route methods a top-level declarator states, per binding it
+/// introduces. Every binding of one declarator shares its initialiser, so a
+/// pattern that picks out more than one thing cannot say which of them the
+/// verb belongs to and states nothing for any of them.
+fn declared_route_methods(pat: &Pat, init: &Expr) -> Vec<(String, Vec<String>)> {
+    let methods = call_declared_methods(init);
+    if methods.is_empty() {
+        return Vec::new();
+    }
+    let bindings = destructured_binding_names(pat);
+    if bindings.len() != 1 {
+        return Vec::new();
+    }
+    bindings
+        .into_iter()
+        .map(|binding| (binding, methods.clone()))
+        .collect()
+}
+
 fn collect_method_guards<N>(node: &N) -> Vec<String>
 where
     N: VisitWith<MethodGuardVisitor> + ?Sized,
@@ -3028,6 +3239,110 @@ export function ping(myTransport: { fire(u: string): void }) {
             .find(|h| h.name == export)
             .unwrap_or_else(|| panic!("export {export} not found"))
             .method_guards
+    }
+
+    fn declared_methods(content: &str, export: &str) -> Vec<String> {
+        let scanner = SwcScanner::new();
+        scanner
+            .exported_handlers(&PathBuf::from("route.ts"), content)
+            .into_iter()
+            .find(|h| h.name == export)
+            .unwrap_or_else(|| panic!("export {export} not found"))
+            .declared_methods
+    }
+
+    // --- Declared route methods (carrick#665) ---
+
+    #[test]
+    fn a_declared_method_is_read_off_the_builders_options() {
+        let content = r#"
+const { action } = createWriteRoute({ params: Params, method: "PUT" }, handler);
+export { action };
+"#;
+        assert_eq!(declared_methods(content, "action"), vec!["PUT"]);
+    }
+
+    #[test]
+    fn a_declared_method_list_is_read_whole() {
+        let content = r#"
+const { action } = createWriteRoute({ method: ["PATCH", "DELETE"] }, handler);
+export { action };
+"#;
+        assert_eq!(declared_methods(content, "action"), vec!["PATCH", "DELETE"]);
+    }
+
+    #[test]
+    fn a_declared_method_survives_an_export_at_its_declaration() {
+        let content = r#"
+export const { action } = createWriteRoute({ method: "DELETE" }, handler);
+"#;
+        assert_eq!(declared_methods(content, "action"), vec!["DELETE"]);
+    }
+
+    #[test]
+    fn a_declared_method_reaches_one_handler_taken_off_the_result() {
+        let content = r#"
+const route = createWriteRoute({ method: "PUT" }, handler);
+export const action = route.action;
+"#;
+        assert_eq!(declared_methods(content, "action"), vec!["PUT"]);
+    }
+
+    #[test]
+    fn a_declared_method_reaches_neither_of_two_handlers_off_one_result() {
+        let content = r#"
+const route = createResourceRoute({ method: "PUT" }, handler);
+export const loader = route.loader;
+export const action = route.action;
+"#;
+        assert!(declared_methods(content, "action").is_empty());
+        assert!(declared_methods(content, "loader").is_empty());
+    }
+
+    #[test]
+    fn a_declared_method_reaches_neither_of_two_destructured_handlers() {
+        let content = r#"
+const { loader, action } = createResourceRoute({ method: "PUT" }, handler);
+export { loader, action };
+"#;
+        assert!(declared_methods(content, "action").is_empty());
+        assert!(declared_methods(content, "loader").is_empty());
+    }
+
+    #[test]
+    fn a_method_that_is_not_a_literal_declares_nothing() {
+        let content = r#"
+const { action } = createWriteRoute({ method: configuredMethod }, handler);
+export { action };
+"#;
+        assert!(declared_methods(content, "action").is_empty());
+    }
+
+    #[test]
+    fn a_method_nested_in_another_option_declares_nothing() {
+        let content = r#"
+const { action } = createWriteRoute({ retry: { method: "DELETE" } }, handler);
+export { action };
+"#;
+        assert!(declared_methods(content, "action").is_empty());
+    }
+
+    #[test]
+    fn two_object_arguments_that_disagree_declare_nothing() {
+        let content = r#"
+const { action } = createWriteRoute({ method: "PUT" }, { method: "PATCH" });
+export { action };
+"#;
+        assert!(declared_methods(content, "action").is_empty());
+    }
+
+    #[test]
+    fn a_half_readable_method_list_declares_nothing() {
+        let content = r#"
+const { action } = createWriteRoute({ method: ["PATCH", verb] }, handler);
+export { action };
+"#;
+        assert!(declared_methods(content, "action").is_empty());
     }
 
     // --- Method guards (carrick#601) ---

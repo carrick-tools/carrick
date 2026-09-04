@@ -125,6 +125,10 @@ mod type_compat_v2;
 /// join could not follow, and the count is stamped on rows in the files a scan
 /// analyses, so a v17 cache holds those rows without the field and an
 /// unchanged service would never acquire it.
+/// Same version covers carrick#665: a file-based route whose builder call
+/// declares its HTTP method as an option is recorded under that verb rather
+/// than the convention's default, so an unchanged route file that a v17 cache
+/// holds as a POST is a PUT, a PATCH or a DELETE.
 const CACHE_VERSION: u32 = 18;
 
 // Type aliases to reduce complexity
