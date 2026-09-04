@@ -108,6 +108,7 @@ jobs:
           --test socket_extraction_test
           --test socket_namespace_test
           --test socket_type_alias_test
+          --test workspace_package_client_test
 
       # Every tests/*.rs must be run by a step above or be listed here with a
       # reason. Nine of twenty were silently local-only before this step.

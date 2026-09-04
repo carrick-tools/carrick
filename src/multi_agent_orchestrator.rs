@@ -85,6 +85,8 @@ impl MultiAgentOrchestrator {
         // carrick.json declares one, else the repo root (see
         // `engine::service_scan_root`).
         service_root: &str,
+        // The repository root, for the workspace package map (carrick#666).
+        repo_root: &std::path::Path,
         graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
         graphql_consumer_hints: &crate::graphql::GraphqlConsumerHints,
         normalizer: &UrlNormalizer,
@@ -130,6 +132,7 @@ impl MultiAgentOrchestrator {
                 &framework_guidance,
                 &framework_detection,
                 std::path::Path::new(service_root),
+                repo_root,
                 &packages.declared_dependency_names(),
                 graphql_producer_hints,
                 graphql_consumer_hints,

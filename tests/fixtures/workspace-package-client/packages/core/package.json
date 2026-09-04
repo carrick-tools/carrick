@@ -1,0 +1,24 @@
+{
+  "name": "@fixture/core",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "import": {
+        "@fixture/source": "./src/index.ts",
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    },
+    "./v2": {
+      "import": {
+        "@fixture/source": "./src/v2/index.ts",
+        "types": "./dist/v2/index.d.ts",
+        "default": "./dist/v2/index.js"
+      }
+    }
+  }
+}

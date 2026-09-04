@@ -1,0 +1,10 @@
+{
+  "name": "@fixture/sdk",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/widgets.ts",
+  "dependencies": {
+    "@fixture/core": "workspace:*",
+    "@fixture/other": "workspace:*"
+  }
+}

@@ -13,10 +13,14 @@
 //! one service's `package.json` therefore answers "external?" with "no" for
 //! most real wrappers.
 //!
-//! This is not a Node resolver. `exports` maps, conditions, `browser` fields,
-//! `paths` from tsconfig, and `node_modules` lookups are all out of scope: the
-//! scan needs to know which SOURCE file in this repo a specifier names, and the
-//! candidate list below is what the repo's own layout proves.
+//! This is not a Node resolver. Conditions, `browser` fields, `paths` from
+//! tsconfig, and `node_modules` lookups are all out of scope: the scan needs to
+//! know which SOURCE file in this repo a specifier names, and the candidate
+//! list below is what the repo's own layout proves. A workspace member's
+//! `exports` map is read, because for a package that publishes subpaths it is
+//! the only statement anywhere of which file `@scope/core/v3` names — but it is
+//! read as a set of spellings of one module, not as a condition algorithm
+//! ([`WorkspaceIndex::resolve_exports`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -56,8 +60,16 @@ struct InternalPackage {
     /// Repo-relative directory holding the `package.json`.
     dir: PathBuf,
     /// The manifest's `main`, when it has one. Used only for a bare import of
-    /// the package with no subpath.
+    /// the package with no subpath, and only when `exports` states nothing for
+    /// it.
     main: Option<String>,
+    /// The manifest's `exports` field, verbatim. This is the only thing in a
+    /// manifest that says which FILE a subpath specifier names, and a workspace
+    /// package that publishes subpaths (`@scope/core/v3`) states them nowhere
+    /// else: the subpath is a name the manifest maps, not a directory under the
+    /// package root. See [`WorkspaceIndex::resolve_exports`] for what is read
+    /// off it.
+    exports: Option<serde_json::Value>,
 }
 
 /// The repo's manifests, reduced to what specifier resolution needs.
@@ -114,6 +126,7 @@ impl WorkspaceIndex {
                 .get("main")
                 .and_then(|m| m.as_str())
                 .map(str::to_string);
+            let exports = json.get("exports").cloned();
             // Two directories can declare the same package name — a vendored
             // copy, a fork kept alongside the original. Keeping the
             // lexicographically smallest directory makes the choice a property
@@ -122,7 +135,8 @@ impl WorkspaceIndex {
             match internal_packages.get(name) {
                 Some(existing) if existing.dir <= dir => {}
                 _ => {
-                    internal_packages.insert(name.to_string(), InternalPackage { dir, main });
+                    internal_packages
+                        .insert(name.to_string(), InternalPackage { dir, main, exports });
                 }
             }
         }
@@ -138,6 +152,13 @@ impl WorkspaceIndex {
             external_packages: declared,
             internal_packages,
         }
+    }
+
+    /// Whether the repo declares any workspace member at all. No members means
+    /// no specifier can name one, so the caller can skip the package-surface
+    /// walk entirely.
+    pub fn has_internal_packages(&self) -> bool {
+        !self.internal_packages.is_empty()
     }
 
     /// Whether any external package is declared at all. An empty universe means
@@ -167,11 +188,18 @@ impl WorkspaceIndex {
         if let Some(name) = longest_match(specifier, self.internal_packages.keys()) {
             let package = &self.internal_packages[&name];
             let subpath = specifier[name.len()..].trim_start_matches('/');
-            let resolved = if subpath.is_empty() {
-                self.resolve_package_entry(package)
+            let key = if subpath.is_empty() {
+                ".".to_string()
             } else {
-                self.resolve_file(&normalize(&package.dir.join(subpath)))
+                format!("./{}", subpath)
             };
+            let resolved = self.resolve_exports(package, &key).or_else(|| {
+                if subpath.is_empty() {
+                    self.resolve_package_entry(package)
+                } else {
+                    self.resolve_file(&normalize(&package.dir.join(subpath)))
+                }
+            });
             return match resolved {
                 Some(file) => Resolution::Internal(file),
                 None => Resolution::Unresolved,
@@ -186,6 +214,74 @@ impl WorkspaceIndex {
             }
             None => Resolution::Unresolved,
         }
+    }
+
+    /// The source file a manifest's `exports` field names for one specifier
+    /// key (`"."` for the package itself, `"./v3"` for a subpath).
+    ///
+    /// This is not a Node conditional-exports implementation and does not try
+    /// to be one. Conditions (`import`/`require`/`types`/vendor-specific ones)
+    /// select between spellings of the SAME module, and the question here is
+    /// only which file in this repo that module is. So every string leaf under
+    /// the matched key is a candidate, sorted so the answer is a property of
+    /// the manifest rather than of map iteration order, and the first that
+    /// names an existing file wins — with two orderings laid over it:
+    ///
+    /// - Declaration files are dropped outright. A `types` condition points at
+    ///   a `.d.ts`, which states the module's shape and none of its behaviour;
+    ///   reading requests off one would find nothing and shadow the source that
+    ///   has them.
+    /// - A TypeScript hit is preferred over any other. `main` and the default
+    ///   conditions point at build output, which in a repo that commits its
+    ///   `dist` exists alongside the source and would otherwise win on sort
+    ///   order; the source is what the scan reads.
+    ///
+    /// Wildcard keys (`"./*"`) are not expanded: the specifier that matched
+    /// them names a file the pattern computes, and the fallback path below
+    /// (the subpath as a directory under the package root) already covers the
+    /// layouts where that file is where the specifier says it is.
+    fn resolve_exports(&self, package: &InternalPackage, key: &str) -> Option<PathBuf> {
+        let exports = package.exports.as_ref()?;
+        let entry = match exports {
+            // `"exports": "./index.js"` — the whole field is the "." entry.
+            serde_json::Value::String(_) if key == "." => exports,
+            serde_json::Value::Object(map) => {
+                if map.keys().any(|k| k.starts_with('.')) {
+                    map.get(key)?
+                } else if key == "." {
+                    // A conditions object with no subpath keys IS the "."
+                    // entry (`"exports": { "import": "./index.js" }`).
+                    exports
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+
+        let mut leaves: Vec<&str> = Vec::new();
+        collect_string_leaves(entry, 0, &mut leaves);
+        leaves.sort_unstable();
+        leaves.dedup();
+
+        let mut fallback: Option<PathBuf> = None;
+        for leaf in leaves {
+            if is_declaration_file(leaf) {
+                continue;
+            }
+            let Some(file) = self.resolve_file(&normalize(&package.dir.join(leaf))) else {
+                continue;
+            };
+            if file
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e == "ts" || e == "tsx")
+            {
+                return Some(file);
+            }
+            fallback.get_or_insert(file);
+        }
+        fallback
     }
 
     /// A bare import of a workspace member: its declared `main` if it has one,
@@ -248,6 +344,37 @@ impl WorkspaceIndex {
     fn exists(&self, relative: &Path) -> bool {
         self.repo_root.join(relative).is_file()
     }
+}
+
+/// Every string leaf under an `exports` entry, in document order. Conditions
+/// nest (`{ import: { types: "…", default: "…" } }`), so the walk is recursive,
+/// bounded by a depth no real manifest reaches.
+fn collect_string_leaves<'a>(value: &'a serde_json::Value, depth: usize, out: &mut Vec<&'a str>) {
+    const MAX_CONDITION_DEPTH: usize = 8;
+    if depth > MAX_CONDITION_DEPTH {
+        return;
+    }
+    match value {
+        serde_json::Value::String(s) => out.push(s.as_str()),
+        serde_json::Value::Object(map) => {
+            for nested in map.values() {
+                collect_string_leaves(nested, depth + 1, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for nested in items {
+                collect_string_leaves(nested, depth + 1, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A TypeScript declaration file: shape without behaviour.
+fn is_declaration_file(path: &str) -> bool {
+    [".d.ts", ".d.mts", ".d.cts"]
+        .iter()
+        .any(|suffix| path.ends_with(suffix))
 }
 
 /// Every `package.json` under `repo_root`, sorted, skipping dependency installs
@@ -318,6 +445,51 @@ mod tests {
 
     fn resolve(from: &str, specifier: &str) -> Resolution {
         index().resolve(Path::new(from), specifier)
+    }
+
+    fn workspace_package_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-package-client")
+    }
+
+    fn resolve_in_workspace_package_fixture(specifier: &str) -> Resolution {
+        WorkspaceIndex::build(&workspace_package_root())
+            .resolve(Path::new("packages/sdk/src/widgets.ts"), specifier)
+    }
+
+    #[test]
+    fn a_subpath_exports_key_names_the_source_it_maps_to() {
+        // `@fixture/core` publishes `./v2` only through its `exports` map;
+        // there is no `packages/core/v2` directory for the fallback to find.
+        assert_eq!(
+            resolve_in_workspace_package_fixture("@fixture/core/v2"),
+            Resolution::Internal(PathBuf::from("packages/core/src/v2/index.ts"))
+        );
+    }
+
+    #[test]
+    fn the_typescript_source_beats_the_committed_build_output() {
+        // The same key also names `./dist/index.d.ts` (a declaration file) and
+        // `./dist/index.js` (build output), both of which exist on disk.
+        assert_eq!(
+            resolve_in_workspace_package_fixture("@fixture/core"),
+            Resolution::Internal(PathBuf::from("packages/core/src/index.ts"))
+        );
+    }
+
+    #[test]
+    fn a_package_with_no_exports_map_still_resolves_through_main() {
+        assert_eq!(
+            resolve_in_workspace_package_fixture("@fixture/other"),
+            Resolution::Internal(PathBuf::from("packages/other/src/index.ts"))
+        );
+    }
+
+    #[test]
+    fn an_exports_key_the_manifest_does_not_publish_resolves_to_nothing() {
+        assert_eq!(
+            resolve_in_workspace_package_fixture("@fixture/core/v9"),
+            Resolution::Unresolved
+        );
     }
 
     #[test]

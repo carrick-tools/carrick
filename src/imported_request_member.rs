@@ -106,8 +106,16 @@
 //! the call's receiver is itself an imported binding, it must be imported from
 //! the very module the member came from. A receiver that is a parameter or a
 //! local — the common shape, and the one this pass exists for — carries no
-//! such constraint, and a receiver imported from a package matches no module
-//! and so joins to nothing.
+//! such constraint.
+//!
+//! The rings stop at the repo's relative import graph. A client another
+//! WORKSPACE PACKAGE publishes is imported by package name, which names no
+//! module here, so the rings reach nothing for it. That half is
+//! `FileOrchestrator::resolve_package_surface_members`,
+//! which reads the same member index off the package's published surface and
+//! constrains it with the receiver's own origin
+//! ([`crate::receiver_origin`]) rather than with an import of the member's
+//! module.
 
 use std::collections::{HashMap, HashSet};
 

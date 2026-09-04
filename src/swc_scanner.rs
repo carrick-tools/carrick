@@ -90,6 +90,19 @@ pub struct CandidateTarget {
     /// wrapper is built out of. Not serialized, for the same reason.
     #[serde(skip)]
     pub request_shape: RequestShapeSignal,
+    /// The IMMEDIATE receiver of this call, when it is a bare identifier: `c`
+    /// in `c.retrieveThing(id)`, and the callee itself in `retrieveThing(id)`.
+    /// `None` when the receiver is any other expression — a `this` chain, or
+    /// the result of an earlier call (`client.cancelRun(id).catch(fn)`, whose
+    /// receiver is a promise and not the client).
+    ///
+    /// `callee_object` cannot answer this: it reports the chain's ROOT, so it
+    /// names the client for both of those and would let a join keyed on the
+    /// receiver read `.catch` as a method of the client. Not serialized, for
+    /// the same reason as `request_spec`. Read by the package-surface member
+    /// join (carrick#666).
+    #[serde(skip)]
+    pub receiver_ident: Option<String>,
 }
 
 /// The HTTP method and URL a call declares as data on one object-literal
@@ -1235,7 +1248,10 @@ impl Visit for MethodGuardVisitor {
 /// the scanner's own map. Returns `None` when the file does not parse; every
 /// deterministic pass built on this treats a parse failure as "no facts here",
 /// which is what the scanner's candidate pass does too.
-fn parse_standalone_module(file_path: &Path, content: &str) -> Option<(Lrc<SourceMap>, Module)> {
+pub(crate) fn parse_standalone_module(
+    file_path: &Path,
+    content: &str,
+) -> Option<(Lrc<SourceMap>, Module)> {
     use swc_common::FileName;
     use swc_ecma_parser::{Parser, StringInput, Syntax, lexer::Lexer};
 
@@ -2061,6 +2077,7 @@ impl CandidateVisitor {
         // another file imports this module as its HTTP wrapper
         // (carrick-cloud#386).
         let request_shape = call_request_shape(call, callee_property.as_deref());
+        let receiver_ident = Self::receiver_ident(&call.callee);
 
         self.candidates.push(CandidateTarget {
             protocol: Protocol::Http,
@@ -2076,6 +2093,7 @@ impl CandidateVisitor {
             request_spec,
             new_url_path,
             request_shape,
+            receiver_ident,
         });
     }
 
@@ -2113,6 +2131,7 @@ impl CandidateVisitor {
             // Not a call expression, so there are no request arguments to read.
             new_url_path: None,
             request_shape: RequestShapeSignal::NotARequest,
+            receiver_ident: None,
         });
     }
 
@@ -2426,6 +2445,31 @@ impl CandidateVisitor {
         parts.push("this".to_string());
         parts.reverse();
         Some(parts.join("."))
+    }
+
+    /// The immediate receiver of a call, when it is a bare identifier. See
+    /// [`CandidateTarget::receiver_ident`] for why this is not
+    /// `extract_callee_object`.
+    fn receiver_ident(callee: &Callee) -> Option<String> {
+        let Callee::Expr(expr) = callee else {
+            return None;
+        };
+        fn unwrap(expr: &Expr) -> &Expr {
+            match expr {
+                Expr::Paren(paren) => unwrap(&paren.expr),
+                Expr::TsNonNull(non_null) => unwrap(&non_null.expr),
+                Expr::TsAs(as_expr) => unwrap(&as_expr.expr),
+                other => other,
+            }
+        }
+        match unwrap(expr) {
+            Expr::Ident(ident) => Some(ident.sym.to_string()),
+            Expr::Member(member) => match unwrap(&member.obj) {
+                Expr::Ident(ident) => Some(ident.sym.to_string()),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn extract_callee_object(expr: &Expr) -> Option<String> {
@@ -4681,6 +4725,7 @@ async function fetchUser(id: string) {
             request_spec: None,
             new_url_path: None,
             request_shape: RequestShapeSignal::NotARequest,
+            receiver_ident: Some("app".to_string()),
         };
 
         let hint = candidate.format_hint();

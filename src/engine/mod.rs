@@ -129,6 +129,11 @@ mod type_compat_v2;
 /// declares its HTTP method as an option is recorded under that verb rather
 /// than the convention's default, so an unchanged route file that a v17 cache
 /// holds as a POST is a PUT, a PATCH or a DELETE.
+/// Same version covers carrick#666: a call site that reaches a client method
+/// published by ANOTHER workspace package, imported by package name, now
+/// resolves and emits its consumer row, where a v17 cache holds no row at all
+/// for an unchanged consumer file in a monorepo whose client lives in a
+/// sibling package.
 const CACHE_VERSION: u32 = 18;
 
 // Type aliases to reduce complexity
@@ -1291,6 +1296,7 @@ async fn analyze_current_repo_incremental(
                         &guidance,
                         &detection,
                         &service_root,
+                        Path::new(repo_path),
                         &packages.declared_dependency_names(),
                         &graphql_producer_hints,
                         &graphql_consumer_hints,
@@ -3816,6 +3822,7 @@ async fn analyze_current_repo(
             packages,
             &all_imported_symbols,
             &service_root.to_string_lossy(),
+            Path::new(repo_path),
             &graphql_producer_hints,
             &graphql_consumer_hints,
             &normalizer,
