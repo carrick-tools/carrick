@@ -31,10 +31,13 @@
 //! - a binding — class field, private field, constructor parameter property,
 //!   `const`, or parameter — whose declared type is the `Socket` type imported
 //!   from `socket.io-client` (client) or the `Socket`/`Namespace` type
-//!   imported from `socket.io` (server side), or a type alias declared in the
-//!   same file for one of those (`type SupervisorSocket = Socket<…>`, which a
-//!   file that holds several sockets usually declares once and then uses on
-//!   every field — carrick#670), and
+//!   imported from `socket.io` (server side), or a type alias for one of those
+//!   (`type SupervisorSocket = Socket<…>`, which a file holding several
+//!   sockets declares once and then uses on every field). The alias may be
+//!   declared in the file or imported from a relative sibling, which is
+//!   followed ONE hop through the binding resolver, re-export chains included;
+//!   the declaring module is then read with these same module-local rules, so
+//!   an alias of an imported alias stops there (carrick#670), and
 //! - `this.<field> = <expr>` where the right-hand side is already a socket
 //!   root (a factory call, `new Server(...)`, or another root binding).
 //!
@@ -52,13 +55,17 @@
 //!   rules above — method-return flow is not traced,
 //! - a socket taken out of a container (`this.sockets.get(id).emit(…)`) is not
 //!   a root: the container's value type is never consulted (carrick#670),
-//! - a socket reached as a member off an IMPORTED binding
-//!   (`gateway.workerNamespace.emit(…)`) is not a root: rooting is file-local,
-//!   so the import hop is not followed (carrick#670),
+//! - a socket reached as a member off an IMPORTED VALUE
+//!   (`gateway.workerNamespace.emit(…)`) is not a root: only the alias hop
+//!   above crosses a module boundary, and it carries a type, not a value
+//!   (carrick#670),
+//! - a type alias imported by a PACKAGE specifier is not followed: reaching it
+//!   needs the sidecar's module resolution, as it does everywhere else,
 //! - socket identity is tracked by binding name (`this.<field>` for fields),
 //!   not full scope analysis, and is flat per file: two classes in one file
 //!   with same-named socket fields share a root.
 
+use crate::import_bindings::BindingResolver;
 use crate::operation::{OperationKey, SocketDirection};
 use crate::parser::parse_file;
 use std::collections::{HashMap, HashSet};
@@ -67,9 +74,9 @@ use swc_common::errors::{ColorConfig, Handler};
 use swc_common::{GLOBALS, Globals, SourceMap, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::{
     AssignExpr, AssignTarget, Callee, ClassProp, Expr, ExprOrSpread, ImportDecl, ImportSpecifier,
-    Lit, MemberExpr, MemberProp, ModuleExportName, NewExpr, OptChainBase, OptChainExpr, Pat,
-    PrivateProp, PropName, SimpleAssignTarget, TsEntityName, TsParamProp, TsParamPropParam, TsType,
-    TsTypeAliasDecl, TsTypeAnn, TsUnionOrIntersectionType, VarDeclarator,
+    Lit, MemberExpr, MemberProp, Module, ModuleExportName, NewExpr, OptChainBase, OptChainExpr,
+    Pat, PrivateProp, PropName, SimpleAssignTarget, TsEntityName, TsParamProp, TsParamPropParam,
+    TsType, TsTypeAliasDecl, TsTypeAnn, TsUnionOrIntersectionType, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::debug;
@@ -138,6 +145,10 @@ const RESERVED_EVENTS: &[&str] = &[
 /// Extract Socket.IO operations from the service's TS/JS files.
 pub fn scan_files(service_files: &[PathBuf]) -> SocketExtraction {
     let mut extraction = SocketExtraction::default();
+    // One resolver for the whole service: it caches each module's export
+    // table, and a module that declares a shared socket type is read by every
+    // file that imports it (carrick#670).
+    let mut resolver = AliasResolver::default();
     for file in service_files {
         let is_script = file
             .extension()
@@ -146,7 +157,7 @@ pub fn scan_files(service_files: &[PathBuf]) -> SocketExtraction {
         if !is_script {
             continue;
         }
-        extraction.merge(extract_from_ts_file(file));
+        extraction.merge(extract_from_ts_file(file, &mut resolver));
     }
     debug!(
         listeners = extraction.listeners.len(),
@@ -156,7 +167,7 @@ pub fn scan_files(service_files: &[PathBuf]) -> SocketExtraction {
     extraction
 }
 
-fn extract_from_ts_file(file_path: &Path) -> SocketExtraction {
+fn extract_from_ts_file(file_path: &Path, resolver: &mut AliasResolver) -> SocketExtraction {
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
 
@@ -166,17 +177,15 @@ fn extract_from_ts_file(file_path: &Path) -> SocketExtraction {
             return SocketExtraction::default();
         };
 
-        // Pass A: collect socket-rooted binding names. Run to fixpoint (a
-        // connection-handler socket needs the server root known first);
-        // two iterations cover every realistic nesting.
+        // Pass A: collect socket-rooted binding names, to fixpoint.
         let mut roots = SocketRoots::default();
-        loop {
-            let before = roots.size();
-            let mut collector = RootCollector { roots: &mut roots };
-            module.visit_with(&mut collector);
-            if roots.size() == before {
-                break;
-            }
+        collect_roots(&module, &mut roots);
+
+        // Pass A2 (carrick#670): a field whose declared type is a socket alias
+        // IMPORTED from a sibling module — the module-local rules cannot see
+        // the declaration, so follow the import one hop and re-collect.
+        if resolve_imported_aliases(&module, file_path, &mut roots, resolver) {
+            collect_roots(&module, &mut roots);
         }
 
         if roots.size() == 0 {
@@ -193,6 +202,176 @@ fn extract_from_ts_file(file_path: &Path) -> SocketExtraction {
         module.visit_with(&mut ops);
         ops.extraction
     })
+}
+
+/// Cross-module resolution of a socket type alias, with the two caches that
+/// keep it cheap: the binding resolver's export tables, and one verdict per
+/// (declaring module, exported name) — a shared socket type is imported by
+/// many files and must be read once (carrick#670).
+#[derive(Default)]
+struct AliasResolver {
+    bindings: BindingResolver,
+    verdicts: HashMap<(PathBuf, String), Option<SocketKind>>,
+}
+
+impl AliasResolver {
+    /// What the type `exported_name` of `specifier`, as imported by
+    /// `importer`, resolves to — `None` when it is not a socket type, when the
+    /// specifier is not relative, or when the declaration cannot be reached.
+    ///
+    /// ONE import hop. Re-export hops on the way to the declaring module are
+    /// followed by the binding resolver, but if the declaring module's alias is
+    /// ITSELF an imported alias it stops there: the declaring module is read
+    /// with the module-local rules only.
+    fn kind_of_imported_type(
+        &mut self,
+        importer: &Path,
+        specifier: &str,
+        exported_name: &str,
+    ) -> Option<SocketKind> {
+        if !specifier.starts_with('.') {
+            return None;
+        }
+        let declaring = self
+            .bindings
+            .resolve_type(importer, specifier, exported_name)?;
+        let key = (declaring.clone(), exported_name.to_string());
+        if let Some(verdict) = self.verdicts.get(&key) {
+            return *verdict;
+        }
+        let verdict = declaring_module_kind(&declaring, exported_name);
+        self.verdicts.insert(key, verdict);
+        verdict
+    }
+}
+
+/// Read the module that declares the alias with the module-local rules and ask
+/// what its own collector made of the name.
+fn declaring_module_kind(file: &Path, exported_name: &str) -> Option<SocketKind> {
+    let cm: Lrc<SourceMap> = Default::default();
+    let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
+    let globals = Globals::new();
+    GLOBALS.set(&globals, || {
+        let module = parse_file(file, &cm, &handler)?;
+        let mut roots = SocketRoots::default();
+        collect_roots(&module, &mut roots);
+        if roots.client_socket_types.contains(exported_name) {
+            Some(SocketKind::Client)
+        } else if roots.server_socket_types.contains(exported_name) {
+            Some(SocketKind::Server)
+        } else {
+            None
+        }
+    })
+}
+
+/// Run the root collector to fixpoint: a connection-handler socket needs the
+/// server root known first, and an alias may be declared after its use.
+fn collect_roots(module: &Module, roots: &mut SocketRoots) {
+    loop {
+        let before = roots.size();
+        let mut collector = RootCollector { roots };
+        module.visit_with(&mut collector);
+        if roots.size() == before {
+            break;
+        }
+    }
+}
+
+/// Admit any imported socket type alias this file needs, and report whether
+/// anything was admitted.
+///
+/// Gated on the file actually writing a socket-shaped call whose receiver is
+/// still unrooted, and then on that receiver having a declared type name: a
+/// file with nothing to gain resolves nothing, so the cost lands only where
+/// the answer can change.
+fn resolve_imported_aliases(
+    module: &Module,
+    file_path: &Path,
+    roots: &mut SocketRoots,
+    resolver: &mut AliasResolver,
+) -> bool {
+    let mut wanted = UnrootedCallRoots {
+        roots,
+        keys: HashSet::new(),
+    };
+    module.visit_with(&mut wanted);
+    let keys = wanted.keys;
+    if keys.is_empty() {
+        return false;
+    }
+
+    let mut admitted = false;
+    for key in keys {
+        let Some(type_name) = roots.declared_type_names.get(&key).cloned() else {
+            continue;
+        };
+        if roots.client_socket_types.contains(&type_name)
+            || roots.server_socket_types.contains(&type_name)
+        {
+            continue;
+        }
+        let Some((specifier, exported)) = roots.imported_types.get(&type_name).cloned() else {
+            continue;
+        };
+        let Some(kind) = resolver.kind_of_imported_type(file_path, &specifier, &exported) else {
+            continue;
+        };
+        match kind {
+            SocketKind::Client => roots.client_socket_types.insert(type_name),
+            SocketKind::Server => roots.server_socket_types.insert(type_name),
+        };
+        admitted = true;
+    }
+    admitted
+}
+
+/// Receivers of a socket-shaped call (`.on`/`.once`/`.emit` with a literal
+/// event) that no rule has rooted yet.
+struct UnrootedCallRoots<'a> {
+    roots: &'a SocketRoots,
+    keys: HashSet<String>,
+}
+
+impl UnrootedCallRoots<'_> {
+    fn note(&mut self, member: &MemberExpr, args: &[ExprOrSpread]) {
+        if let Some(prop) = member.prop.as_ident()
+            && matches!(prop.sym.as_ref(), "on" | "once" | "emit")
+            && args
+                .first()
+                .is_some_and(|arg| matches!(&*arg.expr, Expr::Lit(Lit::Str(_))))
+            && let Some(root) = chain_root(&member.obj)
+            && self.roots.kind_of(&root).is_none()
+        {
+            self.keys.insert(root);
+        }
+    }
+}
+
+impl Visit for UnrootedCallRoots<'_> {
+    fn visit_call_expr(&mut self, node: &swc_ecma_ast::CallExpr) {
+        if let Callee::Expr(callee) = &node.callee
+            && let Expr::Member(member) = &**callee
+        {
+            self.note(member, &node.args);
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_opt_chain_expr(&mut self, node: &OptChainExpr) {
+        if let OptChainBase::Call(call) = &*node.base {
+            match &*call.callee {
+                Expr::Member(member) => self.note(member, &call.args),
+                Expr::OptChain(inner) => {
+                    if let OptChainBase::Member(member) = &*inner.base {
+                        self.note(member, &call.args);
+                    }
+                }
+                _ => {}
+            }
+        }
+        node.visit_children_with(self);
+    }
 }
 
 /// Which side of the wire a socket-rooted binding sits on.
@@ -212,6 +391,14 @@ struct SocketRoots {
     /// A binding declared with it holds a client socket however it was
     /// initialized (carrick#659).
     client_socket_types: HashSet<String>,
+    /// Local type name → (module specifier, name inside that module) for every
+    /// named type-position import from a relative specifier. Feeds the
+    /// imported-alias hop (carrick#670).
+    imported_types: HashMap<String, (String, String)>,
+    /// Binding key (`socket`, `this.socket`) → the simple type name it was
+    /// declared with, when that name is not an admitted socket type. The
+    /// imported-alias hop reads this to know WHICH name to follow.
+    declared_type_names: HashMap<String, String>,
     /// Local names of the `Socket` TYPE imported from `socket.io` — the
     /// per-connection server socket, not the server root.
     server_socket_types: HashSet<String>,
@@ -299,6 +486,35 @@ impl SocketRoots {
         }
     }
 
+    /// The simple type NAME a declared type carries, when it is one named
+    /// reference (`X`, `X<A, B>`, `X | undefined`). The alias hop needs the
+    /// name of a type it could not resolve locally.
+    fn simple_type_name(ty: &TsType) -> Option<String> {
+        match ty {
+            TsType::TsTypeRef(type_ref) => match &type_ref.type_name {
+                TsEntityName::Ident(ident) => Some(ident.sym.to_string()),
+                TsEntityName::TsQualifiedName(_) => None,
+            },
+            TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(union)) => {
+                union
+                    .types
+                    .iter()
+                    .find_map(|member| Self::simple_type_name(member))
+            }
+            TsType::TsParenthesizedType(paren) => Self::simple_type_name(&paren.type_ann),
+            _ => None,
+        }
+    }
+
+    /// Remember what a binding was declared with when the type is not (yet) an
+    /// admitted socket type, so the imported-alias hop knows which name to
+    /// follow for that binding.
+    fn note_declared_type(&mut self, key: &str, type_ann: &TsTypeAnn) {
+        if let Some(name) = Self::simple_type_name(&type_ann.type_ann) {
+            self.declared_type_names.insert(key.to_string(), name);
+        }
+    }
+
     /// Socket kind of an expression that is being bound to a name: a client
     /// factory call, a `new Server(...)`, or a reference to a binding already
     /// known to be a root. Nothing else — a method call that happens to return
@@ -370,6 +586,19 @@ impl Visit for RootCollector<'_> {
                 self.roots
                     .type_imports
                     .insert(named.local.sym.to_string(), source.to_string());
+                // Same binding, keyed for the alias hop: the name the DECLARING
+                // module publishes, which a renaming import changes.
+                let exported = named
+                    .imported
+                    .as_ref()
+                    .map(|name| match name {
+                        ModuleExportName::Ident(ident) => ident.sym.to_string(),
+                        ModuleExportName::Str(s) => s.value.to_string(),
+                    })
+                    .unwrap_or_else(|| named.local.sym.to_string());
+                self.roots
+                    .imported_types
+                    .insert(named.local.sym.to_string(), (source.to_string(), exported));
             }
         }
         if source != "socket.io" && source != "socket.io-client" {
@@ -470,8 +699,13 @@ impl Visit for RootCollector<'_> {
                         .as_deref()
                         .and_then(|value| self.roots.kind_of_init(value))
                 });
-            if let Some(kind) = kind {
-                self.roots.record(key, kind);
+            match kind {
+                Some(kind) => self.roots.record(key, kind),
+                None => {
+                    if let Some(type_ann) = node.type_ann.as_deref() {
+                        self.roots.note_declared_type(&key, type_ann);
+                    }
+                }
             }
         }
         node.visit_children_with(self);
@@ -489,8 +723,13 @@ impl Visit for RootCollector<'_> {
                     .as_deref()
                     .and_then(|value| self.roots.kind_of_init(value))
             });
-        if let Some(kind) = kind {
-            self.roots.record(key, kind);
+        match kind {
+            Some(kind) => self.roots.record(key, kind),
+            None => {
+                if let Some(type_ann) = node.type_ann.as_deref() {
+                    self.roots.note_declared_type(&key, type_ann);
+                }
+            }
         }
         node.visit_children_with(self);
     }
@@ -501,9 +740,12 @@ impl Visit for RootCollector<'_> {
         // reach it or every later `this.socket.on(…)` is invisible.
         if let TsParamPropParam::Ident(ident) = &node.param
             && let Some(type_ann) = ident.type_ann.as_deref()
-            && let Some(kind) = self.roots.kind_of_type_ann(type_ann)
         {
-            self.roots.record(format!("this.{}", ident.id.sym), kind);
+            let key = format!("this.{}", ident.id.sym);
+            match self.roots.kind_of_type_ann(type_ann) {
+                Some(kind) => self.roots.record(key, kind),
+                None => self.roots.note_declared_type(&key, type_ann),
+            }
         }
         node.visit_children_with(self);
     }
@@ -566,8 +808,11 @@ impl Visit for RootCollector<'_> {
             // the same rule as a class field (carrick#659): `(socket: Socket)
             // => …` on the server, `const socket: Socket<…> = connect()` on
             // the client.
-            if let Some(kind) = self.roots.kind_of_type_ann(type_ann) {
-                self.roots.record(ident.id.sym.to_string(), kind);
+            match self.roots.kind_of_type_ann(type_ann) {
+                Some(kind) => self.roots.record(ident.id.sym.to_string(), kind),
+                None => self
+                    .roots
+                    .note_declared_type(ident.id.sym.as_ref(), type_ann),
             }
         }
         node.visit_children_with(self);
@@ -817,7 +1062,33 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("file.ts");
         std::fs::write(&file, source).unwrap();
-        let result = extract_from_ts_file(&file);
+        let result = extract_from_ts_file(&file, &mut AliasResolver::default());
+        std::fs::remove_dir_all(&dir).ok();
+        result
+    }
+
+    /// Write a small module graph and extract from `main.ts`, so a test can
+    /// exercise the one-hop alias import (carrick#670).
+    fn extract_graph(files: &[(&str, &str)]) -> SocketExtraction {
+        let dir = std::env::temp_dir().join(format!(
+            "carrick-socket-graph-{}-{:016x}",
+            std::process::id(),
+            {
+                let mut hash: u64 = 0xcbf29ce484222325;
+                for (name, source) in files {
+                    for byte in name.as_bytes().iter().chain(source.as_bytes()) {
+                        hash ^= u64::from(*byte);
+                        hash = hash.wrapping_mul(0x100000001b3);
+                    }
+                }
+                hash
+            }
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, source) in files {
+            std::fs::write(dir.join(name), source).unwrap();
+        }
+        let result = extract_from_ts_file(&dir.join("main.ts"), &mut AliasResolver::default());
         std::fs::remove_dir_all(&dir).ok();
         result
     }
@@ -1293,6 +1564,143 @@ class Controller {
             "an alias of a foreign type is not a socket, got {:?}",
             keys(&result.emitters)
         );
+    }
+
+    #[test]
+    fn an_imported_socket_type_alias_is_followed_one_hop() {
+        // carrick#670: the module that owns the socket declares the alias and
+        // its siblings import it, so the importing file never names the socket
+        // type at all.
+        let result = extract_graph(&[
+            (
+                "controller.ts",
+                r#"
+import type { Socket } from "socket.io-client";
+export type SupervisorSocket = Socket<ServerToClient, ClientToServer>;
+"#,
+            ),
+            (
+                "main.ts",
+                r#"
+import type { SupervisorSocket } from "./controller.js";
+
+export class RunNotifier {
+  private socket: SupervisorSocket;
+
+  constructor(opts: { supervisorSocket: SupervisorSocket }) {
+    this.socket = opts.supervisorSocket;
+  }
+
+  start() {
+    this.socket.on("run:notify", async ({ run }) => this.handle(run));
+  }
+}
+"#,
+            ),
+        ]);
+        assert_eq!(
+            keys(&result.listeners),
+            vec!["socket|SERVER->CLIENT|run:notify"]
+        );
+    }
+
+    #[test]
+    fn an_imported_alias_is_followed_through_a_re_export() {
+        // The importing file names a barrel, and the barrel republishes the
+        // type from the module that declares it.
+        let result = extract_graph(&[
+            (
+                "socketTypes.ts",
+                r#"
+import type { Socket } from "socket.io";
+export type WorkloadSocket = Socket<ClientToServer, ServerToClient>;
+"#,
+            ),
+            (
+                "index.ts",
+                r#"
+export type { WorkloadSocket } from "./socketTypes.js";
+"#,
+            ),
+            (
+                "main.ts",
+                r#"
+import type { WorkloadSocket } from "./index.js";
+
+class Connection {
+  constructor(private readonly socket: WorkloadSocket) {}
+
+  register() {
+    this.socket.on("run:start", ({ runId }) => this.start(runId));
+    this.socket.emit("run:notify", { version: "1" });
+  }
+}
+"#,
+            ),
+        ]);
+        assert_eq!(
+            keys(&result.listeners),
+            vec!["socket|CLIENT->SERVER|run:start"]
+        );
+        assert_eq!(
+            keys(&result.emitters),
+            vec!["socket|SERVER->CLIENT|run:notify"]
+        );
+    }
+
+    #[test]
+    fn an_imported_alias_of_an_unrelated_type_is_not_followed() {
+        // The hop reads the declaring module with the same rules; an alias of
+        // something that is not a socket resolves to nothing.
+        let result = extract_graph(&[
+            (
+                "controller.ts",
+                r#"
+import type { EventEmitter } from "node:events";
+export type SupervisorSocket = EventEmitter;
+"#,
+            ),
+            (
+                "main.ts",
+                r#"
+import type { SupervisorSocket } from "./controller.js";
+
+class RunNotifier {
+  private socket: SupervisorSocket;
+
+  start() {
+    this.socket.on("run:notify", (msg) => this.handle(msg));
+  }
+}
+"#,
+            ),
+        ]);
+        assert!(
+            result.is_empty(),
+            "an imported alias of a foreign type is not a socket, got {:?}",
+            keys(&result.listeners)
+        );
+    }
+
+    #[test]
+    fn a_package_specifier_alias_is_not_followed() {
+        // Only relative specifiers are followed; a package import would need
+        // the sidecar's module resolution.
+        let result = extract_graph(&[(
+            "main.ts",
+            r#"
+import type { SupervisorSocket } from "@acme/contracts";
+
+class RunNotifier {
+  private socket: SupervisorSocket;
+
+  start() {
+    this.socket.on("run:notify", (msg) => this.handle(msg));
+  }
+}
+"#,
+        )]);
+        assert!(result.is_empty());
     }
 
     #[test]

@@ -26,6 +26,10 @@ class WorkloadConnection {
       console.log("stop", runId);
     });
   }
+
+  notify(runId: string) {
+    this.socket.emit("run:notify", { version: "1", runId });
+  }
 }
 
 export function startWorkloadServer(httpServer: HttpServer) {
