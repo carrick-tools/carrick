@@ -10,27 +10,49 @@
 //! `socket.io` makes server roots, and the first parameter of a
 //! `connection` handler is a per-connection server socket.
 //!
+//! A long-lived socket is usually held on a class field rather than a local
+//! (`private socket?: Socket<…>`; `this.socket = this.#createSocket()`), and
+//! the emits that carry the contract sit in later methods, on `this.socket`
+//! (carrick#659). Those fields are roots too, by two structural rules that do
+//! not depend on how the field is initialized:
+//! - a binding — class field, private field, constructor parameter property,
+//!   `const`, or parameter — whose declared type is the `Socket` type imported
+//!   from `socket.io-client` (client) or `socket.io` (per-connection server
+//!   socket), and
+//! - `this.<field> = <expr>` where the right-hand side is already a socket
+//!   root (a factory call, `new Server(...)`, or another root binding).
+//!
 //! Precision over recall, per the brittleness guardrails:
 //! - only string-literal event names count; dynamic names are skipped,
 //! - reserved lifecycle events (`connect`, `disconnect`, ...) never become
 //!   contract events,
 //! - files using custom namespaces (`io.of(...)`) are skipped entirely —
-//!   default-namespace identity would be ambiguous there,
+//!   default-namespace identity would be ambiguous there. The guard only sees
+//!   an `of` call on a TRACKED root, so a file whose server root is untracked
+//!   (a function return, say) is not skipped, and a socket the declared-type
+//!   rule reaches inside it is recorded under the plain event key,
+//! - a namespaced server whose root is only ever a `Server`/`Namespace`-typed
+//!   binding stays invisible: the type rule admits the `Socket` type alone,
 //! - CommonJS `require("socket.io")` bootstrapping is not traced (coverage
 //!   gap, not a false positive),
-//! - socket identity is tracked by binding name, not full scope analysis;
-//!   bindings are only created from socket.io factories and connection
-//!   handler parameters.
+//! - a field assigned the RETURN VALUE of a method that builds a socket
+//!   (`this.socket = this.#createSocket()`) is a root only via one of the two
+//!   rules above — method-return flow is not traced,
+//! - socket identity is tracked by binding name (`this.<field>` for fields),
+//!   not full scope analysis, and is flat per file: two classes in one file
+//!   with same-named socket fields share a root.
 
 use crate::operation::{OperationKey, SocketDirection};
 use crate::parser::parse_file;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swc_common::errors::{ColorConfig, Handler};
-use swc_common::{GLOBALS, Globals, SourceMap, Spanned, sync::Lrc};
+use swc_common::{GLOBALS, Globals, SourceMap, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::{
-    Callee, Expr, ImportDecl, ImportSpecifier, Lit, ModuleExportName, NewExpr, Pat, TsEntityName,
-    TsType, TsTypeAnn, VarDeclarator,
+    AssignExpr, AssignTarget, Callee, ClassProp, Expr, ExprOrSpread, ImportDecl, ImportSpecifier,
+    Lit, MemberExpr, MemberProp, ModuleExportName, NewExpr, OptChainBase, OptChainExpr, Pat,
+    PrivateProp, PropName, SimpleAssignTarget, TsEntityName, TsParamProp, TsParamPropParam, TsType,
+    TsTypeAnn, TsUnionOrIntersectionType, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::debug;
@@ -165,13 +187,28 @@ fn extract_from_ts_file(file_path: &Path) -> SocketExtraction {
     })
 }
 
+/// Which side of the wire a socket-rooted binding sits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketKind {
+    Client,
+    Server,
+}
+
 #[derive(Default)]
 struct SocketRoots {
     /// Local names of `socket.io-client` factories (`io`, `connect`, ...).
     client_factories: HashSet<String>,
     /// Local names of the `socket.io` `Server` class.
     server_classes: HashSet<String>,
-    /// Bindings holding client sockets (`const s = io(url)`).
+    /// Local names of the `Socket` TYPE imported from `socket.io-client`.
+    /// A binding declared with it holds a client socket however it was
+    /// initialized (carrick#659).
+    client_socket_types: HashSet<String>,
+    /// Local names of the `Socket` TYPE imported from `socket.io` — the
+    /// per-connection server socket, not the server root.
+    server_socket_types: HashSet<String>,
+    /// Bindings holding client sockets (`const s = io(url)`). Class fields are
+    /// keyed `this.<name>` / `this.#<name>`.
     client_sockets: HashSet<String>,
     /// Bindings holding server roots (`const io = new Server(...)`) or
     /// per-connection sockets (`io.on("connection", (socket) => ...)`).
@@ -195,10 +232,96 @@ impl SocketRoots {
     fn size(&self) -> usize {
         self.client_factories.len()
             + self.server_classes.len()
+            + self.client_socket_types.len()
+            + self.server_socket_types.len()
             + self.client_sockets.len()
             + self.server_sockets.len()
             + self.type_imports.len()
             + self.binding_types.len()
+    }
+
+    fn record(&mut self, key: String, kind: SocketKind) {
+        match kind {
+            SocketKind::Client => self.client_sockets.insert(key),
+            SocketKind::Server => self.server_sockets.insert(key),
+        };
+    }
+
+    fn kind_of(&self, key: &str) -> Option<SocketKind> {
+        if self.client_sockets.contains(key) {
+            Some(SocketKind::Client)
+        } else if self.server_sockets.contains(key) {
+            Some(SocketKind::Server)
+        } else {
+            None
+        }
+    }
+
+    /// Socket kind a declared type annotation implies, or `None` when the type
+    /// is not the socket.io `Socket` type. `Socket<ServerToClient,
+    /// ClientToServer>` and `Socket | undefined` both resolve — a generic
+    /// parameterization and an optional field are still that socket.
+    fn kind_of_type_ann(&self, type_ann: &TsTypeAnn) -> Option<SocketKind> {
+        self.kind_of_type(&type_ann.type_ann)
+    }
+
+    fn kind_of_type(&self, ty: &TsType) -> Option<SocketKind> {
+        match ty {
+            TsType::TsTypeRef(type_ref) => match &type_ref.type_name {
+                TsEntityName::Ident(ident) => {
+                    let name = ident.sym.as_ref();
+                    if self.client_socket_types.contains(name) {
+                        Some(SocketKind::Client)
+                    } else if self.server_socket_types.contains(name) {
+                        Some(SocketKind::Server)
+                    } else {
+                        None
+                    }
+                }
+                TsEntityName::TsQualifiedName(_) => None,
+            },
+            TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(union)) => {
+                union
+                    .types
+                    .iter()
+                    .find_map(|member| self.kind_of_type(member))
+            }
+            TsType::TsParenthesizedType(paren) => self.kind_of_type(&paren.type_ann),
+            _ => None,
+        }
+    }
+
+    /// Socket kind of an expression that is being bound to a name: a client
+    /// factory call, a `new Server(...)`, or a reference to a binding already
+    /// known to be a root. Nothing else — a method call that happens to return
+    /// a socket is not traced (see the module docs).
+    fn kind_of_init(&self, expr: &Expr) -> Option<SocketKind> {
+        match expr {
+            Expr::Call(call) => match &call.callee {
+                Callee::Expr(callee) => match &**callee {
+                    Expr::Ident(factory)
+                        if self.client_factories.contains(factory.sym.as_ref()) =>
+                    {
+                        Some(SocketKind::Client)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            Expr::New(NewExpr { callee, .. }) => match &**callee {
+                Expr::Ident(class) if self.server_classes.contains(class.sym.as_ref()) => {
+                    Some(SocketKind::Server)
+                }
+                _ => None,
+            },
+            Expr::Ident(ident) => self.kind_of(ident.sym.as_ref()),
+            Expr::Member(member) => member_root(member).and_then(|root| self.kind_of(&root)),
+            Expr::Paren(paren) => self.kind_of_init(&paren.expr),
+            Expr::Await(awaited) => self.kind_of_init(&awaited.arg),
+            Expr::TsNonNull(non_null) => self.kind_of_init(&non_null.expr),
+            Expr::TsAs(as_expr) => self.kind_of_init(&as_expr.expr),
+            _ => None,
+        }
     }
 
     fn direction_for(&self, root: &str, is_listener: bool) -> Option<SocketDirection> {
@@ -271,6 +394,19 @@ impl Visit for RootCollector<'_> {
                                 .server_classes
                                 .insert(named.local.sym.to_string());
                         }
+                        // The socket TYPE on either side. A binding declared
+                        // with it is a socket root regardless of how it was
+                        // initialized (carrick#659).
+                        ("socket.io-client", "Socket") => {
+                            self.roots
+                                .client_socket_types
+                                .insert(named.local.sym.to_string());
+                        }
+                        ("socket.io", "Socket") => {
+                            self.roots
+                                .server_socket_types
+                                .insert(named.local.sym.to_string());
+                        }
                         _ => {}
                     }
                 }
@@ -280,27 +416,80 @@ impl Visit for RootCollector<'_> {
     }
 
     fn visit_var_declarator(&mut self, node: &VarDeclarator) {
-        if let (Pat::Ident(binding), Some(init)) = (&node.name, node.init.as_deref()) {
-            match init {
-                // const socket = io(url) — client socket
-                Expr::Call(call) => {
-                    if let Callee::Expr(callee) = &call.callee
-                        && let Expr::Ident(factory) = &**callee
-                        && self.roots.client_factories.contains(factory.sym.as_ref())
-                    {
-                        self.roots.client_sockets.insert(binding.id.sym.to_string());
-                    }
-                }
-                // const io = new Server(httpServer) — server root
-                Expr::New(NewExpr { callee, .. }) => {
-                    if let Expr::Ident(class) = &**callee
-                        && self.roots.server_classes.contains(class.sym.as_ref())
-                    {
-                        self.roots.server_sockets.insert(binding.id.sym.to_string());
-                    }
-                }
-                _ => {}
+        // const socket = io(url) — client socket; const io = new Server(...) —
+        // server root.
+        if let Pat::Ident(binding) = &node.name
+            && let Some(init) = node.init.as_deref()
+            && let Some(kind) = self.roots.kind_of_init(init)
+        {
+            self.roots.record(binding.id.sym.to_string(), kind);
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_class_prop(&mut self, node: &ClassProp) {
+        // `private socket?: Socket<…>` / `socket = io(url)` on a class body:
+        // the field is the root every later `this.socket.emit(…)` reads
+        // (carrick#659).
+        if let PropName::Ident(name) = &node.key {
+            let key = format!("this.{}", name.sym);
+            let kind = node
+                .type_ann
+                .as_deref()
+                .and_then(|type_ann| self.roots.kind_of_type_ann(type_ann))
+                .or_else(|| {
+                    node.value
+                        .as_deref()
+                        .and_then(|value| self.roots.kind_of_init(value))
+                });
+            if let Some(kind) = kind {
+                self.roots.record(key, kind);
             }
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_private_prop(&mut self, node: &PrivateProp) {
+        // Same rule for `#socket`, which is a distinct AST node.
+        let key = format!("this.#{}", node.key.name);
+        let kind = node
+            .type_ann
+            .as_deref()
+            .and_then(|type_ann| self.roots.kind_of_type_ann(type_ann))
+            .or_else(|| {
+                node.value
+                    .as_deref()
+                    .and_then(|value| self.roots.kind_of_init(value))
+            });
+        if let Some(kind) = kind {
+            self.roots.record(key, kind);
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_ts_param_prop(&mut self, node: &TsParamProp) {
+        // `constructor(private readonly socket: Socket)` declares the field and
+        // the parameter in one breath, so the same declared-type rule has to
+        // reach it or every later `this.socket.on(…)` is invisible.
+        if let TsParamPropParam::Ident(ident) = &node.param
+            && let Some(type_ann) = ident.type_ann.as_deref()
+            && let Some(kind) = self.roots.kind_of_type_ann(type_ann)
+        {
+            self.roots.record(format!("this.{}", ident.id.sym), kind);
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_assign_expr(&mut self, node: &AssignExpr) {
+        // `this.socket = io(url)` / `this.socket = socket` — the untyped route
+        // to the same field root. The fixpoint loop lets the right-hand side
+        // become known after this statement is first visited.
+        if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &node.left
+            && let Some(key) = member_root(member)
+            && key.starts_with("this.")
+            && let Some(kind) = self.roots.kind_of_init(&node.right)
+        {
+            self.roots.record(key, kind);
         }
         node.visit_children_with(self);
     }
@@ -314,8 +503,8 @@ impl Visit for RootCollector<'_> {
                 .prop
                 .as_ident()
                 .is_some_and(|prop| prop.sym.as_ref() == "on")
-            && let Expr::Ident(receiver) = &*member.obj
-            && self.roots.server_sockets.contains(receiver.sym.as_ref())
+            && let Some(receiver) = member_root(member)
+            && self.roots.server_sockets.contains(&receiver)
             && let Some(first) = node.args.first()
             && matches!(&*first.expr, Expr::Lit(Lit::Str(event)) if matches!(event.value.as_ref(), "connection" | "connect"))
             && let Some(handler) = node.args.get(1)
@@ -339,11 +528,19 @@ impl Visit for RootCollector<'_> {
         // `named_type_symbol`); anything else leaves the binding unanchored.
         if let Pat::Ident(ident) = node
             && let Some(type_ann) = ident.type_ann.as_ref()
-            && let Some(symbol) = named_type_symbol(type_ann)
         {
-            self.roots
-                .binding_types
-                .insert(ident.id.sym.to_string(), symbol);
+            if let Some(symbol) = named_type_symbol(type_ann) {
+                self.roots
+                    .binding_types
+                    .insert(ident.id.sym.to_string(), symbol);
+            }
+            // A local or parameter declared with the socket type is a root by
+            // the same rule as a class field (carrick#659): `(socket: Socket)
+            // => …` on the server, `const socket: Socket<…> = connect()` on
+            // the client.
+            if let Some(kind) = self.roots.kind_of_type_ann(type_ann) {
+                self.roots.record(ident.id.sym.to_string(), kind);
+            }
         }
         node.visit_children_with(self);
     }
@@ -423,18 +620,44 @@ struct OpCollector<'a> {
 }
 
 /// Walk a callee chain (`io.to("room").emit`, `socket.broadcast.emit`) back
-/// to its root identifier.
-fn chain_root(expr: &Expr) -> Option<&swc_ecma_ast::Ident> {
+/// to the name of its root binding. A chain rooted on `this` yields the field
+/// key (`this.socket`, `this.#socket`) the class-field rules record under.
+fn chain_root(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::Ident(ident) => Some(ident),
-        Expr::Member(member) => chain_root(&member.obj),
+        Expr::Ident(ident) => Some(ident.sym.to_string()),
+        Expr::Member(member) => member_root(member),
         Expr::Call(call) => match &call.callee {
             Callee::Expr(callee) => chain_root(callee),
             _ => None,
         },
+        Expr::OptChain(opt) => match &*opt.base {
+            OptChainBase::Member(member) => member_root(member),
+            OptChainBase::Call(call) => chain_root(&call.callee),
+        },
         Expr::Paren(paren) => chain_root(&paren.expr),
         Expr::Await(awaited) => chain_root(&awaited.arg),
+        Expr::TsNonNull(non_null) => chain_root(&non_null.expr),
+        Expr::TsAs(as_expr) => chain_root(&as_expr.expr),
         _ => None,
+    }
+}
+
+/// Root binding name of a member expression: the field key when the object is
+/// `this`, otherwise the root of whatever the object is rooted on.
+fn member_root(member: &MemberExpr) -> Option<String> {
+    if matches!(&*member.obj, Expr::This(_)) {
+        return this_field_key(&member.prop);
+    }
+    chain_root(&member.obj)
+}
+
+/// `this.socket` -> `"this.socket"`, `this.#socket` -> `"this.#socket"`.
+/// Computed access (`this[name]`) has no static key.
+fn this_field_key(prop: &MemberProp) -> Option<String> {
+    match prop {
+        MemberProp::Ident(ident) => Some(format!("this.{}", ident.sym)),
+        MemberProp::PrivateName(private) => Some(format!("this.#{}", private.name)),
+        MemberProp::Computed(_) => None,
     }
 }
 
@@ -442,56 +665,24 @@ impl Visit for OpCollector<'_> {
     fn visit_call_expr(&mut self, node: &swc_ecma_ast::CallExpr) {
         if let Callee::Expr(callee) = &node.callee
             && let Expr::Member(member) = &**callee
-            && let Some(prop) = member.prop.as_ident()
-            && let Some(root) = chain_root(&member.obj)
         {
-            let root_name = root.sym.as_ref();
-            let is_socket_root = self.roots.client_sockets.contains(root_name)
-                || self.roots.server_sockets.contains(root_name);
+            self.record_member_call(member, &node.args, node.span());
+        }
+        node.visit_children_with(self);
+    }
 
-            if is_socket_root && prop.sym.as_ref() == "of" {
-                self.uses_namespaces = true;
-            }
-
-            let is_listener = matches!(prop.sym.as_ref(), "on" | "once");
-            let is_emitter = prop.sym.as_ref() == "emit";
-            if is_socket_root
-                && (is_listener || is_emitter)
-                && let Some(first) = node.args.first()
-                && let Expr::Lit(Lit::Str(event)) = &*first.expr
-                && !RESERVED_EVENTS.contains(&event.value.as_ref())
-            {
-                let direction = self.roots.direction_for(root_name, is_listener);
-                if let Some(direction) = direction {
-                    let payload_symbol = if is_listener {
-                        // Listener: the handler's first parameter is the
-                        // received payload; read its type annotation directly.
-                        self.listener_payload_symbol(node)
-                    } else {
-                        // Emitter: the second argument is the sent payload;
-                        // recover its symbol from the binding's annotation.
-                        self.emitter_payload_symbol(node)
-                    };
-                    let (payload_type_symbol, payload_type_source) = match payload_symbol {
-                        Some(symbol) => {
-                            let source = self.roots.type_imports.get(&symbol).cloned();
-                            (Some(symbol), source)
-                        }
-                        None => (None, None),
-                    };
-                    let op = SocketOp {
-                        key: OperationKey::socket(event.value.to_string(), direction),
-                        file_path: self.file_path.to_path_buf(),
-                        line: self.cm.lookup_char_pos(node.span().lo).line as u32,
-                        payload_type_symbol,
-                        payload_type_source,
-                    };
-                    if is_listener {
-                        self.extraction.listeners.push(op);
-                    } else {
-                        self.extraction.emitters.push(op);
+    fn visit_opt_chain_expr(&mut self, node: &OptChainExpr) {
+        // `this.socket?.emit("x", …)` is an optional call, not a `CallExpr`,
+        // so it needs its own arm or the op is silently lost.
+        if let OptChainBase::Call(call) = &*node.base {
+            match &*call.callee {
+                Expr::Member(member) => self.record_member_call(member, &call.args, node.span()),
+                Expr::OptChain(inner) => {
+                    if let OptChainBase::Member(member) = &*inner.base {
+                        self.record_member_call(member, &call.args, node.span());
                     }
                 }
+                _ => {}
             }
         }
         node.visit_children_with(self);
@@ -499,10 +690,65 @@ impl Visit for OpCollector<'_> {
 }
 
 impl OpCollector<'_> {
+    /// Record the socket op a `<root>.<method>(...)` call site carries, if any.
+    /// Shared by plain and optional calls so both spellings resolve.
+    fn record_member_call(&mut self, member: &MemberExpr, args: &[ExprOrSpread], span: Span) {
+        let Some(prop) = member.prop.as_ident() else {
+            return;
+        };
+        let Some(root_name) = chain_root(&member.obj) else {
+            return;
+        };
+        let is_socket_root = self.roots.kind_of(&root_name).is_some();
+
+        if is_socket_root && prop.sym.as_ref() == "of" {
+            self.uses_namespaces = true;
+        }
+
+        let is_listener = matches!(prop.sym.as_ref(), "on" | "once");
+        let is_emitter = prop.sym.as_ref() == "emit";
+        if is_socket_root
+            && (is_listener || is_emitter)
+            && let Some(first) = args.first()
+            && let Expr::Lit(Lit::Str(event)) = &*first.expr
+            && !RESERVED_EVENTS.contains(&event.value.as_ref())
+            && let Some(direction) = self.roots.direction_for(&root_name, is_listener)
+        {
+            let payload_symbol = if is_listener {
+                // Listener: the handler's first parameter is the received
+                // payload; read its type annotation directly.
+                Self::listener_payload_symbol(args)
+            } else {
+                // Emitter: the second argument is the sent payload; recover
+                // its symbol from the binding's annotation.
+                self.emitter_payload_symbol(args)
+            };
+            let (payload_type_symbol, payload_type_source) = match payload_symbol {
+                Some(symbol) => {
+                    let source = self.roots.type_imports.get(&symbol).cloned();
+                    (Some(symbol), source)
+                }
+                None => (None, None),
+            };
+            let op = SocketOp {
+                key: OperationKey::socket(event.value.to_string(), direction),
+                file_path: self.file_path.to_path_buf(),
+                line: self.cm.lookup_char_pos(span.lo).line as u32,
+                payload_type_symbol,
+                payload_type_source,
+            };
+            if is_listener {
+                self.extraction.listeners.push(op);
+            } else {
+                self.extraction.emitters.push(op);
+            }
+        }
+    }
+
     /// Payload type symbol of a listener call's handler — the type annotation
     /// on the handler's first parameter (`socket.on("e", (p: Payment) => …)`).
-    fn listener_payload_symbol(&self, node: &swc_ecma_ast::CallExpr) -> Option<String> {
-        let handler = node.args.get(1)?;
+    fn listener_payload_symbol(args: &[ExprOrSpread]) -> Option<String> {
+        let handler = args.get(1)?;
         let first_param: Option<&Pat> = match &*handler.expr {
             Expr::Arrow(arrow) => arrow.params.first(),
             Expr::Fn(func) => func.function.params.first().map(|p| &p.pat),
@@ -518,8 +764,8 @@ impl OpCollector<'_> {
     /// type (`socket.emit("e", payment)` where `payment: Payment`). Only a bare
     /// identifier argument resolves; inline literals/expressions stay
     /// unanchored.
-    fn emitter_payload_symbol(&self, node: &swc_ecma_ast::CallExpr) -> Option<String> {
-        let payload = node.args.get(1)?;
+    fn emitter_payload_symbol(&self, args: &[ExprOrSpread]) -> Option<String> {
+        let payload = args.get(1)?;
         match &*payload.expr {
             Expr::Ident(ident) => self.roots.binding_types.get(ident.sym.as_ref()).cloned(),
             _ => None,
@@ -789,5 +1035,228 @@ socket.on("e:fn", (p: Function) => p());
         }
         let listener = find(&result.listeners, "socket|SERVER->CLIENT|e:fn");
         assert_eq!(listener.payload_type_symbol, None);
+    }
+
+    #[test]
+    fn typed_client_field_emits_are_recorded() {
+        // carrick#659: the socket is built in one method, parked on a class
+        // field, and the contract emits happen in later methods on
+        // `this.<field>`. The field's declared type is what makes it a root —
+        // the assignment goes through a method return, which is not traced.
+        let result = extract(
+            r#"
+import type { Socket } from "socket.io-client";
+import { io } from "socket.io-client";
+
+class Supervisor {
+  private notifications?: Socket<ServerToClient, ClientToServer>;
+
+  private createSocket() {
+    const socket = io(this.url);
+    socket.on("run:notify", (msg) => this.handle(msg));
+    return socket;
+  }
+
+  start() {
+    this.notifications = this.createSocket();
+  }
+
+  subscribe(runIds: string[]) {
+    this.notifications.emit("run:subscribe", { version: "1", runIds });
+  }
+
+  unsubscribe(runIds: string[]) {
+    this.notifications.emit("run:unsubscribe", { version: "1", runIds });
+  }
+}
+"#,
+        );
+        assert_eq!(
+            keys(&result.emitters),
+            vec![
+                "socket|CLIENT->SERVER|run:subscribe",
+                "socket|CLIENT->SERVER|run:unsubscribe",
+            ],
+            "emits on a typed client socket field are client->server consumers"
+        );
+        assert_eq!(
+            keys(&result.listeners),
+            vec!["socket|SERVER->CLIENT|run:notify"],
+            "the local-binding listener still resolves"
+        );
+    }
+
+    #[test]
+    fn typed_server_socket_param_and_field_are_roots() {
+        // The `socket.io` `Socket` type is the per-connection server socket, so
+        // its listeners produce client->server and its emits consume
+        // server->client — the mirror of the client field.
+        let result = extract(
+            r#"
+import type { Socket } from "socket.io";
+
+class Connection {
+  private socket: Socket;
+
+  constructor(socket: Socket) {
+    this.socket = socket;
+    socket.on("worker:ready", (msg) => this.ack(msg));
+  }
+
+  push() {
+    this.socket.emit("worker:task", { id: 1 });
+  }
+}
+"#,
+        );
+        assert_eq!(
+            keys(&result.listeners),
+            vec!["socket|CLIENT->SERVER|worker:ready"]
+        );
+        assert_eq!(
+            keys(&result.emitters),
+            vec!["socket|SERVER->CLIENT|worker:task"]
+        );
+    }
+
+    #[test]
+    fn constructor_parameter_property_is_a_field_root() {
+        // `constructor(private readonly socket: Socket)` declares the field
+        // and the parameter at once — a distinct AST node from a class prop.
+        let result = extract(
+            r#"
+import type { Socket } from "socket.io";
+
+class WorkerConnection {
+  constructor(private readonly socket: Socket) {}
+
+  register() {
+    this.socket.on("worker:ready", (msg) => this.ack(msg));
+    this.socket.emit("worker:task", { id: 1 });
+  }
+}
+"#,
+        );
+        assert_eq!(
+            keys(&result.listeners),
+            vec!["socket|CLIENT->SERVER|worker:ready"]
+        );
+        assert_eq!(
+            keys(&result.emitters),
+            vec!["socket|SERVER->CLIENT|worker:task"]
+        );
+    }
+
+    #[test]
+    fn untyped_field_assigned_a_factory_call_is_a_root() {
+        // No type annotation: the field becomes a root through the assignment
+        // rule instead, including the private-field spelling.
+        let result = extract(
+            r#"
+import { io } from "socket.io-client";
+
+class Client {
+  #socket;
+  socket;
+
+  connect() {
+    this.#socket = io(this.url);
+    this.socket = io(this.url);
+  }
+
+  send() {
+    this.#socket.emit("private:ping", {});
+    this.socket.emit("public:ping", {});
+  }
+}
+"#,
+        );
+        assert_eq!(
+            keys(&result.emitters),
+            vec![
+                "socket|CLIENT->SERVER|private:ping",
+                "socket|CLIENT->SERVER|public:ping",
+            ]
+        );
+    }
+
+    #[test]
+    fn optional_chained_field_calls_are_recorded() {
+        // `this.socket?.emit(...)` is an optional call, a different AST node
+        // from a plain call; it must not silently drop the op.
+        let result = extract(
+            r#"
+import type { Socket } from "socket.io-client";
+
+class Client {
+  private socket?: Socket;
+
+  send() {
+    this.socket?.emit("run:subscribe", { version: "1" });
+    this.socket?.on("run:notify", (msg) => this.handle(msg));
+  }
+}
+"#,
+        );
+        assert_eq!(
+            keys(&result.emitters),
+            vec!["socket|CLIENT->SERVER|run:subscribe"]
+        );
+        assert_eq!(
+            keys(&result.listeners),
+            vec!["socket|SERVER->CLIENT|run:notify"]
+        );
+    }
+
+    #[test]
+    fn untyped_unassigned_fields_are_not_roots() {
+        // A field that is neither declared with the socket type nor assigned a
+        // socket root stays invisible — no phantom ops from `this.bus.emit`.
+        let result = extract(
+            r#"
+import { io } from "socket.io-client";
+const probe = io(url);
+
+class Client {
+  private bus = new EventEmitter();
+  private socketish;
+
+  send() {
+    this.bus.emit("domain:event", {});
+    this.socketish.emit("domain:other", {});
+  }
+}
+"#,
+        );
+        assert!(
+            result.is_empty(),
+            "only socket-rooted fields produce ops, got {:?}",
+            keys(&result.emitters)
+        );
+    }
+
+    #[test]
+    fn field_type_from_an_unrelated_module_is_not_a_root() {
+        // The type name alone means nothing: `Socket` must come from a
+        // socket.io module for the field to be a root.
+        let result = extract(
+            r#"
+import type { Socket } from "net";
+import { io } from "socket.io-client";
+const probe = io(url);
+
+class Client {
+  private socket?: Socket;
+
+  send() {
+    this.socket.emit("domain:event", {});
+  }
+}
+"#,
+        );
+        assert!(
+            result.is_empty(),
+            "a same-named foreign type is not a socket"
+        );
     }
 }
