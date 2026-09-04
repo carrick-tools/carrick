@@ -839,6 +839,7 @@ app.post('/users', (req, res) => res.json({ created: true }));
             &http_guidance(&guidance),
             &detection,
             temp_dir.path(),
+            temp_dir.path(),
             &[],
             &Default::default(),
             &Default::default(),
@@ -881,6 +882,7 @@ async fn test_file_orchestrator_handles_empty_files() {
             &http_guidance(&guidance),
             &detection,
             temp_dir.path(),
+            temp_dir.path(),
             &[],
             &Default::default(),
             &Default::default(),
@@ -912,12 +914,17 @@ async fn test_file_orchestrator_handles_missing_files() {
 
     // Try to analyze a non-existent file
     let files = vec![PathBuf::from("/nonexistent/file.ts")];
+    // An empty temp dir, not `/`: the roots are walked for manifests and route
+    // conventions, and handing the pass the filesystem root would walk the
+    // whole disk.
+    let empty_root = tempfile::tempdir().expect("temp root");
     let result = orchestrator
         .analyze_files(
             &files,
             &http_guidance(&guidance),
             &detection,
-            PathBuf::from("/").as_path(),
+            empty_root.path(),
+            empty_root.path(),
             &[],
             &Default::default(),
             &Default::default(),

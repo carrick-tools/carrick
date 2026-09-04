@@ -38,13 +38,14 @@ use crate::{
     framework_detector::DetectionResult,
     import_bindings::BindingResolver,
     imported_request_member::{
-        RequestMember, RequestMemberIndex, ResolvedMember, UnfollowedMemberSites,
+        OwnedMember, RequestMember, RequestMemberIndex, ResolvedMember, UnfollowedMemberSites,
         collect_request_members, fold_indexes_with_conflicts,
     },
     local_http_wrapper::LocalWrapperCall,
     mount_graph::{DataFetchingCall, GraphNode, MountEdge, MountGraph, NodeType, ResolvedEndpoint},
     operation::{OperationKey, Protocol},
     parser::parse_file,
+    receiver_origin::{ReceiverOrigins, collect_receiver_origins},
     services::type_sidecar::{
         ExtractionConfig, InferKind, InferRequestItem, SymbolRequest, TypeResolutionResult,
         TypeSidecar,
@@ -59,6 +60,7 @@ use crate::{
     },
     url_normalizer::UrlNormalizer,
     visitor::{ImportSymbolExtractor, ImportedSymbol, SymbolKind, TypeSymbolExtractor},
+    workspace_resolver::{Resolution, WorkspaceIndex},
     wrapper_request_shape::{self, RequestShapeSignal, WrapperRequestShape},
 };
 use futures::stream::StreamExt;
@@ -208,6 +210,10 @@ struct SymbolTable {
     imported_symbols: HashMap<String, ImportedSymbol>,
 }
 
+/// One workspace package's published request members, folded across every
+/// module of its surface, with the names its modules declare differently.
+type PackageSurface = (HashMap<String, OwnedMember<PathBuf>>, HashSet<String>);
+
 /// Everything one parse of a source file yields for the passes that follow.
 ///
 /// A struct rather than a tuple because two of the fields are the same type —
@@ -230,6 +236,9 @@ struct FileSymbols {
     /// The file's own request members, read for the files that import it
     /// (carrick#588).
     request_members: RequestMemberIndex,
+    /// Which import each local binding's value traces back to (carrick#666).
+    /// Constrains the package-surface member join below.
+    receiver_origins: ReceiverOrigins,
 }
 
 /// Where one request member is declared (carrick#656).
@@ -695,6 +704,10 @@ impl FileOrchestrator {
         // carrick.json declares one, else the repo root. Convention root globs
         // (`app`, `src/app`, …) are matched against paths relative to THIS.
         service_root: &Path,
+        // The repository root, for the workspace package map: which SOURCE file
+        // a `@scope/pkg` specifier names is a property of the whole tree's
+        // manifests, not of one service's directory (carrick#666).
+        repo_root: &Path,
         // Package names the service's own package.json declares. Second input to
         // the routing-convention bootstrap, so a file-routed service is
         // recognized from its manifest even when framework detection names only
@@ -805,6 +818,9 @@ impl FileOrchestrator {
             /// This file's OWN request members, keyed by name (carrick#588).
             /// Read for the files that import it, never for itself.
             request_members: RequestMemberIndex,
+            /// Which import each local binding's value traces back to
+            /// (carrick#666), read at the package-surface member join.
+            receiver_origins: ReceiverOrigins,
             /// Call sites whose callee names a request member of an imported
             /// same-repo module, keyed by the site's call-expression start
             /// offset (carrick#588). The member states the whole request, so
@@ -1161,6 +1177,7 @@ impl FileOrchestrator {
                 pubsub_anchor_ops: scan_result.pubsub_anchor_ops,
                 local_wrapper_calls: scan_result.local_wrapper_calls,
                 request_members: symbols.request_members,
+                receiver_origins: symbols.receiver_origins,
                 resolved_members: HashMap::new(),
                 unresolved_member_sites: Vec::new(),
             });
@@ -1240,6 +1257,15 @@ impl FileOrchestrator {
             }
         }
 
+        // The repo's workspace package map, built once: which SOURCE file a
+        // `@scope/pkg` specifier names is a property of the whole tree's
+        // manifests (carrick#666). Empty for a repo with no workspace members,
+        // where the package-surface join below is a no-op.
+        let workspace_packages = WorkspaceIndex::build(repo_root);
+        // The published surface of each package specifier, memoized across
+        // every importer: a package name resolves the same from every file, so
+        // this is repo-wide rather than per-consumer.
+        let mut surface_cache: HashMap<String, Vec<PathBuf>> = HashMap::new();
         let mut reexport_cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
         // The same-repo modules each module imports, resolved, memoized across
         // every importer that reaches it: the second ring of the member join
@@ -1354,6 +1380,69 @@ impl FileOrchestrator {
                             &import_owners,
                             &receiver_imports,
                         );
+
+                    // The same join across a workspace package boundary
+                    // (carrick#666). Kept separate from the rings above rather
+                    // than folded into them: a package surface publishes dozens
+                    // of members, and folding them into ring 1 would mark every
+                    // name it shares with a relatively-imported module as
+                    // conflicting, dropping sites that resolve today. Runs only
+                    // where the rings resolved nothing, and joins only where the
+                    // receiver's own origin says the value came out of that
+                    // package.
+                    if workspace_packages.has_internal_packages() {
+                        let mut surfaces: HashMap<String, PackageSurface> = HashMap::new();
+                        for symbol in pf.symbol_table.imported_symbols.values() {
+                            let specifier = &symbol.source;
+                            if specifier.starts_with("./")
+                                || specifier.starts_with("../")
+                                || surfaces.contains_key(specifier)
+                            {
+                                continue;
+                            }
+                            let modules = surface_cache
+                                .entry(specifier.clone())
+                                .or_insert_with(|| {
+                                    Self::package_surface_modules(
+                                        specifier,
+                                        &workspace_packages,
+                                        repo_root,
+                                        &mut reexport_cache,
+                                        &cm,
+                                        &handler,
+                                    )
+                                })
+                                .clone();
+                            if modules.is_empty() {
+                                continue;
+                            }
+                            let mut indexes: Vec<(PathBuf, RequestMemberIndex)> = Vec::new();
+                            for path in modules {
+                                if self_canon.as_ref() == Some(&path) {
+                                    continue;
+                                }
+                                if !member_cache.contains_key(&path) {
+                                    let index = parse_file(&path, &cm, &handler)
+                                        .map(|module| collect_request_members(&module, &cm))
+                                        .unwrap_or_default();
+                                    member_cache.insert(path.clone(), index);
+                                }
+                                if let Some(index) = member_cache.get(&path) {
+                                    indexes.push((path, index.clone()));
+                                }
+                            }
+                            surfaces
+                                .insert(specifier.clone(), fold_indexes_with_conflicts(indexes));
+                        }
+                        let through_packages = Self::resolve_package_surface_members(
+                            &pf.candidate_map,
+                            &surfaces,
+                            &pf.receiver_origins,
+                        );
+                        for (span, member) in through_packages {
+                            pf.resolved_members.entry(span).or_insert(member);
+                        }
+                    }
                 }
             }
         }
@@ -1450,6 +1539,7 @@ impl FileOrchestrator {
                 // A rescued file raised no candidate of its own, so it is not
                 // read as anybody's wrapper and nothing joins onto it either.
                 request_members: RequestMemberIndex::default(),
+                receiver_origins: ReceiverOrigins::default(),
                 resolved_members: HashMap::new(),
                 unresolved_member_sites: Vec::new(),
             });
@@ -3142,6 +3232,150 @@ impl FileOrchestrator {
     /// single import can add.
     const WRAPPER_REEXPORT_MAX_HITS: usize = 4;
 
+    /// How many re-export hops a workspace package's published surface is
+    /// followed for (carrick#666). A package entry point is a barrel by
+    /// construction, and the module the consumer's binding actually comes from
+    /// sits behind it; three hops covers `entry -> area barrel -> module`.
+    const PACKAGE_SURFACE_MAX_HOPS: usize = 3;
+    /// Hard cap on modules in one package's surface, so a package that
+    /// re-exports its whole tree cannot turn one import into an unbounded parse.
+    /// Higher than the wrapper walk's cap because a public surface legitimately
+    /// fronts dozens of modules — that breadth is the point here, whereas for
+    /// the wrapper walk it was the disqualifier.
+    const PACKAGE_SURFACE_MAX_MODULES: usize = 400;
+
+    /// The modules a workspace package's specifier publishes: the file its
+    /// manifest names for that specifier, plus everything that file re-exports,
+    /// transitively (carrick#666).
+    ///
+    /// A package name is a SURFACE, not a module. `import { manager } from
+    /// "@scope/core/v3"` names a barrel, and the binding it hands over is
+    /// declared in whatever that barrel re-exports — so a member join that
+    /// stopped at the entry file would find nothing at all. A relative
+    /// specifier is the opposite: it names one module, and the existing rings
+    /// treat it that way.
+    ///
+    /// Returns an empty list for anything that is not a workspace package: an
+    /// external dependency has no source in this repo to read.
+    fn package_surface_modules(
+        specifier: &str,
+        workspace: &WorkspaceIndex,
+        repo_root: &Path,
+        reexport_cache: &mut HashMap<PathBuf, Vec<String>>,
+        cm: &Lrc<SourceMap>,
+        handler: &Handler,
+    ) -> Vec<PathBuf> {
+        let absolute = |relative: PathBuf| repo_root.join(relative).canonicalize().ok();
+        let Resolution::Internal(entry) = workspace.resolve(Path::new(""), specifier) else {
+            return Vec::new();
+        };
+        let Some(entry) = absolute(entry) else {
+            return Vec::new();
+        };
+
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        visited.insert(entry.clone());
+        let mut surface: Vec<PathBuf> = vec![entry.clone()];
+        let mut frontier: Vec<PathBuf> = vec![entry];
+        for _ in 0..Self::PACKAGE_SURFACE_MAX_HOPS {
+            if frontier.is_empty() || surface.len() >= Self::PACKAGE_SURFACE_MAX_MODULES {
+                break;
+            }
+            let mut next: Vec<PathBuf> = Vec::new();
+            for module in frontier {
+                let sources = reexport_cache
+                    .entry(module.clone())
+                    .or_insert_with(|| Self::reexport_sources(&module, cm, handler))
+                    .clone();
+                for source in sources {
+                    // A barrel re-exports relatively within its own package and
+                    // by name across packages; both are how the surface is
+                    // assembled, so both are followed.
+                    let resolved =
+                        Self::resolve_relative_import(&module, &source).or_else(|| match workspace
+                            .resolve(Path::new(""), &source)
+                        {
+                            Resolution::Internal(relative) => absolute(relative),
+                            _ => None,
+                        });
+                    let Some(resolved) = resolved else {
+                        continue;
+                    };
+                    if !visited.insert(resolved.clone()) {
+                        continue;
+                    }
+                    surface.push(resolved.clone());
+                    if surface.len() >= Self::PACKAGE_SURFACE_MAX_MODULES {
+                        return surface;
+                    }
+                    next.push(resolved);
+                }
+            }
+            frontier = next;
+        }
+        surface
+    }
+
+    /// Join a file's candidate call sites onto the request members published by
+    /// the workspace packages it imports BY NAME (carrick#666).
+    ///
+    /// The rings above reach same-repo modules through relative specifiers
+    /// only, so in a monorepo the one client every consumer actually calls —
+    /// the one another package publishes — is unreachable no matter how many
+    /// rings are added. The site then states no path and no verb, its own file
+    /// states neither, extraction answers nothing, and the endpoint is absent
+    /// from the index entirely while its producer is reported orphaned.
+    ///
+    /// Reach alone would be too wide. A package surface publishes dozens of
+    /// members, and `list`, `get` and `create` are what every client calls its
+    /// methods, so a name match across a package boundary needs a reason to
+    /// believe the receiver belongs to that package. The reason is the
+    /// receiver's own origin: it is either the imported binding itself, or a
+    /// local whose value traces back to one ([`crate::receiver_origin`]). A
+    /// receiver that traces back to nothing joins to nothing here, however
+    /// unambiguous the name — which is the opposite of the local-receiver rule
+    /// in the relative rings, and deliberately so: there the modules are ones
+    /// this file chose to import one by one, here they are a published surface
+    /// the file named wholesale.
+    ///
+    /// Within a surface, a name two of its modules declare differently is
+    /// dropped rather than picked between, exactly as in the rings.
+    fn resolve_package_surface_members(
+        candidate_map: &HashMap<String, CandidateTarget>,
+        surfaces: &HashMap<String, PackageSurface>,
+        receiver_origins: &ReceiverOrigins,
+    ) -> HashMap<u32, ResolvedMember> {
+        let mut resolved = HashMap::new();
+        if surfaces.is_empty() {
+            return resolved;
+        }
+        for candidate in candidate_map.values() {
+            let name = Self::member_call_name(candidate);
+            let Some(receiver) = candidate.receiver_ident.as_deref() else {
+                continue;
+            };
+            let Some(specifier) = receiver_origins.get(receiver) else {
+                continue;
+            };
+            let Some((members, conflicting)) = surfaces.get(specifier) else {
+                continue;
+            };
+            if conflicting.contains(name) {
+                continue;
+            }
+            if let Some(owned) = members.get(name) {
+                resolved.insert(
+                    candidate.span_start,
+                    ResolvedMember {
+                        name: name.to_string(),
+                        member: owned.member.clone(),
+                    },
+                );
+            }
+        }
+        resolved
+    }
+
     /// The wrapper modules a resolved import target stands for (#472).
     ///
     /// Normally that is the target itself. But with NodeNext specifier
@@ -3288,6 +3522,9 @@ impl FileOrchestrator {
         // requests go through a helper raises no HTTP candidate of its own, so
         // the wrapper map's candidate gate is the wrong filter for this.
         let request_members = collect_request_members(&module, cm);
+        // Same parse again: the origins are read off the declarators the
+        // extractors above already walked.
+        let receiver_origins = collect_receiver_origins(&module);
 
         FileSymbols {
             table: SymbolTable {
@@ -3299,6 +3536,7 @@ impl FileOrchestrator {
             env_fallbacks: bindings.env_fallbacks,
             literal_bases: bindings.literal_bases,
             request_members,
+            receiver_origins,
         }
     }
 
@@ -4671,8 +4909,8 @@ impl FileOrchestrator {
     /// Where the call's receiver is one of those names it must have come from
     /// the very module the member did. A receiver that is a parameter or a
     /// local carries no such constraint, which is the shape this pass exists
-    /// for; a receiver imported from a package matches no module and joins to
-    /// nothing.
+    /// for; a receiver imported from a package matches no module here, and is
+    /// answered instead by [`Self::resolve_package_surface_members`].
     /// Join each candidate's callee name onto a request member, nearest ring
     /// first.
     ///
@@ -4894,7 +5132,13 @@ impl FileOrchestrator {
                     .map(|resolved| (candidate, &resolved.member))
             })
             .collect();
-        sites.sort_by_key(|(candidate, _)| candidate.span_start);
+        // Innermost first within one start offset: a chained call
+        // (`client.cancelRun(id).catch(fn)`) raises a candidate for each link,
+        // and every link shares the start offset of the receiver it is chained
+        // onto, so they all read the same resolved member. They are one
+        // outbound request, and the innermost link is the one that makes it.
+        sites.sort_by_key(|(candidate, _)| (candidate.span_start, candidate.span_end));
+        let mut emitted_spans: HashSet<u32> = HashSet::new();
 
         // Only rows extraction produced can cover a site. Reading the vector
         // as it grows would let the first backfill of a line suppress its
@@ -4915,6 +5159,9 @@ impl FileOrchestrator {
                 .iter()
                 .any(|endpoint| endpoint.call_expression_span_start == Some(candidate.span_start))
             {
+                continue;
+            }
+            if !emitted_spans.insert(candidate.span_start) {
                 continue;
             }
             let line = i32::try_from(candidate.line_number).unwrap_or(i32::MAX);
@@ -11114,6 +11361,7 @@ export { routes };
             request_spec: None,
             new_url_path: None,
             request_shape: crate::wrapper_request_shape::RequestShapeSignal::NotARequest,
+            receiver_ident: Some("router".to_string()),
         }
     }
 
@@ -11951,6 +12199,176 @@ export { routes };
                 .consumers_not_resolved
                 .is_none()
         );
+    }
+
+    fn surface(
+        entries: &[(&str, &str, &str, &str)],
+    ) -> (HashMap<String, OwnedMember<PathBuf>>, HashSet<String>) {
+        fold_indexes_with_conflicts(ring(entries))
+    }
+
+    fn package_site(receiver: &str, member: &str) -> HashMap<String, CandidateTarget> {
+        let mut candidate = candidate_with_snippet("c1", None);
+        candidate.callee_object = receiver.to_string();
+        candidate.callee_property = Some(member.to_string());
+        candidate.receiver_ident = Some(receiver.to_string());
+        HashMap::from([("c1".to_string(), candidate)])
+    }
+
+    /// carrick#666: a member the consumer reaches through a factory imported
+    /// from a workspace package, with the receiver's origin as the constraint.
+    #[test]
+    fn a_package_surface_member_resolves_when_the_receiver_came_from_that_package() {
+        let surfaces = HashMap::from([(
+            "@scope/core/v2".to_string(),
+            surface(&[(
+                "client.ts",
+                "retrieveWidget",
+                "GET",
+                "${this.base}/api/v2/widgets",
+            )]),
+        )]);
+        let origins = HashMap::from([("coreClient".to_string(), "@scope/core/v2".to_string())]);
+        let resolved = FileOrchestrator::resolve_package_surface_members(
+            &package_site("coreClient", "retrieveWidget"),
+            &surfaces,
+            &origins,
+        );
+        assert_eq!(
+            resolved.get(&100),
+            Some(&ring_outcome(
+                "retrieveWidget",
+                "GET",
+                "${this.base}/api/v2/widgets"
+            ))
+        );
+    }
+
+    /// A receiver with no origin joins nothing, however unambiguous the name.
+    /// This is what keeps a package's `get`/`list` off every local in the file.
+    #[test]
+    fn a_package_surface_member_needs_the_receivers_origin() {
+        let surfaces = HashMap::from([(
+            "@scope/core/v2".to_string(),
+            surface(&[("client.ts", "list", "GET", "${this.base}/api/v2/widgets")]),
+        )]);
+        let resolved = FileOrchestrator::resolve_package_surface_members(
+            &package_site("anything", "list"),
+            &surfaces,
+            &HashMap::new(),
+        );
+        assert!(resolved.is_empty(), "{resolved:?}");
+    }
+
+    /// The origin names ONE package, so a member of a different package's
+    /// surface is not reachable from it even under the same name.
+    #[test]
+    fn a_package_surface_member_is_scoped_to_the_receivers_own_package() {
+        let surfaces = HashMap::from([(
+            "@scope/core/v2".to_string(),
+            surface(&[(
+                "client.ts",
+                "retrieveWidget",
+                "GET",
+                "${this.base}/api/v2/widgets",
+            )]),
+        )]);
+        let origins = HashMap::from([("otherClient".to_string(), "@scope/other".to_string())]);
+        let resolved = FileOrchestrator::resolve_package_surface_members(
+            &package_site("otherClient", "retrieveWidget"),
+            &surfaces,
+            &origins,
+        );
+        assert!(resolved.is_empty(), "{resolved:?}");
+    }
+
+    /// A name two modules of one surface declare differently is dropped rather
+    /// than picked between, exactly as in the rings.
+    #[test]
+    fn a_name_two_surface_modules_declare_differently_joins_to_nothing() {
+        let surfaces = HashMap::from([(
+            "@scope/core/v2".to_string(),
+            surface(&[
+                ("a.ts", "list", "GET", "${this.base}/api/a"),
+                ("b.ts", "list", "GET", "${this.base}/api/b"),
+            ]),
+        )]);
+        let origins = HashMap::from([("coreClient".to_string(), "@scope/core/v2".to_string())]);
+        let resolved = FileOrchestrator::resolve_package_surface_members(
+            &package_site("coreClient", "list"),
+            &surfaces,
+            &origins,
+        );
+        assert!(resolved.is_empty(), "{resolved:?}");
+    }
+
+    /// A chained link (`client.archive(id).catch(fn)`) has no bare-identifier
+    /// receiver: the thing `.catch` is called on is a promise. Without one
+    /// there is no origin to check, so the link joins to nothing.
+    #[test]
+    fn a_chained_link_has_no_receiver_to_constrain_and_joins_to_nothing() {
+        let surfaces = HashMap::from([(
+            "@scope/core/v2".to_string(),
+            surface(&[("client.ts", "catch", "GET", "${this.base}/api/v2/widgets")]),
+        )]);
+        let origins = HashMap::from([("coreClient".to_string(), "@scope/core/v2".to_string())]);
+        let mut candidates = package_site("coreClient", "catch");
+        candidates.get_mut("c1").unwrap().receiver_ident = None;
+        let resolved =
+            FileOrchestrator::resolve_package_surface_members(&candidates, &surfaces, &origins);
+        assert!(resolved.is_empty(), "{resolved:?}");
+    }
+
+    /// The surface walk follows the entry barrel's re-exports: the member lives
+    /// two modules behind the file the manifest names.
+    #[test]
+    fn a_package_surface_reaches_the_modules_its_entry_barrel_re_exports() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/workspace-package-client");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
+        let workspace = WorkspaceIndex::build(&root);
+        let mut reexport_cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        let surface = FileOrchestrator::package_surface_modules(
+            "@fixture/core/v2",
+            &workspace,
+            &root,
+            &mut reexport_cache,
+            &cm,
+            &handler,
+        );
+        assert!(
+            surface
+                .iter()
+                .any(|path| path.ends_with("core/src/v2/client/index.ts")),
+            "the client module the entry barrel re-exports is missing: {surface:?}"
+        );
+        assert!(
+            surface
+                .iter()
+                .any(|path| path.ends_with("core/src/v2/index.ts")),
+            "the entry itself is missing: {surface:?}"
+        );
+    }
+
+    /// A specifier naming no workspace member has no surface to read.
+    #[test]
+    fn an_external_package_publishes_no_surface() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/workspace-package-client");
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
+        let workspace = WorkspaceIndex::build(&root);
+        let mut reexport_cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        let surface = FileOrchestrator::package_surface_modules(
+            "some-external-package",
+            &workspace,
+            &root,
+            &mut reexport_cache,
+            &cm,
+            &handler,
+        );
+        assert!(surface.is_empty(), "{surface:?}");
     }
 
     /// carrick#623: `apply_imported_members` can only rewrite a row that
