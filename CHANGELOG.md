@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.3.36](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.35...carrick-v0.3.36) (2026-09-04)
+
+
+### Features
+
+* **scanner:** count the client-method call sites the join could not follow ([#663](https://github.com/carrick-tools/carrick/issues/663)) ([7659b9f](https://github.com/carrick-tools/carrick/commit/7659b9faf1dd8a9a5746d585ee96e4cc1dcdd458))
+
+
+### Bug Fixes
+
+* **scanner:** read the HTTP method a route builder is given as an option ([#673](https://github.com/carrick-tools/carrick/issues/673)) ([4c98b82](https://github.com/carrick-tools/carrick/commit/4c98b8289edd755b84ca7f59a474b6ace96903fe)), closes [#665](https://github.com/carrick-tools/carrick/issues/665)
+* **scanner:** resolve client members published by a sibling workspace package ([#671](https://github.com/carrick-tools/carrick/issues/671)) ([b37fc79](https://github.com/carrick-tools/carrick/commit/b37fc79a95eec782e54ed0957e1a864a786e214a))
+* **socket:** follow an imported socket type alias one hop ([#674](https://github.com/carrick-tools/carrick/issues/674)) ([32c8ccc](https://github.com/carrick-tools/carrick/commit/32c8ccc2f5cebe1e9e71131f912832f66aaf8540))
+* **socket:** record ops served on a custom namespace ([#668](https://github.com/carrick-tools/carrick/issues/668)) ([927c05c](https://github.com/carrick-tools/carrick/commit/927c05c0e63d3fa2cb366f3b3aef52c58466e47d))
+* **socket:** resolve a same-file type alias of the socket type ([#672](https://github.com/carrick-tools/carrick/issues/672)) ([6de5782](https://github.com/carrick-tools/carrick/commit/6de57824c200f57df9e3292870974584c04d8b31))
+* **socket:** resolve socket roots held on class fields ([#661](https://github.com/carrick-tools/carrick/issues/661)) ([698c2ec](https://github.com/carrick-tools/carrick/commit/698c2ec51f1fbde7945a06d827931d95b12bb54c))
+
+
+### Documentation
+
+* **socket:** state the namespace imprecision the pass accepts ([#669](https://github.com/carrick-tools/carrick/issues/669)) ([40b7e3e](https://github.com/carrick-tools/carrick/commit/40b7e3e19bf28f6a1102969abef03cd23cfc49c0))
+
 ## [0.3.35](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.34...carrick-v0.3.35) (2026-09-04)
 
 
