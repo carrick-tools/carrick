@@ -98,8 +98,8 @@
 //! by design, so every row the join produces for a member carries how many
 //! OTHER sites in the service named that member and were not followed to it
 //! (`consumers_not_resolved`). Counted in
-//! [`crate::agents::file_orchestrator::FileOrchestrator::unresolved_member_sites`],
-//! which states the rules and the direction of its error.
+//! [`crate::agents::file_orchestrator::FileOrchestrator::resolve_imported_members`],
+//! which states which declines count and which do not.
 //!
 //! A name alone would be too wide, because `list` and `get` and `create` are
 //! what every client calls its methods. So the receiver constrains it: where
@@ -163,10 +163,15 @@ impl Eq for RequestMember {}
 ///
 /// Carried on every row the join produced for that member, and on the member's
 /// own request row inside its module, so a listing of an operation's consumers
-/// can say it is not complete instead of reading as though it were. A FLOOR,
-/// never a total: see
-/// [`crate::agents::file_orchestrator::FileOrchestrator::unresolved_member_sites`]
-/// for what is counted and what is deliberately left out.
+/// can say it is not complete instead of reading as though it were.
+///
+/// WHAT THE NUMBER IS. What the scan that wrote the row counted, and only
+/// that. It is not a remainder to subtract, and it lags the source BOTH ways
+/// on an incremental scan: a new site in a file that did not change is never
+/// counted, and a site that was fixed or deleted stays counted on every row
+/// that scan did not re-analyse, until those files change or `CACHE_VERSION`
+/// moves. The rules for what counts at all are in
+/// [`crate::agents::file_orchestrator::FileOrchestrator::resolve_imported_members`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnfollowedMemberSites {
     /// The member name the unfollowed sites called (`getEnvironmentVariables`).

@@ -223,6 +223,11 @@ pub struct DataCallResult {
     /// member and on the member's own request row. Absent whenever the count is
     /// zero, which is also what a scan that saw no such site records: absence
     /// says nothing was counted, never that the consumer list is complete.
+    ///
+    /// Cached with the rest of the row, so on an incremental scan it states
+    /// what the last scan to re-analyse these files counted. That lags the
+    /// source in both directions — an uncounted new site, or a fixed one still
+    /// counted — until those files change or `CACHE_VERSION` moves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumers_not_resolved: Option<crate::imported_request_member::UnfollowedMemberSites>,
 }
