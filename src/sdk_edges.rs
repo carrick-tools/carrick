@@ -660,6 +660,7 @@ mod tests {
             host: None,
             line: Some(32),
             base: None,
+            consumers_not_resolved: None,
         }];
         data.mount_graph = Some(graph);
         data
@@ -782,6 +783,7 @@ mod tests {
             host: None,
             line: Some(3),
             base: None,
+            consumers_not_resolved: None,
         }];
         data.mount_graph = Some(graph);
         data

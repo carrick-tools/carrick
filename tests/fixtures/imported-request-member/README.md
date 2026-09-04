@@ -36,6 +36,14 @@ method and path live in a client module it imports, and nowhere in its own file.
 - `src/supervisor.ts` holds the client in a field of an options record and
   reaches it off `this` (`this.options.client.describeSession()`), which is a
   receiver with no root identifier. It imports the client type-only.
+- `src/instance.ts` constructs the client and exports the INSTANCE, and
+  `src/envvars.ts` calls a method on that imported binding (carrick#656). The
+  join declines it by design — the binding's source module is not the member's,
+  and the name alone cannot say the binding is the client — so the site is
+  COUNTED instead: every row `readArtifactUrl` produced states that one call
+  site of it was not followed. `legacy.ts` is the control: its binding shares a
+  name with a member but its module never imports the client, so that site is a
+  different function and is not counted.
 
 ## The answer key
 
@@ -50,6 +58,7 @@ method and path live in a client module it imports, and nowhere in its own file.
 | `uploads.ts:15` `client.describeSession()` | `GET /api/v2/session` |
 | `envcmd.ts:8` `projectClient.client.readArtifactUrl(name)` | `GET /api/v1/artifacts/:encoded` |
 | `supervisor.ts:12` `this.options.client.describeSession()` | `GET /api/v2/session` |
+| `envvars.ts:6` `client.readArtifactUrl(name)` | no row; counted as one call site of `readArtifactUrl` the join did not follow |
 
 ## The cassette
 
@@ -64,7 +73,10 @@ show up as a change in the assertions, and no model behaviour is being measured.
 `__llm__/analyze-file/envcmd.json`, `supervisor.json` and `session.json` hold
 no answer either, for the same reason: the two carrick#655 sites state nothing
 their own file could answer from, and the rows exist only if the scanner
-emits them.
+emits them. `envvars.json` is empty for a different reason: its site resolves to
+nothing, so a row there would be one the scanner invented. `instance.ts` needs
+no cassette at all — it raises no candidate and imports no wrapper module, so
+it is skipped before the analyzer is asked.
 
 `__llm__/analyze-file/uploads.json` holds no answer at all: an empty
 `data_calls` array, which is what the analyzer returns for a file whose call

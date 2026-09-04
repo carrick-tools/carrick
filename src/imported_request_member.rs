@@ -92,6 +92,15 @@
 //! name alone cannot say that binding is the client, and the fixpoint that
 //! could (`external_call_candidates`) does not reach same-repo classes.
 //!
+//! What the join could NOT follow is counted rather than left silent
+//! (carrick#656). A listing of an operation's consumers reads as complete
+//! whatever the join declined, and the two receiver shapes above are declined
+//! by design, so every row the join produces for a member carries how many
+//! OTHER sites in the service named that member and were not followed to it
+//! (`consumers_not_resolved`). Counted in
+//! [`crate::agents::file_orchestrator::FileOrchestrator::resolve_imported_members`],
+//! which states which declines count and which do not.
+//!
 //! A name alone would be too wide, because `list` and `get` and `create` are
 //! what every client calls its methods. So the receiver constrains it: where
 //! the call's receiver is itself an imported binding, it must be imported from
@@ -101,6 +110,8 @@
 //! and so joins to nothing.
 
 use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
 
 use swc_common::{SourceMap, SourceMapper, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
@@ -113,7 +124,7 @@ use crate::wrapper_request_shape::{
 };
 
 /// The request one member issues, read off its body.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RequestMember {
     /// Upper-case HTTP method, stated as a literal by the member's request.
     pub method: String,
@@ -125,6 +136,64 @@ pub struct RequestMember {
     /// target is the path alone, which is what a host-free call already is
     /// everywhere else in the scanner.
     pub target: String,
+    /// 1-based line the member's request is written on, inside the client's own
+    /// module. Provenance, not identity: it is how the row the client's own
+    /// file carries for this request is found again (carrick#656), and it is
+    /// deliberately outside `PartialEq` below.
+    pub request_line: u32,
+}
+
+/// Two members state the SAME request when their method and their URL agree.
+///
+/// Written out rather than derived because `request_line` is provenance: a
+/// module that declares one name twice with the same request keeps it (see
+/// `MemberCollector::pop_frame`), and deriving equality over the line would
+/// turn every such pair into a conflict and drop a member that is not
+/// ambiguous at all.
+impl PartialEq for RequestMember {
+    fn eq(&self, other: &Self) -> bool {
+        self.method == other.method && self.target == other.target
+    }
+}
+
+impl Eq for RequestMember {}
+
+/// What the member join could NOT follow, for the member a row belongs to
+/// (carrick#656).
+///
+/// Carried on every row the join produced for that member, and on the member's
+/// own request row inside its module, so a listing of an operation's consumers
+/// can say it is not complete instead of reading as though it were.
+///
+/// WHAT THE NUMBER IS. What the scan that wrote the row counted, and only
+/// that. It is not a remainder to subtract, and it lags the source BOTH ways
+/// on an incremental scan: a new site in a file that did not change is never
+/// counted, and a site that was fixed or deleted stays counted on every row
+/// that scan did not re-analyse, until those files change or `CACHE_VERSION`
+/// moves. The rules for what counts at all are in
+/// [`crate::agents::file_orchestrator::FileOrchestrator::resolve_imported_members`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnfollowedMemberSites {
+    /// The member name the unfollowed sites called (`getEnvironmentVariables`).
+    pub member: String,
+    /// How many call sites named it in this service without resolving to it.
+    /// Never zero: the field is absent instead.
+    pub count: u32,
+}
+
+/// One call site's join outcome: the member's request, and the name the site
+/// called it by.
+///
+/// The name is the key the join matched on, kept because the count of sites
+/// that named the same member and were NOT followed to it is a fact about the
+/// NAME (carrick#656), and by the time the rows are stamped the index the join
+/// read is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedMember {
+    /// The member name this site called.
+    pub name: String,
+    /// The request that member issues.
+    pub member: RequestMember,
 }
 
 /// The request members a module declares, keyed by name.
@@ -383,7 +452,12 @@ impl MemberCollector<'_> {
             None => verb?,
         };
 
-        Some(RequestMember { method, target })
+        Some(RequestMember {
+            method,
+            target,
+            request_line: u32::try_from(self.source_map.lookup_char_pos(call.span().lo).line)
+                .unwrap_or(0),
+        })
     }
 
     /// The call's single URL argument: a route-shaped string or template as
@@ -630,6 +704,16 @@ mod tests {
         collect_request_members(&module, &source_map)
     }
 
+    /// A member as the assertions compare it. `request_line` is provenance and
+    /// outside `PartialEq`, so the value here is never read.
+    fn member(method: &str, target: &str) -> RequestMember {
+        RequestMember {
+            method: method.to_string(),
+            target: target.to_string(),
+            request_line: 0,
+        }
+    }
+
     #[test]
     fn reads_method_and_versioned_path_off_a_class_method() {
         let members = index(
@@ -654,19 +738,33 @@ mod tests {
         );
         assert_eq!(
             members.get("createArtifactUrl"),
-            Some(&RequestMember {
-                method: "PUT".to_string(),
-                target: "${this.baseUrl}/api/v2/artifacts/${encoded}".to_string(),
-            }),
+            Some(&member(
+                "PUT",
+                "${this.baseUrl}/api/v2/artifacts/${encoded}"
+            )),
             "the URL is at argument 1 and the method is a literal in the options bag"
         );
         assert_eq!(
             members.get("readArtifactUrl"),
-            Some(&RequestMember {
-                method: "GET".to_string(),
-                target: "${this.baseUrl}/api/v1/artifacts/${encoded}".to_string(),
-            }),
+            Some(&member(
+                "GET",
+                "${this.baseUrl}/api/v1/artifacts/${encoded}"
+            )),
             "sibling methods keep their own verb and their own version"
+        );
+    }
+
+    /// carrick#656: the member records the line its request is written on, so
+    /// the row the client's own file carries for it can be found again.
+    #[test]
+    fn records_the_line_its_request_is_written_on() {
+        let members = index(
+            "class ApiClient {\n  listThings() {\n    return send(Schema, `${this.base}/api/v1/things`, {\n      method: \"GET\",\n    });\n  }\n}\n",
+        );
+        assert_eq!(
+            members.get("listThings").map(|member| member.request_line),
+            Some(3),
+            "the request's own line, not the member's or the file's"
         );
     }
 
@@ -751,10 +849,7 @@ mod tests {
         );
         assert_eq!(
             members.get("listThings"),
-            Some(&RequestMember {
-                method: "GET".to_string(),
-                target: "${this.base}/api/v1/things".to_string(),
-            })
+            Some(&member("GET", "${this.base}/api/v1/things"))
         );
     }
 
@@ -804,10 +899,7 @@ mod tests {
         );
         assert_eq!(
             members.get("readThing"),
-            Some(&RequestMember {
-                method: "GET".to_string(),
-                target: "${this.base}/api/v1/things/${id}".to_string(),
-            }),
+            Some(&member("GET", "${this.base}/api/v1/things/${id}")),
             "a bag holding only headers states the method every client defaults to"
         );
     }

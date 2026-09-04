@@ -60,6 +60,11 @@ pub struct EvalOp {
     /// the expression; this is the only field that says where the base goes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<crate::call_base::CallBaseResolution>,
+    /// Consumer ops only: what the member join could not follow for the client
+    /// method this call reaches (carrick#656), the same value the persisted row
+    /// carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumers_not_resolved: Option<crate::imported_request_member::UnfollowedMemberSites>,
     pub file: String,
     pub line: u32,
     // --- Type-manifest fields (contract §3), joined by OperationKey ---
@@ -154,6 +159,10 @@ impl EvalProjection {
         type_manifest: &[TypeManifestEntry],
         raw_targets: &HashMap<(String, String), String>,
         call_bases: &HashMap<(String, String), crate::call_base::CallBaseResolution>,
+        call_unfollowed_members: &HashMap<
+            (String, String),
+            crate::imported_request_member::UnfollowedMemberSites,
+        >,
     ) -> Self {
         let manifest_index = ManifestIndex::build(type_manifest);
         // Canonical ordering so the projection is deterministic across runs:
@@ -230,6 +239,7 @@ impl EvalProjection {
                     );
                     op.target_url = raw_targets.get(&site).cloned();
                     op.base = call_bases.get(&site).cloned();
+                    op.consumers_not_resolved = call_unfollowed_members.get(&site).cloned();
                     op
                 })
                 .collect(),
@@ -485,6 +495,7 @@ impl EvalOp {
             // the same reason `target_url` is: the details type carries
             // neither.
             base: None,
+            consumers_not_resolved: None,
             handler: d.handler_name.clone(),
             request_type: d
                 .request_type
@@ -753,8 +764,13 @@ mod tests {
             cross_repo_matches: vec![],
         };
 
-        let projection =
-            EvalProjection::from_results(&result, &[], &HashMap::new(), &HashMap::new());
+        let projection = EvalProjection::from_results(
+            &result,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let endpoint_keys: Vec<&str> = projection
             .endpoints
             .iter()
@@ -816,8 +832,13 @@ mod tests {
             cross_repo_matches: vec![],
         };
 
-        let projection =
-            EvalProjection::from_results(&result, &[], &HashMap::new(), &HashMap::new());
+        let projection = EvalProjection::from_results(
+            &result,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let surviving: Vec<(&str, &str)> = projection
             .endpoints
             .iter()
@@ -927,8 +948,13 @@ mod tests {
             Some("OrderResponse"),
         )];
 
-        let projection =
-            EvalProjection::from_results(&result, &manifest, &HashMap::new(), &HashMap::new());
+        let projection = EvalProjection::from_results(
+            &result,
+            &manifest,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
 
@@ -1005,8 +1031,13 @@ mod tests {
             cross_repo_matches: vec![],
         };
 
-        let projection =
-            EvalProjection::from_results(&result, &[], &HashMap::new(), &HashMap::new());
+        let projection = EvalProjection::from_results(
+            &result,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
         let op = &json["endpoints"].as_array().unwrap()[0];
@@ -1081,8 +1112,13 @@ mod tests {
             Some("Payment"),
         )];
 
-        let projection =
-            EvalProjection::from_results(&result, &manifest, &HashMap::new(), &HashMap::new());
+        let projection = EvalProjection::from_results(
+            &result,
+            &manifest,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
         let op = &json["calls"].as_array().unwrap()[0];
@@ -1161,8 +1197,13 @@ mod tests {
             ),
         ];
 
-        let projection =
-            EvalProjection::from_results(&result, &manifest, &HashMap::new(), &HashMap::new());
+        let projection = EvalProjection::from_results(
+            &result,
+            &manifest,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
 
@@ -1239,8 +1280,13 @@ mod tests {
             ),
         ];
 
-        let projection =
-            EvalProjection::from_results(&result, &manifest, &HashMap::new(), &HashMap::new());
+        let projection = EvalProjection::from_results(
+            &result,
+            &manifest,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
         let op = &json["endpoints"].as_array().unwrap()[0];
@@ -1299,8 +1345,13 @@ mod tests {
             None,
         )];
 
-        let projection =
-            EvalProjection::from_results(&result, &manifest, &HashMap::new(), &HashMap::new());
+        let projection = EvalProjection::from_results(
+            &result,
+            &manifest,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
         let op = &json["calls"].as_array().unwrap()[0];
@@ -1379,8 +1430,13 @@ mod tests {
             ),
         ];
 
-        let projection =
-            EvalProjection::from_results(&result, &manifest, &HashMap::new(), &HashMap::new());
+        let projection = EvalProjection::from_results(
+            &result,
+            &manifest,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let json: Value =
             serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
         let calls = json["calls"].as_array().unwrap();
