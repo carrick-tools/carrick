@@ -31,7 +31,10 @@
 //! - a binding — class field, private field, constructor parameter property,
 //!   `const`, or parameter — whose declared type is the `Socket` type imported
 //!   from `socket.io-client` (client) or the `Socket`/`Namespace` type
-//!   imported from `socket.io` (server side), and
+//!   imported from `socket.io` (server side), or a type alias declared in the
+//!   same file for one of those (`type SupervisorSocket = Socket<…>`, which a
+//!   file that holds several sockets usually declares once and then uses on
+//!   every field — carrick#670), and
 //! - `this.<field> = <expr>` where the right-hand side is already a socket
 //!   root (a factory call, `new Server(...)`, or another root binding).
 //!
@@ -47,6 +50,11 @@
 //! - a field assigned the RETURN VALUE of a method that builds a socket
 //!   (`this.socket = this.#createSocket()`) is a root only via one of the two
 //!   rules above — method-return flow is not traced,
+//! - a socket taken out of a container (`this.sockets.get(id).emit(…)`) is not
+//!   a root: the container's value type is never consulted (carrick#670),
+//! - a socket reached as a member off an IMPORTED binding
+//!   (`gateway.workerNamespace.emit(…)`) is not a root: rooting is file-local,
+//!   so the import hop is not followed (carrick#670),
 //! - socket identity is tracked by binding name (`this.<field>` for fields),
 //!   not full scope analysis, and is flat per file: two classes in one file
 //!   with same-named socket fields share a root.
@@ -61,7 +69,7 @@ use swc_ecma_ast::{
     AssignExpr, AssignTarget, Callee, ClassProp, Expr, ExprOrSpread, ImportDecl, ImportSpecifier,
     Lit, MemberExpr, MemberProp, ModuleExportName, NewExpr, OptChainBase, OptChainExpr, Pat,
     PrivateProp, PropName, SimpleAssignTarget, TsEntityName, TsParamProp, TsParamPropParam, TsType,
-    TsTypeAnn, TsUnionOrIntersectionType, VarDeclarator,
+    TsTypeAliasDecl, TsTypeAnn, TsUnionOrIntersectionType, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::debug;
@@ -417,6 +425,22 @@ impl Visit for RootCollector<'_> {
                 _ => {}
             }
         }
+    }
+
+    fn visit_ts_type_alias_decl(&mut self, node: &TsTypeAliasDecl) {
+        // `type SupervisorSocket = Socket<ServerToClient, ClientToServer>` —
+        // a file that names its socket type once and then declares every field
+        // with the alias (carrick#670). The alias IS the admitted type, so it
+        // joins the same set and every rule that reads a declared type sees it.
+        // The fixpoint loop resolves declaration order and a chain of aliases.
+        if let Some(kind) = self.roots.kind_of_type(&node.type_ann) {
+            let name = node.id.sym.to_string();
+            match kind {
+                SocketKind::Client => self.roots.client_socket_types.insert(name),
+                SocketKind::Server => self.roots.server_socket_types.insert(name),
+            };
+        }
+        node.visit_children_with(self);
     }
 
     fn visit_var_declarator(&mut self, node: &VarDeclarator) {
@@ -1171,6 +1195,103 @@ class Connection {
         assert_eq!(
             keys(&result.emitters),
             vec!["socket|SERVER->CLIENT|worker:task"]
+        );
+    }
+
+    #[test]
+    fn same_file_socket_type_alias_is_a_root_type() {
+        // carrick#670: a file that holds several sockets names the type once
+        // and then declares every field with the alias. The alias is the
+        // admitted type, so fields declared with it are roots.
+        let result = extract(
+            r#"
+import type { Socket } from "socket.io-client";
+
+export type SupervisorSocket = Socket<ServerToClient, ClientToServer>;
+
+class Controller {
+  private socket: SupervisorSocket;
+
+  constructor(socket: SupervisorSocket) {
+    this.socket = socket;
+  }
+
+  start() {
+    this.socket.emit("run:start", { version: "1" });
+    this.socket.on("run:notify", (msg) => this.handle(msg));
+  }
+
+  stop() {
+    this.socket.emit("run:stop", { version: "1" });
+  }
+}
+"#,
+        );
+        assert_eq!(
+            keys(&result.emitters),
+            vec![
+                "socket|CLIENT->SERVER|run:start",
+                "socket|CLIENT->SERVER|run:stop",
+            ]
+        );
+        assert_eq!(
+            keys(&result.listeners),
+            vec!["socket|SERVER->CLIENT|run:notify"]
+        );
+    }
+
+    #[test]
+    fn a_chain_of_socket_type_aliases_resolves() {
+        // The alias is resolved by the same fixpoint the other roots use, so
+        // declaration order and an alias of an alias both work.
+        let result = extract(
+            r#"
+import type { Socket } from "socket.io";
+
+class Connection {
+  private socket: WorkerSocket;
+
+  register() {
+    this.socket.on("worker:ready", (msg) => this.ack(msg));
+  }
+}
+
+type WorkerSocket = ConnectedSocket;
+type ConnectedSocket = Socket<ClientToServer, ServerToClient>;
+"#,
+        );
+        assert_eq!(
+            keys(&result.listeners),
+            vec!["socket|CLIENT->SERVER|worker:ready"],
+            "an alias declared after use, and an alias of an alias, both resolve"
+        );
+    }
+
+    #[test]
+    fn an_alias_of_an_unrelated_type_is_not_a_root_type() {
+        // The alias only counts because its right-hand side is the socket
+        // type; a same-named alias of anything else stays inert.
+        let result = extract(
+            r#"
+import type { Socket } from "socket.io-client";
+import { io } from "socket.io-client";
+const probe = io(url);
+
+type SupervisorSocket = EventEmitter;
+
+class Controller {
+  private socket: SupervisorSocket;
+
+  start() {
+    this.socket.emit("run:start", {});
+  }
+}
+"#,
+        );
+        assert!(
+            result.is_empty(),
+            "an alias of a foreign type is not a socket, got {:?}",
+            keys(&result.emitters)
         );
     }
 
