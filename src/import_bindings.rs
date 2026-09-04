@@ -74,6 +74,15 @@ struct ModuleExports {
     forwarded: HashMap<String, (String, String)>,
     /// `export * from "./x"` specifiers, in source order.
     stars: Vec<String>,
+    /// Exported names this module declares as a TYPE (`export type X = …`,
+    /// `export { type X }`). Kept apart from `local` so a module that exports
+    /// a type and a value under one name cannot have either shadow the other
+    /// (carrick#670).
+    type_local: HashSet<String>,
+    /// Type-only re-exports: exported name → (module specifier, name inside
+    /// that module). `export type { X } from "./m"`, `export { type X } from
+    /// "./m"`.
+    type_forwarded: HashMap<String, (String, String)>,
 }
 
 /// Resolver with a per-file export-table cache. Parsing is the expensive part
@@ -139,6 +148,66 @@ impl BindingResolver {
     /// export), not a local binding.
     pub fn resolve_export(&mut self, file: &Path, export_name: &str) -> Option<ResolvedBinding> {
         self.follow(file, export_name)
+    }
+
+    /// Resolve a TYPE imported from `specifier` to the module that DECLARES
+    /// it, following the same re-export hops values follow (carrick#670).
+    ///
+    /// Types live in their own declaration space, so this walks the type
+    /// tables and never the value ones: a module that exports a type and a
+    /// value under one name resolves each independently. The caller gets the
+    /// declaring file and reads the declaration itself — deciding what a given
+    /// type MEANS is the caller's job, not the resolver's.
+    pub fn resolve_type(
+        &mut self,
+        importer: &Path,
+        specifier: &str,
+        exported_name: &str,
+    ) -> Option<PathBuf> {
+        let target = FileOrchestrator::resolve_relative_import(importer, specifier)?;
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        visited.insert(target.clone());
+        self.follow_type(target, exported_name.to_string(), 0, &mut visited)
+    }
+
+    fn follow_type(
+        &mut self,
+        file: PathBuf,
+        export_name: String,
+        hops: usize,
+        visited: &mut HashSet<PathBuf>,
+    ) -> Option<PathBuf> {
+        if hops > MAX_HOPS || visited.len() > MAX_VISITS {
+            return None;
+        }
+        let exports = self.exports_of(&file)?;
+
+        if let Some((specifier, upstream)) = exports.type_forwarded.get(&export_name).cloned() {
+            let next = FileOrchestrator::resolve_relative_import(&file, &specifier)?;
+            if !visited.insert(next.clone()) {
+                return None; // circular re-export
+            }
+            return self.follow_type(next, upstream, hops + 1, visited);
+        }
+
+        if exports.type_local.contains(&export_name) {
+            return Some(file);
+        }
+
+        // A plain `export * from "./m"` republishes types as well as values.
+        for specifier in exports.stars.clone() {
+            let Some(next) = FileOrchestrator::resolve_relative_import(&file, &specifier) else {
+                continue;
+            };
+            if !visited.insert(next.clone()) {
+                continue;
+            }
+            if let Some(found) = self.follow_type(next, export_name.clone(), hops + 1, visited) {
+                return Some(found);
+            }
+        }
+
+        None
     }
 
     /// Every name `file` publishes, deduplicated and sorted.
@@ -284,6 +353,11 @@ fn collect_exports(module: &swc_ecma_ast::Module) -> ModuleExports {
                         }
                     }
                 }
+                // `export type X = …` — a type export, tracked separately
+                // from the value table (carrick#670).
+                Decl::TsTypeAlias(alias) => {
+                    exports.type_local.insert(alias.id.sym.to_string());
+                }
                 _ => {}
             },
             // `export default function routes() {}`, `export default class C {}`
@@ -311,6 +385,32 @@ fn collect_exports(module: &swc_ecma_ast::Module) -> ModuleExports {
                 exports.local.insert(DEFAULT_EXPORT.to_string(), local);
             }
             ModuleDecl::ExportNamed(named) => {
+                // Type-only specifiers feed the TYPE tables, never the value
+                // ones: `export type { X } from "./m"` republishes a type.
+                for spec in &named.specifiers {
+                    let ExportSpecifier::Named(spec) = spec else {
+                        continue;
+                    };
+                    if !named.type_only && !spec.is_type_only {
+                        continue;
+                    }
+                    let upstream = export_name_string(&spec.orig);
+                    let exported = spec
+                        .exported
+                        .as_ref()
+                        .map(export_name_string)
+                        .unwrap_or_else(|| upstream.clone());
+                    match &named.src {
+                        Some(src) => {
+                            exports
+                                .type_forwarded
+                                .insert(exported, (src.value.to_string(), upstream));
+                        }
+                        None => {
+                            exports.type_local.insert(exported);
+                        }
+                    }
+                }
                 if named.type_only {
                     continue;
                 }

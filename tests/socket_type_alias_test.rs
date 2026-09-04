@@ -8,8 +8,12 @@
 //! imported names literally, so before the alias was resolved neither side
 //! produced a row at all.
 //!
+//! One file goes further and never names the socket type at all: it imports
+//! the alias its sibling declares, which the pass follows one hop through the
+//! binding resolver (carrick#670, second half).
+//!
 //! Every `__llm__` cassette is empty, so a row exists only if the
-//! deterministic socket pass emitted it. This test FAILS on main by
+//! deterministic socket pass emitted it. These tests FAIL on main by
 //! construction.
 
 use std::path::{Path, PathBuf};
@@ -139,4 +143,40 @@ fn alias_declared_sockets_meet_on_one_key() {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+#[test]
+fn an_imported_alias_is_followed_to_its_declaring_module() {
+    // `notifier.ts` imports the alias from `controller.ts` and never names the
+    // socket type, so this row exists only if the import hop ran.
+    let projection = scan_fixture();
+
+    find_op(
+        &projection,
+        "endpoints",
+        "socket|SERVER->CLIENT|run:notify",
+        "notifier.ts",
+    );
+    find_op(
+        &projection,
+        "calls",
+        "socket|SERVER->CLIENT|run:notify",
+        "workloadServer.ts",
+    );
+
+    let matches = projection["cross_repo_matches"]
+        .as_array()
+        .expect("projection has no `cross_repo_matches` array");
+    let key = "socket|SERVER->CLIENT|run:notify";
+    assert!(
+        matches
+            .iter()
+            .any(|m| m["producer_key"].as_str() == Some(key)
+                && m["consumer_key"].as_str() == Some(key)),
+        "{key} should match the alias-importing listener to its emitter; matched keys: {:?}",
+        matches
+            .iter()
+            .map(|m| m["producer_key"].as_str())
+            .collect::<Vec<_>>()
+    );
 }

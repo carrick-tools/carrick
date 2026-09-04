@@ -8,7 +8,11 @@ of the imported socket type, declared in the same file (carrick#670):
 - `services/gateway` aliases the per-connection server socket and registers
   the two handlers on a constructor parameter property declared with it.
 
-Before the alias was resolved, neither side produced a row, because the
-declared-type rule admitted only the imported names literally. Every `__llm__`
+`services/runner/src/notifier.ts` goes one step further: it never names the
+socket type at all, importing the alias its sibling declares and listening for
+`run:notify` on a field declared with it.
+
+Before the alias was resolved, none of the three files produced a row, because
+the declared-type rule admitted only the imported names literally. Every `__llm__`
 cassette is empty: the rows exist only if the deterministic socket pass emits
 them.
