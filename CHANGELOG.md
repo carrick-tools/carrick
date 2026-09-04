@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.35](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.34...carrick-v0.3.35) (2026-09-04)
+
+
+### Bug Fixes
+
+* **scanner:** resolve client-method call sites two import hops away and off `this` ([#657](https://github.com/carrick-tools/carrick/issues/657)) ([600e5bf](https://github.com/carrick-tools/carrick/commit/600e5bfdea3c122d60cf388d4844aa2d4e9da2d7))
+
+
+### Documentation
+
+* state the ownership boundary (agents merge and release; owner gates deploys and paid evals) ([#648](https://github.com/carrick-tools/carrick/issues/648)) ([fad0737](https://github.com/carrick-tools/carrick/commit/fad07371388c288056f8f8f2bd8e2fc8cb369a11))
+
 ## [0.3.34](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.33...carrick-v0.3.34) (2026-09-03)
 
 
