@@ -1,4 +1,4 @@
-import { mergeOptions, send } from "./send.js";
+import { mergeOptions, send, sendPage } from "./send.js";
 
 const ArtifactSchema = { kind: "upload" };
 
@@ -39,6 +39,22 @@ export class ApiClient {
     return send(ArtifactSchema, url.href, {
       headers: this.headers(),
     });
+  }
+
+  listArtifacts(page?: number) {
+    return sendPage(
+      ArtifactSchema,
+      `${this.baseUrl}/api/v1/artifacts`,
+      {
+        page,
+        limit: 20,
+      },
+      {
+        method: "GET",
+        headers: this.headers(),
+      },
+      mergeOptions(this.defaults, {})
+    );
   }
 
   private headers() {

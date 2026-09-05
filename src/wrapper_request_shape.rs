@@ -141,16 +141,29 @@ pub(crate) fn is_request_options(obj: &ObjectLit) -> bool {
     })
 }
 
-/// The object literal among a call's arguments, when exactly one argument is
-/// one. Two object-literal arguments (a payload plus an options bag) is not a
-/// shape this reads.
-pub(crate) fn sole_object_literal(call: &CallExpr) -> Option<(usize, &ObjectLit)> {
+/// The request-options bag among a call's arguments: the one object literal
+/// that carries a request-options key, whatever position it sits at and
+/// whatever else the call is passed.
+///
+/// This used to require the bag to be the call's ONLY object literal, which
+/// read a paginating helper — `page(Schema, url, { page, limit }, { method,
+/// headers }, …)` — as not a request at all, while the same client's plain
+/// helper one line below was read (carrick#675). A literal carrying none of
+/// the four keys states nothing about the request, so it cannot make the one
+/// that does ambiguous.
+///
+/// Two literals that BOTH carry a request-options key is still nothing this
+/// reads: a payload spelled `{ body: … }` beside a bag spelled `{ headers: … }`
+/// leaves which one configures the request a guess, and the call is dropped.
+pub(crate) fn request_options_argument(call: &CallExpr) -> Option<(usize, &ObjectLit)> {
     let mut found: Option<(usize, &ObjectLit)> = None;
     for (index, arg) in call.args.iter().enumerate() {
         if arg.spread.is_some() {
             continue;
         }
-        if let Expr::Object(obj) = &*arg.expr {
+        if let Expr::Object(obj) = &*arg.expr
+            && is_request_options(obj)
+        {
             if found.is_some() {
                 return None;
             }
@@ -166,7 +179,7 @@ pub(crate) fn sole_object_literal(call: &CallExpr) -> Option<(usize, &ObjectLit)
 /// `client.post(...)`), as the candidate scanner already recorded it.
 pub fn call_request_shape(call: &CallExpr, callee_property: Option<&str>) -> RequestShapeSignal {
     let verb = verb_from_callee_property(callee_property);
-    let options = sole_object_literal(call).filter(|(_, obj)| is_request_options(obj));
+    let options = request_options_argument(call);
 
     // Not request-shaped: no verb, no options bag. Response handling
     // (`response.json()`), config builders and everything else land here and

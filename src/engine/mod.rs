@@ -134,7 +134,13 @@ mod type_compat_v2;
 /// resolves and emits its consumer row, where a v17 cache holds no row at all
 /// for an unchanged consumer file in a monorepo whose client lives in a
 /// sibling package.
-const CACHE_VERSION: u32 = 18;
+/// 19: a client method whose request goes through a PAGINATING transport —
+/// a page bag beside the request-options bag, so the call carries two object
+/// literals — now states its request, and its call sites resolve to it
+/// (carrick#675). A v18 cache holds no row at all for an unchanged consumer
+/// file whose client lists a collection, while the same client's unpaginated
+/// methods have theirs.
+const CACHE_VERSION: u32 = 19;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
