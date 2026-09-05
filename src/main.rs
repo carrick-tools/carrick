@@ -10,6 +10,7 @@ mod config;
 mod engine;
 mod env_alias;
 mod eval_output;
+mod event_emitter;
 mod external_call_candidates;
 mod extractor;
 mod file_based_router;
