@@ -29,12 +29,82 @@ pub const ALLOW_PARTIAL_ENV: &str = "CARRICK_ALLOW_PARTIAL_ANALYSIS";
 /// How many lost files are named individually before the list is truncated.
 const MAX_NAMED_FILES: usize = 10;
 
+/// The counters themselves, owned rather than reached through the global.
+///
+/// Every rule about what a run lost lives on this value, so it can be built,
+/// filled and read in isolation. The process-global below is one instance of
+/// it, held for the duration of a scan; nothing about the policy needs the
+/// global, which is why the tests never touch it (carrick#683).
 #[derive(Default)]
 struct Registry {
     /// Files dispatched to the analyzer across every service in this run.
     attempted: usize,
     /// One entry per file the analyzer never answered for: (path, reason code).
     lost: Vec<(String, String)>,
+}
+
+impl Registry {
+    /// Adds a service's dispatched file count to the total.
+    fn record_files_attempted(&mut self, count: usize) {
+        self.attempted += count;
+    }
+
+    /// Records that `path` has no analysis, and why.
+    fn record_unanalysed_file(&mut self, path: &str, reason: &str) {
+        self.lost.push((path.to_string(), reason.to_string()));
+    }
+
+    /// How many files were lost.
+    fn lost_file_count(&self) -> usize {
+        self.lost.len()
+    }
+
+    /// One line naming what was lost and why, or `None` when nothing was.
+    ///
+    /// Grouped by reason and ordered most-frequent first, because the useful
+    /// fact is the cause: twelve files lost to one expired token is a different
+    /// incident from twelve lost to twelve different failures.
+    fn summary_line(&self) -> Option<String> {
+        if self.lost.is_empty() {
+            return None;
+        }
+
+        let mut by_reason: BTreeMap<&str, usize> = BTreeMap::new();
+        for (_, reason) in &self.lost {
+            *by_reason.entry(reason.as_str()).or_default() += 1;
+        }
+        let mut reasons: Vec<(&str, usize)> = by_reason.into_iter().collect();
+        reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        let reasons = reasons
+            .iter()
+            .map(|(reason, count)| format!("{} {}", count, reason))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut paths: Vec<&str> = self.lost.iter().map(|(path, _)| path.as_str()).collect();
+        paths.sort_unstable();
+        let named = paths
+            .iter()
+            .take(MAX_NAMED_FILES)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let and_more = if paths.len() > MAX_NAMED_FILES {
+            format!(" and {} more", paths.len() - MAX_NAMED_FILES)
+        } else {
+            String::new()
+        };
+
+        Some(format!(
+            "{} of {} files were not analysed: {}. Their endpoints and calls are missing \
+             from this run's results ({}{})",
+            self.lost.len(),
+            self.attempted,
+            reasons,
+            named,
+            and_more
+        ))
+    }
 }
 
 fn registry() -> &'static Mutex<Registry> {
@@ -45,7 +115,10 @@ fn registry() -> &'static Mutex<Registry> {
 /// Adds a service's dispatched file count to the run total. Called once per
 /// service, since a repo can hold several.
 pub fn record_files_attempted(count: usize) {
-    registry().lock().expect("scan health lock").attempted += count;
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .record_files_attempted(count);
 }
 
 /// Records that `path` has no analysis in this run's index, and why.
@@ -56,8 +129,7 @@ pub fn record_unanalysed_file(path: &str, reason: &str) {
     registry()
         .lock()
         .expect("scan health lock")
-        .lost
-        .push((path.to_string(), reason.to_string()));
+        .record_unanalysed_file(path, reason);
 }
 
 /// Reason code for a failed file analysis, for [`record_unanalysed_file`].
@@ -74,7 +146,10 @@ pub fn analysis_failure_reason(error: &(dyn std::error::Error + 'static)) -> Str
 
 /// How many files this run lost.
 pub fn lost_file_count() -> usize {
-    registry().lock().expect("scan health lock").lost.len()
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .lost_file_count()
 }
 
 /// How many files this run sent to the analyzer.
@@ -83,51 +158,8 @@ pub fn attempted_count() -> usize {
 }
 
 /// One line naming what the run lost and why, or `None` when it lost nothing.
-///
-/// Grouped by reason and ordered most-frequent first, because the useful fact
-/// is the cause: twelve files lost to one expired token is a different incident
-/// from twelve lost to twelve different failures.
 pub fn summary_line() -> Option<String> {
-    let guard = registry().lock().expect("scan health lock");
-    if guard.lost.is_empty() {
-        return None;
-    }
-
-    let mut by_reason: BTreeMap<&str, usize> = BTreeMap::new();
-    for (_, reason) in &guard.lost {
-        *by_reason.entry(reason.as_str()).or_default() += 1;
-    }
-    let mut reasons: Vec<(&str, usize)> = by_reason.into_iter().collect();
-    reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-    let reasons = reasons
-        .iter()
-        .map(|(reason, count)| format!("{} {}", count, reason))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let mut paths: Vec<&str> = guard.lost.iter().map(|(path, _)| path.as_str()).collect();
-    paths.sort_unstable();
-    let named = paths
-        .iter()
-        .take(MAX_NAMED_FILES)
-        .copied()
-        .collect::<Vec<_>>()
-        .join(", ");
-    let and_more = if paths.len() > MAX_NAMED_FILES {
-        format!(" and {} more", paths.len() - MAX_NAMED_FILES)
-    } else {
-        String::new()
-    };
-
-    Some(format!(
-        "{} of {} files were not analysed: {}. Their endpoints and calls are missing \
-         from this run's results ({}{})",
-        guard.lost.len(),
-        guard.attempted,
-        reasons,
-        named,
-        and_more
-    ))
+    registry().lock().expect("scan health lock").summary_line()
 }
 
 /// Whether [`ALLOW_PARTIAL_ENV`] is set for this run.
@@ -143,34 +175,36 @@ pub fn should_fail_run(lost: usize, allow_partial: bool) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) fn reset() {
-    let mut guard = registry().lock().expect("scan health lock");
-    guard.attempted = 0;
-    guard.lost.clear();
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent_service::AgentCallError;
 
+    /// Every test owns its counters. Nothing here reads the process-global, so
+    /// two of these running at once cannot see each other's numbers — which is
+    /// the race #683 fixed, and the reason there is no `reset()` to call.
+    fn run() -> Registry {
+        Registry::default()
+    }
+
     /// A run that lost nothing says nothing and passes.
     #[test]
     fn a_clean_run_has_no_summary_and_does_not_fail() {
-        reset();
-        record_files_attempted(120);
-        assert_eq!(summary_line(), None);
-        assert!(!should_fail_run(lost_file_count(), false));
+        let mut run = run();
+        run.record_files_attempted(120);
+        assert_eq!(run.summary_line(), None);
+        assert!(!should_fail_run(run.lost_file_count(), false));
     }
 
     /// The regression: one lost file must reach the summary AND the exit code.
     #[test]
     fn a_lost_file_is_named_and_fails_the_run() {
-        reset();
-        record_files_attempted(3);
-        record_unanalysed_file("src/routes/orders.ts", "gateway_error");
+        let mut run = run();
+        run.record_files_attempted(3);
+        run.record_unanalysed_file("src/routes/orders.ts", "gateway_error");
 
-        let summary = summary_line().expect("a lost file must produce a summary");
+        let summary = run
+            .summary_line()
+            .expect("a lost file must produce a summary");
         assert!(
             summary.starts_with("1 of 3 files were not analysed: 1 gateway_error"),
             "summary: {summary}"
@@ -179,27 +213,26 @@ mod tests {
             summary.contains("src/routes/orders.ts"),
             "summary: {summary}"
         );
-        assert!(should_fail_run(lost_file_count(), false));
+        assert!(should_fail_run(run.lost_file_count(), false));
         // Only an explicit opt-in keeps such a run green.
-        assert!(!should_fail_run(lost_file_count(), true));
-        reset();
+        assert!(!should_fail_run(run.lost_file_count(), true));
     }
 
     /// Reasons are grouped and ordered by how many files each cost, so the
     /// dominant cause is the first thing read.
     #[test]
     fn reasons_are_grouped_most_frequent_first() {
-        reset();
-        record_files_attempted(2987);
+        let mut run = run();
+        run.record_files_attempted(2987);
         for i in 0..8 {
-            record_unanalysed_file(&format!("a/{i}.ts"), "gateway_error");
+            run.record_unanalysed_file(&format!("a/{i}.ts"), "gateway_error");
         }
         for i in 0..3 {
-            record_unanalysed_file(&format!("b/{i}.ts"), "model_error");
+            run.record_unanalysed_file(&format!("b/{i}.ts"), "model_error");
         }
-        record_unanalysed_file("c/0.ts", "oidc_rejected");
+        run.record_unanalysed_file("c/0.ts", "oidc_rejected");
 
-        let summary = summary_line().unwrap();
+        let summary = run.summary_line().unwrap();
         assert!(
             summary.starts_with(
                 "12 of 2987 files were not analysed: 8 gateway_error, 3 model_error, \
@@ -209,7 +242,6 @@ mod tests {
         );
         // Twelve paths, ten named.
         assert!(summary.contains("and 2 more"), "summary: {summary}");
-        reset();
     }
 
     /// The reason comes from the cloud's own error code when there is one.
