@@ -4984,6 +4984,7 @@ mod tests {
                     emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
+                    resolution_source: None,
                 })
                 .collect(),
             data_calls: data_calls
@@ -5007,6 +5008,7 @@ mod tests {
                     loopback_default_url: None,
                     base: None,
                     consumers_not_resolved: None,
+                    resolution_source: None,
                 })
                 .collect(),
             graphql_operations: vec![],
@@ -5510,6 +5512,7 @@ mod tests {
                         emission_style: None,
                         primary_type_symbol: None,
                         type_import_source: None,
+                        resolution_source: None,
                     }],
                     data_calls: vec![],
                     graphql_operations: vec![],
@@ -7388,6 +7391,7 @@ mod tests {
             emission_style: None,
             primary_type_symbol: None,
             type_import_source: None,
+            resolution_source: None,
         }
     }
 

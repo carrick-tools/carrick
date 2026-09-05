@@ -125,6 +125,7 @@ fn test_file_analysis_result_structures() {
         emission_style: None,
         primary_type_symbol: None,
         type_import_source: None,
+        resolution_source: None,
     };
     assert_eq!(endpoint.method, "GET");
     assert_eq!(endpoint.path, "/:id");
@@ -149,6 +150,7 @@ fn test_file_analysis_result_structures() {
         loopback_default_url: None,
         base: None,
         consumers_not_resolved: None,
+        resolution_source: None,
     };
     assert_eq!(data_call.target, "https://api.example.com/users");
     assert_eq!(data_call.method, Some("POST".to_string()));
@@ -194,6 +196,7 @@ fn test_file_analysis_result_serialization() {
                 emission_style: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+                resolution_source: None,
             },
             EndpointResult {
                 candidate_id: "span:350-400".to_string(),
@@ -212,6 +215,7 @@ fn test_file_analysis_result_serialization() {
                 emission_style: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+                resolution_source: None,
             },
         ],
         data_calls: vec![DataCallResult {
@@ -233,6 +237,7 @@ fn test_file_analysis_result_serialization() {
             loopback_default_url: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         }],
     };
 
@@ -281,20 +286,16 @@ fn test_processing_stats_tracking() {
         files_parse_failed: 1,
         files_analysis_failed: 0,
         files_skipped_unrouted_protocol: 0,
-        imported_member_resolutions: 0,
-        imported_member_backfills: 0,
-        whole_url_env_backfills: 0,
-        whole_url_env_corrections: 0,
+        deterministic_rows_emitted: Default::default(),
+        model_rows_joined: 0,
+        model_contradictions_discarded: 0,
+        model_only_rows: 0,
+        unemitted_literal_candidates: 0,
         wrapper_method_propagations: 0,
         total_mounts: 3,
         total_endpoints: 10,
-        file_based_endpoints: 2,
-        route_descriptor_endpoints: 1,
-        class_controller_endpoints: 0,
         pubsub_anchor_backfills: 0,
         pubsub_phantom_topic_drops: 0,
-        request_spec_call_backfills: 0,
-        local_wrapper_call_backfills: 0,
         total_data_calls: 4,
         errors: vec!["Test error".to_string()],
     };
@@ -406,6 +407,7 @@ fn test_cross_file_import_resolution() {
                     emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
+                    resolution_source: None,
                 },
                 EndpointResult {
                     candidate_id: "span:510-540".to_string(),
@@ -424,6 +426,7 @@ fn test_cross_file_import_resolution() {
                     emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
+                    resolution_source: None,
                 },
                 EndpointResult {
                     candidate_id: "span:550-580".to_string(),
@@ -442,6 +445,7 @@ fn test_cross_file_import_resolution() {
                     emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
+                    resolution_source: None,
                 },
             ],
             data_calls: vec![],
@@ -474,6 +478,7 @@ fn test_cross_file_import_resolution() {
                     emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
+                    resolution_source: None,
                 },
                 EndpointResult {
                     candidate_id: "span:630-660".to_string(),
@@ -492,6 +497,7 @@ fn test_cross_file_import_resolution() {
                     emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
+                    resolution_source: None,
                 },
             ],
             data_calls: vec![],
@@ -546,6 +552,7 @@ fn test_data_call_extraction() {
                 loopback_default_url: None,
                 base: None,
                 consumers_not_resolved: None,
+                resolution_source: None,
             },
             DataCallResult {
                 call_kind: None,
@@ -566,6 +573,7 @@ fn test_data_call_extraction() {
                 loopback_default_url: None,
                 base: None,
                 consumers_not_resolved: None,
+                resolution_source: None,
             },
             DataCallResult {
                 call_kind: None,
@@ -586,6 +594,7 @@ fn test_data_call_extraction() {
                 loopback_default_url: None,
                 base: None,
                 consumers_not_resolved: None,
+                resolution_source: None,
             },
         ],
     };
@@ -693,6 +702,7 @@ fn test_nested_router_mounts() {
                 emission_style: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+                resolution_source: None,
             }],
             data_calls: vec![],
         },
@@ -733,6 +743,7 @@ fn test_multiple_http_methods_on_same_path() {
                 emission_style: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+                resolution_source: None,
             },
             EndpointResult {
                 candidate_id: "span:910-940".to_string(),
@@ -751,6 +762,7 @@ fn test_multiple_http_methods_on_same_path() {
                 emission_style: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+                resolution_source: None,
             },
             EndpointResult {
                 candidate_id: "span:950-980".to_string(),
@@ -769,6 +781,7 @@ fn test_multiple_http_methods_on_same_path() {
                 emission_style: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+                resolution_source: None,
             },
             EndpointResult {
                 candidate_id: "span:990-1020".to_string(),
@@ -787,6 +800,7 @@ fn test_multiple_http_methods_on_same_path() {
                 emission_style: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+                resolution_source: None,
             },
         ],
         data_calls: vec![],

@@ -21,7 +21,7 @@ use crate::{
     agents::{
         file_analyzer_agent::{
             DataCallResult, EmissionStyle, EndpointResult, FileAnalysisResult, FileAnalyzerAgent,
-            MountResult, PubsubOperation,
+            MountResult, PubsubOperation, ResolutionSource,
         },
         framework_guidance_agent::ProtocolGuidance,
     },
@@ -38,7 +38,7 @@ use crate::{
     framework_detector::DetectionResult,
     import_bindings::BindingResolver,
     imported_request_member::{
-        OwnedMember, RequestMember, RequestMemberIndex, ResolvedMember, UnfollowedMemberSites,
+        OwnedMember, RequestMemberIndex, ResolvedMember, UnfollowedMemberSites,
         collect_request_members, fold_indexes_with_conflicts,
     },
     local_http_wrapper::LocalWrapperCall,
@@ -64,7 +64,7 @@ use crate::{
     wrapper_request_shape::{self, RequestShapeSignal, WrapperRequestShape},
 };
 use futures::stream::StreamExt;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swc_common::{
     SourceMap,
@@ -115,18 +115,12 @@ pub struct ProcessingStats {
     pub files_skipped_unrouted_protocol: usize,
     pub total_mounts: usize,
     pub total_endpoints: usize,
-    /// Endpoints derived structurally from file-based routing conventions
-    /// (Next.js app router, etc.) rather than from a call-site scan. A subset
-    /// of `total_endpoints`.
-    pub file_based_endpoints: usize,
-    /// Endpoints derived deterministically from route-descriptor data
-    /// (`{ method, path, handler }` in a registry array) rather than from the
-    /// file-analyzer LLM. A subset of `total_endpoints`. See #234.
-    pub route_descriptor_endpoints: usize,
-    /// Endpoints derived deterministically by joining a route table's bound
-    /// path to the controller class the binding resolves to, across files. A
-    /// subset of `total_endpoints`. See #580.
-    pub class_controller_endpoints: usize,
+    /// Rows the deterministic layer stated for itself, per source. Counted
+    /// where they are emitted, so a route this scan derived from the file
+    /// layout and a call it read off an imported member are the same kind of
+    /// fact with two provenances. A subset of `total_endpoints` +
+    /// `total_data_calls`. See [`ResolutionSource`].
+    pub deterministic_rows_emitted: BTreeMap<ResolutionSource, usize>,
     /// Pub/sub operations asserted deterministically from the AST and merged in
     /// because the file-analyzer's extraction omitted them (carrick#387). The
     /// anchors themselves are computed for every gated file; only the ones the
@@ -138,31 +132,21 @@ pub struct ProcessingStats {
     /// a topic from a wrapper-function NAME (`publishStatusChanged` ->
     /// `status.changed`); the real op lives in the file that holds the literal.
     pub pubsub_phantom_topic_drops: usize,
-    /// Outbound calls asserted deterministically from a verb-named request
-    /// spec (`client.post({ url: "/v1/things" })`) and merged in because the
-    /// file-analyzer's extraction omitted them (#529). A subset of
-    /// `total_data_calls`.
-    pub request_spec_call_backfills: usize,
-    /// Outbound calls resolved through a request wrapper declared in the same
-    /// file and merged in because their call sites raise no candidate for the
-    /// file-analyzer to answer (carrick#588). A subset of `total_data_calls`.
-    pub local_wrapper_call_backfills: usize,
-    /// Data calls whose method and target were read off the imported member
-    /// they call, rather than left to extraction to infer from the consumer
-    /// file (carrick#588). A subset of `total_data_calls`.
-    pub imported_member_resolutions: usize,
-    /// Outbound calls asserted from the imported member they call and merged
-    /// in because extraction returned no row for their site at all
-    /// (carrick#623). A subset of `total_data_calls`.
-    pub imported_member_backfills: usize,
-    /// Outbound calls whose whole URL is read from an environment variable and
-    /// merged in because extraction returned no row for their site at all
-    /// (carrick#632). A subset of `total_data_calls`.
-    pub whole_url_env_backfills: usize,
-    /// Whole-URL env-var calls extraction DID answer, whose row was corrected
-    /// to what the binding's own AST states (carrick#632). A subset of
-    /// `total_data_calls`.
-    pub whole_url_env_corrections: usize,
+    /// Model rows that joined a deterministic row at their span and
+    /// contributed only what determinism did not state.
+    pub model_rows_joined: usize,
+    /// Model methods, targets and paths discarded because the source states
+    /// something else at the same span. Each one is logged with both values.
+    pub model_contradictions_discarded: usize,
+    /// Model rows kept as rows of their own: the only record of a shape no
+    /// deterministic source reads.
+    pub model_only_rows: usize,
+    /// Candidates that carry a route-shaped literal argument and a readable
+    /// verb, and that neither the deterministic layer nor the model produced a
+    /// row for. A bare `x.verb("/lit", arg)` states no producer/consumer role,
+    /// so emitting it would need a classification rule the scanner does not
+    /// have; this counts the gap rather than guessing at it.
+    pub unemitted_literal_candidates: usize,
     /// Wrapper-resolved data calls whose HTTP method was corrected from what
     /// extraction gave them to the method their wrapper module hardcodes
     /// (carrick-cloud#386). A subset of `total_data_calls`.
@@ -671,6 +655,79 @@ pub struct FileOrchestrator {
     swc_scanner: SwcScanner,
 }
 
+/// One statement the deterministic layer makes about one call site, before
+/// the model is asked anything.
+///
+/// Every HTTP candidate the gatekeeper raised is resolved into at most one
+/// of these, and they are the substrate: `emit_resolved_rows` turns them
+/// into rows, and `join_model_rows` folds the model's answer onto them.
+/// That is the inversion — a pass that fully resolves a candidate EMITS,
+/// so a model that says nothing about the file cannot lose the fact
+/// (carrick#623, #632, #641, #655 were all that bug).
+///
+/// `url` is the target string today. The structured URL resolver swaps a
+/// value in behind it without touching this seam.
+struct Resolved {
+    /// The HTTP verb the source states, upper-cased. `None` where the
+    /// source resolves the URL and not the verb.
+    method: Option<String>,
+    /// The target the source states, in the spelling the row persists.
+    url: String,
+    /// The call expression's span. `None` for a route the source declares
+    /// with no call site of its own (a file-based route, a route
+    /// descriptor, a class controller's method).
+    span: Option<(u32, u32)>,
+    line: i32,
+    source: ResolutionSource,
+    /// Whether this statement is a ROW when the model returns nothing at
+    /// its span. False for a statement that can only qualify a row the
+    /// model returns: the path a `new URL` gives a call whose verb is
+    /// unreadable has no verb to be indexed under.
+    emits: bool,
+    row: ResolvedRow,
+}
+
+/// The row shape a [`Resolved`] carries: the consumer side or the producer
+/// side. Boxed because the two variants differ in size by more than clippy
+/// will accept inline.
+enum ResolvedRow {
+    Call(Box<DataCallResult>),
+    Endpoint(Box<EndpointResult>),
+}
+
+impl ResolutionSource {
+    /// Which source wins when two claim one call site. Higher wins; the loser
+    /// is logged, never merged. The order is the one the pass sequence had
+    /// before this consolidation: the whole-URL correction ran last and
+    /// overwrote, the imported member ran before the request spec, and the
+    /// request spec overruled the `new URL` path.
+    fn precedence(self) -> u8 {
+        match self {
+            Self::WholeUrlEnv => 6,
+            Self::ImportedMember => 5,
+            Self::RequestSpec => 4,
+            Self::NewUrl => 3,
+            Self::SameFileWrapper => 2,
+            Self::FileBasedRoute | Self::DescriptorRoute | Self::ClassController => 1,
+            Self::InlineLiteral | Self::Model => 0,
+        }
+    }
+
+    /// Whether a model target that already CARRIES what this source states,
+    /// behind a base the model read for itself, is kept.
+    ///
+    /// A client built with a configured `baseURL` reports
+    /// `${API_URL}/v1/login` for a spec that states `/v1/login`: the same path
+    /// with the host classification needs in front of it, and the base is the
+    /// one thing the model knows that the source does not state at the site.
+    /// The sources that resolve a URL out of a BINDING have no such escape
+    /// hatch — there the model's target is a paraphrase of the same binding,
+    /// and the binding is the better witness.
+    fn keeps_a_baked_prefix(self) -> bool {
+        matches!(self, Self::RequestSpec | Self::NewUrl)
+    }
+}
+
 impl FileOrchestrator {
     pub fn new(agent_service: AgentService) -> Self {
         Self {
@@ -833,6 +890,11 @@ impl FileOrchestrator {
             /// stamped onto the rows that member DID produce, so a consumer
             /// listing can state what the join could not follow.
             unresolved_member_sites: Vec<(u32, String)>,
+            /// What the deterministic layer states about this file, computed
+            /// once every cross-file input it reads is in and before the model
+            /// is called. These become the file's rows; the model's answer is
+            /// joined onto them. See [`FileOrchestrator::resolve_candidates`].
+            resolved: Vec<Resolved>,
         }
 
         /// A zero-candidate file whose skip decision is deferred until the
@@ -1062,28 +1124,31 @@ impl FileOrchestrator {
             // route-descriptor endpoints are still recorded: they're derived
             // structurally and need no LLM.
             if http_candidates.is_empty() {
-                let structural_endpoints: Vec<EndpointResult> = route_endpoints
-                    .iter()
-                    .cloned()
-                    .chain(descriptor_endpoints.iter().cloned())
-                    .collect();
-                if !structural_endpoints.is_empty() {
+                if !route_endpoints.is_empty() || !descriptor_endpoints.is_empty() {
                     debug!(
                         "Structural route(s) (no call-site candidates): {} [{} file-based, {} route-descriptor]",
                         path_str,
                         route_endpoints.len(),
                         descriptor_endpoints.len()
                     );
-                    stats.total_endpoints += structural_endpoints.len();
-                    stats.file_based_endpoints += route_endpoints.len();
-                    stats.route_descriptor_endpoints += descriptor_endpoints.len();
-                    file_results.insert(
-                        path_str,
-                        FileAnalysisResult {
-                            endpoints: structural_endpoints,
-                            ..Default::default()
-                        },
+                    // The same emission every other deterministic row goes
+                    // through; this file simply never reaches a model to join.
+                    let mut result = FileAnalysisResult::default();
+                    let _ = Self::emit_resolved_rows(
+                        &mut result,
+                        Self::resolve_candidates(
+                            &HashMap::new(),
+                            &HashMap::new(),
+                            &[],
+                            &EnvAliasMap::new(),
+                            &WholeUrlFallbackMap::new(),
+                            &route_endpoints,
+                            &descriptor_endpoints,
+                        ),
+                        &mut stats.deterministic_rows_emitted,
                     );
+                    stats.total_endpoints += result.endpoints.len();
+                    file_results.insert(path_str, result);
                     continue;
                 } else if is_graphql_resolver_file {
                     // Fall through to the LLM pass with empty HTTP candidates:
@@ -1180,6 +1245,7 @@ impl FileOrchestrator {
                 receiver_origins: symbols.receiver_origins,
                 resolved_members: HashMap::new(),
                 unresolved_member_sites: Vec::new(),
+                resolved: Vec::new(),
             });
         }
 
@@ -1542,6 +1608,7 @@ impl FileOrchestrator {
                 receiver_origins: ReceiverOrigins::default(),
                 resolved_members: HashMap::new(),
                 unresolved_member_sites: Vec::new(),
+                resolved: Vec::new(),
             });
         }
 
@@ -1586,6 +1653,25 @@ impl FileOrchestrator {
                     &handler,
                 );
             }
+        }
+
+        // PHASE 1d: the deterministic layer. Every HTTP candidate, plus the
+        // routes and same-file wrapper sites that raise none, resolved into
+        // the rows the model's answer will be joined onto. Runs here because
+        // it reads what phases 1b and 1c produce (the imported-member join and
+        // the cross-file env aliases) and because it must run BEFORE the model
+        // is asked anything: a fact the source states outright is not the
+        // model's to lose by staying silent.
+        for pf in &mut pending {
+            pf.resolved = Self::resolve_candidates(
+                &pf.candidate_map,
+                &pf.resolved_members,
+                &pf.local_wrapper_calls,
+                &pf.env_alias_map,
+                &pf.whole_url_fallbacks,
+                &pf.route_endpoints,
+                &pf.descriptor_endpoints,
+            );
         }
 
         // PHASE 2 (concurrent, I/O-bound): dispatch the LLM calls. `AgentService` owns a
@@ -1644,52 +1730,44 @@ impl FileOrchestrator {
             .collect()
             .await;
 
-        // PHASE 3 (serial): fold the per-file results into the aggregate.
+        // PHASE 3 (serial): emit the deterministic rows for each file, join
+        // the model's answer onto them, and fold the result into the
+        // aggregate.
         for (pf, result) in analyzed {
             match result {
-                Ok(result) => {
+                Ok(model) => {
                     // Note: Type positions are now resolved by the TypeSidecar (src/sidecar)
                     // using the compiler-based approach instead of position-based extraction.
-
-                    let mut adjusted = result;
-                    Self::apply_candidate_map(&mut adjusted, &pf.candidate_map, &pf.path_str);
-                    // Read the method and target of a site that calls an
-                    // imported module's request member off that member
-                    // (carrick#588). Runs first among the post-extraction
-                    // passes: it states both facts outright, where the ones
-                    // below correct or backfill one of them.
-                    stats.imported_member_resolutions +=
-                        Self::apply_imported_members(&mut adjusted, &pf.resolved_members);
-                    // Then emit the resolved sites extraction returned no row
-                    // for at all (carrick#623). Immediately after the rewrite
-                    // above, so the coverage test below reads the rows
-                    // extraction produced and nothing a later pass appends.
-                    stats.imported_member_backfills += Self::merge_imported_member_calls(
+                    //
+                    // The deterministic rows are the substrate. Emission runs
+                    // first, so a candidate the source fully resolves is a row
+                    // whatever the model says, and the join by span decides
+                    // what the model adds to it.
+                    let mut adjusted = FileAnalysisResult::default();
+                    let overrules = Self::emit_resolved_rows(
                         &mut adjusted,
-                        &pf.resolved_members,
-                        &pf.candidate_map,
+                        pf.resolved,
+                        &mut stats.deterministic_rows_emitted,
                     );
+                    Self::join_model_rows(
+                        &mut adjusted,
+                        model,
+                        &pf.candidate_map,
+                        &overrules,
+                        &pf.path_str,
+                        &mut stats,
+                    );
+
                     // Carry the wrapper's own request shape onto the sites that
-                    // delegate to it (carrick-cloud#386). Runs immediately after
-                    // `apply_candidate_map` because that is what stamps the span
-                    // this reads to tell a delegating site from a real client
-                    // call, and before every downstream method reader.
+                    // delegate to it (carrick-cloud#386). Runs first among the
+                    // passes over the joined rows, because it tells a
+                    // delegating site from a real client call by the absence of
+                    // a span — which the join is what settles — and every
+                    // downstream method reader depends on the answer.
                     stats.wrapper_method_propagations += Self::propagate_wrapper_request_shape(
                         &mut adjusted,
                         pf.wrapper_request_shape.as_ref(),
                     );
-                    // Merge the outbound calls that reach their endpoint
-                    // through a request wrapper declared in this same file
-                    // (carrick#588). Their sites raise no candidate, so
-                    // extraction was never asked about them and without this
-                    // the endpoints they reach are absent from the index
-                    // entirely. Merged HERE, before the fold below, so these
-                    // rows go through the same normalization the analyzer's
-                    // do: a wrapper that interpolates an env-var base emits
-                    // `${ALIAS}/things`, and alias resolution is what turns
-                    // that into the `process.env` name matching keys on.
-                    stats.local_wrapper_call_backfills +=
-                        Self::merge_local_wrapper_calls(&mut adjusted, pf.local_wrapper_calls);
                     // Collapse inline env-var fallbacks the model rendered
                     // verbatim (`${A ?? "http://localhost"}/p` -> `${A}/p`,
                     // carrick#399) BEFORE alias resolution: a local alias with
@@ -1706,27 +1784,6 @@ impl FileOrchestrator {
                         &pf.whole_url_fallbacks,
                         &pf.literal_bases,
                     );
-                    // Then emit the whole-URL sites that resolution had no row
-                    // to rewrite (carrick#632). Immediately after the rewrite
-                    // above, so both sides of the coverage test are in the
-                    // resolved `${process.env.NAME}/path` form and nothing a
-                    // later pass appends is read as covering a site.
-                    //
-                    // The general rule these three backfills share: a pass
-                    // that fully resolves a candidate must EMIT, not only
-                    // patch. Patching is enough while extraction is wrong
-                    // about a site; it does nothing at all when extraction is
-                    // silent about it, which is the more common failure and
-                    // the one that leaves the endpoint absent from the index
-                    // rather than merely mis-stated.
-                    let (backfilled, corrected) = Self::merge_whole_url_env_calls(
-                        &mut adjusted,
-                        &pf.candidate_map,
-                        &pf.env_alias_map,
-                        &pf.whole_url_fallbacks,
-                    );
-                    stats.whole_url_env_backfills += backfilled;
-                    stats.whole_url_env_corrections += corrected;
                     Self::validate_type_hints(&mut adjusted, &pf.symbol_table);
                     Self::normalize_unusable_types(&mut adjusted, &framework_detection.frameworks);
 
@@ -1759,18 +1816,6 @@ impl FileOrchestrator {
                     // form between non-deterministic scans.
                     Self::canonicalize_endpoint_paths(&mut adjusted);
 
-                    // Merge file-based route endpoints the LLM pass didn't already
-                    // produce. The structural (method, path) facts are authoritative.
-                    stats.file_based_endpoints +=
-                        Self::merge_file_based_endpoints(&mut adjusted, pf.route_endpoints);
-
-                    // Merge route-descriptor endpoints (`{ method, path, handler }`
-                    // data) the LLM pass didn't produce — it ignores route-as-data,
-                    // so these are emitted deterministically and are authoritative
-                    // for such routes (#234).
-                    stats.route_descriptor_endpoints +=
-                        Self::merge_file_based_endpoints(&mut adjusted, pf.descriptor_endpoints);
-
                     // Drop LLM-emitted pub/sub ops whose topic has no literal
                     // witness in the file's source (carrick#311): the analyzer
                     // occasionally invents a topic from a wrapper-function
@@ -1788,21 +1833,13 @@ impl FileOrchestrator {
                     stats.pubsub_anchor_backfills +=
                         Self::merge_pubsub_anchor_ops(&mut adjusted, pf.pubsub_anchor_ops);
 
-                    // Merge the outbound calls a verb-named request spec states
-                    // outright (`client.post({ url: "/v1/things" })`) and the
-                    // extraction did not report (#529). Runs after
-                    // `apply_candidate_map` so the coverage check reads the
-                    // model's calls already re-anchored to their spec.
-                    stats.request_spec_call_backfills +=
-                        Self::merge_request_spec_calls(&mut adjusted, &pf.candidate_map);
-
                     // carrick#656: what the join could not follow in THIS
                     // file, less the sites that turned out to be route
                     // definitions. A route registration whose verb happens to
                     // name a request member (`app.get` against a client's
                     // `get`) is a producer, not a consumer that went
-                    // unfollowed — the same exclusion `merge_imported_member_calls`
-                    // applies before it emits a row.
+                    // unfollowed — the same exclusion the emission applies
+                    // before it states a row.
                     for (span, name) in &pf.unresolved_member_sites {
                         if adjusted
                             .endpoints
@@ -1873,9 +1910,12 @@ impl FileOrchestrator {
                 bindings,
             ));
         }
-        let class_controller_added =
-            Self::merge_class_controller_endpoints(&mut file_results, files, class_controller_rows);
-        stats.class_controller_endpoints += class_controller_added;
+        let class_controller_added = Self::emit_class_controller_endpoints(
+            &mut file_results,
+            files,
+            class_controller_rows,
+            &mut stats.deterministic_rows_emitted,
+        );
         stats.total_endpoints += class_controller_added;
 
         debug!("\n=== FILE PROCESSING COMPLETE ===");
@@ -1893,42 +1933,19 @@ impl FileOrchestrator {
         }
         debug!("  - Total mounts: {}", stats.total_mounts);
         debug!("  - Total endpoints: {}", stats.total_endpoints);
-        debug!(
-            "  - File-based route endpoints: {}",
-            stats.file_based_endpoints
-        );
-        debug!(
-            "  - Route-descriptor endpoints: {}",
-            stats.route_descriptor_endpoints
-        );
-        debug!(
-            "  - Class-controller endpoints: {}",
-            stats.class_controller_endpoints
-        );
         debug!("  - Total data calls: {}", stats.total_data_calls);
+        for (source, count) in &stats.deterministic_rows_emitted {
+            debug!("  - Deterministic rows ({source:?}): {count}");
+        }
+        debug!("  - Model rows joined: {}", stats.model_rows_joined);
         debug!(
-            "  - Request-spec call backfills: {}",
-            stats.request_spec_call_backfills
+            "  - Model statements discarded as contradictions: {}",
+            stats.model_contradictions_discarded
         );
+        debug!("  - Model-only rows: {}", stats.model_only_rows);
         debug!(
-            "  - Same-file wrapper call backfills: {}",
-            stats.local_wrapper_call_backfills
-        );
-        debug!(
-            "  - Imported-member resolutions: {}",
-            stats.imported_member_resolutions
-        );
-        debug!(
-            "  - Imported-member call backfills: {}",
-            stats.imported_member_backfills
-        );
-        debug!(
-            "  - Whole-URL env-var call backfills: {}",
-            stats.whole_url_env_backfills
-        );
-        debug!(
-            "  - Whole-URL env-var call corrections: {}",
-            stats.whole_url_env_corrections
+            "  - Literal candidates neither layer stated a row for: {}",
+            stats.unemitted_literal_candidates
         );
         debug!(
             "  - Wrapper method propagations: {}",
@@ -4017,6 +4034,7 @@ impl FileOrchestrator {
                             emission_style: None,
                             primary_type_symbol: None,
                             type_import_source: None,
+                            resolution_source: None,
                         })
                         .collect::<Vec<_>>()
                 })
@@ -4071,6 +4089,7 @@ impl FileOrchestrator {
                     emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
+                    resolution_source: None,
                 }
             })
             .collect()
@@ -4155,6 +4174,7 @@ impl FileOrchestrator {
                         emission_style: None,
                         primary_type_symbol: None,
                         type_import_source: None,
+                        resolution_source: None,
                     },
                 ));
             }
@@ -4162,23 +4182,21 @@ impl FileOrchestrator {
         endpoints
     }
 
-    /// Merge the class-controller endpoints of a whole pass into `file_results`,
-    /// keyed by the controller module each one belongs to (#580 part b).
+    /// Emit the routes a route table binds to an imported controller class
+    /// (#580 part b), into the results of the CONTROLLER modules they belong
+    /// to.
     ///
-    /// Runs after every file's own result is in, so a controller's rows are
-    /// never overwritten by the pass that analyses that controller file. The
-    /// `file_results` key for a controller is the key its own file was analysed
-    /// under — resolved canonically, because a key and a resolved import can
-    /// name the same file by different paths — so a controller that also
-    /// carries call-site endpoints keeps one entry, not two.
-    ///
-    /// Returns the number of endpoints added.
-    fn merge_class_controller_endpoints(
+    /// Cross-file, so it runs once every file's own result is in — a
+    /// controller's rows must survive the pass that analysed the controller
+    /// file — but the rows themselves go through the same emission as every
+    /// other deterministic row, deduped against whatever is already there.
+    fn emit_class_controller_endpoints(
         file_results: &mut HashMap<String, FileAnalysisResult>,
         // The files this pass scanned, so a controller module that produced no
         // result of its own is still keyed the way every other file is.
         scanned_files: &[PathBuf],
         endpoints: Vec<(PathBuf, EndpointResult)>,
+        emitted: &mut BTreeMap<ResolutionSource, usize>,
     ) -> usize {
         let mut key_by_canonical: HashMap<PathBuf, String> = HashMap::new();
         for file in scanned_files {
@@ -4188,48 +4206,25 @@ impl FileOrchestrator {
         }
 
         let mut added = 0;
-        for (controller_file, endpoint) in endpoints {
+        for (controller_file, mut endpoint) in endpoints {
             let key = key_by_canonical
                 .get(&controller_file)
                 .cloned()
                 .unwrap_or_else(|| controller_file.to_string_lossy().to_string());
             let result = file_results.entry(key).or_default();
-            // Deduped on method + path + line, not method + path: one class
-            // legitimately serves the same method at several paths, and the
-            // line is what distinguishes this row's handler from another
-            // extraction of the same route. A row already at this exact
-            // position is the same fact twice.
-            let duplicate = result.endpoints.iter().any(|existing| {
-                existing.method.eq_ignore_ascii_case(&endpoint.method)
-                    && existing.path == endpoint.path
-                    && existing.line_number == endpoint.line_number
-            });
-            if !duplicate {
-                result.endpoints.push(endpoint);
-                added += 1;
-            }
-        }
-        added
-    }
-
-    /// Append structurally derived endpoints (file-based routes and
-    /// route-descriptor data) the LLM pass didn't already produce (matched by
-    /// method + path), keeping the deterministic entries. Returns the number
-    /// actually added.
-    fn merge_file_based_endpoints(
-        result: &mut FileAnalysisResult,
-        route_endpoints: Vec<EndpointResult>,
-    ) -> usize {
-        let mut added = 0;
-        for ep in route_endpoints {
-            let duplicate = result
-                .endpoints
-                .iter()
-                .any(|e| e.method.eq_ignore_ascii_case(&ep.method) && e.path == ep.path);
-            if !duplicate {
-                result.endpoints.push(ep);
-                added += 1;
-            }
+            let before = result.endpoints.len();
+            endpoint.resolution_source = Some(ResolutionSource::ClassController);
+            let resolved = Resolved {
+                method: Some(endpoint.method.clone()),
+                url: endpoint.path.clone(),
+                span: None,
+                line: endpoint.line_number,
+                source: ResolutionSource::ClassController,
+                emits: true,
+                row: ResolvedRow::Endpoint(Box::new(endpoint)),
+            };
+            let _ = Self::emit_resolved_rows(result, vec![resolved], emitted);
+            added += result.endpoints.len() - before;
         }
         added
     }
@@ -4346,70 +4341,695 @@ impl FileOrchestrator {
         }
     }
 
-    fn apply_candidate_map(
-        result: &mut FileAnalysisResult,
+    /// Resolve every HTTP candidate in one file, plus the routes and wrapper
+    /// sites the file states without a candidate, into the deterministic rows
+    /// the model's answer will be joined onto.
+    ///
+    /// Runs after the cross-file passes that feed it (the env-alias merge and
+    /// the imported-member join) and before the model dispatch. One statement
+    /// per call site: where two sources claim one span the higher precedence
+    /// wins and the loser is logged.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_candidates(
         candidate_map: &HashMap<String, CandidateTarget>,
-        file_path: &str,
-    ) {
-        // Endpoints: keep filter_map (endpoints without candidates are unreliable),
-        // but a drop means an endpoint the LLM reported vanishes from the index —
-        // log which, so silent loss is at least diagnosable.
-        let mut dropped_endpoints: Vec<String> = Vec::new();
-        result.endpoints = result
-            .endpoints
-            .drain(..)
-            .filter_map(|mut endpoint| {
-                let Some(candidate) = candidate_map.get(&endpoint.candidate_id) else {
-                    dropped_endpoints.push(format!(
-                        "{} {} (candidate_id '{}')",
-                        endpoint.method, endpoint.path, endpoint.candidate_id
-                    ));
-                    return None;
-                };
-                endpoint.line_number = candidate.line_number as i32;
-                endpoint.call_expression_span_start = Some(candidate.span_start);
-                endpoint.call_expression_span_end = Some(candidate.span_end);
-                Self::reanchor_endpoint_path(&mut endpoint, candidate, file_path);
-                Some(endpoint)
-            })
-            .collect();
+        resolved_members: &HashMap<u32, ResolvedMember>,
+        local_wrapper_calls: &[LocalWrapperCall],
+        aliases: &EnvAliasMap,
+        whole_url_fallbacks: &WholeUrlFallbackMap,
+        route_endpoints: &[EndpointResult],
+        descriptor_endpoints: &[EndpointResult],
+    ) -> Vec<Resolved> {
+        // Keyed by the span START, which is the join key: a chained call
+        // (`client.cancelRun(id).catch(fn)`) raises a candidate per link and
+        // every link shares the receiver's start offset, so the links are one
+        // outbound request and the innermost of them is the one that makes it.
+        let mut by_span: BTreeMap<u32, Resolved> = BTreeMap::new();
+        let mut claim = |resolved: Resolved| {
+            let Some((start, end)) = resolved.span else {
+                return;
+            };
+            if let Some(held) = by_span.get(&start) {
+                let held_end = held.span.map(|(_, end)| end).unwrap_or(u32::MAX);
+                let outranked = resolved.source.precedence() > held.source.precedence();
+                let inner = resolved.source == held.source && end < held_end;
+                if !outranked && !inner {
+                    debug!(
+                        "Two sources state the call at span {start}: keeping {:?} {} {}, dropping {:?} {} {}",
+                        held.source,
+                        held.method.as_deref().unwrap_or("<unstated>"),
+                        held.url,
+                        resolved.source,
+                        resolved.method.as_deref().unwrap_or("<unstated>"),
+                        resolved.url,
+                    );
+                    return;
+                }
+            }
+            by_span.insert(start, resolved);
+        };
 
-        if !dropped_endpoints.is_empty() {
+        let mut candidates: Vec<&CandidateTarget> = candidate_map
+            .values()
+            .filter(|candidate| candidate.protocol == Protocol::Http)
+            .collect();
+        candidates.sort_by_key(|candidate| (candidate.span_start, candidate.span_end));
+
+        for candidate in candidates {
+            let line = i32::try_from(candidate.line_number).unwrap_or(i32::MAX);
+            let span = Some((candidate.span_start, candidate.span_end));
+
+            // A binding that holds the WHOLE request URL, read from an
+            // environment variable (carrick#572/#632). The method has to be
+            // the call's own literal: the site states no path, so a verb
+            // inferred from anything else would index the wrong operation.
+            if let RequestShapeSignal::Known(shape) = &candidate.request_shape
+                && let Some(snippet) = candidate.path_snippet.as_deref()
+                && let Some(target) =
+                    resolve_whole_url_target(snippet, aliases, whole_url_fallbacks)
+            {
+                let local_default = whole_url_local_default(snippet, aliases, whole_url_fallbacks);
+                claim(Resolved {
+                    method: Some(shape.method.clone()),
+                    url: target.clone(),
+                    span,
+                    line,
+                    source: ResolutionSource::WholeUrlEnv,
+                    emits: true,
+                    row: ResolvedRow::Call(Box::new(Self::deterministic_call(
+                        candidate,
+                        line,
+                        target,
+                        Some(shape.method.clone()),
+                        ResolutionSource::WholeUrlEnv,
+                        local_default,
+                    ))),
+                });
+            }
+
+            // A request member of an imported same-repo module
+            // (carrick#588/#623/#655). Both facts are literals in the member's
+            // own source.
+            if let Some(resolved) = resolved_members.get(&candidate.span_start) {
+                let member = &resolved.member;
+                claim(Resolved {
+                    method: Some(member.method.clone()),
+                    url: member.target.clone(),
+                    span,
+                    line,
+                    source: ResolutionSource::ImportedMember,
+                    emits: true,
+                    row: ResolvedRow::Call(Box::new(Self::deterministic_call(
+                        candidate,
+                        line,
+                        member.target.clone(),
+                        Some(member.method.clone()),
+                        ResolutionSource::ImportedMember,
+                        None,
+                    ))),
+                });
+            }
+
+            // A request spec: method and URL written as data on the call's
+            // own object argument (#537/#529). Both are AST facts, so neither
+            // is the model's to decide.
+            if let Some(spec) = candidate.request_spec.as_ref() {
+                claim(Resolved {
+                    method: Some(spec.method.clone()),
+                    url: spec.url.clone(),
+                    span,
+                    line,
+                    source: ResolutionSource::RequestSpec,
+                    // Only the verb-from-callee form is a row of its own. A
+                    // bare `{ method, url }` object can equally be a
+                    // producer's route descriptor, so it stays the model's to
+                    // classify and only overrules what the model returns.
+                    emits: spec.method_from_callee,
+                    row: ResolvedRow::Call(Box::new(Self::deterministic_call(
+                        candidate,
+                        line,
+                        spec.url.clone(),
+                        Some(spec.method.clone()),
+                        ResolutionSource::RequestSpec,
+                        None,
+                    ))),
+                });
+            }
+
+            // The path a `new URL(path, base)` states for the target
+            // (carrick#610). The base stays opaque, so the call matches by
+            // route path like every other host-free call. A site whose verb is
+            // not readable off its own options bag states no row — the same
+            // rule the whole-URL source above applies — but it still overrules
+            // the path of the row the model returns.
+            if let Some(path) = candidate.new_url_path.as_deref() {
+                let method = match &candidate.request_shape {
+                    RequestShapeSignal::Known(shape) => Some(shape.method.clone()),
+                    _ => None,
+                };
+                claim(Resolved {
+                    method: method.clone(),
+                    url: path.to_string(),
+                    span,
+                    line,
+                    source: ResolutionSource::NewUrl,
+                    emits: method.is_some(),
+                    row: ResolvedRow::Call(Box::new(Self::deterministic_call(
+                        candidate,
+                        line,
+                        path.to_string(),
+                        method,
+                        ResolutionSource::NewUrl,
+                        None,
+                    ))),
+                });
+            }
+        }
+
+        // A request wrapper declared in the SAME file, called with the path as
+        // an argument (carrick#588). These sites raise no candidate at all —
+        // the callee is a local identifier and the path is not the first
+        // argument — so the model was never asked about them.
+        for call in local_wrapper_calls {
+            let line = i32::try_from(call.line_number).unwrap_or(i32::MAX);
+            claim(Resolved {
+                method: call.method.clone(),
+                url: call.target.clone(),
+                span: Some((call.span_start, call.span_end)),
+                line,
+                source: ResolutionSource::SameFileWrapper,
+                emits: true,
+                row: ResolvedRow::Call(Box::new(DataCallResult {
+                    candidate_id: format!("span:{}-{}", call.span_start, call.span_end),
+                    line_number: line,
+                    target: call.target.clone(),
+                    method: call.method.clone(),
+                    // Classification is judgment, not an AST fact: the target
+                    // is the wrapper's own URL expression, with no host to
+                    // classify from beyond what the wrapper closes over.
+                    call_kind: None,
+                    pattern_matched: call.wrapper_name.clone(),
+                    // The span is the SITE's, which is what the type sidecar
+                    // anchors on and what marks this call candidate-backed
+                    // downstream.
+                    call_expression_span_start: Some(call.span_start),
+                    call_expression_span_end: Some(call.span_end),
+                    call_expression_text: None,
+                    call_expression_line: Some(line),
+                    payload_expression_text: None,
+                    payload_expression_line: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                    loopback_default_url: None,
+                    base: None,
+                    consumers_not_resolved: None,
+                    resolution_source: Some(ResolutionSource::SameFileWrapper),
+                })),
+            });
+        }
+
+        let mut resolved: Vec<Resolved> = by_span.into_values().collect();
+
+        // Routes the source declares without a call site: their path and
+        // method are read off the file layout or off route data, so there is
+        // no span for them to join on and nothing for the model to contradict.
+        for (endpoints, source) in [
+            (route_endpoints, ResolutionSource::FileBasedRoute),
+            (descriptor_endpoints, ResolutionSource::DescriptorRoute),
+        ] {
+            for endpoint in endpoints {
+                let mut endpoint = endpoint.clone();
+                endpoint.resolution_source = Some(source);
+                resolved.push(Resolved {
+                    method: Some(endpoint.method.clone()),
+                    url: endpoint.path.clone(),
+                    span: None,
+                    line: endpoint.line_number,
+                    source,
+                    emits: true,
+                    row: ResolvedRow::Endpoint(Box::new(endpoint)),
+                });
+            }
+        }
+        resolved
+    }
+
+    /// The row shape every candidate-backed deterministic call shares.
+    ///
+    /// `pattern_matched` is the client the scanner saw, which is what the row
+    /// displays as its handler; a receiver that is an expression rather than a
+    /// name has no name to show, so the generic tag stands in for it.
+    fn deterministic_call(
+        candidate: &CandidateTarget,
+        line: i32,
+        target: String,
+        method: Option<String>,
+        source: ResolutionSource,
+        loopback_default_url: Option<String>,
+    ) -> DataCallResult {
+        let pattern_matched = match source {
+            ResolutionSource::RequestSpec if candidate.callee_object.starts_with('<') => {
+                // The receiver is an expression, not a name (the
+                // `(options?.client ?? client)` shape).
+                "http-client".to_string()
+            }
+            ResolutionSource::RequestSpec => candidate.callee_object.clone(),
+            _ => candidate
+                .callee_property
+                .clone()
+                .unwrap_or_else(|| candidate.callee_object.clone()),
+        };
+        DataCallResult {
+            candidate_id: candidate.candidate_id.clone(),
+            line_number: line,
+            target,
+            method,
+            // Classification is judgment, not an AST fact: these targets are
+            // bare paths, or origins the environment supplies.
+            call_kind: None,
+            pattern_matched,
+            // The span is what the type sidecar anchors on, and it is also
+            // what marks this call candidate-backed downstream.
+            call_expression_span_start: Some(candidate.span_start),
+            call_expression_span_end: Some(candidate.span_end),
+            call_expression_text: None,
+            call_expression_line: Some(line),
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(source),
+        }
+    }
+
+    /// Put the deterministic rows into the file's result, in source order.
+    ///
+    /// One row per span. A route that duplicates one already present is
+    /// dropped rather than doubled: two structural sources can state the same
+    /// route (a file-based route the descriptor pass also reads), and the
+    /// cross-file controller join runs against results that already hold the
+    /// model's rows.
+    /// Returns the statements that are NOT rows of their own — a config-object
+    /// request spec, a `new URL` path at a site whose verb is unreadable —
+    /// which the join applies to whatever the model returns at their span.
+    fn emit_resolved_rows(
+        result: &mut FileAnalysisResult,
+        resolved: Vec<Resolved>,
+        emitted: &mut BTreeMap<ResolutionSource, usize>,
+    ) -> Vec<Resolved> {
+        let mut overrules = Vec::new();
+        for entry in resolved {
+            if !entry.emits {
+                overrules.push(entry);
+                continue;
+            }
+            match entry.row {
+                ResolvedRow::Call(call) => {
+                    let duplicate = call.call_expression_span_start.is_some_and(|span| {
+                        result
+                            .data_calls
+                            .iter()
+                            .any(|existing| existing.call_expression_span_start == Some(span))
+                    });
+                    if duplicate {
+                        continue;
+                    }
+                    debug!(
+                        "Emitting {:?} call: {} {} at line {}",
+                        entry.source,
+                        entry.method.as_deref().unwrap_or("<unstated>"),
+                        entry.url,
+                        entry.line
+                    );
+                    result.data_calls.push(*call);
+                }
+                ResolvedRow::Endpoint(endpoint) => {
+                    // Deduped on method + path, and additionally on the line
+                    // for a class controller: one class legitimately serves
+                    // the same method at several paths, and the line is what
+                    // distinguishes this row's handler from another extraction
+                    // of the same route.
+                    let canonical = Self::canonicalize_route_path(&endpoint.path);
+                    let duplicate = result.endpoints.iter().any(|existing| {
+                        existing.method.eq_ignore_ascii_case(&endpoint.method)
+                            && Self::canonicalize_route_path(&existing.path) == canonical
+                            && (entry.source != ResolutionSource::ClassController
+                                || existing.line_number == endpoint.line_number)
+                    });
+                    if duplicate {
+                        continue;
+                    }
+                    debug!(
+                        "Emitting {:?} route: {} {} at line {}",
+                        entry.source, endpoint.method, endpoint.path, entry.line
+                    );
+                    result.endpoints.push(*endpoint);
+                }
+            }
+            *emitted.entry(entry.source).or_insert(0) += 1;
+        }
+        overrules
+    }
+
+    /// Fold the model's answer for one file onto the deterministic rows
+    /// already emitted for it.
+    ///
+    /// The key is the candidate's span START (the same key every span-joined
+    /// pass in this file uses, because a chained call's links share it). Where
+    /// a deterministic row holds that span, the model contributes only what
+    /// determinism did not state, and a method or target that contradicts it
+    /// is logged and discarded. A model row whose `candidate_id` joins no
+    /// candidate keeps no span, exactly as before, and is placed by its line.
+    /// A model row with no deterministic twin is kept as its own row.
+    fn join_model_rows(
+        result: &mut FileAnalysisResult,
+        model: FileAnalysisResult,
+        candidate_map: &HashMap<String, CandidateTarget>,
+        overrules: &[Resolved],
+        file_path: &str,
+        stats: &mut ProcessingStats,
+    ) {
+        let FileAnalysisResult {
+            mounts,
+            endpoints,
+            data_calls,
+            graphql_operations,
+            pubsub_operations,
+            graphql_consumer_locates,
+        } = model;
+        // Everything the deterministic layer states nothing about travels
+        // through unchanged.
+        result.mounts = mounts;
+        result.graphql_operations = graphql_operations;
+        result.pubsub_operations = pubsub_operations;
+        result.graphql_consumer_locates = graphql_consumer_locates;
+
+        // --- the producer side -------------------------------------------
+        //
+        // An endpoint whose `candidate_id` joins nothing is dropped: without a
+        // candidate behind it there is no evidence the registration exists.
+        let mut dropped: Vec<String> = Vec::new();
+        for mut endpoint in endpoints {
+            let Some(candidate) = candidate_map.get(&endpoint.candidate_id) else {
+                dropped.push(format!(
+                    "{} {} (candidate_id '{}')",
+                    endpoint.method, endpoint.path, endpoint.candidate_id
+                ));
+                continue;
+            };
+            endpoint.line_number = candidate.line_number as i32;
+            endpoint.call_expression_span_start = Some(candidate.span_start);
+            endpoint.call_expression_span_end = Some(candidate.span_end);
+            endpoint.resolution_source = Some(ResolutionSource::Model);
+            if let Some(literal) = Self::inline_literal_path(&endpoint.path, candidate) {
+                warn!(
+                    "[FileOrchestrator] Re-anchored endpoint path '{}' to registration literal '{}' ({}:{})",
+                    endpoint.path, literal, file_path, candidate.line_number
+                );
+                endpoint.path = literal;
+                endpoint.resolution_source = Some(ResolutionSource::InlineLiteral);
+                stats.model_contradictions_discarded += 1;
+            }
+            // A structural route the deterministic layer already stated. The
+            // two agree on method and path by construction of the match, and
+            // the model's row is the one that carries the owner, the handler
+            // and the type anchors, so it is the one kept.
+            let canonical = Self::canonicalize_route_path(&endpoint.path);
+            let twin = result.endpoints.iter().position(|existing| {
+                existing.resolution_source != Some(ResolutionSource::Model)
+                    && existing.method.eq_ignore_ascii_case(&endpoint.method)
+                    && Self::canonicalize_route_path(&existing.path) == canonical
+            });
+            match twin {
+                Some(index) => {
+                    result.endpoints.remove(index);
+                    stats.model_rows_joined += 1;
+                }
+                None => stats.model_only_rows += 1,
+            }
+            result.endpoints.push(endpoint);
+        }
+        if !dropped.is_empty() {
             warn!(
                 "[FileOrchestrator] {} endpoint(s) in {} dropped — {}: {}",
-                dropped_endpoints.len(),
+                dropped.len(),
                 file_path,
                 Self::drop_reason(candidate_map.len()),
-                dropped_endpoints.join(", ")
+                dropped.join(", ")
             );
         }
 
-        // Data calls: preserve even without candidate match (inline aliases still work)
-        let mut dropped_count = 0;
-        result.data_calls = result
-            .data_calls
-            .drain(..)
-            .map(|mut data_call| {
-                if let Some(candidate) = candidate_map.get(&data_call.candidate_id) {
-                    data_call.line_number = candidate.line_number as i32;
-                    data_call.call_expression_span_start = Some(candidate.span_start);
-                    data_call.call_expression_span_end = Some(candidate.span_end);
-                    Self::reanchor_data_call(&mut data_call, candidate, file_path);
-                } else {
-                    dropped_count += 1;
-                }
-                data_call
-            })
+        // A span the model answered as an ENDPOINT is a route the file
+        // DEFINES, not a call it makes. One candidate map holds both, and a
+        // registration whose verb happens to name a client's request member
+        // (`app.get` against a client's `get`) resolves like any other bare
+        // call, so the deterministic row at that span is withdrawn.
+        let route_spans: HashSet<u32> = result
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.call_expression_span_start)
             .collect();
+        result.data_calls.retain(|call| {
+            let withdrawn = call.resolution_source != Some(ResolutionSource::Model)
+                && call
+                    .call_expression_span_start
+                    .is_some_and(|span| route_spans.contains(&span));
+            if withdrawn {
+                debug!(
+                    "Withdrawing the deterministic call at a span the model answered as a route: {} {} ({})",
+                    call.method.as_deref().unwrap_or("<unstated>"),
+                    call.target,
+                    file_path
+                );
+            }
+            !withdrawn
+        });
 
-        if dropped_count > 0 {
+        // --- the consumer side ---------------------------------------------
+        let mut unjoined = 0;
+        let mut folded: HashSet<usize> = HashSet::new();
+        for mut call in data_calls {
+            match candidate_map.get(&call.candidate_id) {
+                Some(candidate) => {
+                    call.line_number = candidate.line_number as i32;
+                    call.call_expression_span_start = Some(candidate.span_start);
+                    call.call_expression_span_end = Some(candidate.span_end);
+                }
+                // Preserved without a span, as before: an inline alias still
+                // resolves, and the row is the only record of a site the
+                // scanner raised no candidate for (a wrapper delegation).
+                None => unjoined += 1,
+            }
+            let line = call.line_number;
+            let span = call.call_expression_span_start;
+            let twin = result.data_calls.iter().position(|row| {
+                if row.resolution_source == Some(ResolutionSource::Model) {
+                    return false;
+                }
+                match span {
+                    Some(span) => row.call_expression_span_start == Some(span),
+                    // A row the model wrote for a site with no candidate of
+                    // its own: its line is all that places it, and a second
+                    // request on that line would have raised its own
+                    // candidate and carried its own span.
+                    None => row.line_number == line || row.call_expression_line == Some(line),
+                }
+            });
+            match twin.filter(|index| folded.insert(*index)) {
+                Some(index) => {
+                    Self::fold_model_call(&mut result.data_calls[index], call, file_path, stats);
+                    stats.model_rows_joined += 1;
+                }
+                None => {
+                    // No row of its own at this span, but the source may still
+                    // state part of what the model reported there.
+                    if let Some(overrule) = overrules
+                        .iter()
+                        .find(|entry| entry.span.map(|(start, _)| start) == span)
+                    {
+                        Self::overrule_model_call(&mut call, overrule, file_path, stats);
+                    }
+                    call.resolution_source = Some(ResolutionSource::Model);
+                    result.data_calls.push(call);
+                    stats.model_only_rows += 1;
+                }
+            }
+        }
+        if unjoined > 0 {
             warn!(
                 "[FileOrchestrator] {} data call(s) in {} had no matching SWC candidate ({}, spans unavailable)",
-                dropped_count,
+                unjoined,
                 file_path,
                 Self::drop_reason(candidate_map.len())
             );
         }
+
+        // What the deterministic layer read a route literal and a verb off,
+        // and neither it nor the model produced a row for (the plan's uniform
+        // "a literal segment plus a stated method is a row" applied to a bare
+        // `x.verb("/lit", arg)`, which carries no producer/consumer role).
+        // Counted so the gap can be sized on real code; never emitted.
+        stats.unemitted_literal_candidates += candidate_map
+            .values()
+            .filter(|candidate| candidate.protocol == Protocol::Http)
+            .filter(|candidate| {
+                matches!(candidate.request_shape, RequestShapeSignal::Known(_))
+                    && Self::route_literal_from_snippet(candidate.path_snippet.as_deref()).is_some()
+                    && !result.endpoints.iter().any(|endpoint| {
+                        endpoint.call_expression_span_start == Some(candidate.span_start)
+                    })
+                    && !result
+                        .data_calls
+                        .iter()
+                        .any(|call| call.call_expression_span_start == Some(candidate.span_start))
+            })
+            .count();
+    }
+
+    /// Fold one model row into the deterministic row at its span.
+    ///
+    /// What determinism stated wins; the model contributes the fields it did
+    /// not state — the classification, the payload and response anchors, the
+    /// type symbols, the call text and the client name the row displays.
+    fn fold_model_call(
+        deterministic: &mut DataCallResult,
+        model: DataCallResult,
+        file_path: &str,
+        stats: &mut ProcessingStats,
+    ) {
+        let source = deterministic
+            .resolution_source
+            .unwrap_or(ResolutionSource::Model);
+        let stated_method = deterministic.method.clone();
+        let stated_target = deterministic.target.clone();
+        Self::settle_target_and_method(
+            deterministic,
+            source,
+            stated_method.as_deref(),
+            &stated_target,
+            model.target,
+            model.method,
+            file_path,
+            stats,
+        );
+
+        // Everything determinism does not state.
+        deterministic.candidate_id = model.candidate_id;
+        deterministic.call_kind = model.call_kind;
+        if !model.pattern_matched.trim().is_empty() {
+            deterministic.pattern_matched = model.pattern_matched;
+        }
+        deterministic.call_expression_text = model.call_expression_text;
+        if model.call_expression_line.is_some() {
+            deterministic.call_expression_line = model.call_expression_line;
+        }
+        deterministic.payload_expression_text = model.payload_expression_text;
+        deterministic.payload_expression_line = model.payload_expression_line;
+        deterministic.primary_type_symbol = model.primary_type_symbol;
+        deterministic.type_import_source = model.type_import_source;
+    }
+
+    /// Apply a statement that is not a row of its own to the model row at its
+    /// span: what the source states about the target and the verb wins,
+    /// exactly as it does where the source also emits.
+    fn overrule_model_call(
+        call: &mut DataCallResult,
+        overrule: &Resolved,
+        file_path: &str,
+        stats: &mut ProcessingStats,
+    ) {
+        let (target, method) = (call.target.clone(), call.method.clone());
+        Self::settle_target_and_method(
+            call,
+            overrule.source,
+            overrule.method.as_deref(),
+            &overrule.url,
+            target,
+            method,
+            file_path,
+            stats,
+        );
+    }
+
+    /// The one rule for what a row's target and method end up as when a source
+    /// states them and the model states them too.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_target_and_method(
+        row: &mut DataCallResult,
+        source: ResolutionSource,
+        stated_method: Option<&str>,
+        stated_target: &str,
+        model_target: String,
+        model_method: Option<String>,
+        file_path: &str,
+        stats: &mut ProcessingStats,
+    ) {
+        // A model target that already carries what the source states, behind a
+        // base the model read for itself, is the better statement of the two
+        // for the sources that allow it.
+        if stated_target.is_empty() {
+            row.target = model_target;
+        } else {
+            let reported = normalize_path_params(model_target.trim());
+            if source.keeps_a_baked_prefix() && Self::target_carries_url(&reported, stated_target) {
+                row.target = reported;
+            } else {
+                if reported != stated_target {
+                    debug!(
+                        "Discarding the model's target for a {source:?} call at {file_path}:{}: {model_target:?} (the source states {stated_target:?})",
+                        row.line_number
+                    );
+                    stats.model_contradictions_discarded += 1;
+                }
+                row.target = stated_target.to_string();
+            }
+        }
+
+        match (stated_method, model_method.as_deref()) {
+            (Some(ours), Some(theirs))
+                if !theirs.trim().eq_ignore_ascii_case(ours) && !theirs.trim().is_empty() =>
+            {
+                debug!(
+                    "Discarding the model's method for a {source:?} call at {file_path}:{}: {theirs:?} (the source states {ours:?})",
+                    row.line_number
+                );
+                stats.model_contradictions_discarded += 1;
+                row.method = Some(ours.to_string());
+            }
+            (Some(ours), _) => row.method = Some(ours.to_string()),
+            (None, _) => row.method = model_method,
+        }
+    }
+
+    /// The path the candidate's own first-argument literal states, when the
+    /// model's path disagrees with it (#332).
+    ///
+    /// For root routes the model emits whitespace junk (`"/ "`) or copies a
+    /// sibling route's path (`"/:id"`); the literal at the registration the
+    /// endpoint already points at is deterministic ground truth. A path that
+    /// merely EXTENDS the literal at a segment boundary (`/api/v1/status` vs
+    /// `/status`) is kept: that is a constructor-carried prefix baked into the
+    /// path, not a mis-copy, and `join_paths`' idempotent guard depends on it
+    /// surviving. `None` means the model's path stands.
+    fn inline_literal_path(path: &str, candidate: &CandidateTarget) -> Option<String> {
+        let literal = Self::route_literal_from_snippet(candidate.path_snippet.as_deref())?;
+        let canonical_literal = Self::canonicalize_route_path(&literal);
+        let canonical_path = Self::canonicalize_route_path(path);
+        if canonical_literal == canonical_path {
+            return None;
+        }
+        // Baked-prefix escape hatch. A root literal never qualifies: every
+        // path trivially "ends with" `/`, and the observed mis-copies are
+        // exactly root routes.
+        if canonical_literal != "/"
+            && let Some(rest) = canonical_path.strip_suffix(&canonical_literal)
+            && (rest.is_empty() || rest.ends_with('/') || canonical_literal.starts_with('/'))
+        {
+            return None;
+        }
+        Some(canonical_literal)
     }
 
     /// Why a reported operation failed the candidate join, phrased so the two
@@ -4446,128 +5066,6 @@ impl FileOrchestrator {
         }
     }
 
-    /// Re-anchor an LLM-emitted endpoint path to the registration call's
-    /// first-arg string literal when the two disagree (#332). For root routes
-    /// the LLM emits whitespace junk (`"/ "`) or copies a sibling route's path
-    /// (`"/:id"`); the literal at the candidate the endpoint already points at
-    /// is deterministic ground truth. An emitted path that merely EXTENDS the
-    /// literal at a segment boundary (`/api/v1/status` vs `/status`) is kept:
-    /// that is a constructor-carried prefix baked into the path, not a
-    /// mis-copy (join_paths' idempotent guard depends on it surviving).
-    fn reanchor_endpoint_path(
-        endpoint: &mut EndpointResult,
-        candidate: &CandidateTarget,
-        file_path: &str,
-    ) {
-        let Some(literal) = Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
-        else {
-            return;
-        };
-        let canon_literal = Self::canonicalize_route_path(&literal);
-        let canon_path = Self::canonicalize_route_path(&endpoint.path);
-        if canon_literal == canon_path {
-            return;
-        }
-        // Baked-prefix escape hatch. A root literal never qualifies: every
-        // path trivially "ends with" `/`, and the observed mis-copies are
-        // exactly root routes.
-        if canon_literal != "/"
-            && let Some(rest) = canon_path.strip_suffix(&canon_literal)
-            && (rest.is_empty() || rest.ends_with('/') || canon_literal.starts_with('/'))
-        {
-            return;
-        }
-        warn!(
-            "[FileOrchestrator] Re-anchored endpoint path '{}' to registration literal '{}' ({}:{})",
-            endpoint.path, canon_literal, file_path, candidate.line_number
-        );
-        endpoint.path = canon_literal;
-    }
-
-    /// Overrule the model's `target` and `method` with the structural request
-    /// spec, for the calls that carry one (#537).
-    ///
-    /// `client({ method: "post", url: "/api/v1/login" })` states its method
-    /// and its path as data. Both are AST facts, so neither is the model's to
-    /// decide, and when the model has to guess at this shape it guesses badly:
-    /// the observed failure was a wildcard path on every such call, which then
-    /// matched a producer's SPA fallback.
-    ///
-    /// The one thing the model may know better is the BASE. A client built
-    /// with a configured `baseURL` gives targets like `${API_URL}/api/v1/login`
-    /// — the same path with the host the normalizer needs for internal/external
-    /// classification in front of it. So a target that already ends with the
-    /// spec's URL at a segment boundary is kept as-is; anything else is
-    /// replaced. This is the same baked-prefix rule
-    /// [`Self::reanchor_endpoint_path`] applies on the producer side.
-    fn reanchor_data_call(
-        data_call: &mut DataCallResult,
-        candidate: &CandidateTarget,
-        file_path: &str,
-    ) {
-        let Some(spec) = candidate.request_spec.as_ref() else {
-            Self::reanchor_new_url_call(data_call, candidate, file_path);
-            return;
-        };
-
-        if data_call.method.as_deref().map(str::trim) != Some(spec.method.as_str()) {
-            data_call.method = Some(spec.method.clone());
-        }
-
-        // Both sides in the router spelling before they are compared: the spec
-        // url already is, and a model that copied an OpenAPI-style `{param}`
-        // out of the source is stating the same path (#529).
-        let target = normalize_path_params(data_call.target.trim());
-        if Self::target_carries_url(&target, &spec.url) {
-            if target != data_call.target {
-                data_call.target = target;
-            }
-            return;
-        }
-
-        warn!(
-            "[FileOrchestrator] Re-anchored data call target '{}' to request-spec url '{}' ({}:{})",
-            data_call.target, spec.url, file_path, candidate.line_number
-        );
-        data_call.target = spec.url.clone();
-    }
-
-    /// Anchor a call whose target is built as `new URL(path, base)` to the
-    /// path that constructor states (carrick#610).
-    ///
-    /// The value the request receives is a binding, or a `.href` off one, so
-    /// the site itself is not route-shaped and extraction has nothing to read
-    /// the path off. What it wrote down is therefore either unusable (the
-    /// binding name, dropped downstream for want of a route shape) or lifted
-    /// from somewhere else in the file, which is how a client calling `v2` came
-    /// to be recorded calling `v1`.
-    ///
-    /// Only the path is asserted. The base stays opaque, so the call matches by
-    /// route path like every other host-free call, and a target that already
-    /// carries the path behind a base it read for itself is left alone.
-    fn reanchor_new_url_call(
-        data_call: &mut DataCallResult,
-        candidate: &CandidateTarget,
-        file_path: &str,
-    ) {
-        let Some(path) = candidate.new_url_path.as_deref() else {
-            return;
-        };
-        let target = normalize_path_params(data_call.target.trim());
-        if Self::target_carries_url(&target, path) {
-            if target != data_call.target {
-                data_call.target = target;
-            }
-            return;
-        }
-
-        warn!(
-            "[FileOrchestrator] Re-anchored data call target '{}' to the path its URL constructor states, '{}' ({}:{})",
-            data_call.target, path, file_path, candidate.line_number
-        );
-        data_call.target = path.to_string();
-    }
-
     /// Does `target` already state `url` — either as the whole target, or as
     /// its tail behind a base (`${API_URL}/v1/things`)? The tail must start at
     /// a segment boundary, so `/things` does not "carry" `/other-things`.
@@ -4577,196 +5075,6 @@ impl FileOrchestrator {
             Some(prefix) => prefix.is_empty() || !prefix.ends_with('/'),
             None => false,
         }
-    }
-
-    /// Emit the outbound calls a verb-named request spec states outright, for
-    /// the call sites the file analyzer returned nothing for (#529).
-    ///
-    /// `client.post({ url: "/v1/sessions/{sessionId}/release" })` is how a
-    /// generated OpenAPI client issues an operation, and the method and path
-    /// are both AST facts there — the same standing as a route descriptor's
-    /// `{ method, path }`, which is merged deterministically by #234. When
-    /// extraction misses such a file (a generated client is hundreds of
-    /// near-identical wrappers, and the analyzer routinely returns none of
-    /// them), the consumer side of every one of those operations is lost and
-    /// the producer's endpoints are reported orphaned — the index asserting no
-    /// consumer where one exists.
-    ///
-    /// Only `method_from_callee` specs qualify; see [`RequestSpec`] for why
-    /// the `{ method, url }` object form stays the analyzer's to classify.
-    /// A spec whose site the analyzer DID answer is left alone, and so is one
-    /// whose (method, url) another call in the file already carries — a target
-    /// behind a base URL included, since the base is the one thing the
-    /// analyzer knows and this backfill does not.
-    fn merge_request_spec_calls(
-        result: &mut FileAnalysisResult,
-        candidate_map: &HashMap<String, CandidateTarget>,
-    ) -> usize {
-        let mut specs: Vec<&CandidateTarget> = candidate_map
-            .values()
-            .filter(|candidate| {
-                candidate
-                    .request_spec
-                    .as_ref()
-                    .is_some_and(|spec| spec.method_from_callee)
-            })
-            .collect();
-        // The map iterates in hash order; emit in source order so a scan of the
-        // same file always produces the same rows.
-        specs.sort_by_key(|candidate| candidate.span_start);
-
-        let mut added = 0;
-        for candidate in specs {
-            let Some(spec) = candidate.request_spec.as_ref() else {
-                continue;
-            };
-            let covered = result.data_calls.iter().any(|data_call| {
-                data_call.candidate_id == candidate.candidate_id
-                    || (data_call
-                        .method
-                        .as_deref()
-                        .map(|method| method.trim().to_uppercase())
-                        .as_deref()
-                        == Some(spec.method.as_str())
-                        && Self::target_carries_url(
-                            &normalize_path_params(&data_call.target),
-                            &spec.url,
-                        ))
-            });
-            if covered {
-                continue;
-            }
-            debug!(
-                "Backfilling outbound call the extraction missed: {} {} at line {}",
-                spec.method, spec.url, candidate.line_number
-            );
-            result.data_calls.push(DataCallResult {
-                candidate_id: candidate.candidate_id.clone(),
-                line_number: i32::try_from(candidate.line_number).unwrap_or(i32::MAX),
-                target: spec.url.clone(),
-                method: Some(spec.method.clone()),
-                // Classification is judgment, not an AST fact: the URL is a
-                // bare path with no host to classify from.
-                call_kind: None,
-                pattern_matched: if candidate.callee_object.starts_with('<') {
-                    // The receiver is an expression, not a name (the
-                    // `(options?.client ?? client)` shape).
-                    "http-client".to_string()
-                } else {
-                    candidate.callee_object.clone()
-                },
-                // The span is what the type sidecar anchors on, and it is also
-                // what marks this call candidate-backed downstream.
-                call_expression_span_start: Some(candidate.span_start),
-                call_expression_span_end: Some(candidate.span_end),
-                call_expression_text: None,
-                call_expression_line: Some(
-                    i32::try_from(candidate.line_number).unwrap_or(i32::MAX),
-                ),
-                payload_expression_text: None,
-                payload_expression_line: None,
-                primary_type_symbol: None,
-                type_import_source: None,
-
-                loopback_default_url: None,
-                base: None,
-                consumers_not_resolved: None,
-            });
-            added += 1;
-        }
-        added
-    }
-
-    /// Emit the outbound calls that reach their endpoint through a request
-    /// wrapper declared in the SAME file, with the path passed in as an
-    /// argument (carrick#588).
-    ///
-    /// `requestJson(base, "/api/v1/widgets", token)` delegating to a local
-    /// `requestJson(base, path, token)` that does the `fetch` is one HTTP call
-    /// to `/api/v1/widgets`, and every part of that is an AST fact. Neither
-    /// half is extractable alone: the wrapper's own request interpolates a
-    /// parameter, so its URL resolves to nothing, and the site raises no
-    /// candidate at all (its callee is a local identifier and its path is not
-    /// the first argument), so the analyzer is never asked about it. The
-    /// endpoints reached this way are therefore absent from the index — not
-    /// wrong rows, no rows — which is what makes this a deterministic emission
-    /// rather than a prompt problem. #369/#370 resolve the same indirection
-    /// across files, where the wrapper's source has to be injected before the
-    /// model can join it; same-file needs no injection and no judgment.
-    ///
-    /// A site extraction DID answer is left alone: same span, same line, or a
-    /// call already carrying the same path with a compatible method.
-    fn merge_local_wrapper_calls(
-        result: &mut FileAnalysisResult,
-        wrapper_calls: Vec<LocalWrapperCall>,
-    ) -> usize {
-        // Only rows extraction produced can cover a site. Reading the vector
-        // as it grows would let the first backfill of a line suppress its
-        // siblings — two wrapper sites on one line (a `Promise.all` of them,
-        // say) are two calls.
-        let extracted = result.data_calls.len();
-        let mut added = 0;
-        for call in wrapper_calls {
-            let line = i32::try_from(call.line_number).unwrap_or(i32::MAX);
-            let ours = normalize_path_params(&call.target);
-            let covered = result.data_calls[..extracted].iter().any(|data_call| {
-                if data_call.call_expression_span_start == Some(call.span_start)
-                    || data_call.line_number == line
-                    || data_call.call_expression_line == Some(line)
-                {
-                    return true;
-                }
-                let method_agrees = match (data_call.method.as_deref(), call.method.as_deref()) {
-                    (Some(theirs), Some(mine)) => theirs.trim().eq_ignore_ascii_case(mine),
-                    // An unstated method on either side cannot separate them.
-                    _ => true,
-                };
-                let theirs = normalize_path_params(&data_call.target);
-                // An empty target states no path, so it carries nothing: the
-                // suffix test would otherwise read it as covering everything.
-                !theirs.trim().is_empty()
-                    && method_agrees
-                    && (Self::target_carries_url(&theirs, &ours)
-                        || Self::target_carries_url(&ours, &theirs))
-            });
-            if covered {
-                continue;
-            }
-            debug!(
-                "Backfilling same-file wrapper call the extraction was never offered: {} {} at line {}",
-                call.method.as_deref().unwrap_or("<unstated>"),
-                call.target,
-                call.line_number
-            );
-            result.data_calls.push(DataCallResult {
-                candidate_id: format!("local-wrapper:{}-{}", call.span_start, call.span_end),
-                line_number: line,
-                target: call.target,
-                method: call.method,
-                // Classification is judgment, not an AST fact: the target is
-                // the wrapper's own URL expression, with no host to classify
-                // from beyond what the wrapper closes over.
-                call_kind: None,
-                pattern_matched: call.wrapper_name,
-                // The span is the SITE's, which is what the type sidecar
-                // anchors on and what marks this call candidate-backed
-                // downstream.
-                call_expression_span_start: Some(call.span_start),
-                call_expression_span_end: Some(call.span_end),
-                call_expression_text: None,
-                call_expression_line: Some(line),
-                payload_expression_text: None,
-                payload_expression_line: None,
-                primary_type_symbol: None,
-                type_import_source: None,
-
-                loopback_default_url: None,
-                base: None,
-                consumers_not_resolved: None,
-            });
-            added += 1;
-        }
-        added
     }
 
     /// Extract the route path from a candidate's first-arg source snippet when
@@ -5040,195 +5348,6 @@ impl FileOrchestrator {
         homes
     }
 
-    /// Apply the resolved members to the sites that called them.
-    ///
-    /// This OVERWRITES the method and target extraction gave the site, which
-    /// nothing else in this pass does. It is warranted because the two are not
-    /// evidence of the same quality: the member's request is a literal in the
-    /// source, and the site's own file contains no statement of either. The
-    /// same reasoning already licenses `reanchor_data_call` to overrule a
-    /// target from a request spec read off the AST.
-    ///
-    /// Runs immediately after `apply_candidate_map`, which is what stamps the
-    /// span this joins on, and before every downstream reader of method or
-    /// target.
-    fn apply_imported_members(
-        result: &mut FileAnalysisResult,
-        resolved: &HashMap<u32, ResolvedMember>,
-    ) -> usize {
-        if resolved.is_empty() {
-            return 0;
-        }
-        let mut applied = 0;
-        for data_call in &mut result.data_calls {
-            let Some(span) = data_call.call_expression_span_start else {
-                continue;
-            };
-            let Some(member) = resolved.get(&span).map(|resolved| &resolved.member) else {
-                continue;
-            };
-            let method_agrees = data_call
-                .method
-                .as_deref()
-                .map(normalize_manifest_method)
-                .is_some_and(|method| method == member.method);
-            if method_agrees && data_call.target == member.target {
-                continue;
-            }
-            debug!(
-                "Resolving call site through its imported member: {} {} (was {} {})",
-                member.method,
-                member.target,
-                data_call.method.as_deref().unwrap_or("<unstated>"),
-                data_call.target,
-            );
-            data_call.method = Some(member.method.clone());
-            data_call.target = member.target.clone();
-            applied += 1;
-        }
-        applied
-    }
-
-    /// Emit the resolved members whose call sites extraction returned no row
-    /// for at all (carrick#623).
-    ///
-    /// `apply_imported_members` above only REWRITES a row that already exists,
-    /// so a resolved member is silently dropped whenever the analyzer answered
-    /// nothing for its site. That is the common case, not the rare one: a bare
-    /// `client.createUpload(name)` states no path and no verb, and a consumer
-    /// file that contains no path-shaped text anywhere gives the model nothing
-    /// to answer with, so it answers with nothing. The endpoint the site
-    /// reaches is then absent from the index entirely, and the producer is
-    /// reported orphaned.
-    ///
-    /// The member's method and URL are both literals in the source, and the
-    /// site's span is an AST fact, so the row is asserted rather than inferred
-    /// — the same standing as `merge_local_wrapper_calls`, whose coverage test
-    /// and row shape this mirrors.
-    fn merge_imported_member_calls(
-        result: &mut FileAnalysisResult,
-        resolved: &HashMap<u32, ResolvedMember>,
-        candidate_map: &HashMap<String, CandidateTarget>,
-    ) -> usize {
-        if resolved.is_empty() {
-            return 0;
-        }
-        // Both maps iterate in hash order; emit in source order so a scan of
-        // the same file always produces the same rows.
-        //
-        // A request member is an HTTP request, so only an HTTP candidate can
-        // be a site that reaches one. The name join is by member name with no
-        // receiver constraint where the receiver is a local, which is the
-        // shape this pass exists for, so a `client.publish(topic, payload)`
-        // would otherwise join to an imported member called `publish`.
-        // Rewriting a row could never act on that (a pub/sub site has no HTTP
-        // row at its span); emitting one could.
-        let mut sites: Vec<(&CandidateTarget, &RequestMember)> = candidate_map
-            .values()
-            .filter(|candidate| candidate.protocol == Protocol::Http)
-            .filter_map(|candidate| {
-                resolved
-                    .get(&candidate.span_start)
-                    .map(|resolved| (candidate, &resolved.member))
-            })
-            .collect();
-        // Innermost first within one start offset: a chained call
-        // (`client.cancelRun(id).catch(fn)`) raises a candidate for each link,
-        // and every link shares the start offset of the receiver it is chained
-        // onto, so they all read the same resolved member. They are one
-        // outbound request, and the innermost link is the one that makes it.
-        sites.sort_by_key(|(candidate, _)| (candidate.span_start, candidate.span_end));
-        let mut emitted_spans: HashSet<u32> = HashSet::new();
-
-        // Only rows extraction produced can cover a site. Reading the vector
-        // as it grows would let the first backfill of a line suppress its
-        // siblings — two resolved sites on one line are two calls.
-        let extracted = result.data_calls.len();
-        let mut added = 0;
-        for (candidate, member) in sites {
-            // A site extraction answered as an ENDPOINT is answered. One
-            // candidate map holds both, and a route definition whose verb
-            // happens to name an imported request member (`app.get(...)`
-            // against a client's `get`) resolves like any other bare call:
-            // the receiver is a local, so no import constrains the join.
-            // Rewriting could never reach it, because there is no data-call
-            // row at its span to rewrite; emitting one would invent a
-            // consumer for a route the file DEFINES.
-            if result
-                .endpoints
-                .iter()
-                .any(|endpoint| endpoint.call_expression_span_start == Some(candidate.span_start))
-            {
-                continue;
-            }
-            if !emitted_spans.insert(candidate.span_start) {
-                continue;
-            }
-            let line = i32::try_from(candidate.line_number).unwrap_or(i32::MAX);
-            let ours = normalize_path_params(&member.target);
-            let covered = result.data_calls[..extracted].iter().any(|data_call| {
-                if data_call.call_expression_span_start == Some(candidate.span_start)
-                    || data_call.line_number == line
-                    || data_call.call_expression_line == Some(line)
-                {
-                    return true;
-                }
-                let method_agrees = match data_call.method.as_deref() {
-                    Some(theirs) => theirs.trim().eq_ignore_ascii_case(&member.method),
-                    // An unstated method cannot separate them.
-                    None => true,
-                };
-                let theirs = normalize_path_params(&data_call.target);
-                // An empty target states no path, so it carries nothing: the
-                // suffix test would otherwise read it as covering everything.
-                !theirs.trim().is_empty()
-                    && method_agrees
-                    && (Self::target_carries_url(&theirs, &ours)
-                        || Self::target_carries_url(&ours, &theirs))
-            });
-            if covered {
-                continue;
-            }
-            debug!(
-                "Backfilling imported-member call the extraction returned no row for: {} {} at line {}",
-                member.method, member.target, candidate.line_number
-            );
-            result.data_calls.push(DataCallResult {
-                candidate_id: format!(
-                    "imported-member:{}-{}",
-                    candidate.span_start, candidate.span_end
-                ),
-                line_number: line,
-                target: member.target.clone(),
-                method: Some(member.method.clone()),
-                // Classification is judgment, not an AST fact: the target is
-                // the member's own URL expression, with no host to classify
-                // from beyond what the member closes over.
-                call_kind: None,
-                pattern_matched: candidate
-                    .callee_property
-                    .clone()
-                    .unwrap_or_else(|| candidate.callee_object.clone()),
-                // The span is what the type sidecar anchors on, and it is also
-                // what marks this call candidate-backed downstream.
-                call_expression_span_start: Some(candidate.span_start),
-                call_expression_span_end: Some(candidate.span_end),
-                call_expression_text: None,
-                call_expression_line: Some(line),
-                payload_expression_text: None,
-                payload_expression_line: None,
-                primary_type_symbol: None,
-                type_import_source: None,
-
-                loopback_default_url: None,
-                base: None,
-                consumers_not_resolved: None,
-            });
-            added += 1;
-        }
-        added
-    }
-
     /// Stamp what the member join could not follow onto the rows that member
     /// DID produce (carrick#656).
     ///
@@ -5319,174 +5438,6 @@ impl FileOrchestrator {
         stamped
     }
 
-    /// Emit the whole-URL environment-variable calls whose sites extraction
-    /// returned no row for at all (carrick#632).
-    ///
-    /// `resolve_env_var_aliases` above only REWRITES a row that already
-    /// exists, so the resolution #604 added is lost whenever the analyzer
-    /// answered nothing for the site. That happens wherever the request is
-    /// buried — an arrow function that is a property of an object literal
-    /// handed to a factory call, say — because the site states no path and the
-    /// file may state none anywhere outside the fallback literal, so there is
-    /// nothing for the model to answer with. The call is then absent from the
-    /// index entirely: not a matched edge, not an unmatched call, not an
-    /// egress candidate.
-    ///
-    /// Every part of the row is a literal in the source. The binding's env var
-    /// and the path inside its `??` fallback are what
-    /// [`resolve_whole_url_target`] reads, the method is the literal in the
-    /// call's own options bag, and the span is an AST fact — the same standing
-    /// as `merge_local_wrapper_calls` and `merge_imported_member_calls`, whose
-    /// coverage test and row shape this mirrors.
-    ///
-    /// Two narrowings keep it to what the source states outright:
-    ///
-    /// - Only a call the AST reads as a REQUEST with a literal method
-    ///   qualifies. A bare binding is passed to plenty of things that are not
-    ///   requests (`new URL(url)`, a logger), and joining on the binding name
-    ///   alone would invent a call at every one of them.
-    /// - A request whose method cannot be read as a literal
-    ///   (`fetch(url, { headers })`, or a parameterized `{ method }`) is left
-    ///   alone rather than emitted with a guessed verb. That shape stays
-    ///   extraction's to answer.
-    ///
-    /// The row extraction produced for the site is CORRECTED rather than left
-    /// alone. Emitting only where extraction was silent is what #633 shipped,
-    /// and it left the live case unfixed: the model does answer this shape
-    /// often enough, paraphrasing the binding as `${SUPPORT_URL}/api/ask`, and
-    /// that spelling is not the one the rest of the pipeline resolves env vars
-    /// through, nor does it carry the fallback the canonical key needs. Same
-    /// span is identity — `apply_candidate_map` stamps the candidate's own
-    /// span on the row answered for it — so the row is this call and every
-    /// field the AST states outright belongs on it. A row on the same line
-    /// with a DIFFERENT span is a different call and still covers the site.
-    fn merge_whole_url_env_calls(
-        result: &mut FileAnalysisResult,
-        candidate_map: &HashMap<String, CandidateTarget>,
-        aliases: &EnvAliasMap,
-        paths: &WholeUrlFallbackMap,
-    ) -> (usize, usize) {
-        if paths.is_empty() {
-            return (0, 0);
-        }
-        // The map iterates in hash order; emit in source order so a scan of
-        // the same file always produces the same rows.
-        let mut sites: Vec<(&CandidateTarget, String, String, Option<String>)> = candidate_map
-            .values()
-            .filter(|candidate| candidate.protocol == Protocol::Http)
-            .filter_map(|candidate| {
-                // The method has to be the call's own literal: see above.
-                let RequestShapeSignal::Known(shape) = &candidate.request_shape else {
-                    return None;
-                };
-                let snippet = candidate.path_snippet.as_deref()?;
-                let target = resolve_whole_url_target(snippet, aliases, paths)?;
-                let local_default = whole_url_local_default(snippet, aliases, paths);
-                Some((candidate, shape.method.clone(), target, local_default))
-            })
-            .collect();
-        sites.sort_by_key(|(candidate, _, _, _)| candidate.span_start);
-
-        // Only rows extraction produced can cover a site. Reading the vector
-        // as it grows would let the first backfill of a line suppress its
-        // siblings — two resolved sites on one line are two calls.
-        let extracted = result.data_calls.len();
-        let mut added = 0;
-        let mut corrected = 0;
-        for (candidate, method, target, local_default) in sites {
-            // A site extraction answered as an ENDPOINT is answered. One
-            // candidate map holds route registrations as well as calls, and a
-            // route mounted at a whole URL read from an environment variable
-            // is a route the file DEFINES, not a call it makes.
-            if result
-                .endpoints
-                .iter()
-                .any(|endpoint| endpoint.call_expression_span_start == Some(candidate.span_start))
-            {
-                continue;
-            }
-            let line = i32::try_from(candidate.line_number).unwrap_or(i32::MAX);
-            let ours = normalize_path_params(&target);
-            // The row extraction answered for THIS call, if it answered one.
-            // Either the candidate's own span, or a row on the line that is
-            // anchored to no span at all — a second request on the line would
-            // have raised its own candidate and carried its own span, so an
-            // unanchored row on it is this one.
-            let mine = result.data_calls[..extracted].iter().position(|data_call| {
-                data_call.call_expression_span_start == Some(candidate.span_start)
-                    || (data_call.call_expression_span_start.is_none()
-                        && (data_call.line_number == line
-                            || data_call.call_expression_line == Some(line)))
-            });
-            if let Some(index) = mine {
-                corrected += Self::correct_whole_url_row(
-                    &mut result.data_calls[index],
-                    candidate,
-                    &method,
-                    target,
-                    local_default,
-                );
-                continue;
-            }
-            let covered = result.data_calls[..extracted].iter().any(|data_call| {
-                if data_call.line_number == line || data_call.call_expression_line == Some(line) {
-                    return true;
-                }
-                let method_agrees = match data_call.method.as_deref() {
-                    Some(theirs) => theirs.trim().eq_ignore_ascii_case(&method),
-                    // An unstated method cannot separate them.
-                    None => true,
-                };
-                let theirs = normalize_path_params(&data_call.target);
-                // An empty target states no path, so it carries nothing: the
-                // suffix test would otherwise read it as covering everything.
-                !theirs.trim().is_empty()
-                    && method_agrees
-                    && (Self::target_carries_url(&theirs, &ours)
-                        || Self::target_carries_url(&ours, &theirs))
-            });
-            if covered {
-                continue;
-            }
-            debug!(
-                "Backfilling whole-URL env-var call the extraction returned no row for: {} {} at line {}",
-                method, target, candidate.line_number
-            );
-            result.data_calls.push(DataCallResult {
-                candidate_id: format!(
-                    "whole-url-env:{}-{}",
-                    candidate.span_start, candidate.span_end
-                ),
-                line_number: line,
-                target,
-                method: Some(method),
-                // Classification is judgment, not an AST fact: the origin is
-                // whatever the environment supplies, and the fallback's host
-                // says nothing about the deployed one.
-                call_kind: None,
-                pattern_matched: candidate
-                    .callee_property
-                    .clone()
-                    .unwrap_or_else(|| candidate.callee_object.clone()),
-                // The span is what the type sidecar anchors on, and it is also
-                // what marks this call candidate-backed downstream.
-                call_expression_span_start: Some(candidate.span_start),
-                call_expression_span_end: Some(candidate.span_end),
-                call_expression_text: None,
-                call_expression_line: Some(line),
-                payload_expression_text: None,
-                payload_expression_line: None,
-                primary_type_symbol: None,
-                type_import_source: None,
-                loopback_default_url: local_default,
-                base: None,
-                consumers_not_resolved: None,
-            });
-            added += 1;
-        }
-        (added, corrected)
-    }
-
     /// The path a data call is KEYED on — the one canonicalization every reader
     /// of the key shares (the mount-graph loop, the type-request join, the
     /// uploaded projection).
@@ -5508,50 +5459,6 @@ impl FileOrchestrator {
             .as_deref()
             .unwrap_or(&data_call.target);
         normalizer.consumer_call_path(url)
-    }
-
-    /// Put on the row extraction answered for a whole-URL env-var call what the
-    /// binding's own AST states: the resolved target, the method the call's
-    /// options bag spells out, and the loopback default the canonical key is
-    /// computed from. Returns 1 when anything changed.
-    ///
-    /// The target is overwritten rather than merged. This rule fires only where
-    /// the call site states no path of its own, so every path in an extracted
-    /// row for it came from reading the same fallback literal — deterministically
-    /// here, by paraphrase there.
-    fn correct_whole_url_row(
-        data_call: &mut DataCallResult,
-        candidate: &CandidateTarget,
-        method: &str,
-        target: String,
-        local_default: Option<String>,
-    ) -> usize {
-        let mut changed = false;
-        if data_call.target != target {
-            debug!(
-                "Correcting whole-URL env-var call target at line {}: {} -> {}",
-                candidate.line_number, data_call.target, target
-            );
-            data_call.target = target;
-            changed = true;
-        }
-        if data_call.loopback_default_url != local_default {
-            data_call.loopback_default_url = local_default;
-            changed = true;
-        }
-        // Only where extraction stated none: a stated verb is the model reading
-        // the same options bag, and disagreeing with it is a separate question
-        // from resolving the URL.
-        if data_call.method.as_deref().is_none_or(str::is_empty) {
-            data_call.method = Some(method.to_string());
-            changed = true;
-        }
-        if data_call.call_expression_span_start.is_none() {
-            data_call.call_expression_span_start = Some(candidate.span_start);
-            data_call.call_expression_span_end = Some(candidate.span_end);
-            changed = true;
-        }
-        usize::from(changed)
     }
 
     fn propagate_wrapper_request_shape(
@@ -7906,6 +7813,7 @@ export * from "./aFetch.js";"#,
                     emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
+                    resolution_source: None,
                 }],
                 data_calls: vec![],
                 graphql_operations: vec![],
@@ -7955,6 +7863,7 @@ export * from "./aFetch.js";"#,
             emission_style: None,
             primary_type_symbol: None,
             type_import_source: None,
+            resolution_source: None,
         };
 
         let mut file_results = HashMap::new();
@@ -8186,10 +8095,11 @@ export * from "./aFetch.js";"#,
         let files = class_controller_fixture_files();
 
         let mut file_results = HashMap::new();
-        let added = FileOrchestrator::merge_class_controller_endpoints(
+        let added = FileOrchestrator::emit_class_controller_endpoints(
             &mut file_results,
             &files,
             class_controller_fixture_endpoints(),
+            &mut BTreeMap::new(),
         );
         assert_eq!(added, 13, "eight bound paths, thirteen handler methods");
 
@@ -8305,6 +8215,7 @@ export * from "./aFetch.js";"#,
                     emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
+                    resolution_source: None,
                 }],
                 ..Default::default()
             },
@@ -8354,6 +8265,7 @@ export * from "./aFetch.js";"#,
             emission_style: None,
             primary_type_symbol: None,
             type_import_source: None,
+            resolution_source: None,
         };
         let file_result = |path: &str| FileAnalysisResult {
             endpoints: vec![endpoint(path)],
@@ -8424,6 +8336,7 @@ export * from "./aFetch.js";"#,
                     emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
+                    resolution_source: None,
                 }],
                 ..Default::default()
             },
@@ -8485,6 +8398,7 @@ export * from "./aFetch.js";"#,
                     loopback_default_url: None,
                     base: None,
                     consumers_not_resolved: None,
+                    resolution_source: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -8643,6 +8557,7 @@ export * from "./aFetch.js";"#,
             loopback_default_url: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         }
     }
 
@@ -8995,6 +8910,7 @@ export * from "./aFetch.js";"#,
                 loopback_default_url: None,
                 base: None,
                 consumers_not_resolved: None,
+                resolution_source: None,
             }],
             ..Default::default()
         };
@@ -9084,6 +9000,7 @@ export * from "./aFetch.js";"#,
             loopback_default_url: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         };
 
         let mut file_results = HashMap::new();
@@ -9109,6 +9026,7 @@ export * from "./aFetch.js";"#,
                     emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
+                    resolution_source: None,
                 }],
                 data_calls: vec![
                     // Self-call to the service's own endpoint over localhost.
@@ -9174,6 +9092,7 @@ export * from "./aFetch.js";"#,
             emission_style: None,
             primary_type_symbol: None,
             type_import_source: None,
+            resolution_source: None,
         };
         let mk_call = |line: u32, method: &str, target: &str| DataCallResult {
             call_kind: None,
@@ -9194,6 +9113,7 @@ export * from "./aFetch.js";"#,
             loopback_default_url: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         };
 
         let mut file_results = HashMap::new();
@@ -9287,6 +9207,7 @@ export * from "./aFetch.js";"#,
             loopback_default_url: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -9356,6 +9277,7 @@ export * from "./aFetch.js";"#,
                         loopback_default_url: None,
                         base: None,
                         consumers_not_resolved: None,
+                        resolution_source: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -9376,6 +9298,7 @@ export * from "./aFetch.js";"#,
                         loopback_default_url: None,
                         base: None,
                         consumers_not_resolved: None,
+                        resolution_source: None,
                     },
                 ],
                 graphql_operations: vec![],
@@ -9427,6 +9350,7 @@ export * from "./aFetch.js";"#,
                     loopback_default_url: None,
                     base: None,
                     consumers_not_resolved: None,
+                    resolution_source: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -9480,6 +9404,7 @@ export * from "./aFetch.js";"#,
                         loopback_default_url: None,
                         base: None,
                         consumers_not_resolved: None,
+                        resolution_source: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -9500,6 +9425,7 @@ export * from "./aFetch.js";"#,
                         loopback_default_url: None,
                         base: None,
                         consumers_not_resolved: None,
+                        resolution_source: None,
                     },
                 ],
                 graphql_operations: vec![],
@@ -9560,6 +9486,7 @@ export * from "./aFetch.js";"#,
                     emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
+                    resolution_source: None,
                 }],
                 data_calls: vec![],
                 graphql_operations: vec![],
@@ -9617,6 +9544,7 @@ export * from "./aFetch.js";"#,
             emission_style,
             primary_type_symbol: None,
             type_import_source: None,
+            resolution_source: None,
         }
     }
 
@@ -9804,6 +9732,7 @@ export * from "./aFetch.js";"#,
                     emission_style: None,
                     primary_type_symbol: Some("User".to_string()),
                     type_import_source: Some("react".to_string()),
+                    resolution_source: None,
                 },
                 EndpointResult {
                     candidate_id: "span:700-740".to_string(),
@@ -9822,6 +9751,7 @@ export * from "./aFetch.js";"#,
                     emission_style: None,
                     primary_type_symbol: Some("Models.User".to_string()),
                     type_import_source: Some("./models".to_string()),
+                    resolution_source: None,
                 },
             ],
             data_calls: vec![DataCallResult {
@@ -9843,6 +9773,7 @@ export * from "./aFetch.js";"#,
                 loopback_default_url: None,
                 base: None,
                 consumers_not_resolved: None,
+                resolution_source: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -9920,6 +9851,7 @@ export * from "./aFetch.js";"#,
                 // `.ts` appended by the model; the extension-less form is imported.
                 primary_type_symbol: Some("OrderPlacedEvent".to_string()),
                 type_import_source: Some("../types/events.ts".to_string()),
+                resolution_source: None,
             }],
             data_calls: vec![DataCallResult {
                 call_kind: None,
@@ -9940,6 +9872,7 @@ export * from "./aFetch.js";"#,
                 loopback_default_url: None,
                 base: None,
                 consumers_not_resolved: None,
+                resolution_source: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![
@@ -10270,6 +10203,7 @@ export * from "./aFetch.js";"#,
                 // Imported symbol, wrong source: HTTP must null, not rewrite.
                 primary_type_symbol: Some("User".to_string()),
                 type_import_source: Some("./wrong".to_string()),
+                resolution_source: None,
             }],
             data_calls: vec![DataCallResult {
                 call_kind: None,
@@ -10291,6 +10225,7 @@ export * from "./aFetch.js";"#,
                 loopback_default_url: None,
                 base: None,
                 consumers_not_resolved: None,
+                resolution_source: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -10376,6 +10311,7 @@ export * from "./aFetch.js";"#,
                         emission_style: None,
                         primary_type_symbol: None,
                         type_import_source: None,
+                        resolution_source: None,
                     },
                     EndpointResult {
                         candidate_id: "span:750-780".to_string(),
@@ -10394,6 +10330,7 @@ export * from "./aFetch.js";"#,
                         emission_style: None,
                         primary_type_symbol: None,
                         type_import_source: None,
+                        resolution_source: None,
                     },
                 ],
                 data_calls: vec![],
@@ -10615,6 +10552,7 @@ export default [
             emission_style: None,
             primary_type_symbol: None,
             type_import_source: None,
+            resolution_source: None,
         }
     }
 
@@ -11004,7 +10942,9 @@ export default [
         assert_eq!(stats.total_mounts, 0);
         assert_eq!(stats.total_endpoints, 0);
         assert_eq!(stats.total_data_calls, 0);
-        assert_eq!(stats.file_based_endpoints, 0);
+        assert!(stats.deterministic_rows_emitted.is_empty());
+        assert_eq!(stats.model_only_rows, 0);
+        assert_eq!(stats.unemitted_literal_candidates, 0);
         assert!(stats.errors.is_empty());
     }
 
@@ -11354,33 +11294,59 @@ export { routes };
             emission_style: None,
             primary_type_symbol: None,
             type_import_source: None,
+            resolution_source: None,
         }
     }
 
     #[test]
-    fn test_merge_file_based_endpoints_dedups_by_method_and_path() {
-        let mut result = FileAnalysisResult {
-            // The LLM pass already produced GET /users (e.g. via a Response.json
-            // candidate). The structural entry for it must not be duplicated.
-            endpoints: vec![synthetic_endpoint("GET", "/users")],
+    fn a_structural_route_the_model_also_reported_is_one_route() {
+        // The structural entries are stated first. The model also reported GET
+        // /users (via a `Response.json` candidate), and its row is the one that
+        // carries the owner, the handler and the type anchors, so the join
+        // keeps it and withdraws the structural twin. POST /users is a route
+        // only the file layout states, and it survives untouched.
+        let mut reported = synthetic_endpoint("GET", "/users");
+        reported.candidate_id = "c1".to_string();
+        reported.handler_name = "GET".to_string();
+        let model = FileAnalysisResult {
+            endpoints: vec![reported],
             ..Default::default()
         };
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
 
-        let added = FileOrchestrator::merge_file_based_endpoints(
-            &mut result,
-            vec![
-                synthetic_endpoint("get", "/users"), // duplicate (case-insensitive method)
+        let (result, stats) = emit_and_join_with(
+            model,
+            &candidate_map,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[
+                synthetic_endpoint("get", "/users"), // the same route, cased differently
                 synthetic_endpoint("POST", "/users"), // new method, same path
             ],
+            "app/users/route.ts",
         );
 
-        assert_eq!(added, 1);
+        assert_eq!(emitted(&stats, ResolutionSource::FileBasedRoute), 2);
+        assert_eq!(stats.model_rows_joined, 1);
         assert_eq!(result.endpoints.len(), 2);
         assert!(
             result
                 .endpoints
                 .iter()
                 .any(|e| e.method == "POST" && e.path == "/users")
+        );
+        assert_eq!(
+            result
+                .endpoints
+                .iter()
+                .filter(|e| e.method.eq_ignore_ascii_case("GET") && e.path == "/users")
+                .count(),
+            1,
+            "one route, not two: {:#?}",
+            result.endpoints
         );
     }
 
@@ -11434,15 +11400,27 @@ export { routes };
         FileOrchestrator::canonicalize_endpoint_paths(&mut result);
         assert_eq!(result.endpoints[0].path, "/w/:slug/projects/new");
 
-        let added = FileOrchestrator::merge_file_based_endpoints(
-            &mut result,
-            vec![synthetic_endpoint("POST", "/w/:slug/projects/new")],
+        // The structural colon form and the model's bracket form are the same
+        // route: the join canonicalizes both sides, so one row survives.
+        result.endpoints[0].candidate_id = "c1".to_string();
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
+        let (joined, _) = emit_and_join_with(
+            result,
+            &candidate_map,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[synthetic_endpoint("POST", "/w/:slug/projects/new")],
+            "app/route.ts",
         );
         assert_eq!(
-            added, 0,
-            "colon-form route should dedupe against the canonicalized LLM path"
+            joined.endpoints.len(),
+            1,
+            "colon-form route should dedupe against the canonicalized LLM path: {:#?}",
+            joined.endpoints
         );
-        assert_eq!(result.endpoints.len(), 1);
     }
 
     #[test]
@@ -11523,6 +11501,74 @@ export { routes };
         }
     }
 
+    /// Drive the emit/join seam the way `analyze_files` does: the
+    /// deterministic layer states its rows first, then the model's answer is
+    /// joined onto them. Every test that used to call one of the merged passes
+    /// goes through this.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_and_join_with(
+        model: FileAnalysisResult,
+        candidate_map: &HashMap<String, CandidateTarget>,
+        resolved_members: &HashMap<u32, ResolvedMember>,
+        local_wrapper_calls: &[LocalWrapperCall],
+        aliases: &EnvAliasMap,
+        whole_url_fallbacks: &WholeUrlFallbackMap,
+        route_endpoints: &[EndpointResult],
+        file_path: &str,
+    ) -> (FileAnalysisResult, ProcessingStats) {
+        let mut stats = ProcessingStats::default();
+        let resolved = FileOrchestrator::resolve_candidates(
+            candidate_map,
+            resolved_members,
+            local_wrapper_calls,
+            aliases,
+            whole_url_fallbacks,
+            route_endpoints,
+            &[],
+        );
+        let mut result = FileAnalysisResult::default();
+        let overrules = FileOrchestrator::emit_resolved_rows(
+            &mut result,
+            resolved,
+            &mut stats.deterministic_rows_emitted,
+        );
+        FileOrchestrator::join_model_rows(
+            &mut result,
+            model,
+            candidate_map,
+            &overrules,
+            file_path,
+            &mut stats,
+        );
+        (result, stats)
+    }
+
+    fn emit_and_join(
+        model: FileAnalysisResult,
+        candidate_map: &HashMap<String, CandidateTarget>,
+        file_path: &str,
+    ) -> (FileAnalysisResult, ProcessingStats) {
+        emit_and_join_with(
+            model,
+            candidate_map,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            file_path,
+        )
+    }
+
+    /// How many rows one source stated in a run of the seam.
+    fn emitted(stats: &ProcessingStats, source: ResolutionSource) -> usize {
+        stats
+            .deterministic_rows_emitted
+            .get(&source)
+            .copied()
+            .unwrap_or(0)
+    }
+
     fn endpoint_with_candidate(path: &str, candidate_id: &str) -> EndpointResult {
         let mut ep = synthetic_endpoint("GET", path);
         ep.candidate_id = candidate_id.to_string();
@@ -11530,11 +11576,11 @@ export { routes };
     }
 
     #[test]
-    fn test_apply_candidate_map_reanchors_path_to_registration_literal() {
+    fn the_registration_literal_overrules_the_models_path() {
         // #332: for a root route the LLM copied the sibling route's path
         // ("/:id"). The first-arg string literal at the candidate the endpoint
         // already points at is deterministic ground truth, so it wins.
-        let mut result = FileAnalysisResult {
+        let result = FileAnalysisResult {
             endpoints: vec![endpoint_with_candidate("/:id", "c1")],
             ..Default::default()
         };
@@ -11543,16 +11589,16 @@ export { routes };
             "c1".to_string(),
             candidate_with_snippet("c1", Some("\"/\"")),
         );
-        FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "routes/orders.ts");
+        let (result, _) = emit_and_join(result, &candidate_map, "routes/orders.ts");
         assert_eq!(result.endpoints[0].path, "/");
     }
 
     #[test]
-    fn test_apply_candidate_map_keeps_path_that_extends_the_literal() {
+    fn a_path_that_extends_the_registration_literal_is_kept() {
         // A constructor-carried prefix baked into the emitted path extends the
         // registration literal at a segment boundary. That is not a mis-copy;
         // it must survive (join_paths' idempotent guard depends on it).
-        let mut result = FileAnalysisResult {
+        let result = FileAnalysisResult {
             endpoints: vec![endpoint_with_candidate("/api/v1/status", "c1")],
             ..Default::default()
         };
@@ -11561,15 +11607,15 @@ export { routes };
             "c1".to_string(),
             candidate_with_snippet("c1", Some("'/status'")),
         );
-        FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "src/app.ts");
+        let (result, _) = emit_and_join(result, &candidate_map, "src/app.ts");
         assert_eq!(result.endpoints[0].path, "/api/v1/status");
     }
 
     #[test]
-    fn test_apply_candidate_map_ignores_non_literal_snippets() {
+    fn a_non_literal_first_argument_overrules_nothing() {
         // Template literals, expressions, and absent snippets are ambiguous;
         // only a plain quoted literal may override the emitted path.
-        let mut result = FileAnalysisResult {
+        let result = FileAnalysisResult {
             endpoints: vec![
                 endpoint_with_candidate("/x/:y", "c1"),
                 endpoint_with_candidate("/a", "c2"),
@@ -11582,7 +11628,7 @@ export { routes };
             candidate_with_snippet("c1", Some("`/x/${y}`")),
         );
         candidate_map.insert("c2".to_string(), candidate_with_snippet("c2", None));
-        FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "src/app.ts");
+        let (result, _) = emit_and_join(result, &candidate_map, "src/app.ts");
         assert_eq!(result.endpoints[0].path, "/x/:y");
         assert_eq!(result.endpoints[1].path, "/a");
     }
@@ -11624,9 +11670,9 @@ export { routes };
     /// offered candidate is the existing contract and stays exactly as it was,
     /// on both routes into the analyzer.
     #[test]
-    fn test_apply_candidate_map_drops_unjoinable_endpoints_on_both_routes() {
+    fn an_endpoint_whose_candidate_id_joins_nothing_is_dropped_on_both_routes() {
         // Route 1: candidates were offered, one id is unknown.
-        let mut result = FileAnalysisResult {
+        let result = FileAnalysisResult {
             endpoints: vec![
                 endpoint_with_candidate("/known", "c1"),
                 endpoint_with_candidate("/invented", "c-nope"),
@@ -11635,16 +11681,16 @@ export { routes };
         };
         let mut candidate_map = HashMap::new();
         candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
-        FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "src/app.ts");
+        let (result, _) = emit_and_join(result, &candidate_map, "src/app.ts");
         assert_eq!(result.endpoints.len(), 1);
         assert_eq!(result.endpoints[0].path, "/known");
 
         // Route 2: force-analyzed, no candidates offered at all.
-        let mut forced = FileAnalysisResult {
+        let forced = FileAnalysisResult {
             endpoints: vec![endpoint_with_candidate("/a", "c1")],
             ..Default::default()
         };
-        FileOrchestrator::apply_candidate_map(&mut forced, &HashMap::new(), "src/forced.ts");
+        let (forced, _) = emit_and_join(forced, &HashMap::new(), "src/forced.ts");
         assert!(forced.endpoints.is_empty());
     }
 
@@ -11691,6 +11737,7 @@ export { routes };
             loopback_default_url: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         }
     }
 
@@ -11700,7 +11747,7 @@ export { routes };
     /// matched a producer's SPA fallback.
     #[test]
     fn request_spec_overrules_the_models_target_and_method() {
-        let mut result = FileAnalysisResult {
+        let result = FileAnalysisResult {
             data_calls: vec![
                 data_call_with("c1", "/*", Some("POST")),
                 data_call_with("c2", "", None),
@@ -11712,12 +11759,12 @@ export { routes };
             "c1".to_string(),
             request_spec_candidate("c1", "POST", "/api/v1/auth/universal-auth/login"),
         );
-        candidate_map.insert(
-            "c2".to_string(),
-            request_spec_candidate("c2", "DELETE", "/api/v1/sessions/current"),
-        );
+        let mut second = request_spec_candidate("c2", "DELETE", "/api/v1/sessions/current");
+        second.span_start = 200;
+        second.span_end = 240;
+        candidate_map.insert("c2".to_string(), second);
 
-        FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "src/client.ts");
+        let (result, _) = emit_and_join(result, &candidate_map, "src/client.ts");
 
         assert_eq!(
             result.data_calls[0].target,
@@ -11735,7 +11782,7 @@ export { routes };
     /// therefore kept.
     #[test]
     fn request_spec_keeps_a_target_that_already_carries_its_url() {
-        let mut result = FileAnalysisResult {
+        let result = FileAnalysisResult {
             data_calls: vec![
                 data_call_with("c1", "${API_URL}/api/v1/status", Some("GET")),
                 data_call_with("c2", "/api/v1/status", Some("GET")),
@@ -11747,12 +11794,12 @@ export { routes };
             "c1".to_string(),
             request_spec_candidate("c1", "GET", "/api/v1/status"),
         );
-        candidate_map.insert(
-            "c2".to_string(),
-            request_spec_candidate("c2", "GET", "/api/v1/status"),
-        );
+        let mut second = request_spec_candidate("c2", "GET", "/api/v1/status");
+        second.span_start = 200;
+        second.span_end = 240;
+        candidate_map.insert("c2".to_string(), second);
 
-        FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "src/client.ts");
+        let (result, _) = emit_and_join(result, &candidate_map, "src/client.ts");
 
         assert_eq!(result.data_calls[0].target, "${API_URL}/api/v1/status");
         assert_eq!(result.data_calls[1].target, "/api/v1/status");
@@ -11762,14 +11809,14 @@ export { routes };
     /// untouched, so the model stays the authority where it always was.
     #[test]
     fn data_calls_without_a_request_spec_are_left_alone() {
-        let mut result = FileAnalysisResult {
+        let result = FileAnalysisResult {
             data_calls: vec![data_call_with("c1", "${API_URL}/things", Some("GET"))],
             ..Default::default()
         };
         let mut candidate_map = HashMap::new();
         candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", Some("'/x'")));
 
-        FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "src/client.ts");
+        let (result, _) = emit_and_join(result, &candidate_map, "src/client.ts");
 
         assert_eq!(result.data_calls[0].target, "${API_URL}/things");
         assert_eq!(result.data_calls[0].method.as_deref(), Some("GET"));
@@ -11781,8 +11828,8 @@ export { routes };
     /// are emitted deterministically rather than lost — otherwise the producer
     /// reports its endpoints orphaned while a consumer in the index calls them.
     #[test]
-    fn merge_request_spec_calls_backfills_operations_extraction_missed() {
-        let mut result = FileAnalysisResult::default();
+    fn a_request_spec_states_the_operations_the_model_missed() {
+        let result = FileAnalysisResult::default();
         let mut candidate_map = HashMap::new();
         let mut release = verb_call_candidate("c1", "POST", "/v1/sessions/:sessionId/release");
         release.span_start = 400;
@@ -11791,9 +11838,9 @@ export { routes };
         candidate_map.insert("c1".to_string(), release);
         candidate_map.insert("c2".to_string(), list);
 
-        let added = FileOrchestrator::merge_request_spec_calls(&mut result, &candidate_map);
+        let (result, stats) = emit_and_join(result, &candidate_map, "src/client.ts");
 
-        assert_eq!(added, 2);
+        assert_eq!(emitted(&stats, ResolutionSource::RequestSpec), 2);
         // Source order, not hash order: the same file must produce the same
         // rows on every scan.
         let emitted: Vec<(&str, Option<&str>)> = result
@@ -11819,8 +11866,8 @@ export { routes };
     /// neither at the same site, nor as the same (method, path) behind the base
     /// URL the analyzer resolved and this pass cannot see.
     #[test]
-    fn merge_request_spec_calls_skips_operations_already_extracted() {
-        let mut result = FileAnalysisResult {
+    fn a_request_spec_site_the_model_answered_is_one_row() {
+        let result = FileAnalysisResult {
             data_calls: vec![
                 data_call_with("c1", "/v1/sessions/:sessionId/release", Some("POST")),
                 data_call_with("other", "${API_URL}/v1/sessions", Some("GET")),
@@ -11834,22 +11881,34 @@ export { routes };
         );
         // Same operation, reported against another candidate id with the base
         // in front of it.
-        candidate_map.insert(
-            "c2".to_string(),
-            verb_call_candidate("c2", "GET", "/v1/sessions"),
-        );
+        let mut listed = verb_call_candidate("c2", "GET", "/v1/sessions");
+        listed.span_start = 200;
+        listed.span_end = 240;
+        candidate_map.insert("c2".to_string(), listed);
         // A different operation on the same path prefix must still be emitted.
-        candidate_map.insert(
-            "c3".to_string(),
-            verb_call_candidate("c3", "DELETE", "/v1/sessions"),
+        let mut removed = verb_call_candidate("c3", "DELETE", "/v1/sessions");
+        removed.span_start = 300;
+        removed.span_end = 340;
+        candidate_map.insert("c3".to_string(), removed);
+
+        let (result, stats) = emit_and_join(result, &candidate_map, "src/client.ts");
+
+        // Three sites, three rows: the two the model answered are joined onto
+        // the deterministic statements at their spans, and the third is the
+        // deterministic statement alone. The model's row for a site that named
+        // another candidate id keeps its own place.
+        assert_eq!(emitted(&stats, ResolutionSource::RequestSpec), 3);
+        assert_eq!(stats.model_rows_joined, 1, "one model row joined by span");
+        assert_eq!(result.data_calls.len(), 4);
+        let rows: Vec<(&str, Option<&str>)> = result
+            .data_calls
+            .iter()
+            .map(|call| (call.target.as_str(), call.method.as_deref()))
+            .collect();
+        assert!(
+            rows.contains(&("/v1/sessions", Some("DELETE"))),
+            "the operation nothing else states must be emitted: {rows:?}"
         );
-
-        let added = FileOrchestrator::merge_request_spec_calls(&mut result, &candidate_map);
-
-        assert_eq!(added, 1);
-        assert_eq!(result.data_calls.len(), 3);
-        assert_eq!(result.data_calls[2].target, "/v1/sessions");
-        assert_eq!(result.data_calls[2].method.as_deref(), Some("DELETE"));
     }
 
     /// A `{ method, url }` object states a request and a route registration
@@ -11857,17 +11916,17 @@ export { routes };
     /// operation being performed — is emitted without the analyzer. The config
     /// form keeps its #537 anchoring role and nothing more.
     #[test]
-    fn merge_request_spec_calls_ignores_config_object_specs() {
-        let mut result = FileAnalysisResult::default();
+    fn a_config_object_spec_states_no_row_of_its_own() {
+        let result = FileAnalysisResult::default();
         let mut candidate_map = HashMap::new();
         candidate_map.insert(
             "c1".to_string(),
             request_spec_candidate("c1", "GET", "/v1/health"),
         );
 
-        let added = FileOrchestrator::merge_request_spec_calls(&mut result, &candidate_map);
+        let (result, stats) = emit_and_join(result, &candidate_map, "src/client.ts");
 
-        assert_eq!(added, 0);
+        assert_eq!(emitted(&stats, ResolutionSource::RequestSpec), 0);
         assert!(result.data_calls.is_empty());
     }
 
@@ -11893,22 +11952,31 @@ export { routes };
     /// in after the pass.
     #[test]
     fn merge_local_wrapper_calls_backfills_sites_never_offered_to_extraction() {
-        let mut result = FileAnalysisResult::default();
+        let result = FileAnalysisResult::default();
         let calls = vec![
             wrapper_call(31, 100, "${base}/api/v1/widgets", None),
             wrapper_call(37, 300, "${base}/api/v1/widgets/${id}", Some("DELETE")),
         ];
 
-        let added = FileOrchestrator::merge_local_wrapper_calls(&mut result, calls);
+        let (result, stats) = emit_and_join_with(
+            result,
+            &HashMap::new(),
+            &HashMap::new(),
+            &calls,
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/tools.ts",
+        );
 
-        assert_eq!(added, 2);
-        let emitted: Vec<(&str, Option<&str>)> = result
+        assert_eq!(emitted(&stats, ResolutionSource::SameFileWrapper), 2);
+        let rows: Vec<(&str, Option<&str>)> = result
             .data_calls
             .iter()
             .map(|call| (call.target.as_str(), call.method.as_deref()))
             .collect();
         assert_eq!(
-            emitted,
+            rows,
             vec![
                 ("${base}/api/v1/widgets", None),
                 ("${base}/api/v1/widgets/${id}", Some("DELETE")),
@@ -11934,7 +12002,7 @@ export { routes };
     #[test]
     fn wrapper_calls_with_a_built_query_string_reach_the_graph() {
         let orchestrator = FileOrchestrator::new(AgentService::new());
-        let mut result = FileAnalysisResult::default();
+        let result = FileAnalysisResult::default();
         let calls = vec![
             wrapper_call(31, 100, "${base}/api/v1/widgets", None),
             wrapper_call(35, 300, "${base}/api/v1/widgets?${params.toString()}", None),
@@ -11946,8 +12014,21 @@ export { routes };
             ),
         ];
 
-        let added = FileOrchestrator::merge_local_wrapper_calls(&mut result, calls);
-        assert_eq!(added, 3, "every site is backfilled");
+        let (result, stats) = emit_and_join_with(
+            result,
+            &HashMap::new(),
+            &HashMap::new(),
+            &calls,
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/tools.ts",
+        );
+        assert_eq!(
+            emitted(&stats, ResolutionSource::SameFileWrapper),
+            3,
+            "every site is stated"
+        );
 
         let mut file_results = HashMap::new();
         file_results.insert("src/tools.ts".to_string(), result);
@@ -11979,22 +12060,36 @@ export { routes };
     /// the first backfill must not suppress its siblings.
     #[test]
     fn merge_local_wrapper_calls_keeps_siblings_on_one_line() {
-        let mut result = FileAnalysisResult::default();
+        let result = FileAnalysisResult::default();
         let calls = vec![
             wrapper_call(88, 100, "${base}/api/v1/widgets", None),
             wrapper_call(88, 200, "${base}/api/v1/gadgets", None),
         ];
 
-        let added = FileOrchestrator::merge_local_wrapper_calls(&mut result, calls);
+        let (result, stats) = emit_and_join_with(
+            result,
+            &HashMap::new(),
+            &HashMap::new(),
+            &calls,
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/tools.ts",
+        );
 
-        assert_eq!(added, 2);
+        assert_eq!(emitted(&stats, ResolutionSource::SameFileWrapper), 2);
         assert_eq!(result.data_calls[1].target, "${base}/api/v1/gadgets");
     }
 
-    /// A site extraction DID answer keeps the analyzer's row: same span, same
-    /// line, or the same path already carried behind a base.
+    /// A site the model answered is one row, not two. It joins by span where
+    /// the model's row carries one and by line where it does not, and what the
+    /// wrapper states wins in both cases — the site's own argument is the
+    /// path, and the model was reading the same source without being asked
+    /// about it. The path-only coincidence (a model row for a different site
+    /// that happens to state the same route) is left to the graph, where a
+    /// candidate-less echo of a candidate-backed call is suppressed.
     #[test]
-    fn merge_local_wrapper_calls_skips_sites_extraction_already_answered() {
+    fn a_same_file_wrapper_site_the_model_answered_is_one_row() {
         let mut by_span = data_call_with("c1", "/api/v1/widgets", Some("GET"));
         by_span.line_number = 90;
         by_span.call_expression_span_start = Some(100);
@@ -12003,7 +12098,7 @@ export { routes };
         let mut by_path = data_call_with("c3", "${base}/api/v1/things", Some("POST"));
         by_path.line_number = 91;
 
-        let mut result = FileAnalysisResult {
+        let result = FileAnalysisResult {
             data_calls: vec![by_span, by_line, by_path],
             ..Default::default()
         };
@@ -12014,11 +12109,47 @@ export { routes };
             wrapper_call(51, 700, "${base}/api/v1/things", Some("DELETE")),
         ];
 
-        let added = FileOrchestrator::merge_local_wrapper_calls(&mut result, calls);
+        let (result, stats) = emit_and_join_with(
+            result,
+            &HashMap::new(),
+            &HashMap::new(),
+            &calls,
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/tools.ts",
+        );
 
-        assert_eq!(added, 1, "only the site nothing already covers is emitted");
-        assert_eq!(result.data_calls[3].target, "${base}/api/v1/things");
-        assert_eq!(result.data_calls[3].method.as_deref(), Some("DELETE"));
+        assert_eq!(
+            emitted(&stats, ResolutionSource::SameFileWrapper),
+            4,
+            "one row per site, whatever the model said"
+        );
+        assert_eq!(
+            stats.model_rows_joined, 2,
+            "the row at the site's span and the row on the site's line fold in"
+        );
+        let rows: Vec<(&str, Option<&str>)> = result
+            .data_calls
+            .iter()
+            .map(|call| (call.target.as_str(), call.method.as_deref()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                // The wrapper states no method for this site; the model's row
+                // at its span does, and determinism stating nothing is exactly
+                // where the model's answer stands.
+                ("${base}/api/v1/widgets", Some("GET")),
+                ("${base}/api/v1/widgets/${id}", Some("DELETE")),
+                ("${base}/api/v1/things", Some("POST")),
+                ("${base}/api/v1/things", Some("DELETE")),
+                // The model's row for a site with neither the span nor the
+                // line of any wrapper call keeps its own place.
+                ("${base}/api/v1/things", Some("POST")),
+            ],
+            "what the wrapper states wins at every site it states"
+        );
     }
 
     fn resolved_member(span: u32, method: &str, target: &str) -> HashMap<u32, ResolvedMember> {
@@ -12034,8 +12165,8 @@ export { routes };
     /// A member as the ring assertions compare it. `request_line` is
     /// provenance and outside `RequestMember`'s `PartialEq`, so the value here
     /// is never read.
-    fn ring_member(method: &str, target: &str) -> RequestMember {
-        RequestMember {
+    fn ring_member(method: &str, target: &str) -> crate::imported_request_member::RequestMember {
+        crate::imported_request_member::RequestMember {
             method: method.to_string(),
             target: target.to_string(),
             request_line: 0,
@@ -12534,22 +12665,33 @@ export { routes };
     /// nothing for was dropped and the endpoint it reaches was absent from the
     /// index entirely.
     #[test]
-    fn merge_imported_member_calls_emits_a_site_extraction_returned_no_row_for() {
-        let mut result = FileAnalysisResult::default();
+    fn an_imported_member_states_the_site_the_model_returned_no_row_for() {
+        let result = FileAnalysisResult::default();
         let mut candidate_map = HashMap::new();
         candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
         let resolved = resolved_member(100, "PUT", "${this.baseUrl}/api/v2/things/${id}");
 
-        let added =
-            FileOrchestrator::merge_imported_member_calls(&mut result, &resolved, &candidate_map);
+        let (result, stats) = emit_and_join_with(
+            result,
+            &candidate_map,
+            &resolved,
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/consumer.ts",
+        );
 
-        assert_eq!(added, 1);
+        assert_eq!(emitted(&stats, ResolutionSource::ImportedMember), 1);
         assert_eq!(
             result.data_calls[0].target, "${this.baseUrl}/api/v2/things/${id}",
             "everything the member closes over is kept verbatim"
         );
         assert_eq!(result.data_calls[0].method.as_deref(), Some("PUT"));
-        assert_eq!(result.data_calls[0].candidate_id, "imported-member:100-140");
+        assert_eq!(
+            result.data_calls[0].candidate_id, "c1",
+            "the candidate's own id, with no pass-name prefix"
+        );
         // The span is the SITE's: it anchors the type sidecar and marks the
         // call candidate-backed downstream.
         assert_eq!(result.data_calls[0].call_expression_span_start, Some(100));
@@ -12561,10 +12703,10 @@ export { routes };
     /// `apply_imported_members` has already corrected by this point): same
     /// span, same line, or the same path already carried behind a base.
     #[test]
-    fn merge_imported_member_calls_skips_sites_extraction_already_answered() {
+    fn an_imported_member_site_the_model_answered_is_one_row() {
         let mut answered = data_call_with("c1", "${base}/api/v2/things/${id}", Some("PUT"));
         answered.call_expression_span_start = Some(100);
-        let mut result = FileAnalysisResult {
+        let result = FileAnalysisResult {
             data_calls: vec![answered],
             ..Default::default()
         };
@@ -12572,11 +12714,23 @@ export { routes };
         candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
         let resolved = resolved_member(100, "PUT", "${this.baseUrl}/api/v2/things/${id}");
 
-        let added =
-            FileOrchestrator::merge_imported_member_calls(&mut result, &resolved, &candidate_map);
+        let (result, stats) = emit_and_join_with(
+            result,
+            &candidate_map,
+            &resolved,
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/consumer.ts",
+        );
 
-        assert_eq!(added, 0);
+        assert_eq!(stats.model_rows_joined, 1, "one call, one row");
         assert_eq!(result.data_calls.len(), 1);
+        assert_eq!(
+            result.data_calls[0].target, "${this.baseUrl}/api/v2/things/${id}",
+            "the member's own URL, not the consumer file's paraphrase of it"
+        );
     }
 
     /// One candidate map holds route registrations as well as calls, and the
@@ -12586,10 +12740,10 @@ export { routes };
     /// reach it; emitting would invent a consumer for a route the file
     /// DEFINES.
     #[test]
-    fn merge_imported_member_calls_leaves_a_route_registration_alone() {
+    fn an_imported_member_states_no_call_at_a_route_registration() {
         let mut endpoint = endpoint_with_candidate("/things", "c1");
         endpoint.call_expression_span_start = Some(100);
-        let mut result = FileAnalysisResult {
+        let result = FileAnalysisResult {
             endpoints: vec![endpoint],
             ..Default::default()
         };
@@ -12597,19 +12751,27 @@ export { routes };
         candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
         let resolved = resolved_member(100, "GET", "${this.baseUrl}/api/v2/things/${id}");
 
-        let added =
-            FileOrchestrator::merge_imported_member_calls(&mut result, &resolved, &candidate_map);
+        let (result, _) = emit_and_join_with(
+            result,
+            &candidate_map,
+            &resolved,
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/routes.ts",
+        );
 
-        assert_eq!(added, 0);
         assert!(result.data_calls.is_empty());
+        assert_eq!(result.endpoints.len(), 1, "the route survives");
     }
 
     /// A request member is an HTTP request, so only an HTTP candidate can be a
     /// site that reaches one. A `client.publish(topic, payload)` sharing a
     /// name with an imported `publish` member joins to nothing.
     #[test]
-    fn merge_imported_member_calls_ignores_a_non_http_candidate() {
-        let mut result = FileAnalysisResult::default();
+    fn an_imported_member_ignores_a_non_http_candidate() {
+        let result = FileAnalysisResult::default();
         let mut candidate = candidate_with_snippet("c1", None);
         candidate.protocol = crate::operation::Protocol::Pubsub;
         candidate.callee_property = Some("publish".to_string());
@@ -12617,10 +12779,18 @@ export { routes };
         candidate_map.insert("c1".to_string(), candidate);
         let resolved = resolved_member(100, "POST", "${this.baseUrl}/api/v2/events");
 
-        let added =
-            FileOrchestrator::merge_imported_member_calls(&mut result, &resolved, &candidate_map);
+        let (result, stats) = emit_and_join_with(
+            result,
+            &candidate_map,
+            &resolved,
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/events.ts",
+        );
 
-        assert_eq!(added, 0);
+        assert_eq!(emitted(&stats, ResolutionSource::ImportedMember), 0);
         assert!(result.data_calls.is_empty());
     }
 
@@ -12657,17 +12827,23 @@ export { routes };
     /// from the index entirely.
     #[test]
     fn merge_whole_url_env_calls_emits_a_site_extraction_returned_no_row_for() {
-        let mut result = FileAnalysisResult::default();
+        let result = FileAnalysisResult::default();
         let candidate_map = whole_url_site("askUrl", "POST");
         let (aliases, paths) =
             whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
 
-        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
-            &mut result,
+        let (result, stats) = emit_and_join_with(
+            result,
             &candidate_map,
+            &HashMap::new(),
+            &[],
             &aliases,
             &paths,
+            &[],
+            "src/support.ts",
         );
+        let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
+        let corrected = stats.model_rows_joined;
 
         assert_eq!((added, corrected), (1, 0));
         assert_eq!(
@@ -12675,12 +12851,15 @@ export { routes };
             "the env var supplies the origin and the fallback literal the path"
         );
         assert_eq!(
+            result.data_calls[0].candidate_id, "c1",
+            "the candidate's own id, with no pass-name prefix"
+        );
+        assert_eq!(
             result.data_calls[0].loopback_default_url.as_deref(),
             Some("http://localhost:3939/api/ask"),
             "the loopback default is what the canonical key is computed from"
         );
         assert_eq!(result.data_calls[0].method.as_deref(), Some("POST"));
-        assert_eq!(result.data_calls[0].candidate_id, "whole-url-env:100-140");
         // The span is the SITE's: it anchors the type sidecar and marks the
         // call candidate-backed downstream.
         assert_eq!(result.data_calls[0].call_expression_span_start, Some(100));
@@ -12699,7 +12878,7 @@ export { routes };
     fn merge_whole_url_env_calls_corrects_the_row_extraction_answered_for_the_site() {
         let mut answered = data_call_with("c1", "${SERVICE_ASK_URL}/api/ask", Some("POST"));
         answered.call_expression_span_start = Some(100);
-        let mut result = FileAnalysisResult {
+        let result = FileAnalysisResult {
             data_calls: vec![answered],
             ..Default::default()
         };
@@ -12707,14 +12886,20 @@ export { routes };
         let (aliases, paths) =
             whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
 
-        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
-            &mut result,
+        let (result, stats) = emit_and_join_with(
+            result,
             &candidate_map,
+            &HashMap::new(),
+            &[],
             &aliases,
             &paths,
+            &[],
+            "src/support.ts",
         );
+        let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
+        let corrected = stats.model_rows_joined;
 
-        assert_eq!((added, corrected), (0, 1), "one call, one row");
+        assert_eq!((added, corrected), (1, 1), "one call, one row");
         assert_eq!(result.data_calls.len(), 1);
         assert_eq!(
             result.data_calls[0].target, "${process.env.SERVICE_ASK_URL}/api/ask",
@@ -12734,7 +12919,7 @@ export { routes };
             data_call_with("c1", "${process.env.SERVICE_ASK_URL}/api/ask", Some("POST"));
         answered.call_expression_span_start = Some(100);
         answered.loopback_default_url = Some("http://localhost:3939/api/ask".to_string());
-        let mut result = FileAnalysisResult {
+        let result = FileAnalysisResult {
             data_calls: vec![answered],
             ..Default::default()
         };
@@ -12742,26 +12927,45 @@ export { routes };
         let (aliases, paths) =
             whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
 
-        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
-            &mut result,
+        let (result, stats) = emit_and_join_with(
+            result,
             &candidate_map,
+            &HashMap::new(),
+            &[],
             &aliases,
             &paths,
+            &[],
+            "src/support.ts",
         );
+        let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
+        let corrected = stats.model_rows_joined;
 
-        assert_eq!((added, corrected), (0, 0));
+        assert_eq!(
+            (added, corrected),
+            (1, 1),
+            "the source states the row and the model's identical answer folds in"
+        );
         assert_eq!(result.data_calls.len(), 1);
+        assert_eq!(
+            result.data_calls[0].target,
+            "${process.env.SERVICE_ASK_URL}/api/ask"
+        );
+        assert_eq!(
+            result.data_calls[0].loopback_default_url.as_deref(),
+            Some("http://localhost:3939/api/ask")
+        );
+        assert_eq!(stats.model_contradictions_discarded, 0);
     }
 
     /// A row on the same line with a span of its OWN is a different call — a
-    /// second request on the line raises its own candidate — so it covers the
-    /// site and neither corrects it nor suppresses the emission for it.
+    /// second request on the line raises its own candidate — so the two are
+    /// two rows, and neither states anything about the other.
     #[test]
     fn merge_whole_url_env_calls_leaves_a_different_call_on_the_same_line_alone() {
         let mut sibling = data_call_with("c2", "${process.env.OTHER_URL}/api/other", Some("GET"));
         sibling.call_expression_span_start = Some(200);
         sibling.line_number = 12;
-        let mut result = FileAnalysisResult {
+        let result = FileAnalysisResult {
             data_calls: vec![sibling],
             ..Default::default()
         };
@@ -12769,16 +12973,31 @@ export { routes };
         let (aliases, paths) =
             whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
 
-        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
-            &mut result,
+        let (result, stats) = emit_and_join_with(
+            result,
             &candidate_map,
+            &HashMap::new(),
+            &[],
             &aliases,
             &paths,
+            &[],
+            "src/support.ts",
         );
+        let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
+        let corrected = stats.model_rows_joined;
 
-        assert_eq!((added, corrected), (0, 0));
         assert_eq!(
-            result.data_calls[0].target, "${process.env.OTHER_URL}/api/other",
+            (added, corrected),
+            (1, 0),
+            "the site the source resolves is a row, and the sibling is another"
+        );
+        assert_eq!(result.data_calls.len(), 2);
+        assert_eq!(
+            result.data_calls[0].target, "${process.env.SERVICE_ASK_URL}/api/ask",
+            "the site the whole-URL binding states"
+        );
+        assert_eq!(
+            result.data_calls[1].target, "${process.env.OTHER_URL}/api/other",
             "the sibling call is untouched"
         );
     }
@@ -12787,7 +13006,7 @@ export { routes };
     /// the call keeps the verbatim env-var key an undeclared base gets.
     #[test]
     fn merge_whole_url_env_calls_keys_a_third_party_fallback_verbatim() {
-        let mut result = FileAnalysisResult::default();
+        let result = FileAnalysisResult::default();
         let candidate_map = whole_url_site("askUrl", "POST");
         let (aliases, paths) = whole_url_maps(
             "askUrl",
@@ -12795,12 +13014,18 @@ export { routes };
             "https://api.example.com/v1/ask",
         );
 
-        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
-            &mut result,
+        let (result, stats) = emit_and_join_with(
+            result,
             &candidate_map,
+            &HashMap::new(),
+            &[],
             &aliases,
             &paths,
+            &[],
+            "src/support.ts",
         );
+        let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
+        let corrected = stats.model_rows_joined;
 
         assert_eq!((added, corrected), (1, 0));
         assert_eq!(
@@ -12819,7 +13044,7 @@ export { routes };
     /// read as a request is left alone.
     #[test]
     fn merge_whole_url_env_calls_ignores_a_site_that_is_not_a_request() {
-        let mut result = FileAnalysisResult::default();
+        let result = FileAnalysisResult::default();
         let mut candidate_map = whole_url_site("askUrl", "POST");
         candidate_map
             .get_mut("c1")
@@ -12828,12 +13053,18 @@ export { routes };
         let (aliases, paths) =
             whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
 
-        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
-            &mut result,
+        let (result, stats) = emit_and_join_with(
+            result,
             &candidate_map,
+            &HashMap::new(),
+            &[],
             &aliases,
             &paths,
+            &[],
+            "src/support.ts",
         );
+        let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
+        let corrected = stats.model_rows_joined;
 
         assert_eq!((added, corrected), (0, 0));
         assert!(result.data_calls.is_empty());
@@ -12844,7 +13075,7 @@ export { routes };
     /// That shape stays extraction's to answer.
     #[test]
     fn merge_whole_url_env_calls_ignores_a_site_with_no_readable_method() {
-        let mut result = FileAnalysisResult::default();
+        let result = FileAnalysisResult::default();
         let mut candidate_map = whole_url_site("askUrl", "POST");
         candidate_map
             .get_mut("c1")
@@ -12853,12 +13084,18 @@ export { routes };
         let (aliases, paths) =
             whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
 
-        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
-            &mut result,
+        let (result, stats) = emit_and_join_with(
+            result,
             &candidate_map,
+            &HashMap::new(),
+            &[],
             &aliases,
             &paths,
+            &[],
+            "src/support.ts",
         );
+        let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
+        let corrected = stats.model_rows_joined;
 
         assert_eq!((added, corrected), (0, 0));
         assert!(result.data_calls.is_empty());
@@ -12871,7 +13108,7 @@ export { routes };
     fn merge_whole_url_env_calls_leaves_a_route_registration_alone() {
         let mut endpoint = endpoint_with_candidate("/api/ask", "c1");
         endpoint.call_expression_span_start = Some(100);
-        let mut result = FileAnalysisResult {
+        let result = FileAnalysisResult {
             endpoints: vec![endpoint],
             ..Default::default()
         };
@@ -12879,15 +13116,31 @@ export { routes };
         let (aliases, paths) =
             whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
 
-        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
-            &mut result,
+        let (result, stats) = emit_and_join_with(
+            result,
             &candidate_map,
+            &HashMap::new(),
+            &[],
             &aliases,
             &paths,
+            &[],
+            "src/support.ts",
         );
+        let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
+        let corrected = stats.model_rows_joined;
 
-        assert_eq!((added, corrected), (0, 0));
-        assert!(result.data_calls.is_empty());
+        assert_eq!(
+            added, 1,
+            "the source states the row before it can know the model called \
+             this span a route"
+        );
+        assert_eq!(corrected, 0);
+        assert!(
+            result.data_calls.is_empty(),
+            "and the join withdraws it: {:#?}",
+            result.data_calls
+        );
+        assert_eq!(result.endpoints.len(), 1, "the route survives");
     }
 
     /// A target that states a path of its own is the base-plus-path shape,
@@ -12895,17 +13148,23 @@ export { routes };
     /// path at the call site would be replaced by the fallback's.
     #[test]
     fn merge_whole_url_env_calls_leaves_a_base_plus_path_site_alone() {
-        let mut result = FileAnalysisResult::default();
+        let result = FileAnalysisResult::default();
         let candidate_map = whole_url_site("`${askUrl}/api/other`", "POST");
         let (aliases, paths) =
             whole_url_maps("askUrl", "SERVICE_ASK_URL", "http://localhost:3939/api/ask");
 
-        let (added, corrected) = FileOrchestrator::merge_whole_url_env_calls(
-            &mut result,
+        let (result, stats) = emit_and_join_with(
+            result,
             &candidate_map,
+            &HashMap::new(),
+            &[],
             &aliases,
             &paths,
+            &[],
+            "src/support.ts",
         );
+        let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
+        let corrected = stats.model_rows_joined;
 
         assert_eq!((added, corrected), (0, 0));
         assert!(result.data_calls.is_empty());
@@ -12915,7 +13174,7 @@ export { routes };
     /// the spec, so it is normalized in place rather than stripped of the base.
     #[test]
     fn request_spec_normalizes_a_target_written_with_openapi_params() {
-        let mut result = FileAnalysisResult {
+        let result = FileAnalysisResult {
             data_calls: vec![data_call_with(
                 "c1",
                 "${API_URL}/v1/sessions/{sessionId}/release",
@@ -12929,7 +13188,7 @@ export { routes };
             verb_call_candidate("c1", "POST", "/v1/sessions/:sessionId/release"),
         );
 
-        FileOrchestrator::apply_candidate_map(&mut result, &candidate_map, "src/client.ts");
+        let (result, _) = emit_and_join(result, &candidate_map, "src/client.ts");
 
         assert_eq!(
             result.data_calls[0].target,
@@ -13208,6 +13467,7 @@ export function publishWrapped(order: OrderPlaced): void {
             loopback_default_url: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         }
     }
 

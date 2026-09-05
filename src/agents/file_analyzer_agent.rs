@@ -115,6 +115,46 @@ where
         .and_then(crate::operation::PubsubRole::parse_lenient))
 }
 
+/// Which layer stated a row, and — for a deterministic row — which pass.
+///
+/// Every HTTP candidate is resolved before the model is called, and the row
+/// the deterministic layer emits for it is the substrate the model's answer is
+/// joined onto (see `FileOrchestrator::emit_resolved_rows` and
+/// `FileOrchestrator::join_model_rows`). This field records who stated the
+/// row, for the cache, the scan log and the tests. It is deliberately absent
+/// from the uploaded projection, which is built from the operation graph and
+/// not from these rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionSource {
+    /// A verb-named request spec: `client.post({ url: "/v1/things" })` (#529).
+    RequestSpec,
+    /// A request wrapper declared in the same file, called with the path as an
+    /// argument (carrick#588).
+    SameFileWrapper,
+    /// A request member of an imported same-repo module (carrick#588/#623).
+    ImportedMember,
+    /// A binding holding the WHOLE request URL, read from an environment
+    /// variable (carrick#572/#632).
+    WholeUrlEnv,
+    /// The path a `new URL(path, base)` states for the call's target
+    /// (carrick#610).
+    NewUrl,
+    /// A route declared by file location (Next.js app router, etc.).
+    FileBasedRoute,
+    /// A route declared as data: `{ method, path, handler }` (#234).
+    DescriptorRoute,
+    /// A route table binding a literal path to an imported controller (#580).
+    ClassController,
+    /// The candidate's own route-shaped first-argument literal. The one source
+    /// that states no row of its own: a bare `x.verb("/lit", arg)` carries no
+    /// role, so whether it registers a route or requests one is the model's to
+    /// decide. It overrules the path of the row the model does return (#332).
+    InlineLiteral,
+    /// The row is the model's, with no deterministic twin at its span.
+    Model,
+}
+
 /// Result of analyzing a single endpoint definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointResult {
@@ -153,6 +193,10 @@ pub struct EndpointResult {
     pub primary_type_symbol: Option<String>,
     /// Import path where the type is defined (e.g., "./types/user"), null if inline or same file
     pub type_import_source: Option<String>,
+    /// Which layer stated this row. Never from the model — set by the
+    /// emit/join pass. See [`ResolutionSource`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_source: Option<ResolutionSource>,
 }
 
 /// Result of analyzing a single data-fetching call
@@ -230,6 +274,10 @@ pub struct DataCallResult {
     /// counted — until those files change or `CACHE_VERSION` moves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumers_not_resolved: Option<crate::imported_request_member::UnfollowedMemberSites>,
+    /// Which layer stated this row. Never from the model — set by the
+    /// emit/join pass. See [`ResolutionSource`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_source: Option<ResolutionSource>,
 }
 
 /// A GraphQL resolver the file-analyzer found: the schema field it answers and
@@ -1498,6 +1546,7 @@ mod tests {
             emission_style: None,
             primary_type_symbol: Some("User".to_string()),
             type_import_source: Some("./types/user".to_string()),
+            resolution_source: None,
         };
 
         let json = serde_json::to_string(&endpoint).unwrap();
@@ -1530,6 +1579,7 @@ mod tests {
             loopback_default_url: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         };
 
         let json = serde_json::to_string(&data_call).unwrap();
@@ -1563,6 +1613,7 @@ mod tests {
                 emission_style: None,
                 primary_type_symbol: Some("-".to_string()),
                 type_import_source: Some(".repo-a_types.ts".to_string()),
+                resolution_source: None,
             }],
             data_calls: vec![DataCallResult {
                 call_kind: None,
@@ -1583,6 +1634,7 @@ mod tests {
                 loopback_default_url: None,
                 base: None,
                 consumers_not_resolved: None,
+                resolution_source: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -1715,6 +1767,7 @@ mod tests {
                 emission_style: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+                resolution_source: None,
             }],
             data_calls: vec![],
             graphql_operations: vec![],
@@ -1922,6 +1975,7 @@ mod tests {
                 emission_style: None,
                 primary_type_symbol: None,
                 type_import_source: None,
+                resolution_source: None,
             }],
             data_calls: vec![DataCallResult {
                 call_kind: None,
@@ -1942,6 +1996,7 @@ mod tests {
                 loopback_default_url: None,
                 base: None,
                 consumers_not_resolved: None,
+                resolution_source: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -1996,6 +2051,7 @@ mod tests {
             loopback_default_url: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         }
     }
 
