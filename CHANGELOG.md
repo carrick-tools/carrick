@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.39](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.38...carrick-v0.3.39) (2026-09-05)
+
+
+### Features
+
+* **scanner:** deterministic-primary emission and raw model cache (consolidation Phase A) ([#691](https://github.com/carrick-tools/carrick/issues/691)) ([e9d2f91](https://github.com/carrick-tools/carrick/commit/e9d2f91e2a12176341d61ab6f0610ca3cb4dcfae))
+
 ## [0.3.38](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.37...carrick-v0.3.38) (2026-09-05)
 
 
