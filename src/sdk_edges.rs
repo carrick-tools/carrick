@@ -793,6 +793,63 @@ mod tests {
         assert!(joined.unresolved().is_empty());
     }
 
+    /// carrick#679, end to end over the REAL published surface: a consumer
+    /// writes `vaults.list(...)` off a named import of a package whose entry
+    /// publishes `export * as vaults from "./vaults.js"`. Nothing in the
+    /// accept rule moves — the group publishes `(export "vaults", chain
+    /// "list")`, which is exactly the pair a named import and a one-hop callee
+    /// form. Before the namespace form was admitted this surface held no
+    /// `vaults` member at all and the call was `member_not_found`.
+    #[test]
+    fn resolves_a_call_through_a_namespace_reexport_group() {
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sdk-surface");
+        let surface = crate::sdk_surface::scan(&fixture, &fixture);
+        let member = surface
+            .iter()
+            .find(|m| m.export == "vaults" && m.chain == "list")
+            .expect("the fixture publishes the group's `list`")
+            .clone();
+        let location = format!("{}:{}", member.file, member.line);
+
+        // The SDK's own outbound call, inside that member's own span.
+        let mut sdk = sdk_repo();
+        sdk.sdk_surface = Some(surface);
+        let mut graph = MountGraph::new();
+        graph.data_calls = vec![DataFetchingCall {
+            method: "GET".to_string(),
+            target_url: "/v1/vaults".to_string(),
+            canonical_path: "/v1/vaults".to_string(),
+            client: "fetch(".to_string(),
+            file_location: location.clone(),
+            call_kind: None,
+            repo_name: None,
+            service_name: None,
+            host: None,
+            line: Some(member.line),
+            base: None,
+            consumers_not_resolved: None,
+        }];
+        sdk.mount_graph = Some(graph);
+
+        let mut edge = sdk_to_producer_match();
+        edge.consumer_location = Some(location.clone());
+
+        let mut candidate = candidate("vaults.list");
+        candidate.import_symbol = Some("vaults".to_string());
+
+        let joined = run(&[producer(), sdk], &[consumer_with(candidate)], &[edge]);
+
+        assert_eq!(joined.edges().len(), 1, "{:?}", joined);
+        let resolved = &joined.edges()[0];
+        assert_eq!(resolved.import_symbol.as_deref(), Some("vaults"));
+        assert_eq!(resolved.callee, "vaults.list");
+        assert_eq!(resolved.sdk_member, "list");
+        assert_eq!(resolved.sdk_location, location);
+        assert_eq!(resolved.producer_key, PRODUCER_KEY);
+        assert!(joined.unresolved().is_empty());
+    }
+
     /// A layered client: the member a consumer calls holds no route, and the
     /// SDK's own outbound call sits in the api wrapper one hop below it. The
     /// consumer writes the accessor call in the middle of the chain.

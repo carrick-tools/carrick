@@ -20,8 +20,9 @@
 //! - `this.foo(...)` — the enclosing class's `Class.foo` key, in the same
 //!   file. A same-named method on another class cannot match.
 //! - `obj.foo(...)` — `obj` as a class in the same file (`Class.staticFn()`),
-//!   an imported class, or a namespace import (`import * as ns`). Anything
-//!   else produces no edge.
+//!   an imported class, a namespace import (`import * as ns`), or a named
+//!   import of a namespace RE-export (`export * as ns from "./m"` in the
+//!   module it comes from, carrick#679). Anything else produces no edge.
 //!
 //! Resolution is keyed on **(file, definition key)** throughout, taken from the
 //! per-file extractor output rather than from the merged function map, so a
@@ -354,6 +355,16 @@ impl<'a> CallResolver<'a> {
         }
 
         let symbol = index.imports.get(object)?;
+
+        // `import { queues } from "./index.js"` where the entry writes
+        // `export * as queues from "./queues.js"`: the name binds a MODULE one
+        // hop away, so `queues.list()` is that module's own `list`. Tried
+        // first because the value walk below answers `None` for such a name
+        // and caches that answer (carrick#679).
+        if let Some(target) = self.resolve_namespace_member(&index.path, symbol, name) {
+            return Some(target);
+        }
+
         let binding = self.resolve_import(&index.path, symbol)?;
         let target_index = self.per_file.get(&binding.file)?;
 
@@ -370,6 +381,38 @@ impl<'a> CallResolver<'a> {
         member_keys(&class, name)
             .into_iter()
             .find_map(|key| same_file(target_index, key))
+    }
+
+    /// `ns.foo(...)` where `ns` is a NAMED import of a namespace re-export
+    /// (`export * as ns from "./m"` in the module it comes from).
+    ///
+    /// The importing file names neither `./m` nor `foo`, so nothing else here
+    /// can reach the definition: the receiver is resolved to the module the
+    /// namespace stands for, and `foo` is then followed out of that module the
+    /// way any export is — a group is commonly a barrel, so the function is
+    /// often declared one hop further on.
+    fn resolve_namespace_member(
+        &mut self,
+        importer: &Path,
+        symbol: &ImportedSymbol,
+        name: &str,
+    ) -> Option<Target<'a>> {
+        if !matches!(symbol.kind, SymbolKind::Named) {
+            return None;
+        }
+        let target = FileOrchestrator::resolve_relative_import(importer, &symbol.source)?;
+        let module = self
+            .bindings
+            .resolve_namespace_export(&target, &symbol.imported_name)?;
+        let binding = self.bindings.resolve_export(&module, name)?;
+        let target_index = self.per_file.get(&binding.file)?;
+        // The declaring module may name it differently (`function impl() {};
+        // export { impl as list }`).
+        binding
+            .local_name
+            .clone()
+            .and_then(|local| same_file(target_index, local))
+            .or_else(|| same_file(target_index, name.to_string()))
     }
 
     /// The module that declares `symbol` as imported by `importer`, or `None`

@@ -35,6 +35,12 @@
 //!   `client.transfers().send(...)`;
 //! - an exported **object literal** contributes the same way over its
 //!   properties;
+//! - a **namespace re-export** (`export * as queues from './queues'`)
+//!   contributes the same way over the module it names: every function that
+//!   module exports is a member of `queues`, which is what a consumer writing
+//!   `queues.list(...)` off a named import calls. A class or object the group
+//!   publishes composes under its own name, and a group inside a group nests
+//!   (carrick#679);
 //! - `export { default as Ledger } from './client'` and `export default
 //!   Ledger` both publish under the export name `default`, which is what a
 //!   consumer's default import binds.
@@ -643,16 +649,71 @@ impl SurfaceScanner {
     fn walk_entry(&mut self, entry: &Path, subpaths: &[String]) {
         self.subpaths = subpaths.to_vec();
         for export in self.bindings.export_names(entry) {
-            let Some(binding) = self.bindings.resolve_export(entry, &export) else {
+            if let Some(binding) = self.bindings.resolve_export(entry, &export) {
+                if let Some(declared) =
+                    self.declaration_of(&binding.file, binding.local_name.as_deref())
+                {
+                    let mut visited = HashSet::new();
+                    self.walk(&export, "", declared, None, 0, &mut visited);
+                }
                 continue;
-            };
-            let Some(declared) = self.declaration_of(&binding.file, binding.local_name.as_deref())
-            else {
-                continue;
-            };
-            let mut visited = HashSet::new();
-            self.walk(&export, "", declared, None, 0, &mut visited);
+            }
+            // `export * as queues from "./queues.js"` names no value to
+            // declare: the export IS the module, and each function it
+            // publishes is a member under that name (carrick#679).
+            if let Some(module) = self.bindings.resolve_namespace_export(entry, &export) {
+                let mut modules = HashSet::new();
+                self.walk_namespace(&export, "", &module, 0, &mut modules);
+            }
         }
+    }
+
+    /// Publish the exports of a module a namespace re-export names, under that
+    /// export's own name.
+    ///
+    /// The same treatment an exported object literal gets, and for the same
+    /// reason: `export * as queues from "./queues.js"` is how a package
+    /// publishes a bag of functions a consumer writes as `queues.list(...)`,
+    /// so `list` is a member of the export `queues` exactly as a property of
+    /// an exported object is a member of it. A class or object the group
+    /// publishes composes under its own name, and a namespace inside a
+    /// namespace nests the prefix.
+    ///
+    /// `default` is skipped: a namespace object's `default` is not a chain any
+    /// consumer writes.
+    fn walk_namespace(
+        &mut self,
+        export: &str,
+        prefix: &str,
+        module: &Path,
+        depth: usize,
+        modules: &mut HashSet<PathBuf>,
+    ) {
+        if depth > MAX_DEPTH || self.truncated {
+            return;
+        }
+        if !modules.insert(module.to_path_buf()) {
+            return; // a group that reaches back into itself
+        }
+        for name in self.bindings.export_names(module) {
+            if name == DEFAULT_EXPORT {
+                continue;
+            }
+            if let Some(binding) = self.bindings.resolve_export(module, &name) {
+                if let Some(declared) =
+                    self.declaration_of(&binding.file, binding.local_name.as_deref())
+                {
+                    let mut visited = HashSet::new();
+                    self.walk_member(export, prefix, &name, declared, None, depth, &mut visited);
+                }
+                continue;
+            }
+            if let Some(nested) = self.bindings.resolve_namespace_export(module, &name) {
+                let nested_prefix = format!("{}{}.", prefix, name);
+                self.walk_namespace(export, &nested_prefix, &nested, depth + 1, modules);
+            }
+        }
+        modules.remove(module);
     }
 
     /// The class or object literal an export's local binding names in `file`.
@@ -1649,6 +1710,39 @@ mod tests {
         assert!(member(&members, "default", "receipts.issue").is_some());
         // The private parameter property beside it is not surface.
         assert!(!members.iter().any(|m| m.chain.starts_with("baseUrl")));
+    }
+
+    /// carrick#679: a group published as `export * as vaults from
+    /// "./vaults.js"` is a member bag exactly as an exported object literal
+    /// is. Every function the named module exports is a member under the
+    /// namespace's own export name, which is the pair a consumer writing
+    /// `vaults.list(...)` off a named import forms.
+    #[test]
+    fn a_namespace_reexport_publishes_the_module_it_names() {
+        let root = fixture();
+        let members = scan(&root, &root);
+
+        let list = member(&members, "vaults", "list").expect("vaults.list");
+        assert_eq!(list.file, "src/vaults.ts");
+        assert!(list.line < list.end_line);
+        assert!(member(&members, "vaults", "retrieve").is_some());
+
+        // A hop inside the group is followed to the module that declares it.
+        let seal = member(&members, "vaults", "seal").expect("vaults.seal");
+        assert_eq!(seal.file, "src/vaults/seal.ts");
+
+        // In front of a barrel of classes, the class composes under its own
+        // name the way a resource field does.
+        let restore = member(&members, "archive", "Vault.restore").expect("archive.Vault.restore");
+        assert_eq!(restore.file, "src/archive/vault.ts");
+
+        // A function in the group is a member, never a resource to recurse
+        // into, so nothing composes under it.
+        assert!(
+            !members.iter().any(|m| m.chain.starts_with("list.")),
+            "{:?}",
+            members
+        );
     }
 
     /// A getter is not a call, a constructor is not a member, and neither is

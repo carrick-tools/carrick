@@ -10421,6 +10421,164 @@ export * from "./aFetch.js";"#,
         assert!(has_import_map, "Should have import mapping node");
     }
 
+    /// Write a module tree and return its canonicalized root.
+    fn module_tree(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (relative, content) in files {
+            let path = dir.path().join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, content).expect("write");
+        }
+        let root = dir.path().canonicalize().expect("canonicalize root");
+        (dir, root)
+    }
+
+    /// PIN (carrick#679). Mount attribution resolves through the SHARED export
+    /// table, so admitting `export * as ns from "./m"` to it must leave every
+    /// mount where it was. A star and a rename keep resolving to the module
+    /// that declares the router; a mount naming a namespace re-export resolves
+    /// to nothing, before and after — a namespace object is not a router, and
+    /// attributing a module's routes to one would be a guess.
+    #[test]
+    fn mount_bindings_resolve_the_same_beside_a_namespace_reexport() {
+        let (_dir, root) = module_tree(&[
+            (
+                "src/index.ts",
+                r#"
+export * as groups from "./groups.js";
+export * from "./health.js";
+export { plugin as userRoutes } from "./users.js";
+"#,
+            ),
+            ("src/groups.ts", "export function list() {}\n"),
+            (
+                "src/health.ts",
+                "export const healthRoutes = async (server) => {};\n",
+            ),
+            (
+                "src/users.ts",
+                "export const plugin = async (server) => {};\n",
+            ),
+            ("src/app.ts", "import { healthRoutes } from './index.js';\n"),
+        ]);
+
+        let mount = |child: &str| MountResult {
+            line_number: 1,
+            parent_node: "fastify".to_string(),
+            child_node: child.to_string(),
+            mount_path: format!("/{child}"),
+            import_source: Some("./index.js".to_string()),
+            pattern_matched: ".register(".to_string(),
+        };
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/app.ts".to_string(),
+            FileAnalysisResult {
+                mounts: vec![mount("healthRoutes"), mount("userRoutes"), mount("groups")],
+                ..Default::default()
+            },
+        );
+        for module in [
+            "src/index.ts",
+            "src/health.ts",
+            "src/users.ts",
+            "src/groups.ts",
+        ] {
+            file_results.insert(module.to_string(), FileAnalysisResult::default());
+        }
+
+        let bindings = FileOrchestrator::resolve_mount_bindings(&file_results, &root);
+
+        let health = bindings.get("src/health.ts").expect("star form resolves");
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].child_node, "healthRoutes");
+        assert_eq!(health[0].local_name.as_deref(), Some("healthRoutes"));
+
+        let users = bindings
+            .get("src/users.ts")
+            .expect("renaming form resolves");
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].child_node, "userRoutes");
+        assert_eq!(users[0].local_name.as_deref(), Some("plugin"));
+
+        assert!(
+            !bindings.contains_key("src/groups.ts"),
+            "a namespace re-export binds a module object, not a mountable \
+             router: {bindings:?}"
+        );
+    }
+
+    /// PIN (carrick#679). The class-controller join reads the same table. A
+    /// controller reached through a star or a rename keeps its routes; one
+    /// bound by a namespace re-export contributes none, before and after —
+    /// `router('/groups', groups)` hands the framework a module object, and
+    /// the class inside it was never the handler.
+    #[test]
+    fn class_controller_bindings_resolve_the_same_beside_a_namespace_reexport() {
+        let (_dir, root) = module_tree(&[
+            (
+                "src/index.ts",
+                r#"
+export * from "./alpha.js";
+export { default as beta } from "./beta.js";
+export * as groups from "./groups.js";
+"#,
+            ),
+            (
+                "src/alpha.ts",
+                "class AlphaController { get(ctx) {} }\nexport const alpha = new AlphaController();\nexport default alpha;\n",
+            ),
+            (
+                "src/beta.ts",
+                "class BetaController { post(ctx) {} }\nexport default new BetaController();\n",
+            ),
+            (
+                "src/groups.ts",
+                "class GroupsController { get(ctx) {} }\nexport default new GroupsController();\n",
+            ),
+            (
+                "src/routes.ts",
+                r#"
+import { router } from './framework';
+import { alpha, beta, groups } from './index.js';
+
+export default [
+  router('/alpha', alpha),
+  router('/beta', beta),
+  router('/groups', groups),
+];
+"#,
+            ),
+        ]);
+
+        let routes = root.join("src/routes.ts");
+        let content = std::fs::read_to_string(&routes).expect("route table is readable");
+        let scanner = SwcScanner::new();
+        let bindings = scanner.controller_route_bindings(&routes, &content);
+        assert_eq!(bindings.len(), 3, "three paths are bound: {bindings:?}");
+
+        let mut resolver = BindingResolver::new();
+        let endpoints = FileOrchestrator::class_controller_endpoints(
+            &scanner,
+            &mut resolver,
+            &routes,
+            &bindings,
+        );
+        let mut paths: Vec<(String, String)> = endpoints
+            .iter()
+            .map(|(_, endpoint)| (endpoint.method.clone(), endpoint.path.clone()))
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                ("GET".to_string(), "/alpha".to_string()),
+                ("POST".to_string(), "/beta".to_string()),
+            ],
+            "the namespace-bound controller contributes no route: {endpoints:?}"
+        );
+    }
+
     /// Root of the on-disk module graph both barrel tests resolve through.
     /// Endpoint extraction is LLM-side, so the `FileAnalysisResult`s below are
     /// authored by hand to mirror what the analyzer emits for these files; the
