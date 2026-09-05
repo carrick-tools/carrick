@@ -220,6 +220,7 @@ fn analyzer_result(
         emission_style: None,
         primary_type_symbol: None,
         type_import_source: None,
+        resolution_source: None,
     };
 
     let mut file_results = HashMap::new();

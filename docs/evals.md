@@ -18,6 +18,24 @@ CARRICK_MOCK_ALL=1 cargo run -- examples/express-single # offline demo, no netwo
 
 See `AGENTS.md` for the full build/test command set.
 
+## Scan-twice determinism probe
+
+Runs the scanner twice over every cassette fixture (and, optionally, one
+large real-world tree) under the mock analyzer and fails if the two eval
+projections differ. It reads determinism, not accuracy: a change that alters
+what the scanner emits from the same input is a defect it catches; a wrong
+row it cannot see. Deterministic-layer changes (emission sources, the join
+rule, the URL resolver) run it before they merge.
+
+```bash
+cargo build
+scripts/scan-twice.sh                     # fixtures only
+scripts/scan-twice.sh /path/to/probe-dir  # plus a one-service carrick.json tree
+```
+
+`CARRICK_BIN` picks the binary, `SCAN_OUT_DIR` keeps both projections per
+target. The script header lists the exclusions and why.
+
 ## Tier-A framework evals
 
 Scores endpoint/call P/R/F1 for the Tier-A framework fixtures (koa-api,

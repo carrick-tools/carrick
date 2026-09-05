@@ -1,11 +1,12 @@
 //! Run-level record of analysis the scan was supposed to do and did not.
 //!
-//! A file whose analyzer call fails after its retries are spent is simply
-//! absent from `file_results`: its endpoints and its outbound calls are not in
-//! the index, and the matched rows on the other side of them disappear too. The
-//! scan itself does not notice — the fold that collects per-file results counts
-//! the failure and carries on, which is how a run could report success while
-//! silently removing most of a service's endpoints (#461).
+//! A file whose analyzer call fails after its retries are spent keeps only
+//! what the deterministic layer stated about it: everything that needed the
+//! model — the calls and routes only extraction reaches, and the matched rows
+//! on the other side of them — is missing from the index. The scan itself does
+//! not notice: the fold that collects per-file results counts the failure and
+//! carries on, which is how a run could report success while silently removing
+//! most of a service's endpoints (#461).
 //!
 //! This module is where those losses are counted, so the end of the run can
 //! state them and refuse to call itself a success. It is a process-global for
