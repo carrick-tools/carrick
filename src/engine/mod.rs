@@ -61,15 +61,24 @@ mod type_compat_v2;
 /// deterministic rows. Those three decide what a cached answer means, so a
 /// cache written under the old one has to be discarded.
 ///
-/// Invalidation itself is unchanged and independent of this: entries are keyed
-/// by repo-relative path, and a file is re-read from the model when `git diff`
-/// against the previous scan's commit names it or when the cache holds no
-/// entry for it.
+/// Invalidation is keyed by repo-relative path: a file goes back to the model
+/// when `git diff` against the previous scan's commit names it, or when the
+/// cache holds no entry for it. Only a file the model was ASKED about has an
+/// entry — a file phase 1 skipped (no candidate, unroutable protocol,
+/// unparseable) and a file whose call failed are both absent. That absence is
+/// deliberate and is what replaces the old "bump the version" escape hatch:
+/// a skipped file is re-examined by phase 1 on every scan at zero model cost,
+/// and is dispatched the first time an improved scanner raises a candidate for
+/// it, without this constant moving and without re-analysing the repo. The
+/// price is that "the model has nothing to say about this file" is never
+/// cached, so a file that IS dispatched and answers with nothing is asked
+/// again after any change to it — the same as today.
 ///
-/// 21: the cache switched from the joined result to the model's raw answer. A
-/// v20 cache holds rows the deterministic layer stated, which this version
-/// states again — replaying one would duplicate them and pin the file to the
-/// resolver of the scan that wrote it.
+/// 21: the cache switched from the joined result to the model's raw answer,
+/// and from keying every discovered file to keying only the files the model
+/// was asked about. A v20 cache holds rows the deterministic layer stated,
+/// which this version states again — replaying one would duplicate them and
+/// pin the file to the resolver of the scan that wrote it.
 const CACHE_VERSION: u32 = 21;
 
 // Type aliases to reduce complexity
@@ -312,14 +321,15 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         );
     }
 
-    // Files the cloud never answered for are absent from the results above:
-    // their endpoints, their outbound calls, and the matches on the other side
-    // of them. Uploading that overwrites a good index with a thinner one and
-    // says nothing, which is how a service went from 11 indexed endpoints to 4
-    // while the run reported success (#461). Same shape as the quota abort
-    // above: stop before the upload, so the index stays stale rather than
-    // becoming wrong, and fail the run so CI says so. The lost files are absent
-    // from the incremental cache too, so the next run re-analyses exactly them.
+    // A file the cloud never answered for reaches the results above with only
+    // what the deterministic layer stated about it — the rows it resolved
+    // before the call went out — and without anything only the model can say.
+    // Uploading that overwrites a good index with a thinner one and says
+    // nothing, which is how a service went from 11 indexed endpoints to 4 while
+    // the run reported success (#461). Same shape as the quota abort above:
+    // stop before the upload, so the index stays stale rather than becoming
+    // wrong, and fail the run so CI says so. The lost files are absent from the
+    // incremental cache, so the next run re-analyses exactly them.
     //
     // `CARRICK_ALLOW_PARTIAL_ANALYSIS` is the deliberate opt-out for someone
     // who wants the partial index anyway; the loss is reported either way.
@@ -1049,8 +1059,11 @@ fn normalize_file_results_keys(
 /// over all of them on every scan (see `CACHE_VERSION`), and this decides only
 /// which ones cost a model call. A file is reusable when the previous scan
 /// recorded an answer for it and `git diff` against that scan's commit does not
-/// name it. A file the previous scan never recorded — new, or one whose call
-/// failed — has no entry and goes to the model.
+/// name it. A file the previous scan never recorded — new, one phase 1 skipped,
+/// or one whose call failed — has no entry and goes back through phase 1, which
+/// dispatches it only if it raises a candidate this time. That is the whole
+/// mechanism by which a scanner improvement reaches an indexed repo: the skip
+/// is re-decided every scan rather than frozen into the cache.
 ///
 /// `discovered` yields each file twice-keyed: first as the ORCHESTRATOR keys it
 /// (the path as it appears in the discovered set), then as the CACHE keys it
@@ -1148,11 +1161,15 @@ async fn analyze_current_repo_incremental(
 
             let total_files = files.len();
             let reused_count = cached_model_results.len();
-            let changed_count = total_files - reused_count;
+            // Files with no cached answer, which is not the same as files the
+            // model will be asked about: most of them are the ones phase 1
+            // skips at zero cost every scan, and only those raising a candidate
+            // are dispatched (see `reusable_model_answers`).
+            let uncached_count = total_files - reused_count;
 
             debug!(
-                "Re-analysing {} of {} file(s) with the model, replaying {} cached answer(s)",
-                changed_count, total_files, reused_count
+                "{} of {} file(s) have no cached answer, replaying {} cached answer(s)",
+                uncached_count, total_files, reused_count
             );
 
             // Check if any package.json changed → need fresh framework
@@ -1186,11 +1203,10 @@ async fn analyze_current_repo_incremental(
                 run_framework_detection_and_guidance(packages, &all_imported_symbols).await?
             };
 
-            // Run Gemini file analysis ONLY on changed files
-            if changed_count > 0 {
-                debug!("Running LLM analysis on {} changed file(s)", changed_count);
-            }
-
+            // What this scan actually dispatches is decided per file inside the
+            // orchestrator — a file with no cached answer still reaches the
+            // model only if phase 1 raises a candidate for it — and it logs the
+            // dispatched and replayed counts once it knows them.
             let agent_service = AgentService::new();
             let file_orchestrator = FileOrchestrator::new(agent_service.clone());
 

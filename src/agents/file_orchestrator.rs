@@ -89,7 +89,15 @@ pub struct FileCentricAnalysisResult {
     /// the join and before every pass over it. This is what the incremental
     /// cache stores, so the deterministic layer can re-run over an unchanged
     /// file on the next scan instead of replaying rows it would state again
-    /// (see `CACHE_VERSION` in `crate::engine`). Keyed like `file_results`.
+    /// (see `CACHE_VERSION` in `crate::engine`).
+    ///
+    /// A SUBSET of `file_results`' keys: only a file the model was actually
+    /// asked about is in here — dispatched and answered this scan, or
+    /// replaying a previous scan's answer. A file phase 1 skipped (no
+    /// candidate, unroutable protocol, unparseable) and a file whose call
+    /// failed are both absent, because neither has an answer to record. That
+    /// absence is what sends the file back through phase 1 on the next scan,
+    /// where a scanner that now raises a candidate for it dispatches it.
     pub raw_model_results: HashMap<String, FileAnalysisResult>,
     /// Aggregated mount graph
     pub mount_graph: MountGraph,
@@ -813,9 +821,12 @@ impl FileOrchestrator {
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         // The other half of the split: what the MODEL said, per file, with
-        // nothing folded in. Every insert into `file_results` below has a twin
-        // here, so the cache keys the same file set the analysis did — a file
-        // missing from it is a file the next scan re-reads from the model.
+        // nothing folded in. Only a file the model was ASKED about is inserted
+        // here — every skip below leaves it out, so the next scan runs phase 1
+        // over that file again and dispatches it the moment it raises a
+        // candidate. Writing an empty answer for a skipped file instead would
+        // read as "the model said nothing about it" and freeze the skip for as
+        // long as the cache lives (#478).
         let mut raw_model_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         let mut stats = ProcessingStats::default();
         let cm: Lrc<SourceMap> = Default::default();
@@ -942,6 +953,135 @@ impl FileOrchestrator {
             import_sources: Vec<String>,
         }
 
+        /// Every pass over ONE file's rows that runs after the model's answer
+        /// is joined onto them, in the order they must run in.
+        ///
+        /// Shared by both arms of the phase-3 fold. The failure arm has no
+        /// model answer to join, so it runs these over the deterministic rows
+        /// alone — which is the same thing as running them over a join with an
+        /// empty answer, the case a model that finds nothing already produces
+        /// on the success arm. Only [`FileOrchestrator::join_model_rows`]
+        /// itself needs the model; everything here reads the rows, the file's
+        /// own AST-derived indexes, or its source.
+        ///
+        /// Nested inside `analyze_files` because it takes a `PendingFile`,
+        /// which is local to it. `pf` is `&mut` so the pub/sub anchor ops can
+        /// be moved out rather than cloned.
+        #[allow(clippy::too_many_arguments)]
+        fn run_post_join_passes(
+            adjusted: &mut FileAnalysisResult,
+            pf: &mut PendingFile,
+            framework_detection: &DetectionResult,
+            env_schema: &EnvSchemaIndex,
+            stats: &mut ProcessingStats,
+            member_deficits: &mut HashMap<String, u32>,
+            resolved_member_rows: &mut HashMap<String, HashMap<u32, String>>,
+        ) {
+            // Carry the wrapper's own request shape onto the sites that
+            // delegate to it (carrick-cloud#386). Runs first among the
+            // passes over the joined rows, because it tells a
+            // delegating site from a real client call by the absence of
+            // a span — which the join is what settles — and every
+            // downstream method reader depends on the answer.
+            stats.wrapper_method_propagations += FileOrchestrator::propagate_wrapper_request_shape(
+                adjusted,
+                pf.wrapper_request_shape.as_ref(),
+            );
+            // Collapse inline env-var fallbacks the model rendered
+            // verbatim (`${A ?? "http://localhost"}/p` -> `${A}/p`,
+            // carrick#399) BEFORE alias resolution: a local alias with
+            // a rendered fallback must become the bare `${alias}` for
+            // the alias-map lookup to rewrite it. This fold is the
+            // single entry point for LLM data calls, so every
+            // downstream reader (route-shape gate, canonical call key,
+            // env-var classification, uploads) sees one normalized
+            // form.
+            FileOrchestrator::normalize_fallback_targets(adjusted);
+            FileOrchestrator::resolve_target_bases(
+                adjusted,
+                &pf.env_alias_map,
+                &pf.whole_url_fallbacks,
+                &pf.literal_bases,
+            );
+            FileOrchestrator::validate_type_hints(adjusted, &pf.symbol_table);
+            FileOrchestrator::normalize_unusable_types(adjusted, &framework_detection.frameworks);
+
+            // Deterministic extraction-flake guards (#361): drop a
+            // data-call response symbol that borrows the request type,
+            // and repair a graphql-over-HTTP target reported as the
+            // transport URL. Both re-parse the file, so both are gated
+            // on a candidate data call being present.
+            let file_path = Path::new(&pf.path_str);
+            FileOrchestrator::suppress_borrowed_request_types(adjusted, file_path);
+            FileOrchestrator::rewrite_graphql_document_targets(adjusted, file_path);
+
+            // Read how each call's base resolves (carrick#649). LAST
+            // among the passes that touch a target, because it must
+            // read the SAME target the row persists: an env-var base
+            // rewritten to `${process.env.NAME}` above is the spelling
+            // this reports, and a graphql target rewritten just above
+            // is the one this reads. Stamps `base` and nothing else —
+            // no target, no method, no key.
+            FileOrchestrator::stamp_call_bases(
+                adjusted,
+                &pf.env_alias_map,
+                &pf.env_fallbacks,
+                env_schema,
+            );
+
+            // Canonicalize LLM-emitted endpoint paths to colon-style params
+            // (`/w/[slug]` -> `/w/:slug`) so they dedupe against the file-based
+            // router's structural entries instead of both surviving and flipping
+            // form between non-deterministic scans.
+            FileOrchestrator::canonicalize_endpoint_paths(adjusted);
+
+            // Drop LLM-emitted pub/sub ops whose topic has no literal
+            // witness in the file's source (carrick#311): the analyzer
+            // occasionally invents a topic from a wrapper-function
+            // NAME (`publishStatusChanged` -> `status.changed`). Must
+            // run before the anchor merge below so deterministic
+            // anchor ops are never candidates for the drop.
+            stats.pubsub_phantom_topic_drops +=
+                FileOrchestrator::suppress_phantom_pubsub_topics(adjusted, file_path);
+
+            // Merge deterministically-anchored pub/sub operations the
+            // LLM pass didn't already produce (carrick#387). A
+            // payload-less publish/subscribe with a resolvable literal
+            // topic is a structural fact — an extraction omission must
+            // not lose the operation.
+            stats.pubsub_anchor_backfills += FileOrchestrator::merge_pubsub_anchor_ops(
+                adjusted,
+                std::mem::take(&mut pf.pubsub_anchor_ops),
+            );
+
+            // carrick#656: what the join could not follow in THIS
+            // file, less the sites that turned out to be route
+            // definitions. A route registration whose verb happens to
+            // name a request member (`app.get` against a client's
+            // `get`) is a producer, not a consumer that went
+            // unfollowed — the same exclusion the emission applies
+            // before it states a row.
+            for (span, name) in &pf.unresolved_member_sites {
+                if adjusted
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.call_expression_span_start == Some(*span))
+                {
+                    continue;
+                }
+                *member_deficits.entry(name.clone()).or_insert(0) += 1;
+            }
+            if !pf.resolved_members.is_empty() {
+                resolved_member_rows.insert(
+                    pf.path_str.clone(),
+                    pf.resolved_members
+                        .iter()
+                        .map(|(span, resolved)| (*span, resolved.name.clone()))
+                        .collect(),
+                );
+            }
+        }
+
         // PHASE 1 (serial, CPU-bound): run the SWC gatekeeper on every file and build the
         // work list of files that actually need an LLM call. Zero-cost skips are recorded here.
         let mut pending: Vec<PendingFile> = Vec::new();
@@ -1009,10 +1149,11 @@ impl FileOrchestrator {
                 stats.errors.push(format!("Parse failure: {}", path_str));
                 stats.files_skipped += 1;
                 stats.files_parse_failed += 1;
-                // Store empty results so the incremental cache knows this file
-                // was processed and the next scan does not pay to re-ask.
-                file_results.insert(path_str.clone(), FileAnalysisResult::default());
-                raw_model_results.insert(path_str, FileAnalysisResult::default());
+                // An empty joined result, because downstream readers key on
+                // every discovered file; no cache entry, because the model was
+                // never asked (a parser fix must reach this file on the next
+                // scan without a version bump).
+                file_results.insert(path_str, FileAnalysisResult::default());
                 continue;
             }
 
@@ -1182,11 +1323,9 @@ impl FileOrchestrator {
                         &mut stats.deterministic_rows_emitted,
                     );
                     stats.total_endpoints += result.endpoints.len();
-                    file_results.insert(path_str.clone(), result);
-                    // The model was never asked about this file, so its cache
-                    // entry is empty: the routes above are re-derived from the
-                    // file layout on every scan.
-                    raw_model_results.insert(path_str, FileAnalysisResult::default());
+                    file_results.insert(path_str, result);
+                    // No cache entry: the model was never asked, and the routes
+                    // above are re-derived from the file layout on every scan.
                     continue;
                 } else if is_graphql_resolver_file {
                     // Fall through to the LLM pass with empty HTTP candidates:
@@ -1234,8 +1373,10 @@ impl FileOrchestrator {
                     );
                     stats.files_skipped += 1;
                     stats.files_skipped_unrouted_protocol += 1;
-                    file_results.insert(path_str.clone(), FileAnalysisResult::default());
-                    raw_model_results.insert(path_str, FileAnalysisResult::default());
+                    // Joined-map key only: routing a protocol that has no LLM
+                    // pass today is a scanner change, and it must reach this
+                    // file without a cache bump.
+                    file_results.insert(path_str, FileAnalysisResult::default());
                     continue;
                 }
             }
@@ -1598,10 +1739,10 @@ impl FileOrchestrator {
                 );
                 stats.files_skipped += 1;
                 stats.files_skipped_no_candidates += 1;
-                // Store empty results so the incremental cache knows this file
-                // was processed and the next scan does not pay to re-ask.
-                file_results.insert(deferred.path_str.clone(), FileAnalysisResult::default());
-                raw_model_results.insert(deferred.path_str, FileAnalysisResult::default());
+                // The zero-cost skip, and the one the cache must not freeze:
+                // this file is re-examined by phase 1 on every scan, so a
+                // scanner that later raises a candidate for it dispatches it.
+                file_results.insert(deferred.path_str, FileAnalysisResult::default());
                 continue;
             }
             debug!(
@@ -1616,8 +1757,7 @@ impl FileOrchestrator {
                     deferred.path_str
                 );
                 stats.files_skipped += 1;
-                file_results.insert(deferred.path_str.clone(), FileAnalysisResult::default());
-                raw_model_results.insert(deferred.path_str, FileAnalysisResult::default());
+                file_results.insert(deferred.path_str, FileAnalysisResult::default());
                 continue;
             };
             let symbols = Self::extract_symbol_table(&deferred.file_path, &cm, &handler);
@@ -1807,13 +1947,7 @@ impl FileOrchestrator {
         // PHASE 3 (serial): emit the deterministic rows for each file, join
         // the model's answer onto them, and fold the result into the
         // aggregate.
-        //
-        // Files the model never answered for. They are absent from both maps —
-        // absent from the joined one because the file has no analysis this run,
-        // and absent from the cache so the NEXT scan asks again rather than
-        // recording the silence as an answer.
-        let mut unanswered: HashSet<String> = HashSet::new();
-        for (pf, result) in analyzed {
+        for (mut pf, result) in analyzed {
             match result {
                 Ok(model) => {
                     // The cache's half of the split, taken before anything is
@@ -1830,7 +1964,7 @@ impl FileOrchestrator {
                     let mut adjusted = FileAnalysisResult::default();
                     let overrules = Self::emit_resolved_rows(
                         &mut adjusted,
-                        pf.resolved,
+                        std::mem::take(&mut pf.resolved),
                         &mut stats.deterministic_rows_emitted,
                     );
                     Self::join_model_rows(
@@ -1842,107 +1976,15 @@ impl FileOrchestrator {
                         &mut stats,
                     );
 
-                    // Carry the wrapper's own request shape onto the sites that
-                    // delegate to it (carrick-cloud#386). Runs first among the
-                    // passes over the joined rows, because it tells a
-                    // delegating site from a real client call by the absence of
-                    // a span — which the join is what settles — and every
-                    // downstream method reader depends on the answer.
-                    stats.wrapper_method_propagations += Self::propagate_wrapper_request_shape(
+                    run_post_join_passes(
                         &mut adjusted,
-                        pf.wrapper_request_shape.as_ref(),
-                    );
-                    // Collapse inline env-var fallbacks the model rendered
-                    // verbatim (`${A ?? "http://localhost"}/p` -> `${A}/p`,
-                    // carrick#399) BEFORE alias resolution: a local alias with
-                    // a rendered fallback must become the bare `${alias}` for
-                    // the alias-map lookup to rewrite it. This fold is the
-                    // single entry point for LLM data calls, so every
-                    // downstream reader (route-shape gate, canonical call key,
-                    // env-var classification, uploads) sees one normalized
-                    // form.
-                    Self::normalize_fallback_targets(&mut adjusted);
-                    Self::resolve_target_bases(
-                        &mut adjusted,
-                        &pf.env_alias_map,
-                        &pf.whole_url_fallbacks,
-                        &pf.literal_bases,
-                    );
-                    Self::validate_type_hints(&mut adjusted, &pf.symbol_table);
-                    Self::normalize_unusable_types(&mut adjusted, &framework_detection.frameworks);
-
-                    // Deterministic extraction-flake guards (#361): drop a
-                    // data-call response symbol that borrows the request type,
-                    // and repair a graphql-over-HTTP target reported as the
-                    // transport URL. Both re-parse the file, so both are gated
-                    // on a candidate data call being present.
-                    let file_path = Path::new(&pf.path_str);
-                    Self::suppress_borrowed_request_types(&mut adjusted, file_path);
-                    Self::rewrite_graphql_document_targets(&mut adjusted, file_path);
-
-                    // Read how each call's base resolves (carrick#649). LAST
-                    // among the passes that touch a target, because it must
-                    // read the SAME target the row persists: an env-var base
-                    // rewritten to `${process.env.NAME}` above is the spelling
-                    // this reports, and a graphql target rewritten just above
-                    // is the one this reads. Stamps `base` and nothing else —
-                    // no target, no method, no key.
-                    Self::stamp_call_bases(
-                        &mut adjusted,
-                        &pf.env_alias_map,
-                        &pf.env_fallbacks,
+                        &mut pf,
+                        framework_detection,
                         &env_schema,
+                        &mut stats,
+                        &mut member_deficits,
+                        &mut resolved_member_rows,
                     );
-
-                    // Canonicalize LLM-emitted endpoint paths to colon-style params
-                    // (`/w/[slug]` -> `/w/:slug`) so they dedupe against the file-based
-                    // router's structural entries instead of both surviving and flipping
-                    // form between non-deterministic scans.
-                    Self::canonicalize_endpoint_paths(&mut adjusted);
-
-                    // Drop LLM-emitted pub/sub ops whose topic has no literal
-                    // witness in the file's source (carrick#311): the analyzer
-                    // occasionally invents a topic from a wrapper-function
-                    // NAME (`publishStatusChanged` -> `status.changed`). Must
-                    // run before the anchor merge below so deterministic
-                    // anchor ops are never candidates for the drop.
-                    stats.pubsub_phantom_topic_drops +=
-                        Self::suppress_phantom_pubsub_topics(&mut adjusted, file_path);
-
-                    // Merge deterministically-anchored pub/sub operations the
-                    // LLM pass didn't already produce (carrick#387). A
-                    // payload-less publish/subscribe with a resolvable literal
-                    // topic is a structural fact — an extraction omission must
-                    // not lose the operation.
-                    stats.pubsub_anchor_backfills +=
-                        Self::merge_pubsub_anchor_ops(&mut adjusted, pf.pubsub_anchor_ops);
-
-                    // carrick#656: what the join could not follow in THIS
-                    // file, less the sites that turned out to be route
-                    // definitions. A route registration whose verb happens to
-                    // name a request member (`app.get` against a client's
-                    // `get`) is a producer, not a consumer that went
-                    // unfollowed — the same exclusion the emission applies
-                    // before it states a row.
-                    for (span, name) in &pf.unresolved_member_sites {
-                        if adjusted
-                            .endpoints
-                            .iter()
-                            .any(|endpoint| endpoint.call_expression_span_start == Some(*span))
-                        {
-                            continue;
-                        }
-                        *member_deficits.entry(name.clone()).or_insert(0) += 1;
-                    }
-                    if !pf.resolved_members.is_empty() {
-                        resolved_member_rows.insert(
-                            pf.path_str.clone(),
-                            pf.resolved_members
-                                .iter()
-                                .map(|(span, resolved)| (*span, resolved.name.clone()))
-                                .collect(),
-                        );
-                    }
 
                     stats.total_mounts += adjusted.mounts.len();
                     stats.total_endpoints += adjusted.endpoints.len();
@@ -1951,18 +1993,53 @@ impl FileOrchestrator {
                     file_results.insert(pf.path_str, adjusted);
                 }
                 Err(e) => {
-                    // The file is absent from `file_results`, so its endpoints
-                    // and calls are absent from the index. Warn rather than
-                    // collect quietly: `stats.errors` is only ever printed at
-                    // debug, which is how this loss stayed invisible (#461).
-                    // The run-level verdict is in `scan_health`.
+                    // The model said nothing about this file, so nothing joins
+                    // — but the deterministic layer resolved its candidates
+                    // before the call went out, and those rows cost nothing and
+                    // are as true as they were a moment ago. Emitting them here
+                    // is what keeps a transient gateway failure from also
+                    // deleting the routes and calls the source states outright.
+                    //
+                    // Warn rather than collect quietly: `stats.errors` is only
+                    // ever printed at debug, which is how this loss stayed
+                    // invisible (#461). The run-level verdict is in
+                    // `scan_health`, recorded at dispatch, and it is unchanged:
+                    // this file is still one the analyzer never answered for,
+                    // and the run still says so.
                     warn!("Failed to analyze {}: {}", pf.path_str, e);
                     stats
                         .errors
                         .push(format!("Failed to analyze {}: {}", pf.path_str, e));
                     stats.files_skipped += 1;
                     stats.files_analysis_failed += 1;
-                    unanswered.insert(pf.path_str);
+
+                    let mut deterministic = FileAnalysisResult::default();
+                    Self::emit_resolved_rows(
+                        &mut deterministic,
+                        std::mem::take(&mut pf.resolved),
+                        &mut stats.deterministic_rows_emitted,
+                    );
+                    run_post_join_passes(
+                        &mut deterministic,
+                        &mut pf,
+                        framework_detection,
+                        &env_schema,
+                        &mut stats,
+                        &mut member_deficits,
+                        &mut resolved_member_rows,
+                    );
+
+                    stats.total_mounts += deterministic.mounts.len();
+                    stats.total_endpoints += deterministic.endpoints.len();
+                    stats.total_data_calls += deterministic.data_calls.len();
+                    // Not `files_processed`: this file is counted under
+                    // `files_skipped`/`files_analysis_failed`, and it has no
+                    // analysis — only the half of it the source stated.
+                    //
+                    // No `raw_model_results` entry either: there is no answer
+                    // to record, and the absence is what makes the next scan
+                    // ask again instead of replaying the silence.
+                    file_results.insert(pf.path_str, deterministic);
                 }
             }
         }
@@ -2002,18 +2079,6 @@ impl FileOrchestrator {
             &mut stats.deterministic_rows_emitted,
         );
         stats.total_endpoints += class_controller_added;
-
-        // The pass above keys a controller module that produced no result of
-        // its own, so the two maps can part company here. Give the cache the
-        // same key with an empty answer — the model said nothing about that
-        // file — unless the model was ASKED and failed, in which case the key
-        // must stay absent so the next scan retries it.
-        for path in file_results.keys() {
-            if unanswered.contains(path) {
-                continue;
-            }
-            raw_model_results.entry(path.clone()).or_default();
-        }
 
         debug!("\n=== FILE PROCESSING COMPLETE ===");
         debug!("  - Files processed: {}", stats.files_processed);

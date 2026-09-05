@@ -101,16 +101,38 @@ fn copy_dir(src: &Path, dst: &Path) {
 /// commit to diff against; nothing else is committed afterwards, so HEAD stays
 /// equal to scan #1's `commit_hash` and `git diff` reports no changed file.
 fn committed_fixture(tmp: &Path) -> (PathBuf, PathBuf) {
+    committed_fixture_with(tmp, &[])
+}
+
+/// The same, plus files written into the copy BEFORE the commit, so a test can
+/// add a source file of its own and still start from a tree `git diff` reports
+/// as clean.
+fn committed_fixture_with(tmp: &Path, extra: &[(&str, &str)]) -> (PathBuf, PathBuf) {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/env-var-whole-url");
     let repo_path = tmp.join("service");
     copy_dir(&fixture, &repo_path);
+    for (relative, contents) in extra {
+        let path = repo_path.join(relative);
+        std::fs::create_dir_all(path.parent().expect("a file has a parent")).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
     run_git(&repo_path, &["init", "-q"]);
     run_git(&repo_path, &["add", "-A"]);
     run_git(&repo_path, &["commit", "-q", "-m", "init"]);
     let cassette = repo_path.join("__llm__");
     (repo_path, cassette)
 }
+
+/// A module the deterministic scan raises no candidate for: no request, no
+/// route, no import of anything that performs one.
+const NO_CANDIDATES: &str = "export function slugify(value: string): string {\n  \
+    return value.trim().toLowerCase().replace(/\\s+/g, \"-\");\n}\n";
+
+/// The same file after a scanner improvement would start seeing a call in it.
+const ONE_CANDIDATE: &str = "export async function fetchNotes(): Promise<string> {\n  \
+    const res = await fetch(\"http://localhost:9100/api/notes\");\n  \
+    return res.text();\n}\n";
 
 fn mock_env(cassette: &Path) {
     // SAFETY: both tests in this binary are `#[serial]`, so no other thread is
@@ -315,5 +337,108 @@ async fn a_previous_format_cache_is_refused_and_the_scan_goes_back_to_the_model(
         dispatched_two > 0,
         "a v20 cache holds joined rows this version's join would fold in again: it must be \
          refused and every file re-read from the model"
+    );
+}
+
+/// HEAD of the fixture copy, so a test can tell the stored payload which
+/// commit its cache was written against.
+fn git_head(dir: &Path) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("git rev-parse failed to spawn");
+    assert!(out.status.success(), "git rev-parse failed");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// A file the model was never asked about must not hold a cache entry, and a
+/// file with no entry must be dispatched.
+///
+/// This is the #478 class, which the raw-answer split makes permanent unless
+/// the two are kept apart: a phase-1 skip used to write an empty
+/// `FileAnalysisResult` into the cache, indistinguishable from a model that
+/// answered with nothing. With no `CACHE_VERSION` bump left to force a
+/// re-analysis (a deterministic improvement no longer moves the constant), an
+/// unchanged file that a later scanner raises a candidate for would be
+/// partitioned as reused and never reach the model again.
+///
+/// `src/notes.ts` starts as a module with no request in it — the deterministic
+/// scan raises no candidate, so phase 1 skips it and the model never sees it.
+/// It is then rewritten to make a call and the stored payload is re-pointed at
+/// the new commit, which is the scanner's view of "this file did not change,
+/// but this scan raises a candidate for it".
+#[tokio::test]
+#[serial]
+async fn a_skipped_file_is_absent_from_the_cache_and_is_dispatched_once_it_raises_a_candidate() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (repo_path, cassette) =
+        committed_fixture_with(tmp.path(), &[("src/notes.ts", NO_CANDIDATES)]);
+    mock_env(&cassette);
+
+    let storage = StubStorage::default();
+
+    let before_scan_one = carrick::scan_health::attempted_count();
+    run_analysis_engine_with_sidecar(storage.clone(), repo_path.to_str().unwrap(), None, false)
+        .await
+        .expect("scan #1 failed");
+    let scan_one = latest_upload(&storage);
+    assert!(
+        carrick::scan_health::attempted_count() - before_scan_one > 0,
+        "scan #1 is the cold scan: it must dispatch files to the model"
+    );
+
+    let cached_files: Vec<String> = scan_one
+        .file_results
+        .as_ref()
+        .expect("scan #1 must populate the cache")
+        .keys()
+        .cloned()
+        .collect();
+    assert!(
+        !cached_files.iter().any(|path| path.ends_with("notes.ts")),
+        "a file phase 1 skipped was never asked about, so the cache must hold no answer for \
+         it: {cached_files:#?}"
+    );
+
+    // The file now makes a request, and the cache is re-pointed at the commit
+    // that says so — from the scanner's side this is an unchanged file that
+    // this scan raises a candidate for, which is what a resolver improvement
+    // looks like to an already-indexed repo.
+    std::fs::write(repo_path.join("src/notes.ts"), ONE_CANDIDATE).unwrap();
+    run_git(&repo_path, &["add", "-A"]);
+    run_git(&repo_path, &["commit", "-q", "-m", "notes calls out"]);
+    {
+        let mut repos = storage.repos.lock().unwrap();
+        let prev = repos.last_mut().expect("no prior upload to re-point");
+        prev.commit_hash = git_head(&repo_path);
+    }
+
+    let before_scan_two = carrick::scan_health::attempted_count();
+    run_analysis_engine_with_sidecar(storage.clone(), repo_path.to_str().unwrap(), None, false)
+        .await
+        .expect("scan #2 failed");
+    let dispatched_two = carrick::scan_health::attempted_count() - before_scan_two;
+
+    assert_eq!(
+        dispatched_two, 1,
+        "the one file with no cached answer must be the one file dispatched; every other file \
+         replays the answer the previous scan recorded"
+    );
+    let scan_two_cached: Vec<String> = latest_upload(&storage)
+        .file_results
+        .as_ref()
+        .expect("scan #2 must populate the cache")
+        .keys()
+        .cloned()
+        .collect();
+    assert!(
+        scan_two_cached
+            .iter()
+            .any(|path| path.ends_with("notes.ts")),
+        "the file the model was asked about must now hold its answer: {scan_two_cached:#?}"
     );
 }
