@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.37](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.36...carrick-v0.3.37) (2026-09-05)
+
+
+### Bug Fixes
+
+* **scanner:** key the SDK-edge join on the subpath a consumer imported ([#656](https://github.com/carrick-tools/carrick/issues/656)) ([#682](https://github.com/carrick-tools/carrick/issues/682)) ([aed7536](https://github.com/carrick-tools/carrick/commit/aed75369d812f21e4e918773ffc293866e340bc7))
+* **scanner:** publish the members a namespace re-export names ([#679](https://github.com/carrick-tools/carrick/issues/679)) ([#681](https://github.com/carrick-tools/carrick/issues/681)) ([d61e74d](https://github.com/carrick-tools/carrick/commit/d61e74d8cd3d95d773d5d98268cf45231a404b0e))
+* **scanner:** read a request whose options bag sits beside a page bag ([#675](https://github.com/carrick-tools/carrick/issues/675)) ([#677](https://github.com/carrick-tools/carrick/issues/677)) ([c2fa67b](https://github.com/carrick-tools/carrick/commit/c2fa67be50c041c6fda39fab30ed2d0b2eaec525))
+* **scanner:** resolve a package entry through a nested exports condition tree ([#656](https://github.com/carrick-tools/carrick/issues/656)) ([#678](https://github.com/carrick-tools/carrick/issues/678)) ([7392c66](https://github.com/carrick-tools/carrick/commit/7392c668c9ccf65bce0f0cf4141030f01a09702e))
+
 ## [0.3.36](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.35...carrick-v0.3.36) (2026-09-04)
 
 
