@@ -30,6 +30,15 @@
 //!   the modeled transport contract and live on their own key; the same span
 //!   must not be indexed twice on two channels.
 //!
+//! A fourth rule lives at the append (`append_event_bus_operations` in
+//! `engine/mod.rs`) because it needs the LLM results this pass never sees: a
+//! row is dropped where the file-analyzer already reported a pub/sub op for the
+//! same file, topic and role. One call site is one row, and of the two the
+//! model's is the richer — it carries the payload anchor that resolves the op's
+//! type, which this pass does not yet extract (#688). What this pass adds is
+//! the sites nothing else reports, which is the whole of the gap it was written
+//! for.
+//!
 //! What that accepts, stated plainly. An event whose name is a literal but
 //! whose emitter is a third-party object with its own vocabulary (a redis
 //! client's `pmessage`, a queue's `stalled`) produces a subscriber row with no
