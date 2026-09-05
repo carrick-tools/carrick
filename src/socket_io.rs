@@ -124,8 +124,10 @@ impl SocketExtraction {
 }
 
 /// Socket.IO lifecycle/reserved events that are not application contract
-/// events.
-const RESERVED_EVENTS: &[&str] = &[
+/// events. Shared with `crate::event_emitter`, which declines the same names:
+/// a site this pass leaves alone because the event is reserved must not be
+/// picked up there as an in-process bus contract instead (carrick#676).
+pub(crate) const RESERVED_EVENTS: &[&str] = &[
     "connection",
     "connect",
     "connect_error",

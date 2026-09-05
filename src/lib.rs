@@ -10,6 +10,7 @@ pub mod config;
 pub mod engine;
 pub mod env_alias;
 pub mod eval_output;
+pub mod event_emitter;
 pub mod external_call_candidates;
 pub mod extractor;
 pub mod file_based_router;

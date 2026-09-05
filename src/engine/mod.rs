@@ -140,7 +140,10 @@ mod type_compat_v2;
 /// (carrick#675). A v18 cache holds no row at all for an unchanged consumer
 /// file whose client lists a collection, while the same client's unpaginated
 /// methods have theirs.
-const CACHE_VERSION: u32 = 19;
+/// 20: an in-process EventEmitter subscription is a pub/sub producer row and an
+/// emission a pub/sub consumer row (carrick#676), so a v19 cache holds no row
+/// at all for an unchanged file whose bus contracts never crossed a wire.
+const CACHE_VERSION: u32 = 20;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
@@ -1577,15 +1580,21 @@ async fn generate_extraction_config(
 
 /// Append deterministically extracted protocol operations to the repo's
 /// index data: GraphQL (SDL root fields as endpoints, document top-level
-/// fields as calls) and Socket.IO (listeners as endpoints, emitters as
+/// fields as calls), Socket.IO (listeners as endpoints, emitters as calls),
+/// and the in-process event bus (subscribers as endpoints, emissions as
 /// calls). These protocols never go through the LLM pipeline.
-/// Deterministically-extracted non-HTTP operations (GraphQL + Socket.IO).
+/// Deterministically-extracted non-HTTP operations (GraphQL + Socket.IO +
+/// in-process event bus).
 /// Returned by `append_deterministic_protocol_operations` so the same scan
 /// feeds both `cloud_data.endpoints/calls` and the type manifest
 /// (`append_protocol_manifest_entries`) without scanning the files twice.
+#[derive(Default)]
 struct ProtocolExtractions {
     graphql: crate::graphql::GraphqlExtraction,
     sockets: crate::socket_io::SocketExtraction,
+    /// In-process EventEmitter contracts (carrick#676). Scanned after
+    /// `sockets`, which it needs to know which spans are already socket ops.
+    event_bus: crate::event_emitter::BusExtraction,
 }
 
 /// The directories to walk for a service's own GraphQL SDL files: its
@@ -1621,7 +1630,12 @@ fn scan_protocol_extractions(
     merge_graphql_resolver_locations(&mut graphql, file_results);
     merge_graphql_consumer_locations(&mut graphql, file_results);
     let sockets = crate::socket_io::scan_files(files);
-    ProtocolExtractions { graphql, sockets }
+    let event_bus = crate::event_emitter::scan_files(files, &sockets);
+    ProtocolExtractions {
+        graphql,
+        sockets,
+        event_bus,
+    }
 }
 
 /// #307 (class 2): drop LLM HTTP data calls that are the TRANSPORT of
@@ -1750,7 +1764,107 @@ fn append_deterministic_protocol_operations(
         );
     }
 
+    append_event_bus_operations(
+        cloud_data,
+        &extractions.event_bus,
+        file_results,
+        &to_details,
+    );
     append_pubsub_operations(cloud_data, file_results, &extractions.sockets, &to_details);
+}
+
+/// Fold the deterministic in-process event-bus scan into `cloud_data`
+/// (carrick#676): a subscription registers a handler and is the contract
+/// producer → `cloud_data.endpoints`; an emission sends and is the consumer →
+/// `cloud_data.calls`. Identity is the event name alone
+/// (`OperationKey::pubsub`), the same key a broker topic uses, because an
+/// in-process bus is pub/sub with a shorter wire.
+///
+/// Where the file-analyzer ALREADY reported a pub/sub op for the same file,
+/// topic and role, that row wins and this one is dropped. Both rows describe
+/// one call site on one channel, so indexing both would double it — and of the
+/// two the model's is the richer: it carries the payload anchor that gives the
+/// op a resolved type, which this pass does not yet extract (#688). The value
+/// added here is the sites the model reported nothing for, which is the whole
+/// of the gap #676 was filed for.
+///
+/// The tradeoff that accepts: where the model reported a role and the AST
+/// disagrees, the model's role stands. It applies only where both saw the same
+/// site, and #688 (payload anchors here) is what would let this prefer the AST.
+fn append_event_bus_operations(
+    cloud_data: &mut CloudRepoData,
+    event_bus: &crate::event_emitter::BusExtraction,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    to_details: &impl Fn(OperationKey, &Path, u32) -> ApiEndpointDetails,
+) {
+    use crate::operation::PubsubRole;
+
+    if event_bus.is_empty() {
+        return;
+    }
+    let reported = llm_pubsub_sites(file_results);
+    let mut subscribers = 0usize;
+    let mut publishers = 0usize;
+    let mut deferred = 0usize;
+    let mut push = |ops: &[crate::event_emitter::BusOp],
+                    role: PubsubRole,
+                    into: &mut Vec<ApiEndpointDetails>,
+                    counter: &mut usize| {
+        for op in ops {
+            let site = (
+                normalize_protocol_file(&op.file_path),
+                op.event.clone(),
+                role,
+            );
+            if reported.contains(&site) {
+                debug!(
+                    event = %op.event,
+                    file = %op.file_path.display(),
+                    "event bus op deferred to the file-analyzer's row for the same site"
+                );
+                deferred += 1;
+                continue;
+            }
+            into.push(to_details(op.key.clone(), &op.file_path, op.line));
+            *counter += 1;
+        }
+    };
+    push(
+        &event_bus.subscribers,
+        PubsubRole::Subscriber,
+        &mut cloud_data.endpoints,
+        &mut subscribers,
+    );
+    push(
+        &event_bus.publishers,
+        PubsubRole::Publisher,
+        &mut cloud_data.calls,
+        &mut publishers,
+    );
+    debug!(
+        subscribers,
+        publishers, deferred, "Indexing in-process event bus operations"
+    );
+}
+
+/// Sites the file-analyzer already reported as pub/sub, as (normalized file,
+/// topic, role). Read by [`append_event_bus_operations`] to know which of its
+/// own rows would be a second copy of one the model already produced. An op
+/// with no role names no site: it was dropped from `cloud_data` entirely, so it
+/// covers nothing.
+fn llm_pubsub_sites(
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+) -> HashSet<(PathBuf, String, crate::operation::PubsubRole)> {
+    let mut sites = HashSet::new();
+    for (path, result) in file_results {
+        let file_norm = normalize_protocol_file(Path::new(path));
+        for op in &result.pubsub_operations {
+            if let Some(role) = op.role {
+                sites.insert((file_norm.clone(), op.topic.clone(), role));
+            }
+        }
+    }
+    sites
 }
 
 /// Component-wise path normalization used by the protocol folds: strip a leading
@@ -1771,6 +1885,11 @@ fn normalize_protocol_file(p: &Path) -> PathBuf {
 /// pub/sub op sharing the SAME file AND the SAME event/topic string is folded
 /// away (dropped) in favor of it — otherwise the emit is indexed twice (once
 /// `socket|…`, once `pubsub|…`), inflating the call set.
+///
+/// An in-process bus op does NOT fold anything here: it is on the same channel
+/// as the pub/sub row it would replace, and the model's row is the richer of
+/// the two (it carries a payload anchor), so the deduplication runs the other
+/// way, in `append_event_bus_operations` (carrick#676).
 ///
 /// The match keys purely on structural coincidence (same file + same name),
 /// never on a library/broker name, so a genuine Kafka/NATS/Redis/BullMQ publish
@@ -1830,7 +1949,7 @@ fn append_pubsub_operations(
 ) {
     use crate::operation::PubsubRole;
 
-    let socket_twins = socket_event_twins(sockets);
+    let twins = socket_event_twins(sockets);
     let mut subscribers = 0usize;
     let mut publishers = 0usize;
     let mut dropped = 0usize;
@@ -1846,7 +1965,7 @@ fn append_pubsub_operations(
             // Same-file socket twin → the file-analyzer double-classified a
             // socket emit/listen site; keep the deterministic socket op, drop
             // this pub/sub form so the site is indexed once.
-            if has_socket_twin(&socket_twins, &file_norm, &op.topic) {
+            if has_socket_twin(&twins, &file_norm, &op.topic) {
                 debug!(
                     topic = %op.topic,
                     file = %path,
@@ -1926,7 +2045,7 @@ fn append_pubsub_manifest_entries(
 ) {
     use crate::operation::PubsubRole;
 
-    let socket_twins = socket_event_twins(sockets);
+    let twins = socket_event_twins(sockets);
     // Deterministic order: sort paths before emitting manifest entries.
     let mut paths: Vec<&String> = file_results.keys().collect();
     paths.sort();
@@ -1936,7 +2055,7 @@ fn append_pubsub_manifest_entries(
         for op in &result.pubsub_operations {
             // Folded into a same-file socket twin: dropped from cloud_data, so
             // emit no orphan anchor here either.
-            if has_socket_twin(&socket_twins, &file_norm, &op.topic) {
+            if has_socket_twin(&twins, &file_norm, &op.topic) {
                 continue;
             }
             let role = match op.role {
@@ -7619,6 +7738,7 @@ mod tests {
         use crate::operation::{GraphqlOperationKind, SocketDirection};
 
         let extractions = ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction::default(),
             graphql: crate::graphql::GraphqlExtraction {
                 producers: vec![graphql_op(
                     GraphqlOperationKind::Query,
@@ -7701,6 +7821,7 @@ mod tests {
             Some("./types/payment"),
         );
         let extractions = ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction::default(),
             graphql: crate::graphql::GraphqlExtraction::default(),
             sockets: crate::socket_io::SocketExtraction {
                 listeners: vec![],
@@ -8200,6 +8321,7 @@ mod tests {
         let publish_file = "payments-svc/events/orders.ts";
 
         let extractions = ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction::default(),
             graphql: crate::graphql::GraphqlExtraction::default(),
             sockets: crate::socket_io::SocketExtraction {
                 listeners: vec![],
@@ -8299,6 +8421,120 @@ mod tests {
         );
     }
 
+    /// carrick#676: an in-process EventEmitter subscription is a contract
+    /// PRODUCER on the pub/sub channel and an emission is the CONSUMER, so a
+    /// census question like "what subscribes to this notification" has a row to
+    /// answer with. Where the file-analyzer already reported the same site, its
+    /// row wins and the deterministic one stands down: one call site is indexed
+    /// once, and by the row that carries a payload anchor.
+    #[test]
+    fn event_bus_ops_are_indexed_and_defer_to_the_llm_row() {
+        use crate::operation::PubsubRole;
+
+        let subscribe_file = "notify-svc/src/handle-socket.ts";
+        let emit_file = "worker-svc/src/event-bus.ts";
+
+        let bus_op = |event: &str, file: &str, line: u32| crate::event_emitter::BusOp {
+            key: OperationKey::pubsub(event),
+            event: event.to_string(),
+            file_path: PathBuf::from(file),
+            line,
+        };
+        let extractions = ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction {
+                subscribers: vec![bus_op("workerNotification", subscribe_file, 180)],
+                publishers: vec![bus_op("workerNotification", emit_file, 389)],
+            },
+            ..Default::default()
+        };
+
+        let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        // The file-analyzer's view of the SAME emission: same file, same topic,
+        // same role, one channel. Its row carries a payload anchor, so it is
+        // the one to keep — the deterministic publisher must stand down.
+        file_results.insert(
+            emit_file.to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "workerNotification",
+                    PubsubRole::Publisher,
+                    Some("WorkerNotification"),
+                    Some("./types/notification"),
+                )],
+                ..Default::default()
+            },
+        );
+        // A broker topic in a file the deterministic pass found nothing in.
+        file_results.insert(
+            "worker-svc/src/queue.ts".to_string(),
+            FileAnalysisResult {
+                pubsub_operations: vec![pubsub_op(
+                    "orders.created",
+                    PubsubRole::Publisher,
+                    None,
+                    None,
+                )],
+                ..Default::default()
+            },
+        );
+
+        let mut cloud_data = repo_with_bundle("notify-monorepo", None, "");
+        append_deterministic_protocol_operations(&mut cloud_data, &extractions, &file_results);
+
+        // The subscription is the gap #676 was filed for: nothing else reports
+        // it, so the deterministic row is the only one, at the AST's own line.
+        let subscriber_rows: Vec<&ApiEndpointDetails> = cloud_data
+            .endpoints
+            .iter()
+            .filter(|e| e.key.canonical() == "pubsub|workerNotification")
+            .collect();
+        assert_eq!(subscriber_rows.len(), 1);
+        assert_eq!(
+            subscriber_rows[0].file_path,
+            PathBuf::from(format!("{subscribe_file}:180")),
+            "the row must carry the AST's own line"
+        );
+        // The emission is indexed once, by the model's row (line 4, not the
+        // AST's 389) — a second row for one call site would double the key.
+        let publisher_rows: Vec<&ApiEndpointDetails> = cloud_data
+            .calls
+            .iter()
+            .filter(|c| c.key.canonical() == "pubsub|workerNotification")
+            .collect();
+        assert_eq!(
+            publisher_rows.len(),
+            1,
+            "one call site must produce one row, not one per pass"
+        );
+        assert_eq!(
+            publisher_rows[0].file_path,
+            PathBuf::from(format!("{emit_file}:14")),
+            "the model's row is the one kept: it carries the payload anchor"
+        );
+        assert_eq!(
+            cloud_data
+                .calls
+                .iter()
+                .filter(|c| c.key.canonical() == "pubsub|orders.created")
+                .count(),
+            1,
+            "a broker topic the deterministic pass cannot see must survive"
+        );
+
+        // The kept model row still anchors its manifest entry, so deferring to
+        // it loses no type resolution.
+        let mut entries = Vec::new();
+        append_pubsub_manifest_entries(&mut entries, &file_results, &extractions.sockets, ".");
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.key.canonical() == "pubsub|workerNotification")
+                .count(),
+            1,
+            "the model's op must keep its anchor"
+        );
+    }
+
     /// A pub/sub op with no decoded payload type (`primary_type_symbol: None`)
     /// still gets a manifest entry, just with a `None` symbol — exactly how a
     /// socket emitter whose payload the extractor couldn't capture is handled.
@@ -8361,6 +8597,7 @@ mod tests {
     fn graphql_symbol_request_alias_matches_manifest_alias() {
         let consumer = graphql_consumer_op("order", Some("OrderView"), Some("./types"));
         let extractions = ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction::default(),
             graphql: crate::graphql::GraphqlExtraction {
                 producers: vec![],
                 consumers: vec![consumer.clone()],
@@ -8490,6 +8727,7 @@ mod tests {
         producer.resolver_line = Some(38);
 
         let extractions = ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction::default(),
             graphql: crate::graphql::GraphqlExtraction {
                 producers: vec![producer.clone()],
                 consumers: vec![],
@@ -8544,6 +8782,7 @@ mod tests {
 
         // A producer without a merged resolver location yields no infer request.
         let bare = ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction::default(),
             graphql: crate::graphql::GraphqlExtraction {
                 producers: vec![graphql_op(
                     GraphqlOperationKind::Query,
