@@ -17,8 +17,9 @@
 //! # What is walked
 //!
 //! The entry module named by the service's own `package.json`
-//! (`exports["."]`, `types`, `main`, falling back to `src/index.ts`), and the
-//! class graph reachable from its exports:
+//! (every string leaf under `exports["."]`, however deeply its conditions
+//! nest, then `types`, `main`, falling back to `src/index.ts`), and the class
+//! graph reachable from its exports:
 //!
 //! - an exported **class** contributes one member per method, and recurses
 //!   into each field whose declared type or `new X(...)` initialiser names a
@@ -123,6 +124,12 @@ const MAX_DELEGATES: usize = 32;
 /// package's own source.
 const NON_SOURCE_DIRS: [&str; 4] = ["node_modules", "dist", "build", ".next"];
 
+/// The `exports` conditions read before anything else at a given level, in
+/// this order. Not a filter: every other condition at that level is read too,
+/// after these. It exists so a package that states its entry plainly is not
+/// out-ordered by a private condition sitting beside it.
+const KNOWN_CONDITIONS: [&str; 4] = ["types", "import", "require", "default"];
+
 /// One callable the package publishes.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SdkMember {
@@ -220,25 +227,27 @@ fn resolve_entry_module(service_root: &Path) -> Option<PathBuf> {
 
 /// The entry specifiers a `package.json` declares, most specific first.
 ///
-/// `exports` is read narrowly on purpose: a bare string, or the `"."` subpath
-/// as a string or as a condition map (`types` / `import` / `default`, in that
-/// order). Conditional trees beyond that shape name build output in every
-/// layout worth guessing at, so they are skipped rather than walked.
+/// The `"."` subpath of `exports` is read as a bare string or as a condition
+/// tree of ANY depth, and every string leaf in that tree is a candidate. A
+/// package that publishes both module systems nests its conditions
+/// (`{ import: { types, default }, require: { … } }`), and the source path a
+/// monorepo resolves internally is usually a private condition key beside
+/// them. Reading only three well-known keys at the top level returned nothing
+/// at all on that layout, so the package published no surface and every
+/// consumer of its client was `member_not_found` (carrick#656).
+///
+/// A candidate that resolves to build output or to a declaration file is
+/// rejected by [`resolve_entry_module`], which is why every leaf can be
+/// offered rather than only the ones this recognises.
 fn declared_entry_specifiers(manifest: &serde_json::Value) -> Vec<String> {
     let mut specifiers = Vec::new();
     match manifest.get("exports") {
         Some(serde_json::Value::String(entry)) => specifiers.push(entry.clone()),
-        Some(serde_json::Value::Object(map)) => match map.get(".") {
-            Some(serde_json::Value::String(entry)) => specifiers.push(entry.clone()),
-            Some(serde_json::Value::Object(conditions)) => {
-                for condition in ["types", "import", "default"] {
-                    if let Some(serde_json::Value::String(entry)) = conditions.get(condition) {
-                        specifiers.push(entry.clone());
-                    }
-                }
+        Some(serde_json::Value::Object(map)) => {
+            if let Some(root) = map.get(".") {
+                collect_string_leaves(root, &mut specifiers);
             }
-            _ => {}
-        },
+        }
         _ => {}
     }
     for field in ["types", "typings", "main"] {
@@ -247,6 +256,40 @@ fn declared_entry_specifiers(manifest: &serde_json::Value) -> Vec<String> {
         }
     }
     specifiers
+}
+
+/// Every string leaf of a condition tree, well-known conditions first.
+///
+/// [`KNOWN_CONDITIONS`] are walked in their own order at each level, so the
+/// entry a package states plainly still wins; whatever else the level holds
+/// follows. Order only decides which of several resolvable candidates is
+/// taken, and on a real package the conditions of one subpath name one module.
+///
+/// Arrays are walked for the same reason objects are: a fallback array is a
+/// list of candidates, and one that names build output is dropped by the
+/// source test rather than by guessing at its position.
+fn collect_string_leaves(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(entry) => out.push(entry.clone()),
+        serde_json::Value::Object(map) => {
+            for condition in KNOWN_CONDITIONS {
+                if let Some(nested) = map.get(condition) {
+                    collect_string_leaves(nested, out);
+                }
+            }
+            for (condition, nested) in map {
+                if !KNOWN_CONDITIONS.contains(&condition.as_str()) {
+                    collect_string_leaves(nested, out);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for nested in items {
+                collect_string_leaves(nested, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Whether a resolved path is TypeScript the package actually authored: a
@@ -1450,9 +1493,8 @@ mod tests {
         assert!(is_typescript_source(Path::new("/repo/src/index.ts")));
     }
 
-    /// `exports` is read narrowly: a bare string, the `"."` string, or the
-    /// `"."` condition map. Anything else names build output in every layout
-    /// worth guessing at.
+    /// `exports` is read from the `"."` subpath only — a bare string, a string,
+    /// or a condition tree — and the well-known conditions are read first.
     #[test]
     fn entry_specifiers_are_read_in_declared_order() {
         let manifest = serde_json::json!({
@@ -1468,10 +1510,87 @@ mod tests {
         let bare = serde_json::json!({ "exports": "./src/index.ts" });
         assert_eq!(declared_entry_specifiers(&bare), vec!["./src/index.ts"]);
 
-        // A conditional tree this does not understand contributes nothing
-        // rather than a guess.
+        // Only the root subpath. A package's other entries publish other
+        // modules, and walking one of them would anchor members to a surface
+        // no root import reaches.
         let nested = serde_json::json!({ "exports": { "./sub": "./src/sub.ts" } });
         assert!(declared_entry_specifiers(&nested).is_empty());
+    }
+
+    /// carrick#656: a package that publishes both module systems nests its
+    /// conditions, and the source path sits under a private condition beside
+    /// them. Reading three keys at the top level found nothing, so the package
+    /// published no surface at all and every consumer of its client was
+    /// `member_not_found`.
+    #[test]
+    fn a_nested_condition_tree_offers_every_leaf_it_holds() {
+        let manifest = serde_json::json!({
+            "exports": {
+                ".": {
+                    "import": {
+                        "@scope/source": "./src/v3/index.ts",
+                        "types": "./dist/esm/index.d.ts",
+                        "default": "./dist/esm/index.js",
+                    },
+                    "require": {
+                        "types": "./dist/cjs/index.d.ts",
+                        "default": "./dist/cjs/index.js",
+                    },
+                },
+                "./v3": { "import": { "@scope/source": "./src/v3/index.ts" } },
+            },
+            "main": "./dist/cjs/index.js",
+        });
+        assert_eq!(
+            declared_entry_specifiers(&manifest),
+            vec![
+                // `import` before `require`, and inside each the well-known
+                // conditions before the private one. `./v3` is another
+                // subpath and contributes nothing; `main` comes last.
+                "./dist/esm/index.d.ts",
+                "./dist/esm/index.js",
+                "./src/v3/index.ts",
+                "./dist/cjs/index.d.ts",
+                "./dist/cjs/index.js",
+                "./dist/cjs/index.js",
+            ]
+        );
+    }
+
+    /// The same tree end to end: only the source leaf resolves, so it is the
+    /// entry, and the `dist` and `.d.ts` leaves beside it are dropped.
+    #[test]
+    fn a_nested_condition_tree_resolves_to_the_source_leaf() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src/v3")).expect("mkdir");
+        std::fs::write(root.join("src/v3/index.ts"), "export const x = 1;\n").expect("write");
+        std::fs::write(
+            root.join("package.json"),
+            serde_json::json!({
+                "name": "@fixture/nested",
+                "main": "./dist/cjs/index.js",
+                "types": "./dist/cjs/index.d.ts",
+                "exports": {
+                    ".": {
+                        "import": {
+                            "@fixture/source": "./src/v3/index.ts",
+                            "types": "./dist/esm/index.d.ts",
+                            "default": "./dist/esm/index.js",
+                        },
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .expect("write");
+
+        let entry = resolve_entry_module(root).expect("an entry resolves");
+        assert!(
+            entry.ends_with("src/v3/index.ts"),
+            "resolved {}",
+            entry.display()
+        );
     }
 
     /// A repo that publishes no client resolves an entry whose exports reach
