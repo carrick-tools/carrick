@@ -281,6 +281,8 @@ fn test_file_orchestrator_creation() {
 fn test_processing_stats_tracking() {
     let stats = ProcessingStats {
         files_processed: 5,
+        files_model_dispatched: 5,
+        files_model_reused: 0,
         files_skipped: 2,
         files_skipped_no_candidates: 1,
         files_parse_failed: 1,
@@ -850,6 +852,7 @@ app.post('/users', (req, res) => res.json({ created: true }));
     let result = orchestrator
         .analyze_files(
             &files,
+            &std::collections::HashMap::new(),
             &http_guidance(&guidance),
             &detection,
             temp_dir.path(),
@@ -893,6 +896,7 @@ async fn test_file_orchestrator_handles_empty_files() {
     let result = orchestrator
         .analyze_files(
             &files,
+            &std::collections::HashMap::new(),
             &http_guidance(&guidance),
             &detection,
             temp_dir.path(),
@@ -935,6 +939,7 @@ async fn test_file_orchestrator_handles_missing_files() {
     let result = orchestrator
         .analyze_files(
             &files,
+            &std::collections::HashMap::new(),
             &http_guidance(&guidance),
             &detection,
             empty_root.path(),

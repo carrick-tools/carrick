@@ -38,6 +38,9 @@ pub struct MultiAgentAnalysisResult {
     pub mount_graph: MountGraph,
     /// File-centric analysis results (replaces old AnalysisResults)
     pub file_results: HashMap<String, FileAnalysisResult>,
+    /// The model's raw per-file answers, for the incremental cache. See
+    /// [`FileCentricAnalysisResult::raw_model_results`].
+    pub raw_model_results: HashMap<String, FileAnalysisResult>,
     /// Processing statistics
     #[allow(dead_code)]
     pub stats: ProcessingStats,
@@ -129,6 +132,9 @@ impl MultiAgentOrchestrator {
         let file_centric_result = file_orchestrator
             .analyze_files(
                 &files,
+                // A full analysis holds no previous answer: every file goes to
+                // the model.
+                &HashMap::new(),
                 &framework_guidance,
                 &framework_detection,
                 std::path::Path::new(service_root),
@@ -159,6 +165,7 @@ impl MultiAgentOrchestrator {
             framework_guidance,
             mount_graph: file_centric_result.mount_graph,
             file_results: file_centric_result.file_results,
+            raw_model_results: file_centric_result.raw_model_results,
             stats: file_centric_result.stats,
         })
     }
@@ -166,9 +173,10 @@ impl MultiAgentOrchestrator {
     fn print_analysis_summary(&self, result: &FileCentricAnalysisResult) {
         debug!("=== ANALYSIS SUMMARY ===");
         debug!("File Processing:");
+        debug!("  - Files processed: {}", result.stats.files_processed);
         debug!(
-            "  - Files processed (LLM calls): {}",
-            result.stats.files_processed
+            "  - Files sent to the model: {}",
+            result.stats.files_model_dispatched
         );
         debug!("  - Files skipped (total): {}", result.stats.files_skipped);
         debug!(

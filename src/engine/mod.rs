@@ -45,105 +45,32 @@ use swc_ecma_visit::VisitWith;
 
 mod type_compat_v2;
 
-/// Current cache format version. Increment when FileAnalysisResult schema
-/// changes — or when extraction itself changes what an unchanged file yields
-/// (#478: a previously-skipped file is cached as an empty result, so routing
-/// improvements never reach it; the durable per-file re-routing design is
-/// tracked there).
-/// 4: EndpointResult gained `emission_style` — pre-4 cached results would
-/// replay with `None` forever and never take the return-value/no-payload
-/// inference paths for unchanged files.
-/// 5: routing/extraction changes (file-based route conventions from declared
-/// dependencies, wrapper barrel-following, injected-base canonical keys) alter
-/// what unchanged files produce; cached skips from ≤0.3.4 must not pin them.
-/// 6: same-file wrapper call backfill (#591 / carrick-cloud#456's sibling,
-/// carrick#588 defect 6) adds rows for unchanged files; v5 caches would pin
-/// every already-indexed repo to the pre-backfill row set forever. Found
-/// live: a 0.3.25 full re-scan of an unchanged tree reused every cached
-/// file_result and emitted none of the new wrapper rows. The rule this
-/// encodes: ANY change to what per-file analysis emits — deterministic
-/// backfills included — must bump this constant, or deployed indexes never
-/// see it.
-/// 7: imported-request-member resolution (carrick#588) rewrites the method and
-/// target of call sites that reach an endpoint through a client method in
-/// another module. Those files do not change, so v6 caches would pin every
-/// already-indexed repo to the wrong verb and the wrong API version.
-/// 8: whole-URL env-var recall (carrick#572) adds a row for a request whose
-/// URL is read from an environment variable and passed to `fetch` as a
-/// binding. A separate bump from 7 on purpose: an index rebuilt on 7 has
-/// already spent its one free pass, so without its own the new rows never
-/// reach it.
-/// 9: end-to-end harness sources are no longer discovered (carrick#588 defect
-/// 1), so the routes an `e2e/` stub registered stop being producer rows. The
-/// incremental merge would shed them on its own — a cached result whose file
-/// is no longer in the discovered set is dropped — but that only runs when a
-/// git diff is available, and the rule above is that any change to what
-/// per-file analysis emits bumps this constant. The bump makes the first scan
-/// after the release a full one on every already-indexed repo.
-/// 10: method-guarded file-based routes (carrick#601). A route module that
-/// exports a generic handler and narrows the HTTP method inside the body now
-/// yields the guarded verb instead of the convention's default. Those files do
-/// not change, so a v9 cache would pin every already-indexed repo to the
-/// phantom default-verb row, which is the row a wrong-method consumer call
-/// matches into a false green edge.
-/// 11: `new URL(path, base)` targets (carrick#610) add rows for requests whose
-/// URL was built a statement before the call, and correct the path of those
-/// that had one invented. Same reasoning as 10: unchanged files, so a v10
-/// cache would pin every already-indexed repo to the wrong version forever.
-/// 12: imported-member call sites extraction returned no row for (carrick#623)
-/// are now emitted, so an unchanged consumer file has consumer rows where a v11
-/// cache has none at all.
-/// 13: a handler's branch on OPTIONS or HEAD no longer displaces the
-/// convention's default verb (carrick#628), so an unchanged route module has
-/// its real verb back where a v12 cache pins it to the preflight verb and drops
-/// the row every consumer of that route matches.
-/// 14: five passes now emit or resolve where a v13 cache holds nothing or a
-/// wrong value for an unchanged file: whole-URL env-var calls extraction
-/// returned no row for (carrick#632), a base declared as a module-level
-/// string literal (carrick#627), a response contract read off the helper's
-/// argument (carrick#631), helper calls whose built query string failed the
-/// route-shape gate (carrick#588 finding 6), and imported members that build
-/// their URL with `new URL()` or state no method (carrick#588 finding 3).
-/// 15: the response-payload recovery now runs where a wrapper rule verified the
-/// transport type (carrick#643), and a whole-URL env-var call extraction
-/// answered by paraphrase is corrected in place and keyed on its loopback
-/// fallback's route (carrick#644), so unchanged route and consumer files
-/// carry a contract and an operation key a v14 cache pins to `unknown` and to
-/// an unkeyed target.
-/// 17: a call site that reaches a client method through a factory's record
-/// (two import hops) or through a field off `this` now resolves and emits its
-/// consumer row (carrick#655), where a v16 cache holds no row for an unchanged
-/// consumer file.
-/// 18: a Socket.IO listener or emitter written on a class field
-/// (`this.socket.emit("run:subscribe", …)`) now resolves its socket root and
-/// emits its row (carrick#659), where a v17 cache holds no row at all for an
-/// unchanged file whose socket is built in one method and used in another.
-/// Same version covers carrick#662: a file that carves a custom namespace off
-/// its server is no longer dropped whole, so its listeners and emitters —
-/// namespaced and default alike — have rows a v17 cache also lacks.
-/// Same version covers carrick#656: a consumer row now states what the member
-/// join could not follow, and the count is stamped on rows in the files a scan
-/// analyses, so a v17 cache holds those rows without the field and an
-/// unchanged service would never acquire it.
-/// Same version covers carrick#665: a file-based route whose builder call
-/// declares its HTTP method as an option is recorded under that verb rather
-/// than the convention's default, so an unchanged route file that a v17 cache
-/// holds as a POST is a PUT, a PATCH or a DELETE.
-/// Same version covers carrick#666: a call site that reaches a client method
-/// published by ANOTHER workspace package, imported by package name, now
-/// resolves and emits its consumer row, where a v17 cache holds no row at all
-/// for an unchanged consumer file in a monorepo whose client lives in a
-/// sibling package.
-/// 19: a client method whose request goes through a PAGINATING transport —
-/// a page bag beside the request-options bag, so the call carries two object
-/// literals — now states its request, and its call sites resolve to it
-/// (carrick#675). A v18 cache holds no row at all for an unchanged consumer
-/// file whose client lists a collection, while the same client's unpaginated
-/// methods have theirs.
-/// 20: an in-process EventEmitter subscription is a pub/sub producer row and an
-/// emission a pub/sub consumer row (carrick#676), so a v19 cache holds no row
-/// at all for an unchanged file whose bus contracts never crossed a wire.
-const CACHE_VERSION: u32 = 20;
+/// Current cache format version.
+///
+/// The incremental cache holds the model's RAW answer per file — exactly what
+/// the analyzer returned, before the deterministic rows are emitted, before
+/// the model's answer is joined onto them and before every pass over the join
+/// (see `FileCentricAnalysisResult::raw_model_results`). The deterministic
+/// layer runs on EVERY scan over EVERY discovered file, so a resolver fix, a
+/// new deterministic source or a changed gate reaches an already-indexed repo
+/// on its next push with zero model calls, and none of them bumps this
+/// constant.
+///
+/// What DOES bump it: a change to the analyze-file prompt, to the response
+/// schema, or to the rule by which the model's answer is joined onto the
+/// deterministic rows. Those three decide what a cached answer means, so a
+/// cache written under the old one has to be discarded.
+///
+/// Invalidation itself is unchanged and independent of this: entries are keyed
+/// by repo-relative path, and a file is re-read from the model when `git diff`
+/// against the previous scan's commit names it or when the cache holds no
+/// entry for it.
+///
+/// 21: the cache switched from the joined result to the model's raw answer. A
+/// v20 cache holds rows the deterministic layer stated, which this version
+/// states again — replaying one would duplicate them and pin the file to the
+/// resolver of the scan that wrote it.
+const CACHE_VERSION: u32 = 21;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
@@ -1115,35 +1042,29 @@ fn normalize_file_results_keys(
         .collect()
 }
 
-/// Strip diagnostic-only fields from file_results before caching.
-/// These fields are not needed by build_mount_graph() or collect_type_requests().
+/// Which of this scan's files already hold a model answer, so the analyzer
+/// need not be asked about them again.
 ///
-/// `response_expression_text` is deliberately KEPT: it is the primary locator
-/// for return-value endpoints (`EmissionStyle::ReturnValue`), whose only
-/// fallback is an inexact registration-line anchor (the sidecar's
-/// `findFunctionByLine` tolerates ±2 lines and can bind an adjacent handler).
-/// Stripping it would make cached replays of unchanged files silently degrade
-/// to that fallback. Every other stripped text field has an exact span
-/// fallback, so replays lose nothing.
-fn strip_diagnostic_fields(
-    file_results: &mut HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
-) {
-    for result in file_results.values_mut() {
-        for endpoint in &mut result.endpoints {
-            endpoint.candidate_id = String::new();
-            endpoint.pattern_matched = String::new();
-            endpoint.payload_expression_text = None;
-        }
-        for data_call in &mut result.data_calls {
-            data_call.candidate_id = String::new();
-            data_call.pattern_matched = String::new();
-            data_call.call_expression_text = None;
-            data_call.payload_expression_text = None;
-        }
-        for mount in &mut result.mounts {
-            mount.pattern_matched = String::new();
-        }
-    }
+/// Every discovered file is analysed either way: the deterministic layer runs
+/// over all of them on every scan (see `CACHE_VERSION`), and this decides only
+/// which ones cost a model call. A file is reusable when the previous scan
+/// recorded an answer for it and `git diff` against that scan's commit does not
+/// name it. A file the previous scan never recorded — new, or one whose call
+/// failed — has no entry and goes to the model.
+///
+/// `discovered` yields each file twice-keyed: first as the ORCHESTRATOR keys it
+/// (the path as it appears in the discovered set), then as the CACHE keys it
+/// (repo-relative). The returned map carries the orchestrator's key, so the two
+/// conventions meet here rather than inside the orchestrator.
+fn reusable_model_answers(
+    discovered: impl Iterator<Item = (String, String)>,
+    previous: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    changed: &HashSet<String>,
+) -> HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult> {
+    discovered
+        .filter(|(_, relative)| !changed.contains(relative))
+        .filter_map(|(key, relative)| Some((key, previous.get(&relative)?.clone())))
+        .collect()
 }
 
 /// Incremental analysis: reuse cached per-file LLM results for unchanged files.
@@ -1214,28 +1135,23 @@ async fn analyze_current_repo_incremental(
                 }
             };
 
-            // Build set of currently discovered file paths (normalized to relative)
-            let current_file_set: HashSet<String> = files.iter().map(&normalize_path).collect();
-
             // Normalize changed files relative to repo root
             let changed_set: HashSet<String> = changed_files.into_iter().collect();
 
-            // Partition: which files need fresh analysis?
-            let files_to_analyze: Vec<PathBuf> = files
-                .iter()
-                .filter(|f| {
-                    let relative = normalize_path(f);
-                    changed_set.contains(&relative) || !prev_file_results.contains_key(&relative)
-                })
-                .cloned()
-                .collect();
+            let cached_model_results = reusable_model_answers(
+                files
+                    .iter()
+                    .map(|f| (f.to_string_lossy().to_string(), normalize_path(f))),
+                prev_file_results,
+                &changed_set,
+            );
 
             let total_files = files.len();
-            let changed_count = files_to_analyze.len();
-            let reused_count = total_files - changed_count;
+            let reused_count = cached_model_results.len();
+            let changed_count = total_files - reused_count;
 
             debug!(
-                "Detected {} changed file(s) out of {}, reusing {} cached",
+                "Re-analysing {} of {} file(s) with the model, replaying {} cached answer(s)",
                 changed_count, total_files, reused_count
             );
 
@@ -1298,43 +1214,30 @@ async fn analyze_current_repo_incremental(
 
             let normalizer = UrlNormalizer::new(config);
             let service_root = service_scan_root(repo_path, config);
-            let new_file_results = if !files_to_analyze.is_empty() {
-                let result = file_orchestrator
-                    .analyze_files(
-                        &files_to_analyze,
-                        &guidance,
-                        &detection,
-                        &service_root,
-                        Path::new(repo_path),
-                        &packages.declared_dependency_names(),
-                        &graphql_producer_hints,
-                        &graphql_consumer_hints,
-                        &normalizer,
-                    )
-                    .await?;
-                result.file_results
-            } else {
-                HashMap::new()
-            };
+            // Analysis runs over EVERY discovered file, cached or not: the
+            // deterministic layer is re-derived from the AST on every scan and
+            // only the model's answer is replayed. That is what lets a resolver
+            // fix reach this repo without a model call — and it is why there is
+            // no merge with the previous scan's rows below: this run states
+            // them all, and a deleted file simply has no row.
+            let analysis = file_orchestrator
+                .analyze_files(
+                    &files,
+                    &cached_model_results,
+                    &guidance,
+                    &detection,
+                    &service_root,
+                    Path::new(repo_path),
+                    &packages.declared_dependency_names(),
+                    &graphql_producer_hints,
+                    &graphql_consumer_hints,
+                    &normalizer,
+                )
+                .await?;
 
-            // Merge: start with previous, remove deleted files, update changed
-            let mut merged_results: HashMap<
-                String,
-                crate::agents::file_analyzer_agent::FileAnalysisResult,
-            > = HashMap::new();
-
-            // Copy cached results for unchanged files that still exist
-            for (path, result) in prev_file_results {
-                if current_file_set.contains(path) && !changed_set.contains(path) {
-                    merged_results.insert(path.clone(), result.clone());
-                }
-            }
-
-            // Normalize and insert new results
-            let normalized_new = normalize_file_results_keys(&new_file_results, repo_path);
-            for (path, result) in normalized_new {
-                merged_results.insert(path, result);
-            }
+            let merged_results = normalize_file_results_keys(&analysis.file_results, repo_path);
+            let raw_model_results =
+                normalize_file_results_keys(&analysis.raw_model_results, repo_path);
 
             // Rebuild mount graph from full merged results
             let graph_orchestrator = FileOrchestrator::new(agent_service.clone());
@@ -1404,10 +1307,14 @@ async fn analyze_current_repo_incremental(
             attach_external_call_candidates(&mut cloud_data, repo_path, &files, config);
             attach_sdk_surface(&mut cloud_data, repo_path, config);
 
-            // Populate cache fields
-            let mut cached_file_results = merged_results.clone();
-            strip_diagnostic_fields(&mut cached_file_results);
-            cloud_data.file_results = Some(cached_file_results);
+            // Populate cache fields. The cache holds the MODEL's answers, not
+            // the joined rows: see CACHE_VERSION. Nothing is stripped from them
+            // — `candidate_id` is the key the next scan's join reaches the
+            // candidate's span by (`span:LO-HI`, computed against a per-file
+            // SourceMap, so it is stable while the file is), and the client
+            // name and payload locators are the model's contribution to the
+            // row, which a replay has to carry as a cold scan would.
+            cloud_data.file_results = Some(raw_model_results);
             cloud_data.cached_detection = Some(detection.clone());
             cloud_data.cached_guidance = Some(guidance);
             cloud_data.cached_extraction_config = extraction_config.clone();
@@ -4094,12 +4001,13 @@ async fn analyze_current_repo(
         let _ = std::fs::remove_dir_all(stub_dir);
     }
 
-    // 7. Populate cache fields for future incremental runs
-    let mut cached_file_results = analysis_result.file_results.clone();
-    let normalized = normalize_file_results_keys(&cached_file_results, repo_path);
-    cached_file_results = normalized;
-    strip_diagnostic_fields(&mut cached_file_results);
-    cloud_data.file_results = Some(cached_file_results);
+    // 7. Populate cache fields for future incremental runs. The MODEL's raw
+    // answers, verbatim — the same rule the incremental branch caches under
+    // (see CACHE_VERSION).
+    cloud_data.file_results = Some(normalize_file_results_keys(
+        &analysis_result.raw_model_results,
+        repo_path,
+    ));
     cloud_data.cached_detection = Some(analysis_result.framework_detection.clone());
     cloud_data.cached_guidance = Some(analysis_result.framework_guidance.clone());
     cloud_data.cache_version = Some(CACHE_VERSION);
@@ -4957,9 +4865,7 @@ mod tests {
 
     // === Incremental analysis tests ===
 
-    use crate::agents::file_analyzer_agent::{
-        DataCallResult, EndpointResult, FileAnalysisResult, MountResult,
-    };
+    use crate::agents::file_analyzer_agent::{DataCallResult, EndpointResult, FileAnalysisResult};
 
     fn make_file_result(endpoints: Vec<&str>, data_calls: Vec<&str>) -> FileAnalysisResult {
         FileAnalysisResult {
@@ -5262,64 +5168,6 @@ mod tests {
 
         // Key doesn't match prefix, should be kept as-is
         assert!(normalized.contains_key("src/app.ts"));
-    }
-
-    #[test]
-    fn test_strip_diagnostic_fields() {
-        let mut results = HashMap::new();
-        results.insert(
-            "src/app.ts".to_string(),
-            make_file_result(vec!["/api/users"], vec!["/api/posts"]),
-        );
-
-        // Add a mount with pattern_matched
-        results
-            .get_mut("src/app.ts")
-            .unwrap()
-            .mounts
-            .push(MountResult {
-                line_number: 5,
-                parent_node: "app".to_string(),
-                child_node: "router".to_string(),
-                mount_path: "/api".to_string(),
-                import_source: Some("./routes".to_string()),
-                pattern_matched: "app.use('/api', router)".to_string(),
-            });
-
-        strip_diagnostic_fields(&mut results);
-
-        let result = &results["src/app.ts"];
-
-        // Endpoint diagnostic fields should be cleared
-        assert_eq!(result.endpoints[0].candidate_id, "");
-        assert_eq!(result.endpoints[0].pattern_matched, "");
-        assert!(result.endpoints[0].payload_expression_text.is_none());
-        // The response expression text is load-bearing for ReturnValue
-        // endpoints on cached replays (its only fallback locator is an
-        // inexact line anchor) — it must survive the strip.
-        assert_eq!(
-            result.endpoints[0].response_expression_text.as_deref(),
-            Some("res.json(data)")
-        );
-        // Non-diagnostic fields should be preserved
-        assert_eq!(result.endpoints[0].path, "/api/users");
-        assert_eq!(result.endpoints[0].method, "GET");
-        assert_eq!(result.endpoints[0].handler_name, "handler");
-        assert_eq!(result.endpoints[0].line_number, 10);
-
-        // Data call diagnostic fields should be cleared
-        assert_eq!(result.data_calls[0].candidate_id, "");
-        assert_eq!(result.data_calls[0].pattern_matched, "");
-        assert!(result.data_calls[0].call_expression_text.is_none());
-        assert!(result.data_calls[0].payload_expression_text.is_none());
-        // Non-diagnostic fields preserved
-        assert_eq!(result.data_calls[0].target, "/api/posts");
-
-        // Mount diagnostic fields should be cleared
-        assert_eq!(result.mounts[0].pattern_matched, "");
-        // Non-diagnostic fields preserved
-        assert_eq!(result.mounts[0].mount_path, "/api");
-        assert_eq!(result.mounts[0].parent_node, "app");
     }
 
     #[test]
@@ -5820,75 +5668,44 @@ mod tests {
         );
     }
 
+    /// The selection the incremental branch makes: previous run had A, B, C;
+    /// this run discovers A, B, D; `git diff` names B. Only A still holds a
+    /// usable model answer. C is gone, D was never asked about, and B changed —
+    /// each of the other three goes to the model.
+    ///
+    /// Nothing here decides what is ANALYSED: every discovered file is, on
+    /// every scan. This decides only what a scan pays the model for.
     #[test]
-    fn test_file_results_merge_handles_deletes_and_additions() {
-        // Simulate: previous run had files A, B, C
-        // Current run discovers A, B, D (C deleted, D new)
-        // Git diff says B changed
-        let mut prev_results = HashMap::new();
-        prev_results.insert(
+    fn only_unchanged_files_the_previous_scan_answered_replay_their_answer() {
+        let mut previous = HashMap::new();
+        previous.insert(
             "src/a.ts".to_string(),
             make_file_result(vec!["/api/a"], vec![]),
         );
-        prev_results.insert(
+        previous.insert(
             "src/b.ts".to_string(),
             make_file_result(vec!["/api/b"], vec![]),
         );
-        prev_results.insert(
+        previous.insert(
             "src/c.ts".to_string(),
             make_file_result(vec!["/api/c"], vec![]),
         );
 
-        // Current file discovery
-        let current_file_set: HashSet<String> = ["src/a.ts", "src/b.ts", "src/d.ts"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let changed_set: HashSet<String> = ["src/b.ts"].iter().map(|s| s.to_string()).collect();
+        let discovered = ["src/a.ts", "src/b.ts", "src/d.ts"]
+            .into_iter()
+            .map(|relative| (format!("/repo/{relative}"), relative.to_string()));
+        let changed: HashSet<String> = ["src/b.ts".to_string()].into_iter().collect();
 
-        // New results from analyzing changed + new files
-        let mut new_results = HashMap::new();
-        new_results.insert(
-            "src/b.ts".to_string(),
-            make_file_result(vec!["/api/b_v2"], vec![]),
-        );
-        new_results.insert(
-            "src/d.ts".to_string(),
-            make_file_result(vec!["/api/d"], vec![]),
-        );
+        let reusable = reusable_model_answers(discovered, &previous, &changed);
 
-        // Merge logic (mirrors analyze_current_repo_incremental)
-        let mut merged: HashMap<String, FileAnalysisResult> = HashMap::new();
-
-        // Copy cached results for unchanged files that still exist
-        for (path, result) in &prev_results {
-            if current_file_set.contains(path) && !changed_set.contains(path) {
-                merged.insert(path.clone(), result.clone());
-            }
-        }
-
-        // Insert new/changed results
-        for (path, result) in new_results {
-            merged.insert(path, result);
-        }
-
-        // Verify merge result
         assert_eq!(
-            merged.len(),
-            3,
-            "Should have A (cached), B (fresh), D (new)"
+            reusable.keys().collect::<Vec<_>>(),
+            vec!["/repo/src/a.ts"],
+            "only the unchanged, previously-answered file replays"
         );
-        assert!(merged.contains_key("src/a.ts"), "A should be cached");
-        assert!(merged.contains_key("src/b.ts"), "B should be fresh");
-        assert!(merged.contains_key("src/d.ts"), "D should be new");
-        assert!(!merged.contains_key("src/c.ts"), "C should be deleted");
-
-        // A should have old data
-        assert_eq!(merged["src/a.ts"].endpoints[0].path, "/api/a");
-        // B should have new data
-        assert_eq!(merged["src/b.ts"].endpoints[0].path, "/api/b_v2");
-        // D should have new data
-        assert_eq!(merged["src/d.ts"].endpoints[0].path, "/api/d");
+        // Keyed the way the orchestrator keys a file, carrying the previous
+        // scan's answer verbatim.
+        assert_eq!(reusable["/repo/src/a.ts"].endpoints[0].path, "/api/a");
     }
 
     #[test]

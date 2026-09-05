@@ -81,8 +81,16 @@ use tracing::{debug, warn};
 /// Complete result of file-centric analysis
 #[derive(Debug)]
 pub struct FileCentricAnalysisResult {
-    /// Per-file analysis results
+    /// Per-file analysis results: the deterministic rows with the model's
+    /// answer joined onto them, plus every pass that runs over the join. This
+    /// is what the mount graph, the protocol merges and the projection read.
     pub file_results: HashMap<String, FileAnalysisResult>,
+    /// Per-file MODEL answers, exactly as the analyzer returned them — before
+    /// the join and before every pass over it. This is what the incremental
+    /// cache stores, so the deterministic layer can re-run over an unchanged
+    /// file on the next scan instead of replaying rows it would state again
+    /// (see `CACHE_VERSION` in `crate::engine`). Keyed like `file_results`.
+    pub raw_model_results: HashMap<String, FileAnalysisResult>,
     /// Aggregated mount graph
     pub mount_graph: MountGraph,
     /// Processing statistics
@@ -96,7 +104,16 @@ pub struct FileCentricAnalysisResult {
 /// Statistics about the file-centric analysis
 #[derive(Debug, Default)]
 pub struct ProcessingStats {
+    /// Files whose result was folded into the aggregate — whether the model
+    /// was called for them this scan or its previous answer came from the
+    /// cache.
     pub files_processed: usize,
+    /// Files this scan actually sent to the analyzer. The rest of
+    /// `files_processed` replayed a cached model answer.
+    pub files_model_dispatched: usize,
+    /// Files whose model answer came from the incremental cache, so no call
+    /// was made. The deterministic layer still ran over every one of them.
+    pub files_model_reused: usize,
     pub files_skipped: usize,
     /// Files skipped because SWC found no API candidates (zero-cost skips)
     pub files_skipped_no_candidates: usize,
@@ -746,15 +763,25 @@ impl FileOrchestrator {
     ///
     /// # Arguments
     /// * `files` - List of file paths to analyze
+    /// * `cached_model_results` - Model answers already in hand, from a
+    ///   previous scan of files this one did not change
     /// * `guidance` - Framework-specific patterns for detection
     /// * `framework_detection` - Framework detection results (used for type scrubbing)
     ///
     /// # Returns
-    /// A `FileCentricAnalysisResult` containing per-file results and aggregated graph.
+    /// A `FileCentricAnalysisResult` carrying both the joined per-file results
+    /// and the raw model answers the cache stores.
     #[allow(clippy::too_many_arguments)]
     pub async fn analyze_files(
         &self,
         files: &[PathBuf],
+        // The model's answer for files a previous scan already asked about and
+        // this one did not change, keyed exactly as `path_str` below is (the
+        // path as it appears in `files`). A file in this map is not dispatched;
+        // its cached answer is joined onto the rows THIS scan's deterministic
+        // layer states, so a resolver improvement reaches an unchanged file
+        // without a model call. Empty on a cold scan.
+        cached_model_results: &HashMap<String, FileAnalysisResult>,
         guidance: &ProtocolGuidance,
         framework_detection: &DetectionResult,
         // Root for file-based route derivation: the SERVICE directory when
@@ -785,6 +812,11 @@ impl FileOrchestrator {
             .ok_or("missing HTTP guidance: guidance map must contain the http protocol")?;
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
+        // The other half of the split: what the MODEL said, per file, with
+        // nothing folded in. Every insert into `file_results` below has a twin
+        // here, so the cache keys the same file set the analysis did — a file
+        // missing from it is a file the next scan re-reads from the model.
+        let mut raw_model_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         let mut stats = ProcessingStats::default();
         let cm: Lrc<SourceMap> = Default::default();
         let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
@@ -977,8 +1009,10 @@ impl FileOrchestrator {
                 stats.errors.push(format!("Parse failure: {}", path_str));
                 stats.files_skipped += 1;
                 stats.files_parse_failed += 1;
-                // Store empty result so incremental cache knows this file was processed
-                file_results.insert(path_str, FileAnalysisResult::default());
+                // Store empty results so the incremental cache knows this file
+                // was processed and the next scan does not pay to re-ask.
+                file_results.insert(path_str.clone(), FileAnalysisResult::default());
+                raw_model_results.insert(path_str, FileAnalysisResult::default());
                 continue;
             }
 
@@ -1148,7 +1182,11 @@ impl FileOrchestrator {
                         &mut stats.deterministic_rows_emitted,
                     );
                     stats.total_endpoints += result.endpoints.len();
-                    file_results.insert(path_str, result);
+                    file_results.insert(path_str.clone(), result);
+                    // The model was never asked about this file, so its cache
+                    // entry is empty: the routes above are re-derived from the
+                    // file layout on every scan.
+                    raw_model_results.insert(path_str, FileAnalysisResult::default());
                     continue;
                 } else if is_graphql_resolver_file {
                     // Fall through to the LLM pass with empty HTTP candidates:
@@ -1196,7 +1234,8 @@ impl FileOrchestrator {
                     );
                     stats.files_skipped += 1;
                     stats.files_skipped_unrouted_protocol += 1;
-                    file_results.insert(path_str, FileAnalysisResult::default());
+                    file_results.insert(path_str.clone(), FileAnalysisResult::default());
+                    raw_model_results.insert(path_str, FileAnalysisResult::default());
                     continue;
                 }
             }
@@ -1559,8 +1598,10 @@ impl FileOrchestrator {
                 );
                 stats.files_skipped += 1;
                 stats.files_skipped_no_candidates += 1;
-                // Store empty result so incremental cache knows this file was processed
-                file_results.insert(deferred.path_str, FileAnalysisResult::default());
+                // Store empty results so the incremental cache knows this file
+                // was processed and the next scan does not pay to re-ask.
+                file_results.insert(deferred.path_str.clone(), FileAnalysisResult::default());
+                raw_model_results.insert(deferred.path_str, FileAnalysisResult::default());
                 continue;
             }
             debug!(
@@ -1575,7 +1616,8 @@ impl FileOrchestrator {
                     deferred.path_str
                 );
                 stats.files_skipped += 1;
-                file_results.insert(deferred.path_str, FileAnalysisResult::default());
+                file_results.insert(deferred.path_str.clone(), FileAnalysisResult::default());
+                raw_model_results.insert(deferred.path_str, FileAnalysisResult::default());
                 continue;
             };
             let symbols = Self::extract_symbol_table(&deferred.file_path, &cm, &handler);
@@ -1685,14 +1727,31 @@ impl FileOrchestrator {
             .unwrap_or(20)
             .max(1);
 
+        // Files whose model answer is already in hand. The deterministic layer
+        // above ran over them like every other file; only the call is skipped.
+        let (reused, to_dispatch): (Vec<PendingFile>, Vec<PendingFile>) = pending
+            .into_iter()
+            .partition(|pf| cached_model_results.contains_key(&pf.path_str));
+        stats.files_model_reused = reused.len();
+        stats.files_model_dispatched = to_dispatch.len();
+        if !reused.is_empty() {
+            debug!(
+                "Replaying {} cached model answer(s); dispatching {}",
+                reused.len(),
+                to_dispatch.len()
+            );
+        }
+
         // STEP 4: Call the file analyzer with Full File + Patterns + Candidate Targets +
         // richer AST-derived import table (Move 3, §9.3 of framework-coverage.md).
+        //
         // Every file dispatched here is one the index expects an answer for, so
         // the count is registered before the calls go out and each failure is
-        // registered as it happens (#461).
-        crate::scan_health::record_files_attempted(pending.len());
-        let analyzed: Vec<(PendingFile, Result<FileAnalysisResult, String>)> =
-            futures::stream::iter(pending.into_iter().map(|pf| async move {
+        // registered as it happens (#461). A file replaying a cached answer is
+        // not dispatched and so is not attempted.
+        crate::scan_health::record_files_attempted(to_dispatch.len());
+        let dispatched: Vec<(PendingFile, Result<FileAnalysisResult, String>)> =
+            futures::stream::iter(to_dispatch.into_iter().map(|pf| async move {
                 let result = self
                     .file_analyzer
                     .analyze_file_with_candidates(
@@ -1730,12 +1789,37 @@ impl FileOrchestrator {
             .collect()
             .await;
 
+        // A cached answer enters phase 3 as the model's answer, because that is
+        // what it is. Everything downstream — the join, every pass over it, the
+        // raw result the cache keeps — is then identical to a cold scan's.
+        let analyzed: Vec<(PendingFile, Result<FileAnalysisResult, String>)> = reused
+            .into_iter()
+            .map(|pf| {
+                let cached = cached_model_results
+                    .get(&pf.path_str)
+                    .cloned()
+                    .expect("partitioned on this key being present");
+                (pf, Ok(cached))
+            })
+            .chain(dispatched)
+            .collect();
+
         // PHASE 3 (serial): emit the deterministic rows for each file, join
         // the model's answer onto them, and fold the result into the
         // aggregate.
+        //
+        // Files the model never answered for. They are absent from both maps —
+        // absent from the joined one because the file has no analysis this run,
+        // and absent from the cache so the NEXT scan asks again rather than
+        // recording the silence as an answer.
+        let mut unanswered: HashSet<String> = HashSet::new();
         for (pf, result) in analyzed {
             match result {
                 Ok(model) => {
+                    // The cache's half of the split, taken before anything is
+                    // folded in: exactly what the analyzer returned.
+                    raw_model_results.insert(pf.path_str.clone(), model.clone());
+
                     // Note: Type positions are now resolved by the TypeSidecar (src/sidecar)
                     // using the compiler-based approach instead of position-based extraction.
                     //
@@ -1878,6 +1962,7 @@ impl FileOrchestrator {
                         .push(format!("Failed to analyze {}: {}", pf.path_str, e));
                     stats.files_skipped += 1;
                     stats.files_analysis_failed += 1;
+                    unanswered.insert(pf.path_str);
                 }
             }
         }
@@ -1918,8 +2003,28 @@ impl FileOrchestrator {
         );
         stats.total_endpoints += class_controller_added;
 
+        // The pass above keys a controller module that produced no result of
+        // its own, so the two maps can part company here. Give the cache the
+        // same key with an empty answer — the model said nothing about that
+        // file — unless the model was ASKED and failed, in which case the key
+        // must stay absent so the next scan retries it.
+        for path in file_results.keys() {
+            if unanswered.contains(path) {
+                continue;
+            }
+            raw_model_results.entry(path.clone()).or_default();
+        }
+
         debug!("\n=== FILE PROCESSING COMPLETE ===");
-        debug!("  - Files processed (LLM calls): {}", stats.files_processed);
+        debug!("  - Files processed: {}", stats.files_processed);
+        debug!(
+            "  - Files sent to the model: {}",
+            stats.files_model_dispatched
+        );
+        debug!(
+            "  - Files replaying a cached model answer: {}",
+            stats.files_model_reused
+        );
         debug!("  - Files skipped (total): {}", stats.files_skipped);
         debug!(
             "  - Zero-cost skips (no API patterns): {}",
@@ -1972,6 +2077,7 @@ impl FileOrchestrator {
 
         Ok(FileCentricAnalysisResult {
             file_results,
+            raw_model_results,
             mount_graph,
             stats,
             bundled_types: None,

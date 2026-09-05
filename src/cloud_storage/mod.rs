@@ -832,6 +832,7 @@ mod tests {
             framework_guidance: ProtocolGuidance::new(),
             mount_graph: MountGraph::new(),
             file_results: HashMap::new(),
+            raw_model_results: HashMap::new(),
             stats: Default::default(),
         };
 
