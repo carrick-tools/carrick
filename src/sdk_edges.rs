@@ -60,10 +60,14 @@
 //!   this case: `client.transfers().send` names the member the surface
 //!   walks as `transfers.send`, and whether it exists is
 //!   `member_not_found`'s answer.
-//! - `member_not_found` — the SDK repo publishes no such member; also the
-//!   answer for a subpath import (`pkg/edge`), whose entry module is not the
-//!   root one the surface was walked from, and for a peer scanned before
-//!   `sdk_surface` existed.
+//! - `member_not_found` — the SDK repo publishes no such member UNDER THE
+//!   SPECIFIER THIS CALL IMPORTED, and for a peer scanned before `sdk_surface`
+//!   existed. A subpath import (`pkg/edge`) is resolved when the surface says
+//!   that subpath reaches the module the member was walked from
+//!   ([`crate::sdk_surface::SdkMember::subpaths`]) and declined otherwise: the
+//!   two names are one module only when the package's own manifest says so,
+//!   and a peer scanned before subpaths were recorded says it of the root
+//!   alone.
 //! - `no_matching_producer` — the member's span contains no outbound call that
 //!   matched a producer. Three structural causes are worth naming, because
 //!   each is a real shape rather than a bug here. The cross-repo analyzer
@@ -307,19 +311,6 @@ pub fn join(input: &SdkJoinInput, matches: &[CrossRepoMatch]) -> SdkJoin {
                 record(RECEIVER_UNRESOLVED);
                 continue;
             };
-            if candidate.subpath.is_some() {
-                // The surface is walked from the package's ROOT entry module.
-                // A subpath entry publishes a different module, so matching a
-                // subpath receiver against the root surface would be a guess.
-                debug!(
-                    "SDK call to '{}/{}' names a subpath entry, which the published surface does \
-                     not cover",
-                    candidate.package,
-                    candidate.subpath.as_deref().unwrap_or_default()
-                );
-                record(MEMBER_NOT_FOUND);
-                continue;
-            }
             let Some(chain) = member_chain(&candidate.callee) else {
                 record(RECEIVER_UNRESOLVED);
                 continue;
@@ -337,10 +328,33 @@ pub fn join(input: &SdkJoinInput, matches: &[CrossRepoMatch]) -> SdkJoin {
                 record(MEMBER_NOT_FOUND);
                 continue;
             };
-            let Some(member) = surface
+            let specifier = imported_subpath(candidate.subpath.as_deref());
+            let named: Vec<&SdkMember> = surface
                 .iter()
-                .find(|m| m.export == import_symbol && m.chain == chain)
+                .filter(|m| m.export == import_symbol && m.chain == chain)
+                .collect();
+            let Some(member) = named
+                .iter()
+                .copied()
+                .find(|m| publishes_subpath(m, &specifier))
             else {
+                if !named.is_empty() {
+                    // The member exists under a name this consumer did not
+                    // write. Saying so keeps a wrong subpath diagnosable from
+                    // a member that is simply absent.
+                    debug!(
+                        "'{}' publishes '{}' on export '{}', but under {:?} rather than the '{}' \
+                         this call imported",
+                        peer.service_id,
+                        chain,
+                        import_symbol,
+                        named
+                            .iter()
+                            .flat_map(|m| m.subpaths.iter())
+                            .collect::<Vec<_>>(),
+                        specifier
+                    );
+                }
                 record(MEMBER_NOT_FOUND);
                 continue;
             };
@@ -541,6 +555,35 @@ fn member_chain(callee: &str) -> Option<String> {
     Some(chain.join("."))
 }
 
+/// The `exports` key a consumer's import specifier names, as the publishing
+/// manifest spells it.
+///
+/// A candidate records what followed the package name (`v3` for `pkg/v3`) and
+/// nothing for a bare import; a manifest writes the same two things as `./v3`
+/// and `.`. This is the only translation between them, and it is spelling
+/// only — no subpath is resolved or invented here.
+fn imported_subpath(subpath: Option<&str>) -> String {
+    match subpath {
+        Some(sub) => format!("./{}", sub.trim_start_matches("./")),
+        None => ".".to_string(),
+    }
+}
+
+/// Whether the package publishes this member under the specifier the consumer
+/// wrote.
+///
+/// An EMPTY list is a surface walked before subpaths were recorded, when the
+/// root entry was the only module walked. Reading it as root-only keeps such a
+/// peer's members joinable by a bare import and declines its subpath imports,
+/// which is exactly the behaviour that surface was produced under — never
+/// "publishes everything" (carrick#656).
+fn publishes_subpath(member: &SdkMember, specifier: &str) -> bool {
+    match member.subpaths.as_slice() {
+        [] => specifier == ".",
+        declared => declared.iter().any(|sub| sub == specifier),
+    }
+}
+
 /// Every span the SDK's own outbound call for `member` may sit in: the member
 /// itself, and the same-repo methods it delegates to. A layered client writes
 /// its route one hop below the published method.
@@ -646,6 +689,7 @@ mod tests {
             line: 28,
             end_line: 33,
             delegates: vec![],
+            subpaths: vec![".".to_string()],
         }]);
         let mut graph = MountGraph::new();
         graph.data_calls = vec![DataFetchingCall {
@@ -769,6 +813,7 @@ mod tests {
                 line: 2,
                 end_line: 7,
             }],
+            subpaths: vec![".".to_string()],
         }]);
         let mut graph = MountGraph::new();
         graph.data_calls = vec![DataFetchingCall {
@@ -954,15 +999,112 @@ mod tests {
         );
     }
 
-    /// A subpath entry publishes a different module from the root one the
-    /// surface was walked from, so matching it against the root surface would
-    /// be a guess.
+    /// A subpath the surface does not name reaches a different module, so
+    /// matching it against the members published elsewhere would be a guess.
     #[test]
-    fn a_subpath_import_is_not_matched_against_the_root_surface() {
+    fn a_subpath_the_surface_does_not_publish_is_not_matched() {
         let mut row = candidate("ledger.payments.create");
         row.subpath = Some("edge".to_string());
         let joined = run(
             &[producer(), sdk_repo()],
+            &[consumer_with(row)],
+            &[sdk_to_producer_match()],
+        );
+        assert!(joined.edges().is_empty());
+        assert_eq!(
+            reasons(&joined),
+            vec![(SDK_PACKAGE.to_string(), MEMBER_NOT_FOUND.to_string(), 1)]
+        );
+    }
+
+    /// The SDK repo as a scanner that records subpaths writes it: the member
+    /// is published under the root AND under `./v3`, which is one module the
+    /// manifest gives two names.
+    ///
+    /// Built from JSON rather than the struct on purpose — this is the row a
+    /// peer downloads, and a scanner that records no subpaths deserializes it
+    /// as a root-only member, which is what makes the test below fail there
+    /// rather than fail to compile.
+    fn sdk_repo_publishing_a_subpath() -> CloudRepoData {
+        let mut data = sdk_repo();
+        data.sdk_surface = Some(vec![
+            serde_json::from_value(serde_json::json!({
+                "export": "default",
+                "chain": "payments.create",
+                "file": "src/resources/payments.ts",
+                "line": 28,
+                "end_line": 33,
+                "delegates": [],
+                "subpaths": [".", "./v3"],
+            }))
+            .expect("member deserializes"),
+        ]);
+        data
+    }
+
+    /// The reference shape this channel was missing: every consumer call site
+    /// imports `pkg/v3`, the package's manifest says `./v3` and `.` are one
+    /// module, and the edge is the same edge a root import produces
+    /// (carrick#656).
+    #[test]
+    fn a_subpath_the_surface_publishes_resolves_to_the_producer() {
+        let mut row = candidate("ledger.payments.create");
+        row.subpath = Some("v3".to_string());
+        let joined = run(
+            &[producer(), sdk_repo_publishing_a_subpath()],
+            &[consumer_with(row)],
+            &[sdk_to_producer_match()],
+        );
+
+        assert_eq!(joined.edges().len(), 1, "{:?}", joined);
+        let edge = &joined.edges()[0];
+        assert_eq!(edge.consumer_repo, "checkout");
+        assert_eq!(edge.sdk_member, "payments.create");
+        assert_eq!(edge.producer_key, PRODUCER_KEY);
+        assert!(joined.unresolved().is_empty());
+    }
+
+    /// A member the surface publishes under a subpath ALONE is not reachable
+    /// by importing the package root. The decline is symmetric: what the
+    /// manifest does not say, the join does not assume in either direction.
+    #[test]
+    fn a_root_import_does_not_reach_a_subpath_only_member() {
+        let mut sdk = sdk_repo_publishing_a_subpath();
+        if let Some(members) = sdk.sdk_surface.as_mut() {
+            members[0].subpaths = vec!["./v3".to_string()];
+        }
+        let joined = run(
+            &[producer(), sdk],
+            &[consumer_with(candidate("ledger.payments.create"))],
+            &[sdk_to_producer_match()],
+        );
+        assert!(joined.edges().is_empty());
+        assert_eq!(
+            reasons(&joined),
+            vec![(SDK_PACKAGE.to_string(), MEMBER_NOT_FOUND.to_string(), 1)]
+        );
+    }
+
+    /// A surface written before subpaths were recorded carries none, and that
+    /// is read as root-only — exactly what such a surface was. A bare import
+    /// of it still resolves; a subpath import of it still does not.
+    #[test]
+    fn a_surface_without_subpaths_is_read_as_root_only() {
+        let mut sdk = sdk_repo();
+        if let Some(members) = sdk.sdk_surface.as_mut() {
+            members[0].subpaths.clear();
+        }
+        let joined = run(
+            &[producer(), sdk.clone()],
+            &[consumer_with(candidate("ledger.payments.create"))],
+            &[sdk_to_producer_match()],
+        );
+        assert_eq!(joined.edges().len(), 1, "a bare import still resolves");
+
+        let mut row = candidate("ledger.payments.create");
+        row.subpath = Some("v3".to_string());
+        let joined = run(
+            &[producer(), sdk],
             &[consumer_with(row)],
             &[sdk_to_producer_match()],
         );
