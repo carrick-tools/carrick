@@ -56,10 +56,22 @@ mod type_compat_v2;
 /// on its next push with zero model calls, and none of them bumps this
 /// constant.
 ///
-/// What DOES bump it: a change to the analyze-file prompt, to the response
-/// schema, or to the rule by which the model's answer is joined onto the
-/// deterministic rows. Those three decide what a cached answer means, so a
-/// cache written under the old one has to be discarded.
+/// What DOES bump it: a change to the analyze-file prompt or to the response
+/// schema. Those two decide what a cached answer IS, so a cache written under
+/// the old one has to be discarded.
+///
+/// A change to how the deterministic layer FOLDS that answer onto its own rows
+/// — which side's field wins at a span, what a kept prefix has to look like —
+/// does not (carrick#697). The cache holds the answer, never the join, and the
+/// join re-runs over the cached answer on every scan, so a corrected fold
+/// reaches an already-indexed repo on its next push with zero model calls, the
+/// same property that lets a resolver fix land without a bump.
+///
+/// The one join change that DOES bump is one that changes what the answer has
+/// to carry to join at all — the `candidate_id` the prompt's hints hand the
+/// model, which is the key every fold is looked up by. That is a prompt change,
+/// and it bumps under the clause above. carrick#693 tracks the fact that none
+/// of this is enforceable from inside this repo.
 ///
 /// Invalidation is keyed by repo-relative path: a file goes back to the model
 /// when `git diff` against the previous scan's commit names it, or when the

@@ -57,10 +57,31 @@ fn call_at_line(calls: &[serde_json::Value], line: i64) -> &serde_json::Value {
     matches[0]
 }
 
+fn call_at<'a>(calls: &'a [serde_json::Value], file: &str, line: i64) -> &'a serde_json::Value {
+    let matches: Vec<&serde_json::Value> = calls
+        .iter()
+        .filter(|call| call["file"] == file && call["line"].as_i64() == Some(line))
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one call row at {file}:{line}, got {matches:#?}"
+    );
+    matches[0]
+}
+
 #[test]
 fn a_new_url_target_carries_the_path_its_first_argument_states() {
     let calls = calls();
-    assert_eq!(calls.len(), 4, "one row per request site: {calls:#?}");
+    let catalogue: Vec<&serde_json::Value> = calls
+        .iter()
+        .filter(|call| call["file"] == "src/catalogue.ts")
+        .collect();
+    assert_eq!(
+        catalogue.len(),
+        4,
+        "one row per request site in the catalogue client: {catalogue:#?}"
+    );
 
     // Direct form: the URL object is the request's own argument. No base, so
     // the call matches by route path like any other host-free call.
@@ -101,4 +122,62 @@ fn the_decoy_call_is_left_exactly_as_it_was_written() {
             "nothing in this package calls the retired version of the route: {call:#?}"
         );
     }
+}
+
+/// carrick#697: the base argument of a `new URL(path, base)` is opaque, so a
+/// base the model reports in front of the path it states is a paraphrase of
+/// that opaque argument, not a reading of the source. Keeping it keys the row
+/// on a base no route lookup can reach.
+///
+/// The one prefix the model can only have READ is a literal absolute origin,
+/// which is also the one that classifies the call as external. That one is
+/// kept; everything else is discarded and the stated path wins.
+#[test]
+fn a_new_url_row_is_keyed_on_the_path_its_source_states_not_the_models_prefix() {
+    let calls = calls();
+    let file = "src/checkpoints.ts";
+
+    // The model invented an `${API_URL}` alias for the opaque base. Kept, it
+    // keys the row on an undeclared env-var base, and the call disappears from
+    // every route-path lookup.
+    let suspend = call_at(&calls, file, 15);
+    assert_eq!(suspend["method"], "POST");
+    assert_eq!(
+        suspend["target_url"],
+        "/api/v1/runs/${runFriendlyId}/snapshots/${snapshotFriendlyId}/suspend"
+    );
+    assert_eq!(
+        suspend["path"],
+        "/api/v1/runs/:runFriendlyId/snapshots/:snapshotFriendlyId/suspend"
+    );
+    assert_eq!(
+        suspend["key"],
+        "http|POST|/api/v1/runs/:runFriendlyId/snapshots/:snapshotFriendlyId/suspend"
+    );
+    assert_eq!(
+        suspend["base"]["kind"], "relative",
+        "the row is host-free, not sitting behind an env-var base: {suspend:#?}"
+    );
+
+    // The model spelled the receiver back as the base. Same rule: the source
+    // states the path, and nothing else.
+    let continue_run = call_at(&calls, file, 30);
+    assert_eq!(continue_run["method"], "POST");
+    assert_eq!(
+        continue_run["target_url"],
+        "/api/v1/runs/${runFriendlyId}/snapshots/${snapshotFriendlyId}/continue"
+    );
+    assert_eq!(
+        continue_run["key"],
+        "http|POST|/api/v1/runs/:runFriendlyId/snapshots/:snapshotFriendlyId/continue"
+    );
+
+    // A literal absolute origin is the carve-out: the model read a host the
+    // source does not state, and the origin is the classification.
+    let complete = call_at(&calls, file, 46);
+    assert_eq!(complete["method"], "POST");
+    assert_eq!(
+        complete["target_url"],
+        "https://api.example.test/api/v1/runs/${runFriendlyId}/attempts/${attemptFriendlyId}/complete"
+    );
 }

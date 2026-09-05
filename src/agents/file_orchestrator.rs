@@ -347,6 +347,34 @@ fn is_transport_shaped_target(target: &str) -> bool {
         || t.starts_with("ENV_VAR:")
 }
 
+/// Is `prefix` a literal absolute http(s) origin — `https://host`, with an
+/// optional `:port` — and nothing else?
+///
+/// An allowlist, deliberately, not a `contains("${")` denylist: the question
+/// is whether the model can only have READ this prefix off the source, and
+/// anything that is not a spelled-out origin (an interpolation, a bare
+/// identifier, a `process.env` read, a path) fails that test whether or not it
+/// is a shape anyone has seen yet.
+fn is_literal_http_origin(prefix: &str) -> bool {
+    let Some(authority) = prefix
+        .strip_prefix("https://")
+        .or_else(|| prefix.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    let host_is_literal = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+    let port_is_literal =
+        port.is_none_or(|port| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()));
+    host_is_literal && port_is_literal
+}
+
 /// Whole-word substring test: `word` appears in `haystack` bounded by
 /// non-identifier characters, so `TICKET_QUERY` matches the call text but does
 /// not match inside `TICKET_QUERY_V2`.
@@ -739,7 +767,7 @@ impl ResolutionSource {
     }
 
     /// Whether a model target that already CARRIES what this source states,
-    /// behind a base the model read for itself, is kept.
+    /// behind `prefix`, keeps that prefix.
     ///
     /// A client built with a configured `baseURL` reports
     /// `${API_URL}/v1/login` for a spec that states `/v1/login`: the same path
@@ -748,8 +776,23 @@ impl ResolutionSource {
     /// The sources that resolve a URL out of a BINDING have no such escape
     /// hatch — there the model's target is a paraphrase of the same binding,
     /// and the binding is the better witness.
-    fn keeps_a_baked_prefix(self) -> bool {
-        matches!(self, Self::RequestSpec | Self::NewUrl)
+    ///
+    /// `new URL(path, base)` sits between the two (carrick#697). The base
+    /// argument is opaque — a field, a parameter, an options member — and the
+    /// path alone is what the site states, so a prefix the model puts in front
+    /// of it is a paraphrase of that opaque argument: an invented `${API_URL}`
+    /// alias, or the receiver spelled back as `${this.opts.apiUrl}`. Kept, an
+    /// invented alias keys the row on an undeclared env-var base that no
+    /// route-path lookup can reach, and the call vanishes from the index. The
+    /// one prefix the model can only have READ rather than paraphrased is a
+    /// literal absolute origin, which is also the one that classifies the call
+    /// as external; that one is kept and every other is discarded.
+    fn keeps_a_baked_prefix(self, prefix: &str) -> bool {
+        match self {
+            Self::RequestSpec => true,
+            Self::NewUrl => prefix.is_empty() || is_literal_http_origin(prefix),
+            _ => false,
+        }
     }
 }
 
@@ -5144,7 +5187,9 @@ impl FileOrchestrator {
             row.target = model_target;
         } else {
             let reported = normalize_path_params(model_target.trim());
-            if source.keeps_a_baked_prefix() && Self::target_carries_url(&reported, stated_target) {
+            let keeps_the_prefix = Self::target_carries_url(&reported, stated_target)
+                .is_some_and(|prefix| source.keeps_a_baked_prefix(prefix));
+            if keeps_the_prefix {
                 row.target = reported;
             } else {
                 if reported != stated_target {
@@ -5241,10 +5286,14 @@ impl FileOrchestrator {
     /// its tail behind a base (`${API_URL}/v1/things`)? The tail must start at
     /// a segment boundary, so `/things` does not "carry" `/other-things`.
     /// Both arguments are expected in the router param spelling.
-    fn target_carries_url(target: &str, url: &str) -> bool {
+    ///
+    /// Returns what sits IN FRONT of `url` when it does — empty when the two
+    /// are the same string — so the caller can judge the prefix rather than
+    /// only its existence. `None` means the target does not state `url` at all.
+    fn target_carries_url<'a>(target: &'a str, url: &str) -> Option<&'a str> {
         match target.trim().strip_suffix(url) {
-            Some(prefix) => prefix.is_empty() || !prefix.ends_with('/'),
-            None => false,
+            Some(prefix) if prefix.is_empty() || !prefix.ends_with('/') => Some(prefix),
+            _ => None,
         }
     }
 
@@ -14386,5 +14435,116 @@ export function run(evt: object, label: string, tail: string): void {
             !template_pattern_matches(&middle_interp, "jobs.email.retry.3"),
             "the last quasi anchors as a suffix"
         );
+    }
+
+    /// carrick#697: what a `new URL(path, base)` row ends up keyed on when
+    /// the model reports the same path behind a prefix.
+    ///
+    /// The base argument is opaque, so only a prefix the model can only have
+    /// READ — a literal absolute origin — survives. A paraphrase of the
+    /// receiver, whatever its spelling, is discarded and the stated path wins,
+    /// counted as the contradiction it is.
+    #[test]
+    fn a_new_url_row_keeps_only_a_literal_origin_in_front_of_its_stated_path() {
+        let stated = "/api/v1/runs/${runId}/suspend";
+        let settle = |source: ResolutionSource, model_target: &str| {
+            let mut row = call_with_span(30, "", Some(200));
+            let mut stats = ProcessingStats::default();
+            FileOrchestrator::settle_target_and_method(
+                &mut row,
+                source,
+                Some("POST"),
+                stated,
+                model_target.to_string(),
+                Some("POST".to_string()),
+                "src/checkpointClient.ts",
+                &mut stats,
+            );
+            (row.target, stats.model_contradictions_discarded)
+        };
+
+        // An invented env-var alias for the opaque base. Kept, this keys the
+        // row on a base no route-path lookup can reach.
+        assert_eq!(
+            settle(ResolutionSource::NewUrl, &format!("${{API_URL}}{stated}")),
+            (stated.to_string(), 1)
+        );
+
+        // The receiver spelled back as the base — the same paraphrase in a
+        // different costume.
+        assert_eq!(
+            settle(
+                ResolutionSource::NewUrl,
+                &format!("${{this.opts.apiUrl}}{stated}")
+            ),
+            (stated.to_string(), 1)
+        );
+
+        // A bare identifier. Not an interpolation, still not something the
+        // source states.
+        assert_eq!(
+            settle(ResolutionSource::NewUrl, &format!("apiBase{stated}")),
+            (stated.to_string(), 1)
+        );
+
+        // A literal absolute origin: read, not paraphrased, and the origin is
+        // the classification.
+        let external = format!("https://api.example.test{stated}");
+        assert_eq!(
+            settle(ResolutionSource::NewUrl, &external),
+            (external.clone(), 0)
+        );
+        let with_port = format!("http://api.example.test:8443{stated}");
+        assert_eq!(settle(ResolutionSource::NewUrl, &with_port), (with_port, 0));
+
+        // The model reported the path and nothing else, or reported nothing:
+        // the stated path stands either way.
+        assert_eq!(
+            settle(ResolutionSource::NewUrl, stated),
+            (stated.to_string(), 0)
+        );
+        assert_eq!(
+            settle(ResolutionSource::NewUrl, ""),
+            (stated.to_string(), 1)
+        );
+
+        // A configured-baseURL client legitimately carries its base, so the
+        // request-spec source is untouched by this rule.
+        let baked = format!("${{API_URL}}{stated}");
+        assert_eq!(settle(ResolutionSource::RequestSpec, &baked), (baked, 0));
+
+        // And a source with no escape hatch at all still loses its prefix.
+        assert_eq!(
+            settle(
+                ResolutionSource::ImportedMember,
+                &format!("https://api.example.test{stated}")
+            ),
+            (stated.to_string(), 1)
+        );
+    }
+
+    /// The origin test is an allowlist: a spelled-out `http(s)://host[:port]`
+    /// and nothing else qualifies.
+    #[test]
+    fn literal_http_origin_admits_only_a_spelled_out_origin() {
+        assert!(is_literal_http_origin("https://api.example.test"));
+        assert!(is_literal_http_origin("http://localhost:30303"));
+        assert!(is_literal_http_origin("https://api.example.test:8443"));
+
+        // Interpolations, in every spelling the model reaches for.
+        assert!(!is_literal_http_origin("${API_URL}"));
+        assert!(!is_literal_http_origin("${this.opts.apiUrl}"));
+        assert!(!is_literal_http_origin("https://${HOST}"));
+        assert!(!is_literal_http_origin("${API_URL}/v1"));
+
+        // Identifiers, env reads, and a bare host with no scheme.
+        assert!(!is_literal_http_origin("apiBase"));
+        assert!(!is_literal_http_origin("process.env.API_URL"));
+        assert!(!is_literal_http_origin("api.example.test"));
+
+        // A scheme with something after the authority, or a junk port.
+        assert!(!is_literal_http_origin("https://api.example.test/v1"));
+        assert!(!is_literal_http_origin("https://api.example.test:port"));
+        assert!(!is_literal_http_origin("https://"));
     }
 }

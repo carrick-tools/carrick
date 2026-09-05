@@ -1,6 +1,6 @@
 # `new-url-target`
 
-Fixture for carrick#610: a request whose target is built as
+Fixture for carrick#610 and carrick#697: a request whose target is built as
 `new URL(path, base)`, where the path literal is the constructor's first
 argument and the base is opaque.
 
@@ -35,6 +35,27 @@ base is a field here, and asserting a host the source does not state is the
 defect this fixture exists for. A host-free call matches by route path, which
 is what every other baseless call in the index does.
 
+## The second client: what the model puts in FRONT of the path
+
+`src/checkpoints.ts` is carrick#697. Three requests of one shape — a
+`new URL(path, base)` whose base is an options member the constructor took,
+written across several lines with the verb on the options bag — and three
+different prefixes in the cassette's answer for them.
+
+| site | the model reports | truth |
+|---|---|---|
+| `checkpoints.ts:15` | `${API_URL}/api/v1/runs/…/suspend` | `POST /api/v1/runs/${runFriendlyId}/snapshots/${snapshotFriendlyId}/suspend`, keyed `/api/v1/runs/:runFriendlyId/snapshots/:snapshotFriendlyId/suspend` |
+| `checkpoints.ts:30` | `${this.opts.apiUrl}/api/v1/runs/…/continue` | `POST /api/v1/runs/${runFriendlyId}/snapshots/${snapshotFriendlyId}/continue`, keyed the same way |
+| `checkpoints.ts:46` | `https://api.example.test/api/v1/runs/…/complete` | kept exactly as reported, origin and all |
+
+The base argument is opaque, so the path is the only thing these sites state
+about the route. The first two prefixes are paraphrases of that opaque
+argument: one invents an env-var alias for it, one spells the receiver back.
+Keeping either keys the row on a base no route-path lookup can reach, and the
+call disappears from the index. The third is the one prefix the model can only
+have READ rather than paraphrased, and the origin is what classifies the call,
+so it survives.
+
 ## The cassette
 
 `__llm__/analyze-file/catalogue.json` holds the answer the deployed index
@@ -49,3 +70,10 @@ model behaviour is being measured.
 
 Line numbers in the cassette's `@line:` placeholders reference exact source
 lines in `src/catalogue.ts`. Re-count them after any edit to that file.
+
+`__llm__/analyze-file/checkpoints.json` freezes the three prefixes above. The
+first two are the shapes a deployed index recorded for this constructor;
+the third is authored, because a literal origin over an opaque base is the
+carve-out the rule has to keep and no scan happened to produce one. Its
+`@line:` placeholders reference `src/checkpoints.ts`; re-count them after any
+edit to that file too.
