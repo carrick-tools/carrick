@@ -1,0 +1,45 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:15",
+      "line_number": 15,
+      "target": "${API_URL}/api/v1/runs/${runFriendlyId}/snapshots/${snapshotFriendlyId}/suspend",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(new URL(`/api/v1/runs/${runFriendlyId}/snapshots/${snapshotFriendlyId}/suspend`, this.opts.apiUrl), { method: \"POST\", ... })",
+      "call_expression_line": 15,
+      "payload_expression_text": "JSON.stringify({ type: this.opts.orchestrator })",
+      "payload_expression_line": 23,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:30",
+      "line_number": 30,
+      "target": "${this.opts.apiUrl}/api/v1/runs/${runFriendlyId}/snapshots/${snapshotFriendlyId}/continue",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(new URL(`/api/v1/runs/${runFriendlyId}/snapshots/${snapshotFriendlyId}/continue`, this.opts.apiUrl), { method: \"POST\", ... })",
+      "call_expression_line": 30,
+      "payload_expression_text": "JSON.stringify({ type: this.opts.orchestrator })",
+      "payload_expression_line": 38,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:46",
+      "line_number": 46,
+      "target": "https://api.example.test/api/v1/runs/${runFriendlyId}/attempts/${attemptFriendlyId}/complete",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(new URL(`/api/v1/runs/${runFriendlyId}/attempts/${attemptFriendlyId}/complete`, this.opts.apiUrl), { method: \"POST\", ... })",
+      "call_expression_line": 46,
+      "payload_expression_text": "JSON.stringify({ type: this.opts.orchestrator })",
+      "payload_expression_line": 54,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}
