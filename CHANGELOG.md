@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.38](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.37...carrick-v0.3.38) (2026-09-05)
+
+
+### Features
+
+* **scanner:** index in-process event bus contracts as pub/sub rows ([#687](https://github.com/carrick-tools/carrick/issues/687)) ([84216dc](https://github.com/carrick-tools/carrick/commit/84216dce3bda5bc0acda3adebc3ae0bdd6e6de27))
+
+
+### Bug Fixes
+
+* **scan_health:** give each test its own counters ([#685](https://github.com/carrick-tools/carrick/issues/685)) ([e051db3](https://github.com/carrick-tools/carrick/commit/e051db3280aed9162853836f5483a7ea5aacb8f8)), closes [#683](https://github.com/carrick-tools/carrick/issues/683)
+
+
+### Documentation
+
+* add Carrick section to CLAUDE.md ([#684](https://github.com/carrick-tools/carrick/issues/684)) ([01e3484](https://github.com/carrick-tools/carrick/commit/01e34844681c4e9882f4fa80e53b087748527a0d))
+
 ## [0.3.37](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.36...carrick-v0.3.37) (2026-09-05)
 
 
