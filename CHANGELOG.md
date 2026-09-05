@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.40](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.39...carrick-v0.3.40) (2026-09-05)
+
+
+### Bug Fixes
+
+* **scanner:** key a new URL call on its stated path, not the model's prefix ([#699](https://github.com/carrick-tools/carrick/issues/699)) ([bc80ef5](https://github.com/carrick-tools/carrick/commit/bc80ef5b85f9d7794d961364b75e03e987b0a8af))
+
 ## [0.3.39](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.38...carrick-v0.3.39) (2026-09-05)
 
 
