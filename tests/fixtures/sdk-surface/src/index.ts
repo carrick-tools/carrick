@@ -54,3 +54,10 @@ const settings = {
 function voidCharge(id: string) {
   return fetch(`/v1/charges/${id}/void`, { method: "POST" });
 }
+
+// A group published under one name: consumers write `vaults.list(...)`, and
+// the module behind the name is reached only through this re-export. Kept at
+// the end of the file so the line numbers above stay put.
+export * as vaults from "./vaults.js";
+// The same form in front of a barrel of classes.
+export * as archive from "./archive/index.js";

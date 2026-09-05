@@ -6362,6 +6362,32 @@ mod tests {
         );
     }
 
+    /// carrick#679: a call through a name the entry publishes with `export *
+    /// as vaults from "./vaults.js"`. The receiver is a namespace one hop
+    /// away, so nothing in the calling file imports the module that declares
+    /// the function — `refresh` had no edge at all until the export table
+    /// carried the form.
+    #[test]
+    fn discovery_resolves_a_call_through_a_namespace_reexport() {
+        let repo = format!("{}/tests/fixtures/sdk-surface", env!("CARGO_MANIFEST_DIR"));
+        let cm: Lrc<SourceMap> = Default::default();
+
+        let (_files, _imports, definitions, _repo_name) =
+            discover_files_and_symbols(&repo, &Config::default(), cm).unwrap();
+
+        let refresh = definitions.get("refresh").expect("refresh indexed");
+        let list = refresh
+            .calls
+            .iter()
+            .find(|c| c.name == "list")
+            .unwrap_or_else(|| panic!("no `list` edge, got {:?}", refresh.calls));
+        assert!(
+            list.file_path.ends_with("src/vaults.ts"),
+            "the edge must point at the module the namespace names, got {}",
+            list.file_path
+        );
+    }
+
     /// The re-keying #582 introduced happens inside discovery, so the file
     /// qualifier has to be repo-RELATIVE on the real path shapes discovery
     /// sees: `repo_path` as the caller typed it (here a temp dir, which is a
