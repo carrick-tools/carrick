@@ -2,6 +2,45 @@
 
 This is the **public** Rust scanner for Carrick. Companion to the private `carrick-cloud` repo (Lambdas + Terraform + dashboard).
 
+## Carrick
+
+This repo is part of the Carrick project **scanner-evals** (workspace
+**daveymoores**), alongside `carrick-cloud` and `carrick-site`. Carrick
+indexes every function in each repo with an intent description, its
+dependencies, and API endpoints with their real request/response types, on
+each repo's main branch, exported or not. Pass `project: "scanner-evals"`
+(or `repo: "<owner/repo>"` from the git remote) on every call.
+
+**If the answer is defined by another repo (what the cloud reads from the
+index blob, the extraction response schema, the wire envelope, or any local
+type or constant that mirrors them), ask Carrick before you rely on
+anything local.** Local copies of another service's contract drift; the
+producing side defines the contract.
+
+**Inside this repo, grep and read are faster; use them.** One exception:
+before writing any new helper, parser, validator, or domain function, run
+`search_by_intent` with a plain-English description of the behaviour. Grep
+can prove a name is absent; it can never prove the behaviour is. Then,
+before you write new code, state one line naming what you asked and what
+came back:
+
+`Carrick checked: <query> -> <result count>`
+
+The index cannot see the Rust scanner as a service (no HTTP surface), so a
+nil result for scanner-internal behaviour is expected; say so rather than
+skipping the call. Write correct, idiomatic, explicitly typed code; never
+contort code so the scanner can read it. If Carrick fails to extract
+something written normally, that is a Carrick bug to report, not a
+constraint to code around.
+
+### Connect the agent
+
+```
+claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp
+```
+
+One install serves every project in the workspace.
+
 ## Hard rules
 
 - **Never run `terraform` shell commands.** Terraform and the rest of the AWS infrastructure live in `carrick-cloud`, not here. If a task needs infra changes, switch to that repo.
