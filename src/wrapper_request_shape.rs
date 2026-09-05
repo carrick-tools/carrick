@@ -246,6 +246,16 @@ fn body_presence(call: &CallExpr, options: Option<(usize, &ObjectLit)>) -> Optio
         if prop_value(obj, "body").is_some() || prop_value(obj, "data").is_some() {
             return Some(true);
         }
+        // Another object literal beside the bag is a payload or a parameter
+        // record this does not model — `client.post(url, payload, config)` and
+        // a paginating helper's page bag are the same argument list from here
+        // (carrick#675). Neither is asserted: a wrong `Some(false)` would
+        // delete a real payload anchor.
+        if call.args.iter().enumerate().any(|(other, arg)| {
+            other != index && arg.spread.is_none() && matches!(&*arg.expr, Expr::Object(_))
+        }) {
+            return None;
+        }
         // A third argument beside the URL and the options bag is a payload this
         // does not model; only the plain `(url, options)` shape settles it.
         if positional <= index + 1 {
@@ -489,6 +499,33 @@ export async function list() {
                 r#"export async function go() { return fetch(URL, { method: "SUBSCRIBE" }); }"#,
             ),
             None
+        );
+    }
+
+    /// A verb-spelled call whose payload and whose config are BOTH object
+    /// literals: `client.post(url, payload, config)`.
+    ///
+    /// The bag used to be found only when it was the call's sole literal, so
+    /// this shape reached `body_presence` with no bag at all and was read as
+    /// carrying a body from its argument count. Now the config IS the bag,
+    /// and the payload beside it is unmodelled — which must read as unknown,
+    /// never as `Some(false)`: a definite no-body is the one value downstream
+    /// acts on, and it would delete this site's payload anchor.
+    #[test]
+    fn a_payload_beside_the_options_bag_leaves_the_body_unknown() {
+        let shape = module_shape(
+            r#"
+export async function create(payload: unknown) {
+  return client.post(`${BASE}/things`, { name: payload }, { headers: {} });
+}
+"#,
+        );
+        assert_eq!(
+            shape,
+            Some(WrapperRequestShape {
+                method: "POST".to_string(),
+                has_body: None,
+            })
         );
     }
 
