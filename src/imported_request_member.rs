@@ -47,9 +47,13 @@
 //! - Its body must contain exactly ONE request. Two, and a site could be
 //!   reaching either, so the member is dropped.
 //! - A request is recognised structurally, the same test the rest of the
-//!   scanner uses: an HTTP-verb callee property, or a sole object-literal
+//!   scanner uses: an HTTP-verb callee property, or one object-literal
 //!   argument carrying at least one of `method` / `headers` / `body` / `data`.
-//!   No client library, framework or helper name appears anywhere here.
+//!   The bag may sit at any position and beside any number of other
+//!   arguments — a paginating transport takes a page bag as well
+//!   (carrick#675) — but two literals that each carry one of those keys leave
+//!   which is the bag a guess, and the member is dropped. No client library,
+//!   framework or helper name appears anywhere here.
 //! - The URL is the request's sole route-shaped string or template argument,
 //!   at whatever position it sits, or the path a `new URL(<literal>, base)`
 //!   declared in the same function supplies to it (`url.href`, `url.toString()`
@@ -128,7 +132,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 use crate::new_url_target::UrlBindings;
 use crate::type_manifest::{is_http_method, normalize_manifest_method};
 use crate::wrapper_request_shape::{
-    is_request_options, literal_string, prop_value, sole_object_literal, verb_from_callee_property,
+    literal_string, prop_value, request_options_argument, verb_from_callee_property,
 };
 
 /// The request one member issues, read off its body.
@@ -435,7 +439,7 @@ impl MemberCollector<'_> {
     /// itself and neither depends on `params`.
     fn member_request(&self, call: &CallExpr, params: &[String]) -> Option<RequestMember> {
         let verb = verb_from_callee_property(callee_property(call).as_deref());
-        let options = sole_object_literal(call).filter(|(_, obj)| is_request_options(obj));
+        let options = request_options_argument(call);
         if verb.is_none() && options.is_none() {
             return None;
         }
@@ -929,6 +933,60 @@ mod tests {
         assert!(
             !members.contains_key("writeThing"),
             "a body with no method is a wrapper injecting the verb, not a default GET"
+        );
+    }
+
+    /// carrick#675: the member's request goes through a PAGINATING transport,
+    /// which takes a page bag as well as a request-options bag.
+    ///
+    /// Two object literals in one call used to read as no request at all, so a
+    /// client's list endpoints had no member and no consumer row, while the
+    /// same client's unpaginated methods resolved theirs.
+    #[test]
+    fn a_page_bag_beside_the_options_bag_is_still_the_members_request() {
+        let members = index(
+            r#"
+            class C {
+              listThings(page?: number) {
+                return sendPage(
+                  Schema,
+                  `${this.base}/api/v1/things`,
+                  { page, limit: 20 },
+                  { method: "GET", headers: this.headers() }
+                );
+              }
+            }
+            "#,
+        );
+        assert_eq!(
+            members.get("listThings"),
+            Some(&member("GET", "${this.base}/api/v1/things")),
+            "a literal carrying none of the request keys cannot make the bag ambiguous"
+        );
+    }
+
+    /// Two literals that BOTH carry a request key state nothing: which one
+    /// configures the request is a guess, and guessing sets the method and the
+    /// path for every site that calls the member.
+    #[test]
+    fn two_request_options_literals_state_no_single_request() {
+        let members = index(
+            r#"
+            class C {
+              writeThing(payload: unknown) {
+                return send(
+                  Schema,
+                  `${this.base}/api/v1/things`,
+                  { body: payload },
+                  { method: "POST", headers: this.headers() }
+                );
+              }
+            }
+            "#,
+        );
+        assert!(
+            !members.contains_key("writeThing"),
+            "two bags that each carry a request key leave which is which a guess"
         );
     }
 

@@ -141,16 +141,29 @@ pub(crate) fn is_request_options(obj: &ObjectLit) -> bool {
     })
 }
 
-/// The object literal among a call's arguments, when exactly one argument is
-/// one. Two object-literal arguments (a payload plus an options bag) is not a
-/// shape this reads.
-pub(crate) fn sole_object_literal(call: &CallExpr) -> Option<(usize, &ObjectLit)> {
+/// The request-options bag among a call's arguments: the one object literal
+/// that carries a request-options key, whatever position it sits at and
+/// whatever else the call is passed.
+///
+/// This used to require the bag to be the call's ONLY object literal, which
+/// read a paginating helper — `page(Schema, url, { page, limit }, { method,
+/// headers }, …)` — as not a request at all, while the same client's plain
+/// helper one line below was read (carrick#675). A literal carrying none of
+/// the four keys states nothing about the request, so it cannot make the one
+/// that does ambiguous.
+///
+/// Two literals that BOTH carry a request-options key is still nothing this
+/// reads: a payload spelled `{ body: … }` beside a bag spelled `{ headers: … }`
+/// leaves which one configures the request a guess, and the call is dropped.
+pub(crate) fn request_options_argument(call: &CallExpr) -> Option<(usize, &ObjectLit)> {
     let mut found: Option<(usize, &ObjectLit)> = None;
     for (index, arg) in call.args.iter().enumerate() {
         if arg.spread.is_some() {
             continue;
         }
-        if let Expr::Object(obj) = &*arg.expr {
+        if let Expr::Object(obj) = &*arg.expr
+            && is_request_options(obj)
+        {
             if found.is_some() {
                 return None;
             }
@@ -166,7 +179,7 @@ pub(crate) fn sole_object_literal(call: &CallExpr) -> Option<(usize, &ObjectLit)
 /// `client.post(...)`), as the candidate scanner already recorded it.
 pub fn call_request_shape(call: &CallExpr, callee_property: Option<&str>) -> RequestShapeSignal {
     let verb = verb_from_callee_property(callee_property);
-    let options = sole_object_literal(call).filter(|(_, obj)| is_request_options(obj));
+    let options = request_options_argument(call);
 
     // Not request-shaped: no verb, no options bag. Response handling
     // (`response.json()`), config builders and everything else land here and
@@ -232,6 +245,16 @@ fn body_presence(call: &CallExpr, options: Option<(usize, &ObjectLit)>) -> Optio
     if let Some((index, obj)) = options {
         if prop_value(obj, "body").is_some() || prop_value(obj, "data").is_some() {
             return Some(true);
+        }
+        // Another object literal beside the bag is a payload or a parameter
+        // record this does not model — `client.post(url, payload, config)` and
+        // a paginating helper's page bag are the same argument list from here
+        // (carrick#675). Neither is asserted: a wrong `Some(false)` would
+        // delete a real payload anchor.
+        if call.args.iter().enumerate().any(|(other, arg)| {
+            other != index && arg.spread.is_none() && matches!(&*arg.expr, Expr::Object(_))
+        }) {
+            return None;
         }
         // A third argument beside the URL and the options bag is a payload this
         // does not model; only the plain `(url, options)` shape settles it.
@@ -476,6 +499,33 @@ export async function list() {
                 r#"export async function go() { return fetch(URL, { method: "SUBSCRIBE" }); }"#,
             ),
             None
+        );
+    }
+
+    /// A verb-spelled call whose payload and whose config are BOTH object
+    /// literals: `client.post(url, payload, config)`.
+    ///
+    /// The bag used to be found only when it was the call's sole literal, so
+    /// this shape reached `body_presence` with no bag at all and was read as
+    /// carrying a body from its argument count. Now the config IS the bag,
+    /// and the payload beside it is unmodelled — which must read as unknown,
+    /// never as `Some(false)`: a definite no-body is the one value downstream
+    /// acts on, and it would delete this site's payload anchor.
+    #[test]
+    fn a_payload_beside_the_options_bag_leaves_the_body_unknown() {
+        let shape = module_shape(
+            r#"
+export async function create(payload: unknown) {
+  return client.post(`${BASE}/things`, { name: payload }, { headers: {} });
+}
+"#,
+        );
+        assert_eq!(
+            shape,
+            Some(WrapperRequestShape {
+                method: "POST".to_string(),
+                has_body: None,
+            })
         );
     }
 

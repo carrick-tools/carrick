@@ -46,7 +46,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::type_manifest::{is_http_method, normalize_manifest_method};
 use crate::wrapper_request_shape::{
-    is_request_options, literal_string, prop_value, sole_object_literal, verb_from_callee_property,
+    literal_string, prop_value, request_options_argument, verb_from_callee_property,
 };
 
 /// One outbound call resolved through a request wrapper declared in the same
@@ -200,7 +200,7 @@ impl WrapperCollector<'_> {
         params: &[Option<String>],
     ) -> Option<(Vec<UrlPart>, MethodSource)> {
         let verb = verb_from_callee_property(callee_property(call).as_deref());
-        let options = sole_object_literal(call).filter(|(_, obj)| is_request_options(obj));
+        let options = request_options_argument(call);
         // Not request-shaped: no HTTP-verb callee and no request-options bag.
         // The same structural test the cross-file wrapper pass uses.
         if verb.is_none() && options.is_none() {

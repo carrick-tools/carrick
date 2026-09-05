@@ -8,6 +8,10 @@ method and path live in a client module it imports, and nowhere in its own file.
 - `src/send.ts` is the transport. Its URL is the SECOND argument, so no
   candidate signal recognises a call to it as a request. Every request the
   client makes is therefore invisible to the candidate scanner.
+- `src/send.ts` also exports `sendPage`, the same transport paginated
+  (carrick#675): its page bag sits BETWEEN the URL and the request-options bag,
+  so a call to it carries two object literals. The client's `listArtifacts`
+  goes through it, and `uploads.ts` calls that.
 - `src/apiClient.ts` is the client: one class, one method per endpoint, each
   stating its own verb and its own API version. It raises no HTTP candidate of
   its own, which is why the wrapper map's candidate gate is the wrong filter for
@@ -58,6 +62,7 @@ method and path live in a client module it imports, and nowhere in its own file.
 | `uploads.ts:15` `client.describeSession()` | `GET /api/v2/session` |
 | `envcmd.ts:8` `projectClient.client.readArtifactUrl(name)` | `GET /api/v1/artifacts/:encoded` |
 | `supervisor.ts:12` `this.options.client.describeSession()` | `GET /api/v2/session` |
+| `uploads.ts:19` `client.listArtifacts()` | `GET /api/v1/artifacts`, through the paginating transport |
 | `envvars.ts:6` `client.readArtifactUrl(name)` | no row; counted as one call site of `readArtifactUrl` the join did not follow |
 
 ## The cassette

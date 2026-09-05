@@ -14,3 +14,7 @@ export async function pullArtifact(name: string, client: ApiClient) {
 export async function readSession(client: ApiClient) {
   return client.describeSession();
 }
+
+export async function listArtifacts(client: ApiClient) {
+  return client.listArtifacts();
+}

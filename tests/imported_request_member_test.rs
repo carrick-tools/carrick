@@ -61,7 +61,7 @@ fn call_at_line(calls: &[serde_json::Value], line: i64) -> &serde_json::Value {
 #[test]
 fn client_method_states_the_verb_and_the_version_for_its_call_sites() {
     let calls = calls("imported-request-member");
-    assert_eq!(calls.len(), 9, "one row per call site: {calls:#?}");
+    assert_eq!(calls.len(), 10, "one row per call site: {calls:#?}");
 
     // `client.createArtifactUrl(name)` reaches a PUT to /api/v2. The cassette
     // says POST, and says v2 only because the error message four lines below
@@ -144,6 +144,24 @@ fn a_resolved_member_is_emitted_when_extraction_returned_no_row_at_all() {
         pull["target_url"],
         "${this.baseUrl}/api/v1/artifacts/${encoded}"
     );
+}
+
+/// carrick#675: the member's request is issued through a PAGINATING transport,
+/// so the call carries a page bag as well as its request-options bag.
+///
+/// Two object literals in one call used to read as no request at all, and the
+/// member was dropped: the same client's unpaginated methods resolved their
+/// call sites one line above while every list endpoint it serves had no
+/// consumer row anywhere. `uploads.json` holds no answer for this site either,
+/// so the row below exists only if the scanner emits it.
+#[test]
+fn a_member_whose_request_carries_a_page_bag_beside_its_options_resolves() {
+    let calls = calls("imported-request-member");
+
+    let list = call_at_line(&calls, 19);
+    assert_eq!(list["method"], "GET");
+    assert_eq!(list["path"], "/api/v1/artifacts");
+    assert_eq!(list["target_url"], "${this.baseUrl}/api/v1/artifacts");
 }
 
 /// carrick#655: two receiver shapes the join could not reach.
