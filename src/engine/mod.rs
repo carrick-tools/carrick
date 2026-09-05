@@ -4550,6 +4550,7 @@ mod tests {
                     line: 12,
                     end_line: 18,
                 }],
+                subpaths: vec![".".to_string()],
             }]),
             sdk_edges: None,
             sdk_unresolved: None,

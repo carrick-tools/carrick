@@ -4,9 +4,21 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
+    "./package.json": "./package.json",
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.mjs"
+    },
+    "./ledger": {
+      "types": "./dist/index.d.ts",
+      "import": "./src/index.ts"
+    },
+    "./edge": {
+      "types": "./dist/edge/index.d.ts",
+      "import": "./src/edge/index.ts"
+    },
+    "./regions/*": {
+      "import": "./src/regions/*.ts"
     }
   }
 }

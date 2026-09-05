@@ -16,10 +16,11 @@
 //!
 //! # What is walked
 //!
-//! The entry module named by the service's own `package.json`
-//! (every string leaf under `exports["."]`, however deeply its conditions
-//! nest, then `types`, `main`, falling back to `src/index.ts`), and the class
-//! graph reachable from its exports:
+//! EVERY entry module the service's own `package.json` publishes — the root
+//! (`exports["."]`, every string leaf however deeply its conditions nest, then
+//! `types`, `main`, falling back to `src/index.ts`) and each further `"./…"`
+//! subpath of `exports` — and the class graph reachable from each one's
+//! exports:
 //!
 //! - an exported **class** contributes one member per method, and recurses
 //!   into each field whose declared type or `new X(...)` initialiser names a
@@ -58,10 +59,28 @@
 //! Resolution runs through [`crate::import_bindings::BindingResolver`], so a
 //! barrel in front of the real module is followed rather than guessed at.
 //!
+//! # Subpaths
+//!
+//! A consumer writes `import { batch } from "pkg/v3"`, and the join has to
+//! decide whether the `pkg/v3` module is the one a member was walked from.
+//! Only the package's own manifest holds that fact: `.` and `./v3` may be one
+//! file or two, and the specifier alone cannot say which. So every subpath is
+//! walked and each member records the subpaths that reach it
+//! ([`SdkMember::subpaths`]), with the entries deduped by resolved module —
+//! one file published under two names is one walk and one member row naming
+//! both. Before this, the surface was walked from the root entry alone and
+//! [`crate::sdk_edges`] declined every subpath import as unmatchable
+//! (carrick#656).
+//!
 //! # Deliberate limits
 //!
 //! - **Entry modules only.** The walk starts at what the package publishes,
 //!   not at every file in the tree: a class nobody exports is not surface.
+//! - **Declared subpaths only, [`MAX_ENTRY_MODULES`] of them.** A pattern key
+//!   (`"./*"`) names no single module and is skipped, and a manifest declaring
+//!   more entries than the cap has the remainder logged and left unwalked: a
+//!   consumer importing one of those resolves to no member, which is the same
+//!   answer it got before any subpath was walked at all.
 //! - **Relative hops only.** A field typed by a class imported from another
 //!   npm package resolves to nothing. Reaching it needs the sidecar's
 //!   tsconfig knowledge, and a wrong hop here silently mis-attributes a
@@ -84,7 +103,7 @@ use crate::agents::file_orchestrator::FileOrchestrator;
 use crate::import_bindings::BindingResolver;
 use crate::parser::parse_file;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use swc_common::{
@@ -119,6 +138,19 @@ const MAX_DELEGATE_DEPTH: usize = 2;
 /// Cap on the delegate spans one member carries. A member that reaches more
 /// than this is a fan-out, not a delegation chain.
 const MAX_DELEGATES: usize = 32;
+
+/// How many distinct entry modules one package's `exports` map may contribute.
+/// A manifest is free to declare hundreds of subpaths, and each one is a walk
+/// of a class graph whose members all ride the uploaded blob — [`MAX_MEMBERS`]
+/// bounds what is published but not what is parsed to get there. Thirty-two
+/// covers the layered clients this channel exists for (the largest real
+/// manifest measured while building it declares thirty-seven keys, of which
+/// several resolve to one module).
+const MAX_ENTRY_MODULES: usize = 32;
+
+/// The `exports` key naming the package root, and how a member reached through
+/// it is recorded. A consumer's bare `import … from "pkg"` is this subpath.
+const ROOT_SUBPATH: &str = ".";
 
 /// Directories whose contents are build output or dependencies, never the
 /// package's own source.
@@ -158,6 +190,24 @@ pub struct SdkMember {
     /// unlayered member, which is what every such surface was read as.
     #[serde(default)]
     pub delegates: Vec<SdkSpan>,
+    /// The `exports` subpaths whose entry module this member was reached
+    /// from, spelled as the manifest writes them: `"."` for the package root,
+    /// `"./v3"` for what a consumer imports as `pkg/v3`. One module published
+    /// under several names is ONE member row naming every subpath that
+    /// reaches it.
+    ///
+    /// This is the only statement anything downstream has that two import
+    /// specifiers name the same module, which is a fact the package's own
+    /// manifest holds and nothing else can infer: the join in
+    /// [`crate::sdk_edges`] resolves a consumer's call only when the specifier
+    /// it wrote is in this list.
+    ///
+    /// Empty on every surface written before the field existed, and the join
+    /// reads empty as root-only — which is exactly what those surfaces were,
+    /// so an old peer's members stay joinable by a bare package import and by
+    /// nothing else (carrick#656).
+    #[serde(default)]
+    pub subpaths: Vec<String>,
 }
 
 /// A source range in the SDK repo, repo-relative and 1-based.
@@ -175,19 +225,144 @@ pub struct SdkSpan {
 /// resolvable TypeScript entry, or one whose exports reach no class or object
 /// literal, produces no members and parses at most a handful of files.
 pub fn scan(repo_root: &Path, service_root: &Path) -> Vec<SdkMember> {
-    let Some(entry) = resolve_entry_module(service_root) else {
+    let entries = resolve_entry_modules(service_root);
+    if entries.is_empty() {
         debug!(
             "No TypeScript entry module under {}; publishing no SDK surface",
             service_root.display()
         );
         return Vec::new();
-    };
+    }
     let mut scanner = SurfaceScanner::new(repo_root);
-    scanner.walk_entry(&entry);
-    let mut members = scanner.members;
-    members.sort();
-    members.dedup();
-    members
+    for entry in &entries {
+        scanner.walk_entry(&entry.module, &entry.subpaths);
+    }
+    merge_by_callable(scanner.members)
+}
+
+/// One entry module, and every `exports` subpath that resolves to it.
+struct EntryModule {
+    /// Subpath keys as the manifest spells them, root first:
+    /// `[".", "./v3"]` for a package whose root and `./v3` are one module.
+    subpaths: Vec<String>,
+    module: PathBuf,
+}
+
+/// Members deduped on everything that identifies a callable, with the subpath
+/// lists of equal members unioned.
+///
+/// The plain `sort`/`dedup` this replaces cannot do that once a member records
+/// where it was reached from: walking two entries that resolve to one module
+/// produces rows equal in every field naming the callable and unequal in the
+/// field naming the import specifiers that reach it, and dropping either row
+/// would lose a name a consumer legitimately writes. The output order is
+/// unchanged — the identity tuple is `SdkMember`'s leading fields in
+/// declaration order, so this sorts exactly as the old `members.sort()` did.
+fn merge_by_callable(members: Vec<SdkMember>) -> Vec<SdkMember> {
+    type Identity = (String, String, String, u32, u32, Vec<SdkSpan>);
+    let mut merged: BTreeMap<Identity, BTreeSet<String>> = BTreeMap::new();
+    for member in members {
+        merged
+            .entry((
+                member.export,
+                member.chain,
+                member.file,
+                member.line,
+                member.end_line,
+                member.delegates,
+            ))
+            .or_default()
+            .extend(member.subpaths);
+    }
+    merged
+        .into_iter()
+        .map(
+            |((export, chain, file, line, end_line, delegates), subpaths)| SdkMember {
+                export,
+                chain,
+                file,
+                line,
+                end_line,
+                delegates,
+                subpaths: subpaths.into_iter().collect(),
+            },
+        )
+        .collect()
+}
+
+/// Every entry module the package publishes, root first, each carrying the
+/// `exports` subpaths that reach it.
+///
+/// The root is resolved exactly as it always was ([`resolve_entry_module`]),
+/// and every other `"./…"` key of `exports` then goes through the same leaf
+/// walk and source test. Two keys resolving to ONE module are one entry naming
+/// both, which is the shape this exists for: a package whose `.` and `./v3`
+/// are the same file publishes one surface under two names, and a consumer
+/// writing either is calling the same code (carrick#656).
+///
+/// Bounded three ways, because a manifest may declare hundreds of entries:
+/// a key resolving to no TS source drops out (`./package.json`, every `dist/`
+/// leaf), a pattern key (`./*`) is skipped because resolving it means globbing
+/// a tree rather than reading a path, and at most [`MAX_ENTRY_MODULES`]
+/// distinct modules are walked. `serde_json` sorts the manifest's keys, so
+/// which entries a cap drops is deterministic rather than incidental, and the
+/// skipped ones are named in the log.
+fn resolve_entry_modules(service_root: &Path) -> Vec<EntryModule> {
+    let manifest = service_root.join("package.json");
+    let json = std::fs::read_to_string(&manifest)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+
+    // Insertion order is the walk order, and the root is walked first.
+    let mut entries: Vec<EntryModule> = Vec::new();
+    let mut seen: HashMap<PathBuf, usize> = HashMap::new();
+    if let Some(root) = resolve_entry_module(service_root) {
+        seen.insert(root.clone(), 0);
+        entries.push(EntryModule {
+            subpaths: vec![ROOT_SUBPATH.to_string()],
+            module: root,
+        });
+    }
+
+    let mut skipped: Vec<String> = Vec::new();
+    if let Some(serde_json::Value::Object(map)) = json.as_ref().and_then(|json| json.get("exports"))
+    {
+        for (key, value) in map {
+            if key == ROOT_SUBPATH || !key.starts_with("./") {
+                continue;
+            }
+            if key.contains('*') {
+                debug!("Skipping SDK surface entry '{key}': a pattern names no single module");
+                continue;
+            }
+            let mut specifiers = Vec::new();
+            collect_string_leaves(value, &mut specifiers);
+            let Some(module) = resolve_specifiers(&manifest, &specifiers) else {
+                continue;
+            };
+            match seen.get(&module) {
+                Some(&at) => entries[at].subpaths.push(key.clone()),
+                None if entries.len() >= MAX_ENTRY_MODULES => skipped.push(key.clone()),
+                None => {
+                    seen.insert(module.clone(), entries.len());
+                    entries.push(EntryModule {
+                        subpaths: vec![key.clone()],
+                        module,
+                    });
+                }
+            }
+        }
+    }
+    if !skipped.is_empty() {
+        warn!(
+            "{} declares more than {} entry modules; these subpaths are not walked, and a \
+             consumer that imports one of them resolves to no member: {}",
+            manifest.display(),
+            MAX_ENTRY_MODULES,
+            skipped.join(", ")
+        );
+    }
+    entries
 }
 
 /// The entry module a package publishes, as a TypeScript source path.
@@ -200,23 +375,31 @@ pub fn scan(repo_root: &Path, service_root: &Path) -> Vec<SdkMember> {
 /// actually fires on most repos.
 fn resolve_entry_module(service_root: &Path) -> Option<PathBuf> {
     let manifest = service_root.join("package.json");
-    let declared = std::fs::read_to_string(&manifest)
+    let mut declared = std::fs::read_to_string(&manifest)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .map(|json| declared_entry_specifiers(&json))
         .unwrap_or_default();
+    declared.extend(["./src/index.ts".to_string(), "./index.ts".to_string()]);
+    resolve_specifiers(&manifest, &declared)
+}
 
-    for specifier in declared
-        .iter()
-        .map(String::as_str)
-        .chain(["./src/index.ts", "./index.ts"])
-    {
+/// The first of `specifiers`, in the order given, that resolves relative to
+/// `manifest` to real TypeScript source.
+///
+/// The order is the caller's statement of preference, and the source test is
+/// what makes offering every candidate safe: a published package points its
+/// declared fields at `dist/index.js`, which resolves to nothing in a source
+/// checkout, so a leaf naming build output or a `.d.ts` drops out here rather
+/// than having to be recognised by name.
+fn resolve_specifiers(manifest: &Path, specifiers: &[String]) -> Option<PathBuf> {
+    for specifier in specifiers {
         let relative = if specifier.starts_with("./") || specifier.starts_with("../") {
-            specifier.to_string()
+            specifier.clone()
         } else {
             format!("./{}", specifier.trim_start_matches('/'))
         };
-        if let Some(resolved) = FileOrchestrator::resolve_relative_import(&manifest, &relative)
+        if let Some(resolved) = FileOrchestrator::resolve_relative_import(manifest, &relative)
             && is_typescript_source(&resolved)
         {
             return Some(resolved);
@@ -432,6 +615,10 @@ struct SurfaceScanner {
     modules: HashMap<PathBuf, Option<Rc<Module>>>,
     members: Vec<SdkMember>,
     truncated: bool,
+    /// The subpaths of the entry currently being walked, stamped onto every
+    /// member it emits. One scanner walks every entry the package declares, so
+    /// its parsed-module and binding caches are shared across them.
+    subpaths: Vec<String>,
 }
 
 impl SurfaceScanner {
@@ -449,10 +636,12 @@ impl SurfaceScanner {
             modules: HashMap::new(),
             members: Vec::new(),
             truncated: false,
+            subpaths: Vec::new(),
         }
     }
 
-    fn walk_entry(&mut self, entry: &Path) {
+    fn walk_entry(&mut self, entry: &Path, subpaths: &[String]) {
+        self.subpaths = subpaths.to_vec();
         for export in self.bindings.export_names(entry) {
             let Some(binding) = self.bindings.resolve_export(entry, &export) else {
                 continue;
@@ -892,6 +1081,7 @@ impl SurfaceScanner {
             line: self.line_of(span.lo),
             end_line: self.line_of(span.hi),
             delegates,
+            subpaths: self.subpaths.clone(),
         });
     }
 
@@ -1599,5 +1789,127 @@ mod tests {
     fn a_repo_with_no_entry_module_publishes_nothing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         assert!(scan(tmp.path(), tmp.path()).is_empty());
+    }
+
+    /// The subpaths a member is published under, read off the SERIALIZED row —
+    /// the shape a peer downloads, and the only thing the join can key on.
+    /// Reading it through `serde_json` rather than the struct field is
+    /// deliberate: it is the same test on a surface written by a scanner that
+    /// records no subpaths, where it fails instead of failing to compile.
+    fn subpaths_of(member: &SdkMember) -> Vec<String> {
+        let row = serde_json::to_value(member).expect("member serializes");
+        row.get("subpaths")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| value.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_else(|| panic!("member '{}' carries no subpaths", member.chain))
+    }
+
+    /// The corpus E shape: `.` and `./ledger` are the same module, so the
+    /// package publishes one surface under two names. That is one member row
+    /// naming both — not two rows, and not one row that silently drops the
+    /// name a consumer actually imported.
+    #[test]
+    fn two_subpaths_naming_one_module_are_one_member_row() {
+        let root = fixture();
+        let members = scan(&root, &root);
+
+        let rows: Vec<&SdkMember> = members
+            .iter()
+            .filter(|m| m.export == "default" && m.chain == "payments.create")
+            .collect();
+        assert_eq!(rows.len(), 1, "one row per callable, got {rows:?}");
+        assert_eq!(subpaths_of(rows[0]), vec![".", "./ledger"]);
+    }
+
+    /// A module published ONLY under a subpath contributes members reachable
+    /// under that name alone. The decline the root import gets is the join's
+    /// to make, and this is the fact it makes it from.
+    #[test]
+    fn a_subpath_only_module_publishes_under_its_own_name_alone() {
+        let root = fixture();
+        let members = scan(&root, &root);
+
+        let publish = member(&members, "edge", "publish").expect("edge.publish");
+        assert_eq!(publish.file, "src/edge/index.ts");
+        assert_eq!(subpaths_of(publish), vec!["./edge"]);
+    }
+
+    /// Two keys that name no module to walk: `./package.json` resolves to no
+    /// TypeScript source, and `./regions/*` is a pattern. Neither contributes
+    /// an entry, so the module behind the pattern publishes nothing at all.
+    #[test]
+    fn a_pattern_key_and_a_non_source_key_contribute_no_entry() {
+        let root = fixture();
+        let members = scan(&root, &root);
+
+        assert!(
+            !members.iter().any(|m| m.file.starts_with("src/regions/")),
+            "a pattern key names no single module, got {:?}",
+            members
+                .iter()
+                .filter(|m| m.file.starts_with("src/regions/"))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            members
+                .iter()
+                .all(|m| !subpaths_of(m).iter().any(|sub| sub.contains('*'))),
+            "no member may be published under a pattern"
+        );
+    }
+
+    /// The cap bounds the walk, not the members of the entries that fit: a
+    /// manifest declaring more entries than [`MAX_ENTRY_MODULES`] keeps the
+    /// first of them, and a consumer importing one of the rest resolves to no
+    /// member — the answer it got before any subpath was walked.
+    #[test]
+    fn entries_beyond_the_cap_are_not_walked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).expect("mkdir");
+        std::fs::write(
+            root.join("src/index.ts"),
+            "export const root = { a() {} };\n",
+        )
+        .expect("write");
+
+        let mut exports = serde_json::Map::new();
+        exports.insert(".".to_string(), serde_json::json!("./src/index.ts"));
+        // Zero-padded so the manifest's sorted key order is the numeric one.
+        for n in 0..MAX_ENTRY_MODULES + 4 {
+            let module = format!("src/m{n:03}.ts");
+            std::fs::write(
+                root.join(&module),
+                format!("export const m{n:03} = {{ call() {{}} }};\n"),
+            )
+            .expect("write");
+            exports.insert(
+                format!("./m{n:03}"),
+                serde_json::json!(format!("./{module}")),
+            );
+        }
+        std::fs::write(
+            root.join("package.json"),
+            serde_json::json!({ "name": "@fixture/many", "exports": exports }).to_string(),
+        )
+        .expect("write");
+
+        let entries = resolve_entry_modules(root);
+        assert_eq!(entries.len(), MAX_ENTRY_MODULES);
+        let members = scan(root, root);
+        assert!(
+            member(&members, "m000", "call").is_some(),
+            "an entry inside the cap is walked"
+        );
+        let last = MAX_ENTRY_MODULES + 3;
+        assert!(
+            member(&members, &format!("m{last:03}"), "call").is_none(),
+            "an entry beyond the cap is not"
+        );
     }
 }
