@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.41](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.40...carrick-v0.3.41) (2026-09-06)
+
+
+### Features
+
+* **scanner:** claim route modules by their exported handler, not their extension ([#713](https://github.com/carrick-tools/carrick/issues/713)) ([c2ef458](https://github.com/carrick-tools/carrick/commit/c2ef458616296555100c89afdfbb7c4d82774127))
+* **scanner:** per-service boundary block on the index blob and in CLI output ([#716](https://github.com/carrick-tools/carrick/issues/716)) ([cfefc47](https://github.com/carrick-tools/carrick/commit/cfefc4790f5e825e8c13e3f0f1b31aa1980467f5))
+* **scanner:** persist how a row was resolved, and fix the join order behind it ([#712](https://github.com/carrick-tools/carrick/issues/712)) ([c9fbff6](https://github.com/carrick-tools/carrick/commit/c9fbff6b5b9e5a734c6d250882b4d03d1f77113d))
+* **sidecar:** classify bare x.verb("/lit", arg) sites by the receiver's type ([#717](https://github.com/carrick-tools/carrick/issues/717)) ([dda17e5](https://github.com/carrick-tools/carrick/commit/dda17e5f8627cf5f547b35e903e6dc99b86cb450))
+
+
+### Bug Fixes
+
+* **scanner:** key a producer's manifest type alias on its declaration site ([#720](https://github.com/carrick-tools/carrick/issues/720)) ([e29c015](https://github.com/carrick-tools/carrick/commit/e29c0150962f06ec647e4f1fe83076f32982c564)), closes [#718](https://github.com/carrick-tools/carrick/issues/718)
+
 ## [0.3.40](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.39...carrick-v0.3.40) (2026-09-05)
 
 
