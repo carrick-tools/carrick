@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://carrick.tools/schemas/carrick-check-0.json",
+  "title": "carrick.check/0",
+  "description": "Output of `carrick touch --json` and `carrick check --json`. Prose: docs/local-mode-output.md. Fields may be added; none is renamed or removed without notice. Readers ignore unknown fields and read an absent optional field as 'not stated', never as zero.",
+  "oneOf": [{ "$ref": "#/$defs/result" }, { "$ref": "#/$defs/error" }],
+  "$defs": {
+    "result": {
+      "type": "object",
+      "required": [
+        "schema",
+        "file",
+        "service",
+        "index_commit",
+        "changed_since_index",
+        "stale",
+        "items"
+      ],
+      "properties": {
+        "schema": { "const": "carrick.check/0" },
+        "file": {
+          "type": "string",
+          "description": "The queried file, relative to the repo that owns it."
+        },
+        "service": {
+          "type": "string",
+          "description": "serviceName from carrick.json, else the repo name."
+        },
+        "index_commit": {
+          "type": "string",
+          "description": "Commit this service was indexed at."
+        },
+        "indexed_at": {
+          "type": "string",
+          "description": "RFC 3339 time the index (or the last refresh of this service) ran."
+        },
+        "scanner_version": {
+          "type": "string",
+          "description": "Scanner release that wrote the index."
+        },
+        "changed_since_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Files changed since index_commit: git diff --name-only plus mtime newer than the index."
+        },
+        "stale": {
+          "type": "boolean",
+          "description": "This file is one of the changed files."
+        },
+        "deleted": {
+          "type": "boolean",
+          "description": "The index holds the file and it is no longer on disk."
+        },
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/item" },
+          "description": "Routes and calls the index holds for this file, in line order."
+        },
+        "boundary": {
+          "type": ["object", "null"],
+          "description": "ServiceBoundary for this file's service (src/boundary.rs), verbatim. Null when the index states none.",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "item": {
+      "type": "object",
+      "required": ["kind", "method", "path", "source", "counterparts"],
+      "properties": {
+        "kind": {
+          "enum": ["route", "call"],
+          "description": "A route this file serves, or a call it makes."
+        },
+        "method": {
+          "type": "string",
+          "description": "HTTP method, GraphQL kind, or socket direction."
+        },
+        "path": {
+          "type": "string",
+          "description": "Route path, GraphQL field, socket event, or pub/sub topic."
+        },
+        "line": { "type": ["integer", "null"], "minimum": 1 },
+        "col": { "type": ["integer", "null"], "minimum": 1 },
+        "source": {
+          "enum": ["fact", "candidate"],
+          "description": "fact = a deterministic pass stated it; candidate = the model's reading alone. Local mode indexes no model rows."
+        },
+        "resolution_source": {
+          "type": ["string", "null"],
+          "description": "The wire value from the index blob (file_based_route, imported_member, model, ...). Null = not stated by this row."
+        },
+        "evidence": {
+          "type": ["string", "null"],
+          "description": "One line naming what the row was read off."
+        },
+        "counterparts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/counterpart" }
+        },
+        "verdict": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/verdict" }],
+          "description": "Always null from touch. check fills it in where the index holds one."
+        }
+      },
+      "additionalProperties": true
+    },
+    "counterpart": {
+      "type": "object",
+      "required": ["role", "service", "file"],
+      "properties": {
+        "role": {
+          "enum": ["producer", "consumer", "peer"],
+          "description": "peer = shared external contract: both sides call the same third party and neither serves the other."
+        },
+        "service": { "type": "string" },
+        "file": {
+          "type": "string",
+          "description": "Relative to the counterpart's own repo."
+        },
+        "line": { "type": ["integer", "null"], "minimum": 1 }
+      },
+      "additionalProperties": true
+    },
+    "verdict": {
+      "type": "object",
+      "required": ["state", "detail"],
+      "properties": {
+        "state": {
+          "enum": ["resolved", "unresolved", "not_checked"],
+          "description": "resolved = the index holds a verdict; unresolved = the file changed since the index; not_checked = matched, never compared."
+        },
+        "result": {
+          "type": ["string", "null"],
+          "enum": [
+            "compatible",
+            "type_mismatch",
+            "method_mismatch",
+            "producer_removed",
+            null
+          ]
+        },
+        "detail": {
+          "type": "string",
+          "description": "One line, written to be read by a model."
+        }
+      },
+      "additionalProperties": true
+    },
+    "error": {
+      "type": "object",
+      "required": ["schema", "error"],
+      "properties": {
+        "schema": { "const": "carrick.check/0" },
+        "error": {
+          "enum": ["not_indexed", "not_in_workspace", "index_unreadable"],
+          "description": "Exit code is 0 anyway: a read-only command never fails an edit."
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}
