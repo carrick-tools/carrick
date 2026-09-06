@@ -1,0 +1,18 @@
+{
+  "carrick": {
+    "command": "node",
+    "args": [
+      "${CLAUDE_PLUGIN_ROOT}/src/server.ts",
+      "--stdio",
+      "--hooks-installed"
+    ],
+    "extensionToLanguage": {
+      ".ts": "typescript",
+      ".tsx": "typescriptreact"
+    },
+    "transport": "stdio",
+    "diagnostics": true,
+    "restartOnCrash": true,
+    "startupTimeout": 30000
+  }
+}

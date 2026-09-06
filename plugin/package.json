@@ -1,0 +1,19 @@
+{
+  "name": "carrick-plugin",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Claude Code plugin and stdio language server that push carrick check verdicts into an agent's context",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "tsc --noEmit && node --test 'test/**/*.test.ts'",
+    "typecheck": "tsc --noEmit",
+    "selftest": "node test/selftest.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.2"
+  }
+}

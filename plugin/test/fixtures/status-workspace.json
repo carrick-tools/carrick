@@ -1,0 +1,128 @@
+{
+  "schema": "carrick.status/0",
+  "workspace": "/workspace",
+  "indexed_at": "2026-09-06T21:14:03Z",
+  "scanner_version": "0.3.41",
+  "services": [
+    {
+      "service": "user-service",
+      "repo": "/workspace/user-service",
+      "index_commit": "6a1b2c3d4e5f60718293a4b5c6d7e8f900112233",
+      "indexed_at": "2026-09-06T21:14:03Z",
+      "routes": 157,
+      "calls": 12,
+      "changed_since_index": 7,
+      "stale_files": [
+        "src/routes/users.ts",
+        "src/routes/orders.ts",
+        "src/lib/db.ts",
+        "src/lib/http.ts",
+        "src/util/format.ts",
+        "src/util/time.ts",
+        "src/index.ts"
+      ],
+      "stale_files_total": 7,
+      "stale_files_truncated": false,
+      "boundary": {
+        "commit_hash": "6a1b2c3d4e5f60718293a4b5c6d7e8f900112233",
+        "files_attempted": 0,
+        "unemitted_literal_candidates": 4
+      },
+      "boundary_note": "A local index holds what the deterministic passes state: 41 candidate(s) in this service need a model and were not classified here.",
+      "boundary_lines": [
+        "A local index holds what the deterministic passes state: 41 candidate(s) in this service need a model and were not classified here.",
+        "boundary (user-service): 4 unemitted literal candidates."
+      ]
+    },
+    {
+      "service": "user-admin",
+      "repo": "/workspace/user-service",
+      "index_commit": "6a1b2c3d4e5f60718293a4b5c6d7e8f900112233",
+      "indexed_at": "2026-09-06T21:14:03Z",
+      "routes": 12,
+      "calls": 3,
+      "changed_since_index": 7,
+      "stale_files": [
+        "src/routes/users.ts"
+      ],
+      "stale_files_total": 7,
+      "stale_files_truncated": true,
+      "boundary": {
+        "commit_hash": "6a1b2c3d4e5f60718293a4b5c6d7e8f900112233",
+        "files_attempted": 0
+      },
+      "boundary_note": "A local index holds what the deterministic passes state: 2 candidate(s) in this service need a model and were not classified here.",
+      "boundary_lines": [
+        "A local index holds what the deterministic passes state: 2 candidate(s) in this service need a model and were not classified here."
+      ]
+    },
+    {
+      "service": "order-service",
+      "repo": "/workspace/order-service",
+      "index_commit": "99887766554433221100aabbccddeeff00112233",
+      "indexed_at": "2026-09-06T21:10:00Z",
+      "routes": 40,
+      "calls": 61,
+      "changed_since_index": 120,
+      "stale_files": [
+        "src/file1.ts",
+        "src/file2.ts",
+        "src/file3.ts",
+        "src/file4.ts",
+        "src/file5.ts",
+        "src/file6.ts",
+        "src/file7.ts",
+        "src/file8.ts",
+        "src/file9.ts",
+        "src/file10.ts",
+        "src/file11.ts",
+        "src/file12.ts",
+        "src/file13.ts",
+        "src/file14.ts",
+        "src/file15.ts",
+        "src/file16.ts",
+        "src/file17.ts",
+        "src/file18.ts",
+        "src/file19.ts",
+        "src/file20.ts",
+        "src/file21.ts",
+        "src/file22.ts",
+        "src/file23.ts",
+        "src/file24.ts",
+        "src/file25.ts",
+        "src/file26.ts",
+        "src/file27.ts",
+        "src/file28.ts",
+        "src/file29.ts",
+        "src/file30.ts",
+        "src/file31.ts",
+        "src/file32.ts",
+        "src/file33.ts",
+        "src/file34.ts",
+        "src/file35.ts",
+        "src/file36.ts",
+        "src/file37.ts",
+        "src/file38.ts",
+        "src/file39.ts",
+        "src/file40.ts",
+        "src/file41.ts",
+        "src/file42.ts",
+        "src/file43.ts",
+        "src/file44.ts",
+        "src/file45.ts",
+        "src/file46.ts",
+        "src/file47.ts",
+        "src/file48.ts",
+        "src/file49.ts",
+        "src/file50.ts"
+      ],
+      "stale_files_total": 120,
+      "stale_files_truncated": true,
+      "boundary": null,
+      "boundary_note": "A local index holds what the deterministic passes state: 9 candidate(s) in this service need a model and were not classified here.",
+      "boundary_lines": [
+        "A local index holds what the deterministic passes state: 9 candidate(s) in this service need a model and were not classified here."
+      ]
+    }
+  ]
+}

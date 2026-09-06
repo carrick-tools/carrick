@@ -1,0 +1,10 @@
+{
+  "schema": "carrick.check/0",
+  "file": "src/util/format.ts",
+  "service": "user-service",
+  "index_commit": "6a1b2c3d4e5f60718293a4b5c6d7e8f900112233",
+  "changed_since_index": 0,
+  "stale": false,
+  "items": [],
+  "boundary": null
+}
