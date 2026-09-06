@@ -1655,6 +1655,7 @@ fn append_deterministic_protocol_operations(
         // paths are not root-stripped here, and segment-matching an
         // un-relativized path would misfire on scan-prefix directories.
         provenance: Default::default(),
+        resolution_source: None,
     };
 
     let graphql = &extractions.graphql;
@@ -4445,6 +4446,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         };
 
         let mut graph = MountGraph::new();
@@ -4469,6 +4471,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
         });
         graph.data_calls.push(DataFetchingCall {
             method: "GET".to_string(),
@@ -4483,6 +4486,7 @@ mod tests {
             line: Some(313),
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         });
 
         let mut function_definitions = HashMap::new();
@@ -4708,6 +4712,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         };
 
         let test_data = CloudRepoData {
@@ -4841,6 +4846,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         };
 
         let test_data = vec![CloudRepoData {
@@ -4986,6 +4992,7 @@ mod tests {
                 line: None,
                 base: None,
                 consumers_not_resolved: None,
+                resolution_source: None,
             }
         };
         let mut mount_graph = MountGraph::new();
@@ -5052,6 +5059,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
         };
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints = vec![
@@ -5110,6 +5118,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::CallSite,
+            resolution_source: None,
         }];
         mount_graph.data_calls = vec![crate::mount_graph::DataFetchingCall {
             method: "POST".to_string(),
@@ -5124,6 +5133,7 @@ mod tests {
             line: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         }];
 
         let entries = build_type_manifest_entries(&mount_graph, &config, ".");
@@ -5933,6 +5943,7 @@ mod tests {
                 line: Some(12),
                 base: None,
                 consumers_not_resolved: None,
+                resolution_source: None,
             },
             crate::mount_graph::DataFetchingCall {
                 method: "GET".to_string(),
@@ -5947,6 +5958,7 @@ mod tests {
                 line: Some(7),
                 base: None,
                 consumers_not_resolved: None,
+                resolution_source: None,
             },
         ];
 
@@ -6726,6 +6738,7 @@ mod tests {
             line: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         }
     }
 
@@ -6781,6 +6794,7 @@ mod tests {
             line: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         }];
         let graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],
@@ -8085,6 +8099,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         };
         append_pubsub_operations(
             &mut cloud_data,

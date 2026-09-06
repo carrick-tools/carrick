@@ -6466,6 +6466,9 @@ impl FileOrchestrator {
                     // `CallSite` by `classify_endpoint_evidence` when the same
                     // source site was also extracted as a data call (#379).
                     evidence: carrick_match::MatchEvidence::RouteDefinition,
+                    // Which layer stated the row, carried onto the wire
+                    // (carrick#660). Retention only, like `provenance`.
+                    resolution_source: endpoint.resolution_source,
                 });
             }
         }
@@ -6533,6 +6536,9 @@ impl FileOrchestrator {
                         // client method (carrick#656), carried through so the
                         // index can state it beside the consumer list.
                         consumers_not_resolved: data_call.consumers_not_resolved.clone(),
+                        // Which layer stated the row (carrick#660): the pass
+                        // that resolved it, or the model. Retention only.
+                        resolution_source: data_call.resolution_source,
                     },
                     data_call.call_expression_span_start.is_some(),
                 ));

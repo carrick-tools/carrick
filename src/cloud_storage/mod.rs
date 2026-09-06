@@ -577,6 +577,7 @@ pub fn mount_graph_to_api_details(
             repo_name: None,
             service_name: None,
             provenance: endpoint.provenance,
+            resolution_source: endpoint.resolution_source,
         })
         .collect();
 
@@ -597,6 +598,7 @@ pub fn mount_graph_to_api_details(
             service_name: None,
             // Provenance is producer-side metadata; calls keep the default.
             provenance: Default::default(),
+            resolution_source: call.resolution_source,
         })
         .collect();
 
@@ -912,6 +914,7 @@ mod tests {
             service_name: None,
             provenance: EndpointProvenance::Mock,
             evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
         });
 
         let (endpoints, _calls) = mount_graph_to_api_details(&graph);
@@ -921,6 +924,66 @@ mod tests {
         // And it is on the serialized wire (the index blob).
         let json = serde_json::to_value(&endpoints[0]).unwrap();
         assert_eq!(json["provenance"], "mock");
+    }
+
+    /// The uploaded index carries which layer stated each row (carrick#660):
+    /// the projection copies it off the mount-graph row on both sides, and a
+    /// row that predates the field reads as "not stated", never as the model's.
+    #[test]
+    fn mount_graph_projection_carries_the_resolution_source() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
+
+        let mut graph = MountGraph::new();
+        graph.endpoints.push(ResolvedEndpoint {
+            method: "GET".to_string(),
+            path: "/api/widgets".to_string(),
+            full_path: "/api/widgets".to_string(),
+            handler: Some("loader".to_string()),
+            owner: "http".to_string(),
+            file_location: "app/routes/api.widgets.ts:4".to_string(),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: Some(ResolutionSource::FileBasedRoute),
+        });
+        graph.data_calls.push(DataFetchingCall {
+            method: "POST".to_string(),
+            target_url: "${process.env.GATEWAY_URL}/v1/quote".to_string(),
+            canonical_path: "/v1/quote".to_string(),
+            client: "gatewayClient".to_string(),
+            file_location: "src/ledger.ts:31".to_string(),
+            call_kind: None,
+            repo_name: None,
+            service_name: None,
+            host: None,
+            line: Some(31),
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(ResolutionSource::WholeUrlEnv),
+        });
+
+        let (endpoints, calls) = mount_graph_to_api_details(&graph);
+        assert_eq!(
+            endpoints[0].resolution_source,
+            Some(ResolutionSource::FileBasedRoute)
+        );
+        assert_eq!(
+            calls[0].resolution_source,
+            Some(ResolutionSource::WholeUrlEnv)
+        );
+
+        // And on the serialized wire, under the snake_case enum spelling.
+        assert_eq!(
+            serde_json::to_value(&endpoints[0]).unwrap()["resolution_source"],
+            "file_based_route"
+        );
+        assert_eq!(
+            serde_json::to_value(&calls[0]).unwrap()["resolution_source"],
+            "whole_url_env"
+        );
     }
 
     use crate::analyzer::CrossRepoMatch;
@@ -1004,6 +1067,64 @@ mod tests {
         }"#;
         let data: CloudRepoData = serde_json::from_str(json).unwrap();
         assert!(data.compat_verdicts.is_none());
+    }
+
+    /// A blob from a scanner that predates `resolution_source` (v20/v21)
+    /// deserializes with the field absent on every row it carries — the
+    /// operations, and the mount-graph rows behind them. Absence is the
+    /// scanner never having stated it, which is why nothing here defaults to
+    /// `Model`.
+    #[test]
+    fn cloud_repo_data_without_resolution_source_deserializes_to_none() {
+        let json = r#"{
+            "repo_name": "org/api",
+            "endpoints": [{
+                "owner": {"App": "http"},
+                "key": {"protocol": "http", "method": "GET", "path": "/api/widgets"},
+                "params": [],
+                "request_body": null,
+                "response_body": null,
+                "handler_name": "loader",
+                "request_type": null,
+                "response_type": null,
+                "file_path": "app/routes/api.widgets.ts:4"
+            }],
+            "calls": [],
+            "mounts": [],
+            "apps": {},
+            "imported_handlers": [],
+            "function_definitions": {},
+            "config_json": null,
+            "package_json": null,
+            "packages": null,
+            "last_updated": "2026-01-01T00:00:00Z",
+            "commit_hash": "abc123",
+            "mount_graph": {
+                "nodes": {},
+                "mounts": [],
+                "endpoints": [{
+                    "method": "GET",
+                    "path": "/api/widgets",
+                    "full_path": "/api/widgets",
+                    "handler": "loader",
+                    "owner": "http",
+                    "file_location": "app/routes/api.widgets.ts:4",
+                    "middleware_chain": []
+                }],
+                "data_calls": [{
+                    "method": "POST",
+                    "target_url": "/v1/quote",
+                    "canonical_path": "/v1/quote",
+                    "client": "gatewayClient",
+                    "file_location": "src/ledger.ts:31"
+                }]
+            }
+        }"#;
+        let data: CloudRepoData = serde_json::from_str(json).expect("an older blob still reads");
+        assert!(data.endpoints[0].resolution_source.is_none());
+        let graph = data.mount_graph.expect("the blob carries its mount graph");
+        assert!(graph.endpoints[0].resolution_source.is_none());
+        assert!(graph.data_calls[0].resolution_source.is_none());
     }
 
     /// A verdict round-trips through JSON keyed by canonical pair identity, and a

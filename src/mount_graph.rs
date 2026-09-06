@@ -64,6 +64,16 @@ pub struct ResolvedEndpoint {
     /// keeps its meaning.
     #[serde(default)]
     pub evidence: carrick_match::MatchEvidence,
+    /// Which layer stated this route, and for a deterministic row which pass
+    /// (carrick#660). Carried from the per-file row the emit/join phase
+    /// produced, so a reader of the index can tell a route the source declares
+    /// outright from one only the model reported.
+    ///
+    /// `None` means the scan did not record it — an older scanner, or a row
+    /// this scanner builds outside the emit/join phase — never that the row is
+    /// the model's. Retention only: nothing in matching reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
 }
 
 /// Represents a data-fetching call with its target
@@ -135,6 +145,21 @@ pub struct DataFetchingCall {
     /// and `line`: nothing in matching reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumers_not_resolved: Option<crate::imported_request_member::UnfollowedMemberSites>,
+    /// Which layer stated this call, and for a deterministic row which pass
+    /// (carrick#660).
+    ///
+    /// `client` is the extraction's own text and is two different things
+    /// depending on which pass wrote the row: a bare identifier by
+    /// construction on a backfilled row, and whatever the model wrote on a
+    /// model row. This is the scanner's own statement about which of the two
+    /// the reader is looking at, so the read path does not have to infer it
+    /// from the shape of a name.
+    ///
+    /// `None` means the scan did not record it — an older scanner, or a row
+    /// built outside the emit/join phase — never that the call is direct.
+    /// Retention only: nothing in matching reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
 }
 
 /// The complete mount and endpoint graph
@@ -518,6 +543,7 @@ mod tests {
             line: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         };
         assert_eq!(
             serde_json::to_value(&call).unwrap(),
@@ -537,15 +563,25 @@ mod tests {
         .expect("a payload written before the fields existed still reads");
         assert_eq!(older.host, None);
         assert_eq!(older.line, None);
+        // Absent, so the read path sees "this scan did not state how the row
+        // was resolved" rather than a claim about the row (carrick#660).
+        assert_eq!(older.resolution_source, None);
 
         let retained = DataFetchingCall {
             host: Some("api.vendor.test".to_string()),
             line: Some(4),
+            resolution_source: Some(
+                crate::agents::file_analyzer_agent::ResolutionSource::ImportedMember,
+            ),
             ..call
         };
         let json = serde_json::to_value(&retained).unwrap();
         assert_eq!(json["host"], serde_json::json!("api.vendor.test"));
         assert_eq!(json["line"], serde_json::json!(4));
+        assert_eq!(
+            json["resolution_source"],
+            serde_json::json!("imported_member")
+        );
     }
 
     #[test]
@@ -566,6 +602,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
         });
 
         // Create config with internal domain
@@ -842,6 +879,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
         });
 
         let config = Config {
@@ -889,6 +927,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
         });
 
         // No env vars declared: the injected base cannot be classified through
@@ -922,6 +961,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
         });
 
         let config = Config {
@@ -956,6 +996,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
         });
 
         let config = Config::default();
@@ -990,6 +1031,7 @@ mod tests {
                 service_name: None,
                 provenance: Default::default(),
                 evidence: carrick_match::MatchEvidence::RouteDefinition,
+                resolution_source: None,
             });
         }
         let normalizer = UrlNormalizer::default_permissive();
@@ -1041,6 +1083,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
         });
         crate::cloud_storage::CloudRepoData {
             repo_name: repo.to_string(),
@@ -1142,6 +1185,7 @@ mod tests {
                 line: None,
                 base: None,
                 consumers_not_resolved: None,
+                resolution_source: None,
             });
         let merged = MountGraph::merge_from_repos(&[repo]);
         assert_eq!(merged.data_calls.len(), 1);
