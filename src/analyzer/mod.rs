@@ -415,6 +415,30 @@ fn consumer_identity(location: &str) -> (String, u32) {
     parse_file_location(location)
 }
 
+/// How far the type layer got, read off the bucket its verdict landed in
+/// (cloud#599).
+///
+/// `Incompatible` and `Compatible` are the compiler's own answers on a pair
+/// where both sides resolved: the capture-time deep walk (fails closed on an
+/// `any`/`unknown` at any depth, carrick#448) and the probe's whole-type
+/// IsAny/IsUnknown gates route everything else into the other two buckets. So
+/// a finding projected from `Incompatible` — the only bucket findings come
+/// from today — is `Resolved` by construction, and the rest of the mapping is
+/// stated here so a finding built off another bucket cannot silently claim it.
+fn verdict_state_for(
+    bucket: crate::services::type_sidecar::VerdictBucket,
+) -> crate::findings::VerdictState {
+    use crate::services::type_sidecar::VerdictBucket;
+    match bucket {
+        VerdictBucket::Incompatible | VerdictBucket::Compatible => {
+            crate::findings::VerdictState::Resolved
+        }
+        VerdictBucket::Unverifiable | VerdictBucket::GateCaughtBakedAny => {
+            crate::findings::VerdictState::Unresolved
+        }
+    }
+}
+
 /// Strip the GitHub Actions checkout prefix (`/home/runner/work/<repo>/<repo>/`)
 /// from a stored location so PR-comment rows cite `server.ts:66`, not the
 /// runner's absolute workspace path (#337). Anything else (local absolute
@@ -1655,6 +1679,9 @@ impl Analyzer {
         struct MismatchCandidate {
             call_sites: BTreeSet<String>,
             producers: Vec<(String, String, String)>,
+            /// Which layer stated each consumer call folded into this
+            /// candidate, for the finding's `edge_source` (cloud#599).
+            consumer_sources: Vec<Option<crate::agents::file_analyzer_agent::ResolutionSource>>,
         }
 
         // Grouped accumulators, BTree-keyed so same-target call sites collapse
@@ -1713,6 +1740,29 @@ impl Analyzer {
                 })
             })
             .collect();
+
+        // Which layer stated each consumer call, keyed the way
+        // `apply_pair_outcomes` keys a call site, and each producer row's
+        // source keyed by the `METHOD:path` id the matcher already uses.
+        // Both feed `EdgeSource::fold` (cloud#599).
+        let consumer_source_by_call: HashMap<
+            (String, u32),
+            Option<crate::agents::file_analyzer_agent::ResolutionSource>,
+        > = mount_graph
+            .get_data_calls()
+            .iter()
+            .map(|c| (consumer_identity(&c.file_location), c.resolution_source))
+            .collect();
+        let mut producer_sources_by_key: HashMap<
+            String,
+            Vec<Option<crate::agents::file_analyzer_agent::ResolutionSource>>,
+        > = HashMap::new();
+        for endpoint in mount_graph.get_resolved_endpoints() {
+            producer_sources_by_key
+                .entry(format!("{}:{}", endpoint.method, endpoint.full_path))
+                .or_default()
+                .push(endpoint.resolution_source);
+        }
 
         // Track which endpoints have been matched
         let mut matched_endpoints: HashSet<String> = HashSet::new();
@@ -1931,6 +1981,12 @@ impl Analyzer {
                             .entry((method.to_string(), miss_path))
                             .or_default();
                         candidate.call_sites.insert(call_site);
+                        candidate.consumer_sources.push(
+                            consumer_source_by_call
+                                .get(&consumer_identity(&call.file_path.display().to_string()))
+                                .copied()
+                                .flatten(),
+                        );
                         for endpoint in path_matches {
                             candidate.producers.push((
                                 endpoint.method.to_uppercase(),
@@ -1950,7 +2006,11 @@ impl Analyzer {
         // exact-path producer is verified. Only the chosen producer is
         // suppressed from the orphan list. Keyed by the producer's DECLARED
         // path so N consumer spellings of one route collapse into one risk.
-        let mut method_mismatches: BTreeMap<(String, String, String), BTreeSet<String>> =
+        type MethodMismatchRow = (
+            BTreeSet<String>,
+            Vec<Option<crate::agents::file_analyzer_agent::ResolutionSource>>,
+        );
+        let mut method_mismatches: BTreeMap<(String, String, String), MethodMismatchRow> =
             BTreeMap::new();
         for ((method, _consumer_path), mut candidate) in mismatch_candidates {
             candidate.producers.sort();
@@ -1964,24 +2024,34 @@ impl Analyzer {
             else {
                 continue;
             };
+            // The one producer this finding names is the only producer row it
+            // rests on; its exact-path siblings keep their own classification
+            // and are not part of this pairing.
+            let producer_sources = producer_sources_by_key
+                .get(&producer_key)
+                .cloned()
+                .unwrap_or_default();
             method_mismatched_producers.insert(producer_key);
-            method_mismatches
+            let row = method_mismatches
                 .entry((method, declared_path, expected))
-                .or_default()
-                .extend(candidate.call_sites);
+                .or_default();
+            row.0.extend(candidate.call_sites);
+            row.1.extend(producer_sources);
+            row.1.extend(candidate.consumer_sources);
         }
 
         // Findings order: risks (method mismatches) first, then gaps, then
         // advisories — mirrors the report's section order.
         let mut findings: Vec<Finding> = Vec::new();
-        for ((method, path, expected), sites) in method_mismatches {
-            findings.push(Finding::method_mismatch(
-                method,
-                path,
-                None,
-                sites.into_iter().collect(),
-                expected,
-            ));
+        for ((method, path, expected), (sites, sources)) in method_mismatches {
+            findings.push(
+                Finding::method_mismatch(method, path, None, sites.into_iter().collect(), expected)
+                    .with_edge_source(crate::findings::EdgeSource::fold(sources))
+                    // A wrong verb on a declared route is a routing fact; no type
+                    // verdict bears on it, which is not the same as one that could
+                    // not be reached (cloud#599).
+                    .with_verdict_state(Some(crate::findings::VerdictState::NotChecked)),
+            );
         }
         for ((method, path), sites) in missing {
             findings.push(Finding::missing_endpoint(
@@ -2033,7 +2103,8 @@ impl Analyzer {
                             .clone()
                             .or_else(|| endpoint.repo_name.clone()),
                     )
-                    .with_producer_provenance(endpoint.provenance),
+                    .with_producer_provenance(endpoint.provenance)
+                    .with_view_module(endpoint.view_module),
                 );
             }
         }
@@ -2639,6 +2710,8 @@ impl Analyzer {
                 .unwrap_or_else(|| alias.to_string())
         };
 
+        let consumer_sources = self.consumer_resolution_sources();
+
         outcomes
             .iter()
             .filter(|o| o.bucket == crate::services::type_sidecar::VerdictBucket::Incompatible)
@@ -2652,6 +2725,27 @@ impl Analyzer {
                 let location = format!("{}:{}", outcome.consumer_file, outcome.consumer_line);
                 let call_sites = vec![strip_ci_workspace_prefix(&location).to_string()];
                 let producer_provenance = self.producer_provenance_for(&method, &path);
+                // The edge is the producer rows plus the one consumer call
+                // this verdict was reached at. The consumer key is the stored
+                // (unstripped) location, matching how the data calls are keyed;
+                // `apply_pair_outcomes` reads a zero line as line 1, so this
+                // does too.
+                let consumer_key = (
+                    outcome.consumer_file.clone(),
+                    if outcome.consumer_line == 0 {
+                        1
+                    } else {
+                        outcome.consumer_line
+                    },
+                );
+                let mut sources = self.producer_resolution_sources_for(&method, &path);
+                match consumer_sources.get(&consumer_key) {
+                    Some(source) => sources.push(*source),
+                    // The consumer row is not in this graph (a peer whose
+                    // calls did not merge). One side unknown is not a fact.
+                    None => sources.push(None),
+                }
+                let edge_source = crate::findings::EdgeSource::fold(sources);
                 let detail = outcome
                     .diagnostic
                     .clone()
@@ -2667,6 +2761,8 @@ impl Analyzer {
                     &self.clean_error_message(&detail, &display_names),
                 )
                 .with_producer_provenance(producer_provenance)
+                .with_edge_source(edge_source)
+                .with_verdict_state(Some(verdict_state_for(outcome.bucket)))
             })
             .collect()
     }
@@ -2695,6 +2791,55 @@ impl Analyzer {
             .map(|endpoint| endpoint.provenance)
             .min()
             .unwrap_or_default()
+    }
+
+    /// Every producer row behind a compat verdict, as its stated resolution
+    /// source — the same `(METHOD, path)` join `producer_provenance_for` uses.
+    ///
+    /// Returns one entry per matching producer, so the fold sees them all: two
+    /// producers under one key are two rows the pairing rests on, and a model
+    /// row among them makes the pairing a candidate however the other rows
+    /// were stated. Empty when nothing matched, which the fold reads as
+    /// "cannot say" rather than as a fact.
+    fn producer_resolution_sources_for(
+        &self,
+        method: &str,
+        path: &str,
+    ) -> Vec<Option<crate::agents::file_analyzer_agent::ResolutionSource>> {
+        let Some(mount_graph) = self.mount_graph.as_ref() else {
+            return Vec::new();
+        };
+        let want = normalize_compat_path(path);
+        mount_graph
+            .get_resolved_endpoints()
+            .iter()
+            .filter(|endpoint| {
+                endpoint.method.eq_ignore_ascii_case(method)
+                    && normalize_compat_path(&endpoint.full_path) == want
+            })
+            .map(|endpoint| endpoint.resolution_source)
+            .collect()
+    }
+
+    /// Consumer call rows by call-site identity (`file`, `line`) — the same key
+    /// `apply_pair_outcomes` joins a verdict to its consumer with, so a
+    /// finding's edge source is folded over the very rows that made the pair.
+    fn consumer_resolution_sources(
+        &self,
+    ) -> HashMap<(String, u32), Option<crate::agents::file_analyzer_agent::ResolutionSource>> {
+        let Some(mount_graph) = self.mount_graph.as_ref() else {
+            return HashMap::new();
+        };
+        mount_graph
+            .get_data_calls()
+            .iter()
+            .map(|call| {
+                (
+                    consumer_identity(&call.file_location),
+                    call.resolution_source,
+                )
+            })
+            .collect()
     }
 
     fn clean_type_string(&self, type_str: &str, display_names: &HashMap<String, String>) -> String {
@@ -4003,17 +4148,156 @@ mod tests {
 
         assert_eq!(
             findings,
-            vec![Finding::method_mismatch(
-                "GET",
-                "/api/orders",
-                None,
-                vec!["client.ts:12".into()],
-                "POST",
-            )],
+            vec![
+                Finding::method_mismatch(
+                    "GET",
+                    "/api/orders",
+                    None,
+                    vec!["client.ts:12".into()],
+                    "POST",
+                )
+                .with_verdict_state(Some(crate::findings::VerdictState::NotChecked))
+            ],
             "a wrong-verb call must surface once, as a risk"
         );
         // The producer is neither verified nor orphaned.
         assert!(verified.is_empty());
+    }
+
+    /// The finding's `edge_source` is folded over the rows the pairing rests
+    /// on (cloud#599): one model row anywhere makes it a candidate, and it is
+    /// a fact only when every row is one the source states.
+    #[test]
+    fn method_mismatch_edge_source_folds_producer_and_consumer_rows() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
+
+        // (consumer call source, producer route source) -> expected edge_source
+        let cases = [
+            (
+                Some(ResolutionSource::ImportedMember),
+                Some(ResolutionSource::FileBasedRoute),
+                Some(crate::findings::EdgeSource::Fact),
+            ),
+            (
+                Some(ResolutionSource::Model),
+                Some(ResolutionSource::FileBasedRoute),
+                Some(crate::findings::EdgeSource::Candidate),
+            ),
+            (
+                Some(ResolutionSource::ImportedMember),
+                Some(ResolutionSource::Model),
+                Some(crate::findings::EdgeSource::Candidate),
+            ),
+            (None, Some(ResolutionSource::FileBasedRoute), None),
+        ];
+
+        for (consumer_source, producer_source, expected) in cases {
+            let mut analyzer = Analyzer::new(Config::default());
+            analyzer.calls.push(ApiEndpointDetails {
+                view_module: false,
+                owner: None,
+                key: OperationKey::http("GET", "/api/orders"),
+                params: vec![],
+                request_body: None,
+                response_body: None,
+                handler_name: None,
+                request_type: None,
+                response_type: None,
+                file_path: PathBuf::from("client.ts:12"),
+                repo_name: None,
+                service_name: None,
+                provenance: Default::default(),
+                resolution_source: consumer_source,
+            });
+
+            let mut mount_graph = MountGraph::new();
+            mount_graph.endpoints.push(ResolvedEndpoint {
+                view_module: false,
+                method: "POST".to_string(),
+                path: "/api/orders".to_string(),
+                full_path: "/api/orders".to_string(),
+                handler: None,
+                owner: "app".to_string(),
+                file_location: "server.ts:10".to_string(),
+                middleware_chain: vec![],
+                repo_name: Some("api".to_string()),
+                service_name: None,
+                provenance: Default::default(),
+                evidence: carrick_match::MatchEvidence::RouteDefinition,
+                resolution_source: producer_source,
+            });
+            mount_graph.data_calls.push(DataFetchingCall {
+                method: "GET".to_string(),
+                target_url: "/api/orders".to_string(),
+                canonical_path: "/api/orders".to_string(),
+                client: "fetch".to_string(),
+                file_location: "client.ts:12".to_string(),
+                call_kind: None,
+                repo_name: Some("consumer-repo".to_string()),
+                service_name: None,
+                host: None,
+                line: None,
+                base: None,
+                consumers_not_resolved: None,
+                resolution_source: consumer_source,
+            });
+
+            let (findings, _verified, _edges) =
+                analyzer.analyze_matches_with_mount_graph(&mount_graph);
+            let sources: Vec<Option<crate::findings::EdgeSource>> = findings
+                .iter()
+                .filter_map(|f| match f {
+                    Finding::MethodMismatch { edge_source, .. } => Some(*edge_source),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                sources,
+                vec![expected],
+                "consumer {consumer_source:?} + producer {producer_source:?}"
+            );
+        }
+    }
+
+    /// A view module's route carries the marker onto its orphan row, so the
+    /// renderers can leave a page's own data endpoint out of the unconsumed
+    /// section (R1b, cloud#599).
+    #[test]
+    fn orphaned_endpoint_carries_the_view_module_marker() {
+        use crate::mount_graph::ResolvedEndpoint;
+
+        let analyzer = Analyzer::new(Config::default());
+        let mut mount_graph = MountGraph::new();
+        for (path, is_view_module) in [("/dashboard", true), ("/api/orders", false)] {
+            mount_graph.endpoints.push(ResolvedEndpoint {
+                view_module: is_view_module,
+                method: "GET".to_string(),
+                path: path.to_string(),
+                full_path: path.to_string(),
+                handler: None,
+                owner: "app".to_string(),
+                file_location: format!("app{path}/route.tsx:1"),
+                middleware_chain: vec![],
+                repo_name: Some("web".to_string()),
+                service_name: None,
+                provenance: Default::default(),
+                evidence: carrick_match::MatchEvidence::RouteDefinition,
+                resolution_source: None,
+            });
+        }
+
+        let (findings, _verified, _edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+        let marked: Vec<(&str, bool)> = findings
+            .iter()
+            .filter_map(|f| match f {
+                Finding::OrphanedEndpoint {
+                    path, view_module, ..
+                } => Some((path.as_str(), *view_module)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(marked, vec![("/dashboard", true), ("/api/orders", false)]);
     }
 
     /// A call whose path matches nothing at all (under any verb) is still a
@@ -4544,13 +4828,16 @@ mod tests {
 
         assert_eq!(
             findings,
-            vec![Finding::method_mismatch(
-                "GET",
-                "/orders/:id",
-                None,
-                vec!["client.ts:7".into()],
-                "POST",
-            )]
+            vec![
+                Finding::method_mismatch(
+                    "GET",
+                    "/orders/:id",
+                    None,
+                    vec!["client.ts:7".into()],
+                    "POST",
+                )
+                .with_verdict_state(Some(crate::findings::VerdictState::NotChecked))
+            ]
         );
     }
 
@@ -4578,7 +4865,8 @@ mod tests {
             findings,
             vec![
                 // Expected method is the unverified POST, not the verified GET.
-                Finding::method_mismatch("PUT", "/a", None, vec!["client.ts:2".into()], "POST"),
+                Finding::method_mismatch("PUT", "/a", None, vec!["client.ts:2".into()], "POST")
+                    .with_verdict_state(Some(crate::findings::VerdictState::NotChecked)),
                 // GET /b keeps its orphan classification; POST /a is
                 // suppressed (it is the producer the risk names).
                 Finding::orphaned_endpoint("GET", "/b", Some("api".to_string())),
@@ -4611,13 +4899,10 @@ mod tests {
 
         assert_eq!(
             findings,
-            vec![Finding::method_mismatch(
-                "PUT",
-                "/a",
-                None,
-                vec!["client.ts:2".into()],
-                "GET",
-            )]
+            vec![
+                Finding::method_mismatch("PUT", "/a", None, vec!["client.ts:2".into()], "GET",)
+                    .with_verdict_state(Some(crate::findings::VerdictState::NotChecked))
+            ]
         );
         assert_eq!(
             verified,
