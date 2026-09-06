@@ -23,9 +23,9 @@
 //! The golden is portable with no masking because the scanner emits
 //! repo-relative paths; the assertion below holds that property.
 //!
-//! `Endpoint_<hash>_<Kind>_Call<id>` aliases are compared verbatim:
-//! `build_call_site_id` hashes the REPO-RELATIVE call-site path (#355), so the
-//! ids are identical on every machine and need no masking.
+//! Site-suffixed aliases (`_Call<id>` on a consumer, `_At<id>` on a producer)
+//! are compared verbatim: `build_site_id` hashes the REPO-RELATIVE site path
+//! (#355), so the ids are identical on every machine and need no masking.
 
 use std::process::Command;
 

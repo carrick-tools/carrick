@@ -33,6 +33,10 @@ pub fn build_display_name(key: &OperationKey, type_kind: &str) -> String {
     format!("{} → {}", key, kind)
 }
 
+/// The alias for one operation, keyed on the operation alone. Every caller that
+/// can name the SITE the type belongs to should use
+/// [`build_manifest_type_alias_with_site_id`] instead: an operation key is not
+/// unique to one place in the source on either side (carrick#718).
 pub fn build_manifest_type_alias(
     key: &OperationKey,
     role: ManifestRole,
@@ -72,9 +76,17 @@ fn repo_relative_source_path<'a>(file_path: &'a str, repo_root: &str) -> &'a str
 }
 
 /// Hash a consumer call site into the 16-hex id embedded in
-/// `Endpoint_<hash>_<Kind>_Call<id>` aliases. The id is a join key across the
-/// manifest, SymbolRequest, and infer-request sides, so every producer of it
-/// must call this function with the same `(path, line, key)` triple.
+/// site-suffixed aliases. The id is a join key across the manifest,
+/// SymbolRequest, and infer-request sides, so every producer of it must call
+/// this function with the same `(path, line, key)` triple.
+///
+/// "Site" means the call site for a consumer and the declaration site for a
+/// producer (carrick#718). Both need one for the same reason: an operation key
+/// is not unique to one place in the source. A consumer fans in — many call
+/// sites, one route — and a producer can too, because two modules legitimately
+/// serve one `(method, path)`: a pathless layout and the page beneath it, an
+/// `index` module and its sibling. Without the site they share an alias, and
+/// one resolved definition is reported for both.
 ///
 /// The path is reduced to its repo-relative form before hashing (issue #355):
 /// hashing the absolute path made every `_Call<id>` alias machine-specific,
@@ -83,7 +95,7 @@ fn repo_relative_source_path<'a>(file_path: &'a str, repo_root: &str) -> &'a str
 /// than at call sites) keeps the id identical at every join site regardless of
 /// whether the caller holds an absolute full-scan key or a repo-relative
 /// incremental key.
-pub fn build_call_site_id(
+pub fn build_site_id(
     file_path: &str,
     line_number: u32,
     key: &OperationKey,
@@ -94,15 +106,29 @@ pub fn build_call_site_id(
     format!("{:016x}", fnv1a_hash(&hash_input))
 }
 
-pub fn build_manifest_type_alias_with_call_id(
+/// The alias for one operation AT ONE SITE. `site_id` comes from
+/// [`build_site_id`]; `None` leaves the key-only alias, which is what the
+/// non-HTTP protocols still use on the producer side (their producers are
+/// keyed by event, field or topic name and no collision has been observed).
+///
+/// The suffix is spelled for the role, because the two sites are different
+/// things: `_Call<id>` is where a consumer calls the operation, `_At<id>` is
+/// where a producer declares it. Nothing parses either spelling — the manifest
+/// entry carries the alias and every reader takes it whole — so the spelling is
+/// for the human reading a bundled `.d.ts` or an MCP result.
+pub fn build_manifest_type_alias_with_site_id(
     key: &OperationKey,
     role: ManifestRole,
     type_kind: ManifestTypeKind,
-    call_id: Option<&str>,
+    site_id: Option<&str>,
 ) -> String {
     let base = build_manifest_type_alias(key, role, type_kind);
-    match call_id {
-        Some(id) if !id.trim().is_empty() => format!("{}_Call{}", base, id.trim()),
+    let marker = match role {
+        ManifestRole::Consumer => "Call",
+        ManifestRole::Producer => "At",
+    };
+    match site_id {
+        Some(id) if !id.trim().is_empty() => format!("{}_{}{}", base, marker, id.trim()),
         _ => base,
     }
 }
@@ -248,12 +274,12 @@ mod tests {
     }
 
     #[test]
-    fn test_build_manifest_type_alias_with_call_id() {
+    fn test_build_manifest_type_alias_with_site_id() {
         let key = OperationKey::http("GET", "/users");
         let base =
             build_manifest_type_alias(&key, ManifestRole::Consumer, ManifestTypeKind::Response);
-        let call_id = build_call_site_id("src/service.ts", 12, &key, ".");
-        let with_call = build_manifest_type_alias_with_call_id(
+        let call_id = build_site_id("src/service.ts", 12, &key, ".");
+        let with_call = build_manifest_type_alias_with_site_id(
             &key,
             ManifestRole::Consumer,
             ManifestTypeKind::Response,
@@ -269,13 +295,12 @@ mod tests {
     /// another root, and the already-relative incremental-cache form must all
     /// hash to the same id.
     #[test]
-    fn test_build_call_site_id_is_repo_root_invariant() {
+    fn test_build_site_id_is_repo_root_invariant() {
         let key = OperationKey::http("GET", "/users");
-        let from_abs_a =
-            build_call_site_id("/home/alice/repo/src/api.ts", 12, &key, "/home/alice/repo");
-        let from_abs_b = build_call_site_id("/ci/work/repo/src/api.ts", 12, &key, "/ci/work/repo/");
-        let from_rel = build_call_site_id("src/api.ts", 12, &key, ".");
-        let from_dot_rel = build_call_site_id("./src/api.ts", 12, &key, ".");
+        let from_abs_a = build_site_id("/home/alice/repo/src/api.ts", 12, &key, "/home/alice/repo");
+        let from_abs_b = build_site_id("/ci/work/repo/src/api.ts", 12, &key, "/ci/work/repo/");
+        let from_rel = build_site_id("src/api.ts", 12, &key, ".");
+        let from_dot_rel = build_site_id("./src/api.ts", 12, &key, ".");
 
         assert_eq!(from_abs_a, from_abs_b);
         assert_eq!(from_abs_a, from_rel);

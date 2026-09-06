@@ -56,7 +56,7 @@ use crate::{
         SwcScanner, collect_import_sources, is_producer_route_path, normalize_path_params,
     },
     type_manifest::{
-        build_call_site_id, build_manifest_type_alias, build_manifest_type_alias_with_call_id,
+        build_manifest_type_alias, build_manifest_type_alias_with_site_id, build_site_id,
         is_http_method, normalize_manifest_method, parse_file_location,
     },
     url_normalizer::UrlNormalizer,
@@ -2465,7 +2465,7 @@ impl FileOrchestrator {
             // Canonical path computed once at mount-graph build time; keep the
             // manifest join key identical to the projection key for this call.
             let path = data_call.canonical_path.clone();
-            let call_id = build_call_site_id(
+            let call_id = build_site_id(
                 &file_path,
                 line_number,
                 &OperationKey::http(&method, path.clone()),
@@ -2515,15 +2515,27 @@ impl FileOrchestrator {
                     continue;
                 }
                 let key = OperationKey::http(&method, path.clone());
-                let response_alias = build_manifest_type_alias(
+                // The producer's declaration site, the way the consumer branch
+                // below builds its call site (carrick#718). It must be the same
+                // `(file, line, key, repo_root)` the manifest side passes in
+                // `build_type_manifest_entries` — which it is whenever
+                // `endpoint_lookup` matched, because that lookup IS the two
+                // sides agreeing on the file and the line — or the alias
+                // diverges and the resolved `.d.ts` never joins back. Where the
+                // lookup missed there is no mount-graph endpoint for this row,
+                // so no manifest entry either and the alias goes unused.
+                let site_id = build_site_id(file_path, line_number, &key, repo_path);
+                let response_alias = build_manifest_type_alias_with_site_id(
                     &key,
                     ManifestRole::Producer,
                     ManifestTypeKind::Response,
+                    Some(&site_id),
                 );
-                let request_alias = build_manifest_type_alias(
+                let request_alias = build_manifest_type_alias_with_site_id(
                     &key,
                     ManifestRole::Producer,
                     ManifestTypeKind::Request,
+                    Some(&site_id),
                 );
 
                 // no-payload endpoints have no recoverable response contract:
@@ -2721,7 +2733,7 @@ impl FileOrchestrator {
                         (
                             method_fallback.clone(),
                             target_path.clone(),
-                            build_call_site_id(
+                            build_site_id(
                                 file_path,
                                 line_number,
                                 &OperationKey::http(&method_fallback, target_path.clone()),
@@ -2730,13 +2742,13 @@ impl FileOrchestrator {
                         )
                     });
                 let key = OperationKey::http(&method, path.clone());
-                let response_alias = build_manifest_type_alias_with_call_id(
+                let response_alias = build_manifest_type_alias_with_site_id(
                     &key,
                     ManifestRole::Consumer,
                     ManifestTypeKind::Response,
                     Some(&call_id),
                 );
-                let request_alias = build_manifest_type_alias_with_call_id(
+                let request_alias = build_manifest_type_alias_with_site_id(
                     &key,
                     ManifestRole::Consumer,
                     ManifestTypeKind::Request,
@@ -2908,7 +2920,7 @@ impl FileOrchestrator {
     /// stamps on the manifest entry in `append_pubsub_manifest_entries` — or the
     /// resolved `.d.ts` never joins back and the entry stays `Unknown`. Producers
     /// (subscribers) use the plain `build_manifest_type_alias(&key, role,
-    /// Response)`; consumers (publishers) append a `build_call_site_id(path, line,
+    /// Response)`; consumers (publishers) append a `build_site_id(path, line,
     /// &key)` suffix so fan-in publishers on one topic don't collide on a single
     /// alias (see `append_pubsub_manifest_entries`). Both contracts are guarded by
     /// unit tests.
@@ -3016,7 +3028,7 @@ impl FileOrchestrator {
                 // Mirror the manifest side (`append_pubsub_manifest_entries`):
                 // publishers (consumers) disambiguate by call site so fan-in
                 // publishers don't collide on one alias; subscribers (producers)
-                // stay plain. `build_call_site_id` MUST see the same (path, line,
+                // stay plain. `build_site_id` MUST see the same (path, line,
                 // key, repo_root) the manifest side passes — `path` is the raw
                 // `file_results` key on both sides and the id relativizes it
                 // against `repo_root` internally (#355) — or the alias diverges
@@ -3027,8 +3039,8 @@ impl FileOrchestrator {
                         // Same >= 1 clamp as the manifest side (see
                         // `append_pubsub_manifest_entries`) so the call_id matches.
                         let line = u32::try_from(op.line_number).unwrap_or(0).max(1);
-                        let call_id = build_call_site_id(path, line, &key, repo_path);
-                        build_manifest_type_alias_with_call_id(
+                        let call_id = build_site_id(path, line, &key, repo_path);
+                        build_manifest_type_alias_with_site_id(
                             &key,
                             role,
                             ManifestTypeKind::Response,
@@ -3092,7 +3104,7 @@ impl FileOrchestrator {
     ///
     /// The alias MUST be byte-identical to the one
     /// `append_pubsub_manifest_entries` stamped on the manifest entry — same
-    /// key, role, kind, and (for publishers) the same `build_call_site_id` over
+    /// key, role, kind, and (for publishers) the same `build_site_id` over
     /// the same raw `file_results` path and >=1-clamped line — or the
     /// enrich-join silently fails to flip `Unknown` → `Implicit`. Guarded by a
     /// unit test alongside the symbol-path alias test.
@@ -3162,8 +3174,8 @@ impl FileOrchestrator {
                 let key = OperationKey::pubsub(op.topic.clone());
                 let alias = match role {
                     ManifestRole::Consumer => {
-                        let call_id = build_call_site_id(path, line, &key, repo_path);
-                        build_manifest_type_alias_with_call_id(
+                        let call_id = build_site_id(path, line, &key, repo_path);
+                        build_manifest_type_alias_with_site_id(
                             &key,
                             role,
                             ManifestTypeKind::Response,
