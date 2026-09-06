@@ -99,6 +99,7 @@ impl CloudStorage for MockStorage {
             // Create mock repos for testing
             let mock_repos = vec![
                 CloudRepoData {
+                    boundary: None,
                     repo_name: "repo-a".to_string(),
                     service_name: None,
                     endpoints: vec![],
@@ -132,6 +133,7 @@ impl CloudStorage for MockStorage {
                     scanner_version: None,
                 },
                 CloudRepoData {
+                    boundary: None,
                     repo_name: "repo-b".to_string(),
                     service_name: None,
                     endpoints: vec![],

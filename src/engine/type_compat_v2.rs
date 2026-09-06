@@ -1113,6 +1113,7 @@ mod tests {
         capture_stub: Option<CaptureStubArtifact>,
     ) -> CloudRepoData {
         CloudRepoData {
+            boundary: None,
             repo_name: repo_name.to_string(),
             service_name: service_name.map(str::to_string),
             endpoints: Vec::new(),

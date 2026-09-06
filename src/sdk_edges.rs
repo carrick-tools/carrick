@@ -170,7 +170,7 @@ impl SdkJoin {
             .collect()
     }
 
-    fn unresolved_for(&self, service_id: &str) -> Vec<SdkUnresolved> {
+    pub fn unresolved_for(&self, service_id: &str) -> Vec<SdkUnresolved> {
         self.unresolved
             .iter()
             .filter(|(consumer, _)| consumer == service_id)
@@ -627,6 +627,7 @@ mod tests {
 
     fn blob(repo_name: &str) -> CloudRepoData {
         CloudRepoData {
+            boundary: None,
             repo_name: repo_name.to_string(),
             service_name: None,
             endpoints: vec![],

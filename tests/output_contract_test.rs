@@ -277,3 +277,156 @@ async fn test_output_stability_across_analysis_runs() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The boundary block (carrick#705): what a scan could not classify, stated on
+// the blob and printed at the end of the run.
+// ---------------------------------------------------------------------------
+
+/// A blob in the shape the cloud reads, built from JSON rather than from the
+/// struct literal so this test would also run against a payload written by a
+/// scanner that knows nothing about the boundary.
+fn blob_with_rows() -> serde_json::Value {
+    serde_json::json!({
+        "repo_name": "org/api",
+        "service_name": "orders",
+        "endpoints": [{
+            "owner": {"App": "http"},
+            "key": {"protocol": "http", "method": "GET", "path": "/orders"},
+            "params": [],
+            "request_body": null,
+            "response_body": null,
+            "handler_name": "listOrders",
+            "request_type": null,
+            "response_type": null,
+            "file_path": "src/routes/orders.ts:4"
+        }],
+        "calls": [{
+            "owner": null,
+            "key": {"protocol": "http", "method": "GET", "path": "/:base/:rest"},
+            "params": [],
+            "request_body": null,
+            "response_body": null,
+            "handler_name": "fetch",
+            "request_type": null,
+            "response_type": null,
+            "file_path": "src/client.ts:9"
+        }],
+        "mounts": [],
+        "apps": {},
+        "imported_handlers": [],
+        "function_definitions": {},
+        "config_json": null,
+        "package_json": null,
+        "packages": null,
+        "last_updated": "2026-01-01T00:00:00Z",
+        "commit_hash": "0123456789abcdef",
+        "mount_graph": {
+            "nodes": {},
+            "mounts": [],
+            "endpoints": [],
+            "data_calls": [{
+                "method": "GET",
+                "target_url": "${base}/${rest}",
+                "canonical_path": "/:base/:rest",
+                "client": "fetch",
+                "file_location": "src/client.ts:9",
+                "consumers_not_resolved": {"member": "getEnvironmentVariables", "count": 3}
+            }]
+        }
+    })
+}
+
+/// The shape the cloud reads: every count carries its exact total, the reasons
+/// are capped, and the block names the commit its numbers were counted at.
+#[test]
+fn the_boundary_block_states_counts_totals_and_the_commit() {
+    use carrick::agents::file_orchestrator::ProcessingStats;
+    use carrick::boundary::{MAX_REASONS, ServiceBoundary};
+    use carrick::cloud_storage::CloudRepoData;
+
+    let data: CloudRepoData =
+        serde_json::from_value(blob_with_rows()).expect("the blob shape still reads");
+    let stats = ProcessingStats {
+        files_model_dispatched: 12,
+        files_analysis_failed: 1,
+        errors: vec!["Failed to analyze src/dead.ts: gateway timeout".to_string()],
+        unemitted_literal_candidates: 4,
+        model_only_rows: 7,
+        model_rows_joined: 2,
+        model_contradictions_discarded: 1,
+        ..Default::default()
+    };
+
+    let boundary = ServiceBoundary::collect(&data, &stats, "/tmp/scan-root");
+    let json = serde_json::to_value(&boundary).expect("the boundary serializes");
+
+    assert_eq!(json["commit_hash"], "0123456789abcdef");
+    assert_eq!(json["files_attempted"], 12);
+    assert_eq!(json["files_lost"]["total"], 1);
+    assert_eq!(
+        json["files_lost"]["reasons"][0],
+        "Failed to analyze src/dead.ts: gateway timeout"
+    );
+    assert_eq!(json["unemitted_literal_candidates"], 4);
+    assert_eq!(json["model_only_rows"], 7);
+    assert_eq!(json["model_rows_joined"], 2);
+    assert_eq!(json["model_contradictions_discarded"], 1);
+
+    // Read off the rows the blob carries, not re-derived from source.
+    assert_eq!(json["consumers_not_resolved"]["total"], 3);
+    assert_eq!(
+        json["consumers_not_resolved"]["reasons"][0],
+        "getEnvironmentVariables ×3"
+    );
+    assert_eq!(
+        json["unknown_call_paths"]["total"], 1,
+        "a call with no literal segment is in the index and unclaimable: {json:#?}"
+    );
+    assert_eq!(json["routes_without_response_type"]["total"], 1);
+    assert_eq!(json["calls_without_expected_type"]["total"], 1);
+    assert_eq!(json["bare_checkout"], false);
+
+    // The counter carrick#704 fills is ABSENT, not zero: this scanner does not
+    // count it yet, which is not the same as counting none.
+    assert!(
+        json.get("model_endpoints_discarded_in_claimed_modules")
+            .is_none(),
+        "an uncounted thing is absent, never zero: {json:#?}"
+    );
+
+    // The SDK half is a cross-repo fact, folded in after the join.
+    assert_eq!(json["sdk_unresolved"]["total"], 0);
+
+    // A count is never mistaken for the whole list.
+    let many = ServiceBoundary::collect(&data, &stats, "/tmp/scan-root");
+    assert!(many.unknown_call_paths.reasons.len() <= MAX_REASONS);
+}
+
+/// A blob from a scanner that predates the block carries no boundary at all.
+/// Absent reads as "this scanner does not state its boundary"; it must never
+/// read as "this scan had none".
+#[test]
+fn a_blob_without_a_boundary_reads_as_unstated() {
+    use carrick::cloud_storage::CloudRepoData;
+
+    let data: CloudRepoData =
+        serde_json::from_value(blob_with_rows()).expect("the blob shape still reads");
+    assert!(data.boundary.is_none());
+
+    // And a blob this scanner writes round-trips its boundary.
+    let mut stated = data;
+    stated.boundary = Some(carrick::boundary::ServiceBoundary {
+        commit_hash: "abc1234".to_string(),
+        files_attempted: 2,
+        ..Default::default()
+    });
+    let round_tripped: CloudRepoData =
+        serde_json::from_str(&serde_json::to_string(&stated).expect("serializes"))
+            .expect("round-trips");
+    let boundary = round_tripped
+        .boundary
+        .expect("the boundary survived the wire");
+    assert_eq!(boundary.commit_hash, "abc1234");
+    assert_eq!(boundary.files_attempted, 2);
+}
