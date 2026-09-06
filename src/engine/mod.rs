@@ -627,7 +627,11 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     //     structural-matching-only. Absent for edges the check didn't evaluate,
     //     which the cloud reads as "not compared" (fail closed, #324).
     if let Some(mut payloads) = upload_payloads {
-        crate::cloud_storage::attach_compat_verdicts(&mut payloads, &results.cross_repo_matches);
+        crate::cloud_storage::attach_compat_verdicts(
+            &mut payloads,
+            &results.cross_repo_matches,
+            &analyzer.pair_resolutions(),
+        );
         // SDK edges ride along on the same terms as the verdicts: small,
         // consumer-side, canonical-keyed, and attached before the size guard.
         crate::sdk_edges::attach_sdk_edges(&mut payloads, &sdk_join);
@@ -5888,7 +5892,7 @@ mod tests {
             producer_provenance: Default::default(),
             relationship: carrick_match::MatchRelationship::ProducerConsumer,
         }];
-        crate::cloud_storage::attach_compat_verdicts(&mut payloads, &matches);
+        crate::cloud_storage::attach_compat_verdicts(&mut payloads, &matches, &Default::default());
         assert!(
             serde_json::to_string(&payloads[0]).unwrap().len() > MAX_PAYLOAD_BYTES,
             "test setup: verdicts must push the payload over the cap"

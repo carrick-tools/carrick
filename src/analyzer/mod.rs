@@ -415,27 +415,27 @@ fn consumer_identity(location: &str) -> (String, u32) {
     parse_file_location(location)
 }
 
-/// How far the type layer got, read off the bucket its verdict landed in
-/// (cloud#599).
+/// How far the type layer got on one pair, read off the outcome's own
+/// `resolved` flag (carrick#734, cloud#599).
 ///
-/// `Incompatible` and `Compatible` are the compiler's own answers on a pair
-/// where both sides resolved: the capture-time deep walk (fails closed on an
-/// `any`/`unknown` at any depth, carrick#448) and the probe's whole-type
-/// IsAny/IsUnknown gates route everything else into the other two buckets. So
-/// a finding projected from `Incompatible` — the only bucket findings come
-/// from today — is `Resolved` by construction, and the rest of the mapping is
-/// stated here so a finding built off another bucket cannot silently claim it.
-fn verdict_state_for(
-    bucket: crate::services::type_sidecar::VerdictBucket,
-) -> crate::findings::VerdictState {
-    use crate::services::type_sidecar::VerdictBucket;
-    match bucket {
-        VerdictBucket::Incompatible | VerdictBucket::Compatible => {
-            crate::findings::VerdictState::Resolved
-        }
-        VerdictBucket::Unverifiable | VerdictBucket::GateCaughtBakedAny => {
-            crate::findings::VerdictState::Unresolved
-        }
+/// NOT the bucket. `Compatible` means the probe raised no assignment
+/// diagnostic, and the probe gates are whole-type only: a producer carrying
+/// `any` three members down clears every one of them and then reads compatible
+/// against any counterparty shape at all. Calling that `Resolved` tells a
+/// reader a comparison happened when none did. `resolved` (carrick#730) is
+/// true only when a deep walk over both sides, run in the assembled workspace
+/// after the pinned externals installed, found no `any`/`unknown` at any
+/// depth — so it is the only field that answers this question.
+///
+/// A verdict that exists but is not resolved is `Unresolved`: it was
+/// attempted and could not be reached. `NotChecked` is for a finding no
+/// verdict bears on at all, and is set where such a finding is built, not
+/// here.
+fn verdict_state_for(outcome: &PairCheckOutcome) -> crate::findings::VerdictState {
+    if outcome.resolved {
+        crate::findings::VerdictState::Resolved
+    } else {
+        crate::findings::VerdictState::Unresolved
     }
 }
 
@@ -494,25 +494,103 @@ fn normalize_compat_path(path: &str) -> String {
 /// produced NO pair outcome stays `None` — compat was never evaluated for
 /// it, and the old optimistic `Some(true)` default is gone: `Some(true)` now
 /// requires an explicit compatible verdict.
-pub(crate) fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [CrossRepoMatch]) {
-    // The per-pair verdict key: producer `(METHOD, normalized identity)` plus
-    // the consumer call-site identity `(file, line)`.
-    type VerdictKey = (String, String, (String, u32));
+/// The per-pair verdict key: producer `(METHOD, normalized identity)` plus the
+/// consumer call-site identity `(file, line)`.
+type VerdictKey = (String, String, (String, u32));
 
+/// The key an OUTCOME is filed under.
+fn verdict_key_of_outcome(outcome: &PairCheckOutcome) -> VerdictKey {
+    (
+        outcome.pseudo_method.clone(),
+        normalize_compat_path(&outcome.identity),
+        (
+            outcome.consumer_file.clone(),
+            if outcome.consumer_line == 0 {
+                1
+            } else {
+                outcome.consumer_line
+            },
+        ),
+    )
+}
+
+/// The same key recovered from an EDGE, or `None` when the edge cannot carry a
+/// verdict at all: a shared-external-contract pair (both sides are call sites),
+/// a producer key from a protocol the check never ran on, or an edge with no
+/// consumer location to attribute a verdict to.
+///
+/// One definition, so the verdict overlay and every later reader of a pair's
+/// resolution join identically. Two spellings of this key would silently
+/// disagree on exactly the parameterized routes the normalization exists for.
+fn verdict_key_of_edge(edge: &CrossRepoMatch) -> Option<VerdictKey> {
+    if edge.relationship != carrick_match::MatchRelationship::ProducerConsumer {
+        return None;
+    }
+    let (method, path) = parse_producer_key(&edge.producer_key)?;
+    let consumer = consumer_identity(edge.consumer_location.as_deref()?);
+    Some((method, normalize_compat_path(&path), consumer))
+}
+
+/// Whether one pair's verdict is a fact about two known types, and why not when
+/// it is not (carrick#730/#734).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairResolution {
+    /// True only when the bucket is compatible/incompatible AND the check's
+    /// deep walk found no `any`/`unknown` on either side, so a comparison
+    /// really happened between two known shapes.
+    pub resolved: bool,
+    /// Which side, and where in it, left the verdict unresolved. `None`
+    /// exactly when `resolved`.
+    pub unresolved_reason: Option<String>,
+}
+
+/// Every checked pair's resolution, joined to an edge by the same key the
+/// verdict overlay uses.
+///
+/// Built once and read wherever a reader needs to say whether a verdict is a
+/// comparison or the absence of one — the structured finding's `verdict_state`
+/// and the blob's `CompatVerdict`. Kept OFF [`CrossRepoMatch`] deliberately:
+/// that struct is the eval projection, and a field there would move every
+/// recorded row without changing a single answer.
+#[derive(Debug, Default)]
+pub struct PairResolutions {
+    by_key: HashMap<VerdictKey, PairResolution>,
+}
+
+impl PairResolutions {
+    /// Index the outcomes. An unresolved answer wins a key collision: two
+    /// type_kinds for one pair are one pairing, and it is only a fact when
+    /// both halves are.
+    pub fn from_outcomes(outcomes: &[PairCheckOutcome]) -> Self {
+        let mut by_key: HashMap<VerdictKey, PairResolution> = HashMap::new();
+        for outcome in outcomes {
+            let entry = by_key
+                .entry(verdict_key_of_outcome(outcome))
+                .or_insert_with(|| PairResolution {
+                    resolved: true,
+                    unresolved_reason: None,
+                });
+            if !outcome.resolved && entry.resolved {
+                entry.resolved = false;
+                entry.unresolved_reason = outcome.unresolved_reason.clone();
+            }
+        }
+        Self { by_key }
+    }
+
+    /// The resolution for one edge, or `None` when no outcome was filed for it
+    /// — the pair was never checked, which is not the same as unresolved.
+    pub fn for_edge(&self, edge: &CrossRepoMatch) -> Option<&PairResolution> {
+        self.by_key.get(&verdict_key_of_edge(edge)?)
+    }
+}
+
+pub(crate) fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [CrossRepoMatch]) {
     let mut incompatible: HashMap<VerdictKey, String> = HashMap::new();
     let mut unverifiable: HashSet<VerdictKey> = HashSet::new();
     let mut compatible: HashSet<VerdictKey> = HashSet::new();
     for outcome in outcomes {
-        let line = if outcome.consumer_line == 0 {
-            1
-        } else {
-            outcome.consumer_line
-        };
-        let key = (
-            outcome.pseudo_method.clone(),
-            normalize_compat_path(&outcome.identity),
-            (outcome.consumer_file.clone(), line),
-        );
+        let key = verdict_key_of_outcome(outcome);
         match outcome.bucket {
             crate::services::type_sidecar::VerdictBucket::Incompatible => {
                 // Multiple type_kinds for one pair collapse to the first
@@ -544,30 +622,18 @@ pub(crate) fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [
         // are verdict-exempt: `type_compatible` stays `None` (#379), and the
         // reason is cleared with it — `mismatch_reason` is only ever present
         // alongside `type_compatible == Some(false)`.
-        if edge.relationship != carrick_match::MatchRelationship::ProducerConsumer {
+        // `verdict_key_of_edge` returns `None` for the three edges that can
+        // carry no verdict: a shared-external-contract pair (both sides are
+        // call sites, so any comparison would be request-vs-request), a
+        // producer key from a protocol the check never ran on, and an edge
+        // with no consumer identity to attribute a verdict to. All three leave
+        // compat undetermined rather than fabricate `Some(true)` (#260, #379).
+        let Some(key) = verdict_key_of_edge(edge) else {
             edge.type_compatible = None;
             edge.type_verdict = None;
             edge.mismatch_reason = None;
             continue;
-        }
-        // Recover the join key from the producer_key: HTTP, socket, graphql,
-        // and pubsub all join here. Any other protocol was never checked, so
-        // its verdict is genuinely unknown — leave it `None` rather than
-        // fabricate `Some(true)` (#260, part 2).
-        let Some((method, path)) = parse_producer_key(&edge.producer_key) else {
-            edge.type_compatible = None;
-            edge.type_verdict = None;
-            continue;
         };
-        // Without a consumer identity the pair can't be matched to its own
-        // verdict, and asserting `Some(true)` would risk re-smearing — leave it
-        // `None` (compat undetermined for this edge).
-        let Some(consumer) = edge.consumer_location.as_deref().map(consumer_identity) else {
-            edge.type_compatible = None;
-            edge.type_verdict = None;
-            continue;
-        };
-        let key = (method, normalize_compat_path(&path), consumer);
         // `type_verdict` carries the three-way result WITHOUT the `Option<bool>`
         // collapse: `Unverifiable` stays distinct from "never evaluated"
         // (`None`), which is exactly what the honest "Verified" buckets need.
@@ -1045,10 +1111,8 @@ pub struct PairCheckOutcome {
     /// bucket is `compatible`/`incompatible` AND the check's deep walk, run
     /// after the pinned externals installed, found no `any`/`unknown` on
     /// either side.
-    #[allow(dead_code)]
     pub resolved: bool,
     /// Why `resolved` is false. `None` exactly when it is true.
-    #[allow(dead_code)]
     pub unresolved_reason: Option<String>,
 }
 
@@ -1080,6 +1144,17 @@ impl Analyzer {
 
     /// Store the structured v2 check outcomes for this run. Not calling this
     /// leaves compat unevaluated: every edge keeps `type_compatible: None`.
+    /// Every checked pair's resolution, for a reader that must say whether a
+    /// stored verdict is a comparison or the absence of one (carrick#734).
+    /// Empty when the check never ran, which reads as "no pair was checked"
+    /// rather than "no pair resolved".
+    pub fn pair_resolutions(&self) -> PairResolutions {
+        match self.pair_outcomes.as_ref() {
+            Some(outcomes) => PairResolutions::from_outcomes(outcomes),
+            None => PairResolutions::default(),
+        }
+    }
+
     pub fn set_pair_outcomes(&mut self, outcomes: Vec<PairCheckOutcome>) {
         self.pair_outcomes = Some(outcomes);
     }
@@ -2783,7 +2858,7 @@ impl Analyzer {
                 )
                 .with_producer_provenance(producer_provenance)
                 .with_edge_source(edge_source)
-                .with_verdict_state(Some(verdict_state_for(outcome.bucket)))
+                .with_verdict_state(Some(verdict_state_for(outcome)))
             })
             .collect()
     }
@@ -5340,6 +5415,84 @@ mod tests {
         };
         assert_eq!(call_sites, &vec!["server.ts:66".to_string()]);
         assert_eq!(detail, "NotificationStatus not assignable to StatusView");
+    }
+
+    /// The finding's verdict state comes from the outcome's `resolved` flag,
+    /// never from its bucket (carrick#734). An `Incompatible` bucket whose
+    /// deep walk found an `any` is a mismatch nobody established.
+    #[test]
+    fn verdict_state_follows_the_resolved_flag_not_the_bucket() {
+        for (resolved, expected) in [
+            (true, crate::findings::VerdictState::Resolved),
+            (false, crate::findings::VerdictState::Unresolved),
+        ] {
+            let mut row = outcome(
+                "GET",
+                "/api/orders/:id",
+                "src/client.ts:12",
+                VerdictBucket::Incompatible,
+                Some("Type 'A' is not assignable to type 'B'"),
+            );
+            row.resolved = resolved;
+            row.unresolved_reason =
+                (!resolved).then(|| "the producer type carries `any` at `data.items`".to_string());
+            let analyzer = analyzer_with_outcomes(vec![row]);
+
+            let findings = analyzer.get_type_mismatch_findings();
+            assert_eq!(findings.len(), 1);
+            let Finding::TypeMismatch { verdict_state, .. } = &findings[0] else {
+                panic!("expected a TypeMismatch finding, got {:?}", findings[0]);
+            };
+            assert_eq!(*verdict_state, Some(expected), "resolved = {resolved}");
+        }
+    }
+
+    /// The resolution index joins an edge by the same key the verdict overlay
+    /// used, an unresolved half of a pair wins, and an edge nobody checked
+    /// gets nothing rather than `unresolved`.
+    #[test]
+    fn pair_resolutions_join_by_the_verdict_key() {
+        let mut resolved_row = outcome(
+            "GET",
+            "/api/orders/:id",
+            PAYMENTS_CONSUMER_LOC,
+            VerdictBucket::Compatible,
+            None,
+        );
+        resolved_row.resolved = true;
+        // The same pair, other type_kind, deep-walked to an `any`: the pairing
+        // is only a fact when both halves are.
+        let mut unresolved_row = resolved_row.clone();
+        unresolved_row.resolved = false;
+        unresolved_row.unresolved_reason =
+            Some("the consumer type carries `any` at `body.meta`".to_string());
+
+        let resolutions =
+            PairResolutions::from_outcomes(&[resolved_row.clone(), unresolved_row.clone()]);
+        // Param spelling differs from the outcome's identity on purpose: the
+        // shared key normalizes both sides, and a second spelling of it would
+        // miss on exactly these routes.
+        let matched = edge("http|GET|/api/orders/:orderId");
+        let found = resolutions
+            .for_edge(&matched)
+            .expect("edge joins a verdict");
+        assert!(!found.resolved);
+        assert_eq!(
+            found.unresolved_reason.as_deref(),
+            Some("the consumer type carries `any` at `body.meta`")
+        );
+
+        // Order must not decide it.
+        let flipped = PairResolutions::from_outcomes(&[unresolved_row, resolved_row]);
+        assert_eq!(flipped.for_edge(&matched), Some(found));
+
+        // A producer nobody filed an outcome for: absent, not unresolved.
+        assert_eq!(resolutions.for_edge(&edge("http|GET|/api/other")), None);
+
+        // A shared-external-contract edge carries no producer contract at all.
+        let mut peer = matched.clone();
+        peer.relationship = carrick_match::MatchRelationship::SharedExternalContract;
+        assert_eq!(resolutions.for_edge(&peer), None);
     }
 
     /// A consumer location outside the GitHub Actions workspace passes through

@@ -1265,6 +1265,10 @@ mod tests {
             mismatch_reason: (!compatible)
                 .then(|| "Property 'amountCents' is missing in type 'Payment'".to_string()),
             scanner_version: "0.0.0-test".to_string(),
+            // The SDK repo's own blob, as an older scanner wrote it: it states
+            // no resolution, and this side must not invent one.
+            resolved: None,
+            unresolved_reason: None,
         }
     }
 
