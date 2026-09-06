@@ -32,15 +32,22 @@ pub fn answer(workspace_root: &Path, file: &Path, mode: Mode) -> Result<CheckOut
     let (repo, relative) = index.locate_file(file).ok_or(ReadError::NotInWorkspace)?;
     let items = repo.files.get(&relative).cloned().unwrap_or_default();
 
-    // The service is the file's own when the index holds rows for it, and the
-    // repo's single service otherwise. A file with no rows in a monorepo has
-    // no service to name, so the repo answers for it.
-    let service = items
+    // The service is the file's own when the index holds rows for it, and
+    // otherwise the service whose directory contains the file. Most files in a
+    // monorepo hold no row at all, so the directory is what answers in the
+    // common case; picking the repo's first service instead would answer for
+    // every rowless file in a 34-service tree with whichever one sorted first.
+    let service_row = items
         .first()
-        .map(|item| item.service.clone())
-        .or_else(|| repo.services.first().map(|service| service.name.clone()))
+        .and_then(|item| {
+            repo.services
+                .iter()
+                .find(|indexed| indexed.name == item.service)
+        })
+        .or_else(|| repo.service_for(&relative));
+    let service = service_row
+        .map(|service| service.name.clone())
         .unwrap_or_else(|| repo.name.clone());
-    let service_row = repo.services.iter().find(|indexed| indexed.name == service);
 
     let commit = service_row
         .map(|service| service.commit.clone())

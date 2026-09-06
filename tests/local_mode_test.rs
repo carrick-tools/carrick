@@ -24,6 +24,7 @@
 //! Every workspace is copied to a temp dir and `git init`-ed there: the tests
 //! edit producers and delete files, and a fixture is never mutated in place.
 
+use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -145,6 +146,7 @@ fn edit(file: &Path, from: &str, to: &str) {
 /// The whole cycle on the purpose-built workspace: a matched pair with a
 /// compiler verdict, a breaking edit, a refresh, and the verdict that follows.
 #[test]
+#[serial]
 fn local_mode_answers_and_follows_an_edit() {
     let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
     let root = workspace.path();
@@ -272,6 +274,7 @@ fn local_mode_answers_and_follows_an_edit() {
 /// The JSON is the contract in `docs/local-mode-output.md`, and the hook and
 /// the LSP shim are built against it.
 #[test]
+#[serial]
 fn the_json_matches_the_published_contract() {
     let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
     let root = workspace.path();
@@ -375,6 +378,7 @@ fn the_json_matches_the_published_contract() {
 /// The workspace question, with no file in it: what a surface opening a
 /// session asks (carrick#728).
 #[test]
+#[serial]
 fn status_answers_for_the_workspace() {
     let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
     let root = workspace.path();
@@ -453,6 +457,7 @@ fn status_answers_for_the_workspace() {
 /// the median of three runs, because a debug binary on a loaded CI box is not
 /// a stopwatch.
 #[test]
+#[serial]
 fn a_read_costs_what_a_hook_can_afford() {
     let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
     let root = workspace.path();
@@ -475,6 +480,7 @@ fn a_read_costs_what_a_hook_can_afford() {
 /// The same commands over a corpus written for something else: the counterpart
 /// a reader wants is named, across repos, from facts alone.
 #[test]
+#[serial]
 fn local_mode_answers_over_a_real_corpus() {
     let workspace = workspace(
         "xrepo-corpus-1",
@@ -484,6 +490,25 @@ fn local_mode_answers_over_a_real_corpus() {
     index(root);
 
     // A GraphQL producer names its consumer in another repo.
+    // A file with no indexed rows still answers, and it answers for the
+    // service whose DIRECTORY holds it. A monorepo's rowless files are most of
+    // its files, and naming the wrong service there is silent and wrong. Both
+    // services are asserted because either one alone would pass on whichever
+    // service happened to sort first.
+    for (file, service) in [
+        ("orders-monorepo/packages/gateway/src/index.ts", "(gateway,"),
+        (
+            "orders-monorepo/packages/orders-pkg/src/types.ts",
+            "(orders-pkg,",
+        ),
+    ] {
+        let rowless = touch(root, file);
+        assert!(
+            rowless.contains(service),
+            "{file} belongs to the service whose directory holds it:\n{rowless}"
+        );
+    }
+
     let schema = touch(root, "orders-monorepo/packages/gateway/src/schema.graphql");
     assert!(
         schema.contains("QUERY order"),
@@ -514,6 +539,7 @@ fn local_mode_answers_over_a_real_corpus() {
 /// — is where a local index is thinnest, and the one place it must not read as
 /// "there is no API here".
 #[test]
+#[serial]
 fn a_thin_index_says_what_it_could_not_classify() {
     let workspace = workspace("xrepo-corpus-2", &["notifications-svc"]);
     let root = workspace.path();

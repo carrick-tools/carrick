@@ -1601,6 +1601,14 @@ async fn generate_extraction_config(
     detection: &DetectionResult,
     packages: &Packages,
 ) -> Option<crate::services::type_sidecar::ExtractionConfig> {
+    // Local mode makes no model call at all, and this is one (carrick#708).
+    // Without the gate a laptop scan fires it, fails on the missing OIDC
+    // credential, and prints GitHub Actions advice to somebody who is not in
+    // CI — while the scan proceeds without unwrapping either way.
+    if crate::local_mode::no_model() {
+        debug!("Local mode: skipping extraction-config generation (no model)");
+        return None;
+    }
     let dependencies = packages.cleaned_dependency_names();
     match agent
         .fetch_extraction_config(detection, &dependencies)

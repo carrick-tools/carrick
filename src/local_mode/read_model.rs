@@ -125,6 +125,13 @@ pub struct IndexedItem {
 pub struct IndexedService {
     /// `service_name ?? repo_name` — what every counterpart names it by.
     pub name: String,
+    /// The service's root inside its repo, as `carrick.json` declares it
+    /// (`packages/gateway`). `None` for a single-service repo, which owns the
+    /// whole tree. It is what decides which service a file with no indexed
+    /// rows belongs to: without it, a monorepo answers for every such file
+    /// with whichever service sorted first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory: Option<String>,
     pub commit: String,
     /// RFC 3339, when this service was last indexed or refreshed.
     pub indexed_at: String,
@@ -142,6 +149,41 @@ pub struct IndexedRepo {
     pub services: Vec<IndexedService>,
     /// Repo-relative path -> the rows the index holds for it, in line order.
     pub files: BTreeMap<String, Vec<IndexedItem>>,
+}
+
+impl IndexedRepo {
+    /// The service a repo-relative path belongs to: the one whose directory is
+    /// the longest prefix of it, and the repo's only service when that service
+    /// declares no directory.
+    ///
+    /// Most files in a monorepo hold no indexed row at all, so this — not the
+    /// rows — is what names the service in the common case.
+    pub fn service_for(&self, relative: &str) -> Option<&IndexedService> {
+        let mut best: Option<&IndexedService> = None;
+        for service in &self.services {
+            let matches = match service.directory.as_deref() {
+                Some(directory) => {
+                    let directory = directory.trim_matches('/');
+                    !directory.is_empty()
+                        && (relative == directory || relative.starts_with(&format!("{directory}/")))
+                }
+                // A service with no directory owns the whole repo, and is only
+                // the answer when nothing more specific claims the path.
+                None => true,
+            };
+            if !matches {
+                continue;
+            }
+            let longer = best.as_ref().is_none_or(|current| {
+                current.directory.as_deref().map_or(0, str::len)
+                    < service.directory.as_deref().map_or(0, str::len)
+            });
+            if longer {
+                best = Some(service);
+            }
+        }
+        best
+    }
 }
 
 /// The whole read model.

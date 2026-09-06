@@ -115,13 +115,16 @@ impl Workspace {
 /// the first two exist because a repo listed as `../shared-client` is not
 /// under the workspace at all, so no walk from the file can reach it.
 pub fn locate(explicit: Option<&Path>, file: Option<&Path>) -> Option<PathBuf> {
+    // Canonicalized on every path out of here: the output contract states an
+    // absolute workspace, and `--workspace .` is the ordinary way a hook
+    // invokes this.
     if let Some(root) = explicit {
-        return Some(root.to_path_buf());
+        return Some(absolute(root));
     }
     if let Ok(root) = std::env::var(WORKSPACE_ENV)
         && !root.is_empty()
     {
-        return Some(PathBuf::from(root));
+        return Some(absolute(Path::new(&root)));
     }
     let from_file = file
         .and_then(|f| f.parent().map(Path::to_path_buf))
@@ -130,6 +133,13 @@ pub fn locate(explicit: Option<&Path>, file: Option<&Path>) -> Option<PathBuf> {
         return from_file;
     }
     std::env::current_dir().ok().and_then(|dir| walk_up(&dir))
+}
+
+/// An absolute path for a directory, falling back to what the caller wrote
+/// when it cannot be resolved — a wrong-looking path in the output beats
+/// refusing to answer.
+fn absolute(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The nearest ancestor holding a workspace file (or an index built from one).
@@ -210,6 +220,19 @@ mod tests {
         let dir = workspace_with(r#"{"repos": ["./api"]}"#);
         let other = tempfile::tempdir().unwrap();
         let found = locate(Some(other.path()), Some(&dir.path().join("api/src/x.ts"))).unwrap();
-        assert_eq!(found, other.path());
+        assert_eq!(found, other.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn locate_answers_with_an_absolute_path() {
+        // `--workspace .` is how a hook invokes this, and the contract says
+        // the workspace it reports is absolute.
+        let dir = workspace_with(r#"{"repos": ["./api"]}"#);
+        std::fs::create_dir(dir.path().join("api")).unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let found = locate(Some(Path::new(".")), None).unwrap();
+        std::env::set_current_dir(previous).unwrap();
+        assert!(found.is_absolute(), "{found:?}");
     }
 }

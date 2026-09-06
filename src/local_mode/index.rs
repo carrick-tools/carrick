@@ -207,6 +207,19 @@ fn service_id(blob: &CloudRepoData) -> String {
         .unwrap_or_else(|| blob.repo_name.clone())
 }
 
+/// The service root this blob was scanned with, from the config it carries.
+/// `None` for a single-service repo and for a blob whose config does not
+/// parse — both mean "this service is not confined to a subdirectory".
+fn service_directory(blob: &CloudRepoData) -> Option<String> {
+    let config = blob.config_json.as_deref()?;
+    let parsed: serde_json::Value = serde_json::from_str(config).ok()?;
+    parsed
+        .get("directory")?
+        .as_str()
+        .map(|directory| directory.trim_matches('/').to_string())
+        .filter(|directory| !directory.is_empty())
+}
+
 /// Every blob in the cache dir, in a stable order.
 fn read_blobs(blobs: &Path) -> Result<Vec<CloudRepoData>, String> {
     let Ok(entries) = std::fs::read_dir(blobs) else {
@@ -248,6 +261,7 @@ fn build(workspace: &Workspace, blobs_dir: &Path, join: &LocalJoin) -> Result<Lo
             .filter(|blob| blob.repo_name == name)
             .map(|blob| IndexedService {
                 name: service_id(blob),
+                directory: service_directory(blob),
                 commit: blob.commit_hash.clone(),
                 indexed_at: now.clone(),
                 boundary: blob.boundary.clone(),
