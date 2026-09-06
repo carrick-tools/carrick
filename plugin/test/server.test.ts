@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { LspClient } from "./lsp-client.ts";
-import { fakeEnv, fixturePath, makeWorkspace } from "./helpers.ts";
+import { fakeEnv, firstCall, fixturePath, makeWorkspace } from "./helpers.ts";
 
 test("didOpen publishes the check verdicts, on the file and on its counterparts", async (t) => {
   const workspace = makeWorkspace();
@@ -38,13 +38,10 @@ test("the CLI runs from the workspace root with the file relative to it", async 
 
   await client.initialize(workspace.root);
   client.open(workspace.file);
-  await client.waitFor(() => fs.existsSync(argvLog), "a CLI call");
-  await client.settle(100);
+  await client.waitFor(() => firstCall(argvLog) !== null, "a CLI call");
 
-  const call = JSON.parse(fs.readFileSync(argvLog, "utf8").trim().split("\n")[0] as string) as {
-    argv: string[];
-    cwd: string;
-  };
+  const call = firstCall(argvLog);
+  assert.ok(call);
   assert.deepEqual(call.argv, ["check", "user-service/src/routes/users.ts", "--json"]);
   assert.equal(fs.realpathSync(call.cwd), fs.realpathSync(workspace.root));
 });
@@ -63,11 +60,10 @@ test("a client rooted inside one service is corrected to the workspace, and logg
   // The cwd trap: rootUri follows the agent's shell, so it can name a service.
   await client.initialize(workspace.service);
   client.open(workspace.file);
-  await client.waitFor(() => fs.existsSync(argvLog), "a CLI call");
+  await client.waitFor(() => firstCall(argvLog) !== null, "a CLI call");
 
-  const call = JSON.parse(fs.readFileSync(argvLog, "utf8").trim().split("\n")[0] as string) as {
-    cwd: string;
-  };
+  const call = firstCall(argvLog);
+  assert.ok(call);
   assert.equal(fs.realpathSync(call.cwd), fs.realpathSync(workspace.root));
   // stderr arrives on its own schedule, so wait for the line rather than
   // assuming it landed before the CLI call did.
@@ -88,7 +84,7 @@ test("a burst of didChange checks once", async (t) => {
 
   await client.initialize(workspace.root);
   for (let version = 1; version <= 5; version += 1) client.change(workspace.file, version);
-  await client.waitFor(() => fs.existsSync(argvLog), "a CLI call");
+  await client.waitFor(() => firstCall(argvLog) !== null, "a CLI call");
   await client.settle(600);
 
   const calls = fs.readFileSync(argvLog, "utf8").trim().split("\n");

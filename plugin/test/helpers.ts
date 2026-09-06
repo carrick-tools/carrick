@@ -74,6 +74,24 @@ export function makeWorkspace(): Workspace {
   };
 }
 
+/**
+ * The first complete call the fake CLI logged, or null while it is mid-write.
+ *
+ * `existsSync` goes true when the file is created, which can be before the line
+ * in it is whole, so a test waits on this rather than on the file.
+ */
+export function firstCall(argvLog: string): { argv: string[]; cwd: string } | null {
+  try {
+    const line = fs
+      .readFileSync(argvLog, "utf8")
+      .split("\n")
+      .find((candidate) => candidate.trim().length > 0);
+    return line ? (JSON.parse(line) as { argv: string[]; cwd: string }) : null;
+  } catch {
+    return null;
+  }
+}
+
 export type HookRun = { stdout: string; stderr: string; code: number | null; ms: number };
 
 /** Run one of the hook scripts the way Claude Code runs it: payload on stdin. */
@@ -114,6 +132,9 @@ export function fakeEnv(overrides: Record<string, string> = {}): NodeJS.ProcessE
     CARRICK_BIN: fakeBin,
     CARRICK_LOG_QUIET: "1",
     CARRICK_FAKE_FIXTURE: fixturePath("check-mismatch.json"),
+    // The fixtures speak in absolute paths under /workspace; an integration
+    // test's workspace is a fresh temp directory, so the fake CLI rebases them.
+    CARRICK_FAKE_REBASE: "1",
     ...overrides,
   };
 }

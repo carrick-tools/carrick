@@ -4,7 +4,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { editPayload, fakeEnv, fixturePath, makeWorkspace, runHook } from "./helpers.ts";
+import { editPayload, fakeEnv, firstCall, fixturePath, makeWorkspace, runHook } from "./helpers.ts";
 
 test("an edit gets the verdicts as additionalContext", async (t) => {
   const workspace = makeWorkspace();
@@ -50,7 +50,7 @@ test("a file with no indexed rows still gets the boundary", async (t) => {
   const context = (
     JSON.parse(clean.stdout) as { hookSpecificOutput: { additionalContext: string } }
   ).hookSpecificOutput.additionalContext;
-  assert.match(context, /41 candidate\(s\) not classified locally/);
+  assert.match(context, /A local index holds what the deterministic passes state/);
 });
 
 test("the hook is silent when there is nothing to say", async (t) => {
@@ -163,13 +163,11 @@ test("the session line asks status about the workspace, and states what it holds
     }),
   });
   assert.equal(run.code, 0);
-  assert.match(run.stdout, /^Carrick indexed 3 service\(s\) in \/workspace/);
+  assert.match(run.stdout, /^Carrick indexed 3 service\(s\) in \S+ at 2026-09-06T21:14:03Z/);
   assert.match(run.stdout, /\n- user-service at 6a1b2c3: 157 route\(s\), 12 call\(s\), changed since index: 7 \(/);
   assert.match(run.stdout, /\n- user-admin .*Same repo as user-service, so the same 7 changed file\(s\)/);
-  const call = JSON.parse(fs.readFileSync(argvLog, "utf8").trim()) as {
-    argv: string[];
-    cwd: string;
-  };
+  const call = firstCall(argvLog);
+  assert.ok(call);
   assert.deepEqual(call.argv.slice(0, 2), ["status", "--workspace"]);
   assert.equal(call.argv.at(-1), "--json");
   assert.equal(fs.realpathSync(call.cwd), fs.realpathSync(workspace.root));

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { binary, check, status, timeoutMs } from "../src/cli.ts";
-import { fakeBin, fakeEnv, fixturePath, makeWorkspace } from "./helpers.ts";
+import { fakeBin, fakeEnv, firstCall, fixturePath, makeWorkspace } from "./helpers.ts";
 
 test("the binary is `carrick` on PATH unless CARRICK_BIN names another", () => {
   assert.equal(binary({}), "carrick");
@@ -28,7 +28,8 @@ test("check runs the binary from the workspace root and parses its answer", asyn
   });
   assert.equal(outcome.failure, null);
   assert.equal(outcome.result?.service, "user-service");
-  const call = JSON.parse(fs.readFileSync(argvLog, "utf8").trim()) as { argv: string[] };
+  const call = firstCall(argvLog);
+  assert.ok(call);
   assert.deepEqual(call.argv, ["check", "user-service/src/routes/users.ts", "--json"]);
 });
 
@@ -48,7 +49,8 @@ test("status asks about the workspace and takes no file", async (t) => {
   });
   assert.equal(outcome.result?.services.length, 3);
   assert.equal(outcome.result?.services[0]?.routes, 157);
-  const call = JSON.parse(fs.readFileSync(argvLog, "utf8").trim()) as { argv: string[] };
+  const call = firstCall(argvLog);
+  assert.ok(call);
   assert.deepEqual(call.argv, ["status", "--workspace", workspace.root, "--json"]);
 });
 
@@ -66,7 +68,8 @@ test("status without a named workspace lets the CLI find the index", async (t) =
     }),
     bin: fakeBin,
   });
-  const call = JSON.parse(fs.readFileSync(argvLog, "utf8").trim()) as { argv: string[] };
+  const call = firstCall(argvLog);
+  assert.ok(call);
   assert.deepEqual(call.argv, ["status", "--json"]);
 });
 

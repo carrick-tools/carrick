@@ -30,8 +30,6 @@ export type Boundary = {
   model_endpoints_discarded_in_claimed_modules?: number;
   routes_without_response_type?: Counted;
   calls_without_expected_type?: Counted;
-  /** Local mode runs no model, so nothing it indexed was classified by one. */
-  candidates_not_classified?: number;
   types_degraded?: { stage?: string; detail?: string };
   bare_checkout?: boolean;
 };
@@ -43,6 +41,9 @@ export type Counterpart = {
    */
   role: "producer" | "consumer" | "peer" | string;
   service?: string;
+  /** Absolute path of the counterpart's repo; null when the index lost it. */
+  repo?: string | null;
+  /** Relative to the counterpart's own repo, which is not the queried file's. */
   file?: string;
   line?: number;
 };

@@ -114,7 +114,7 @@ test("a file with no indexed rows still carries the boundary", () => {
   const context = renderPostToolUse(fixture("check-clean.json")) ?? "";
   assert.match(context, /^Carrick checked src\/util\/format\.ts/);
   assert.equal(context.split("\n").some((line) => line.startsWith("- ")), false);
-  assert.match(context, /41 candidate\(s\) not classified locally: no model runs on this machine/);
+  assert.match(context, /^Boundary: A local index holds what the deterministic passes state/m);
 });
 
 test("nothing to say prints nothing", () => {
@@ -145,9 +145,6 @@ test("the boundary keeps the CLI's wording", () => {
     lines.includes("  1 call site(s) that named a client member and did not resolve to it (usersClient.get)"),
   );
   assert.ok(lines.includes("  4 bare route-literal call site(s) left unclassified"));
-  assert.ok(
-    lines.includes("  41 candidate(s) not classified locally: no model runs on this machine"),
-  );
   assert.ok(lines.includes("  6 row(s) the model alone states (11 joined a deterministic row)"));
   assert.ok(
     lines.includes("  1 model endpoint(s) dropped in modules a routing convention claims"),
@@ -201,9 +198,12 @@ test("the session line ends with each service's boundary lines, verbatim", () =>
 });
 
 test("a local index dispatches nothing, so the header drops the analyzer count", () => {
-  const lines = boundaryLines({ commit_hash: "abc1234def", files_attempted: 0, candidates_not_classified: 3 }, "webapp");
+  const lines = boundaryLines(
+    { commit_hash: "abc1234def", files_attempted: 0, unemitted_literal_candidates: 3 },
+    "webapp",
+  );
   assert.equal(lines[0], "webapp at abc1234");
-  assert.equal(lines[1], "  3 candidate(s) not classified locally: no model runs on this machine");
+  assert.equal(lines[1], "  3 bare route-literal call site(s) left unclassified");
 });
 
 test("a boundary with a degraded type stage says which stage", () => {

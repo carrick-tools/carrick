@@ -20,11 +20,11 @@
 // not a file with no contracts. One information diagnostic carries the boundary
 // on every checked file that has one.
 //
-// Counterpart paths are relative to the counterpart's OWN repo, and the payload
-// does not name that repo's directory. So a counterpart location is resolved
-// against the workspace root and against `<root>/<service>`, and when neither
-// exists the site stays in the message text and gets no URI: a wrong URI is
-// worse than a location the reader has to open themselves.
+// A counterpart's `file` is relative to its OWN repo, and the payload names
+// that repo absolutely, so `repo` + `file` is the path and nothing is guessed.
+// `repo` is null when the index no longer holds the counterpart's repo: then
+// there is no path to give, the site stays in the message text with no URI, and
+// no diagnostic is mirrored onto a file this machine cannot point at.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -123,27 +123,21 @@ function defaultExists(target: string): boolean {
 }
 
 /**
- * Where a counterpart's repo-relative path lands on this disk, or null.
+ * Where a counterpart lands on this disk, or null when it cannot be pointed at.
  *
- * `<root>/<file>` covers a workspace whose repo directory is already in the
- * path; `<root>/<service>/<file>` covers the common layout where the service
- * name is its directory.
+ * `repo` + `file`, and nothing else: the payload states the repo absolutely, so
+ * a reader that also tried the workspace root or a directory named after the
+ * service would be guessing at paths the producer already knows.
  */
 export function resolveCounterpart(
-  root: string,
   counterpart: Counterpart,
   exists: (target: string) => boolean = defaultExists,
-  ownRepo?: string,
 ): string | null {
   if (!counterpart.file) return null;
   if (path.isAbsolute(counterpart.file)) return exists(counterpart.file) ? counterpart.file : null;
-  const candidates = [path.resolve(root, counterpart.file)];
-  if (counterpart.service) {
-    candidates.push(path.resolve(root, counterpart.service, counterpart.file));
-  }
-  // A counterpart in the queried file's own repo resolves against `repo`.
-  if (ownRepo) candidates.push(path.resolve(ownRepo, counterpart.file));
-  return candidates.find((candidate) => exists(candidate)) ?? null;
+  if (!counterpart.repo) return null;
+  const target = path.resolve(counterpart.repo, counterpart.file);
+  return exists(target) ? target : null;
 }
 
 export type DiagnosticOptions = {
@@ -183,7 +177,7 @@ export function toDiagnostics(
   for (const item of problemItems(result)) {
     const counterparts = item.counterparts ?? [];
     const related = counterparts
-      .map((counterpart) => ({ counterpart, resolved: resolveCounterpart(root, counterpart, exists, result.repo) }))
+      .map((counterpart) => ({ counterpart, resolved: resolveCounterpart(counterpart, exists) }))
       .filter((entry) => entry.resolved !== null)
       .map((entry) => ({
         location: {
@@ -203,7 +197,7 @@ export function toDiagnostics(
     put(checkedAbs, diagnostic);
 
     for (const counterpart of counterparts) {
-      const resolved = resolveCounterpart(root, counterpart, exists, result.repo);
+      const resolved = resolveCounterpart(counterpart, exists);
       if (!resolved) continue;
       const mirrored: Diagnostic = {
         range: rangeAt(counterpart.line, 1),

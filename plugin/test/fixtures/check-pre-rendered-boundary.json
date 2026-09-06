@@ -31,7 +31,7 @@
           "service": "billing-service",
           "file": "src/lookup.ts",
           "line": 7,
-          "repo": "/workspace/billing-service"
+          "repo": null
         }
       ],
       "verdict": {
@@ -147,7 +147,6 @@
         "src/legacy/other.ts: no answer"
       ]
     },
-    "candidates_not_classified": 41,
     "unemitted_literal_candidates": 4,
     "consumers_not_resolved": {
       "total": 1,

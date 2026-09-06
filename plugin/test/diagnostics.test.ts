@@ -8,13 +8,14 @@ const ROOT = "/workspace";
 const CHECKED = "user-service/src/routes/users.ts";
 const CHECKED_ABS = path.resolve(ROOT, CHECKED);
 
-/** Counterpart paths are repo-relative, so these are the files on this disk. */
+/** `repo` + `file` for every counterpart the fixtures name, as it is on disk. */
 const onDisk = new Set(
   [
     "order-service/src/clients/users.ts",
     "order-service/src/server.ts",
     "billing-service/src/lookup.ts",
     "billing-service/src/charges.ts",
+    "audit-service/src/routes/audit.ts",
   ].map((file) => path.resolve(ROOT, file)),
 );
 const exists = (target: string): boolean => onDisk.has(target);
@@ -87,7 +88,7 @@ test("the boundary is published even when nothing is wrong", () => {
   assert.equal(edited?.length, 1);
   assert.equal(edited?.[0]?.code, "boundary");
   assert.equal(edited?.[0]?.severity, SEVERITY.information);
-  assert.match(edited?.[0]?.message ?? "", /41 candidate\(s\) not classified locally/);
+  assert.match(edited?.[0]?.message ?? "", /A local index holds what the deterministic passes state/);
 });
 
 test("the boundary diagnostic carries the CLI's own lines when they arrive", () => {
@@ -112,7 +113,7 @@ test("the range is zero-based and one character wide", () => {
 test("counterpart sites are in the message text and in relatedInformation (E18)", () => {
   const first = diagnosticsFor("check-mismatch.json").get(CHECKED_ABS)?.[0];
   assert.match(first?.message ?? "", /Counterparts: consumer in order-service, src\/clients\/users\.ts:18/);
-  assert.equal(first?.relatedInformation?.length, 2);
+  assert.equal(first?.relatedInformation?.length, 1);
   assert.match(
     first?.relatedInformation?.[0]?.location.uri ?? "",
     /file:\/\/\/workspace\/order-service\/src\/clients\/users\.ts$/,
@@ -151,7 +152,6 @@ test("the same finding is published at each counterpart site", () => {
   assert.equal(consumer?.length, 1);
   assert.match(consumer?.[0]?.message ?? "", /^consumer in order-service of src\/routes\/users\.ts\./);
   assert.equal(consumer?.[0]?.range.start.line, 17);
-  assert.equal(byFile.has(path.resolve(ROOT, "billing-service/src/lookup.ts")), true);
   assert.equal(byFile.has(path.resolve(ROOT, "order-service/src/server.ts")), true);
 });
 
@@ -165,15 +165,36 @@ test("a counterpart path that is not on this disk gets no URI", () => {
   assert.equal(byFile.size, 1, "only the checked file, and no guessed location");
 });
 
-test("resolveCounterpart tries the workspace root and the service directory", () => {
+test("a counterpart resolves through its own repo, and nothing is guessed", () => {
   assert.equal(
-    resolveCounterpart(ROOT, { role: "consumer", service: "order-service", file: "src/server.ts" }, exists),
+    resolveCounterpart(
+      { role: "consumer", service: "order-service", repo: "/workspace/order-service", file: "src/server.ts" },
+      exists,
+    ),
     path.resolve(ROOT, "order-service/src/server.ts"),
   );
+  // The index no longer holds the repo: there is no path to give, and the
+  // workspace root is not a substitute for one.
   assert.equal(
-    resolveCounterpart(ROOT, { role: "consumer", service: "nowhere", file: "src/server.ts" }, exists),
+    resolveCounterpart({ role: "consumer", service: "order-service", repo: null, file: "src/server.ts" }, exists),
     null,
   );
+  assert.equal(
+    resolveCounterpart(
+      { role: "consumer", service: "order-service", repo: "/elsewhere", file: "src/server.ts" },
+      exists,
+    ),
+    null,
+  );
+});
+
+test("a counterpart whose repo the index lost stays in the text with no URI", () => {
+  const byFile = diagnosticsFor("check-mismatch.json");
+  const first = byFile.get(CHECKED_ABS)?.[0];
+  // Two consumers on that row, one of them with repo: null.
+  assert.equal(first?.relatedInformation?.length, 1);
+  assert.match(first?.message ?? "", /consumer in billing-service, src\/lookup\.ts:7/);
+  assert.equal(byFile.has(path.resolve(ROOT, "billing-service/src/lookup.ts")), false);
 });
 
 test("a deleted file is surfaced as producer removed", () => {

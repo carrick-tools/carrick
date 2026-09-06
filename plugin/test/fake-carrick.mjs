@@ -10,6 +10,10 @@
 //   CARRICK_FAKE_DELAY_MS milliseconds to wait before printing
 //   CARRICK_FAKE_EXIT     exit code to use, with nothing on stdout
 //   CARRICK_FAKE_ARGV_LOG file to append the argv and cwd of every call to
+//   CARRICK_FAKE_REBASE   "1" rewrites the fixtures' `/workspace` prefix to the
+//                         working directory, so the absolute `repo` paths a
+//                         payload carries point at the throwaway workspace an
+//                         integration test just built
 
 import fs from "node:fs";
 import path from "node:path";
@@ -35,7 +39,11 @@ const fixture = process.env.CARRICK_FAKE_FIXTURE
 
 const delay = process.env.CARRICK_FAKE_DELAY_MS ? Number(process.env.CARRICK_FAKE_DELAY_MS) : 0;
 const print = () => {
-  process.stdout.write(fs.readFileSync(fixture, "utf8"));
+  let body = fs.readFileSync(fixture, "utf8");
+  if (process.env.CARRICK_FAKE_REBASE === "1") {
+    body = body.split('"/workspace').join(`"${process.cwd()}`);
+  }
+  process.stdout.write(body);
   process.exit(0);
 };
 if (delay > 0) setTimeout(print, delay);

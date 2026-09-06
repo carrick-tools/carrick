@@ -62,11 +62,6 @@ export function boundaryLines(boundary: Boundary | undefined, service: string | 
   push(boundary.unknown_call_paths, "indexed call(s) whose path no producer may claim");
   push(boundary.routes_without_response_type, "route(s) with no resolved response type");
   push(boundary.calls_without_expected_type, "call(s) with no resolved expected type");
-  if ((boundary.candidates_not_classified ?? 0) > 0) {
-    out.push(
-      `  ${boundary.candidates_not_classified} candidate(s) not classified locally: no model runs on this machine`,
-    );
-  }
   if ((boundary.unemitted_literal_candidates ?? 0) > 0) {
     out.push(
       `  ${boundary.unemitted_literal_candidates} bare route-literal call site(s) left unclassified`,
