@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.42](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.41...carrick-v0.3.42) (2026-09-06)
+
+
+### Features
+
+* **action:** install the scanned repo's dependencies when a lockfile is present ([#721](https://github.com/carrick-tools/carrick/issues/721)) ([a9a3edd](https://github.com/carrick-tools/carrick/commit/a9a3eddcdd0a64e554cbfaad8fe6bb5cd8eaba33)), closes [#706](https://github.com/carrick-tools/carrick/issues/706)
+* **findings:** state each finding's source and verdict state on the wire ([#727](https://github.com/carrick-tools/carrick/issues/727)) ([86be20f](https://github.com/carrick-tools/carrick/commit/86be20f7f13a974323afe95b0084d505b63b3cde))
+* **local:** read-only facts from your disk — carrick index | status | touch | check | refresh ([#736](https://github.com/carrick-tools/carrick/issues/736)) ([4ca61fa](https://github.com/carrick-tools/carrick/commit/4ca61faff5155cdc911720d63a7f1a5881eca756))
+* **sidecar:** read the payload a route handler serialises, and say why a type is any ([#730](https://github.com/carrick-tools/carrick/issues/730)) ([21f736f](https://github.com/carrick-tools/carrick/commit/21f736f10c959ad095ae9408993c8e49822d909e))
+
+
+### Bug Fixes
+
+* **findings:** read a verdict's state from its resolution, not its bucket ([#737](https://github.com/carrick-tools/carrick/issues/737)) ([bab8369](https://github.com/carrick-tools/carrick/commit/bab83690e1ad8c530f5377c8ce87788f37548148))
+
 ## [0.3.41](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.40...carrick-v0.3.41) (2026-09-06)
 
 
