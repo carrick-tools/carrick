@@ -36,5 +36,7 @@
       "total": 0
     },
     "bare_checkout": false
-  }
+  },
+  "repo": "/workspace/user-service",
+  "boundary_note": "A local index holds what the deterministic passes state: 41 candidate(s) in this service need a model and were not classified here."
 }

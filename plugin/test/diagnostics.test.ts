@@ -102,6 +102,14 @@ test("counterpart sites are in the message text and in relatedInformation (E18)"
   assert.equal(first?.relatedInformation?.[0]?.location.range.start.line, 17);
 });
 
+test("a diagnostic never prints the word null, and says when a verdict is about the indexed tree", () => {
+  const edited = diagnosticsFor("check-mismatch.json").get(CHECKED_ABS) ?? [];
+  const messages = edited.map((diagnostic) => diagnostic.message).join("\n");
+  assert.equal(/\bnull\b/.test(messages), false);
+  const stale = edited.find((diagnostic) => diagnostic.message.includes("/api/audit/:id"));
+  assert.match(stale?.message ?? "", /type_mismatch \(unresolved, so it describes the indexed version\)/);
+});
+
 test("a candidate diagnostic says it is a reading of the code", () => {
   const candidate = diagnosticsFor("check-mismatch.json")
     .get(CHECKED_ABS)

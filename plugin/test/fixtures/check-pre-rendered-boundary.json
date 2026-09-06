@@ -97,7 +97,7 @@
       "verdict": {
         "state": "unresolved",
         "result": "type_mismatch",
-        "detail": "the expected type resolved to `any`, so the shapes were compared without one side"
+        "detail": "this file changed since the index, so the comparison is against the indexed version"
       }
     },
     {
@@ -167,7 +167,10 @@
     "bare_checkout": true
   },
   "boundary_lines": [
+    "A local index holds what the deterministic passes state: 41 candidate(s) in this service need a model and were not classified here.",
     "boundary (user-service): 41 candidates not classified locally, 4 unemitted literal",
     "candidates. Candidates are not classified locally: no model runs on this machine."
-  ]
+  ],
+  "repo": "/workspace/user-service",
+  "boundary_note": "A local index holds what the deterministic passes state: 41 candidate(s) in this service need a model and were not classified here."
 }

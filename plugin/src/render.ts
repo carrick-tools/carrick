@@ -101,7 +101,11 @@ export function boundaryLines(boundary: Boundary | undefined, service: string | 
  */
 export function boundaryFor(result: CheckResult): string[] {
   if (result.boundary_lines?.length) return result.boundary_lines;
-  return boundaryLines(result.boundary, result.service);
+  const counts = boundaryLines(result.boundary, result.service);
+  // `boundary_note` is the sentence about what a local index cannot hold at
+  // all, and it leads the CLI's own lines, so it leads these too.
+  if (result.boundary_note) return [result.boundary_note, ...counts];
+  return counts;
 }
 
 /** True when the lines came from the CLI rather than from the port above. */
@@ -143,10 +147,34 @@ function sourceLabel(item: CheckItem): string {
   return parts.length ? ` [${parts.join(", ")}]` : "";
 }
 
+/**
+ * The state in words. `not_checked` and `unresolved` are the two that change
+ * what a result means, and both have to survive into the rendered line.
+ */
+export function stateWord(state: string | undefined): string {
+  if (state === "not_checked") return "not checked";
+  if (state === "unresolved") return "unresolved, so it describes the indexed version";
+  return state ?? "";
+}
+
+/**
+ * What is known about the contract at this row.
+ *
+ * A `not_checked` verdict carries `result: null` by contract, so there is no
+ * result word to print and the state is the whole answer. Every state other
+ * than `resolved` rides along with the result, because a `type_mismatch` about
+ * the indexed tree and one about the tree on disk read identically otherwise.
+ */
 function verdictText(item: CheckItem): string {
   if (!item.verdict) return "";
   const { state, result, detail } = item.verdict;
-  const head = result === "compatible" && state !== "resolved" ? `${result} (${state})` : result;
+  const head =
+    result == null
+      ? stateWord(state)
+      : state === "resolved"
+        ? result
+        : `${result} (${stateWord(state)})`;
+  if (!head) return detail ? ` ${detail}` : "";
   return detail ? ` ${head}: ${detail}` : ` ${head}`;
 }
 

@@ -55,13 +55,34 @@ test("a peer counterpart gets locations and no producer or consumer word", () =>
   assert.equal(/consumer|producer/i.test(line), false);
 });
 
-test("a row nothing was compared for is not reported as a problem", () => {
+test("a not_checked row prints the state, never the word null", () => {
   const context = renderPostToolUse(fixture("check-mismatch.json")) ?? "";
   const line = context.split("\n").find((text) => text.includes("example-payments"));
-  // not_checked with a null result: listed because it names a counterpart,
-  // after the three real problems, and never as a verdict of its own.
   assert.ok(line);
+  // result is null by contract on this state, so the state is the whole answer.
+  assert.match(line, /not checked: matched to a shared external contract/);
+  assert.equal(/\bnull\b/.test(line), false);
   assert.equal(line.includes("not_checked"), false);
+});
+
+test("no rendered line anywhere prints the word null", () => {
+  const rendered = [
+    renderPostToolUse(fixture("check-mismatch.json")) ?? "",
+    renderPostToolUse(fixture("check-deleted.json")) ?? "",
+    renderPostToolUse(fixture("check-pre-rendered-boundary.json")) ?? "",
+    renderSessionStart(fixture("touch-workspace.json")),
+  ].join("\n");
+  assert.equal(/\bnull\b/.test(rendered), false);
+  assert.equal(rendered.includes("undefined"), false);
+});
+
+test("a verdict about the indexed tree says so, so it cannot read as a live one", () => {
+  const context = renderPostToolUse(fixture("check-mismatch.json")) ?? "";
+  const stale = context.split("\n").find((text) => text.includes("/api/audit/:id"));
+  assert.match(stale ?? "", /type_mismatch \(unresolved, so it describes the indexed version\)/);
+  const live = context.split("\n").find((text) => text.includes("/api/users/:id"));
+  assert.match(live ?? "", /type_mismatch: the response no longer carries/);
+  assert.equal(live?.includes("unresolved"), false);
 });
 
 test("evidence rides the item line when the row states it", () => {
@@ -140,7 +161,8 @@ test("the CLI's own boundary lines are printed as they arrive", () => {
   const result = fixture("check-pre-rendered-boundary.json");
   const context = renderPostToolUse(result) ?? "";
   const lines = context.split("\n");
-  assert.deepEqual(lines.slice(-2), result.boundary_lines);
+  const sent = result.boundary_lines ?? [];
+  assert.deepEqual(lines.slice(-sent.length), sent);
   assert.equal(
     lines.some((line) => line.startsWith("Boundary: ")),
     false,
@@ -154,17 +176,23 @@ test("the CLI's own boundary lines are printed as they arrive", () => {
   assert.deepEqual(boundaryFor(result), result.boundary_lines);
 });
 
-test("without the CLI's lines the counts are rendered and labelled", () => {
+test("without the CLI's lines the note leads the counts, and the block is labelled", () => {
   const result = fixture("check-mismatch.json");
   assert.equal(result.boundary_lines, undefined);
-  assert.deepEqual(boundaryFor(result), boundaryLines(result.boundary, result.service));
-  assert.match(renderPostToolUse(result) ?? "", /\nBoundary: user-service at 6a1b2c3/);
+  assert.deepEqual(boundaryFor(result), [
+    result.boundary_note,
+    ...boundaryLines(result.boundary, result.service),
+  ]);
+  const context = renderPostToolUse(result) ?? "";
+  assert.match(context, /\nBoundary: A local index holds what the deterministic passes state/);
+  assert.match(context, /\nuser-service at 6a1b2c3: 128 file\(s\) sent to the analyzer/);
 });
 
 test("the session line takes the CLI's boundary lines too", () => {
   const result = fixture("check-pre-rendered-boundary.json");
   const rendered = renderSessionStart(result).split("\n");
-  assert.deepEqual(rendered.slice(-2), result.boundary_lines);
+  const sent = result.boundary_lines ?? [];
+  assert.deepEqual(rendered.slice(-sent.length), sent);
 });
 
 test("a local index dispatches nothing, so the header drops the analyzer count", () => {

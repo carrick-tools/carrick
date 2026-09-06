@@ -80,6 +80,8 @@ export type CheckResult = {
   /** Set instead of the payload, e.g. `not_indexed`. */
   error?: string;
   file?: string;
+  /** Absolute path of the repo owning `file`; `repo` + `file` is openable. */
+  repo?: string;
   service?: string;
   index_commit?: string;
   /** RFC 3339 time the index or the last refresh of this service ran. */
@@ -92,6 +94,12 @@ export type CheckResult = {
   deleted?: boolean;
   items?: CheckItem[];
   boundary?: Boundary;
+  /**
+   * One sentence about what a local index cannot hold at all. Always sent, so a
+   * thin index never reads as "there is no API here". It leads `boundary_lines`
+   * and, when those are absent, the counts rendered here.
+   */
+  boundary_note?: string;
   /**
    * The boundary already rendered by the CLI, the same bytes it prints at the
    * tail of its human output. When it is here it is printed as it stands; when
@@ -130,6 +138,7 @@ export function parseCheckResult(stdout: string): CheckResult | null {
   };
   if (typeof parsed["error"] === "string") result.error = parsed["error"];
   if (typeof parsed["file"] === "string") result.file = parsed["file"];
+  if (typeof parsed["repo"] === "string") result.repo = parsed["repo"];
   if (typeof parsed["service"] === "string") result.service = parsed["service"];
   if (typeof parsed["index_commit"] === "string") result.index_commit = parsed["index_commit"];
   if (typeof parsed["indexed_at"] === "string") result.indexed_at = parsed["indexed_at"];
@@ -142,6 +151,7 @@ export function parseCheckResult(stdout: string): CheckResult | null {
   }
   if (typeof parsed["stale"] === "boolean") result.stale = parsed["stale"];
   if (isRecord(parsed["boundary"])) result.boundary = parsed["boundary"] as Boundary;
+  if (typeof parsed["boundary_note"] === "string") result.boundary_note = parsed["boundary_note"];
   if (Array.isArray(parsed["boundary_lines"])) {
     const lines = (parsed["boundary_lines"] as unknown[]).filter(
       (line): line is string => typeof line === "string",

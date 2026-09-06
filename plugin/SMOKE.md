@@ -46,6 +46,10 @@ index holds no rows and no boundary for that file. Time it: the hook's own work
 is under 300 ms, and the CLI's share is the number in the log line
 (`CARRICK_LOG_QUIET=0` puts it on stderr).
 
+The session line has nothing to prove until carrick#728: `touch` with no file
+exits 2 today, so the SessionStart hook prints nothing by design. Re-run this
+section when that command lands.
+
 ## 1. Headless Claude Code, three arms (about $1, owner-gated)
 
 Guards, from the harness rules: identical `allowedTools` in every arm, the

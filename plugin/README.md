@@ -57,10 +57,13 @@ session on its own. Diagnostics also arrive one model turn later than the hook,
 and Claude Code drops `relatedInformation`, which is why every counterpart site
 is written into the message text as well.
 
-SessionStart prints one line: the service, the commit it was indexed at, how
-many files have changed since, and the boundary. `carrick touch` returns every
-verdict as null, so that line carries no compatibility finding and is printed
-whichever channel is delivering.
+SessionStart is registered and inert until carrick#728. It asks for a workspace
+answer (`carrick touch --json` with no file), and today `touch` takes exactly one
+file and exits 2 without one, so the hook logs a line and prints nothing. When
+that command lands, the hook prints the service, the commit it was indexed at,
+how many files have changed since, and the boundary. `touch` returns every
+verdict as null either way, so the line carries no compatibility finding and is
+printed whichever channel is delivering verdicts.
 
 ## VS Code
 

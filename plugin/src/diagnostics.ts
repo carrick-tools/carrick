@@ -33,7 +33,7 @@ import {
   type CheckResult,
   type Counterpart,
 } from "./contract.ts";
-import { boundaryFor } from "./render.ts";
+import { boundaryFor, stateWord } from "./render.ts";
 
 export const SOURCE = "carrick";
 
@@ -83,7 +83,16 @@ function counterpartWhere(counterpart: Counterpart): string {
 export function messageOf(item: CheckItem): string {
   const operation = [item.method, item.path].filter(Boolean).join(" ");
   const verdict = item.verdict;
-  const head = [operation, verdict?.result].filter(Boolean).join(" ");
+  // `result` is null on a `not_checked` verdict, and a result whose state is
+  // not `resolved` is a verdict about the indexed tree rather than this one.
+  const verdictWords = verdict
+    ? verdict.result == null
+      ? stateWord(verdict.state)
+      : verdict.state === "resolved"
+        ? verdict.result
+        : `${verdict.result} (${stateWord(verdict.state)})`
+    : "";
+  const head = [operation, verdictWords].filter(Boolean).join(" ");
   const parts: string[] = [verdict?.detail ? `${head}: ${verdict.detail}` : head];
   if (isCandidate(item)) {
     const from = item.resolution_source ? ` (${item.resolution_source})` : "";
@@ -120,6 +129,7 @@ export function resolveCounterpart(
   root: string,
   counterpart: Counterpart,
   exists: (target: string) => boolean = defaultExists,
+  ownRepo?: string,
 ): string | null {
   if (!counterpart.file) return null;
   if (path.isAbsolute(counterpart.file)) return exists(counterpart.file) ? counterpart.file : null;
@@ -127,6 +137,8 @@ export function resolveCounterpart(
   if (counterpart.service) {
     candidates.push(path.resolve(root, counterpart.service, counterpart.file));
   }
+  // A counterpart in the queried file's own repo resolves against `repo`.
+  if (ownRepo) candidates.push(path.resolve(ownRepo, counterpart.file));
   return candidates.find((candidate) => exists(candidate)) ?? null;
 }
 
@@ -153,8 +165,10 @@ export function toDiagnostics(
   const byFile = new Map<string, Diagnostic[]>();
   if (result.error) return byFile;
 
-  // The caller asked about this path; `result.file` is relative to its own repo
-  // and cannot be resolved against the workspace root.
+  // The path the caller asked about, always: that is the document the editor
+  // has open, and a diagnostic published to any other URI is invisible. The
+  // payload's `repo` + `file` names the same file by another route and is used
+  // for counterparts, where the caller has no path of its own.
   const checkedAbs = path.resolve(root, checkedFile);
   const put = (file: string, diagnostic: Diagnostic): void => {
     const existing = byFile.get(file);
@@ -165,7 +179,7 @@ export function toDiagnostics(
   for (const item of problemItems(result)) {
     const counterparts = item.counterparts ?? [];
     const related = counterparts
-      .map((counterpart) => ({ counterpart, resolved: resolveCounterpart(root, counterpart, exists) }))
+      .map((counterpart) => ({ counterpart, resolved: resolveCounterpart(root, counterpart, exists, result.repo) }))
       .filter((entry) => entry.resolved !== null)
       .map((entry) => ({
         location: {
@@ -185,7 +199,7 @@ export function toDiagnostics(
     put(checkedAbs, diagnostic);
 
     for (const counterpart of counterparts) {
-      const resolved = resolveCounterpart(root, counterpart, exists);
+      const resolved = resolveCounterpart(root, counterpart, exists, result.repo);
       if (!resolved) continue;
       const mirrored: Diagnostic = {
         range: rangeAt(counterpart.line, 1),

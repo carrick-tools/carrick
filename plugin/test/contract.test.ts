@@ -5,6 +5,8 @@ import { fixture } from "./helpers.ts";
 
 test("a payload with the right schema parses", () => {
   const result = fixture("check-mismatch.json");
+  assert.equal(result.repo, "/workspace/user-service");
+  assert.match(result.boundary_note ?? "", /^A local index holds/);
   assert.equal(result.service, "user-service");
   assert.equal(result.stale, true);
   assert.equal(result.items?.length, 5);
@@ -55,7 +57,7 @@ test("a verdict with a null result is not a problem", () => {
 });
 
 test("boundary_lines is read when the CLI sends it, and only when it holds strings", () => {
-  assert.deepEqual(fixture("check-pre-rendered-boundary.json").boundary_lines?.length, 2);
+  assert.deepEqual(fixture("check-pre-rendered-boundary.json").boundary_lines?.length, 3);
   assert.equal(fixture("check-mismatch.json").boundary_lines, undefined);
   assert.equal(
     parseCheckResult('{"schema":"carrick.check/0","boundary_lines":[1,2]}')?.boundary_lines,

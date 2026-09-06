@@ -1,10 +1,16 @@
 #!/usr/bin/env node
 // SessionStart hook: one orientation line about the index this workspace has.
 //
-// `carrick touch --json` with no file answers for the workspace: which service
-// the index holds, the commit it was taken at, how many files have changed
-// since, and the boundary. Claude Code adds a SessionStart hook's stdout to the
-// session on exit 0, so a plain print is the whole mechanism.
+// INERT UNTIL carrick#728. As of the contract pinned on 2026-09-06, `touch` and
+// `check` each take exactly one file and neither answers for a workspace: with
+// no path they print a usage line and exit 2. The workspace summary is a
+// separate command that is not built. So this hook asks for the fileless form,
+// gets no `carrick.check/0` payload, logs one line and prints nothing. The
+// moment that command exists it answers here with no change to this file, and
+// the renderer is tested against the shape it will return.
+//
+// Claude Code adds a SessionStart hook's stdout to the session on exit 0, so a
+// plain print is the whole mechanism.
 //
 // This is not a verdict channel. `touch` returns every verdict null by
 // contract, so the line carries no compatibility finding and cannot be confused
