@@ -703,10 +703,18 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // answer that ends without its boundary reads as a complete one.
     print_boundaries(&boundaries);
 
-    if let Some(payload) = pr_result
-        && let Err(e) = storage.post_pr_result(&payload).await
-    {
-        warn!("Failed to post PR result: {}", e);
+    if let Some(payload) = pr_result {
+        // The payload as the cloud receives it. The terminal report renders the
+        // findings without the fields a reader has to judge them by
+        // (`edge_source`, `verdict_state`, carrick#727), and no storage backend
+        // shows it, so an offline run has no way to see what a scan would post.
+        match serde_json::to_string(&payload) {
+            Ok(json) => debug!("PR result payload: {json}"),
+            Err(error) => debug!("PR result payload could not be serialized: {error}"),
+        }
+        if let Err(e) = storage.post_pr_result(&payload).await {
+            warn!("Failed to post PR result: {}", e);
+        }
     }
 
     Ok(())
