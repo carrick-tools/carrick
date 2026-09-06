@@ -148,6 +148,11 @@ pub struct ProcessingStats {
     /// Files whose model answer came from the incremental cache, so no call
     /// was made. The deterministic layer still ran over every one of them.
     pub files_model_reused: usize,
+    /// Files that raised a candidate and were never asked about, because this
+    /// run has no model stage at all (local mode, carrick#708). Not a loss and
+    /// not a skip: the deterministic layer ran over every one of them, and the
+    /// candidates nobody classified are what the boundary counts.
+    pub files_model_not_asked: usize,
     pub files_skipped: usize,
     /// Files skipped because SWC found no API candidates (zero-cost skips)
     pub files_skipped_no_candidates: usize,
@@ -752,6 +757,23 @@ struct MountBinding {
 pub struct FileOrchestrator {
     file_analyzer: FileAnalyzerAgent,
     swc_scanner: SwcScanner,
+}
+
+/// What the model had to say about one file, once every source of an answer
+/// has been settled.
+///
+/// The third state is the point: a file can reach phase 3 with no answer
+/// because the call failed, OR because this run never makes calls. Collapsing
+/// the two loses the difference between an index that lost something and one
+/// that was never asked to have it.
+enum ModelAnswer {
+    /// A fresh answer, or the cached one this file is replaying — downstream
+    /// they are the same thing.
+    Answered(FileAnalysisResult),
+    /// The analyzer was asked and did not answer; the string is why.
+    Failed(String),
+    /// No model stage ran (local mode).
+    NotAsked,
 }
 
 /// One statement the deterministic layer makes about one call site, before
@@ -2013,8 +2035,31 @@ impl FileOrchestrator {
         let (reused, to_dispatch): (Vec<PendingFile>, Vec<PendingFile>) = pending
             .into_iter()
             .partition(|pf| cached_model_results.contains_key(&pf.path_str));
+
+        // Local mode (carrick#708): the model stage does not run at all. The
+        // files that would have been dispatched keep the rows the
+        // deterministic layer already resolved for them, and nothing about
+        // them is recorded as a loss — a file nobody asked about is not a
+        // file that failed, so `scan_health` stays silent and the run does not
+        // report a partial index. They are also kept OUT of
+        // `raw_model_results`: an empty answer cached there would read as "the
+        // model said nothing about this file" and freeze the skip for as long
+        // as the cache lives (#478).
+        let (to_dispatch, not_asked): (Vec<PendingFile>, Vec<PendingFile>) =
+            if crate::local_mode::no_model() {
+                (Vec::new(), to_dispatch)
+            } else {
+                (to_dispatch, Vec::new())
+            };
+        if !not_asked.is_empty() {
+            debug!(
+                "Local mode: {} file(s) raised a candidate and were not dispatched (no model)",
+                not_asked.len()
+            );
+        }
         stats.files_model_reused = reused.len();
         stats.files_model_dispatched = to_dispatch.len();
+        stats.files_model_not_asked = not_asked.len();
         if !reused.is_empty() {
             debug!(
                 "Replaying {} cached model answer(s); dispatching {}",
@@ -2073,24 +2118,28 @@ impl FileOrchestrator {
         // A cached answer enters phase 3 as the model's answer, because that is
         // what it is. Everything downstream — the join, every pass over it, the
         // raw result the cache keeps — is then identical to a cold scan's.
-        let analyzed: Vec<(PendingFile, Result<FileAnalysisResult, String>)> = reused
+        let analyzed: Vec<(PendingFile, ModelAnswer)> = reused
             .into_iter()
             .map(|pf| {
                 let cached = cached_model_results
                     .get(&pf.path_str)
                     .cloned()
                     .expect("partitioned on this key being present");
-                (pf, Ok(cached))
+                (pf, ModelAnswer::Answered(cached))
             })
-            .chain(dispatched)
+            .chain(dispatched.into_iter().map(|(pf, result)| match result {
+                Ok(model) => (pf, ModelAnswer::Answered(model)),
+                Err(e) => (pf, ModelAnswer::Failed(e)),
+            }))
+            .chain(not_asked.into_iter().map(|pf| (pf, ModelAnswer::NotAsked)))
             .collect();
 
         // PHASE 3 (serial): emit the deterministic rows for each file, join
         // the model's answer onto them, and fold the result into the
         // aggregate.
-        for (mut pf, result) in analyzed {
-            match result {
-                Ok(model) => {
+        for (mut pf, answer) in analyzed {
+            match answer {
+                ModelAnswer::Answered(model) => {
                     // The cache's half of the split, taken before anything is
                     // folded in: exactly what the analyzer returned.
                     raw_model_results.insert(pf.path_str.clone(), model.clone());
@@ -2134,26 +2183,32 @@ impl FileOrchestrator {
                     stats.files_processed += 1;
                     file_results.insert(pf.path_str, adjusted);
                 }
-                Err(e) => {
-                    // The model said nothing about this file, so nothing joins
-                    // — but the deterministic layer resolved its candidates
-                    // before the call went out, and those rows cost nothing and
-                    // are as true as they were a moment ago. Emitting them here
-                    // is what keeps a transient gateway failure from also
-                    // deleting the routes and calls the source states outright.
-                    //
-                    // Warn rather than collect quietly: `stats.errors` is only
-                    // ever printed at debug, which is how this loss stayed
-                    // invisible (#461). The run-level verdict is in
-                    // `scan_health`, recorded at dispatch, and it is unchanged:
-                    // this file is still one the analyzer never answered for,
-                    // and the run still says so.
-                    warn!("Failed to analyze {}: {}", pf.path_str, e);
-                    stats
-                        .errors
-                        .push(format!("Failed to analyze {}: {}", pf.path_str, e));
-                    stats.files_skipped += 1;
-                    stats.files_analysis_failed += 1;
+                unanswered => {
+                    // No model answer joins onto this file — because the call
+                    // failed, or because local mode never made one. Either way
+                    // the deterministic layer resolved this file's candidates
+                    // already, and those rows cost nothing and are as true as
+                    // they were a moment ago. Emitting them here is what keeps
+                    // a transient gateway failure (and a laptop with no model)
+                    // from also deleting the routes and calls the source states
+                    // outright.
+                    if let ModelAnswer::Failed(e) = &unanswered {
+                        // Warn rather than collect quietly: `stats.errors` is
+                        // only ever printed at debug, which is how this loss
+                        // stayed invisible (#461). The run-level verdict is in
+                        // `scan_health`, recorded at dispatch, and it is
+                        // unchanged: this file is still one the analyzer never
+                        // answered for, and the run still says so.
+                        //
+                        // A NOT-ASKED file records none of this: nothing was
+                        // lost, so nothing is reported lost.
+                        warn!("Failed to analyze {}: {}", pf.path_str, e);
+                        stats
+                            .errors
+                            .push(format!("Failed to analyze {}: {}", pf.path_str, e));
+                        stats.files_skipped += 1;
+                        stats.files_analysis_failed += 1;
+                    }
 
                     let mut deterministic = FileAnalysisResult::default();
                     Self::emit_resolved_rows(
@@ -2169,6 +2224,11 @@ impl FileOrchestrator {
                         &mut stats,
                         &mut member_deficits,
                         &mut resolved_member_rows,
+                    );
+                    Self::count_unemitted_literal_candidates(
+                        &deterministic,
+                        &pf.candidate_map,
+                        &mut stats,
                     );
 
                     stats.total_mounts += deterministic.mounts.len();
@@ -5450,11 +5510,25 @@ impl FileOrchestrator {
             );
         }
 
-        // What the deterministic layer read a route literal and a verb off,
-        // and neither it nor the model produced a row for (the plan's uniform
-        // "a literal segment plus a stated method is a row" applied to a bare
-        // `x.verb("/lit", arg)`, which carries no producer/consumer role).
-        // Counted so the gap can be sized on real code; never emitted.
+        Self::count_unemitted_literal_candidates(result, candidate_map, stats);
+    }
+
+    /// What the deterministic layer read a route literal and a verb off, and
+    /// no layer produced a row for (the plan's uniform "a literal segment plus
+    /// a stated method is a row" applied to a bare `x.verb("/lit", arg)`,
+    /// which carries no producer/consumer role). Counted so the gap can be
+    /// sized on real code; never emitted.
+    ///
+    /// Called on every path a file can leave phase 3 by, not just the joined
+    /// one: a file the analyzer never answered for, and a file local mode
+    /// never asked about, have exactly this gap and used to report it as
+    /// zero — which reads as "nothing here to classify" rather than "nobody
+    /// classified it".
+    fn count_unemitted_literal_candidates(
+        result: &FileAnalysisResult,
+        candidate_map: &HashMap<String, CandidateTarget>,
+        stats: &mut ProcessingStats,
+    ) {
         stats.unemitted_literal_candidates += candidate_map
             .values()
             .filter(|candidate| candidate.protocol == Protocol::Http)

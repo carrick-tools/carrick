@@ -101,11 +101,23 @@ impl MultiAgentOrchestrator {
         debug!("Starting AST-Gated File-Centric analysis...");
 
         // Stage 0: Framework Detection
+        //
+        // Both model stages below are skipped in local mode (carrick#708):
+        // detection and guidance are prompt inputs, and a run with no model to
+        // prompt states an empty inventory rather than an invented one. The
+        // deterministic layer reads the declared dependencies for the routing
+        // conventions it needs, so the facts a file states outright survive
+        // the skip.
         debug!("=== Stage 0: Framework Detection ===");
-        let framework_detector = FrameworkDetector::new(self.agent_service.clone());
-        let framework_detection = framework_detector
-            .detect_frameworks_and_libraries(packages, imported_symbols)
-            .await?;
+        let framework_detection = if crate::local_mode::no_model() {
+            debug!("Local mode: skipping framework detection (no model)");
+            DetectionResult::default()
+        } else {
+            let framework_detector = FrameworkDetector::new(self.agent_service.clone());
+            framework_detector
+                .detect_frameworks_and_libraries(packages, imported_symbols)
+                .await?
+        };
 
         debug!("Detected frameworks: {:?}", framework_detection.frameworks);
         debug!(
@@ -115,10 +127,15 @@ impl MultiAgentOrchestrator {
 
         // Stage 1: Framework Guidance Generation
         debug!("=== Stage 1: Framework Guidance Generation ===");
-        let framework_guidance_agent = FrameworkGuidanceAgent::new(self.agent_service.clone());
-        let framework_guidance = framework_guidance_agent
-            .generate_for_active_protocols(&framework_detection)
-            .await?;
+        let framework_guidance = if crate::local_mode::no_model() {
+            debug!("Local mode: skipping framework guidance (no model)");
+            crate::local_mode::offline_guidance()
+        } else {
+            let framework_guidance_agent = FrameworkGuidanceAgent::new(self.agent_service.clone());
+            framework_guidance_agent
+                .generate_for_active_protocols(&framework_detection)
+                .await?
+        };
 
         for (protocol, guidance) in &framework_guidance {
             debug!(

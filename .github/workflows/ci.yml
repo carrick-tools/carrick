@@ -111,6 +111,7 @@ jobs:
           --test intent_incremental_test
           --test literal_base_url_test
           --test llm_mock_pipeline_test
+          --test local_mode_test
           --test new_url_target_test
           --test receiver_type_classification_test
           --test route_request_anchor_test

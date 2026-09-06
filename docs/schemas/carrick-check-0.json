@@ -22,6 +22,10 @@
           "type": "string",
           "description": "The queried file, relative to the repo that owns it."
         },
+        "repo": {
+          "type": "string",
+          "description": "Absolute path of that repo on this machine. repo + file is the path to open."
+        },
         "service": {
           "type": "string",
           "description": "serviceName from carrick.json, else the repo name."
@@ -60,6 +64,15 @@
           "type": ["object", "null"],
           "description": "ServiceBoundary for this file's service (src/boundary.rs), verbatim. Null when the index states none.",
           "additionalProperties": true
+        },
+        "boundary_note": {
+          "type": "string",
+          "description": "One sentence naming what a local index cannot hold at all, with the count the scan kept. Always present: a thin index must never read as 'there is no API here'."
+        },
+        "boundary_lines": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "The boundary as the CLI prints it, line by line (boundary_note first, then the counts). Print these bytes rather than re-wording the struct."
         }
       },
       "additionalProperties": true
@@ -114,9 +127,13 @@
           "description": "peer = shared external contract: both sides call the same third party and neither serves the other."
         },
         "service": { "type": "string" },
+        "repo": {
+          "type": ["string", "null"],
+          "description": "Absolute path of the counterpart's repo on this machine; null when the index no longer holds it."
+        },
         "file": {
           "type": "string",
-          "description": "Relative to the counterpart's own repo."
+          "description": "Relative to the counterpart's OWN repo, which is a different repo from the queried file's."
         },
         "line": { "type": ["integer", "null"], "minimum": 1 }
       },

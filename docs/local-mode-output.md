@@ -42,6 +42,7 @@ no candidate is classified locally and the boundary block says so.
 {
   "schema": "carrick.check/0",
   "file": "app/routes/orders.$id.ts",
+  "repo": "/Users/dev/repos/webapp",
   "service": "webapp",
   "index_commit": "a1b2c3d4e5f6",
   "indexed_at": "2026-09-06T21:14:03Z",
@@ -63,6 +64,7 @@ no candidate is classified locally and the boundary block says so.
         {
           "role": "consumer",
           "service": "admin-ui",
+          "repo": "/Users/dev/repos/admin-ui",
           "file": "src/api/orders.ts",
           "line": 44
         }
@@ -77,11 +79,22 @@ no candidate is classified locally and the boundary block says so.
   "boundary": {
     "commit_hash": "a1b2c3d4e5f6",
     "files_attempted": 0,
-    "candidates_not_classified": 41,
-    "unemitted_literal_candidates": 12
-  }
+    "files_lost": { "total": 0 },
+    "unemitted_literal_candidates": 12,
+    "consumers_not_resolved": { "total": 0 },
+    "sdk_unresolved": { "total": 0 },
+    "unknown_call_paths": { "total": 0 },
+    "model_only_rows": 0,
+    "model_rows_joined": 0,
+    "model_contradictions_discarded": 0
+  },
+  "boundary_note": "candidates: not classified locally (no model runs on this machine). A route registered on a typed receiver (`app.get(\"/x\", h)`) and a call whose URL is built at the call site are classified by the model in the hosted index and are absent here: 12 route-literal call site(s) counted and unclassified in this service."
 }
 ```
+
+`boundary` is the `ServiceBoundary` block from `src/boundary.rs`, verbatim and
+whole; the fields above are a sample of it, not its definition. `files_attempted`
+is 0 on every local index, because a local index asks the model nothing.
 
 ### Top level
 
@@ -89,6 +102,7 @@ no candidate is classified locally and the boundary block says so.
 |---|---|---|
 | `schema` | string | always `carrick.check/0` for this document |
 | `file` | string | the queried file, relative to the repo that owns it |
+| `repo` | string | the absolute path of that repo on this machine. `repo` + `file` is the path to open; `file` alone is what the index keys on |
 | `service` | string | the service the file belongs to (`serviceName` from `carrick.json`, else the repo name) |
 | `index_commit` | string | the commit that service was indexed at |
 | `indexed_at` | string (RFC 3339) | when `index` (or the last `refresh` of this service) ran |
@@ -97,7 +111,9 @@ no candidate is classified locally and the boundary block says so.
 | `stale` | bool | this file is one of them, so its rows may not describe what is on disk now |
 | `deleted` | bool | the file is in the index and no longer on disk |
 | `items` | array | routes and calls the index holds for this file, in line order |
-| `boundary` | object | what this service's scan could not classify (`ServiceBoundary`, `src/boundary.rs`) |
+| `boundary` | object \| null | what this service's scan could not classify (`ServiceBoundary`, `src/boundary.rs`), verbatim |
+| `boundary_note` | string | one sentence naming what a LOCAL index cannot hold at all, with the count the scan kept. Always present, whatever the numbers: a thin index must never read as "there is no API here". |
+| `boundary_lines` | string[] | the boundary as the CLI prints it, line by line: `boundary_note` first, then the counts. A reader rendering the boundary prints these bytes rather than re-wording the struct, so a hook and a terminal say the same sentence about the same number. |
 
 Locations come first and the boundary comes last: a reader that stops early has
 read the facts, and a reader that reads to the end knows what is missing.
@@ -123,7 +139,8 @@ read the facts, and a reader that reads to the end knows what is missing.
 |---|---|---|
 | `role` | `"producer"` \| `"consumer"` \| `"peer"` | what the counterpart is. `peer` is a shared external contract: both sides call the same third party, and neither serves the other. |
 | `service` | string | the counterpart's service |
-| `file` | string | the counterpart's file, relative to its own repo |
+| `repo` | string \| null | the absolute path of the counterpart's repo on this machine. `repo` + `file` opens it; null when the index no longer holds that repo |
+| `file` | string | the counterpart's file, relative to ITS OWN repo, which is a different repo from the queried file's |
 | `line` | int \| null | 1-based line, when the index recorded one |
 
 ### `items[].verdict`
@@ -142,12 +159,16 @@ index still holds the route, and its consumers are listed as counterparts.
 ### Errors
 
 Exit code is 0 for every read-only command, including failure: a hook must
-never fail an edit. A missing or unreadable index prints one line to stderr and
-this to stdout:
+never fail an edit. A missing or unreadable index prints one line to stderr
+saying what to do, and with `--json` this to stdout:
 
 ```json
 { "schema": "carrick.check/0", "error": "not_indexed" }
 ```
+
+A caller parsing JSON therefore always gets JSON. Without `--json` the sentence
+on stderr is the whole answer: printing a JSON body into a human's terminal
+would be noise, not an error report.
 
 | `error` | meaning |
 |---|---|
@@ -164,16 +185,23 @@ a model reading a terminal, so every location is a path a reader can open and
 no line needs a legend.
 
 ```
-app/routes/orders.$id.ts (webapp, indexed at a1b2c3d)
+app/routes/api.v1.widgets.$widgetId.ts (catalog-web, indexed at 4b96017)
 
-  route  GET /api/orders/:id  line 12  [fact: file_based_route]
-    consumer  admin-ui  src/api/orders.ts:44
-    verdict   compatible (compiler-compared)
+  route  GET /api/v1/widgets/:widgetId  line 11  [fact: file_based_route]
+    consumer  inventory-svc  src/inventory.ts:9
+    consumer  inventory-svc  src/inventory.ts:17
+    verdict   type_mismatch — GET /api/v1/widgets/:widgetId -> Response not
+  assignable to GET /api/v1/widgets/:encoded -> Response
+    Types of property 'activeCount' are incompatible.
 
-changed since index: 3 files; this file has changed since it was indexed.
-boundary (webapp): 41 candidates not classified locally, 12 unemitted literal
-candidates. Candidates are not classified locally: no model runs on this
-machine.
+changed since index: 1 file(s); this file is one of them, so its rows are
+unresolved since your edit
+boundary (catalog-web): candidates: not classified locally (no model runs on
+this machine). A route registered on a typed receiver (`app.get("/x", h)`) and
+a call whose URL is built at the call site are classified by the model in the
+hosted index and are absent here: 0 route-literal call site(s) counted and
+unclassified in this service.
+  catalog-web at 4b96017: 0 file(s) sent to the analyzer
 ```
 
 ## On-disk layout
@@ -183,9 +211,9 @@ machine.
 | path | what |
 |---|---|
 | `.carrick/.gitignore` | `*` — the directory ignores itself, so no user file has to change |
-| `.carrick/workspace.json` | the resolved workspace: every repo path, its service ids, the commit each was indexed at, the scanner version, the index time |
-| `.carrick/repos/<repo>__<service>.json` | the per-service index blob (`CloudRepoData`), written by `LocalDirStorage` — the same bytes the cloud path would upload |
-| `.carrick/index.json` | the joined read model `touch` and `check` answer from: items per file, counterparts, verdicts, per-service boundary |
+| `.carrick/repos/<repo>__<service>.json` | the per-service index blob (`CloudRepoData`), written by `LocalDirStorage` — the same bytes the cloud path would upload, minus everything a model would have added |
+| `.carrick/index.json` | the joined read model `touch` and `check` answer from: every repo's absolute path, its services with their commits and boundaries, and per file the rows with their counterparts and verdicts |
+| `.carrick/join.json` | transient. The join phase writes it, the indexer folds it into `index.json` and deletes it; a copy left behind means an index that did not finish |
 
 `index.json` is derived: deleting it and re-running `carrick index` reproduces
 it. Nothing outside `src/local_mode/` reads it, and its internal shape is not
@@ -200,11 +228,27 @@ init`:
 
 Explicit paths, relative to the workspace file. No directory walk.
 
+## What `touch` and `check` require
+
+Both take exactly one file. Neither answers for a workspace: with no path they
+print `carrick touch needs a file path` and exit 2, which is a usage error and
+not a read. A session-level summary (the workspace's services, their commits
+and their boundaries, with no file in the question) is a separate command and
+is not built — carrick#728.
+
 ## Out of scope in this version
 
 - **Pulling candidates from the cloud index.** The scanner authenticates with
   GitHub OIDC, which a laptop does not have, so local mode reads disk only. The
   model rows the cloud index holds for these repos are not merged in. That
   needs a user-auth path and is not built.
-- Per-file incremental extraction, a persistent process, and socket/pub-sub
-  edges in the local read path.
+- Per-file incremental extraction and a persistent process.
+- **Rows only a model can state.** A local index holds what the deterministic
+  passes state: file-based and descriptor routes, class-controller routes,
+  imported-member calls, GraphQL schema and document rows, socket and pub/sub
+  operations, SDK surfaces. A route registered on a typed receiver
+  (`app.get("/x", handler)`) is NOT among them — its route-ness is decided by
+  matching the receiver's declaring package against a framework inventory only
+  the model produces — and neither is a call whose URL is assembled at the call
+  site. On a service written that way the local index is close to empty, which
+  is why `boundary_note` is on every answer.
