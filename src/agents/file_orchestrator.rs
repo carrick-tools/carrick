@@ -52,8 +52,9 @@ use crate::{
         TypeSidecar,
     },
     swc_scanner::{
-        CandidateTarget, ControllerRouteBinding, PubsubAnchorOp, RouteDescriptorEndpoint,
-        SwcScanner, collect_import_sources, is_producer_route_path, normalize_path_params,
+        CandidateTarget, ControllerRouteBinding, DecoratorRoute, PubsubAnchorOp,
+        RouteDescriptorEndpoint, SwcScanner, collect_import_sources, is_producer_route_path,
+        normalize_path_params,
     },
     type_manifest::{
         build_manifest_type_alias, build_manifest_type_alias_with_site_id, build_site_id,
@@ -255,6 +256,10 @@ const CLASS_CONTROLLER_PATTERN: &str = "class-controller-route";
 
 /// Pattern tag for a route whose ROLE the receiver's type stated (carrick#695).
 const RECEIVER_TYPE_PATTERN: &str = "receiver-type-route";
+
+/// `pattern_matched` tag for endpoints emitted deterministically from a class
+/// that declares its routes with decorators (carrick#732).
+const DECORATOR_ROUTE_PATTERN: &str = "decorator-route";
 
 type EndpointLookup = HashMap<(String, u32), Vec<(String, String)>>;
 type DataCallLookup = HashMap<(String, u32), Vec<(String, String, String)>>;
@@ -802,12 +807,23 @@ impl ResolutionSource {
     /// request spec overruled the `new URL` path.
     fn precedence(self) -> u8 {
         match self {
-            Self::WholeUrlEnv => 6,
+            Self::WholeUrlEnv => 7,
+            // Documentation rather than arbitration: an env-backed base
+            // followed by a literal path is a different SHAPE from a binding
+            // that holds the whole URL, from a request spec's object literal
+            // and from a `new URL`, so no two of them can claim one site. It
+            // sits below the whole-URL rule for the same reason that rule
+            // sits at the top: a binding read straight out of the environment
+            // is the most specific statement a target makes.
+            Self::EnvBasePath => 6,
             Self::ImportedMember => 5,
             Self::RequestSpec => 4,
             Self::NewUrl => 3,
             Self::SameFileWrapper => 2,
-            Self::FileBasedRoute | Self::DescriptorRoute | Self::ClassController => 1,
+            Self::FileBasedRoute
+            | Self::DescriptorRoute
+            | Self::ClassController
+            | Self::DecoratorRoute => 1,
             // Above the bare literal it replaces, below every source that
             // states the TARGET as well as the role: a resolved member or a
             // whole-URL binding knows where the request goes, and this knows
@@ -990,6 +1006,10 @@ impl FileOrchestrator {
             /// LLM ignores route-as-data, so these are the authoritative source
             /// for such endpoints. Empty for files with no route descriptors.
             descriptor_endpoints: Vec<EndpointResult>,
+            /// Routes a class in this file declares with decorators
+            /// (carrick#732): the prefix on the class, the verb and the path
+            /// on the method. Empty for files with no decorated class.
+            decorator_endpoints: Vec<EndpointResult>,
             /// Repo-global GraphQL producer hint lines (Stage B2), injected into
             /// the user message so the model can link resolver functions in this
             /// file to schema fields. Identical for every file; cloned per-pending
@@ -1352,6 +1372,15 @@ impl FileOrchestrator {
                 .filter(|c| !descriptor_spans.contains(&(c.span_start, c.span_end)))
                 .collect();
 
+            // Decorator-declared routes (carrick#732): a class stating its
+            // prefix, and its methods stating a verb and a path, is a complete
+            // route set read off this one file. The decorator candidates the
+            // scanner raises for the same class are deliberately KEPT: the
+            // model reading them is what supplies the owner and the type
+            // anchors, and its rows fold onto these as twins.
+            let decorator_endpoints =
+                Self::decorator_route_endpoints(&self.swc_scanner, file_path, &content);
+
             // Class-controller routes (#580 part b): a route table binding a
             // literal path to an imported handler. Collected before any of the
             // skip branches below, because a route table is usually a file with
@@ -1417,12 +1446,16 @@ impl FileOrchestrator {
             // route-descriptor endpoints are still recorded: they're derived
             // structurally and need no LLM.
             if http_candidates.is_empty() {
-                if !route_endpoints.is_empty() || !descriptor_endpoints.is_empty() {
+                if !route_endpoints.is_empty()
+                    || !descriptor_endpoints.is_empty()
+                    || !decorator_endpoints.is_empty()
+                {
                     debug!(
-                        "Structural route(s) (no call-site candidates): {} [{} file-based, {} route-descriptor]",
+                        "Structural route(s) (no call-site candidates): {} [{} file-based, {} route-descriptor, {} decorator]",
                         path_str,
                         route_endpoints.len(),
-                        descriptor_endpoints.len()
+                        descriptor_endpoints.len(),
+                        decorator_endpoints.len()
                     );
                     // The same emission every other deterministic row goes
                     // through; this file simply never reaches a model to join.
@@ -1437,6 +1470,7 @@ impl FileOrchestrator {
                             &WholeUrlFallbackMap::new(),
                             &route_endpoints,
                             &descriptor_endpoints,
+                            &decorator_endpoints,
                             // No call-site candidates here by construction, so
                             // no receiver to ask about.
                             &HashMap::new(),
@@ -1538,6 +1572,7 @@ impl FileOrchestrator {
                 literal_bases: symbols.literal_bases,
                 route_endpoints,
                 descriptor_endpoints,
+                decorator_endpoints,
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: Vec::new(),
@@ -1898,6 +1933,7 @@ impl FileOrchestrator {
                 literal_bases: symbols.literal_bases,
                 route_endpoints: Vec::new(),
                 descriptor_endpoints: Vec::new(),
+                decorator_endpoints: Vec::new(),
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: ctx,
@@ -1993,6 +2029,7 @@ impl FileOrchestrator {
                 &pf.whole_url_fallbacks,
                 &pf.route_endpoints,
                 &pf.descriptor_endpoints,
+                &pf.decorator_endpoints,
                 receiver_roles.get(&pf.path_str).unwrap_or(&empty_roles),
             );
         }
@@ -4444,6 +4481,48 @@ impl FileOrchestrator {
             .collect()
     }
 
+    /// Build deterministic endpoints for the routes a class declares with
+    /// decorators (carrick#732).
+    ///
+    /// The prefix, the verb and the method path are literals in the class's
+    /// own source, so the route is stated whether or not the model describes
+    /// the file. See [`SwcScanner::decorator_routes`] for the shape and why it
+    /// names no framework.
+    ///
+    /// The owner is the class name, which matches no mount, so the joined path
+    /// is used as-is — like a file-based, descriptor or class-controller
+    /// route.
+    fn decorator_route_endpoints(
+        scanner: &SwcScanner,
+        file_path: &Path,
+        content: &str,
+    ) -> Vec<EndpointResult> {
+        scanner
+            .decorator_routes(file_path, content)
+            .into_iter()
+            .map(|route: DecoratorRoute| EndpointResult {
+                view_module: false,
+                candidate_id: format!("decorator-route:{}:{}", route.method, route.span_start),
+                line_number: i32::try_from(route.line_number).unwrap_or(0),
+                owner_node: route.class_name,
+                method: route.method,
+                path: route.path,
+                handler_name: route.handler,
+                pattern_matched: DECORATOR_ROUTE_PATTERN.to_string(),
+                call_expression_span_start: Some(route.span_start),
+                call_expression_span_end: Some(route.span_end),
+                payload_expression_text: None,
+                payload_expression_line: None,
+                response_expression_text: None,
+                response_expression_line: None,
+                emission_style: None,
+                primary_type_symbol: None,
+                type_import_source: None,
+                resolution_source: None,
+            })
+            .collect()
+    }
+
     /// Build the endpoints a route table declares by binding a path to an
     /// imported controller instance (#580 part b).
     ///
@@ -4708,6 +4787,7 @@ impl FileOrchestrator {
         whole_url_fallbacks: &WholeUrlFallbackMap,
         route_endpoints: &[EndpointResult],
         descriptor_endpoints: &[EndpointResult],
+        decorator_endpoints: &[EndpointResult],
         // What the compiler says the receiver of each bare literal candidate
         // IS, keyed by the candidate's span start (carrick#695). Empty when no
         // sidecar answered, which is exactly today's behaviour.
@@ -4776,6 +4856,39 @@ impl FileOrchestrator {
                         Some(shape.method.clone()),
                         ResolutionSource::WholeUrlEnv,
                         local_default,
+                    ))),
+                });
+            }
+
+            // A base binding read from the environment, followed by a literal
+            // path (carrick#733). The origin is the environment's to supply
+            // and the path is written at the call site, which is the whole
+            // request: the target is emitted in the source's own spelling, so
+            // the base-resolution pass rewrites it to `${process.env.NAME}`
+            // exactly as it rewrites the model's reading of the same line.
+            //
+            // The verb has to be the call's own, for the same reason the
+            // whole-URL rule requires it: a target states no verb, and one
+            // inferred from anywhere else would index the wrong operation.
+            if let Some(base_path) = candidate.base_path_target.as_ref()
+                && let RequestShapeSignal::Known(shape) = &candidate.request_shape
+                && (base_path.base_reads_env || aliases.contains_key(&base_path.base))
+            {
+                let target = base_path.target();
+                claim(Resolved {
+                    method: Some(shape.method.clone()),
+                    url: target.clone(),
+                    span,
+                    line,
+                    source: ResolutionSource::EnvBasePath,
+                    emits: true,
+                    row: ResolvedRow::Call(Box::new(Self::deterministic_call(
+                        candidate,
+                        line,
+                        target,
+                        Some(shape.method.clone()),
+                        ResolutionSource::EnvBasePath,
+                        None,
                     ))),
                 });
             }
@@ -4945,6 +5058,7 @@ impl FileOrchestrator {
         for (endpoints, source) in [
             (route_endpoints, ResolutionSource::FileBasedRoute),
             (descriptor_endpoints, ResolutionSource::DescriptorRoute),
+            (decorator_endpoints, ResolutionSource::DecoratorRoute),
         ] {
             for endpoint in endpoints {
                 let mut endpoint = endpoint.clone();
@@ -12326,6 +12440,7 @@ export { routes };
                 },
             ),
             receiver_ident: Some(receiver.to_string()),
+            base_path_target: None,
         }
     }
 
@@ -12465,6 +12580,7 @@ export { routes };
             new_url_path: None,
             request_shape: crate::wrapper_request_shape::RequestShapeSignal::NotARequest,
             receiver_ident: Some("router".to_string()),
+            base_path_target: None,
         }
     }
 
@@ -12520,6 +12636,7 @@ export { routes };
             aliases,
             whole_url_fallbacks,
             route_endpoints,
+            &[],
             &[],
             receiver_roles,
         );
