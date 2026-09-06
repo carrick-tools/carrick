@@ -21,7 +21,7 @@ use crate::boundary::ServiceBoundary;
 /// Bumped whenever this file's shape changes. A mismatch makes every read-only
 /// command answer `index_unreadable`, which tells the user to re-index instead
 /// of showing them rows in a shape the reader half-understands.
-pub const READ_MODEL_VERSION: u32 = 1;
+pub const READ_MODEL_VERSION: u32 = 2;
 
 /// A route the service serves, or a call it makes.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

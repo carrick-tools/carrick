@@ -33,6 +33,11 @@ pub enum LocalCommand {
         service: Option<String>,
         workspace: Option<PathBuf>,
     },
+    /// What the workspace holds, with no file in the question.
+    Status {
+        workspace: Option<PathBuf>,
+        json: bool,
+    },
 }
 
 impl LocalCommand {
@@ -51,7 +56,7 @@ impl LocalCommand {
 /// argument is not one of the four names.
 pub fn parse(args: &[String]) -> Option<Result<LocalCommand, String>> {
     let name = args.first()?.as_str();
-    if !matches!(name, "index" | "touch" | "check" | "refresh") {
+    if !matches!(name, "index" | "touch" | "check" | "refresh" | "status") {
         return None;
     }
     Some(parse_command(name, &args[1..]))
@@ -105,6 +110,14 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             Ok(LocalCommand::Index { workspace })
         }
         "refresh" => Ok(LocalCommand::Refresh { service, workspace }),
+        "status" => {
+            if workspace.is_none()
+                && let Some(first) = positional.first()
+            {
+                workspace = Some(PathBuf::from(first));
+            }
+            Ok(LocalCommand::Status { workspace, json })
+        }
         "touch" | "check" => {
             let file = positional
                 .first()
@@ -159,6 +172,35 @@ pub fn run(command: LocalCommand) -> i32 {
             workspace,
             json,
         } => read(&file, workspace.as_deref(), json, Mode::Check),
+        LocalCommand::Status { workspace, json } => status(workspace.as_deref(), json),
+    }
+}
+
+/// `status`: the workspace, with no file in the question.
+fn status(root: Option<&Path>, json: bool) -> i32 {
+    let Some(root) = super::workspace::locate(root, None) else {
+        return report(ReadError::NotIndexed, json, super::contract::STATUS_SCHEMA);
+    };
+    match super::query::status(&root) {
+        Ok(output) => {
+            if json {
+                match serde_json::to_string_pretty(&output) {
+                    Ok(text) => println!("{text}"),
+                    Err(e) => {
+                        eprintln!("carrick: could not serialize the answer: {e}");
+                        return report(
+                            ReadError::IndexUnreadable,
+                            json,
+                            super::contract::STATUS_SCHEMA,
+                        );
+                    }
+                }
+            } else {
+                print!("{}", output.render());
+            }
+            0
+        }
+        Err(error) => report(error, json, super::contract::STATUS_SCHEMA),
     }
 }
 
@@ -233,7 +275,7 @@ fn print_map(outcome: &super::index::IndexOutcome) {
 /// `touch` and `check`: answer about one file.
 fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode) -> i32 {
     let Some(root) = super::workspace::locate(root, Some(file)) else {
-        return report(ReadError::NotIndexed, json);
+        return report(ReadError::NotIndexed, json, super::contract::SCHEMA);
     };
     match super::query::answer(&root, file, mode) {
         Ok(output) => {
@@ -242,7 +284,7 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode) -> i32 {
                     Ok(text) => println!("{text}"),
                     Err(e) => {
                         eprintln!("carrick: could not serialize the answer: {e}");
-                        return report(ReadError::IndexUnreadable, json);
+                        return report(ReadError::IndexUnreadable, json, super::contract::SCHEMA);
                     }
                 }
             } else {
@@ -250,16 +292,16 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode) -> i32 {
             }
             0
         }
-        Err(error) => report(error, json),
+        Err(error) => report(error, json, super::contract::SCHEMA),
     }
 }
 
 /// Say why there is no answer, in the form the caller asked for, and still
 /// exit 0.
-fn report(error: ReadError, json: bool) -> i32 {
+fn report(error: ReadError, json: bool, schema: &str) -> i32 {
     eprintln!("carrick: {}", error.message());
     if json {
-        let body = ErrorOutput::new(error);
+        let body = ErrorOutput::new(error, schema);
         if let Ok(text) = serde_json::to_string(&body) {
             println!("{text}");
         }
@@ -273,12 +315,15 @@ fn print_help() {
 
 USAGE:
     carrick index   [--workspace <dir>]
+    carrick status  [--workspace <dir>] [--json]
     carrick touch   <file> [--workspace <dir>] [--json]
     carrick check   <file> [--workspace <dir>] [--json]
     carrick refresh [--service <name>] [--workspace <dir>]
 
     index      Scan every repo listed in <dir>/carrick-workspace.json into
                <dir>/.carrick/. Deterministic facts only: no model runs here.
+    status     What the workspace holds: every service, the commit it was
+               indexed at, how far its repo has moved since, and its boundary.
     touch      The routes and calls in one file, and their counterparts in
                every other repo in the workspace. Reads the index only.
     check      The same, plus the contract verdicts the index already holds.
@@ -288,7 +333,8 @@ The workspace is the folder holding your repos and a carrick-workspace.json
 listing them: {{"repos": ["./api", "./web"]}}. `touch` and `check` find it
 above the file, or take it from --workspace or CARRICK_WORKSPACE.
 
-Output shape: docs/local-mode-output.md (`--json` prints carrick.check/0)."#
+Output shape: docs/local-mode-output.md (`--json` prints carrick.check/0, or
+carrick.status/0 from `status`)."#
     );
 }
 
@@ -298,6 +344,18 @@ mod tests {
 
     fn args(input: &[&str]) -> Vec<String> {
         input.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn status_takes_a_workspace_and_the_json_flag() {
+        let parsed = parse(&args(&["status", "--json"])).unwrap().unwrap();
+        assert_eq!(
+            parsed,
+            LocalCommand::Status {
+                workspace: None,
+                json: true,
+            }
+        );
     }
 
     #[test]

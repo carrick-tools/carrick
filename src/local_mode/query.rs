@@ -10,7 +10,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::contract::{CheckOutput, Counterpart, Item, ReadError, SCHEMA, Verdict};
+use super::contract::{
+    CheckOutput, Counterpart, Item, MAX_STALE_FILES, ReadError, SCHEMA, STATUS_SCHEMA,
+    StatusOutput, StatusService, Verdict,
+};
 use super::read_model::{IndexedItem, IndexedRepo, LocalIndex};
 
 /// Which of the two read-only commands is asking. The only difference is
@@ -24,16 +27,7 @@ pub enum Mode {
 
 /// Answer about one file.
 pub fn answer(workspace_root: &Path, file: &Path, mode: Mode) -> Result<CheckOutput, ReadError> {
-    let index_file = workspace_root
-        .join(super::workspace::INDEX_DIR)
-        .join("index.json");
-    if !index_file.is_file() {
-        return Err(ReadError::NotIndexed);
-    }
-    let index = LocalIndex::read(&index_file).map_err(|e| {
-        eprintln!("carrick: {e}");
-        ReadError::IndexUnreadable
-    })?;
+    let index = read_index(workspace_root)?;
 
     let (repo, relative) = index.locate_file(file).ok_or(ReadError::NotInWorkspace)?;
     let items = repo.files.get(&relative).cloned().unwrap_or_default();
@@ -96,6 +90,62 @@ pub fn answer(workspace_root: &Path, file: &Path, mode: Mode) -> Result<CheckOut
         boundary,
         boundary_note,
         boundary_lines,
+    })
+}
+
+/// Answer about the whole workspace: what is indexed, at which commit, and how
+/// far each repo has moved since (carrick#728).
+///
+/// The shape a session-start surface needs, and deliberately not a `check`
+/// response with the file left out: every `carrick.check/0` answer is about one
+/// file, and a reader that always has one should not have to defend against a
+/// response that does not.
+pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadError> {
+    let index = read_index(workspace_root)?;
+
+    // Git is asked once per REPO, not once per service: a monorepo's services
+    // share a tree, and asking again per service is the difference between two
+    // git calls and thirty.
+    let mut services = Vec::new();
+    for repo in &index.repos {
+        let repo_root = PathBuf::from(&repo.path);
+        let commit = repo
+            .services
+            .first()
+            .map(|service| service.commit.clone())
+            .unwrap_or_default();
+        let mut changed: Vec<String> = changed_since(&repo_root, &commit).into_iter().collect();
+        changed.sort();
+        let total = changed.len();
+        let truncated = total > MAX_STALE_FILES;
+        changed.truncate(MAX_STALE_FILES);
+
+        for service in &repo.services {
+            let note = boundary_note(service.boundary.as_ref());
+            services.push(StatusService {
+                service: service.name.clone(),
+                repo: repo.path.clone(),
+                index_commit: service.commit.clone(),
+                indexed_at: service.indexed_at.clone(),
+                routes: service.routes,
+                calls: service.calls,
+                changed_since_index: total,
+                stale_files: changed.clone(),
+                stale_files_total: total,
+                stale_files_truncated: truncated,
+                boundary_lines: boundary_lines(&service.name, &note, service.boundary.as_ref()),
+                boundary_note: note,
+                boundary: service.boundary.clone(),
+            });
+        }
+    }
+
+    Ok(StatusOutput {
+        schema: STATUS_SCHEMA.to_string(),
+        workspace: workspace_root.to_string_lossy().into_owned(),
+        indexed_at: index.indexed_at.clone(),
+        scanner_version: index.scanner_version.clone(),
+        services,
     })
 }
 
@@ -210,6 +260,20 @@ fn verdict_for(
             stored.detail.clone()
         },
     }
+}
+
+/// The read model, or why there is no answer.
+fn read_index(workspace_root: &Path) -> Result<LocalIndex, ReadError> {
+    let index_file = workspace_root
+        .join(super::workspace::INDEX_DIR)
+        .join("index.json");
+    if !index_file.is_file() {
+        return Err(ReadError::NotIndexed);
+    }
+    LocalIndex::read(&index_file).map_err(|e| {
+        eprintln!("carrick: {e}");
+        ReadError::IndexUnreadable
+    })
 }
 
 /// The repo-relative paths that differ from the commit the index was built at:

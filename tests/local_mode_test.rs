@@ -372,6 +372,83 @@ fn the_json_matches_the_published_contract() {
     assert_eq!(outside["error"], serde_json::json!("not_in_workspace"));
 }
 
+/// The workspace question, with no file in it: what a surface opening a
+/// session asks (carrick#728).
+#[test]
+fn status_answers_for_the_workspace() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+
+    let body: serde_json::Value =
+        serde_json::from_str(&run(root, &["status", "--workspace", ".", "--json"]))
+            .expect("status --json was not JSON");
+    assert_eq!(body["schema"], serde_json::json!("carrick.status/0"));
+    let services = body["services"].as_array().expect("services");
+    assert_eq!(services.len(), 2, "{body:#}");
+
+    let producer = services
+        .iter()
+        .find(|service| service["service"] == serde_json::json!("catalog-web"))
+        .expect("the producer service");
+    assert_eq!(producer["routes"], serde_json::json!(2));
+    assert_eq!(producer["changed_since_index"], serde_json::json!(0));
+    assert_eq!(
+        producer["stale_files"].as_array().map(Vec::len),
+        Some(0),
+        "a clean tree lists nothing changed:\n{producer:#}"
+    );
+    assert!(
+        Path::new(producer["repo"].as_str().expect("the repo")).is_dir(),
+        "the repo path is openable:\n{producer:#}"
+    );
+    assert!(
+        !producer["boundary_lines"]
+            .as_array()
+            .expect("boundary_lines")
+            .is_empty(),
+        "the boundary rides the session answer too:\n{producer:#}"
+    );
+
+    // An edit with no refresh is what a session line exists to report.
+    edit(
+        &root.join("catalog-web/app/routes/api.v1.widgets.$widgetId.ts"),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let after: serde_json::Value =
+        serde_json::from_str(&run(root, &["status", "--workspace", ".", "--json"]))
+            .expect("status --json was not JSON");
+    let producer = after["services"]
+        .as_array()
+        .expect("services")
+        .iter()
+        .find(|service| service["service"] == serde_json::json!("catalog-web"))
+        .expect("the producer service");
+    assert_eq!(producer["changed_since_index"], serde_json::json!(1));
+    assert_eq!(
+        producer["stale_files"][0],
+        serde_json::json!("app/routes/api.v1.widgets.$widgetId.ts"),
+        "and names the file:\n{producer:#}"
+    );
+    assert_eq!(producer["stale_files_total"], serde_json::json!(1));
+    assert_eq!(producer["stale_files_truncated"], serde_json::json!(false));
+
+    // Under the session budget, like every other read.
+    let mut timings: Vec<Duration> = Vec::new();
+    for _ in 0..3 {
+        let started = Instant::now();
+        run(root, &["status", "--workspace", "."]);
+        timings.push(started.elapsed());
+    }
+    timings.sort();
+    assert!(
+        timings[1] < Duration::from_millis(300),
+        "a session read must stay under 300 ms; median of three was {:?} ({timings:?})",
+        timings[1]
+    );
+}
+
 /// A read is a read: it must cost what an editor hook can afford. Asserted on
 /// the median of three runs, because a debug binary on a loaded CI box is not
 /// a stopwatch.

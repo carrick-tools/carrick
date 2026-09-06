@@ -23,11 +23,13 @@ change bumps it to `carrick.check/1` and both are emitted for one release.
 | command | reads | writes | budget |
 |---|---|---|---|
 | `carrick index --workspace <dir>` | the repos listed in `<dir>/carrick-workspace.json` | `<dir>/.carrick/` | minutes, cold |
+| `carrick status [--json]` | `.carrick/` only | nothing | < 300 ms |
 | `carrick touch <file> [--json]` | `.carrick/` only | nothing | < 300 ms |
 | `carrick check <file> [--json]` | `.carrick/` only | nothing | < 300 ms |
 | `carrick refresh [--service <name>]` | one service's source | `<dir>/.carrick/` | seconds |
 
-`touch` and `check` never parse the file, never call a model, never call the
+`status` answers about the workspace and takes no file; it is what a surface
+opening a session asks. `touch` and `check` never parse the file, never call a model, never call the
 cloud, and never re-extract. They read what `index` already computed. `touch`
 answers "what is on the other side of what I am editing"; `check` adds the
 contract verdicts computed at index time. Both exit 0 whatever they find:
@@ -249,15 +251,58 @@ Explicit paths, relative to the workspace file. No directory walk.
 
 Both take exactly one file. Neither answers for a workspace: with no path they
 print `carrick touch needs a file path` and exit 2, which is a usage error and
-not a read, and nothing is written to stdout. That is why `file` (and `repo`,
-and `service`) are required in the schema: every response this contract
-describes is about one file.
+not a read, and nothing is written to stdout. That is why `file`, `repo` and
+`service` are required in the schema: every `carrick.check/0` response is about
+one file, and a reader that always has one should not have to defend against a
+response that does not.
 
-A session-level summary — the workspace's services, their commits, how far each
-has moved and what each one's boundary is, with no file in the question — is a
-separate command, **carrick#728**, and it will carry its own response shape in
-this document and its own entry in the schema rather than relaxing `required`
-here. A reader must not build a session line by calling `touch` with no path.
+The workspace question has its own command and its own schema, below.
+
+## `carrick status` — the workspace, with no file in the question
+
+What a surface opening a session asks: what is indexed, at which commit, how
+far each repo has moved since, and what each service could not classify. Same
+rules as the other reads — index only, exit 0 whatever it finds, under 300 ms.
+
+`--json` prints **`carrick.status/0`**
+([`schemas/carrick-status-0.json`](./schemas/carrick-status-0.json)):
+
+```json
+{
+  "schema": "carrick.status/0",
+  "workspace": "/Users/dev/repos",
+  "indexed_at": "2026-09-06T21:14:03Z",
+  "scanner_version": "0.3.41",
+  "services": [
+    {
+      "service": "webapp",
+      "repo": "/Users/dev/repos/webapp",
+      "index_commit": "a1b2c3d4e5f6",
+      "indexed_at": "2026-09-06T21:14:03Z",
+      "routes": 157,
+      "calls": 12,
+      "changed_since_index": 3,
+      "stale_files": ["app/routes/orders.$id.ts"],
+      "stale_files_total": 3,
+      "stale_files_truncated": false,
+      "boundary": { "commit_hash": "a1b2c3d4e5f6", "files_attempted": 0 },
+      "boundary_note": "candidates: not classified locally ...",
+      "boundary_lines": ["boundary (webapp): candidates: not classified ..."]
+    }
+  ]
+}
+```
+
+| field | meaning |
+|---|---|
+| `workspace` | the folder holding `carrick-workspace.json` and `.carrick/` |
+| `services[].repo` | absolute; services of one repo share a commit and a changed-file count, and this is what says so |
+| `services[].changed_since_index` | the exact number of changed and untracked files in that repo |
+| `services[].stale_files` | up to 50 of them, repo-relative; `stale_files_total` is always exact and `stale_files_truncated` says which you are looking at |
+| `services[].boundary_lines` | the same pre-rendered lines `check` and `touch` carry |
+
+Errors are the same three, under this schema:
+`{ "schema": "carrick.status/0", "error": "not_indexed" }`.
 
 ## Out of scope in this version
 

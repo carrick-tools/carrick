@@ -64,9 +64,12 @@ pub struct ErrorOutput {
 }
 
 impl ErrorOutput {
-    pub fn new(error: ReadError) -> Self {
+    /// The schema is the one the CALLER asked under: a `status` failure is a
+    /// `carrick.status/0` body, so a reader that rejects any other marker
+    /// still gets an answer it can parse.
+    pub fn new(error: ReadError, schema: &str) -> Self {
         Self {
-            schema: SCHEMA.to_string(),
+            schema: schema.to_string(),
             error: error.wire().to_string(),
         }
     }
@@ -219,6 +222,95 @@ impl CheckOutput {
         for line in &self.boundary_lines {
             out.push_str(line);
             out.push('\n');
+        }
+        out
+    }
+}
+
+/// The version marker on a `carrick status` answer. Its own schema, because a
+/// status answer is about a WORKSPACE and every `carrick.check/0` response is
+/// about one file — relaxing that document to admit a fileless shape would
+/// make `file` optional for readers that always have one.
+pub const STATUS_SCHEMA: &str = "carrick.status/0";
+
+/// How many stale paths a service lists before the list is a sample. The exact
+/// total is stated either way, so a reader can always tell "here are all 6"
+/// from "here are 50 of 900".
+pub const MAX_STALE_FILES: usize = 50;
+
+/// One service of the workspace, as `carrick status` reports it.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StatusService {
+    pub service: String,
+    /// Absolute path of the repo this service belongs to. Services of one repo
+    /// share a commit and a changed-file count, and this is what says so.
+    pub repo: String,
+    pub index_commit: String,
+    pub indexed_at: String,
+    pub routes: usize,
+    pub calls: usize,
+    /// Files in this service's repo that differ from `index_commit`, or that
+    /// git does not track.
+    pub changed_since_index: usize,
+    /// Up to [`MAX_STALE_FILES`] of them, repo-relative.
+    pub stale_files: Vec<String>,
+    /// The exact number, whatever the list length.
+    pub stale_files_total: usize,
+    /// Whether `stale_files` is a sample rather than the whole set.
+    pub stale_files_truncated: bool,
+    pub boundary: Option<ServiceBoundary>,
+    pub boundary_note: String,
+    pub boundary_lines: Vec<String>,
+}
+
+/// What `carrick status` answers: the workspace, not a file.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StatusOutput {
+    pub schema: String,
+    /// The workspace root: the folder holding `carrick-workspace.json` and
+    /// `.carrick/`.
+    pub workspace: String,
+    pub indexed_at: String,
+    pub scanner_version: String,
+    pub services: Vec<StatusService>,
+}
+
+impl StatusOutput {
+    /// The human form: one block per service, boundary last, same order as
+    /// every other local answer.
+    pub fn render(&self) -> String {
+        let mut out = format!(
+            "{} — {} service(s), indexed at {} by carrick {}\n\n",
+            self.workspace,
+            self.services.len(),
+            self.indexed_at,
+            self.scanner_version
+        );
+        for service in &self.services {
+            out.push_str(&format!(
+                "  {:<28} {:>4} route(s)  {:>4} call(s)  {}  changed since index: {}\n",
+                service.service,
+                service.routes,
+                service.calls,
+                short_commit(&service.index_commit),
+                service.changed_since_index
+            ));
+            for file in &service.stale_files {
+                out.push_str(&format!("      changed  {file}\n"));
+            }
+            if service.stale_files_truncated {
+                out.push_str(&format!(
+                    "      ... and {} more\n",
+                    service.stale_files_total - service.stale_files.len()
+                ));
+            }
+        }
+        out.push('\n');
+        for service in &self.services {
+            for line in &service.boundary_lines {
+                out.push_str(line);
+                out.push('\n');
+            }
         }
         out
     }
