@@ -1655,6 +1655,9 @@ fn append_deterministic_protocol_operations(
         // paths are not root-stripped here, and segment-matching an
         // un-relativized path would misfire on scan-prefix directories.
         provenance: Default::default(),
+        // These ops come from the deterministic protocol extractions, not from
+        // the HTTP emit/join phase, so no pass stated them in the sense
+        // `resolution_source` records (carrick#660).
         resolution_source: None,
     };
 
