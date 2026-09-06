@@ -38,8 +38,14 @@ function firstReason(count: Counted): string {
 export function boundaryLines(boundary: Boundary | undefined, service: string | undefined): string[] {
   if (!boundary) return [];
   const who = service ?? "this workspace";
+  // Local mode dispatches nothing to the analyzer, so the count is 0 on every
+  // laptop index and the clause would be noise on every edit. The commit is
+  // the part of the header that always says something.
+  const attempted = boundary.files_attempted ?? 0;
   const out: string[] = [
-    `${who} at ${shortHash(boundary.commit_hash)}: ${boundary.files_attempted ?? 0} file(s) sent to the analyzer`,
+    attempted > 0
+      ? `${who} at ${shortHash(boundary.commit_hash)}: ${attempted} file(s) sent to the analyzer`
+      : `${who} at ${shortHash(boundary.commit_hash)}`,
   ];
   const push = (count: Counted | undefined, what: string): void => {
     if (!count || count.total === 0) return;

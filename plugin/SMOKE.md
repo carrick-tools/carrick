@@ -73,9 +73,18 @@ Grade from the transcript, not the logs above:
 
 ```
 TRANSCRIPT=$(ls -t ~/.claude/projects/*/*.jsonl | head -1)
-grep -c 'Carrick checked' "$TRANSCRIPT"        # hook contexts
-grep -c '"diagnostics"' "$TRANSCRIPT"          # diagnostic attachments
+# hook contexts
+jq -c 'select(.type=="attachment" and .attachment.type=="hook_additional_context")' "$TRANSCRIPT" | wc -l
+# diagnostic attachments
+jq -c 'select(.type=="attachment" and .attachment.type=="diagnostics")' "$TRANSCRIPT" | wc -l
+# and which turn Carrick first reached the model
+jq -c 'select(.type=="attachment") | .attachment.type' "$TRANSCRIPT" | head
 ```
+
+Those two attachment types are the counters the spike's grader used
+(`harness/grade.mjs`); a plain grep over the transcript also matches the task
+text and file contents, so it is not the instrument. Diagnostics never appear in
+`stream-json` at all.
 
 Passes when arm B shows hook contexts and no diagnostic attachment, arm C shows
 the reverse, and arm A shows neither. Arm C is also the one-turn-late test: a

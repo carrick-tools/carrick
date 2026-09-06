@@ -103,7 +103,7 @@
     {
       "kind": "call",
       "method": "POST",
-      "path": "https://api.stripe.com/v1/charges",
+      "path": "https://api.example-payments.test/v1/charges",
       "line": 95,
       "col": 7,
       "source": "fact",

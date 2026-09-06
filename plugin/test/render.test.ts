@@ -48,7 +48,7 @@ test("consumer sites ride the item line", () => {
 
 test("a peer counterpart gets locations and no producer or consumer word", () => {
   const context = renderPostToolUse(fixture("check-mismatch.json")) ?? "";
-  const line = context.split("\n").find((text) => text.includes("stripe"));
+  const line = context.split("\n").find((text) => text.includes("example-payments"));
   assert.ok(line);
   assert.match(line, /Same contract in: billing-service src\/charges\.ts:31/);
   assert.equal(/consumer|producer/i.test(line), false);
@@ -56,7 +56,7 @@ test("a peer counterpart gets locations and no producer or consumer word", () =>
 
 test("a row nothing was compared for is not reported as a problem", () => {
   const context = renderPostToolUse(fixture("check-mismatch.json")) ?? "";
-  const line = context.split("\n").find((text) => text.includes("stripe"));
+  const line = context.split("\n").find((text) => text.includes("example-payments"));
   // not_checked with a null result: listed because it names a counterpart,
   // after the three real problems, and never as a verdict of its own.
   assert.ok(line);
@@ -133,6 +133,12 @@ test("the boundary keeps the CLI's wording", () => {
     false,
     "a zero count prints no line",
   );
+});
+
+test("a local index dispatches nothing, so the header drops the analyzer count", () => {
+  const lines = boundaryLines({ commit_hash: "abc1234def", files_attempted: 0, candidates_not_classified: 3 }, "webapp");
+  assert.equal(lines[0], "webapp at abc1234");
+  assert.equal(lines[1], "  3 candidate(s) not classified locally: no model runs on this machine");
 });
 
 test("a boundary with a degraded type stage says which stage", () => {

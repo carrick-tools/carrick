@@ -33,7 +33,8 @@ node bundle-server.mjs # copies the shared server into server/
 npx --yes @vscode/vsce package
 ```
 
-Not published to the Marketplace or Open VSX yet. The publisher account and the
+Packaging was run once on 2026-09-06 and produced a 479 KB `.vsix`; the file is
+gitignored. Not published to the Marketplace or Open VSX yet. The publisher account and the
 Open VSX namespace are owner actions in carrick#710, and the same ticket makes
 the server a subcommand of the `carrick` package, at which point this extension
 holds a manifest and nothing else.

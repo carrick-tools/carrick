@@ -60,9 +60,10 @@ whichever channel is delivering.
 ## VS Code
 
 `vscode/` holds a thin extension: a `LanguageClient` on the same server,
-activated on TypeScript files, with no UI of its own. Build it with
-`npm install && npm run build` in that directory. It is not published to the
-Marketplace or Open VSX; the publisher accounts are owner actions in
+activated on TypeScript files, with no UI of its own. Build and package it with
+`npm install && npm run build && node bundle-server.mjs && npx --yes @vscode/vsce package`
+in that directory (proved on 2026-09-06: 330 files, 479 KB). It is not published
+to the Marketplace or Open VSX; the publisher accounts are owner actions in
 carrick#710.
 
 An editor accepts any number of diagnostic providers per file, so this server
