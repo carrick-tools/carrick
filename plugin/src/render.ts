@@ -13,6 +13,8 @@ import {
   type CheckResult,
   type Counted,
   type Counterpart,
+  type StatusResult,
+  type StatusService,
 } from "./contract.ts";
 
 /** How many item lines one hook message carries before it says how many are left. */
@@ -148,22 +150,23 @@ function sourceLabel(item: CheckItem): string {
 }
 
 /**
- * The state in words. `not_checked` and `unresolved` are the two that change
- * what a result means, and both have to survive into the rendered line.
+ * The verdict state in words. It is the type layer's word and only that: it
+ * says nothing about freshness, which `stale` and `changed_since_index` carry.
  */
 export function stateWord(state: string | undefined): string {
-  if (state === "not_checked") return "not checked";
-  if (state === "unresolved") return "unresolved, so it describes the indexed version";
+  if (state === "not_checked") return "no type verdict";
+  if (state === "unresolved") return "no usable type on one side, so nothing is claimed";
+  if (state === "resolved") return "compiler-compared";
   return state ?? "";
 }
 
 /**
  * What is known about the contract at this row.
  *
- * A `not_checked` verdict carries `result: null` by contract, so there is no
- * result word to print and the state is the whole answer. Every state other
- * than `resolved` rides along with the result, because a `type_mismatch` about
- * the indexed tree and one about the tree on disk read identically otherwise.
+ * `result` is null wherever the state is the whole statement, so there is no
+ * result word to print and the state carries the line. Where both are present
+ * the state qualifies the result, because `method_mismatch` with no type
+ * verdict behind it is a different claim from a compiler-compared mismatch.
  */
 function verdictText(item: CheckItem): string {
   if (!item.verdict) return "";
@@ -278,25 +281,78 @@ export function renderPostToolUse(result: CheckResult, displayFile?: string): st
 }
 
 /**
- * The SessionStart line: what the index holds and how far the tree has moved
- * from it. Printed once, at exit 0, so Claude Code adds it to the session.
+ * The boundary for one service in a status answer, same preference as a check.
  */
-export function renderSessionStart(result: CheckResult): string {
-  if (result.error === "not_indexed") {
-    return "Carrick has no index for this workspace, so nothing in this session is checked against the other services. `carrick index` builds one.";
+export function serviceBoundary(service: StatusService): string[] {
+  if (service.boundary_lines?.length) return service.boundary_lines;
+  const counts = boundaryLines(service.boundary, service.service);
+  if (service.boundary_note) return [service.boundary_note, ...counts];
+  return counts;
+}
+
+/** How many stale files one service line names before it says how many are left. */
+export const MAX_STALE_FILES = 5;
+
+function staleText(service: StatusService): string {
+  const total = service.stale_files_total ?? service.changed_since_index;
+  const shown = (service.stale_files ?? []).slice(0, MAX_STALE_FILES);
+  if (!shown.length) return "";
+  const rest = total - shown.length;
+  const listed = rest > 0 ? `${shown.join(", ")}, +${rest} more` : shown.join(", ");
+  return ` (${listed})`;
+}
+
+/**
+ * One line per service: what it holds, at which commit, and how far its repo
+ * has moved since.
+ *
+ * Services of one repo share a commit and a changed-file count, so the count is
+ * stated on the first service of each repo and the others point at it. Saying
+ * it once is the difference between one repo with three services and three
+ * repos that all happen to have moved by the same number of files.
+ */
+export function serviceLine(service: StatusService, sharesRepoWith: string | null): string {
+  const head = `- ${service.service} at ${shortHash(service.index_commit)}: ${service.routes} route(s), ${service.calls} call(s)`;
+  if (sharesRepoWith) {
+    return `${head}. Same repo as ${sharesRepoWith}, so the same ${service.changed_since_index} changed file(s)`;
   }
-  if (result.error) {
-    return `Carrick could not read its index for this workspace (${result.error}).`;
+  return `${head}, changed since index: ${service.changed_since_index}${staleText(service)}`;
+}
+
+/**
+ * The SessionStart line, from `carrick status --json`.
+ *
+ * `check` and `touch` each take exactly one file, so this is the only read that
+ * answers for a workspace. It carries no verdict: `status` states what is
+ * indexed and what each service could not classify, and nothing about whether a
+ * contract holds.
+ */
+export function renderSessionStart(status: StatusResult): string {
+  if (status.error === "not_indexed") {
+    return "Carrick has no index for this workspace, so nothing in this session is checked against the other services. `carrick index --workspace <dir>` builds one.";
   }
-  const who = result.service ?? "this workspace";
-  const changed = result.changed_since_index;
+  if (status.error) {
+    return `Carrick could not read its index for this workspace (${status.error}).`;
+  }
+  if (!status.services.length) {
+    return `Carrick has an index at ${status.workspace ?? "this workspace"} and it holds no services.`;
+  }
+
+  const version = status.scanner_version ? `, scanner ${status.scanner_version}` : "";
+  const where = status.workspace ? ` in ${status.workspace}` : "";
+  const when = status.indexed_at ? ` at ${status.indexed_at}` : "";
   const lines: string[] = [
-    typeof changed === "number"
-      ? `Carrick indexed ${who} at ${shortHash(result.index_commit)}. ${changed} file(s) have changed since then, and their routes and calls are whatever the index last saw.`
-      : `Carrick indexed ${who} at ${shortHash(result.index_commit)}.`,
+    `Carrick indexed ${status.services.length} service(s)${where}${when}${version}.`,
   ];
-  const items = reportableItems(result);
-  for (const item of items.slice(0, MAX_ITEM_LINES)) lines.push(itemLine(item, result.file));
-  pushBoundary(lines, result, boundaryFor(result));
+
+  const firstOfRepo = new Map<string, string>();
+  for (const service of status.services) {
+    const shared = firstOfRepo.get(service.repo) ?? null;
+    if (!shared) firstOfRepo.set(service.repo, service.service);
+    lines.push(serviceLine(service, shared));
+  }
+  for (const service of status.services) {
+    for (const line of serviceBoundary(service)) lines.push(line);
+  }
   return lines.join("\n");
 }

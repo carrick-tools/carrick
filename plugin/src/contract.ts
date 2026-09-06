@@ -110,6 +110,37 @@ export type CheckResult = {
 };
 
 export const SCHEMA = "carrick.check/0";
+export const STATUS_SCHEMA = "carrick.status/0";
+
+/** One service in a `carrick status --json` answer. */
+export type StatusService = {
+  service: string;
+  /** Absolute. Services of one repo share a commit and a changed-file count. */
+  repo: string;
+  index_commit: string;
+  indexed_at?: string;
+  routes: number;
+  calls: number;
+  changed_since_index: number;
+  /** Up to 50, repo-relative and sorted. */
+  stale_files?: string[];
+  /** Always exact, whatever the list length. */
+  stale_files_total?: number;
+  stale_files_truncated?: boolean;
+  boundary?: Boundary;
+  boundary_note?: string;
+  boundary_lines?: string[];
+};
+
+/** `carrick status --json`: the workspace, with no file in the question. */
+export type StatusResult = {
+  schema: string;
+  error?: string;
+  workspace?: string;
+  indexed_at?: string;
+  scanner_version?: string;
+  services: StatusService[];
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -161,6 +192,39 @@ export function parseCheckResult(stdout: string): CheckResult | null {
   return result;
 }
 
+/**
+ * Parse `carrick status --json` output, or `null` when it is not that shape.
+ *
+ * Its own schema rather than a fileless `check`, so every `carrick.check/0`
+ * response stays about one file. A service row missing a required field is
+ * dropped rather than rendered half-formed.
+ */
+export function parseStatusResult(stdout: string): StatusResult | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed)) return null;
+  if (parsed["schema"] !== STATUS_SCHEMA) return null;
+  const result: StatusResult = { schema: STATUS_SCHEMA, services: [] };
+  if (typeof parsed["error"] === "string") result.error = parsed["error"];
+  if (typeof parsed["workspace"] === "string") result.workspace = parsed["workspace"];
+  if (typeof parsed["indexed_at"] === "string") result.indexed_at = parsed["indexed_at"];
+  if (typeof parsed["scanner_version"] === "string") {
+    result.scanner_version = parsed["scanner_version"];
+  }
+  const services = Array.isArray(parsed["services"]) ? parsed["services"] : [];
+  for (const entry of services) {
+    if (!isRecord(entry)) continue;
+    if (typeof entry["service"] !== "string" || typeof entry["repo"] !== "string") continue;
+    if (typeof entry["index_commit"] !== "string") continue;
+    result.services.push(entry as unknown as StatusService);
+  }
+  return result;
+}
+
 /** True when the row is the model's reading alone (R1). */
 export function isCandidate(item: CheckItem): boolean {
   return item.source === "candidate";
@@ -170,15 +234,17 @@ export function isCandidate(item: CheckItem): boolean {
  * Items worth reporting: a verdict that states a result other than
  * `compatible`.
  *
- * A null verdict, a null result and `not_checked` all say the same thing in
- * different words: nothing was compared here. None of them is a problem to
- * publish. Both channels report the same set, so a diagnostic and a hook line
- * never disagree about what is wrong.
+ * The result decides, not the state. `state` is the type layer's word, and
+ * `not_checked` covers the routing findings (`method_mismatch`,
+ * `producer_removed`) as well as the rows nothing bears on, so filtering on it
+ * would drop real findings. A null result is the "nothing is claimed" case in
+ * every state. Both channels report this same set, so a diagnostic and a hook
+ * line never disagree about what is wrong.
  */
 export function problemItems(result: CheckResult): CheckItem[] {
   return (result.items ?? []).filter((item) => {
     const verdict = item.verdict;
-    if (!verdict || verdict.state === "not_checked") return false;
+    if (!verdict) return false;
     return verdict.result != null && verdict.result !== "compatible";
   });
 }

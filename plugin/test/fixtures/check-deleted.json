@@ -23,11 +23,12 @@
           "role": "consumer",
           "service": "order-service",
           "file": "src/clients/users.ts",
-          "line": 18
+          "line": 18,
+          "repo": "/workspace/order-service"
         }
       ],
       "verdict": {
-        "state": "resolved",
+        "state": "not_checked",
         "result": "producer_removed",
         "detail": "the file is gone from disk and one consumer still calls this route"
       }

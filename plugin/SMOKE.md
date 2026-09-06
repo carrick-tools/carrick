@@ -19,9 +19,11 @@ export WS=/path/to/a/workspace/with/several/repos
 cd "$WS"
 carrick index --workspace "$WS"
 carrick check <a file with a route> --json | python3 -m json.tool | head -40
+carrick status --json | python3 -m json.tool | head -40
 ```
 
-Read the payload against `docs/schemas/carrick-check-0.json`. Then run the
+Read the two payloads against `docs/schemas/carrick-check-0.json` and
+`docs/schemas/carrick-status-0.json`. Then run the
 plugin's suite with the real binary in place of the fake one:
 
 ```
@@ -46,9 +48,16 @@ index holds no rows and no boundary for that file. Time it: the hook's own work
 is under 300 ms, and the CLI's share is the number in the log line
 (`CARRICK_LOG_QUIET=0` puts it on stderr).
 
-The session line has nothing to prove until carrick#728: `touch` with no file
-exits 2 today, so the SessionStart hook prints nothing by design. Re-run this
-section when that command lands.
+The session line has its own check, and it is free:
+
+```
+cd "$WS"
+node "$PLUGIN/src/hook/session-start.ts" < /dev/null
+```
+
+Expect one line per service, the shared-repo count stated once, and each
+service's boundary lines last. Compare it against `carrick status` with no
+`--json`: the boundary lines should be the same bytes in both.
 
 ## 1. Headless Claude Code, three arms (about $1, owner-gated)
 

@@ -6,9 +6,10 @@ import {
   itemLine,
   renderPostToolUse,
   renderSessionStart,
+  serviceLine,
   shortHash,
 } from "../src/render.ts";
-import { fixture } from "./helpers.ts";
+import { fixture, statusFixture } from "./helpers.ts";
 
 test("the hook context puts locations first and the boundary last", () => {
   const context = renderPostToolUse(fixture("check-mismatch.json"));
@@ -17,7 +18,8 @@ test("the hook context puts locations first and the boundary last", () => {
   assert.match(lines[0] ?? "", /^Carrick checked src\/routes\/users\.ts against the workspace index \(user-service, indexed at 6a1b2c3\)/);
   // Problems first, by line, then the rows that only name a counterpart.
   assert.match(lines[1] ?? "", /^- src\/routes\/users\.ts:42:3/);
-  assert.match(lines[4] ?? "", /^- src\/routes\/users\.ts:12:3/);
+  assert.match(lines[2] ?? "", /^- src\/routes\/users\.ts:61:9/);
+  assert.match(lines[3] ?? "", /^- src\/routes\/users\.ts:12:3/);
   const boundaryAt = lines.findIndex((line) => line.startsWith("Boundary:"));
   const lastItemAt = lines.reduce((at, line, index) => (line.startsWith("- ") ? index : at), -1);
   assert.ok(boundaryAt > lastItemAt, "the boundary follows every location line");
@@ -36,7 +38,7 @@ test("a candidate row is labelled as one and names what produced it", () => {
   const line = context.split("\n").find((text) => text.includes("/api/orders"));
   assert.ok(line);
   assert.match(line, /\[candidate, model\]/);
-  assert.match(line, /method_mismatch: order-service serves PUT at this path/);
+  assert.match(line, /method_mismatch \(no type verdict\): order-service serves PUT at this path/);
 });
 
 test("consumer sites ride the item line", () => {
@@ -59,8 +61,8 @@ test("a not_checked row prints the state, never the word null", () => {
   const context = renderPostToolUse(fixture("check-mismatch.json")) ?? "";
   const line = context.split("\n").find((text) => text.includes("example-payments"));
   assert.ok(line);
-  // result is null by contract on this state, so the state is the whole answer.
-  assert.match(line, /not checked: matched to a shared external contract/);
+  // result is null wherever the state is the whole statement.
+  assert.match(line, /no type verdict: matched to a shared external contract/);
   assert.equal(/\bnull\b/.test(line), false);
   assert.equal(line.includes("not_checked"), false);
 });
@@ -70,19 +72,22 @@ test("no rendered line anywhere prints the word null", () => {
     renderPostToolUse(fixture("check-mismatch.json")) ?? "",
     renderPostToolUse(fixture("check-deleted.json")) ?? "",
     renderPostToolUse(fixture("check-pre-rendered-boundary.json")) ?? "",
-    renderSessionStart(fixture("touch-workspace.json")),
+    renderSessionStart(statusFixture("status-workspace.json")),
   ].join("\n");
   assert.equal(/\bnull\b/.test(rendered), false);
   assert.equal(rendered.includes("undefined"), false);
 });
 
-test("a verdict about the indexed tree says so, so it cannot read as a live one", () => {
+test("a verdict that claims nothing says so, and a compiler verdict stands alone", () => {
   const context = renderPostToolUse(fixture("check-mismatch.json")) ?? "";
-  const stale = context.split("\n").find((text) => text.includes("/api/audit/:id"));
-  assert.match(stale ?? "", /type_mismatch \(unresolved, so it describes the indexed version\)/);
-  const live = context.split("\n").find((text) => text.includes("/api/users/:id"));
-  assert.match(live ?? "", /type_mismatch: the response no longer carries/);
-  assert.equal(live?.includes("unresolved"), false);
+  // `unresolved` is the type layer's word: a side would not resolve, so there
+  // is no result to print and nothing is asserted about the pair.
+  const unresolved = context.split("\n").find((text) => text.includes("/api/audit/:id"));
+  assert.match(unresolved ?? "", /no usable type on one side, so nothing is claimed: the consumer's expected type resolved to `any`/);
+  assert.equal(/type_mismatch/.test(unresolved ?? ""), false);
+  const compared = context.split("\n").find((text) => text.includes("/api/users/:id"));
+  assert.match(compared ?? "", /type_mismatch: the response no longer carries/);
+  assert.equal(compared?.includes("no type verdict"), false);
 });
 
 test("evidence rides the item line when the row states it", () => {
@@ -121,8 +126,8 @@ test("no user-visible line carries an em-dash", () => {
   const rendered = [
     renderPostToolUse(fixture("check-mismatch.json")) ?? "",
     renderPostToolUse(fixture("check-deleted.json")) ?? "",
-    renderSessionStart(fixture("touch-workspace.json")),
-    renderSessionStart(fixture("check-not-indexed.json")),
+    renderSessionStart(statusFixture("status-workspace.json")),
+    renderSessionStart(statusFixture("status-not-indexed.json")),
   ].join("\n");
   assert.equal(rendered.includes("—"), false);
   assert.equal(rendered.includes("–"), false);
@@ -188,11 +193,11 @@ test("without the CLI's lines the note leads the counts, and the block is labell
   assert.match(context, /\nuser-service at 6a1b2c3: 128 file\(s\) sent to the analyzer/);
 });
 
-test("the session line takes the CLI's boundary lines too", () => {
-  const result = fixture("check-pre-rendered-boundary.json");
-  const rendered = renderSessionStart(result).split("\n");
-  const sent = result.boundary_lines ?? [];
-  assert.deepEqual(rendered.slice(-sent.length), sent);
+test("the session line ends with each service's boundary lines, verbatim", () => {
+  const status = statusFixture("status-workspace.json");
+  const rendered = renderSessionStart(status).split("\n");
+  const expected = status.services.flatMap((service) => service.boundary_lines ?? []);
+  assert.deepEqual(rendered.slice(-expected.length), expected);
 });
 
 test("a local index dispatches nothing, so the header drops the analyzer count", () => {
@@ -202,7 +207,15 @@ test("a local index dispatches nothing, so the header drops the analyzer count",
 });
 
 test("a boundary with a degraded type stage says which stage", () => {
-  const lines = boundaryLines(fixture("touch-workspace.json").boundary, "user-service");
+  const lines = boundaryLines(
+    {
+      commit_hash: "abc1234def",
+      files_attempted: 3,
+      sdk_unresolved: { total: 2, reasons: ["@acme/sdk x2: no surface for the member"] },
+      types_degraded: { stage: "capture", detail: "the sidecar ran out of memory" },
+    },
+    "user-service",
+  );
   assert.ok(lines.includes("  types degraded at capture: the sidecar ran out of memory"));
   // Two of them, one reason listed, so the reason reads as an example.
   assert.ok(
@@ -210,17 +223,48 @@ test("a boundary with a degraded type stage says which stage", () => {
   );
 });
 
-test("the session line states the index, the drift and the boundary", () => {
-  const rendered = renderSessionStart(fixture("touch-workspace.json"));
-  const lines = rendered.split("\n");
-  assert.match(lines[0] ?? "", /^Carrick indexed user-service at 6a1b2c3\. 7 file\(s\) have changed/);
-  assert.ok(lines.some((line) => line.startsWith("Boundary:")));
+test("the session line is one line per service, with what it holds and how far it has moved", () => {
+  const lines = renderSessionStart(statusFixture("status-workspace.json")).split("\n");
+  assert.match(
+    lines[0] ?? "",
+    /^Carrick indexed 3 service\(s\) in \/workspace at 2026-09-06T21:14:03Z, scanner 0\.3\.41\.$/,
+  );
+  assert.match(
+    lines[1] ?? "",
+    /^- user-service at 6a1b2c3: 157 route\(s\), 12 call\(s\), changed since index: 7 \(/,
+  );
+  assert.match(lines[3] ?? "", /^- order-service at 9988776: 40 route\(s\), 61 call\(s\), changed since index: 120 \(/);
+});
+
+test("at most five stale files are named, and the rest are counted", () => {
+  const lines = renderSessionStart(statusFixture("status-workspace.json")).split("\n");
+  const first = lines[1] ?? "";
+  assert.match(first, /\(src\/routes\/users\.ts, src\/routes\/orders\.ts, src\/lib\/db\.ts, src\/lib\/http\.ts, src\/util\/format\.ts, \+2 more\)$/);
+  const truncated = lines[3] ?? "";
+  assert.match(truncated, /, \+115 more\)$/, "the count comes from stale_files_total, not the list");
+});
+
+test("services sharing a repo say the changed count once", () => {
+  const lines = renderSessionStart(statusFixture("status-workspace.json")).split("\n");
+  assert.match(lines[2] ?? "", /^- user-admin at 6a1b2c3: 12 route\(s\), 3 call\(s\)\. Same repo as user-service, so the same 7 changed file\(s\)$/);
+  assert.equal(
+    (lines[2] ?? "").includes("changed since index:"),
+    false,
+    "the second service of a repo does not restate the count",
+  );
+});
+
+test("a service line names its own repo's count when the repo is new", () => {
+  const [service] = statusFixture("status-workspace.json").services;
+  assert.ok(service);
+  assert.match(serviceLine(service, null), /changed since index: 7/);
+  assert.match(serviceLine(service, "another"), /Same repo as another, so the same 7 changed file\(s\)$/);
 });
 
 test("no index gives one line and the command that builds one", () => {
-  const rendered = renderSessionStart(fixture("check-not-indexed.json"));
+  const rendered = renderSessionStart(statusFixture("status-not-indexed.json"));
   assert.match(rendered, /^Carrick has no index for this workspace/);
-  assert.match(rendered, /`carrick index` builds one\.$/);
+  assert.match(rendered, /`carrick index --workspace <dir>` builds one\.$/);
 });
 
 test("a short hash is seven characters, and an absent one says so", () => {

@@ -2,10 +2,13 @@
 //
 // Four rules decide what a diagnostic looks like here.
 //
-// R1: only a fact row with a resolved verdict is an error. A mismatch found on
-// a candidate row, or on a row whose types did not resolve, is a warning and
-// carries its label in the text, because a candidate is the model's reading and
-// nothing in the product enforces one.
+// R1: a finding on a fact row is an error; the same finding on a candidate row
+// is a warning that says it is the model's reading. `verdict.state` is the type
+// layer's word and not a confidence in the row: `method_mismatch` and
+// `producer_removed` are routing facts and carry `not_checked` because no type
+// verdict bears on them, so keying severity off the state alone would demote
+// every routing finding. A state of `unresolved` is the exception: nothing was
+// claimed there, so nothing is asserted here either.
 //
 // E18: Claude Code drops `relatedInformation` from the attachment it gives the
 // model, and editors render it as clickable locations. So every counterpart
@@ -63,11 +66,12 @@ function rangeAt(line: number | undefined, col: number | undefined): Range {
   };
 }
 
-/** An error only for a fact row whose verdict resolved (R1c). */
+/** An error only for a finding on a fact row that claims something (R1c). */
 export function severityOf(item: CheckItem): number {
   if (isCandidate(item)) return SEVERITY.warning;
   if (item.source !== "fact") return SEVERITY.warning;
-  return item.verdict?.state === "resolved" ? SEVERITY.error : SEVERITY.warning;
+  if (item.verdict?.state === "unresolved") return SEVERITY.warning;
+  return SEVERITY.error;
 }
 
 /** `consumer in admin-ui`, and for a peer the role word is left out. */
@@ -83,8 +87,8 @@ function counterpartWhere(counterpart: Counterpart): string {
 export function messageOf(item: CheckItem): string {
   const operation = [item.method, item.path].filter(Boolean).join(" ");
   const verdict = item.verdict;
-  // `result` is null on a `not_checked` verdict, and a result whose state is
-  // not `resolved` is a verdict about the indexed tree rather than this one.
+  // `result` is null wherever the state is the whole statement, and a result
+  // whose state is not `resolved` has no compiler verdict behind it.
   const verdictWords = verdict
     ? verdict.result == null
       ? stateWord(verdict.state)

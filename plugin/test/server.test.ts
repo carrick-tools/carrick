@@ -23,8 +23,8 @@ test("didOpen publishes the check verdicts, on the file and on its counterparts"
   assert.ok(uris.some((uri) => uri.endsWith("user-service/src/routes/users.ts")));
   assert.ok(uris.some((uri) => uri.endsWith("order-service/src/clients/users.ts")));
   const edited = client.publishes.find((publish) => publish.uri.endsWith("routes/users.ts"));
-  // three problems and the boundary
-  assert.equal(edited?.diagnostics.length, 4);
+  // two findings and the boundary
+  assert.equal(edited?.diagnostics.length, 3);
 });
 
 test("the CLI runs from the workspace root with the file relative to it", async (t) => {
@@ -69,7 +69,12 @@ test("a client rooted inside one service is corrected to the workspace, and logg
     cwd: string;
   };
   assert.equal(fs.realpathSync(call.cwd), fs.realpathSync(workspace.root));
-  assert.match(client.stderr, /has no \.carrick\/; using .* \(ancestor\)/);
+  // stderr arrives on its own schedule, so wait for the line rather than
+  // assuming it landed before the CLI call did.
+  await client.waitFor(
+    () => /has no \.carrick\/; using .* \(ancestor\)/.test(client.stderr),
+    "the root correction in the log",
+  );
 });
 
 test("a burst of didChange checks once", async (t) => {
@@ -166,7 +171,7 @@ test("a pull request for diagnostics is answered from the same check", async (t)
   await client.waitFor(() => client.responses.has(id), "a pull response");
   const result = client.responses.get(id) as { kind: string; items: unknown[] };
   assert.equal(result.kind, "full");
-  assert.equal(result.items.length, 4);
+  assert.equal(result.items.length, 3);
 });
 
 test("a CLI that fails publishes nothing and keeps the server alive", async (t) => {

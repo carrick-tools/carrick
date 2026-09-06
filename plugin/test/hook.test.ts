@@ -150,7 +150,7 @@ test("the hook stays quiet when the LSP owns delivery", async (t) => {
   }
 });
 
-test("the session line states the index and the drift", async (t) => {
+test("the session line asks status about the workspace, and states what it holds", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const argvLog = path.join(workspace.root, "argv.log");
@@ -158,14 +158,40 @@ test("the session line states the index and the drift", async (t) => {
   const run = await runHook("session-start.ts", {
     cwd: workspace.root,
     env: fakeEnv({
-      CARRICK_FAKE_FIXTURE: fixturePath("touch-workspace.json"),
+      CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json"),
       CARRICK_FAKE_ARGV_LOG: argvLog,
     }),
   });
   assert.equal(run.code, 0);
-  assert.match(run.stdout, /^Carrick indexed user-service at 6a1b2c3\. 7 file\(s\) have changed/);
-  const call = JSON.parse(fs.readFileSync(argvLog, "utf8").trim()) as { argv: string[] };
-  assert.deepEqual(call.argv, ["touch", "--json"]);
+  assert.match(run.stdout, /^Carrick indexed 3 service\(s\) in \/workspace/);
+  assert.match(run.stdout, /\n- user-service at 6a1b2c3: 157 route\(s\), 12 call\(s\), changed since index: 7 \(/);
+  assert.match(run.stdout, /\n- user-admin .*Same repo as user-service, so the same 7 changed file\(s\)/);
+  const call = JSON.parse(fs.readFileSync(argvLog, "utf8").trim()) as {
+    argv: string[];
+    cwd: string;
+  };
+  assert.deepEqual(call.argv.slice(0, 2), ["status", "--workspace"]);
+  assert.equal(call.argv.at(-1), "--json");
+  assert.equal(fs.realpathSync(call.cwd), fs.realpathSync(workspace.root));
+});
+
+test("no index gives the session one line and no session fails on it", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+
+  const run = await runHook("session-start.ts", {
+    cwd: workspace.root,
+    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("status-not-indexed.json") }),
+  });
+  assert.equal(run.code, 0);
+  assert.match(run.stdout, /^Carrick has no index for this workspace/);
+
+  const broken = await runHook("session-start.ts", {
+    cwd: workspace.root,
+    env: fakeEnv({ CARRICK_FAKE_EXIT: "2" }),
+  });
+  assert.equal(broken.code, 0);
+  assert.equal(broken.stdout, "");
 });
 
 test("the session line is printed whichever channel delivers verdicts", async (t) => {
@@ -176,7 +202,7 @@ test("the session line is printed whichever channel delivers verdicts", async (t
     cwd: workspace.root,
     env: fakeEnv({
       CARRICK_CHANNEL: "lsp",
-      CARRICK_FAKE_FIXTURE: fixturePath("touch-workspace.json"),
+      CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json"),
     }),
   });
   assert.match(lsp.stdout, /^Carrick indexed/);
@@ -185,7 +211,7 @@ test("the session line is printed whichever channel delivers verdicts", async (t
     cwd: workspace.root,
     env: fakeEnv({
       CARRICK_CHANNEL: "off",
-      CARRICK_FAKE_FIXTURE: fixturePath("touch-workspace.json"),
+      CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json"),
     }),
   });
   assert.equal(off.stdout, "");

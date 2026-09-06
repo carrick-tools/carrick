@@ -23,7 +23,7 @@ function diagnosticsFor(name: string) {
   return toDiagnostics(fixture(name), ROOT, CHECKED, { exists });
 }
 
-test("only a fact row with a resolved verdict is an error (R1)", () => {
+test("a finding on a fact row is an error and the same on a candidate is a warning (R1)", () => {
   assert.equal(
     severityOf({
       kind: "route",
@@ -44,7 +44,7 @@ test("only a fact row with a resolved verdict is an error (R1)", () => {
     severityOf({
       kind: "call",
       source: "fact",
-      verdict: { state: "unresolved", result: "type_mismatch" },
+      verdict: { state: "unresolved", result: null },
     }),
     SEVERITY.warning,
   );
@@ -52,14 +52,32 @@ test("only a fact row with a resolved verdict is an error (R1)", () => {
 
 test("the checked file gets one diagnostic per problem, then the boundary", () => {
   const edited = diagnosticsFor("check-mismatch.json").get(CHECKED_ABS);
-  assert.equal(edited?.length, 4);
+  assert.equal(edited?.length, 3);
   assert.deepEqual(
     edited?.map((diagnostic) => diagnostic.severity),
-    [SEVERITY.error, SEVERITY.warning, SEVERITY.warning, SEVERITY.information],
+    [SEVERITY.error, SEVERITY.warning, SEVERITY.information],
   );
   assert.deepEqual(
     edited?.map((diagnostic) => diagnostic.code),
-    ["type_mismatch", "method_mismatch", "type_mismatch", "boundary"],
+    ["type_mismatch", "method_mismatch", "boundary"],
+  );
+});
+
+test("a routing finding on a fact row is an error, whatever its type state", () => {
+  // `not_checked` says no TYPE verdict bears on the row, not that the row is
+  // uncertain: a method mismatch read off two deterministic rows is a fact.
+  assert.equal(
+    severityOf({
+      kind: "call",
+      source: "fact",
+      verdict: { state: "not_checked", result: "method_mismatch" },
+    }),
+    SEVERITY.error,
+  );
+  // `unresolved` claims nothing, so nothing is asserted here either.
+  assert.equal(
+    severityOf({ kind: "call", source: "fact", verdict: { state: "unresolved", result: null } }),
+    SEVERITY.warning,
   );
 });
 
@@ -102,12 +120,17 @@ test("counterpart sites are in the message text and in relatedInformation (E18)"
   assert.equal(first?.relatedInformation?.[0]?.location.range.start.line, 17);
 });
 
-test("a diagnostic never prints the word null, and says when a verdict is about the indexed tree", () => {
+test("a diagnostic never prints the word null, and qualifies a finding with no type verdict", () => {
   const edited = diagnosticsFor("check-mismatch.json").get(CHECKED_ABS) ?? [];
   const messages = edited.map((diagnostic) => diagnostic.message).join("\n");
   assert.equal(/\bnull\b/.test(messages), false);
-  const stale = edited.find((diagnostic) => diagnostic.message.includes("/api/audit/:id"));
-  assert.match(stale?.message ?? "", /type_mismatch \(unresolved, so it describes the indexed version\)/);
+  const routing = edited.find((diagnostic) => diagnostic.code === "method_mismatch");
+  assert.match(routing?.message ?? "", /method_mismatch \(no type verdict\)/);
+  assert.equal(
+    edited.some((diagnostic) => diagnostic.message.includes("/api/audit/:id")),
+    false,
+    "a row that claims nothing publishes nothing",
+  );
 });
 
 test("a candidate diagnostic says it is a reading of the code", () => {

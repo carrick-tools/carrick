@@ -6,7 +6,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseCheckResult, type CheckResult } from "../src/contract.ts";
+import {
+  parseCheckResult,
+  parseStatusResult,
+  type CheckResult,
+  type StatusResult,
+} from "../src/contract.ts";
 
 export const testDir = path.dirname(fileURLToPath(import.meta.url));
 export const pluginDir = path.dirname(testDir);
@@ -19,6 +24,12 @@ export function fixturePath(name: string): string {
 export function fixture(name: string): CheckResult {
   const parsed = parseCheckResult(fs.readFileSync(fixturePath(name), "utf8"));
   if (!parsed) throw new Error(`fixture ${name} is not a carrick.check/0 payload`);
+  return parsed;
+}
+
+export function statusFixture(name: string): StatusResult {
+  const parsed = parseStatusResult(fs.readFileSync(fixturePath(name), "utf8"));
+  if (!parsed) throw new Error(`fixture ${name} is not a carrick.status/0 payload`);
   return parsed;
 }
 

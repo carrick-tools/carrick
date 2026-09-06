@@ -5,7 +5,12 @@
 // answer", because neither an edit nor a session start may fail on Carrick.
 
 import { execFile } from "node:child_process";
-import { parseCheckResult, type CheckResult } from "./contract.ts";
+import {
+  parseCheckResult,
+  parseStatusResult,
+  type CheckResult,
+  type StatusResult,
+} from "./contract.ts";
 
 /** Binary to run. `carrick` on PATH unless CARRICK_BIN names another. */
 export function binary(env: NodeJS.ProcessEnv = process.env): string {
@@ -19,8 +24,8 @@ export function timeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 5000;
 }
 
-export type RunOutcome = {
-  result: CheckResult | null;
+export type RunOutcome<T = CheckResult> = {
+  result: T | null;
   /** Why there is no result, for the log. Null when there is one. */
   failure: string | null;
   ms: number;
@@ -33,11 +38,15 @@ export type RunOptions = {
   bin?: string;
 };
 
-async function run(args: string[], options: RunOptions): Promise<RunOutcome> {
+async function run<T>(
+  args: string[],
+  options: RunOptions,
+  parse: (stdout: string) => T | null,
+): Promise<RunOutcome<T>> {
   const env = options.env ?? process.env;
   const bin = options.bin ?? binary(env);
   const started = Date.now();
-  return await new Promise<RunOutcome>((resolve) => {
+  return await new Promise<RunOutcome<T>>((resolve) => {
     execFile(
       bin,
       args,
@@ -50,14 +59,14 @@ async function run(args: string[], options: RunOptions): Promise<RunOutcome> {
       },
       (error, stdout) => {
         const ms = Date.now() - started;
-        const parsed = parseCheckResult(stdout ?? "");
+        const parsed = parse(stdout ?? "");
         if (parsed) {
           resolve({ result: parsed, failure: null, ms });
           return;
         }
         const failure = error
           ? `${bin} ${args.join(" ")} failed: ${error.message}`
-          : `${bin} ${args.join(" ")} printed no carrick.check/0 payload`;
+          : `${bin} ${args.join(" ")} printed no payload this reader knows`;
         resolve({ result: null, failure, ms });
       },
     );
@@ -65,12 +74,22 @@ async function run(args: string[], options: RunOptions): Promise<RunOutcome> {
 }
 
 /** `carrick check <file> --json`, run from the workspace root. */
-export async function check(file: string, options: RunOptions): Promise<RunOutcome> {
-  return await run(["check", file, "--json"], options);
+export async function check(file: string, options: RunOptions): Promise<RunOutcome<CheckResult>> {
+  return await run(["check", file, "--json"], options, parseCheckResult);
 }
 
-/** `carrick touch <file> --json`, or with no file for the whole workspace. */
-export async function touch(file: string | null, options: RunOptions): Promise<RunOutcome> {
-  const args = file ? ["touch", file, "--json"] : ["touch", "--json"];
-  return await run(args, options);
+/**
+ * `carrick status --json`: the workspace, with no file in the question.
+ *
+ * `check` and `touch` each take exactly one file, so this is the command a
+ * surface opening a session asks. `--workspace` is passed only when the caller
+ * names one; without it the CLI finds `.carrick/` from the working directory.
+ */
+export async function status(
+  options: RunOptions & { workspace?: string | null },
+): Promise<RunOutcome<StatusResult>> {
+  const args = options.workspace
+    ? ["status", "--workspace", options.workspace, "--json"]
+    : ["status", "--json"];
+  return await run(args, options, parseStatusResult);
 }

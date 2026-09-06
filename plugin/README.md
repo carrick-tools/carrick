@@ -5,9 +5,12 @@ without anyone asking for it: the routes and calls in that file, who is on the
 other side of them in the other repos on disk, and any contract that no longer
 holds. Two delivery channels, one source of facts, no model on the laptop.
 
-Everything here reads `carrick check <file> --json` and `carrick touch --json`.
-The shape is pinned in [`docs/local-mode-output.md`](../docs/local-mode-output.md)
-and [`docs/schemas/carrick-check-0.json`](../docs/schemas/carrick-check-0.json).
+Everything here reads two commands: `carrick check <file> --json` for the file
+an agent just touched, and `carrick status --json` for the workspace a session
+just opened. Both shapes are pinned in
+[`docs/local-mode-output.md`](../docs/local-mode-output.md), with
+[`carrick-check-0.json`](../docs/schemas/carrick-check-0.json) and
+[`carrick-status-0.json`](../docs/schemas/carrick-status-0.json) beside it.
 Nothing in this directory computes a verdict, and nothing writes.
 
 The boundary is the CLI's own text when the payload carries `boundary_lines`,
@@ -20,8 +23,9 @@ here instead, using the wording of `ServiceBoundary::lines`.
 - Node 24 or newer. The server and the hooks are TypeScript run directly.
 - The `carrick` CLI on PATH, or `CARRICK_BIN` pointing at it.
 - An indexed workspace: `carrick index --workspace <dir>` writes `<dir>/.carrick/`.
-  Without it every command answers `not_indexed`, the hooks stay quiet, and the
-  session line says the index is missing.
+  Without it every command answers `not_indexed`, the edit hook stays quiet, and
+  the session line says the index is missing and names the command that builds
+  one.
 
 ## The two channels
 
@@ -57,13 +61,13 @@ session on its own. Diagnostics also arrive one model turn later than the hook,
 and Claude Code drops `relatedInformation`, which is why every counterpart site
 is written into the message text as well.
 
-SessionStart is registered and inert until carrick#728. It asks for a workspace
-answer (`carrick touch --json` with no file), and today `touch` takes exactly one
-file and exits 2 without one, so the hook logs a line and prints nothing. When
-that command lands, the hook prints the service, the commit it was indexed at,
-how many files have changed since, and the boundary. `touch` returns every
-verdict as null either way, so the line carries no compatibility finding and is
-printed whichever channel is delivering verdicts.
+SessionStart runs `carrick status --json` and prints one line per service: what
+the index holds for it, the commit it was taken at, how far that repo has moved
+since, and up to five of the files that moved. Services of one repo share a
+commit and a changed-file count, so the count is stated on the first of them and
+the others point at it. Each service's boundary lines follow, as the CLI printed
+them. `status` carries no verdict at all, so the line cannot be confused with
+either verdict channel and is printed whichever one is delivering.
 
 ## VS Code
 

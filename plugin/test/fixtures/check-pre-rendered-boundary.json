@@ -23,13 +23,15 @@
           "role": "consumer",
           "service": "order-service",
           "file": "src/clients/users.ts",
-          "line": 18
+          "line": 18,
+          "repo": "/workspace/order-service"
         },
         {
           "role": "consumer",
           "service": "billing-service",
           "file": "src/lookup.ts",
-          "line": 7
+          "line": 7,
+          "repo": "/workspace/billing-service"
         }
       ],
       "verdict": {
@@ -52,13 +54,14 @@
           "role": "producer",
           "service": "order-service",
           "file": "src/server.ts",
-          "line": 120
+          "line": 120,
+          "repo": "/workspace/order-service"
         }
       ],
       "verdict": {
-        "state": "resolved",
+        "state": "not_checked",
         "result": "method_mismatch",
-        "detail": "order-service serves PUT at this path"
+        "detail": "order-service serves PUT at this path, and no type verdict bears on a routing mismatch"
       }
     },
     {
@@ -75,7 +78,8 @@
           "role": "consumer",
           "service": "order-service",
           "file": "src/clients/users.ts",
-          "line": 4
+          "line": 4,
+          "repo": "/workspace/order-service"
         }
       ],
       "verdict": {
@@ -93,11 +97,19 @@
       "source": "fact",
       "resolution_source": "imported_member",
       "evidence": null,
-      "counterparts": [],
+      "counterparts": [
+        {
+          "role": "producer",
+          "service": "audit-service",
+          "repo": "/workspace/audit-service",
+          "file": "src/routes/audit.ts",
+          "line": 9
+        }
+      ],
       "verdict": {
         "state": "unresolved",
-        "result": "type_mismatch",
-        "detail": "this file changed since the index, so the comparison is against the indexed version"
+        "result": null,
+        "detail": "the consumer's expected type resolved to `any`"
       }
     },
     {
@@ -114,13 +126,14 @@
           "role": "peer",
           "service": "billing-service",
           "file": "src/charges.ts",
-          "line": 31
+          "line": 31,
+          "repo": "/workspace/billing-service"
         }
       ],
       "verdict": {
         "state": "not_checked",
         "result": null,
-        "detail": "matched to a shared external contract, never compared"
+        "detail": "matched to a shared external contract, and nothing pairs with it to compare"
       }
     }
   ],

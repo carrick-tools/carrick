@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { binary, check, timeoutMs, touch } from "../src/cli.ts";
+import { binary, check, status, timeoutMs } from "../src/cli.ts";
 import { fakeBin, fakeEnv, fixturePath, makeWorkspace } from "./helpers.ts";
 
 test("the binary is `carrick` on PATH unless CARRICK_BIN names another", () => {
@@ -32,22 +32,63 @@ test("check runs the binary from the workspace root and parses its answer", asyn
   assert.deepEqual(call.argv, ["check", "user-service/src/routes/users.ts", "--json"]);
 });
 
-test("touch with no file asks about the workspace", async (t) => {
+test("status asks about the workspace and takes no file", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const argvLog = path.join(workspace.root, "argv.log");
 
-  const outcome = await touch(null, {
+  const outcome = await status({
     cwd: workspace.root,
+    workspace: workspace.root,
     env: fakeEnv({
       CARRICK_FAKE_ARGV_LOG: argvLog,
-      CARRICK_FAKE_FIXTURE: fixturePath("touch-workspace.json"),
+      CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json"),
     }),
     bin: fakeBin,
   });
-  assert.equal(outcome.result?.changed_since_index, 7);
+  assert.equal(outcome.result?.services.length, 3);
+  assert.equal(outcome.result?.services[0]?.routes, 157);
   const call = JSON.parse(fs.readFileSync(argvLog, "utf8").trim()) as { argv: string[] };
-  assert.deepEqual(call.argv, ["touch", "--json"]);
+  assert.deepEqual(call.argv, ["status", "--workspace", workspace.root, "--json"]);
+});
+
+test("status without a named workspace lets the CLI find the index", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const argvLog = path.join(workspace.root, "argv.log");
+
+  await status({
+    cwd: workspace.root,
+    workspace: null,
+    env: fakeEnv({
+      CARRICK_FAKE_ARGV_LOG: argvLog,
+      CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json"),
+    }),
+    bin: fakeBin,
+  });
+  const call = JSON.parse(fs.readFileSync(argvLog, "utf8").trim()) as { argv: string[] };
+  assert.deepEqual(call.argv, ["status", "--json"]);
+});
+
+test("a check payload is not accepted as a status answer, or the other way round", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+
+  const wrongWay = await status({
+    cwd: workspace.root,
+    workspace: null,
+    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("check-mismatch.json") }),
+    bin: fakeBin,
+  });
+  assert.equal(wrongWay.result, null);
+  assert.match(wrongWay.failure ?? "", /printed no payload this reader knows/);
+
+  const otherWay = await check("a.ts", {
+    cwd: workspace.root,
+    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json") }),
+    bin: fakeBin,
+  });
+  assert.equal(otherWay.result, null);
 });
 
 test("a failure is reported, never thrown", async (t) => {

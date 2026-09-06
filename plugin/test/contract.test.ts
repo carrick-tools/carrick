@@ -37,7 +37,7 @@ test("a field the plugin does not know is dropped, not fatal", () => {
 test("problem items are the verdicts that are not compatible", () => {
   const result = fixture("check-mismatch.json");
   const problems = problemItems(result);
-  assert.equal(problems.length, 3);
+  assert.equal(problems.length, 2);
   assert.equal(
     problems.some((item) => item.verdict?.result === "compatible"),
     false,
@@ -46,14 +46,22 @@ test("problem items are the verdicts that are not compatible", () => {
 
 test("connected items are the ones naming another service", () => {
   const result = fixture("check-mismatch.json");
-  assert.equal(connectedItems(result).length, 4);
+  assert.equal(connectedItems(result).length, 5);
 });
 
-test("a verdict with a null result is not a problem", () => {
+test("the result decides what is a problem, not the state", () => {
   const result = fixture("check-mismatch.json");
-  const notChecked = (result.items ?? []).find((item) => item.verdict?.state === "not_checked");
-  assert.ok(notChecked);
-  assert.equal(problemItems(result).includes(notChecked), false);
+  const items = result.items ?? [];
+  // A routing finding carries `not_checked`, because no TYPE verdict bears on
+  // it, and it is still a finding.
+  const routing = items.find((item) => item.verdict?.result === "method_mismatch");
+  assert.ok(routing);
+  assert.equal(routing.verdict?.state, "not_checked");
+  assert.equal(problemItems(result).includes(routing), true);
+  // A null result claims nothing, in whatever state.
+  for (const item of items.filter((entry) => entry.verdict?.result == null)) {
+    assert.equal(problemItems(result).includes(item), false);
+  }
 });
 
 test("boundary_lines is read when the CLI sends it, and only when it holds strings", () => {
