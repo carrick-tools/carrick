@@ -36,6 +36,10 @@
 //! inert for `class-controller-api`, `flat-routes-method-guard` and
 //! `e2e-scaffolding` (their rows have no call-site candidate to answer at) and
 //! for `literal-base-url` (it has no deterministic row to contradict).
+//!
+//! `file-route-model-twin` is the third arrangement (carrick#660): the model
+//! answers for a route the file layout already states, so what is pinned is
+//! not the method or the target but WHO the row says stated it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -437,4 +441,69 @@ fn a_contradicting_model_loses_to_the_imported_member() {
         assert_eq!(row["method"], method, "method at {file}:{line}");
         assert_eq!(row["path"], path, "path at {file}:{line}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The twin cassette: the model answers for a route the file layout states.
+// ---------------------------------------------------------------------------
+
+/// The model's answer for a file-declared route, anchored on the only
+/// candidate that file offers.
+const ROUTE_TWIN: &str = r#"{"mounts":[],"data_calls":[],"endpoints":[{
+    "candidate_id":"@line:13","line_number":13,"owner_node":"app","method":"GET",
+    "path":"/orders","handler_name":"listOrders","pattern_matched":"route handler",
+    "payload_expression_text":null,"payload_expression_line":null,
+    "response_expression_text":"order","response_expression_line":15,
+    "primary_type_symbol":"Order","type_import_source":null}]}"#;
+
+fn only_row(rows: &[serde_json::Value]) -> serde_json::Value {
+    assert_eq!(rows.len(), 1, "expected exactly one row: {rows:#?}");
+    rows[0].clone()
+}
+
+/// carrick#660: a route stated by the file layout keeps the convention as its
+/// source when the model describes it too. The model contributes the handler
+/// and the type anchors — the fields determinism does not state — and does not
+/// relabel the row as its own reading.
+///
+/// The label is the whole point: a reader that cannot tell a route the layout
+/// declares from one only the model reported has to treat both the same way,
+/// and the row that is a structural fact is the one that should not need
+/// corroborating.
+#[test]
+fn a_model_answer_at_a_file_route_keeps_the_convention_as_the_source() {
+    // The convention alone: the file layout gives the path, the exported
+    // handler name gives the verb.
+    let silent = only_row(&rows(&empty_scan("file-route-model-twin"), "endpoints"));
+    assert_eq!(silent["method"], "GET");
+    assert_eq!(silent["path"], "/orders");
+    assert_eq!(silent["handler"], "GET");
+    assert_eq!(
+        silent["resolution_source"], "file_based_route",
+        "the convention states this row"
+    );
+
+    // The same route, with the model answering at the file's one candidate.
+    let dir = cassette("file-route-model-twin", &|stem| match stem {
+        "route" => ROUTE_TWIN.to_string(),
+        _ => NOTHING.to_string(),
+    });
+    let joined = only_row(&rows(
+        &scan("file-route-model-twin", dir.path()),
+        "endpoints",
+    ));
+    assert_eq!(joined["method"], "GET");
+    assert_eq!(joined["path"], "/orders");
+    assert_eq!(
+        joined["resolution_source"], "file_based_route",
+        "a joined row keeps the source of the deterministic twin it folded into"
+    );
+    assert_eq!(
+        joined["handler"], "listOrders",
+        "the model still contributes what determinism does not state"
+    );
+    assert_eq!(
+        joined["primary_type_symbol"], "Order",
+        "and the type anchor it read"
+    );
 }

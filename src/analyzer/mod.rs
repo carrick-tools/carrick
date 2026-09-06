@@ -235,6 +235,18 @@ pub struct ApiEndpointDetails {
     /// deserialize as `Route`.
     #[serde(default)]
     pub provenance: crate::operation::EndpointProvenance,
+    /// Which layer stated this operation, and for a deterministic row which
+    /// pass (carrick#660). Projected from the mount-graph row this operation
+    /// was built from, so the index can say whether a row is a fact the source
+    /// states outright or the model's own reading of the file.
+    ///
+    /// `None` on an operation that does not come from the HTTP emit/join phase
+    /// (GraphQL, socket and pub/sub ops are indexed by their own extractions)
+    /// and on every blob written before the field existed. Absence reads as
+    /// "not stated by this scan", never as "the model said it". Nothing in
+    /// matching or type compatibility reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
 }
 
 pub struct ApiAnalysisResult {
@@ -3353,6 +3365,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         }
     }
 
@@ -3711,6 +3724,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         });
 
         // 2. Unclassified env var (not in internal/external list)
@@ -3727,6 +3741,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         });
 
         // 3. Process.env pattern (should be detected as env var)
@@ -3743,6 +3758,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         });
 
         // 4. Raw code pattern with UPPERCASE var (common in legacy code)
@@ -3760,6 +3776,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         });
 
         let mount_graph = MountGraph::new(); // Empty graph
@@ -3832,6 +3849,7 @@ mod tests {
                 repo_name: None,
                 service_name: None,
                 provenance: Default::default(),
+                resolution_source: None,
             });
         }
 
@@ -3898,6 +3916,7 @@ mod tests {
                 repo_name: None,
                 service_name: None,
                 provenance: Default::default(),
+                resolution_source: None,
             });
         }
 
@@ -3943,6 +3962,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -3958,6 +3978,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
         });
 
         let (findings, verified, _edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -3998,6 +4019,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -4013,6 +4035,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
         });
 
         let (findings, _, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -4052,6 +4075,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -4067,6 +4091,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
         });
 
         let (findings, _, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -4106,6 +4131,7 @@ mod tests {
             repo_name: Some("consumer-repo".to_string()),
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -4122,6 +4148,7 @@ mod tests {
             service_name: None,
             provenance: EndpointProvenance::Mock,
             evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
         });
         // An unmatched mock producer: must orphan WITH the mock tag.
         mount_graph.endpoints.push(ResolvedEndpoint {
@@ -4136,6 +4163,7 @@ mod tests {
             service_name: None,
             provenance: EndpointProvenance::Mock,
             evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
             method: "GET".to_string(),
@@ -4150,6 +4178,7 @@ mod tests {
             line: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         });
 
         let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -4242,6 +4271,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::CallSite,
+            resolution_source: None,
         });
         // repo-beta: the identical call to the same external endpoint.
         mount_graph.data_calls.push(DataFetchingCall {
@@ -4257,6 +4287,7 @@ mod tests {
             line: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         });
         analyzer
             .calls
@@ -4319,6 +4350,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
             method: "POST".to_string(),
@@ -4333,6 +4365,7 @@ mod tests {
             line: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         });
         analyzer
             .calls
@@ -4378,6 +4411,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::CallSite,
+            resolution_source: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
             method: "POST".to_string(),
@@ -4392,6 +4426,7 @@ mod tests {
             line: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         });
         analyzer.calls.push(http_call(
             "POST",
@@ -4428,6 +4463,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
         }
     }
 
@@ -5476,6 +5512,7 @@ mod tests {
             line: None,
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         }
     }
 

@@ -4945,6 +4945,11 @@ impl FileOrchestrator {
         // An endpoint whose `candidate_id` joins nothing is dropped: without a
         // candidate behind it there is no evidence the registration exists.
         let mut dropped: Vec<String> = Vec::new();
+        // The rows the emit phase produced, which are the only ones a model
+        // row can be the twin OF: every row this loop pushes is appended after
+        // them, and a second model row for one route must not fold into the
+        // first one's joined row (that would drop a row rather than label it).
+        let mut deterministic_rows = result.endpoints.len();
         for mut endpoint in endpoints {
             let Some(candidate) = candidate_map.get(&endpoint.candidate_id) else {
                 dropped.push(format!(
@@ -4970,15 +4975,31 @@ impl FileOrchestrator {
             // two agree on method and path by construction of the match, and
             // the model's row is the one that carries the owner, the handler
             // and the type anchors, so it is the one kept.
+            //
+            // What it does NOT carry is the claim about who stated the route.
+            // The file layout (or the route data, or the controller table)
+            // states this route whether or not the model described it, so the
+            // joined row keeps the twin's source and the model contributes the
+            // fields determinism does not state — the same rule the consumer
+            // side has always applied in `fold_model_call`. Before carrick#660
+            // the stamp above survived the join, and a file route the model
+            // also described reached the index as the model's own reading.
             let canonical = Self::canonicalize_route_path(&endpoint.path);
-            let twin = result.endpoints.iter().position(|existing| {
-                existing.resolution_source != Some(ResolutionSource::Model)
-                    && existing.method.eq_ignore_ascii_case(&endpoint.method)
-                    && Self::canonicalize_route_path(&existing.path) == canonical
-            });
+            let twin = result.endpoints[..deterministic_rows]
+                .iter()
+                .position(|existing| {
+                    existing.resolution_source != Some(ResolutionSource::Model)
+                        && existing.method.eq_ignore_ascii_case(&endpoint.method)
+                        && Self::canonicalize_route_path(&existing.path) == canonical
+                });
             match twin {
                 Some(index) => {
+                    let stated_by = result.endpoints[index].resolution_source;
+                    if stated_by.is_some() {
+                        endpoint.resolution_source = stated_by;
+                    }
                     result.endpoints.remove(index);
+                    deterministic_rows -= 1;
                     stats.model_rows_joined += 1;
                 }
                 None => stats.model_only_rows += 1,
@@ -6466,6 +6487,9 @@ impl FileOrchestrator {
                     // `CallSite` by `classify_endpoint_evidence` when the same
                     // source site was also extracted as a data call (#379).
                     evidence: carrick_match::MatchEvidence::RouteDefinition,
+                    // Which layer stated the row, carried onto the wire
+                    // (carrick#660). Retention only, like `provenance`.
+                    resolution_source: endpoint.resolution_source,
                 });
             }
         }
@@ -6533,6 +6557,9 @@ impl FileOrchestrator {
                         // client method (carrick#656), carried through so the
                         // index can state it beside the consumer list.
                         consumers_not_resolved: data_call.consumers_not_resolved.clone(),
+                        // Which layer stated the row (carrick#660): the pass
+                        // that resolved it, or the model. Retention only.
+                        resolution_source: data_call.resolution_source,
                     },
                     data_call.call_expression_span_start.is_some(),
                 ));

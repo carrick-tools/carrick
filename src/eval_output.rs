@@ -65,6 +65,11 @@ pub struct EvalOp {
     /// carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumers_not_resolved: Option<crate::imported_request_member::UnfollowedMemberSites>,
+    /// Which layer stated this row, and for a deterministic row which pass
+    /// (carrick#660), exactly as the persisted operation carries it. `None`
+    /// for an op that does not come from the HTTP emit/join phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
     pub file: String,
     pub line: u32,
     // --- Type-manifest fields (contract §3), joined by OperationKey ---
@@ -496,6 +501,8 @@ impl EvalOp {
             // neither.
             base: None,
             consumers_not_resolved: None,
+            // Carried by the details type itself (carrick#660), on both sides.
+            resolution_source: d.resolution_source,
             handler: d.handler_name.clone(),
             request_type: d
                 .request_type
@@ -692,6 +699,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         }
     }
 
@@ -709,6 +717,7 @@ mod tests {
             repo_name: Some(repo.to_string()),
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         }
     }
 
@@ -1085,6 +1094,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         };
 
         let result = ApiAnalysisResult {
@@ -1165,6 +1175,7 @@ mod tests {
                 repo_name: None,
                 service_name: None,
                 provenance: Default::default(),
+                resolution_source: None,
             }],
             findings: vec![],
             dependency_conflicts: vec![],
@@ -1319,6 +1330,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         };
         let result = ApiAnalysisResult {
             endpoints: vec![],
@@ -1387,6 +1399,7 @@ mod tests {
             repo_name: None,
             service_name: None,
             provenance: Default::default(),
+            resolution_source: None,
         };
         let result = ApiAnalysisResult {
             endpoints: vec![],

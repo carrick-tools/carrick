@@ -705,6 +705,7 @@ mod tests {
             line: Some(32),
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         }];
         data.mount_graph = Some(graph);
         data
@@ -829,6 +830,7 @@ mod tests {
             line: Some(member.line),
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         }];
         sdk.mount_graph = Some(graph);
 
@@ -886,6 +888,7 @@ mod tests {
             line: Some(3),
             base: None,
             consumers_not_resolved: None,
+            resolution_source: None,
         }];
         data.mount_graph = Some(graph);
         data

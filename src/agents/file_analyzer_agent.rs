@@ -121,9 +121,12 @@ where
 /// the deterministic layer emits for it is the substrate the model's answer is
 /// joined onto (see `FileOrchestrator::emit_resolved_rows` and
 /// `FileOrchestrator::join_model_rows`). This field records who stated the
-/// row, for the cache, the scan log and the tests. It is deliberately absent
-/// from the uploaded projection, which is built from the operation graph and
-/// not from these rows.
+/// row, for the cache, the scan log and the tests.
+///
+/// It also rides the wire (carrick#660): the mount-graph row and the uploaded
+/// operation both carry it, so a reader of the index can tell a row the source
+/// states outright from one that is the model's own reading. Absence there
+/// means the scan did not state it, never that the row is the model's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolutionSource {

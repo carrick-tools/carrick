@@ -3441,6 +3441,7 @@ mod tests {
                 line,
                 base: None,
                 consumers_not_resolved: None,
+                resolution_source: None,
             }
         }
 
