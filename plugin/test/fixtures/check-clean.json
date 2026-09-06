@@ -1,0 +1,40 @@
+{
+  "schema": "carrick.check/0",
+  "file": "src/util/format.ts",
+  "service": "user-service",
+  "index_commit": "6a1b2c3d4e5f60718293a4b5c6d7e8f900112233",
+  "indexed_at": "2026-09-06T21:14:03Z",
+  "scanner_version": "0.3.41",
+  "changed_since_index": 1,
+  "stale": false,
+  "deleted": false,
+  "items": [],
+  "boundary": {
+    "commit_hash": "6a1b2c3d4e5f60718293a4b5c6d7e8f900112233",
+    "files_attempted": 128,
+    "files_lost": {
+      "total": 0
+    },
+    "candidates_not_classified": 41,
+    "unemitted_literal_candidates": 0,
+    "consumers_not_resolved": {
+      "total": 0
+    },
+    "sdk_unresolved": {
+      "total": 0
+    },
+    "unknown_call_paths": {
+      "total": 0
+    },
+    "model_only_rows": 0,
+    "model_rows_joined": 0,
+    "model_contradictions_discarded": 0,
+    "routes_without_response_type": {
+      "total": 0
+    },
+    "calls_without_expected_type": {
+      "total": 0
+    },
+    "bare_checkout": false
+  }
+}

@@ -1,0 +1,169 @@
+{
+  "schema": "carrick.check/0",
+  "file": "src/routes/users.ts",
+  "service": "user-service",
+  "index_commit": "6a1b2c3d4e5f60718293a4b5c6d7e8f900112233",
+  "indexed_at": "2026-09-06T21:14:03Z",
+  "scanner_version": "0.3.41",
+  "changed_since_index": 3,
+  "stale": true,
+  "deleted": false,
+  "items": [
+    {
+      "kind": "route",
+      "method": "GET",
+      "path": "/api/users/:id",
+      "line": 42,
+      "col": 3,
+      "source": "fact",
+      "resolution_source": "file_based_route",
+      "evidence": "loader export claimed by a file-route convention",
+      "counterparts": [
+        {
+          "role": "consumer",
+          "service": "order-service",
+          "file": "src/clients/users.ts",
+          "line": 18
+        },
+        {
+          "role": "consumer",
+          "service": "billing-service",
+          "file": "src/lookup.ts",
+          "line": 7
+        }
+      ],
+      "verdict": {
+        "state": "resolved",
+        "result": "type_mismatch",
+        "detail": "the response no longer carries `email`, which both consumers read"
+      }
+    },
+    {
+      "kind": "call",
+      "method": "POST",
+      "path": "/api/orders",
+      "line": 61,
+      "col": 9,
+      "source": "candidate",
+      "resolution_source": "model",
+      "evidence": null,
+      "counterparts": [
+        {
+          "role": "producer",
+          "service": "order-service",
+          "file": "src/server.ts",
+          "line": 120
+        }
+      ],
+      "verdict": {
+        "state": "resolved",
+        "result": "method_mismatch",
+        "detail": "order-service serves PUT at this path"
+      }
+    },
+    {
+      "kind": "route",
+      "method": "GET",
+      "path": "/api/users",
+      "line": 12,
+      "col": 3,
+      "source": "fact",
+      "resolution_source": "imported_member",
+      "evidence": null,
+      "counterparts": [
+        {
+          "role": "consumer",
+          "service": "order-service",
+          "file": "src/clients/users.ts",
+          "line": 4
+        }
+      ],
+      "verdict": {
+        "state": "resolved",
+        "result": "compatible",
+        "detail": "response satisfies the consumer's expected type"
+      }
+    },
+    {
+      "kind": "call",
+      "method": "GET",
+      "path": "/api/audit/:id",
+      "line": 80,
+      "col": 5,
+      "source": "fact",
+      "resolution_source": "imported_member",
+      "evidence": null,
+      "counterparts": [],
+      "verdict": {
+        "state": "unresolved",
+        "result": "type_mismatch",
+        "detail": "the expected type resolved to `any`, so the shapes were compared without one side"
+      }
+    },
+    {
+      "kind": "call",
+      "method": "POST",
+      "path": "https://api.stripe.com/v1/charges",
+      "line": 95,
+      "col": 7,
+      "source": "fact",
+      "resolution_source": "imported_member",
+      "evidence": null,
+      "counterparts": [
+        {
+          "role": "peer",
+          "service": "billing-service",
+          "file": "src/charges.ts",
+          "line": 31
+        }
+      ],
+      "verdict": {
+        "state": "not_checked",
+        "result": null,
+        "detail": "matched to a shared external contract, never compared"
+      }
+    }
+  ],
+  "boundary": {
+    "commit_hash": "6a1b2c3d4e5f60718293a4b5c6d7e8f900112233",
+    "files_attempted": 128,
+    "files_lost": {
+      "total": 2,
+      "reasons": [
+        "src/legacy/huge.ts: analyzer timeout",
+        "src/legacy/other.ts: no answer"
+      ]
+    },
+    "candidates_not_classified": 41,
+    "unemitted_literal_candidates": 4,
+    "consumers_not_resolved": {
+      "total": 1,
+      "reasons": [
+        "usersClient.get"
+      ]
+    },
+    "sdk_unresolved": {
+      "total": 0
+    },
+    "unknown_call_paths": {
+      "total": 3,
+      "reasons": [
+        "src/proxy.ts:22"
+      ]
+    },
+    "model_only_rows": 6,
+    "model_rows_joined": 11,
+    "model_contradictions_discarded": 2,
+    "model_endpoints_discarded_in_claimed_modules": 1,
+    "routes_without_response_type": {
+      "total": 0
+    },
+    "calls_without_expected_type": {
+      "total": 5,
+      "reasons": [
+        "src/routes/users.ts:80"
+      ]
+    },
+    "bare_checkout": true
+  }
+}

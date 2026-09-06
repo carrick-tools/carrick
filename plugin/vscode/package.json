@@ -1,0 +1,56 @@
+{
+  "name": "carrick",
+  "displayName": "Carrick",
+  "description": "Shows what the other services in your workspace do with the routes and calls in the file you are editing",
+  "version": "0.0.1",
+  "publisher": "carrick-tools",
+  "license": "SEE LICENSE IN ../../LICENSE.md",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/carrick-tools/carrick.git",
+    "directory": "plugin/vscode"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": ["Programming Languages", "Linters"],
+  "activationEvents": [
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Carrick",
+      "properties": {
+        "carrick.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Carrick language server entry point. Empty means the copy that ships with this extension."
+        },
+        "carrick.nodePath": {
+          "type": "string",
+          "default": "node",
+          "description": "Node 24 or newer to run the server with."
+        },
+        "carrick.binary": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the carrick CLI. Empty means the carrick on PATH."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "vscode:prepublish": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

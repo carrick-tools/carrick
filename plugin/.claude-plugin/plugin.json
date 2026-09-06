@@ -1,0 +1,6 @@
+{
+  "name": "carrick",
+  "description": "Puts the workspace index's answer about the file you just edited into the session: its routes and calls, who is on the other side of them, and any contract that no longer holds",
+  "version": "0.0.1",
+  "homepage": "https://carrick.tools"
+}
