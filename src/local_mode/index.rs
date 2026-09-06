@@ -471,12 +471,17 @@ fn verdict_for(
         .find(|finding| finding_names(finding, operation))
     {
         return Some(StoredVerdict {
-            // A wrong verb is a routing fact, and no type verdict bears on it.
-            state: match finding.kind.as_str() {
-                "type_mismatch" => "resolved",
-                _ => "not_checked",
-            }
-            .to_string(),
+            // The finding states its own verdict state (carrick#727) in the
+            // same three words this contract prints, so it is carried rather
+            // than re-derived. The fallback is for a finding that states none:
+            // a wrong verb is a routing fact and no type verdict bears on it.
+            state: finding
+                .verdict_state
+                .clone()
+                .unwrap_or_else(|| match finding.kind.as_str() {
+                    "type_mismatch" => "resolved".to_string(),
+                    _ => "not_checked".to_string(),
+                }),
             result: Some(finding.kind.clone()),
             detail: finding.detail.clone(),
         });

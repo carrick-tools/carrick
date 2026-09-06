@@ -87,6 +87,11 @@ pub struct JoinedFinding {
     /// `"file:line"` of each consumer call site the finding covers.
     pub call_sites: Vec<String>,
     pub detail: String,
+    /// The finding's own `verdict_state` (carrick#727), carried rather than
+    /// re-derived: it is the same three words the local contract states, and
+    /// one producer of a word is the whole point of carrick#731. `None` on a
+    /// finding that does not state one.
+    pub verdict_state: Option<String>,
 }
 
 /// Everything the join learned, in the shape the indexer reads it.
@@ -205,6 +210,7 @@ fn project_finding(finding: &crate::findings::Finding) -> Option<JoinedFinding> 
             service,
             call_sites,
             detail,
+            verdict_state,
             ..
         } => Some(JoinedFinding {
             kind: "type_mismatch".to_string(),
@@ -213,6 +219,7 @@ fn project_finding(finding: &crate::findings::Finding) -> Option<JoinedFinding> 
             path: path.clone(),
             call_sites: call_sites.clone(),
             detail: detail.clone(),
+            verdict_state: wire_verdict_state(*verdict_state),
         }),
         crate::findings::Finding::MethodMismatch {
             method,
@@ -220,11 +227,14 @@ fn project_finding(finding: &crate::findings::Finding) -> Option<JoinedFinding> 
             service,
             call_sites,
             expected_method,
+            verdict_state,
+            ..
         } => Some(JoinedFinding {
             kind: "method_mismatch".to_string(),
             service: service.clone(),
             method: method.clone(),
             path: path.clone(),
+            verdict_state: wire_verdict_state(*verdict_state),
             call_sites: call_sites.clone(),
             detail: format!(
                 "this call uses {method} and the producer serves {expected_method} at {path}"
@@ -232,6 +242,15 @@ fn project_finding(finding: &crate::findings::Finding) -> Option<JoinedFinding> 
         }),
         _ => None,
     }
+}
+
+/// The finding's verdict state in the spelling both contracts print.
+fn wire_verdict_state(state: Option<crate::findings::VerdictState>) -> Option<String> {
+    let state = state?;
+    serde_json::to_value(state)
+        .ok()?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// One merged operation, projected. `file_path` carries the location in
