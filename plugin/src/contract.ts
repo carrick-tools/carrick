@@ -92,6 +92,13 @@ export type CheckResult = {
   deleted?: boolean;
   items?: CheckItem[];
   boundary?: Boundary;
+  /**
+   * The boundary already rendered by the CLI, the same bytes it prints at the
+   * tail of its human output. When it is here it is printed as it stands; when
+   * it is not, the counts in `boundary` are rendered instead. One renderer owns
+   * the wording either way, and which one depends only on what the CLI sent.
+   */
+  boundary_lines?: string[];
 };
 
 export const SCHEMA = "carrick.check/0";
@@ -135,6 +142,12 @@ export function parseCheckResult(stdout: string): CheckResult | null {
   }
   if (typeof parsed["stale"] === "boolean") result.stale = parsed["stale"];
   if (isRecord(parsed["boundary"])) result.boundary = parsed["boundary"] as Boundary;
+  if (Array.isArray(parsed["boundary_lines"])) {
+    const lines = (parsed["boundary_lines"] as unknown[]).filter(
+      (line): line is string => typeof line === "string",
+    );
+    if (lines.length) result.boundary_lines = lines;
+  }
   return result;
 }
 

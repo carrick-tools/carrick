@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  boundaryFor,
   boundaryLines,
   itemLine,
   renderPostToolUse,
@@ -133,6 +134,37 @@ test("the boundary keeps the CLI's wording", () => {
     false,
     "a zero count prints no line",
   );
+});
+
+test("the CLI's own boundary lines are printed as they arrive", () => {
+  const result = fixture("check-pre-rendered-boundary.json");
+  const context = renderPostToolUse(result) ?? "";
+  const lines = context.split("\n");
+  assert.deepEqual(lines.slice(-2), result.boundary_lines);
+  assert.equal(
+    lines.some((line) => line.startsWith("Boundary: ")),
+    false,
+    "a label glued to the front would no longer be the CLI's bytes",
+  );
+  assert.equal(
+    context.includes("file(s) sent to the analyzer"),
+    false,
+    "the counts are not rendered a second time",
+  );
+  assert.deepEqual(boundaryFor(result), result.boundary_lines);
+});
+
+test("without the CLI's lines the counts are rendered and labelled", () => {
+  const result = fixture("check-mismatch.json");
+  assert.equal(result.boundary_lines, undefined);
+  assert.deepEqual(boundaryFor(result), boundaryLines(result.boundary, result.service));
+  assert.match(renderPostToolUse(result) ?? "", /\nBoundary: user-service at 6a1b2c3/);
+});
+
+test("the session line takes the CLI's boundary lines too", () => {
+  const result = fixture("check-pre-rendered-boundary.json");
+  const rendered = renderSessionStart(result).split("\n");
+  assert.deepEqual(rendered.slice(-2), result.boundary_lines);
 });
 
 test("a local index dispatches nothing, so the header drops the analyzer count", () => {

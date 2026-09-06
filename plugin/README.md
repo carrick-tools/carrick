@@ -10,6 +10,11 @@ The shape is pinned in [`docs/local-mode-output.md`](../docs/local-mode-output.m
 and [`docs/schemas/carrick-check-0.json`](../docs/schemas/carrick-check-0.json).
 Nothing in this directory computes a verdict, and nothing writes.
 
+The boundary is the CLI's own text when the payload carries `boundary_lines`,
+printed as it arrives so the hook, the diagnostic and `carrick check` in a
+terminal read alike. Without that field the counts in `boundary` are rendered
+here instead, using the wording of `ServiceBoundary::lines`.
+
 ## What it needs
 
 - Node 24 or newer. The server and the hooks are TypeScript run directly.
@@ -119,8 +124,10 @@ npm run selftest
 ```
 
 Tests run against fixture payloads under `test/fixtures/` and a fake CLI
-(`test/fake-carrick.mjs`), so they need no binary and no index. The manual
-smokes, which do, are in [SMOKE.md](./SMOKE.md).
+(`test/fake-carrick.mjs`), so they need no binary and no index.
+`.github/workflows/plugin.yml` runs all three commands plus the VS Code build on
+every pull request that touches this directory. The manual smokes, which need a
+real binary, are in [SMOKE.md](./SMOKE.md).
 
 carrick#710 turns this directory into two manifests: the plugin and the
 extension will point at `carrick lsp --stdio` from the published npm package,

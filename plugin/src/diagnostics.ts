@@ -33,7 +33,7 @@ import {
   type CheckResult,
   type Counterpart,
 } from "./contract.ts";
-import { boundaryLines } from "./render.ts";
+import { boundaryFor } from "./render.ts";
 
 export const SOURCE = "carrick";
 
@@ -212,7 +212,7 @@ export function toDiagnostics(
     });
   }
 
-  const boundary = boundaryLines(result.boundary, result.service);
+  const boundary = boundaryFor(result);
   if (boundary.length) {
     put(checkedAbs, {
       range: rangeAt(1, 1),

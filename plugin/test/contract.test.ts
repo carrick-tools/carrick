@@ -54,6 +54,19 @@ test("a verdict with a null result is not a problem", () => {
   assert.equal(problemItems(result).includes(notChecked), false);
 });
 
+test("boundary_lines is read when the CLI sends it, and only when it holds strings", () => {
+  assert.deepEqual(fixture("check-pre-rendered-boundary.json").boundary_lines?.length, 2);
+  assert.equal(fixture("check-mismatch.json").boundary_lines, undefined);
+  assert.equal(
+    parseCheckResult('{"schema":"carrick.check/0","boundary_lines":[1,2]}')?.boundary_lines,
+    undefined,
+  );
+  assert.equal(
+    parseCheckResult('{"schema":"carrick.check/0","boundary_lines":"one line"}')?.boundary_lines,
+    undefined,
+  );
+});
+
 test("a candidate row is the one whose source says so", () => {
   const result = fixture("check-mismatch.json");
   const candidates = (result.items ?? []).filter(isCandidate);

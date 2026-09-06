@@ -1,0 +1,59 @@
+name: Plugin
+
+# The hook, the language server and the VS Code wrapper. Separate from ci.yml so
+# the path filter can apply: this job is about `plugin/` and nothing in it
+# touches Rust, so a Rust-only pull request should not wait on it and a
+# plugin-only one should not wait on the Rust suite.
+#
+# Everything here runs against fixture payloads and a fake `carrick`
+# (plugin/test/fake-carrick.mjs), so no binary, no index and no network beyond
+# the installs. carrick#723.
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "plugin/**"
+      - ".github/workflows/plugin.yml"
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "plugin/**"
+      - ".github/workflows/plugin.yml"
+
+jobs:
+  plugin:
+    name: Plugin tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 24 is the floor: the server and the hooks are TypeScript run directly,
+      # and the tests rely on the same type stripping.
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: |
+            plugin/package-lock.json
+            plugin/vscode/package-lock.json
+
+      - name: Install
+        working-directory: plugin
+        run: npm ci
+
+      - name: Typecheck and unit tests
+        working-directory: plugin
+        run: npm test
+
+      # Counts hook contexts and diagnostic attachments separately for every
+      # install shape, and fails when a shape delivers on both channels or
+      # neither.
+      - name: One channel per install
+        working-directory: plugin
+        run: npm run selftest
+
+      - name: Build the VS Code extension
+        working-directory: plugin/vscode
+        run: npm ci && npm run build

@@ -91,6 +91,24 @@ export function boundaryLines(boundary: Boundary | undefined, service: string | 
   return out;
 }
 
+/**
+ * The boundary for one payload: the CLI's own lines when it sent them,
+ * otherwise this port of `ServiceBoundary::lines`.
+ *
+ * `boundary_lines` is printed exactly as it arrives, so the hook, the
+ * diagnostic and `carrick check` in a terminal say the same sentence about the
+ * same count. Nothing here reformats or re-orders it.
+ */
+export function boundaryFor(result: CheckResult): string[] {
+  if (result.boundary_lines?.length) return result.boundary_lines;
+  return boundaryLines(result.boundary, result.service);
+}
+
+/** True when the lines came from the CLI rather than from the port above. */
+export function boundaryIsPreRendered(result: CheckResult): boolean {
+  return Boolean(result.boundary_lines?.length);
+}
+
 function counterpartText(counterparts: Counterpart[]): string {
   const shown = counterparts.slice(0, MAX_COUNTERPARTS);
   const rendered = shown
@@ -166,6 +184,23 @@ function deletedLine(result: CheckResult): string | null {
   return `This file is gone from disk and the index still holds ${(result.items ?? []).length} row(s) for it, with ${consumers} counterpart(s) still on the other side.`;
 }
 
+/**
+ * Append the boundary to a rendered message.
+ *
+ * The port's first line is labelled, because on its own it reads as a bare
+ * count. The CLI's own lines are appended untouched: a label glued to the front
+ * of them would no longer be the bytes the CLI printed.
+ */
+function pushBoundary(lines: string[], result: CheckResult, boundary: string[]): void {
+  if (!boundary.length) return;
+  if (boundaryIsPreRendered(result)) {
+    for (const line of boundary) lines.push(line);
+    return;
+  }
+  lines.push(`Boundary: ${boundary[0]}`);
+  for (const line of boundary.slice(1)) lines.push(line);
+}
+
 function staleLine(result: CheckResult): string | null {
   if (!result.stale) return null;
   const changed = result.changed_since_index;
@@ -187,7 +222,7 @@ function staleLine(result: CheckResult): string | null {
 export function renderPostToolUse(result: CheckResult, displayFile?: string): string | null {
   if (result.error) return null;
   const items = reportableItems(result);
-  const boundary = boundaryLines(result.boundary, result.service);
+  const boundary = boundaryFor(result);
   // The boundary is never dropped: the local index holds no bare-receiver route
   // and no `fetch` call, because both need a model, so an empty answer without
   // the boundary beside it reads as "there is nothing here" when it means
@@ -210,10 +245,7 @@ export function renderPostToolUse(result: CheckResult, displayFile?: string): st
   if (deleted) lines.push(deleted);
   const stale = staleLine(result);
   if (stale) lines.push(stale);
-  if (boundary.length) {
-    lines.push(`Boundary: ${boundary[0]}`);
-    for (const line of boundary.slice(1)) lines.push(line);
-  }
+  pushBoundary(lines, result, boundary);
   return lines.join("\n");
 }
 
@@ -237,10 +269,6 @@ export function renderSessionStart(result: CheckResult): string {
   ];
   const items = reportableItems(result);
   for (const item of items.slice(0, MAX_ITEM_LINES)) lines.push(itemLine(item, result.file));
-  const boundary = boundaryLines(result.boundary, result.service);
-  if (boundary.length) {
-    lines.push(`Boundary: ${boundary[0]}`);
-    for (const line of boundary.slice(1)) lines.push(line);
-  }
+  pushBoundary(lines, result, boundaryFor(result));
   return lines.join("\n");
 }

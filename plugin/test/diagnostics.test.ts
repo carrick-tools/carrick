@@ -72,6 +72,13 @@ test("the boundary is published even when nothing is wrong", () => {
   assert.match(edited?.[0]?.message ?? "", /41 candidate\(s\) not classified locally/);
 });
 
+test("the boundary diagnostic carries the CLI's own lines when they arrive", () => {
+  const edited = diagnosticsFor("check-pre-rendered-boundary.json").get(CHECKED_ABS);
+  const boundary = edited?.find((diagnostic) => diagnostic.code === "boundary");
+  assert.match(boundary?.message ?? "", /boundary \(user-service\): 41 candidates not classified locally/);
+  assert.equal(boundary?.message.includes("file(s) sent to the analyzer"), false);
+});
+
 test("a payload with no boundary publishes no boundary diagnostic", () => {
   assert.equal(diagnosticsFor("check-silent.json").size, 0);
 });
