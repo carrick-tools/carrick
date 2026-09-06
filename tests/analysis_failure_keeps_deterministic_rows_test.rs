@@ -162,18 +162,15 @@ async fn a_failed_model_call_keeps_the_files_deterministic_rows() {
         "the whole-URL call the source resolves must survive the model's failure: \
          {helpdesk_calls:#?}"
     );
-    // The boundary, asserted so it stays visible: the file's OTHER call is one
-    // the deterministic layer resolves but does not state a row for on its own
-    // — it covers the model's row instead of overruling it. With no model
-    // answer there is nothing to cover, so that call is lost, which is exactly
-    // what "this file was not analysed" means. The fix keeps what determinism
-    // stated; it does not make a failed call harmless.
+    // The file's OTHER call used to be the boundary: the deterministic layer
+    // resolved its base but stated no row of its own, so a model failure lost
+    // it. carrick#733 made an env-backed base plus a literal path a row, and
+    // the assertion says so rather than pinning the gap it left.
     assert!(
-        !helpdesk_calls
+        helpdesk_calls
             .iter()
             .any(|key| key.contains("/api/v1/items")),
-        "a call only the model states cannot survive the model's failure; if this now passes, \
-         the deterministic layer states it too and the assertion should say so: \
+        "the base-plus-path call the source states must survive the model's failure too: \
          {helpdesk_calls:#?}"
     );
 

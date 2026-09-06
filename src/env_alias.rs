@@ -487,7 +487,7 @@ pub fn merge_imported_env_aliases<F>(
 /// stripped via [`unwrap_transparent`] before matching, so every caller —
 /// direct-alias bindings AND config-object property values — recognizes a
 /// wrapped env read.
-fn process_env_name(expr: &Expr) -> Option<String> {
+pub(crate) fn process_env_name(expr: &Expr) -> Option<String> {
     match unwrap_transparent(expr) {
         Expr::Member(member) => process_env_member_name(member),
         // `process.env.NAME ?? "default"` / `... || "default"`: the env read is

@@ -64,6 +64,7 @@ echo "scan-twice: output  $out_dir"
 fixture_targets=(
   astro
   class-controller-api
+  demo-services-shape
   e2e-scaffolding
   env-var-whole-url
   fastify-api
