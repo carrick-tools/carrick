@@ -1758,6 +1758,12 @@ impl Analyzer {
             Vec<Option<crate::agents::file_analyzer_agent::ResolutionSource>>,
         > = HashMap::new();
         for endpoint in mount_graph.get_resolved_endpoints() {
+            // Route definitions only, matching the `path_matches` filter that
+            // picks the producer a wrong-verb risk names: a call-site-evidence
+            // entry is not a producer (#379).
+            if endpoint.evidence != carrick_match::MatchEvidence::RouteDefinition {
+                continue;
+            }
             producer_sources_by_key
                 .entry(format!("{}:{}", endpoint.method, endpoint.full_path))
                 .or_default()
@@ -2814,7 +2820,12 @@ impl Analyzer {
             .get_resolved_endpoints()
             .iter()
             .filter(|endpoint| {
-                endpoint.method.eq_ignore_ascii_case(method)
+                // Only a route definition is a producer. A call-site-evidence
+                // entry (#379) is a consumer's own double-extracted call, and
+                // it is usually a model row — folding it in would demote a
+                // deterministic route that happens to share its key.
+                endpoint.evidence == carrick_match::MatchEvidence::RouteDefinition
+                    && endpoint.method.eq_ignore_ascii_case(method)
                     && normalize_compat_path(&endpoint.full_path) == want
             })
             .map(|endpoint| endpoint.resolution_source)
@@ -4258,6 +4269,86 @@ mod tests {
                 "consumer {consumer_source:?} + producer {producer_source:?}"
             );
         }
+    }
+
+    /// A call-site-evidence entry is not a producer (#379), so its (usually
+    /// model-stated) row must not demote the deterministic route it shares a
+    /// key with.
+    #[test]
+    fn edge_source_ignores_call_site_evidence_entries() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
+
+        let mut analyzer = Analyzer::new(Config::default());
+        analyzer.calls.push(ApiEndpointDetails {
+            view_module: false,
+            owner: None,
+            key: OperationKey::http("GET", "/api/orders"),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from("client.ts:12"),
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            resolution_source: Some(ResolutionSource::ImportedMember),
+        });
+
+        let mut mount_graph = MountGraph::new();
+        for (evidence, source) in [
+            (
+                carrick_match::MatchEvidence::RouteDefinition,
+                Some(ResolutionSource::FileBasedRoute),
+            ),
+            (
+                carrick_match::MatchEvidence::CallSite,
+                Some(ResolutionSource::Model),
+            ),
+        ] {
+            mount_graph.endpoints.push(ResolvedEndpoint {
+                view_module: false,
+                method: "POST".to_string(),
+                path: "/api/orders".to_string(),
+                full_path: "/api/orders".to_string(),
+                handler: None,
+                owner: "app".to_string(),
+                file_location: "server.ts:10".to_string(),
+                middleware_chain: vec![],
+                repo_name: Some("api".to_string()),
+                service_name: None,
+                provenance: Default::default(),
+                evidence,
+                resolution_source: source,
+            });
+        }
+        mount_graph.data_calls.push(DataFetchingCall {
+            method: "GET".to_string(),
+            target_url: "/api/orders".to_string(),
+            canonical_path: "/api/orders".to_string(),
+            client: "fetch".to_string(),
+            file_location: "client.ts:12".to_string(),
+            call_kind: None,
+            repo_name: Some("consumer-repo".to_string()),
+            service_name: None,
+            host: None,
+            line: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(ResolutionSource::ImportedMember),
+        });
+
+        let (findings, _verified, _edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+        let sources: Vec<Option<crate::findings::EdgeSource>> = findings
+            .iter()
+            .filter_map(|f| match f {
+                Finding::MethodMismatch { edge_source, .. } => Some(*edge_source),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sources, vec![Some(crate::findings::EdgeSource::Fact)]);
     }
 
     /// A view module's route carries the marker onto its orphan row, so the
