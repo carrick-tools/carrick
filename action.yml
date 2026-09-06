@@ -10,6 +10,20 @@ inputs:
     description: "Path to analyze"
     required: false
     default: "."
+  install-dependencies:
+    description: |
+      Install the scanned repository's dependencies before the scan, so types
+      that resolve through a package are real types instead of `any`.
+
+      "auto" (the default) installs when a lockfile sits at the path being
+      analyzed, with lifecycle scripts disabled, and skips otherwise. Set it to
+      "false" to scan the checkout as-is. A failed or slow install is not an
+      error: Carrick warns and scans the bare checkout.
+
+      Private registries use your own auth. Set NPM_TOKEN (or whatever your
+      .npmrc references) in the job's `env:` and the install step inherits it.
+    required: false
+    default: "auto"
 
 outputs:
   success:
@@ -127,6 +141,47 @@ runs:
       if: steps.fork-check.outputs.skip != 'true'
       shell: bash
       run: cd "${{ steps.download.outputs.dist-dir }}/sidecar" && npm ci
+
+    # The scanned repo's own dependencies, not Carrick's. Without them every
+    # import from a package resolves to the compiler's `error` type and the
+    # indexed request/response types degrade to `any`. Lockfile-gated,
+    # scripts disabled, time-boxed, and tolerant: see
+    # scripts/install-scanned-deps.sh for the posture and why it installs at
+    # the scan root only.
+    - name: Detect the scanned repo's package manager
+      if: steps.fork-check.outputs.skip != 'true' && inputs.install-dependencies != 'false'
+      id: deps
+      shell: bash
+      env:
+        SCAN_PATH: ${{ inputs.path }}
+      run: |
+        "$GITHUB_ACTION_PATH/scripts/install-scanned-deps.sh" detect "$SCAN_PATH" \
+          | tee -a "$GITHUB_OUTPUT"
+
+    # Keyed on the lockfile's hash, so a repo whose dependencies did not change
+    # reuses the manager's download store. The store, not node_modules: `npm
+    # ci` deletes node_modules before installing, and a cache written from a
+    # half-finished install would poison the next run.
+    - name: Restore the package manager's store
+      # `continue-on-error` is not supported on a composite action's steps, so
+      # this leans on actions/cache's own behaviour: a restore that misses or
+      # fails warns, it does not fail the step.
+      if: steps.fork-check.outputs.skip != 'true' && steps.deps.outputs.should_install == 'true' && steps.deps.outputs.cache_dir != ''
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.deps.outputs.cache_dir }}
+        key: carrick-deps-${{ runner.os }}-${{ steps.deps.outputs.manager }}-${{ steps.deps.outputs.lockfile_sha256 }}
+        restore-keys: |
+          carrick-deps-${{ runner.os }}-${{ steps.deps.outputs.manager }}-
+
+    - name: Install the scanned repo's dependencies
+      if: steps.fork-check.outputs.skip != 'true' && steps.deps.outputs.should_install == 'true'
+      shell: bash
+      env:
+        SCAN_PATH: ${{ inputs.path }}
+        PACKAGE_MANAGER: ${{ steps.deps.outputs.manager }}
+      run: |
+        "$GITHUB_ACTION_PATH/scripts/install-scanned-deps.sh" install "$SCAN_PATH" "$PACKAGE_MANAGER"
 
     - name: Run analysis
       if: steps.fork-check.outputs.skip != 'true'
