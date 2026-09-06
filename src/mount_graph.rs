@@ -74,6 +74,16 @@ pub struct ResolvedEndpoint {
     /// the model's. Retention only: nothing in matching reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
+    /// Whether the module serving this route also renders a view: it exports
+    /// the handler that makes this a route AND a default export (the
+    /// component). Set only by the file-based route pass, from the module's
+    /// export list (carrick#704); every other producer leaves it `false`.
+    /// A reader that counts an API surface, or lists routes nothing calls,
+    /// uses it to keep a page's own data endpoint out of that count.
+    /// `default` so graphs serialized before the field existed read as
+    /// `false`, and skipped on the wire when false, like `resolution_source`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub view_module: bool,
 }
 
 /// Represents a data-fetching call with its target
@@ -591,6 +601,7 @@ mod tests {
 
         // Add an endpoint
         graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
             method: "GET".to_string(),
             path: "/users/:id".to_string(),
             full_path: "/users/:id".to_string(),
@@ -868,6 +879,7 @@ mod tests {
         let mut graph = MountGraph::new();
 
         graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
             method: "POST".to_string(),
             path: "/orders".to_string(),
             full_path: "/orders".to_string(),
@@ -916,6 +928,7 @@ mod tests {
         // endpoint; keeping `${this.apiUrl}` on the key made the join impossible.
         let mut graph = MountGraph::new();
         graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
             method: "GET".to_string(),
             path: "/api/v1/widgets/:id".to_string(),
             full_path: "/api/v1/widgets/:id".to_string(),
@@ -950,6 +963,7 @@ mod tests {
         let mut graph = MountGraph::new();
 
         graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
             method: "GET".to_string(),
             path: "/users/:userId/orders/:orderId".to_string(),
             full_path: "/users/:userId/orders/:orderId".to_string(),
@@ -985,6 +999,7 @@ mod tests {
         let mut graph = MountGraph::new();
 
         graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
             method: "GET".to_string(),
             path: "/users".to_string(),
             full_path: "/users".to_string(),
@@ -1020,6 +1035,7 @@ mod tests {
         let mut graph = MountGraph::new();
         for full_path in ["/api/**", "/api/v1/chat/new"] {
             graph.endpoints.push(ResolvedEndpoint {
+                view_module: false,
                 method: "GET".to_string(),
                 path: full_path.to_string(),
                 full_path: full_path.to_string(),
@@ -1072,6 +1088,7 @@ mod tests {
     ) -> crate::cloud_storage::CloudRepoData {
         let mut mg = MountGraph::new();
         mg.endpoints.push(ResolvedEndpoint {
+            view_module: false,
             method: "GET".to_string(),
             path: "/health".to_string(),
             full_path: "/health".to_string(),

@@ -1,0 +1,9 @@
+{
+  "name": "remix-flat-fixture",
+  "private": true,
+  "dependencies": {
+    "@remix-run/node": "^2.0.0",
+    "@remix-run/react": "^2.0.0",
+    "zod": "^3.22.0"
+  }
+}

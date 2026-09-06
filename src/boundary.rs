@@ -109,8 +109,18 @@ pub struct ServiceBoundary {
     /// something else at the same span.
     pub model_contradictions_discarded: usize,
     /// Model endpoints dropped in modules a routing convention already claims
-    /// (carrick#704). `None` until that lands: absent means the scanner does
-    /// not count it yet, which is not the same as counting none.
+    /// (carrick#704): in such a module the route set is the exported handlers,
+    /// so a row the model states there has no registration witness at all.
+    /// `None` on a blob from a scanner that did not count it — absent is not
+    /// the same as counting none.
+    ///
+    /// Not disjoint from `model_contradictions_discarded`, and the two must not
+    /// be added: one model row can raise both. A claimed route module that also
+    /// holds a route-shaped literal (a `fetch("/api/x")` in its loader is
+    /// enough) gets that row's path re-anchored to the literal first — one
+    /// discarded STATEMENT — and the re-anchored row then matches no derived
+    /// route and is dropped whole — one discarded ROW. Each count is true of a
+    /// different thing about the same row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_endpoints_discarded_in_claimed_modules: Option<usize>,
     /// Indexed routes with no resolved response type, so nothing on the
@@ -156,8 +166,9 @@ impl ServiceBoundary {
             model_only_rows: stats.model_only_rows,
             model_rows_joined: stats.model_rows_joined,
             model_contradictions_discarded: stats.model_contradictions_discarded,
-            // carrick#704 fills this; absent rather than zero until it does.
-            model_endpoints_discarded_in_claimed_modules: None,
+            model_endpoints_discarded_in_claimed_modules: Some(
+                stats.model_endpoints_discarded_in_claimed_modules,
+            ),
             routes_without_response_type: operations_without_a_type(data, ManifestRole::Producer),
             calls_without_expected_type: operations_without_a_type(data, ManifestRole::Consumer),
             types_degraded: data.types_degraded.clone(),

@@ -247,6 +247,15 @@ pub struct ApiEndpointDetails {
     /// matching or type compatibility reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
+    /// For endpoints: whether the module serving the route also renders a
+    /// view (it exports a handler and a default export). Read off the export
+    /// list by the file-based route pass (carrick#704); `false` for every
+    /// other producer and meaningless for calls. `default` so an index blob
+    /// written before the field existed deserializes. Skipped on the wire when
+    /// false, like the `resolution_source` line above: it is a marker on a
+    /// minority of rows, not a field every row carries.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub view_module: bool,
 }
 
 pub struct ApiAnalysisResult {
@@ -3353,6 +3362,7 @@ mod tests {
     }
     fn graphql_details(key: OperationKey, file: &str) -> ApiEndpointDetails {
         ApiEndpointDetails {
+            view_module: false,
             owner: None,
             key,
             params: vec![],
@@ -3712,6 +3722,7 @@ mod tests {
         // Add calls that use env vars
         // 1. Valid internal call (should match if endpoint exists, or report missing)
         analyzer.calls.push(ApiEndpointDetails {
+            view_module: false,
             owner: None,
             key: OperationKey::http("GET", "ENV_VAR:API_URL:/users"),
             params: vec![],
@@ -3729,6 +3740,7 @@ mod tests {
 
         // 2. Unclassified env var (not in internal/external list)
         analyzer.calls.push(ApiEndpointDetails {
+            view_module: false,
             owner: None,
             key: OperationKey::http("GET", "ENV_VAR:UNKNOWN_VAR:/posts"),
             params: vec![],
@@ -3746,6 +3758,7 @@ mod tests {
 
         // 3. Process.env pattern (should be detected as env var)
         analyzer.calls.push(ApiEndpointDetails {
+            view_module: false,
             owner: None,
             key: OperationKey::http("GET", "${process.env.OTHER_VAR}/comments"),
             params: vec![],
@@ -3764,6 +3777,7 @@ mod tests {
         // 4. Raw code pattern with UPPERCASE var (common in legacy code)
         // e.g. LEGACY_API_URL + "/users"
         analyzer.calls.push(ApiEndpointDetails {
+            view_module: false,
             owner: None,
             key: OperationKey::http("GET", "LEGACY_API_URL + \"/users\""),
             params: vec![],
@@ -3837,6 +3851,7 @@ mod tests {
             "ENV_VAR:UNKNOWN_API:/posts",
         ] {
             analyzer.calls.push(ApiEndpointDetails {
+                view_module: false,
                 owner: None,
                 key: OperationKey::http("GET", route),
                 params: vec![],
@@ -3904,6 +3919,7 @@ mod tests {
             "https://undeclared.test/v1/orders",
         ] {
             analyzer.calls.push(ApiEndpointDetails {
+                view_module: false,
                 owner: None,
                 key: OperationKey::http("GET", route),
                 params: vec![],
@@ -3950,6 +3966,7 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
+            view_module: false,
             owner: None,
             key: OperationKey::http("GET", "/api/orders"),
             params: vec![],
@@ -3967,6 +3984,7 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
             method: "POST".to_string(),
             path: "/api/orders".to_string(),
             full_path: "/api/orders".to_string(),
@@ -4007,6 +4025,7 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
+            view_module: false,
             owner: None,
             key: OperationKey::http("GET", "/api/missing"),
             params: vec![],
@@ -4024,6 +4043,7 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
             method: "POST".to_string(),
             path: "/api/orders".to_string(),
             full_path: "/api/orders".to_string(),
@@ -4061,6 +4081,7 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
+            view_module: false,
             owner: None,
             key: OperationKey::http("GET", "/api/missing"),
             params: vec![],
@@ -4080,6 +4101,7 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
             method: "POST".to_string(),
             path: "/api/orders".to_string(),
             full_path: "/api/orders".to_string(),
@@ -4119,6 +4141,7 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
+            view_module: false,
             owner: None,
             key: OperationKey::http("GET", "/api/widgets"),
             params: vec![],
@@ -4137,6 +4160,7 @@ mod tests {
         let mut mount_graph = MountGraph::new();
         // The matched producer: an MSW-style handler under a mock tree.
         mount_graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
             method: "GET".to_string(),
             path: "/api/widgets".to_string(),
             full_path: "/api/widgets".to_string(),
@@ -4152,6 +4176,7 @@ mod tests {
         });
         // An unmatched mock producer: must orphan WITH the mock tag.
         mount_graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
             method: "POST".to_string(),
             path: "/api/widgets".to_string(),
             full_path: "/api/widgets".to_string(),
@@ -4260,6 +4285,7 @@ mod tests {
         // reclassified to call-site evidence at scan time.
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
             method: "POST".to_string(),
             path: "/v2/widgets".to_string(),
             full_path: "/v2/widgets".to_string(),
@@ -4339,6 +4365,7 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
             method: "POST".to_string(),
             path: "/v2/widgets".to_string(),
             full_path: "/v2/widgets".to_string(),
@@ -4400,6 +4427,7 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
             method: "POST".to_string(),
             path: "/v2/widgets".to_string(),
             full_path: "/v2/widgets".to_string(),
@@ -4452,6 +4480,7 @@ mod tests {
     /// Producer endpoint in the mount graph, repo-tagged `"api"`.
     fn resolved(method: &str, full_path: &str) -> crate::mount_graph::ResolvedEndpoint {
         crate::mount_graph::ResolvedEndpoint {
+            view_module: false,
             method: method.to_string(),
             path: full_path.to_string(),
             full_path: full_path.to_string(),

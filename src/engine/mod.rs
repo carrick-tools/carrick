@@ -1719,6 +1719,9 @@ fn append_deterministic_protocol_operations(
         // the HTTP emit/join phase, so no pass stated them in the sense
         // `resolution_source` records (carrick#660).
         resolution_source: None,
+        // A file-router module is an HTTP concept; non-HTTP ops carry the
+        // default.
+        view_module: false,
     };
 
     let graphql = &extractions.graphql;
@@ -4499,6 +4502,7 @@ mod tests {
         let abs = |rel: &str| format!("{}/{}", repo_path, rel);
 
         let op = |file: &str| ApiEndpointDetails {
+            view_module: false,
             owner: None,
             key: OperationKey::http("GET", "/orders".to_string()),
             params: vec![],
@@ -4537,6 +4541,7 @@ mod tests {
             },
         );
         graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
             method: "GET".to_string(),
             path: "/orders".to_string(),
             full_path: "/orders".to_string(),
@@ -4766,6 +4771,7 @@ mod tests {
     fn test_ast_stripping_removes_nodes() {
         // Create test CloudRepoData with AST nodes
         let endpoint = ApiEndpointDetails {
+            view_module: false,
             owner: Some(OwnerType::App("test_app".to_string())),
             key: OperationKey::http("GET", "/test"),
             params: vec![],
@@ -4902,6 +4908,7 @@ mod tests {
 
         // Create test data with TypeReferences that would cause SourceMap issues
         let endpoint = ApiEndpointDetails {
+            view_module: false,
             owner: Some(OwnerType::App("test_app".to_string())),
             key: OperationKey::http("GET", "/test"),
             params: vec![],
@@ -4989,6 +4996,7 @@ mod tests {
             endpoints: endpoints
                 .into_iter()
                 .map(|path| EndpointResult {
+                    view_module: false,
                     candidate_id: "cand_123".to_string(),
                     line_number: 10,
                     owner_node: "app".to_string(),
@@ -5129,6 +5137,7 @@ mod tests {
     fn test_duplicate_producer_keys_yield_one_manifest_entry() {
         let config = Config::default();
         let mk_endpoint = |file: &str| crate::mount_graph::ResolvedEndpoint {
+            view_module: false,
             method: "GET".to_string(),
             path: "/api/orders/:id".to_string(),
             full_path: "/api/orders/:id".to_string(),
@@ -5188,6 +5197,7 @@ mod tests {
         let config = Config::default();
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints = vec![crate::mount_graph::ResolvedEndpoint {
+            view_module: false,
             method: "POST".to_string(),
             path: "/v2/widgets".to_string(),
             full_path: "/v2/widgets".to_string(),
@@ -5463,6 +5473,7 @@ mod tests {
                     graphql_consumer_locates: vec![],
                     mounts: vec![],
                     endpoints: vec![EndpointResult {
+                        view_module: false,
                         candidate_id: large_string.clone(),
                         line_number: 1,
                         owner_node: "app".to_string(),
@@ -7329,6 +7340,7 @@ mod tests {
     /// borrow witness.
     fn endpoint_with_handler(handler_name: &str) -> EndpointResult {
         EndpointResult {
+            view_module: false,
             candidate_id: "span:1-2".to_string(),
             line_number: 7,
             owner_node: "TicketsController".to_string(),
@@ -8182,6 +8194,7 @@ mod tests {
         // in calls (consumer), keyed identically so they match cross-repo.
         let mut cloud_data = repo_with_bundle("metrics-monorepo", None, "");
         let to_details = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
+            view_module: false,
             owner: None,
             key,
             params: vec![],

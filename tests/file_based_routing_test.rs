@@ -39,6 +39,20 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 /// fixture, exactly as the orchestrator does: relativize against the repo root,
 /// run the SWC gatekeeper's handler extractor, gate on `builtin_conventions`.
 fn synthesized_routes(fixture: &str, conventions: &[RoutingConvention]) -> BTreeSet<String> {
+    synthesized_rows(fixture, conventions)
+        .into_iter()
+        .map(|(_, method, path, _)| format!("{method} {path}"))
+        .collect()
+}
+
+/// The same derivation, one row per (file, method, path, `view_module`), for
+/// the assertions that are about a particular module rather than the route set:
+/// two modules legitimately serve one path (a layout and its index), so the
+/// route set alone cannot say which of them renders a view.
+fn synthesized_rows(
+    fixture: &str,
+    conventions: &[RoutingConvention],
+) -> BTreeSet<(String, String, String, bool)> {
     let root = fixture_root(fixture);
     let scanner = SwcScanner::new();
     let mut files = Vec::new();
@@ -47,9 +61,14 @@ fn synthesized_routes(fixture: &str, conventions: &[RoutingConvention]) -> BTree
     let mut routes = BTreeSet::new();
     for file in &files {
         let rel = file.strip_prefix(&root).expect("file under fixture root");
-        let content = fs::read_to_string(file).expect("read fixture file");
+        let Ok(content) = fs::read_to_string(file) else {
+            // A fixture may carry a manifest or another non-source file; the
+            // deriver only ever claims source modules anyway.
+            continue;
+        };
         let endpoints =
-            FileOrchestrator::file_based_endpoints(&scanner, rel, file, &content, conventions);
+            FileOrchestrator::file_based_endpoints(&scanner, rel, file, &content, conventions)
+                .endpoints;
         for ep in endpoints {
             // Every synthesized file-based endpoint must carry the metadata the
             // downstream sidecar type-resolution relies on: a convention label,
@@ -68,7 +87,12 @@ fn synthesized_routes(fixture: &str, conventions: &[RoutingConvention]) -> BTree
                 ep.call_expression_span_start.is_some(),
                 "{rel:?}: endpoint missing handler declaration span"
             );
-            routes.insert(format!("{} {}", ep.method, ep.path));
+            routes.insert((
+                rel.to_string_lossy().to_string(),
+                ep.method.clone(),
+                ep.path.clone(),
+                ep.view_module,
+            ));
         }
     }
     routes
@@ -166,9 +190,14 @@ fn astro_fixture_derives_expected_routes() {
 /// its 140 internal route files were `Skipped (no API patterns)` for exactly
 /// this reason.
 ///
-/// The fixture locks both the recall and the precision side: the declared and
-/// called forms must derive identically, while the UI page plane (`.tsx`),
-/// framework-private files, and non-handler exports must derive nothing.
+/// The fixture locks both the recall and the precision side. Recall: the
+/// declared and called forms derive identically, a chain written as a
+/// DIRECTORY derives what the single-file spelling does (carrick#701), a
+/// `_`-prefixed piece is a pathless layout rather than a private file
+/// (carrick#702), and a `.tsx` module that exports a handler is the route it
+/// serves (carrick#704 / R1b). Precision: a module exporting only a component
+/// derives nothing, and neither do `config`/helper exports or the route
+/// builder module itself.
 #[test]
 fn flat_routes_fixture_derives_expected_routes() {
     let routes = synthesized_routes(
@@ -186,6 +215,23 @@ fn flat_routes_fixture_derives_expected_routes() {
         // Bare `$` is the splat; a trailing `index` collapses onto its parent
         // (which is why `/api/v1/widgets` above is not duplicated).
         "GET /api/v1/blobs/**",
+        // The chain written as a directory holding a terminal module: the
+        // directory name splits on the same separator the stem does and the
+        // `route` stem contributes nothing (carrick#701).
+        "GET /projects/v3/:projectRef/metrics",
+        // A `_`-prefixed piece nests without contributing a segment, so this
+        // module is a route and not a skipped private file (carrick#702). The
+        // `.tsx` page at the same path derives the same row from its own file.
+        "GET /widgets/:widgetId",
+        // `_index` is pathless too, so this serves the parent path.
+        "GET /admin",
+        // A `.tsx` module with a handler and no component is a resource route.
+        "GET /resources/things",
+        // The decoy module's own handlers ARE routes; what it must not yield
+        // is a row for the form discriminator in its schema (carrick#703,
+        // pinned end-to-end in `deterministic_emission_test`).
+        "GET /settings/builds",
+        "POST /settings/builds",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -193,11 +239,61 @@ fn flat_routes_fixture_derives_expected_routes() {
 
     assert_eq!(
         routes, expected,
-        "flat-route fixture should yield the .ts route handlers only — \
-         skipping the .tsx page plane, the `_`-prefixed module, and the \
-         `config`/helper exports, and never deriving from the route builder \
-         module itself"
+        "flat-route fixture should yield every module that exports a handler, \
+         whatever its extension — while a page exporting only a component, the \
+         `config`/helper exports, and the route builder module itself yield \
+         nothing"
     );
+}
+
+/// R1b's second half: the row records whether the module that serves the route
+/// also renders a view, read off its export list. Asserted per FILE, because
+/// two modules legitimately serve one path — a pathless layout and the `.tsx`
+/// page beneath it both answer `GET /widgets/:widgetId` — and the route set
+/// cannot tell them apart.
+#[test]
+fn flat_routes_fixture_marks_view_modules() {
+    let rows = synthesized_rows(
+        "remix-flat",
+        &builtin_conventions(&["Remix".to_string()], &[]),
+    );
+    let view_module_of = |file: &str, method: &str| -> bool {
+        let found: Vec<&(String, String, String, bool)> = rows
+            .iter()
+            .filter(|(row_file, row_method, _, _)| row_file == file && row_method == method)
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "expected one {method} row in {file}: {rows:#?}"
+        );
+        found[0].3
+    };
+
+    for (file, method) in [
+        // A handler plus a default export: the module serves the route AND
+        // renders the page.
+        ("app/routes/admin._index.tsx", "GET"),
+        ("app/routes/settings.builds.tsx", "GET"),
+        ("app/routes/settings.builds.tsx", "POST"),
+        ("app/routes/widgets.$widgetId.tsx", "GET"),
+    ] {
+        assert!(
+            view_module_of(file, method),
+            "{file} exports a component alongside its handler"
+        );
+    }
+
+    for (file, method) in [
+        // Handler, no component: an API surface, whatever the extension.
+        ("app/routes/resources.things.tsx", "GET"),
+        ("app/routes/api.v1.widgets.ts", "GET"),
+        ("app/routes/api.v1.widgets.ts", "POST"),
+        ("app/routes/_app.widgets.$widgetId.ts", "GET"),
+        ("app/routes/projects.v3.$projectRef.metrics/route.ts", "GET"),
+    ] {
+        assert!(!view_module_of(file, method), "{file} exports no component");
+    }
 }
 
 /// The gate must open on the manifest alone. Framework detection reports the

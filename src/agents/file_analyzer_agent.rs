@@ -206,6 +206,26 @@ pub struct EndpointResult {
     /// emit/join pass. See [`ResolutionSource`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_source: Option<ResolutionSource>,
+    /// Whether the module serving this route ALSO renders a view: it exports a
+    /// handler (which is why the route exists) and a default export (which is
+    /// the component). A fact read off the module's export list, never from
+    /// the model, and set only by the file-based route pass — every other
+    /// emitter leaves it `false`.
+    ///
+    /// It exists because route-ness is the exported handler and not the file
+    /// extension (carrick#704): once a page module's read handler is
+    /// recognised as the GET it is, a reader needs to tell a page's own data
+    /// endpoint from an API surface a sibling service is expected to call.
+    /// `skip_deserializing` is what makes "never from the model" true rather
+    /// than merely intended: `file_results` holds the model's raw answers, so
+    /// this field is on a shape the model's JSON is parsed into, and a
+    /// hallucinated key would otherwise be believed on a model-only row. The
+    /// value is recomputed from the module's exports on every scan, cold or
+    /// incremental, so nothing needs to round-trip. Skipped when false on the
+    /// way out for the same reason `resolution_source` is: `file_results` is
+    /// the bulk of the blob and the first thing the size limit drops.
+    #[serde(skip_deserializing, skip_serializing_if = "std::ops::Not::not")]
+    pub view_module: bool,
 }
 
 /// Result of analyzing a single data-fetching call
@@ -1539,6 +1559,7 @@ mod tests {
     #[test]
     fn test_endpoint_result_serialization() {
         let endpoint = EndpointResult {
+            view_module: false,
             candidate_id: "span:100-140".to_string(),
             line_number: 15,
             owner_node: "router".to_string(),
@@ -1606,6 +1627,7 @@ mod tests {
             graphql_consumer_locates: vec![],
             mounts: vec![],
             endpoints: vec![EndpointResult {
+                view_module: false,
                 candidate_id: "span:10-50".to_string(),
                 line_number: 1,
                 owner_node: "app".to_string(),
@@ -1760,6 +1782,7 @@ mod tests {
                 pattern_matched: ".use(".to_string(),
             }],
             endpoints: vec![EndpointResult {
+                view_module: false,
                 candidate_id: "span:80-120".to_string(),
                 line_number: 10,
                 owner_node: "router".to_string(),
@@ -1968,6 +1991,7 @@ mod tests {
                 pattern_matched: "app.use".to_string(),
             }],
             endpoints: vec![EndpointResult {
+                view_module: false,
                 candidate_id: "span:130-180".to_string(),
                 line_number: 2,
                 owner_node: "router".to_string(),

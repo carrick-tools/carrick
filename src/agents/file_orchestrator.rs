@@ -110,6 +110,31 @@ pub struct FileCentricAnalysisResult {
     pub type_resolution: Option<TypeResolutionResult>,
 }
 
+/// What a routing convention said about one file: whether it CLAIMED the file
+/// at all, and the endpoints it derived there.
+///
+/// The two are separate answers and the difference is the point (carrick#704).
+/// A route module that exports no handler is claimed and derives nothing —
+/// which is the statement "this file serves no route", and is what lets the
+/// join discard an endpoint the model invented in it. Reading the claim back
+/// off an empty endpoint list would collapse that into "no convention here"
+/// and lose the statement.
+#[derive(Debug, Default)]
+pub struct FileRouteDerivation {
+    /// Whether a convention claimed this file AND states its whole route set
+    /// from the module's exports. False for a file no convention matched; for
+    /// a convention that routes a single default export, where the served
+    /// methods are a runtime branch; and for a module that re-exports another
+    /// wholesale, where the export list is a lower bound rather than the whole
+    /// surface. In each of those the derivation is silent about the route set
+    /// rather than complete, so nothing may be discarded on its authority.
+    pub claimed: bool,
+    /// The endpoints derived from the file's location and its exported
+    /// handlers. Empty when nothing was claimed, and empty when a claimed
+    /// module exports no handler.
+    pub endpoints: Vec<EndpointResult>,
+}
+
 /// Statistics about the file-centric analysis
 #[derive(Debug, Default)]
 pub struct ProcessingStats {
@@ -164,6 +189,13 @@ pub struct ProcessingStats {
     /// Model methods, targets and paths discarded because the source states
     /// something else at the same span. Each one is logged with both values.
     pub model_contradictions_discarded: usize,
+    /// Model endpoint rows discarded because they joined no convention row in
+    /// a file a routing convention CLAIMED (carrick#703). In such a file the
+    /// route set is the module's exported handlers, so a row the model states
+    /// there and the convention does not has no registration witness of any
+    /// kind: not a path argument, not a decorator, not the filename. Each one
+    /// is logged with its method, path and file.
+    pub model_endpoints_discarded_in_claimed_modules: usize,
     /// Model rows kept as rows of their own: the only record of a shape no
     /// deterministic source reads.
     pub model_only_rows: usize,
@@ -944,6 +976,15 @@ impl FileOrchestrator {
             /// Endpoints derived from file-based routing conventions, merged in
             /// after the LLM pass. Empty for non-route files.
             route_endpoints: Vec<EndpointResult>,
+            /// Whether a routing convention claimed this file AND states its
+            /// whole route set from its exports (carrick#704). Read by the
+            /// join: a model endpoint row in such a file that matches no
+            /// derived route is discarded, because the module's exports are
+            /// the complete answer and nothing in it registers that route.
+            /// True independently of `route_endpoints` being empty — a claimed
+            /// module that exports no handler serves no route, which is a
+            /// statement, not a silence.
+            route_module_claimed: bool,
             /// Endpoints derived deterministically from route-descriptor data
             /// (`{ method, path, handler }`), merged in after the LLM pass. The
             /// LLM ignores route-as-data, so these are the authoritative source
@@ -1019,6 +1060,11 @@ impl FileOrchestrator {
             path_str: String,
             file_path: PathBuf,
             import_sources: Vec<String>,
+            /// Carried through the defer because a claimed route module that
+            /// exports no handler is exactly the file that reaches here: it
+            /// raises no candidate of its own, and a wrapper import is what
+            /// rescues it into the model pass (carrick#704).
+            route_module_claimed: bool,
         }
 
         /// Every pass over ONE file's rows that runs after the model's answer
@@ -1268,8 +1314,8 @@ impl FileOrchestrator {
             // exported handler declaration. The path comes from the layout and the
             // methods from exported handler names; both are invisible to a
             // call-site scan, so they are derived deterministically here.
-            let route_endpoints = if conventions.is_empty() {
-                Vec::new()
+            let derivation = if conventions.is_empty() {
+                FileRouteDerivation::default()
             } else {
                 let rel_path = file_path.strip_prefix(service_root).unwrap_or(file_path);
                 Self::file_based_endpoints(
@@ -1280,6 +1326,10 @@ impl FileOrchestrator {
                     &conventions,
                 )
             };
+            let FileRouteDerivation {
+                claimed: route_module_claimed,
+                endpoints: route_endpoints,
+            } = derivation;
 
             // Route-descriptor routes: a route declared as data
             // (`{ method, path, handler }` in a registry array) is fully
@@ -1434,6 +1484,7 @@ impl FileOrchestrator {
                         path_str,
                         file_path: file_path.clone(),
                         import_sources: scan_result.import_sources,
+                        route_module_claimed,
                     });
                     continue;
                 } else {
@@ -1476,6 +1527,7 @@ impl FileOrchestrator {
             pending.push(PendingFile {
                 path_str,
                 content,
+                route_module_claimed,
                 candidate_hints,
                 candidate_contexts,
                 candidate_map,
@@ -1835,6 +1887,7 @@ impl FileOrchestrator {
             pending.push(PendingFile {
                 path_str: deferred.path_str,
                 content,
+                route_module_claimed: deferred.route_module_claimed,
                 candidate_hints: Vec::new(),
                 candidate_contexts: Vec::new(),
                 candidate_map: HashMap::new(),
@@ -2061,6 +2114,7 @@ impl FileOrchestrator {
                         &pf.candidate_map,
                         &overrules,
                         &pf.path_str,
+                        pf.route_module_claimed,
                         &mut stats,
                     );
 
@@ -2199,6 +2253,10 @@ impl FileOrchestrator {
         debug!(
             "  - Model statements discarded as contradictions: {}",
             stats.model_contradictions_discarded
+        );
+        debug!(
+            "  - Model endpoints discarded in convention-claimed modules: {}",
+            stats.model_endpoints_discarded_in_claimed_modules
         );
         debug!("  - Model-only rows: {}", stats.model_only_rows);
         debug!(
@@ -4244,18 +4302,35 @@ impl FileOrchestrator {
         file_path: &Path,
         content: &str,
         conventions: &[RoutingConvention],
-    ) -> Vec<EndpointResult> {
+    ) -> FileRouteDerivation {
         let Some(route) = derive_route(rel_path, conventions) else {
-            return Vec::new();
+            return FileRouteDerivation::default();
         };
 
-        match route.method_source {
+        let module = scanner.module_exports(file_path, content);
+        // A convention that reads the method off an export name states this
+        // module's WHOLE route set from its exports: every handler it exports
+        // is a row here, and an export that names no method is not a route.
+        //
+        // Two things stop that from being the whole answer. A convention that
+        // routes one default export cannot say it at all — the methods it
+        // serves are a runtime branch. And a module that re-exports another
+        // wholesale (`export * from "./route.server"`) exports bindings named
+        // in a file this reader never opened, so its own handler list is a
+        // lower bound; claiming it would discard a model row that correctly
+        // described the route the re-export serves.
+        let claimed = route.method_source == MethodSource::ExportName && !module.reexports_all;
+        let exports = module.handlers;
+        // The module renders a view as well as serving the route when it also
+        // default-exports: a fact from the export list, not a guess.
+        let view_module = exports.iter().any(|handler| handler.name == "default");
+
+        let endpoints = match route.method_source {
             // App-router style: one exported function per HTTP method. The export
             // name *is* the method (GET/POST/...), and its declaration span lets
             // the sidecar locate the handler body later.
-            MethodSource::ExportName => scanner
-                .exported_handlers(file_path, content)
-                .into_iter()
+            MethodSource::ExportName => exports
+                .iter()
                 .flat_map(|h| {
                     // An export named for a method *is* that method; a
                     // convention whose route modules name their handlers for a
@@ -4294,6 +4369,7 @@ impl FileOrchestrator {
                             primary_type_symbol: None,
                             type_import_source: None,
                             resolution_source: None,
+                            view_module,
                         })
                         .collect::<Vec<_>>()
                 })
@@ -4303,7 +4379,8 @@ impl FileOrchestrator {
             // leave these to a follow-up rather than emit an endpoint with an
             // unknown method (which the mount graph would drop anyway).
             MethodSource::DefaultExport => Vec::new(),
-        }
+        };
+        FileRouteDerivation { claimed, endpoints }
     }
 
     /// Build deterministic endpoints for routes declared as data
@@ -4332,6 +4409,7 @@ impl FileOrchestrator {
                     .handler
                     .unwrap_or_else(|| ROUTE_DESCRIPTOR_OWNER.to_string());
                 EndpointResult {
+                    view_module: false,
                     candidate_id: format!("route-descriptor:{}:{}", method, d.span_start),
                     line_number: d.line_number as i32,
                     owner_node: handler.clone(),
@@ -4414,6 +4492,7 @@ impl FileOrchestrator {
                 endpoints.push((
                     resolved.file.clone(),
                     EndpointResult {
+                        view_module: false,
                         candidate_id: format!(
                             "class-controller:{}:{}",
                             method.http_method, method.span_start
@@ -4960,6 +5039,8 @@ impl FileOrchestrator {
             primary_type_symbol: None,
             type_import_source: None,
             resolution_source: Some(ResolutionSource::ReceiverType),
+            // A registration call, not a file-router module.
+            view_module: false,
         }
     }
 
@@ -5151,12 +5232,14 @@ impl FileOrchestrator {
     /// is logged and discarded. A model row whose `candidate_id` joins no
     /// candidate keeps no span, exactly as before, and is placed by its line.
     /// A model row with no deterministic twin is kept as its own row.
+    #[allow(clippy::too_many_arguments)]
     fn join_model_rows(
         result: &mut FileAnalysisResult,
         model: FileAnalysisResult,
         candidate_map: &HashMap<String, CandidateTarget>,
         overrules: &[Resolved],
         file_path: &str,
+        route_module_claimed: bool,
         stats: &mut ProcessingStats,
     ) {
         let FileAnalysisResult {
@@ -5232,9 +5315,29 @@ impl FileOrchestrator {
                     if stated_by.is_some() {
                         endpoint.resolution_source = stated_by;
                     }
+                    // A fact the convention read off the module's structure,
+                    // which the model has no way to state, travels onto the
+                    // row that is kept.
+                    endpoint.view_module = result.endpoints[index].view_module;
                     result.endpoints.remove(index);
                     deterministic_rows -= 1;
                     stats.model_rows_joined += 1;
+                }
+                None if route_module_claimed => {
+                    // A routing convention claimed this file, so the route set
+                    // is its exported handlers and nothing else (carrick#703).
+                    // A row the model states here matched none of them, which
+                    // means nothing registers it: not a path argument, not a
+                    // decorator, not the filename. A schema literal or a form
+                    // field id read as a URL lands exactly here.
+                    warn!(
+                        "[FileOrchestrator] Discarding model endpoint {} {} in {}: a routing \
+                         convention states this module's whole route set and none of it is \
+                         this row",
+                        endpoint.method, endpoint.path, file_path
+                    );
+                    stats.model_endpoints_discarded_in_claimed_modules += 1;
+                    continue;
                 }
                 None => stats.model_only_rows += 1,
             }
@@ -6724,6 +6827,7 @@ impl FileOrchestrator {
                     // Which layer stated the row, carried onto the wire
                     // (carrick#660). Retention only, like `provenance`.
                     resolution_source: endpoint.resolution_source,
+                    view_module: endpoint.view_module,
                 });
             }
         }
@@ -8278,6 +8382,7 @@ export * from "./aFetch.js";"#,
                     pattern_matched: ".use(".to_string(),
                 }],
                 endpoints: vec![EndpointResult {
+                    view_module: false,
                     candidate_id: "span:100-140".to_string(),
                     line_number: 5,
                     owner_node: "app".to_string(),
@@ -8328,6 +8433,7 @@ export * from "./aFetch.js";"#,
         let orchestrator = FileOrchestrator::new(agent_service);
 
         let endpoint = |line_number: i32, method: &str, path: &str| EndpointResult {
+            view_module: false,
             candidate_id: format!("span:{line_number}"),
             line_number,
             owner_node: "SettingsController".to_string(),
@@ -8680,6 +8786,7 @@ export * from "./aFetch.js";"#,
             "src/routes/download.ts".to_string(),
             FileAnalysisResult {
                 endpoints: vec![EndpointResult {
+                    view_module: false,
                     candidate_id: "span:100-140".to_string(),
                     line_number: 5,
                     owner_node: "downloadRoute".to_string(),
@@ -8730,6 +8837,7 @@ export * from "./aFetch.js";"#,
         let orchestrator = FileOrchestrator::new(agent_service);
 
         let endpoint = |path: &str| EndpointResult {
+            view_module: false,
             candidate_id: "span:100-140".to_string(),
             line_number: 5,
             owner_node: "http".to_string(),
@@ -8801,6 +8909,7 @@ export * from "./aFetch.js";"#,
             "tests/fixtures/mocks/service-a/src/index.ts".to_string(),
             FileAnalysisResult {
                 endpoints: vec![EndpointResult {
+                    view_module: false,
                     candidate_id: "span:1-2".to_string(),
                     line_number: 1,
                     owner_node: "app".to_string(),
@@ -9491,6 +9600,7 @@ export * from "./aFetch.js";"#,
                 graphql_consumer_locates: vec![],
                 mounts: vec![],
                 endpoints: vec![EndpointResult {
+                    view_module: false,
                     candidate_id: "span:1-40".to_string(),
                     line_number: 5,
                     owner_node: "app".to_string(),
@@ -9557,6 +9667,7 @@ export * from "./aFetch.js";"#,
         let orchestrator = FileOrchestrator::new(agent_service);
 
         let mk_endpoint = |line: u32, method: &str, path: &str| EndpointResult {
+            view_module: false,
             candidate_id: format!("span:{line}"),
             line_number: line as i32,
             owner_node: "app".to_string(),
@@ -9949,6 +10060,7 @@ export * from "./aFetch.js";"#,
                 graphql_consumer_locates: vec![],
                 mounts: vec![],
                 endpoints: vec![EndpointResult {
+                    view_module: false,
                     candidate_id: "file-route:GET:42".to_string(),
                     line_number: 7,
                     owner_node: FILE_BASED_ROUTE_OWNER.to_string(),
@@ -10009,6 +10121,7 @@ export * from "./aFetch.js";"#,
         emission_style: Option<EmissionStyle>,
     ) -> EndpointResult {
         EndpointResult {
+            view_module: false,
             candidate_id: "span:100-200".to_string(),
             line_number: 12,
             owner_node: "app".to_string(),
@@ -10197,6 +10310,7 @@ export * from "./aFetch.js";"#,
             mounts: vec![],
             endpoints: vec![
                 EndpointResult {
+                    view_module: false,
                     candidate_id: "span:590-650".to_string(),
                     line_number: 10,
                     owner_node: "app".to_string(),
@@ -10216,6 +10330,7 @@ export * from "./aFetch.js";"#,
                     resolution_source: None,
                 },
                 EndpointResult {
+                    view_module: false,
                     candidate_id: "span:700-740".to_string(),
                     line_number: 12,
                     owner_node: "app".to_string(),
@@ -10315,6 +10430,7 @@ export * from "./aFetch.js";"#,
             graphql_consumer_locates: vec![],
             mounts: vec![],
             endpoints: vec![EndpointResult {
+                view_module: false,
                 candidate_id: "span:1-2".to_string(),
                 line_number: 10,
                 owner_node: "app".to_string(),
@@ -10667,6 +10783,7 @@ export * from "./aFetch.js";"#,
             graphql_consumer_locates: vec![],
             mounts: vec![],
             endpoints: vec![EndpointResult {
+                view_module: false,
                 candidate_id: "span:1-2".to_string(),
                 line_number: 10,
                 owner_node: "app".to_string(),
@@ -10776,6 +10893,7 @@ export * from "./aFetch.js";"#,
                 mounts: vec![],
                 endpoints: vec![
                     EndpointResult {
+                        view_module: false,
                         candidate_id: "span:710-740".to_string(),
                         line_number: 5,
                         owner_node: "router".to_string(),
@@ -10795,6 +10913,7 @@ export * from "./aFetch.js";"#,
                         resolution_source: None,
                     },
                     EndpointResult {
+                        view_module: false,
                         candidate_id: "span:750-780".to_string(),
                         line_number: 10,
                         owner_node: "router".to_string(),
@@ -11017,6 +11136,7 @@ export default [
     /// collision is the point: the owner name cannot identify the module.
     fn plugin_endpoint(method: &str, path: &str) -> EndpointResult {
         EndpointResult {
+            view_module: false,
             candidate_id: format!("span:{method}:{path}"),
             line_number: 4,
             owner_node: "server".to_string(),
@@ -11447,7 +11567,8 @@ export const runtime = "edge";
             Path::new("app/users/route.ts"),
             content,
             &next_conventions(),
-        );
+        )
+        .endpoints;
         endpoints.sort_by(|a, b| a.method.cmp(&b.method));
 
         // GET + POST become endpoints; `runtime` is not an HTTP method.
@@ -11475,7 +11596,8 @@ export const runtime = "edge";
             Path::new("app/users/[id]/route.ts"),
             content,
             &next_conventions(),
-        );
+        )
+        .endpoints;
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].method, "GET");
         assert_eq!(endpoints[0].path, "/users/:id");
@@ -11499,7 +11621,8 @@ export const prerender = false;
             Path::new("src/pages/api/users.ts"),
             content,
             &builtin_conventions(&["Astro".to_string()], &[]),
-        );
+        )
+        .endpoints;
         endpoints.sort_by(|a, b| a.method.cmp(&b.method));
 
         // GET + POST become endpoints; `prerender` is not an HTTP method.
@@ -11523,7 +11646,8 @@ export const prerender = false;
             Path::new("src/pages/posts/[id].ts"),
             content,
             &builtin_conventions(&["Astro".to_string()], &[]),
-        );
+        )
+        .endpoints;
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].method, "GET");
         assert_eq!(endpoints[0].path, "/posts/:id");
@@ -11541,7 +11665,8 @@ export const prerender = false;
             Path::new("pages/api/users.ts"),
             content,
             &next_conventions(),
-        );
+        )
+        .endpoints;
         assert!(endpoints.is_empty());
     }
 
@@ -11555,7 +11680,8 @@ export const prerender = false;
             Path::new("src/services/users.ts"),
             content,
             &next_conventions(),
-        );
+        )
+        .endpoints;
         assert!(
             endpoints.is_empty(),
             "non-route files should yield no file-based endpoints"
@@ -11585,7 +11711,8 @@ export const action = makeRoute({ body: WidgetSchema }, async ({ body }) => {
             Path::new("app/routes/api.v1.widgets.$widgetId.activate.ts"),
             content,
             &flat_conventions(),
-        );
+        )
+        .endpoints;
         assert_eq!(endpoints.len(), 1, "expected one endpoint for the action");
         let ep = &endpoints[0];
         assert_eq!(ep.method, "POST");
@@ -11610,7 +11737,8 @@ export const loader = makeRoute({}, async () => json([]));
             Path::new("app/routes/api.v1.widgets.$widgetId.ts"),
             content,
             &flat_conventions(),
-        );
+        )
+        .endpoints;
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].method, "GET");
         assert_eq!(endpoints[0].path, "/api/v1/widgets/:widgetId");
@@ -11637,6 +11765,8 @@ export const loader = makeRoute({}, async () => json([]));
             "export const action = makeRoute({}, async () => json({}));\n",
             &flat_conventions(),
         );
+        let declared = declared.endpoints;
+        let called = called.endpoints;
         assert_eq!(declared.len(), 1);
         assert_eq!(called.len(), 1);
         assert_eq!(declared[0].method, called[0].method);
@@ -11659,7 +11789,8 @@ export function serializeWidget(w) { return w; }
             Path::new("app/routes/api.v1.widgets.ts"),
             content,
             &flat_conventions(),
-        );
+        )
+        .endpoints;
         assert!(
             endpoints.is_empty(),
             "non-handler exports must not become endpoints, got {endpoints:?}"
@@ -11667,19 +11798,16 @@ export function serializeWidget(w) { return w; }
     }
 
     #[test]
-    fn test_file_based_endpoints_flat_route_gate_is_the_route_plane() {
-        // The same call-expression export outside the route plane yields
+    fn test_file_based_endpoints_flat_route_gate_is_the_route_root() {
+        // The same call-expression export outside the route root yields
         // nothing: the recall fix is scoped to files a convention claims.
         let scanner = SwcScanner::new();
         let content = "export const action = makeRoute({}, async () => json({}));\n";
         for rel in [
-            // Not under the route root.
             "app/services/widgets.server.ts",
             "src/lib/api.v1.widgets.$widgetId.activate.ts",
-            // Under the route root, but the UI page plane, not an API surface.
-            "app/routes/api.v1.widgets.$widgetId.activate.tsx",
         ] {
-            let endpoints = FileOrchestrator::file_based_endpoints(
+            let derivation = FileOrchestrator::file_based_endpoints(
                 &scanner,
                 Path::new(rel),
                 Path::new(rel),
@@ -11687,10 +11815,202 @@ export function serializeWidget(w) { return w; }
                 &flat_conventions(),
             );
             assert!(
-                endpoints.is_empty(),
-                "{rel} is not a route module; expected no endpoints, got {endpoints:?}"
+                !derivation.claimed,
+                "{rel} is outside the route root and must not be claimed"
+            );
+            assert!(
+                derivation.endpoints.is_empty(),
+                "{rel} is not a route module; expected no endpoints, got {:?}",
+                derivation.endpoints
             );
         }
+    }
+
+    /// carrick#704 / R1b: inside the route root the extension decides nothing.
+    /// The exported handler decides, and the module's default export is
+    /// recorded beside the row rather than used to suppress it.
+    #[test]
+    fn test_file_based_endpoints_claim_a_page_plane_module_with_a_handler() {
+        let scanner = SwcScanner::new();
+        let rel = Path::new("app/routes/api.v1.widgets.$widgetId.activate.tsx");
+
+        let handler_and_component = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            rel,
+            rel,
+            "export const action = makeRoute({}, async () => json({}));\n\
+             export default function Page() { return null; }\n",
+            &flat_conventions(),
+        );
+        assert!(handler_and_component.claimed);
+        assert_eq!(handler_and_component.endpoints.len(), 1);
+        assert_eq!(
+            handler_and_component.endpoints[0].path,
+            "/api/v1/widgets/:widgetId/activate"
+        );
+        assert_eq!(handler_and_component.endpoints[0].method, "POST");
+        assert!(
+            handler_and_component.endpoints[0].view_module,
+            "a module that also default-exports renders a view"
+        );
+
+        let handler_only = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            rel,
+            rel,
+            "export const action = makeRoute({}, async () => json({}));\n",
+            &flat_conventions(),
+        );
+        assert_eq!(handler_only.endpoints.len(), 1);
+        assert!(
+            !handler_only.endpoints[0].view_module,
+            "no default export, no view"
+        );
+
+        // A page with no handler: claimed, and deriving nothing. The claim is
+        // the statement the join reads — this module serves no route.
+        let component_only = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            rel,
+            rel,
+            "export default function Page() { return null; }\n",
+            &flat_conventions(),
+        );
+        assert!(component_only.claimed);
+        assert!(component_only.endpoints.is_empty());
+    }
+
+    /// A module that re-exports another wholesale does not state its route set
+    /// either: `export * from "./route.server"` exports bindings named in a
+    /// file this reader never opened, so the handler list is a lower bound.
+    /// Claiming it would discard a model row that correctly described the route
+    /// the re-export serves.
+    #[test]
+    fn test_file_based_endpoints_a_wholesale_reexport_does_not_claim_the_route_set() {
+        let scanner = SwcScanner::new();
+        let rel = Path::new("app/routes/api.v1.widgets.ts");
+
+        let opaque = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            rel,
+            rel,
+            "export * from \"./widgets.server\";\n",
+            &flat_conventions(),
+        );
+        assert!(
+            !opaque.claimed,
+            "the export list is a lower bound, so it states nothing to discard against"
+        );
+        assert!(opaque.endpoints.is_empty());
+
+        // A NAMED re-export names its binding, so the list is complete and the
+        // route is derived from it exactly as an inline export would be.
+        let named = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            rel,
+            rel,
+            "export { loader } from \"./widgets.server\";\n",
+            &flat_conventions(),
+        );
+        assert!(named.claimed);
+        assert_eq!(named.endpoints.len(), 1);
+        assert_eq!(named.endpoints[0].method, "GET");
+        assert_eq!(named.endpoints[0].path, "/api/v1/widgets");
+    }
+
+    /// The other half of the claim: a convention that routes a single default
+    /// export does NOT state its module's route set, because the methods it
+    /// serves are a runtime branch. Claiming it would discard every model row
+    /// in a pages-router API file.
+    #[test]
+    fn test_file_based_endpoints_default_export_convention_does_not_claim_the_route_set() {
+        let scanner = SwcScanner::new();
+        let rel = Path::new("pages/api/users.ts");
+        let derivation = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            rel,
+            rel,
+            "export default function handler(req, res) {}\n",
+            &next_conventions(),
+        );
+        assert!(!derivation.claimed);
+        assert!(derivation.endpoints.is_empty());
+    }
+
+    /// carrick#703: in a claimed module the convention's route set is the whole
+    /// answer, so a model row that joins none of it is discarded and counted.
+    #[test]
+    fn a_model_endpoint_in_a_claimed_module_that_joins_nothing_is_discarded() {
+        let derived = synthetic_endpoint("GET", "/settings/builds");
+        // The model answered at a real candidate — the module's own outbound
+        // call — and called it a route.
+        let invented = endpoint_with_candidate("/api/build-settings", "c1");
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
+
+        let (result, stats) = emit_and_join_claimed_route_module(
+            FileAnalysisResult {
+                endpoints: vec![invented],
+                ..Default::default()
+            },
+            &candidate_map,
+            std::slice::from_ref(&derived),
+            "app/routes/settings.builds.tsx",
+        );
+
+        assert_eq!(result.endpoints.len(), 1, "{:?}", result.endpoints);
+        assert_eq!(result.endpoints[0].path, "/settings/builds");
+        assert_eq!(stats.model_endpoints_discarded_in_claimed_modules, 1);
+        assert_eq!(stats.model_only_rows, 0);
+    }
+
+    /// The same row in a file NO convention claimed is kept: there the model is
+    /// the only reader of a registration the scanner cannot see.
+    #[test]
+    fn a_model_endpoint_in_an_unclaimed_file_is_kept() {
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
+        let (result, stats) = emit_and_join(
+            FileAnalysisResult {
+                endpoints: vec![endpoint_with_candidate("/api/build-settings", "c1")],
+                ..Default::default()
+            },
+            &candidate_map,
+            "src/routes/settings.ts",
+        );
+
+        assert_eq!(result.endpoints.len(), 1);
+        assert_eq!(result.endpoints[0].path, "/api/build-settings");
+        assert_eq!(stats.model_endpoints_discarded_in_claimed_modules, 0);
+        assert_eq!(stats.model_only_rows, 1);
+    }
+
+    /// A model row that DOES join the convention's row keeps the structural
+    /// fact the model has no way to state.
+    #[test]
+    fn a_joined_model_endpoint_keeps_the_conventions_view_module_fact() {
+        let mut derived = synthetic_endpoint("GET", "/admin");
+        derived.view_module = true;
+
+        let mut candidate_map = HashMap::new();
+        candidate_map.insert("c1".to_string(), candidate_with_snippet("c1", None));
+
+        let (result, stats) = emit_and_join_claimed_route_module(
+            FileAnalysisResult {
+                endpoints: vec![endpoint_with_candidate("/admin", "c1")],
+                ..Default::default()
+            },
+            &candidate_map,
+            std::slice::from_ref(&derived),
+            "app/routes/admin._index.tsx",
+        );
+
+        assert_eq!(result.endpoints.len(), 1);
+        assert!(
+            result.endpoints[0].view_module,
+            "the joined row must carry the convention's answer, not the model's default"
+        );
+        assert_eq!(stats.model_rows_joined, 1);
     }
 
     #[test]
@@ -11704,7 +12024,8 @@ export function serializeWidget(w) { return w; }
             Path::new("app/users/route.ts"),
             content,
             &builtin_conventions(&["express".to_string()], &[]),
-        );
+        )
+        .endpoints;
         assert!(endpoints.is_empty());
     }
 
@@ -11759,6 +12080,7 @@ export { routes };
 
     fn synthetic_endpoint(method: &str, path: &str) -> EndpointResult {
         EndpointResult {
+            view_module: false,
             candidate_id: format!("file-route:{}:0", method),
             line_number: 1,
             owner_node: FILE_BASED_ROUTE_OWNER.to_string(),
@@ -11808,6 +12130,7 @@ export { routes };
                 synthetic_endpoint("POST", "/users"), // new method, same path
             ],
             "app/users/route.ts",
+            false,
         );
 
         assert_eq!(emitted(&stats, ResolutionSource::FileBasedRoute), 2);
@@ -11895,6 +12218,7 @@ export { routes };
             &WholeUrlFallbackMap::new(),
             &[synthetic_endpoint("POST", "/w/:slug/projects/new")],
             "app/route.ts",
+            false,
         );
         assert_eq!(
             joined.endpoints.len(),
@@ -12010,6 +12334,7 @@ export { routes };
             &WholeUrlFallbackMap::new(),
             &[],
             "src/app.ts",
+            false,
             &HashMap::from([(100, ReceiverRole::Server)]),
         );
 
@@ -12039,6 +12364,7 @@ export { routes };
             &WholeUrlFallbackMap::new(),
             &[],
             "src/client.ts",
+            false,
             &HashMap::from([(100, ReceiverRole::Client)]),
         );
 
@@ -12064,6 +12390,7 @@ export { routes };
             &[],
             "src/thing.ts",
             // The bare-checkout case: no answer for this span.
+            false,
             &HashMap::new(),
         );
 
@@ -12097,6 +12424,7 @@ export { routes };
             &WholeUrlFallbackMap::new(),
             &[],
             "src/consumer.ts",
+            false,
             &HashMap::from([(100, ReceiverRole::Server)]),
         );
 
@@ -12142,6 +12470,7 @@ export { routes };
         whole_url_fallbacks: &WholeUrlFallbackMap,
         route_endpoints: &[EndpointResult],
         file_path: &str,
+        route_module_claimed: bool,
     ) -> (FileAnalysisResult, ProcessingStats) {
         emit_and_join_with_receivers(
             model,
@@ -12152,6 +12481,7 @@ export { routes };
             whole_url_fallbacks,
             route_endpoints,
             file_path,
+            route_module_claimed,
             &HashMap::new(),
         )
     }
@@ -12167,6 +12497,7 @@ export { routes };
         whole_url_fallbacks: &WholeUrlFallbackMap,
         route_endpoints: &[EndpointResult],
         file_path: &str,
+        route_module_claimed: bool,
         receiver_roles: &HashMap<u32, ReceiverRole>,
     ) -> (FileAnalysisResult, ProcessingStats) {
         let mut stats = ProcessingStats::default();
@@ -12192,6 +12523,7 @@ export { routes };
             candidate_map,
             &overrules,
             file_path,
+            route_module_claimed,
             &mut stats,
         );
         (result, stats)
@@ -12211,6 +12543,28 @@ export { routes };
             &WholeUrlFallbackMap::new(),
             &[],
             file_path,
+            false,
+        )
+    }
+
+    /// The same seam over a file a routing convention CLAIMED, with the routes
+    /// it derived already emitted (carrick#704).
+    fn emit_and_join_claimed_route_module(
+        model: FileAnalysisResult,
+        candidate_map: &HashMap<String, CandidateTarget>,
+        route_endpoints: &[EndpointResult],
+        file_path: &str,
+    ) -> (FileAnalysisResult, ProcessingStats) {
+        emit_and_join_with(
+            model,
+            candidate_map,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            route_endpoints,
+            file_path,
+            true,
         )
     }
 
@@ -12621,6 +12975,7 @@ export { routes };
             &WholeUrlFallbackMap::new(),
             &[],
             "src/tools.ts",
+            false,
         );
 
         assert_eq!(emitted(&stats, ResolutionSource::SameFileWrapper), 2);
@@ -12677,6 +13032,7 @@ export { routes };
             &WholeUrlFallbackMap::new(),
             &[],
             "src/tools.ts",
+            false,
         );
         assert_eq!(
             emitted(&stats, ResolutionSource::SameFileWrapper),
@@ -12729,6 +13085,7 @@ export { routes };
             &WholeUrlFallbackMap::new(),
             &[],
             "src/tools.ts",
+            false,
         );
 
         assert_eq!(emitted(&stats, ResolutionSource::SameFileWrapper), 2);
@@ -12772,6 +13129,7 @@ export { routes };
             &WholeUrlFallbackMap::new(),
             &[],
             "src/tools.ts",
+            false,
         );
 
         assert_eq!(
@@ -13334,6 +13692,7 @@ export { routes };
             &WholeUrlFallbackMap::new(),
             &[],
             "src/consumer.ts",
+            false,
         );
 
         assert_eq!(emitted(&stats, ResolutionSource::ImportedMember), 1);
@@ -13377,6 +13736,7 @@ export { routes };
             &WholeUrlFallbackMap::new(),
             &[],
             "src/consumer.ts",
+            false,
         );
 
         assert_eq!(stats.model_rows_joined, 1, "one call, one row");
@@ -13414,6 +13774,7 @@ export { routes };
             &WholeUrlFallbackMap::new(),
             &[],
             "src/routes.ts",
+            false,
         );
 
         assert!(result.data_calls.is_empty());
@@ -13442,6 +13803,7 @@ export { routes };
             &WholeUrlFallbackMap::new(),
             &[],
             "src/events.ts",
+            false,
         );
 
         assert_eq!(emitted(&stats, ResolutionSource::ImportedMember), 0);
@@ -13495,6 +13857,7 @@ export { routes };
             &paths,
             &[],
             "src/support.ts",
+            false,
         );
         let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
         let corrected = stats.model_rows_joined;
@@ -13549,6 +13912,7 @@ export { routes };
             &paths,
             &[],
             "src/support.ts",
+            false,
         );
         let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
         let corrected = stats.model_rows_joined;
@@ -13590,6 +13954,7 @@ export { routes };
             &paths,
             &[],
             "src/support.ts",
+            false,
         );
         let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
         let corrected = stats.model_rows_joined;
@@ -13636,6 +14001,7 @@ export { routes };
             &paths,
             &[],
             "src/support.ts",
+            false,
         );
         let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
         let corrected = stats.model_rows_joined;
@@ -13677,6 +14043,7 @@ export { routes };
             &paths,
             &[],
             "src/support.ts",
+            false,
         );
         let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
         let corrected = stats.model_rows_joined;
@@ -13716,6 +14083,7 @@ export { routes };
             &paths,
             &[],
             "src/support.ts",
+            false,
         );
         let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
         let corrected = stats.model_rows_joined;
@@ -13747,6 +14115,7 @@ export { routes };
             &paths,
             &[],
             "src/support.ts",
+            false,
         );
         let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
         let corrected = stats.model_rows_joined;
@@ -13779,6 +14148,7 @@ export { routes };
             &paths,
             &[],
             "src/support.ts",
+            false,
         );
         let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
         let corrected = stats.model_rows_joined;
@@ -13816,6 +14186,7 @@ export { routes };
             &paths,
             &[],
             "src/support.ts",
+            false,
         );
         let added = emitted(&stats, ResolutionSource::WholeUrlEnv);
         let corrected = stats.model_rows_joined;

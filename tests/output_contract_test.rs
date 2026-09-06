@@ -387,12 +387,12 @@ fn the_boundary_block_states_counts_totals_and_the_commit() {
     assert_eq!(json["calls_without_expected_type"]["total"], 1);
     assert_eq!(json["bare_checkout"], false);
 
-    // The counter carrick#704 fills is ABSENT, not zero: this scanner does not
-    // count it yet, which is not the same as counting none.
-    assert!(
-        json.get("model_endpoints_discarded_in_claimed_modules")
-            .is_none(),
-        "an uncounted thing is absent, never zero: {json:#?}"
+    // carrick#704 counts this now, so the block STATES it — a scan that
+    // discarded nothing says zero. Absence is reserved for a blob written by a
+    // scanner that did not count it at all.
+    assert_eq!(
+        json["model_endpoints_discarded_in_claimed_modules"], 0,
+        "a counted thing is stated, even at zero: {json:#?}"
     );
 
     // The SDK half is a cross-repo fact, folded in after the join.
