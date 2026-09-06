@@ -109,6 +109,7 @@ fn test_file_analysis_result_structures() {
 
     // Test EndpointResult structure
     let endpoint = EndpointResult {
+        view_module: false,
         candidate_id: "span:100-140".to_string(),
         line_number: 15,
         owner_node: "router".to_string(),
@@ -180,6 +181,7 @@ fn test_file_analysis_result_serialization() {
         }],
         endpoints: vec![
             EndpointResult {
+                view_module: false,
                 candidate_id: "span:300-340".to_string(),
                 line_number: 10,
                 owner_node: "router".to_string(),
@@ -199,6 +201,7 @@ fn test_file_analysis_result_serialization() {
                 resolution_source: None,
             },
             EndpointResult {
+                view_module: false,
                 candidate_id: "span:350-400".to_string(),
                 line_number: 15,
                 owner_node: "router".to_string(),
@@ -291,6 +294,7 @@ fn test_processing_stats_tracking() {
         deterministic_rows_emitted: Default::default(),
         model_rows_joined: 0,
         model_contradictions_discarded: 0,
+        model_endpoints_discarded_in_claimed_modules: 0,
         model_only_rows: 0,
         unemitted_literal_candidates: 0,
         receiver_classified_endpoints: 0,
@@ -396,6 +400,7 @@ fn test_cross_file_import_resolution() {
             mounts: vec![],
             endpoints: vec![
                 EndpointResult {
+                    view_module: false,
                     candidate_id: "span:470-500".to_string(),
                     line_number: 5,
                     owner_node: "router".to_string(),
@@ -415,6 +420,7 @@ fn test_cross_file_import_resolution() {
                     resolution_source: None,
                 },
                 EndpointResult {
+                    view_module: false,
                     candidate_id: "span:510-540".to_string(),
                     line_number: 10,
                     owner_node: "router".to_string(),
@@ -434,6 +440,7 @@ fn test_cross_file_import_resolution() {
                     resolution_source: None,
                 },
                 EndpointResult {
+                    view_module: false,
                     candidate_id: "span:550-580".to_string(),
                     line_number: 15,
                     owner_node: "router".to_string(),
@@ -467,6 +474,7 @@ fn test_cross_file_import_resolution() {
             mounts: vec![],
             endpoints: vec![
                 EndpointResult {
+                    view_module: false,
                     candidate_id: "span:590-620".to_string(),
                     line_number: 5,
                     owner_node: "router".to_string(),
@@ -486,6 +494,7 @@ fn test_cross_file_import_resolution() {
                     resolution_source: None,
                 },
                 EndpointResult {
+                    view_module: false,
                     candidate_id: "span:630-660".to_string(),
                     line_number: 10,
                     owner_node: "router".to_string(),
@@ -691,6 +700,7 @@ fn test_nested_router_mounts() {
             pubsub_operations: vec![],
             mounts: vec![],
             endpoints: vec![EndpointResult {
+                view_module: false,
                 candidate_id: "span:830-860".to_string(),
                 line_number: 5,
                 owner_node: "router".to_string(),
@@ -732,6 +742,7 @@ fn test_multiple_http_methods_on_same_path() {
         mounts: vec![],
         endpoints: vec![
             EndpointResult {
+                view_module: false,
                 candidate_id: "span:870-900".to_string(),
                 line_number: 5,
                 owner_node: "router".to_string(),
@@ -751,6 +762,7 @@ fn test_multiple_http_methods_on_same_path() {
                 resolution_source: None,
             },
             EndpointResult {
+                view_module: false,
                 candidate_id: "span:910-940".to_string(),
                 line_number: 10,
                 owner_node: "router".to_string(),
@@ -770,6 +782,7 @@ fn test_multiple_http_methods_on_same_path() {
                 resolution_source: None,
             },
             EndpointResult {
+                view_module: false,
                 candidate_id: "span:950-980".to_string(),
                 line_number: 15,
                 owner_node: "router".to_string(),
@@ -789,6 +802,7 @@ fn test_multiple_http_methods_on_same_path() {
                 resolution_source: None,
             },
             EndpointResult {
+                view_module: false,
                 candidate_id: "span:990-1020".to_string(),
                 line_number: 20,
                 owner_node: "router".to_string(),

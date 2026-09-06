@@ -204,6 +204,7 @@ fn analyzer_result(
     }
 
     let endpoint = EndpointResult {
+        view_module: false,
         candidate_id: format!("span:{}-{}", registration_span, span_end),
         line_number: REGISTRATION_LINE,
         owner_node: "server".to_string(),

@@ -590,6 +590,7 @@ pub fn mount_graph_to_api_details(
             service_name: None,
             provenance: endpoint.provenance,
             resolution_source: endpoint.resolution_source,
+            view_module: endpoint.view_module,
         })
         .collect();
 
@@ -611,6 +612,8 @@ pub fn mount_graph_to_api_details(
             // Provenance is producer-side metadata; calls keep the default.
             provenance: Default::default(),
             resolution_source: call.resolution_source,
+            // Likewise: a view module is a property of a route's module.
+            view_module: false,
         })
         .collect();
 
@@ -915,6 +918,7 @@ mod tests {
 
         let mut graph = MountGraph::new();
         graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
             method: "GET".to_string(),
             path: "/api/widgets".to_string(),
             full_path: "/api/widgets".to_string(),
@@ -960,6 +964,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: Some(ResolutionSource::FileBasedRoute),
+            view_module: false,
         });
         graph.data_calls.push(DataFetchingCall {
             method: "POST".to_string(),

@@ -687,6 +687,7 @@ mod tests {
 
     fn endpoint(method: &str, path: &str, file_line: &str) -> ApiEndpointDetails {
         ApiEndpointDetails {
+            view_module: false,
             owner: None,
             key: OperationKey::http(method, path.to_string()),
             params: vec![],
@@ -705,6 +706,7 @@ mod tests {
 
     fn pubsub_op(topic: &str, file_line: &str, repo: &str) -> ApiEndpointDetails {
         ApiEndpointDetails {
+            view_module: false,
             owner: None,
             key: OperationKey::pubsub(topic),
             params: vec![],
@@ -1082,6 +1084,7 @@ mod tests {
         let socket_key = OperationKey::socket("payment:settled", SocketDirection::ServerToClient);
         // A socket emitter lands on `calls` (consumer side).
         let call = ApiEndpointDetails {
+            view_module: false,
             owner: None,
             key: socket_key.clone(),
             params: vec![],
@@ -1163,6 +1166,7 @@ mod tests {
             // SAME canonical key, the collapse trap.
             endpoints: vec![endpoint("GET", "/orders/:param", "src/orders.ts:12")],
             calls: vec![ApiEndpointDetails {
+                view_module: false,
                 owner: None,
                 key: shared_key.clone(),
                 params: vec![],
@@ -1318,6 +1322,7 @@ mod tests {
     fn request_only_op_still_surfaces_request_definition() {
         let key = OperationKey::http("POST", "/billing/charge");
         let call = ApiEndpointDetails {
+            view_module: false,
             owner: None,
             key: key.clone(),
             params: vec![],
@@ -1387,6 +1392,7 @@ mod tests {
     fn fan_in_consumer_calls_join_their_own_site_records() {
         let key = OperationKey::pubsub("order.placed");
         let call_at = |file_line: &str| ApiEndpointDetails {
+            view_module: false,
             owner: None,
             key: key.clone(),
             params: vec![],

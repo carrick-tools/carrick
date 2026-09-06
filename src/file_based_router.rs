@@ -53,8 +53,10 @@ pub enum SegmentSource {
     ///
     /// When `segment_separator` is set, the filename is not one segment but a
     /// *flattened chain* of them: the stem is split on that separator and each
-    /// piece becomes its own path segment (`a.b.$id.ts` -> `/a/b/:id`). This is
-    /// how "flat route" schemes encode nesting without directories.
+    /// piece becomes its own path segment (`a.b.$id.ts` -> `/a/b/:id`). A
+    /// flattened chain may also be written as a DIRECTORY holding a terminal
+    /// module (`a.b.$id/route.ts`), so the separator applies to the directory
+    /// components too — the two spellings are the same route (carrick#701).
     FileName {
         extensions: Vec<String>,
         #[serde(default)]
@@ -98,6 +100,35 @@ pub struct RoutingConvention {
     /// endpoint.
     #[serde(default)]
     pub method_exports: BTreeMap<String, String>,
+    /// File stems that name the route module itself rather than a path
+    /// segment, and so contribute nothing to the path: `index` in a scheme
+    /// where a directory's index file IS the directory, and `route` in a
+    /// scheme that lets a flattened chain be written as a directory holding a
+    /// terminal module (`a.b.$id/route.ts`). Consulted only for
+    /// [`SegmentSource::FileName`], and only against the LAST piece of the
+    /// stem — a stem's earlier pieces are ordinary segments whatever they are
+    /// called.
+    ///
+    /// Plain data, like every other field here: a convention that spells its
+    /// index file differently states so, and one that has no such stem leaves
+    /// this empty. An externally supplied `FileName` convention that omits the
+    /// field therefore keeps every stem, including `index`; the built-ins
+    /// below all state theirs.
+    #[serde(default)]
+    pub terminal_stems: Vec<String>,
+    /// Filename prefixes that mark a module as framework-private — a file the
+    /// router never serves, whatever it exports (`_app`, `_document`,
+    /// `_middleware`). Matched against the whole FILENAME, not against
+    /// directory components and not against the pieces of a flattened stem.
+    ///
+    /// This is convention data because the same character means the opposite
+    /// thing in different schemes (carrick#702): in a flat-route scheme a
+    /// leading `_` marks a *pathless layout* segment, which nests the module
+    /// and contributes no path segment but leaves it very much routed, so
+    /// that scheme lists no private prefix at all and lets
+    /// [`RoutingConvention::transform_segment`] drop the segment instead.
+    #[serde(default)]
+    pub private_file_prefixes: Vec<String>,
 }
 
 /// A route successfully derived from a file's location.
@@ -232,6 +263,10 @@ impl RoutingConvention {
             group_close: ")".to_string(),
             method_source: MethodSource::ExportName,
             method_exports: BTreeMap::new(),
+            // A directory-chain source names its terminal file in
+            // `terminal_files` above; neither field below is consulted.
+            terminal_stems: Vec::new(),
+            private_file_prefixes: Vec::new(),
         }
     }
 
@@ -258,6 +293,10 @@ impl RoutingConvention {
             group_close: ")".to_string(),
             method_source: MethodSource::DefaultExport,
             method_exports: BTreeMap::new(),
+            terminal_stems: vec!["index".to_string()],
+            // `_app`, `_document`, `_middleware`: files the pages router
+            // reserves for itself and never routes.
+            private_file_prefixes: vec!["_".to_string()],
         }
     }
 
@@ -292,6 +331,9 @@ impl RoutingConvention {
             group_close: String::new(),
             method_source: MethodSource::ExportName,
             method_exports: BTreeMap::new(),
+            terminal_stems: vec!["index".to_string()],
+            // Astro excludes `_`-prefixed files from routing outright.
+            private_file_prefixes: vec!["_".to_string()],
         }
     }
 
@@ -301,16 +343,26 @@ impl RoutingConvention {
     /// route module exports a *read* handler and a *write* handler rather than
     /// one export per HTTP method (carrick#473).
     ///
-    /// Only `.ts`/`.js` files are treated as endpoints. That exclusion is the
-    /// precision wall of this convention: in these stacks `.tsx` route modules
-    /// are the UI page plane, which shares the same directory and the same
-    /// export names but is not an API surface.
+    /// Route-ness is the exported handler, never the extension (carrick#704).
+    /// A `.tsx` module in this tree is a route module that also renders a
+    /// component: the same read handler its `.ts` siblings export answers the
+    /// same HTTP GET, and rendering is an additional thing the module does,
+    /// not a reason the route is absent. A module that exports ONLY a
+    /// component derives nothing, because no export names a method. Where a
+    /// module does both, the row records
+    /// [`crate::agents::file_analyzer_agent::EndpointResult::view_module`], so
+    /// a reader can tell a page's own data endpoint from an API surface.
     pub fn flat_routes() -> Self {
         Self {
             name: "remix-flat".to_string(),
             root_globs: vec!["app/routes".to_string(), "src/app/routes".to_string()],
             segment_source: SegmentSource::FileName {
-                extensions: vec!["ts".to_string(), "js".to_string()],
+                extensions: vec![
+                    "ts".to_string(),
+                    "js".to_string(),
+                    "tsx".to_string(),
+                    "jsx".to_string(),
+                ],
                 segment_separator: Some(".".to_string()),
             },
             path_prefix: String::new(),
@@ -334,6 +386,14 @@ impl RoutingConvention {
                 // serve.
                 ("action".to_string(), "POST".to_string()),
             ]),
+            // The flattened chain may also be written as a directory holding a
+            // terminal module (`a.b.$id/route.ts`), and an index module names
+            // its parent.
+            terminal_stems: vec!["route".to_string(), "index".to_string()],
+            // Deliberately empty: here a leading `_` marks a pathless layout
+            // segment, not a private file. `transform_segment` drops the
+            // segment and the module stays routed (carrick#702).
+            private_file_prefixes: Vec::new(),
         }
     }
 
@@ -436,31 +496,55 @@ impl RoutingConvention {
                 extensions,
                 segment_separator,
             } => {
-                // Skip framework-private files like _app / _document / _middleware.
-                if file.starts_with('_') {
+                // Framework-private files (`_app`, `_document`,
+                // `_middleware`) are never routed — in the schemes that
+                // reserve the prefix. Which schemes those are is convention
+                // data, because a flat-route scheme spends the same character
+                // on a pathless layout segment (carrick#702).
+                if self
+                    .private_file_prefixes
+                    .iter()
+                    .any(|prefix| !prefix.is_empty() && file.starts_with(prefix.as_str()))
+                {
                     return None;
                 }
                 let (stem, ext) = file.rsplit_once('.')?;
                 if !extensions.iter().any(|e| e == ext) {
                     return None;
                 }
-                let mut segs: Vec<String> = dirs.iter().map(|s| s.to_string()).collect();
+                let separator = match segment_separator {
+                    Some(sep) if !sep.is_empty() => Some(sep.as_str()),
+                    _ => None,
+                };
+                let split = |value: &str| -> Vec<String> {
+                    match separator {
+                        Some(sep) => value
+                            .split(sep)
+                            .filter(|piece| !piece.is_empty())
+                            .map(|piece| piece.to_string())
+                            .collect(),
+                        None => vec![value.to_string()],
+                    }
+                };
+                // A flattened chain may be written as a directory too
+                // (`a.b.$id/route.ts`), so the directory components split on
+                // the same separator the stem does (carrick#701). Without a
+                // separator a directory is one segment, as it always was.
+                let mut segs: Vec<String> = dirs.iter().flat_map(|dir| split(dir)).collect();
                 // A flat scheme packs the whole chain into the stem; otherwise
                 // the stem is one segment.
-                let stem_segs: Vec<&str> = match segment_separator {
-                    Some(sep) if !sep.is_empty() => {
-                        stem.split(sep.as_str()).filter(|s| !s.is_empty()).collect()
-                    }
-                    _ => vec![stem],
-                };
-                // A trailing `index` collapses to its parent; every other piece
-                // is a path segment.
+                let stem_segs = split(stem);
+                // A terminal stem names the module rather than a segment
+                // (`index` collapsing onto its parent, `route` naming the
+                // module of a directory-form chain), so the last piece is
+                // dropped when the convention lists it. Earlier pieces are
+                // ordinary segments whatever they are called.
                 let last = stem_segs.len().saturating_sub(1);
-                for (i, seg) in stem_segs.iter().enumerate() {
-                    if i == last && *seg == "index" {
+                for (i, seg) in stem_segs.into_iter().enumerate() {
+                    if i == last && self.terminal_stems.contains(&seg) {
                         continue;
                     }
-                    segs.push((*seg).to_string());
+                    segs.push(seg);
                 }
                 Some(segs)
             }
@@ -855,19 +939,86 @@ mod tests {
     }
 
     #[test]
-    fn flat_routes_exclude_the_ui_page_plane() {
-        // `.tsx` route modules under the same directory are UI pages, not API
-        // endpoints — this exclusion is the convention's precision wall.
-        assert!(flat_route("app/routes/api.v1.widgets.$widgetId.tsx").is_none());
-        assert!(flat_route("app/routes/widgets.$widgetId.jsx").is_none());
+    fn flat_routes_claim_the_page_plane_extensions() {
+        // carrick#704 / R1b: the extension is not what makes a module a route.
+        // The convention claims the file and derives its path; whether any
+        // endpoint follows is decided by the module's exported handlers, which
+        // `derive_route` does not read.
+        assert_eq!(
+            flat_route("app/routes/api.v1.widgets.$widgetId.tsx")
+                .unwrap()
+                .path,
+            "/api/v1/widgets/:widgetId"
+        );
+        assert_eq!(
+            flat_route("app/routes/widgets.$widgetId.jsx").unwrap().path,
+            "/widgets/:widgetId"
+        );
     }
 
     #[test]
-    fn flat_routes_ignore_non_route_files_and_private_files() {
+    fn flat_routes_ignore_files_outside_the_route_root() {
         assert!(flat_route("app/services/widgets.server.ts").is_none());
         assert!(flat_route("app/lib/api.v1.widgets.ts").is_none());
-        // Leading-underscore *files* stay excluded (framework-private).
-        assert!(flat_route("app/routes/_app.widgets.ts").is_none());
+    }
+
+    #[test]
+    fn flat_routes_treat_a_leading_underscore_file_as_a_pathless_layout() {
+        // carrick#702: the global `_`-prefix skip belonged to a convention
+        // that reserves the prefix for its own files. Here it marks a pathless
+        // layout, so the module is routed and the segment is dropped.
+        assert_eq!(
+            flat_route("app/routes/_app.widgets.ts").unwrap().path,
+            "/widgets"
+        );
+        assert_eq!(
+            flat_route("app/routes/_app.widgets.$widgetId.ts")
+                .unwrap()
+                .path,
+            "/widgets/:widgetId"
+        );
+        // `_index` is the same rule reaching the last piece.
+        assert_eq!(
+            flat_route("app/routes/admin._index.tsx").unwrap().path,
+            "/admin"
+        );
+    }
+
+    #[test]
+    fn flat_routes_split_a_directory_form_chain() {
+        // carrick#701: the chain may be written as a directory holding a
+        // terminal module. The directory splits on the same separator the stem
+        // does, and the `route` stem names the module rather than a segment.
+        assert_eq!(
+            flat_route("app/routes/projects.v3.$projectRef.metrics/route.ts")
+                .unwrap()
+                .path,
+            "/projects/v3/:projectRef/metrics"
+        );
+        assert_eq!(
+            flat_route("app/routes/_app.orgs.$orgSlug.settings.general/route.tsx")
+                .unwrap()
+                .path,
+            "/orgs/:orgSlug/settings/general"
+        );
+        // The directory form and the single-file form are the same route.
+        assert_eq!(
+            flat_route("app/routes/projects.v3.$projectRef.metrics/route.ts")
+                .unwrap()
+                .path,
+            flat_route("app/routes/projects.v3.$projectRef.metrics.ts")
+                .unwrap()
+                .path
+        );
+    }
+
+    #[test]
+    fn a_private_file_prefix_still_excludes_where_a_convention_states_one() {
+        // The rule did not go away, it became convention data: the pages
+        // router still reserves the prefix for its own files.
+        assert!(route("pages/api/_middleware.ts").is_none());
+        assert!(route("pages/api/_lib.ts").is_none());
+        assert_eq!(route("pages/api/users.ts").unwrap().path, "/api/users");
     }
 
     #[test]

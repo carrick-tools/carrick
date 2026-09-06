@@ -27,7 +27,10 @@
 //! - `flat-routes-method-guard`: every row. The fixture carries no manifest, so
 //!   no routing convention is bootstrapped for an end-to-end scan of it and the
 //!   file-based pass is a no-op; its routes are pinned by
-//!   `file_based_routing_test` at the pass itself.
+//!   `file_based_routing_test` at the pass itself. `remix-flat` DOES carry a
+//!   manifest, so a scan of it bootstraps the convention and its route rows are
+//!   emitted end-to-end — which is what the claimed-module test at the bottom
+//!   of this file needs.
 //! - `e2e-scaffolding`: every row. Its one endpoint comes from the generated
 //!   mock reading the prompt, not from a deterministic source.
 //!
@@ -506,4 +509,64 @@ fn a_model_answer_at_a_file_route_keeps_the_convention_as_the_source() {
         joined["primary_type_symbol"], "Order",
         "and the type anchor it read"
     );
+}
+
+/// carrick#703 / #704: in a file a routing convention CLAIMED, the route set is
+/// the module's exported handlers and nothing else, so an endpoint the model
+/// states there and the convention does not is discarded.
+///
+/// The fixture's decoy module dispatches its write handler on a form
+/// discriminator (`z.literal("update-build-settings")`), which appears in its
+/// bytes exactly the way a route path would. The cassette answers at the
+/// module's one real candidate — its outbound `fetch` — with a route nothing
+/// registers, and with the call that IS there. The call surviving is the
+/// control: without it, "no invented endpoint" would also be what a file that
+/// never reached the analyzer looks like.
+#[test]
+fn a_model_route_invented_in_a_claimed_module_is_discarded() {
+    const DECOY_CALL_LINE: i64 = 19;
+    let dir = cassette("remix-flat", &|stem| match stem {
+        "settings.builds" => format!(
+            r#"{{"mounts":[],"endpoints":[{{"candidate_id":"@line:{line}",
+                "line_number":{line},"owner_node":"app","method":"POST",
+                "path":"/api/build-settings","handler_name":"action",
+                "pattern_matched":"router.post","payload_expression_text":null,
+                "payload_expression_line":null,"response_expression_text":null,
+                "response_expression_line":null,"primary_type_symbol":null,
+                "type_import_source":null}}],
+                "data_calls":[{}]}}"#,
+            contradiction(DECOY_CALL_LINE, "").replace("/invented/by/the/model", "/internal/audit"),
+            line = DECOY_CALL_LINE,
+        ),
+        _ => NOTHING.to_string(),
+    });
+    let projection = scan("remix-flat", dir.path());
+    let endpoints = rows(&projection, "endpoints");
+    let calls = rows(&projection, "calls");
+
+    assert!(
+        !endpoints
+            .iter()
+            .any(|row| row["path"] == "/api/build-settings"),
+        "a schema literal is not a route: {endpoints:#?}"
+    );
+    assert_none_at(
+        &endpoints,
+        "app/routes/settings.builds.tsx",
+        DECOY_CALL_LINE,
+    );
+
+    // The convention's own rows for that module survive.
+    for (method, path) in [("GET", "/settings/builds"), ("POST", "/settings/builds")] {
+        assert!(
+            endpoints.iter().any(|row| row["method"] == method
+                && row["path"] == path
+                && row["file"] == "app/routes/settings.builds.tsx"),
+            "the module's derived {method} {path} must survive: {endpoints:#?}"
+        );
+    }
+
+    // The control: the cassette WAS applied to this file.
+    let call = row_at(&calls, "app/routes/settings.builds.tsx", DECOY_CALL_LINE);
+    assert_eq!(call["path"], "/internal/audit");
 }
