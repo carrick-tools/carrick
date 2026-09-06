@@ -78,6 +78,25 @@ impl Workspace {
                 file.display()
             ));
         }
+
+        // Checked here, before anything is scanned. A scan records a repo by
+        // its directory name, so two repos sharing one name write to the same
+        // blob file — and by the time the second scan has finished, the first
+        // repo's answers are already gone. Refusing the workspace costs a
+        // message; refusing it later costs an index.
+        let mut seen: Vec<&str> = Vec::new();
+        for repo in &repos {
+            let Some(name) = repo.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if seen.contains(&name) {
+                return Err(format!(
+                    "two repos in {} are both named '{name}'. A scan records a repo by its                      directory name, so one would overwrite the other's index — rename one                      directory, or list only one of them",
+                    file.display()
+                ));
+            }
+            seen.push(name);
+        }
         Ok(Self {
             root,
             repos,
@@ -192,6 +211,17 @@ mod tests {
         let workspace = Workspace::load(dir.path()).unwrap();
         assert_eq!(workspace.repos.len(), 1);
         assert_eq!(workspace.missing, vec!["./gone".to_string()]);
+    }
+
+    #[test]
+    fn two_repos_with_one_directory_name_are_refused_before_anything_is_scanned() {
+        // The scan keys its output by directory name, so the second would
+        // overwrite the first — and by then the first repo's answers are gone.
+        let dir = workspace_with(r#"{"repos": ["./one/api", "./two/api"]}"#);
+        std::fs::create_dir_all(dir.path().join("one/api")).unwrap();
+        std::fs::create_dir_all(dir.path().join("two/api")).unwrap();
+        let err = Workspace::load(dir.path()).unwrap_err();
+        assert!(err.contains("both named 'api'"), "{err}");
     }
 
     #[test]

@@ -248,14 +248,10 @@ fn build(workspace: &Workspace, blobs_dir: &Path, join: &LocalJoin) -> Result<Lo
 
     let mut repos: Vec<IndexedRepo> = Vec::new();
     for repo_path in &workspace.repos {
+        // Two repos with one directory name are refused by `Workspace::load`,
+        // before any of them is scanned: by the time the second scan has
+        // finished, the first repo's blob is already gone.
         let name = repo_label(repo_path);
-        if repos.iter().any(|known| known.name == name) {
-            return Err(format!(
-                "two repos in this workspace are both named '{name}'. Local mode keys a scan's \
-                 output by directory name, so one would overwrite the other — rename one \
-                 directory, or list only one of them"
-            ));
-        }
         let services: Vec<IndexedService> = blobs
             .iter()
             .filter(|blob| blob.repo_name == name)

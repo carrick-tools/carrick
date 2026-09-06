@@ -120,6 +120,14 @@ is 0 on every local index, because a local index asks the model nothing.
 Locations come first and the boundary comes last: a reader that stops early has
 read the facts, and a reader that reads to the end knows what is missing.
 
+**A service with no `serviceName` is named differently here than in the hosted
+index.** Locally it takes the name of its repo's DIRECTORY on this machine,
+because that is what a scan with no CI environment records; in the cloud the
+same service is named after its GitHub repository. The two agree whenever the
+directory is the repo name, which is the ordinary case, and a workspace holding
+two repos with one directory name is refused before anything is scanned rather
+than silently overwritten.
+
 ### `items[]`
 
 | field | type | meaning |
