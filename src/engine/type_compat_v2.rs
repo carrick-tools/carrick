@@ -1139,7 +1139,7 @@ mod tests {
     use super::*;
     use crate::cloud_storage::{ManifestTypeState, TypeEvidence};
     use crate::services::type_sidecar::InferKind;
-    use crate::type_manifest::{build_manifest_type_alias, build_manifest_type_alias_with_call_id};
+    use crate::type_manifest::{build_manifest_type_alias, build_manifest_type_alias_with_site_id};
     use serial_test::serial;
 
     // -----------------------------------------------------------------
@@ -2373,13 +2373,13 @@ mod tests {
         let key = OperationKey::http("GET", "/orders/latest");
         let producer_alias =
             build_manifest_type_alias(&key, ManifestRole::Producer, ManifestTypeKind::Response);
-        let consumer_call_id = crate::type_manifest::build_call_site_id(
+        let consumer_call_id = crate::type_manifest::build_site_id(
             "src/billing-call.ts",
             5,
             &key,
             billing_repo.to_str().unwrap(),
         );
-        let consumer_alias = build_manifest_type_alias_with_call_id(
+        let consumer_alias = build_manifest_type_alias_with_site_id(
             &key,
             ManifestRole::Consumer,
             ManifestTypeKind::Response,
@@ -2546,13 +2546,13 @@ mod tests {
         let key = OperationKey::http("GET", "/notifications/:id");
         let producer_alias =
             build_manifest_type_alias(&key, ManifestRole::Producer, ManifestTypeKind::Response);
-        let consumer_call_id = crate::type_manifest::build_call_site_id(
+        let consumer_call_id = crate::type_manifest::build_site_id(
             "lib/api.ts",
             30,
             &key,
             dash_repo.to_str().unwrap(),
         );
-        let consumer_alias = build_manifest_type_alias_with_call_id(
+        let consumer_alias = build_manifest_type_alias_with_site_id(
             &key,
             ManifestRole::Consumer,
             ManifestTypeKind::Response,
@@ -2758,13 +2758,13 @@ mod tests {
         let key = OperationKey::http("GET", "/health");
         let producer_alias =
             build_manifest_type_alias(&key, ManifestRole::Producer, ManifestTypeKind::Response);
-        let consumer_call_id = crate::type_manifest::build_call_site_id(
+        let consumer_call_id = crate::type_manifest::build_site_id(
             "lib/api.ts",
             40,
             &key,
             dash_repo.to_str().unwrap(),
         );
-        let consumer_alias = build_manifest_type_alias_with_call_id(
+        let consumer_alias = build_manifest_type_alias_with_site_id(
             &key,
             ManifestRole::Consumer,
             ManifestTypeKind::Response,

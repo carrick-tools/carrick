@@ -23,7 +23,7 @@ use crate::services::{
 };
 use crate::signature_pass::populate_function_signatures;
 use crate::type_manifest::{
-    build_call_site_id, build_manifest_type_alias_with_call_id, is_http_method,
+    build_manifest_type_alias_with_site_id, build_site_id, is_http_method,
     normalize_manifest_method, parse_file_location,
 };
 use crate::url_normalizer::UrlNormalizer;
@@ -2078,11 +2078,11 @@ fn append_pubsub_manifest_entries(
             // consumer declarations then define that interface twice with
             // different bodies — one publisher's payload masks the other's,
             // yielding a spurious compat mismatch on whichever loses. Mirror the
-            // HTTP consumer path (`add_manifest_pair` + `build_call_site_id`).
+            // HTTP consumer path (`add_manifest_pair` + `build_site_id`).
             // Subscribers (producers) keep the plain alias: one definition per
             // topic per repo, exactly like an HTTP endpoint.
             let call_id = match role {
-                ManifestRole::Consumer => Some(build_call_site_id(path, line, &key, repo_root)),
+                ManifestRole::Consumer => Some(build_site_id(path, line, &key, repo_root)),
                 ManifestRole::Producer => None,
             };
             add_protocol_manifest_entry(
@@ -2462,7 +2462,7 @@ fn append_protocol_manifest_entries(
 /// `primary_type_symbol` is threaded straight onto the entry at creation — the
 /// op carries its anchor deterministically, unlike HTTP where it is stamped
 /// later from the LLM result. The `type_alias` MUST be computed with the same
-/// `build_manifest_type_alias_with_call_id(key, role, Response, call_id)` the
+/// `build_manifest_type_alias_with_site_id(key, role, Response, call_id)` the
 /// SymbolRequest side uses — same key, same role, same kind, AND the same
 /// `call_id` (see the `call_id` param) — or the enrich-join silently fails to
 /// flip `Unknown` → resolved.
@@ -2483,7 +2483,7 @@ fn add_protocol_manifest_entry(
 ) {
     let type_kind = ManifestTypeKind::Response;
     let type_alias =
-        crate::type_manifest::build_manifest_type_alias_with_call_id(key, role, type_kind, call_id);
+        crate::type_manifest::build_manifest_type_alias_with_site_id(key, role, type_kind, call_id);
     let infer_kind = infer_kind_for_manifest(role, type_kind);
     let evidence = crate::cloud_storage::TypeEvidence {
         file_path: file_path.to_string(),
@@ -3455,15 +3455,14 @@ fn build_type_manifest_entries(
     let normalizer = UrlNormalizer::new(config);
     let mut entries = Vec::new();
 
-    // Producers carry the plain key-only alias (no `_Call<id>` suffix — that
-    // disambiguator exists for consumer fan-in, and the SymbolRequest side
-    // computes the same key-only alias for producers). So two endpoints
-    // colliding on (method, path) — a mis-extracted duplicate route (#332) or a
-    // genuinely twice-declared one — would share one alias and one resolved
-    // definition would silently clobber the other in the bundle (#334). Keep
-    // the first declaration, drop the rest with a warning.
-    let mut seen_producer_keys: HashSet<OperationKey> = HashSet::new();
-
+    // A producer's alias carries its DECLARATION SITE, the way a consumer's
+    // carries its call site (carrick#718). Two endpoints on one (method, path)
+    // — a pathless layout and the page beneath it, an `index` module and its
+    // sibling, or a mis-extracted duplicate route (#332) — therefore get an
+    // entry each and resolve their own type. Until they did, they shared one
+    // alias, one of them was dropped here to stop the other's definition being
+    // clobbered in the bundle (#334), and which one survived depended on the
+    // order this loop saw them in.
     for endpoint in mount_graph.get_resolved_endpoints() {
         let method = normalize_manifest_method(&endpoint.method);
         if !is_http_method(&method) {
@@ -3485,15 +3484,7 @@ fn build_type_manifest_entries(
         let (file_path, line_number) = parse_file_location(&endpoint.file_location);
 
         let key = OperationKey::http(&method, path);
-        if !seen_producer_keys.insert(key.clone()) {
-            warn!(
-                "Duplicate producer endpoint {} at {} shares a manifest alias with an \
-                 earlier declaration; dropping this entry to avoid clobbering its \
-                 resolved type definition",
-                key, endpoint.file_location
-            );
-            continue;
-        }
+        let site_id = build_site_id(&file_path, line_number, &key, repo_root);
 
         add_manifest_pair(
             &mut entries,
@@ -3501,7 +3492,7 @@ fn build_type_manifest_entries(
             ManifestRole::Producer,
             &file_path,
             line_number,
-            None,
+            Some(&site_id),
         );
     }
 
@@ -3527,7 +3518,7 @@ fn build_type_manifest_entries(
             continue;
         }
         let key = OperationKey::http(&method, path);
-        let call_id = build_call_site_id(&file_path, line_number, &key, repo_root);
+        let call_id = build_site_id(&file_path, line_number, &key, repo_root);
 
         add_manifest_pair(
             &mut entries,
@@ -3680,7 +3671,7 @@ fn add_manifest_pair(
     role: ManifestRole,
     file_path: &str,
     line_number: u32,
-    call_id: Option<&str>,
+    site_id: Option<&str>,
 ) {
     // Producers for GET/HEAD/OPTIONS never have request bodies
     let skip_request = role == ManifestRole::Producer
@@ -3693,7 +3684,7 @@ fn add_manifest_pair(
         if skip_request && type_kind == ManifestTypeKind::Request {
             continue;
         }
-        let type_alias = build_manifest_type_alias_with_call_id(&key, role, type_kind, call_id);
+        let type_alias = build_manifest_type_alias_with_site_id(&key, role, type_kind, site_id);
         let infer_kind = infer_kind_for_manifest(role, type_kind);
         let evidence = crate::cloud_storage::TypeEvidence {
             file_path: file_path.to_string(),
@@ -5126,15 +5117,23 @@ mod tests {
         );
     }
 
-    /// Regression for #334: two producer endpoints colliding on (method, path)
-    /// share the plain key-only alias (producers carry no `_Call<id>` suffix),
-    /// so both manifest entries got the same `type_alias` and one resolved
-    /// definition silently clobbered the other in the bundle. Live trigger:
-    /// the file-analyzer emitted a root route as "/:id", duplicating the real
-    /// `GET /api/orders/:id` (#332). The first declaration wins; the duplicate
-    /// is dropped with a warning.
+    /// #334, as carrick#718 resolved it: two producer endpoints on one
+    /// (method, path) each get their own manifest entry, because a producer's
+    /// alias now carries its declaration site.
+    ///
+    /// #334 was the collision itself — both entries took the key-only alias and
+    /// one resolved definition clobbered the other in the bundle — and until
+    /// #718 it was answered by DROPPING the second endpoint here. That was a
+    /// reasonable answer while the live trigger was a mis-extracted duplicate
+    /// route (#332, a root route emitted as "/:id"), and the wrong one once
+    /// carrick#704 made two real producers at one path the normal shape of a
+    /// file-routed app: a pathless layout and the page beneath it both serve
+    /// the parent path, and reporting one's response type for both is a
+    /// statement about a contract the other does not offer. Which one survived
+    /// depended on the order this loop saw them in, so it read as a
+    /// determinism failure too.
     #[test]
-    fn test_duplicate_producer_keys_yield_one_manifest_entry() {
+    fn test_duplicate_producer_keys_each_get_their_own_manifest_entry() {
         let config = Config::default();
         let mk_endpoint = |file: &str| crate::mount_graph::ResolvedEndpoint {
             view_module: false,
@@ -5171,21 +5170,37 @@ mod tests {
             "same-key producers must not share a manifest alias: {:?}",
             producer_aliases
         );
-        // Lock in the drop-with-warning behavior: the duplicate is dropped,
-        // not disambiguated, so exactly one producer entry survives.
+        // Neither is dropped: both declarations are facts about the service.
         assert_eq!(
             producer_aliases.len(),
-            1,
-            "duplicate same-key producer must be dropped, leaving one entry: {:?}",
+            2,
+            "both same-key producers must keep an entry: {:?}",
             producer_aliases
         );
-        // The surviving entry is the first declaration.
-        let survivor = entries
+        let mut sites: Vec<u32> = entries
             .iter()
-            .find(|e| e.role == ManifestRole::Producer)
-            .expect("one producer entry expected");
-        assert_eq!(survivor.file_path, "src/routes/orders.ts");
-        assert_eq!(survivor.line_number, 11);
+            .filter(|e| e.role == ManifestRole::Producer)
+            .map(|e| e.line_number)
+            .collect();
+        sites.sort_unstable();
+        assert_eq!(
+            sites,
+            vec![11, 42],
+            "each entry keeps the line it was declared at"
+        );
+        // The site is what separates them, so it is in the alias itself: the
+        // two agree on everything up to the `_At<id>` suffix.
+        let common_prefix = producer_aliases[0]
+            .char_indices()
+            .zip(producer_aliases[1].chars())
+            .take_while(|((_, a), b)| a == b)
+            .count();
+        assert!(
+            producer_aliases[0][..common_prefix].contains("_Response")
+                || producer_aliases[0][..common_prefix].contains("_Request"),
+            "the aliases must differ only in the site suffix: {:?}",
+            producer_aliases
+        );
     }
 
     /// #379: a call-site-evidence entry never anchors Producer manifest
@@ -8105,7 +8120,7 @@ mod tests {
                 .get(&ManifestRole::Consumer)
                 .map(|s| s.as_str()),
             "publisher infer alias must byte-match the Consumer manifest alias \
-             (same build_call_site_id over the same path/line/key)"
+             (same build_site_id over the same path/line/key)"
         );
     }
 

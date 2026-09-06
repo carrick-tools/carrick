@@ -570,3 +570,74 @@ fn a_model_route_invented_in_a_claimed_module_is_discarded() {
     let call = row_at(&calls, "app/routes/settings.builds.tsx", DECOY_CALL_LINE);
     assert_eq!(call["path"], "/internal/audit");
 }
+
+/// carrick#718: two modules that serve one `(method, path)` each resolve their
+/// OWN response type.
+///
+/// A pathless layout and the page beneath it, or an `_index` module and its
+/// sibling, both serve the parent path — the normal shape of a file-routed app,
+/// and #704's E5 keeps both rows. Until the producer's manifest alias carried
+/// its declaration site, the two shared one alias, one of them was dropped from
+/// the manifest with a warning, and the survivor's type was reported for both.
+/// Which one survived depended on scan order, so this also read as a
+/// determinism failure.
+///
+/// The fixture's two colliding pairs return deliberately different shapes so a
+/// regression cannot pass by accident.
+#[test]
+fn two_producers_at_one_path_each_resolve_their_own_type() {
+    let endpoints = rows(&empty_scan("remix-flat"), "endpoints");
+
+    let row_at = |file: &str, method: &str, path: &str| -> serde_json::Value {
+        let found: Vec<&serde_json::Value> = endpoints
+            .iter()
+            .filter(|row| row["file"] == file && row["method"] == method && row["path"] == path)
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "expected one {method} {path} row in {file}: {endpoints:#?}"
+        );
+        found[0].clone()
+    };
+    let definition_at = |file: &str, path: &str| -> String {
+        row_at(file, "GET", path)["expanded_definition"]
+            .as_str()
+            .unwrap_or("<none>")
+            .to_string()
+    };
+
+    // The pathless layout returns `{}`; the page beneath it returns a title.
+    assert_eq!(
+        definition_at("app/routes/_app.widgets.$widgetId.ts", "/widgets/:widgetId"),
+        "{}"
+    );
+    assert_eq!(
+        definition_at("app/routes/widgets.$widgetId.tsx", "/widgets/:widgetId"),
+        "{ title: string; }"
+    );
+
+    // And the `index` module collapsing onto its sibling's path: an empty array
+    // against declared widgets.
+    assert_eq!(
+        definition_at("app/routes/api.v1.widgets.index.ts", "/api/v1/widgets"),
+        "never[]"
+    );
+    assert_eq!(
+        definition_at("app/routes/api.v1.widgets.ts", "/api/v1/widgets"),
+        "{ id: string; name: string; }[]"
+    );
+
+    // The aliases are what made the two collide, so they are asserted directly.
+    let alias_at = |file: &str, path: &str| -> String {
+        row_at(file, "GET", path)["type_alias"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_ne!(
+        alias_at("app/routes/_app.widgets.$widgetId.ts", "/widgets/:widgetId"),
+        alias_at("app/routes/widgets.$widgetId.tsx", "/widgets/:widgetId"),
+        "two producers at one path must not share a manifest alias"
+    );
+}
