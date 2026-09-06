@@ -1020,7 +1020,7 @@ fn format_unconsumed_section(orphaned: &[&Finding], has_baseline: bool) -> Strin
                 provenance,
                 // The local report lists view modules like any other
                 // unconsumed route for now; excluding them is the renderers'
-                // change (R1b, cloud#599 and carrick#721).
+                // change (R1b, cloud#599 and carrick#726).
                 ..
             } => {
                 // Mark mock/test-handler producers: an orphaned mock is
