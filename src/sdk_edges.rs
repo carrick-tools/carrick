@@ -170,7 +170,7 @@ impl SdkJoin {
             .collect()
     }
 
-    fn unresolved_for(&self, service_id: &str) -> Vec<SdkUnresolved> {
+    pub fn unresolved_for(&self, service_id: &str) -> Vec<SdkUnresolved> {
         self.unresolved
             .iter()
             .filter(|(consumer, _)| consumer == service_id)
@@ -658,6 +658,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         }
     }
 

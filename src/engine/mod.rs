@@ -531,6 +531,21 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         current_services_data.iter(),
     );
 
+    // Each local service's boundary (carrick#705), taken for the same reason:
+    // the blobs are about to move into the analyzer, and the SDK half of the
+    // boundary is only known once the join below has run. Keyed by the same
+    // `service_name ?? repo_name` id every other cross-repo surface uses.
+    let mut boundaries: Vec<(String, crate::boundary::ServiceBoundary)> = current_services_data
+        .iter()
+        .filter_map(|data| {
+            let id = data
+                .service_name
+                .clone()
+                .unwrap_or_else(|| data.repo_name.clone());
+            data.boundary.clone().map(|boundary| (id, boundary))
+        })
+        .collect();
+
     let sp = logging::spinner("Running cross-repo analysis...");
     let analyzer =
         match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar).await {
@@ -576,6 +591,9 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     }
     results.sdk_edges = sdk_join.edges().to_vec();
     results.sdk_unresolved = sdk_join.unresolved();
+    for (id, boundary) in &mut boundaries {
+        boundary.fold_sdk_unresolved(&sdk_join.unresolved_for(id));
+    }
 
     // An SDK-mediated break is a contract risk like any other, so it joins the
     // findings rather than living only in its own section (#525). The PR result
@@ -613,6 +631,18 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         // SDK edges ride along on the same terms as the verdicts: small,
         // consumer-side, canonical-keyed, and attached before the size guard.
         crate::sdk_edges::attach_sdk_edges(&mut payloads, &sdk_join);
+        // The boundary rides on the same terms, and is attached here rather
+        // than at scan time because its SDK half is a cross-repo fact
+        // (carrick#705).
+        for payload in &mut payloads {
+            let id = payload
+                .service_name
+                .clone()
+                .unwrap_or_else(|| payload.repo_name.clone());
+            if let Some((_, boundary)) = boundaries.iter().find(|(known, _)| *known == id) {
+                payload.boundary = Some(boundary.clone());
+            }
+        }
         // The size guard already ran once inside strip_ast_nodes, but the
         // verdicts were appended after it — re-apply so a payload that was
         // near the cap can't be re-inflated past it and 413 the upload
@@ -669,6 +699,10 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     let formatted = crate::formatter::FormattedOutput::new(results, topology, pr_delta);
     formatted.print();
 
+    // The last lines of the run: what it could not classify (carrick#705). An
+    // answer that ends without its boundary reads as a complete one.
+    print_boundaries(&boundaries);
+
     if let Some(payload) = pr_result
         && let Err(e) = storage.post_pr_result(&payload).await
     {
@@ -676,6 +710,23 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     }
 
     Ok(())
+}
+
+/// Print each local service's boundary as the closing lines of the run.
+///
+/// Stdout, beside the report it belongs to. The eval projection mode returns
+/// long before this, so the machine-readable output on stdout is never mixed
+/// with it.
+fn print_boundaries(boundaries: &[(String, crate::boundary::ServiceBoundary)]) {
+    if boundaries.is_empty() {
+        return;
+    }
+    println!("\nWhat this scan could not classify");
+    for (service, boundary) in boundaries {
+        for line in boundary.lines(service) {
+            println!("{line}");
+        }
+    }
 }
 
 /// Best-effort upload of the current run's log tail to S3.
@@ -1424,6 +1475,14 @@ async fn analyze_current_repo_incremental(
             // index data. `repo_path` is the canonicalized root the whole
             // function ran against, so the strip is exact.
             relativize_cloud_paths(&mut cloud_data, repo_path);
+
+            // Same last step as the full branch: the boundary is read off the
+            // finished payload once its paths are repo-relative (carrick#705).
+            cloud_data.boundary = Some(crate::boundary::ServiceBoundary::collect(
+                &cloud_data,
+                &analysis.stats,
+                repo_path,
+            ));
 
             return Ok(cloud_data);
         } else {
@@ -2820,6 +2879,7 @@ fn build_cloud_data_from_mount_graph(
         // "same commit, same scanner" (skip) from "same commit, newer
         // scanner" (re-index).
         scanner_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        boundary: None,
     }
 }
 
@@ -4054,6 +4114,17 @@ async fn analyze_current_repo(
     // a full scan and relative ones on an incremental scan.
     relativize_cloud_paths(&mut cloud_data, repo_path);
 
+    // 9. What this scan could not classify, stated beside what it did
+    // (carrick#705). Collected last, off the finished payload and the stats of
+    // the scan that filled it, so the reason lists quote the repo-relative
+    // paths the index carries. The SDK half is folded in after the cross-repo
+    // join, which is the only place a peer's surface is known.
+    cloud_data.boundary = Some(crate::boundary::ServiceBoundary::collect(
+        &cloud_data,
+        &analysis_result.stats,
+        repo_path,
+    ));
+
     Ok(cloud_data)
 }
 
@@ -4275,6 +4346,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         }
     }
 
@@ -4617,6 +4689,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         relativize_cloud_paths(&mut data, repo_path);
@@ -4750,6 +4823,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -4798,6 +4872,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         }];
 
         // Test Config merging
@@ -4884,6 +4959,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -5442,6 +5518,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         // Staging unavailable: the request body has to carry the payload, so
@@ -5495,6 +5572,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         let stripped = strip_ast_nodes(data, true);
@@ -5559,6 +5637,7 @@ mod tests {
                 sdk_edges: None,
                 sdk_unresolved: None,
                 scanner_version: None,
+                boundary: None,
             }
         }
 
@@ -5634,6 +5713,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         // Size the file_results filler so the payload lands just UNDER the 5MB
@@ -5820,6 +5900,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -5892,6 +5973,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         attach_external_call_candidates(&mut data, &fixture_str, &files, &service);
@@ -5997,6 +6079,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         attach_external_call_candidates(&mut data, &fixture_str, &files, &service);
@@ -6105,6 +6188,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -8707,6 +8791,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         }
     }
 }

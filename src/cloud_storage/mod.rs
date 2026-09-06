@@ -380,6 +380,15 @@ pub struct CloudRepoData {
     /// else's scan, not this scanner's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scanner_version: Option<String>,
+    /// What this service's scan could not classify (carrick#705): the files it
+    /// lost, the calls it could not place, the operations it has no type for,
+    /// each with its reasons capped and its exact total kept.
+    ///
+    /// Additive and optional. A blob written before the field existed carries
+    /// `None`, which reads as "this scanner does not state its boundary" — the
+    /// one thing it must never read as is "this scan had no boundary".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<crate::boundary::ServiceBoundary>,
 }
 
 /// Version of the v2 capture stub artifact schema. Bumped on incompatible
@@ -545,6 +554,9 @@ impl CloudRepoData {
             // "same commit, same scanner" (skip) from "same commit, newer
             // scanner" (re-index).
             scanner_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            // Collected once the blob is complete and its paths are relative;
+            // see `crate::boundary::ServiceBoundary::collect`.
+            boundary: None,
         }
     }
 }
@@ -1021,6 +1033,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         }
     }
 
