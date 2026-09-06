@@ -44,6 +44,7 @@ import type {
 
   ExtractionConfig,
   ExtractionRule,
+  TypeProvenance,
 } from './types.js';
 import { validateInferRequestItem } from './validators.js';
 import { expandTypeStructural } from './type-structural-expander.js';
@@ -406,6 +407,8 @@ export class TypeInferrer {
     const isExplicit = returnTypeNode !== undefined;
     let returnType = func.getReturnType();
     let typeString = typeText(returnType, func);
+    /** Reasons for any `any`/`unknown` this inference ends up publishing. */
+    let provenance: TypeProvenance[] | undefined;
 
     // Apply the agent-generated extraction config to the AWAITED type: an
     // async handler's return is Promise<Wrapper<T>>, whose symbol is
@@ -487,6 +490,20 @@ export class TypeInferrer {
             `${awaitedType.isAny() ? 'any' : 'unknown'} and no returned call stated ` +
             'its payload type in source; leaving it unresolved'
         );
+        // The honest `any` still reaches the manifest, so it carries the
+        // reason with it (carrick#376): the callee has no resolvable
+        // declaration and nothing in the handler says what it is, which is a
+        // different answer from "the type really is `any`" and points at a
+        // different fix (install the dependency, or annotate the payload).
+        provenance = [
+          {
+            path: '',
+            kind: awaitedType.isAny() ? 'any' : 'unknown',
+            reason: 'no_payload_evidence',
+            detail:
+              "the handler returns a call whose callee has no resolvable declaration, and nothing states what it is: no returned sibling call hands it a body plus a status, and no returned argument carries a 'satisfies'/'as' annotation",
+          },
+        ];
       }
       // No wrapper rule fired: the (awaited) return resolved to its own type.
       // A named object return (`async (): Promise<Payment> => …`) renders as the
@@ -515,7 +532,7 @@ export class TypeInferrer {
     }
 
     const anchor = this.unwrapArrayLevels(awaitedType);
-    return this.createInferredType(
+    const inferred = this.createInferredType(
       request,
       typeString,
       isExplicit,
@@ -524,6 +541,10 @@ export class TypeInferrer {
       this.primaryTypeSymbol(anchor.element),
       anchor.depth
     );
+    if (provenance && provenance.length > 0) {
+      inferred.any_provenance = provenance;
+    }
+    return inferred;
   }
 
   /**
@@ -2246,8 +2267,16 @@ export class TypeInferrer {
       anchorType: Type;
     }> = [];
 
-    for (const returned of this.returnedExpressions(func)) {
-      const payloadNode = this.responseHelperPayloadNode(returned, 0, statedOnly);
+    const returned = this.responseReturnedExpressions(func);
+    const serialisers = this.calleesProvenSerialiser(returned);
+
+    for (const expression of returned) {
+      const payloadNode = this.responseHelperPayloadNode(
+        expression,
+        0,
+        statedOnly,
+        serialisers
+      );
       if (!payloadNode) continue;
 
       // A `satisfies X` / `as X` on the argument states the contract in source:
@@ -2331,6 +2360,104 @@ export class TypeInferrer {
   }
 
   /**
+   * The expressions that can carry this handler's response: its own returned
+   * expressions, plus the returned expressions of any function the handler
+   * hands DIRECTLY to a returned call (carrick#707).
+   *
+   * `return settle(...).then(ok => serialise(body), err => serialise(problem))`
+   * returns a call whose result is whatever the callbacks produce, so the
+   * callbacks' returns are this handler's returns as surely as its own. That
+   * shape is how a result-type API, a promise combinator or a matcher is
+   * written, and on a bare checkout the callee resolves to nothing, so the
+   * outer call's type says nothing at all.
+   *
+   * Only ONE level, and only from the returned call's own arguments. A
+   * callback nested deeper is inside an expression the handler computes, not
+   * an expression it returns — `return rows.map(r => …)` returns a row list,
+   * and reading the callback there would report a row as the response. Each
+   * flattened expression still has to pass the payload rule below, which no
+   * bare object literal does.
+   */
+  private responseReturnedExpressions(func: FunctionLike): Node[] {
+    const own = this.returnedExpressions(func);
+    const flattened: Node[] = [...own];
+    for (const expression of own) {
+      const call = this.peelTransparentExpression(expression);
+      if (!Node.isCallExpression(call)) continue;
+      for (const arg of call.getArguments()) {
+        const callback = this.peelTransparentExpression(arg);
+        if (
+          !Node.isArrowFunction(callback) &&
+          !Node.isFunctionExpression(callback)
+        ) {
+          continue;
+        }
+        flattened.push(...this.returnedExpressions(callback));
+      }
+    }
+    return flattened;
+  }
+
+  /**
+   * The callees these returned expressions PROVE are response serialisers.
+   *
+   * A return type of `any` says the callee could not be resolved, not that it
+   * was a serialiser — the reason the unresolvable-callee case is otherwise
+   * restricted to arguments the source annotates. But a handler that writes
+   *
+   *     return f(problem, { status: 401 });
+   *     return f(payload);
+   *
+   * has stated what `f` is in its own source: a call that takes a body and,
+   * beside it, an HTTP status is a response serialiser, and nothing else is
+   * written that way. That is evidence the compiler does not need to resolve
+   * anything to see, so it survives the bare checkout CI scans, and it makes
+   * the second call's unannotated argument a payload rather than a guess.
+   *
+   * Three deliberate limits, each a negative test:
+   *  - only RETURNED expressions count. A handler may well call a logger with
+   *    `{ status: 500 }`; what it returns is what it serialises.
+   *  - the status-stating argument must sit at index >= 1. A status in FIRST
+   *    position is a field of the body (`{ status: 503, note }`), and reading
+   *    it as evidence would promote every callee that takes a status field.
+   *  - the evidence is per HANDLER, never cached across files. It says what
+   *    this handler does, and that is all it is used for.
+   *
+   * Callees are keyed by resolved symbol where one exists — an import alias
+   * resolves locally even when its module does not — and by callee text
+   * otherwise.
+   */
+  private calleesProvenSerialiser(returned: Node[]): Set<string> {
+    const proven = new Set<string>();
+    for (const expression of returned) {
+      const call = this.peelTransparentExpression(expression);
+      if (!Node.isCallExpression(call)) continue;
+      const args = call.getArguments().map((a) => this.peelTransparentExpression(a));
+      if (args.length < 2) continue;
+      const statesStatus = args
+        .slice(1)
+        .some((arg) => this.statedStatusCode(arg) !== undefined);
+      if (!statesStatus) continue;
+      const key = this.calleeIdentity(call);
+      if (key) proven.add(key);
+    }
+    return proven;
+  }
+
+  /**
+   * Stable identity for a call's callee within one file: its resolved symbol
+   * when the compiler has one, else the callee's source text.
+   */
+  private calleeIdentity(call: Node): string | undefined {
+    if (!Node.isCallExpression(call)) return undefined;
+    const callee = call.getExpression();
+    const symbol = callee.getSymbol();
+    if (symbol) return `symbol:${symbol.getFullyQualifiedName()}`;
+    const text = callee.getText().trim();
+    return text.length > 0 ? `text:${text}` : undefined;
+  }
+
+  /**
    * The payload argument of a returned response-helper call, or `undefined`.
    *
    * Walks the call's arguments in source order: the first whose type reads as a
@@ -2343,12 +2470,16 @@ export class TypeInferrer {
    * shape it returns when it succeeds.
    *
    * `statedOnly` narrows what counts as a payload to an argument the source
-   * annotates; see `recoverPayloadFromReturnStatements`.
+   * annotates; see `recoverPayloadFromReturnStatements`. It is lifted for a
+   * callee the handler's own returned calls PROVE is a serialiser
+   * (`calleesProvenSerialiser`): there the source has stated what the callee
+   * is, so its argument is the payload even unannotated.
    */
   private responseHelperPayloadNode(
     expression: Node,
     depth: number,
-    statedOnly: boolean
+    statedOnly: boolean,
+    serialisers: Set<string>
   ): Node | undefined {
     if (depth > RESPONSE_HELPER_MAX_DEPTH) return undefined;
 
@@ -2359,10 +2490,21 @@ export class TypeInferrer {
     if (args.length === 0) return undefined;
     if (args.slice(1).some((a) => this.statesErrorStatus(a))) return undefined;
 
+    const identity = this.calleeIdentity(call);
+    const proven = identity !== undefined && serialisers.has(identity);
+    const effectiveStatedOnly = statedOnly && !proven;
+
     for (const arg of args) {
       const candidate = this.unwrapJsonStringifyArg(arg);
-      if (this.nodeCarriesPayloadContract(candidate, statedOnly)) return candidate;
-      const nested = this.responseHelperPayloadNode(candidate, depth + 1, statedOnly);
+      if (this.nodeCarriesPayloadContract(candidate, effectiveStatedOnly)) {
+        return candidate;
+      }
+      const nested = this.responseHelperPayloadNode(
+        candidate,
+        depth + 1,
+        statedOnly,
+        serialisers
+      );
       if (nested) return nested;
     }
     return undefined;
@@ -2443,11 +2585,27 @@ export class TypeInferrer {
    * type check behind it catches `as const` and hoisted option objects.
    */
   private statesErrorStatus(node: Node): boolean {
-    const isErrorCode = (value: unknown): boolean =>
-      typeof value === 'number' && value >= 400;
+    const code = this.statedStatusCode(node);
+    return code !== undefined && code >= 400;
+  }
+
+  /**
+   * The HTTP status an argument states, or `undefined`.
+   *
+   * Read from the AST first: `{ status: 400 }` in an argument position widens
+   * to `{ status: number }`, so the literal only survives syntactically. The
+   * type check behind it catches `as const` and hoisted option objects. Only
+   * values in the HTTP range count — an arbitrary number named `status` on a
+   * domain object (`{ status: 2 }`) states nothing about transport.
+   */
+  private statedStatusCode(node: Node): number | undefined {
+    const asStatus = (value: unknown): number | undefined =>
+      typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599
+        ? value
+        : undefined;
 
     if (Node.isNumericLiteral(node)) {
-      return isErrorCode(node.getLiteralValue());
+      return asStatus(node.getLiteralValue());
     }
 
     if (Node.isObjectLiteralExpression(node)) {
@@ -2456,7 +2614,8 @@ export class TypeInferrer {
         if (property && Node.isPropertyAssignment(property)) {
           const initializer = property.getInitializer();
           if (initializer && Node.isNumericLiteral(initializer)) {
-            if (isErrorCode(initializer.getLiteralValue())) return true;
+            const code = asStatus(initializer.getLiteralValue());
+            if (code !== undefined) return code;
           }
         }
       }
@@ -2468,14 +2627,12 @@ export class TypeInferrer {
       const declaration = property?.getDeclarations()[0];
       if (!property || !declaration) continue;
       const propertyType = property.getTypeAtLocation(declaration);
-      if (
-        propertyType.isNumberLiteral() &&
-        isErrorCode(propertyType.getLiteralValue())
-      ) {
-        return true;
+      if (propertyType.isNumberLiteral()) {
+        const code = asStatus(propertyType.getLiteralValue());
+        if (code !== undefined) return code;
       }
     }
-    return false;
+    return undefined;
   }
 
   /**

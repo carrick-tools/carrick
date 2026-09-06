@@ -1035,6 +1035,21 @@ pub struct PairCheckOutcome {
     pub producer_service: String,
     #[allow(dead_code)]
     pub consumer_service: String,
+    /// Whether this verdict is a FACT about two known types (carrick#707,
+    /// R1d) — the field a structured finding's verdict state reads.
+    ///
+    /// `bucket` cannot answer that on its own. `compatible` means the probe
+    /// raised no assignment diagnostic, and a producer carrying `any` three
+    /// members down clears every whole-type gate and then reads compatible
+    /// against any counterparty shape at all. `resolved` is true only when the
+    /// bucket is `compatible`/`incompatible` AND the check's deep walk, run
+    /// after the pinned externals installed, found no `any`/`unknown` on
+    /// either side.
+    #[allow(dead_code)]
+    pub resolved: bool,
+    /// Why `resolved` is false. `None` exactly when it is true.
+    #[allow(dead_code)]
+    pub unresolved_reason: Option<String>,
 }
 
 impl CoreExtractor for Analyzer {}
@@ -5051,6 +5066,8 @@ mod tests {
             consumer_alias: "Consumer_Alias".to_string(),
             producer_service: "producer-svc".to_string(),
             consumer_service: "consumer-svc".to_string(),
+            resolved: false,
+            unresolved_reason: None,
         }
     }
 

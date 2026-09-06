@@ -23,6 +23,7 @@
 import type { CheckVerdict } from './api.js';
 import type { GateName, ProbePlan, Side } from './check-probe.js';
 import { scrubDiagnostic, type ScrubContext } from './check-scrub.js';
+import type { PairDeepFindings } from './check-deep.js';
 
 export interface RawDiagnostic {
   /** Workspace-relative, forward-slash file path (empty for global errors). */
@@ -92,6 +93,14 @@ export interface ClassifyInput {
    */
   poisonReason: (serviceName: string, alias: string) => string | undefined;
   scrubCtx: ScrubContext;
+  /**
+   * Deep any/unknown findings for this pair's two sides, walked in the
+   * assembled workspace after the pinned externals installed (carrick#707,
+   * R1d). `undefined` when the walk could not run or could not resolve the
+   * aliases -- absence of findings is not evidence of cleanliness, so the
+   * verdict is then not a fact either.
+   */
+  deepFindings?: PairDeepFindings;
 }
 
 /** Classify one pair into exactly one bucket, honouring the precedence order. */
@@ -99,6 +108,10 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
   const { plan, probeDiags, poisonReason, scrubCtx } = input;
   const codes = [...new Set(probeDiags.map((d) => d.code))].sort((a, b) => a - b);
   const base = { pair_id: plan.pairId, pair_key: plan.spec.pair_key, codes };
+  // Every branch below this point except the last two returns a verdict about
+  // a type nobody could read; each states that in one place rather than
+  // repeating the reasoning.
+  const notAFact = (reason: string) => ({ resolved: false as const, unresolved_reason: reason });
 
   // 1. Poison: a diagnostic in this pair's own alias closure (either side)
   //    makes the pair unverifiable, never "no probe error -> compatible". A
@@ -112,6 +125,7 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
         bucket: 'unverifiable',
         gate: `poison:${side}`,
         diagnostic: `the type stub for service '${endpoint.service_name}' does not typecheck (its own declarations carry diagnostics); compatibility cannot be verified.`,
+        ...notAFact(`the ${side} stub does not typecheck`),
       };
     }
   }
@@ -126,6 +140,7 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
       bucket: 'unverifiable',
       gate: `import:${side}`,
       diagnostic: `surface export '${alias}' for the ${side} is missing or renamed; compatibility cannot be verified.`,
+      ...notAFact(`the ${side} surface export is missing or renamed`),
     };
   }
 
@@ -143,6 +158,7 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
       bucket: 'gate_caught_baked_any',
       gate: `${side}:any`,
       diagnostic: `the ${side} type resolved to 'any' at check time; compatibility cannot be verified (a type inferred through a missing library bakes to any).`,
+      ...notAFact(`the ${side} type is 'any'`),
     };
   }
   const decayGate = gateDiags
@@ -155,6 +171,7 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
       bucket: 'unverifiable',
       gate: `${side}:${kind}`,
       diagnostic: `the ${side} type resolved to '${kind}' at check time; compatibility cannot be verified.`,
+      ...notAFact(`the ${side} type is '${kind}'`),
     };
   }
 
@@ -172,6 +189,7 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
         plan.sentEndpoint.alias,
         plan.expectedEndpoint.alias
       ),
+      ...factness(input),
     };
   }
 
@@ -189,9 +207,50 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
         plan.sentEndpoint.alias,
         plan.expectedEndpoint.alias
       ),
+      ...notAFact('the probe raised a diagnostic that is not an assignment mismatch'),
     };
   }
 
   // 6. No diagnostics -> compatible.
-  return { ...base, bucket: 'compatible' };
+  return { ...base, bucket: 'compatible', ...factness(input) };
+}
+
+/**
+ * Whether a compared pair is a FACT about two known types (carrick#707, R1d).
+ *
+ * The probe gates only rule out a WHOLLY top-typed side. A pair whose producer
+ * declares `{ id: string; meta: any }` clears every gate and then reads
+ * compatible against literally any counterparty `meta`, because `any` is
+ * bidirectionally assignable. That is not a compatibility result, and a reader
+ * who acts on it acts on nothing. So `resolved` additionally requires the deep
+ * walk to have RUN over both sides in the assembled workspace and come back
+ * empty. A walk that could not run leaves the verdict not-a-fact: absence of
+ * findings is not evidence.
+ */
+function factness(input: ClassifyInput): {
+  resolved: boolean;
+  unresolved_reason?: string;
+} {
+  const findings = input.deepFindings;
+  if (!findings) {
+    return {
+      resolved: false,
+      unresolved_reason:
+        'the type could not be walked for member-level any/unknown after install, so the comparison is not established as a fact',
+    };
+  }
+  for (const side of ['sent', 'expected'] as const) {
+    const first = findings[side][0];
+    if (!first) continue;
+    const label = side === 'sent' ? input.plan.direction.sent : input.plan.direction.expected;
+    const where = first.path === '' ? 'its root' : `'${first.path}'`;
+    return {
+      resolved: false,
+      unresolved_reason:
+        first.kind === 'budget_exhausted'
+          ? `the ${label} type is too deep or wide to verify at ${where}`
+          : `the ${label} type carries '${first.kind}' at ${where}, which every counterparty shape satisfies`,
+    };
+  }
+  return { resolved: true };
 }

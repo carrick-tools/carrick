@@ -126,6 +126,62 @@ export type CaptureAnchorRequest =
 
 export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal';
 
+/**
+ * Why a captured or inferred type carries `any`/`unknown` at a given position
+ * (carrick#376).
+ *
+ * A bare `any` in an endpoint's printed type answers nothing. Each of these is
+ * a cause the layer that produced the type actually KNOWS, recorded at the
+ * decision point rather than reconstructed later. When no cause is known the
+ * honest value is `not_recorded` — never a guess.
+ *
+ *  - `declared`: the captured declaration states `any`/`unknown` at this
+ *    position. Whatever put it there (an author annotation, or an emitter that
+ *    printed an unresolved value as `any`), it is baked into the emitted text
+ *    and no install re-resolves it.
+ *  - `budget_exhausted`: the subtree was too deep or wide to finish inside the
+ *    capture walk's budget, so it is reported unverified rather than clean.
+ *  - `no_payload_evidence`: a handler returned a call whose callee has no
+ *    resolvable declaration, and nothing in the handler states what the callee
+ *    is — no returned sibling call hands it a body plus a status, and the
+ *    argument carries no `satisfies`/`as` annotation. Reading its argument
+ *    anyway would publish a query or a parameter bag as the endpoint's
+ *    contract.
+ *  - `machinery_envelope`: the return resolved to transport (a
+ *    Response/Request-shaped envelope) and no payload was recoverable inside
+ *    it or from the handler's returned arguments.
+ *  - `not_recorded`: the position carries a top type and this layer has no
+ *    cause for it.
+ */
+export type TypeProvenanceReason =
+  | 'declared'
+  | 'budget_exhausted'
+  | 'no_payload_evidence'
+  | 'machinery_envelope'
+  | 'not_recorded';
+
+/**
+ * One `any`/`unknown` finding inside a captured or inferred type, with its
+ * position and its cause. Sorted by `path` wherever a list is emitted, so the
+ * output is byte-stable across runs (`scan-twice.sh`).
+ */
+export interface TypeProvenance {
+  /**
+   * Member path of the finding: `''` for the type's own root, otherwise the
+   * same notation the capture self-check walk uses — `sub`, `items<0>.meta`,
+   * `[index]`, `()` for a callable return.
+   */
+  path: string;
+  /** What sits at `path`. `budget_exhausted` means the walk stopped there. */
+  kind: 'any' | 'unknown' | 'budget_exhausted';
+  reason: TypeProvenanceReason;
+  /**
+   * One scrubbed sentence a reader can act on. Never an absolute path, never a
+   * scan internal — the same bar the check phase's `diagnostic` meets.
+   */
+  detail?: string;
+}
+
 export interface CaptureAliasRecord {
   alias: string;
   anchor_kind: CaptureAnchorRequest['kind'];
@@ -149,19 +205,23 @@ export interface CaptureAliasRecord {
    * checkout and is NOT a decay; the probe gates own the final verdict. */
   top_type_at_self_check: boolean;
   /**
-   * Set when the self-check found a disqualifier at DEPTH (member / element /
-   * index signature / type argument / callable return) with no failing
+   * Every disqualifier the self-check found at DEPTH (member / element / index
+   * signature / type argument / callable return) with no failing
    * pinned-external explanation: an author-baked `any`/`unknown`, or
    * `budget_exhausted` — a subtree too deep/wide to finish within the walk's
-   * budget (failed closed, not silently clean). The check phase pre-gates
-   * exactly these aliases: its whole-type probe gates cannot see member-level
-   * decay, and `any` at any depth lets an arbitrary counterparty read
-   * compatible. `any` routes to `gate_caught_baked_any`; `unknown` and
-   * `budget_exhausted` route to `unverifiable`.
+   * budget (failed closed, not silently clean).
+   *
+   * The FIRST entry is the one the check phase pre-gates on: its whole-type
+   * probe gates cannot see member-level decay, and `any` at any depth lets an
+   * arbitrary counterparty read compatible. `any` routes to
+   * `gate_caught_baked_any`; `unknown` and `budget_exhausted` route to
+   * `unverifiable`. The rest of the list exists so a reader of the published
+   * type can be told which fields are `any` and why (carrick#376) instead of
+   * being handed a shrug.
+   *
+   * Sorted by `path`; absent (not empty) when the walk found nothing.
    */
-  deep_top_type_kind?: 'any' | 'unknown' | 'budget_exhausted';
-  /** Member path of the deep find, e.g. `metadata` or `items<0>.meta`. */
-  deep_top_type_path?: string;
+  any_provenance?: TypeProvenance[];
 }
 
 /** Aggregate fidelity metric, emitted per capture (one service). */
@@ -290,6 +350,28 @@ export interface CheckVerdict {
   diagnostic?: string;
   /** TS diagnostic codes attributed to this pair's probe, sorted. */
   codes: number[];
+  /**
+   * Whether this verdict is a FACT about two known types (carrick#707, R1d).
+   *
+   * `bucket` alone does not say that. `compatible` is emitted whenever the
+   * probe raised no assignment diagnostic, and a pair can clear the whole-type
+   * gates while a member three levels down is `any` — which every counterparty
+   * shape satisfies, so "no diagnostic" there means "nothing was compared".
+   * A reader that treats such a verdict as evidence is reading a gap as a
+   * guarantee.
+   *
+   * `true` only when the bucket is `compatible` or `incompatible` AND a deep
+   * walk over BOTH sides of the probe, run in the assembled workspace with the
+   * pinned externals installed, found no `any`/`unknown`/`never` at any depth.
+   * Every other outcome — a gate, a missing import, poison, a pre-verdict, a
+   * deep finding — is `false` with `unresolved_reason` set.
+   *
+   * Deliberately independent of `bucket`: the bucket keeps its existing
+   * meaning and no verdict changes because of this field.
+   */
+  resolved: boolean;
+  /** Why `resolved` is false. Absent exactly when `resolved` is true. */
+  unresolved_reason?: string;
 }
 
 /**

@@ -121,6 +121,20 @@ pub struct TypeManifestEntry {
     /// symbol the resolved file does not itself declare. Never a guess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defined_in: Option<TypeHome>,
+    /// Why this entry's type carries `any`/`unknown`, and where (carrick#376).
+    ///
+    /// A bare `any` in a published endpoint type answers nothing: a reader
+    /// cannot tell "this field really is untyped" from "the dependency that
+    /// declares it was not installed when the scan ran". Each entry names the
+    /// member path and the cause the layer that produced it actually knew —
+    /// the inferrer's reason for declining to read a payload, and the capture
+    /// self-check's structural findings, merged and sorted by path.
+    ///
+    /// Empty when the type carries no top type, and empty is not a claim that
+    /// it does not: a layer with no cause records `not_recorded` rather than
+    /// guessing, and an entry with no type at all has nothing to walk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub any_provenance: Vec<crate::services::type_sidecar::TypeProvenance>,
 }
 
 /// The declaration site of a manifest entry's anchor symbol (carrick#649).
@@ -897,6 +911,7 @@ mod tests {
             expanded_definition: None,
             primary_type_symbol: None,
             defined_in: None,
+            any_provenance: Vec::new(),
         };
 
         let json: serde_json::Value = serde_json::to_value(&entry).unwrap();

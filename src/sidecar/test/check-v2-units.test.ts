@@ -135,6 +135,76 @@ describe('four-bucket classifier precedence', () => {
     assert.strictEqual(v.diagnostic, undefined);
   });
 
+  // carrick#707 R1d: `compatible` says the probe raised no diagnostic.
+  // Whether that is a FACT about two known types is a separate question the
+  // whole-type gates cannot answer, so it is a separate field.
+  describe('verdict fact-ness (resolved)', () => {
+    const clean = { sent: [], expected: [] };
+
+    it('a compared pair with a clean deep walk on both sides is a fact', () => {
+      const v = classifyPair({
+        plan,
+        probeDiags: [],
+        poisonReason: noPoison,
+        scrubCtx,
+        deepFindings: clean,
+      });
+      assert.strictEqual(v.bucket, 'compatible');
+      assert.strictEqual(v.resolved, true);
+      assert.strictEqual(v.unresolved_reason, undefined);
+    });
+
+    it('an incompatible verdict is equally a fact when both sides are known', () => {
+      const v = classifyPair({
+        plan,
+        probeDiags: [diag(plan.assignmentLine, 2741, "Property 'b' is missing in type 'X'.")],
+        poisonReason: noPoison,
+        scrubCtx,
+        deepFindings: clean,
+      });
+      assert.strictEqual(v.bucket, 'incompatible');
+      assert.strictEqual(v.resolved, true);
+    });
+
+    it('a member-level any leaves a compatible verdict not-a-fact', () => {
+      const v = classifyPair({
+        plan,
+        probeDiags: [],
+        poisonReason: noPoison,
+        scrubCtx,
+        deepFindings: {
+          sent: [{ path: 'meta.owner', kind: 'any', reason: 'declared' }],
+          expected: [],
+        },
+      });
+      // The bucket is deliberately unchanged: no verdict moves because of R1d.
+      assert.strictEqual(v.bucket, 'compatible');
+      assert.strictEqual(v.resolved, false);
+      assert.match(v.unresolved_reason!, /producer/);
+      assert.match(v.unresolved_reason!, /meta\.owner/);
+    });
+
+    it('a walk that could not run is not evidence of cleanliness', () => {
+      const v = classifyPair({ plan, probeDiags: [], poisonReason: noPoison, scrubCtx });
+      assert.strictEqual(v.bucket, 'compatible');
+      assert.strictEqual(v.resolved, false);
+      assert.match(v.unresolved_reason!, /not established as a fact/);
+    });
+
+    it('a gated verdict was never a fact and says why', () => {
+      const anyLine = [...plan.gateLines].find(([, n]) => n === 'sent:any')![0];
+      const v = classifyPair({
+        plan,
+        probeDiags: [diag(anyLine, 2344)],
+        poisonReason: noPoison,
+        scrubCtx,
+        deepFindings: clean,
+      });
+      assert.strictEqual(v.resolved, false);
+      assert.match(v.unresolved_reason!, /'any'/);
+    });
+  });
+
   it('assignment-class error -> incompatible with real text', () => {
     const v = classifyPair({
       plan,
