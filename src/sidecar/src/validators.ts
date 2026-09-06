@@ -24,6 +24,7 @@ export const InferKindSchema = z.enum([
   'request_body',
   'signature_return',
   'function_param',
+  'receiver_type',
 ]);
 
 // ============================================================================

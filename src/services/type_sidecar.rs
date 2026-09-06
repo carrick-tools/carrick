@@ -63,6 +63,10 @@ pub enum InferKind {
     SignatureReturn,
     /// Type of a single named parameter (explicit or contextually inferred)
     FunctionParam,
+    /// Type of the RECEIVER of a member call (carrick#695). Answers what `x`
+    /// is at an `x.verb("/lit", arg)` site, so the site's ROLE can be read off
+    /// the compiler rather than guessed from the call's shape.
+    ReceiverType,
 }
 
 /// A rule for unwrapping machinery/wrapper types to extract payload types.
@@ -545,6 +549,18 @@ pub struct InferredType {
     /// only party that knows where the tsc-witnessed payload type lives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_type_symbol_source: Option<String>,
+    /// carrick#695 (`receiver_type` only): the package whose declaration file
+    /// declares the resolved type, when that file sits under a `node_modules`
+    /// tree. `None` for a type the workspace declares itself AND for a type
+    /// that did not resolve — absence is never evidence of locality, which is
+    /// why the classifier reads `type_string` for a top type first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaring_package: Option<String>,
+    /// carrick#695 (`receiver_type` only): awaited return type of the member
+    /// invoked on the receiver. Recorded as evidence beside the receiver; it is
+    /// never a role on its own (an async helper taking a path would match).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_return_type: Option<String>,
 }
 
 /// Information about a symbol that failed to resolve
@@ -2024,6 +2040,8 @@ mod tests {
             primary_type_symbol: symbol.map(str::to_string),
             array_depth,
             primary_type_symbol_source: None,
+            declaring_package: None,
+            member_return_type: None,
         }
     }
 

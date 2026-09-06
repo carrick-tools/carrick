@@ -93,6 +93,10 @@ impl MultiAgentOrchestrator {
         graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
         graphql_consumer_hints: &crate::graphql::GraphqlConsumerHints,
         normalizer: &UrlNormalizer,
+        // The warm type sidecar for this service, when one is up: the
+        // deterministic layer asks it what a bare `x.verb("/lit", arg)` site's
+        // receiver is (carrick#695).
+        sidecar: Option<&crate::services::type_sidecar::TypeSidecar>,
     ) -> Result<MultiAgentAnalysisResult, Box<dyn std::error::Error>> {
         debug!("Starting AST-Gated File-Centric analysis...");
 
@@ -143,6 +147,7 @@ impl MultiAgentOrchestrator {
                 graphql_producer_hints,
                 graphql_consumer_hints,
                 normalizer,
+                sidecar,
             )
             .await?;
 

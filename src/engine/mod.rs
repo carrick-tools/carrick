@@ -43,7 +43,7 @@ use swc_common::{
 };
 use swc_ecma_visit::VisitWith;
 
-mod type_compat_v2;
+pub(crate) mod type_compat_v2;
 
 /// Current cache format version.
 ///
@@ -1311,6 +1311,7 @@ async fn analyze_current_repo_incremental(
                     &graphql_producer_hints,
                     &graphql_consumer_hints,
                     &normalizer,
+                    sidecar,
                 )
                 .await?;
 
@@ -3950,6 +3951,7 @@ async fn analyze_current_repo(
             &graphql_producer_hints,
             &graphql_consumer_hints,
             &normalizer,
+            sidecar,
         )
         .await?;
 
@@ -6557,6 +6559,8 @@ mod tests {
             primary_type_symbol: None,
             array_depth: None,
             primary_type_symbol_source: None,
+            declaring_package: None,
+            member_return_type: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -6586,6 +6590,8 @@ mod tests {
             primary_type_symbol: None,
             array_depth: None,
             primary_type_symbol_source: None,
+            declaring_package: None,
+            member_return_type: None,
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -6615,6 +6621,8 @@ mod tests {
             primary_type_symbol: Some(symbol.to_string()),
             array_depth: None,
             primary_type_symbol_source: None,
+            declaring_package: None,
+            member_return_type: None,
         }
     }
 

@@ -86,6 +86,76 @@ pub(crate) fn contains_disqualifying_top_type(text: &str) -> bool {
     false
 }
 
+// ===========================================================================
+// Scan time: receiver classification (carrick#695)
+// ===========================================================================
+
+/// What a call site's RECEIVER says the site is.
+///
+/// A member call whose first argument is a route-shaped literal —
+/// `x.verb("/lit", arg)` — states a path and a verb and no role: the same
+/// shape registers a route (`app.get`) and requests one (`client.get`). The
+/// ruling of 2026-09-05 forbids deciding that from the call's shape (a
+/// trailing function, an options bag and a verb name each belong equally to
+/// both). What decides it is what `x` IS, which the compiler knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReceiverRole {
+    /// An instance of a package the framework detection named a server
+    /// framework: the site registers a route.
+    Server,
+    /// An instance of a package the framework detection named a data fetcher:
+    /// the site issues a request.
+    Client,
+}
+
+/// Map a receiver type, as the sidecar resolved it, onto a role.
+///
+/// Three facts, in order, and no shape rule anywhere:
+///  1. a receiver whose printed type carries `any`/`unknown` resolved to
+///     nothing — on a checkout with no installed dependencies that is EVERY
+///     dependency-typed receiver — so it states no role;
+///  2. a receiver the workspace itself declares carries no package and stays
+///     the model's (a locally written wrapper class can be either side);
+///  3. otherwise the declaring package decides, against the lists the cloud's
+///     framework detection produced for this repo. A package in both lists
+///     (a full-stack package that ships a server and a fetcher) is ambiguous
+///     and states nothing.
+pub(crate) fn classify_receiver(
+    type_string: &str,
+    declaring_package: Option<&str>,
+    frameworks: &[String],
+    data_fetchers: &[String],
+) -> Option<ReceiverRole> {
+    if contains_disqualifying_top_type(type_string) {
+        return None;
+    }
+    let package = normalize_declaring_package(declaring_package?);
+    let names_it = |list: &[String]| {
+        list.iter()
+            .any(|entry| entry.trim().eq_ignore_ascii_case(&package))
+    };
+    match (names_it(frameworks), names_it(data_fetchers)) {
+        (true, false) => Some(ReceiverRole::Server),
+        (false, true) => Some(ReceiverRole::Client),
+        _ => None,
+    }
+}
+
+/// A DefinitelyTyped package names the package it types, and detection names
+/// the runtime dependency: `@types/express` declares `express`'s types, and
+/// `@types/hapi__hapi` declares `@hapi/hapi`'s. Unwrap that one convention so
+/// a receiver typed from a `@types/*` package is matched against the list the
+/// detection actually produced. Nothing else is rewritten.
+fn normalize_declaring_package(package: &str) -> String {
+    let Some(rest) = package.strip_prefix("@types/") else {
+        return package.to_string();
+    };
+    match rest.split_once("__") {
+        Some((scope, name)) => format!("@{scope}/{name}"),
+        None => rest.to_string(),
+    }
+}
+
 /// Replace the CONTENTS of string-literal types with nothing, keeping the
 /// quotes, so `{ kind: "any" }` cannot false-positive the token scan.
 fn strip_string_literal_contents(text: &str) -> String {
@@ -1072,6 +1142,108 @@ mod tests {
     use crate::type_manifest::{build_manifest_type_alias, build_manifest_type_alias_with_call_id};
     use serial_test::serial;
 
+    // -----------------------------------------------------------------
+    // carrick#695: receiver classification
+    // -----------------------------------------------------------------
+
+    fn lists() -> (Vec<String>, Vec<String>) {
+        (
+            vec!["server-fw".to_string(), "Express".to_string()],
+            vec!["http-fetcher".to_string(), "@scope/fetcher".to_string()],
+        )
+    }
+
+    #[test]
+    fn receiver_declared_by_a_detected_framework_is_a_server() {
+        let (frameworks, fetchers) = lists();
+        assert_eq!(
+            classify_receiver("Server", Some("server-fw"), &frameworks, &fetchers),
+            Some(ReceiverRole::Server)
+        );
+    }
+
+    #[test]
+    fn receiver_declared_by_a_detected_fetcher_is_a_client() {
+        let (frameworks, fetchers) = lists();
+        assert_eq!(
+            classify_receiver("HttpClient", Some("http-fetcher"), &frameworks, &fetchers),
+            Some(ReceiverRole::Client)
+        );
+        assert_eq!(
+            classify_receiver("Fetcher", Some("@scope/fetcher"), &frameworks, &fetchers),
+            Some(ReceiverRole::Client)
+        );
+    }
+
+    #[test]
+    fn detection_list_matching_ignores_case() {
+        let (frameworks, fetchers) = lists();
+        assert_eq!(
+            classify_receiver("Application", Some("express"), &frameworks, &fetchers),
+            Some(ReceiverRole::Server)
+        );
+    }
+
+    #[test]
+    fn a_definitely_typed_package_is_matched_as_the_package_it_types() {
+        let (frameworks, fetchers) = lists();
+        assert_eq!(
+            classify_receiver(
+                "Application",
+                Some("@types/express"),
+                &frameworks,
+                &fetchers
+            ),
+            Some(ReceiverRole::Server)
+        );
+        let scoped = (vec!["@hapi/hapi".to_string()], Vec::<String>::new());
+        assert_eq!(
+            classify_receiver("Server", Some("@types/hapi__hapi"), &scoped.0, &scoped.1),
+            Some(ReceiverRole::Server)
+        );
+    }
+
+    #[test]
+    fn an_unresolved_receiver_states_no_role() {
+        let (frameworks, fetchers) = lists();
+        // The bare-checkout shape: every dependency-typed receiver is `any`.
+        assert_eq!(
+            classify_receiver("any", Some("server-fw"), &frameworks, &fetchers),
+            None
+        );
+        assert_eq!(
+            classify_receiver("unknown", None, &frameworks, &fetchers),
+            None
+        );
+    }
+
+    #[test]
+    fn a_workspace_declared_receiver_stays_the_models() {
+        let (frameworks, fetchers) = lists();
+        assert_eq!(
+            classify_receiver("{ get(path: string): void; }", None, &frameworks, &fetchers),
+            None
+        );
+    }
+
+    #[test]
+    fn a_package_in_both_lists_is_ambiguous_and_states_nothing() {
+        let both = vec!["full-stack".to_string()];
+        assert_eq!(
+            classify_receiver("Thing", Some("full-stack"), &both, &both),
+            None
+        );
+    }
+
+    #[test]
+    fn a_package_in_neither_list_states_nothing() {
+        let (frameworks, fetchers) = lists();
+        assert_eq!(
+            classify_receiver("Redis", Some("ioredis"), &frameworks, &fetchers),
+            None
+        );
+    }
+
     fn entry(
         key: OperationKey,
         role: ManifestRole,
@@ -1265,6 +1437,8 @@ mod tests {
             primary_type_symbol: primary_type_symbol.map(str::to_string),
             array_depth,
             primary_type_symbol_source: None,
+            declaring_package: None,
+            member_return_type: None,
         }
     }
 
@@ -1546,6 +1720,8 @@ mod tests {
             primary_type_symbol: None,
             array_depth: None,
             primary_type_symbol_source: None,
+            declaring_package: None,
+            member_return_type: None,
         };
 
         let infer = vec![
@@ -1670,6 +1846,8 @@ mod tests {
             primary_type_symbol: None,
             array_depth: None,
             primary_type_symbol_source: None,
+            declaring_package: None,
+            member_return_type: None,
         };
 
         let infer = vec![infer_item("Pub_Resolved"), infer_item("Pub_Unresolved")];
@@ -1931,6 +2109,8 @@ mod tests {
             primary_type_symbol: None,
             array_depth: None,
             primary_type_symbol_source: None,
+            declaring_package: None,
+            member_return_type: None,
         };
 
         let explicit = vec![

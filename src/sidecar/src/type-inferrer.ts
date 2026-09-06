@@ -330,6 +330,8 @@ export class TypeInferrer {
         return this.inferSignatureReturn(sourceFile, request);
       case 'function_param':
         return this.inferFunctionParam(sourceFile, request);
+      case 'receiver_type':
+        return this.inferReceiverType(sourceFile, request);
       default:
         this.logError(`Unknown infer kind: ${request.infer_kind}`);
         return null;
@@ -2587,6 +2589,118 @@ export class TypeInferrer {
    * 2. If expression_text present → findNodeByText (Gemini text + line)
    * 3. Otherwise → undefined
    */
+  /**
+   * carrick#695: the type of the RECEIVER of a member call, plus the two facts
+   * a role decision needs about it — which package declares that type, and what
+   * the invoked member returns.
+   *
+   * Nothing here classifies. A member call with a route-shaped literal
+   * (`x.verb("/lit", arg)`) is a route registration or a request depending on
+   * what `x` IS, and that is the only question this answers. The Rust driver
+   * maps the declaring package onto the detected framework / data-fetcher
+   * lists; the compiler layer names no library and applies no shape rule.
+   *
+   * A receiver that does not resolve reports its top type (`any`) with no
+   * package, so the caller can tell "unresolved" from "declared here": on a
+   * checkout with no installed dependencies EVERY dependency-typed receiver is
+   * `any`, and treating that as workspace-owned would invent a role.
+   */
+  private inferReceiverType(
+    sourceFile: SourceFile,
+    request: InferRequestItem
+  ): InferredType | null {
+    const call = this.resolveTargetCallExpression(sourceFile, request);
+    if (!call) {
+      return null;
+    }
+
+    const callee = call.getExpression();
+    // The receiver exists only for a MEMBER call. A bare `fn("/lit", arg)`
+    // has no receiver to classify and is not this kind's question.
+    if (!Node.isPropertyAccessExpression(callee) && !Node.isElementAccessExpression(callee)) {
+      return null;
+    }
+
+    const receiver = callee.getExpression();
+    const receiverType = receiver.getType();
+    const typeString = this.namedTypeLabel(receiverType, receiver);
+
+    return {
+      ...this.createInferredType(
+        request,
+        typeString,
+        false,
+        this.getNodeLocation(receiver)
+      ),
+      declaring_package: this.declaringPackageOf(receiverType),
+      member_return_type: this.memberReturnTypeOf(call, receiver),
+    };
+  }
+
+  /**
+   * The npm package name that declares a type, read off its declaration's file
+   * path. `undefined` when the type has no declaration to read (a top type, a
+   * primitive, an anonymous object literal) or when its declaration is not
+   * under a `node_modules` tree — a type the workspace itself declares.
+   *
+   * The LAST `node_modules` segment wins, which is what a nested or
+   * content-addressed store (`node_modules/.store/pkg@1.0.0/node_modules/pkg`)
+   * requires. Scoped names keep both segments.
+   */
+  private declaringPackageOf(type: Type): string | undefined {
+    const symbol = type.getSymbol() ?? type.getAliasSymbol();
+    const declaration = symbol?.getDeclarations()?.[0];
+    if (!declaration) {
+      return undefined;
+    }
+    const filePath = declaration.getSourceFile().getFilePath().replace(/\\/g, '/');
+    const marker = '/node_modules/';
+    const index = filePath.lastIndexOf(marker);
+    if (index < 0) {
+      return undefined;
+    }
+    const rest = filePath.slice(index + marker.length).split('/');
+    if (rest.length === 0 || rest[0].length === 0) {
+      return undefined;
+    }
+    if (rest[0].startsWith('@')) {
+      return rest.length > 1 ? `${rest[0]}/${rest[1]}` : undefined;
+    }
+    return rest[0];
+  }
+
+  /**
+   * The awaited return type of the member invoked on the receiver. Reported as
+   * a fact next to the receiver; a caller that classified on it alone would be
+   * back to a shape rule (any async helper taking a path would match).
+   */
+  private memberReturnTypeOf(call: CallExpression, receiver: Node): string | undefined {
+    const signature = call.getReturnType();
+    if (!signature) {
+      return undefined;
+    }
+    const awaited = this.unwrapPromiseType(signature);
+    return this.namedTypeLabel(awaited, receiver);
+  }
+
+  /**
+   * A type's own name when it has one, else its printed form.
+   *
+   * The printed form of a type whose declaring module the use site does not
+   * import is `import("/abs/path/to/module").Name` — an absolute path that
+   * would be persisted and rendered. The name alone is both stable and the
+   * part a reader (or a package-list lookup) uses; anonymous types, top types
+   * and primitives have no name and keep their printed text.
+   */
+  private namedTypeLabel(type: Type, enclosingNode: Node): string {
+    const symbol = type.getSymbol() ?? type.getAliasSymbol();
+    const name = symbol?.getName();
+    if (name && !name.startsWith('__') && name !== 'unknown') {
+      return name;
+    }
+    return typeText(type, enclosingNode);
+  }
+
   private resolveTargetNode(
     sourceFile: SourceFile,
     request: InferRequestItem
@@ -3827,6 +3941,8 @@ export class TypeInferrer {
     switch (inferKind) {
       case 'function_return':
         return 'Return';
+      case 'receiver_type':
+        return 'Receiver';
       case 'response_body':
         return 'Response';
       case 'call_result':
