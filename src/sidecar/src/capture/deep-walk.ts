@@ -131,7 +131,19 @@ export function findDisqualifyingTopTypes(
     // walk had already collected.
     if (depth > MAX_DEPTH || visited > MAX_VISITED) {
       exhausted = true;
-      found.unshift({ kind: 'budget_exhausted', path: path === '' ? '<root>' : path });
+      const sentinel: DeepTopType = {
+        kind: 'budget_exhausted',
+        path: path === '' ? '<root>' : path,
+      };
+      // Head position decides the check phase's pre-gate, so it must be
+      // whatever the stop-at-first walk would have returned. That walk could
+      // only exhaust its budget having found NOTHING — it returned the moment
+      // it found something. So the sentinel leads only when nothing was found;
+      // otherwise the first real finding keeps the head and the pre-gate is
+      // byte-identical to before. (Putting the sentinel first regardless would
+      // turn a `gate_caught_baked_any` into an `unverifiable`: same downstream
+      // reading, different verdict, and this change moves no verdicts.)
+      found.push(sentinel);
       return;
     }
     seen.add(t);
@@ -209,16 +221,21 @@ export function findDisqualifyingTopTypes(
   };
 
   walk(root, '', 0);
-  // Property order is the checker's, which is declaration order and therefore
-  // stable per input — but a stated sort is what `scan-twice.sh` byte-identity
-  // rests on, so state it. The budget sentinel keeps its head position: it is
-  // about the whole type, not about a member path.
+  // The HEAD is what the check phase pre-gates on, so it must be exactly what
+  // the stop-at-first walk this replaces would have returned: the first
+  // finding in walk order. Findings are appended in that order, so `found[0]`
+  // already is it — including the budget sentinel, which can only lead when
+  // nothing was found before the budget ran out (the old walk returned the
+  // moment it found anything, so it could only exhaust having found nothing).
+  //
+  // The TAIL is provenance for a reader, and is sorted by member path. Walk
+  // order is the checker's declaration order and stable per input, but
+  // `scan-twice.sh` byte-identity rests on this list, so the order is stated
+  // rather than inherited.
   const [head, ...rest] = found;
-  if (head?.kind === 'budget_exhausted') {
-    rest.sort((a, b) => a.path.localeCompare(b.path));
-    return [head, ...rest];
-  }
-  return [...found].sort((a, b) => a.path.localeCompare(b.path));
+  if (head === undefined) return [];
+  rest.sort((a, b) => a.path.localeCompare(b.path));
+  return [head, ...rest];
 }
 
 /**

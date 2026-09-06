@@ -116,6 +116,28 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
     assert.strictEqual(v.diagnostic, undefined);
   });
 
+  // carrick#707 R1d. The unit tests drive the classifier directly; this is the
+  // only place the walk runs where the real check runs it — a pnpm-isolated
+  // workspace whose surface packages resolve through node_modules symlinks and
+  // CHECKER_TSCONFIG, not a hand-written `paths` map. If it silently fails to
+  // resolve the aliases there, every verdict ships `resolved: false` and the
+  // field is dead while every test still passes.
+  it('a compared pair with two fully known types is a fact', () => {
+    const v = verdicts.get('compatible')!;
+    assert.strictEqual(
+      v.resolved,
+      true,
+      `the walk must run in the real workspace; got: ${v.unresolved_reason}`
+    );
+    assert.strictEqual(v.unresolved_reason, undefined);
+  });
+
+  it('a gated verdict is never a fact, and says which side', () => {
+    const v = verdicts.get('bakedany')!;
+    assert.strictEqual(v.resolved, false);
+    assert.match(v.unresolved_reason!, /producer/);
+  });
+
   it('bucket 2 — incompatible: real TS text is the report', () => {
     const v = verdicts.get('incompatible')!;
     assert.strictEqual(v.bucket, 'incompatible');

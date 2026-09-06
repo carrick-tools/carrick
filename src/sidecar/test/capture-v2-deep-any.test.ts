@@ -266,6 +266,19 @@ describe('check phase: capture-recorded deep decay is never read as compatible',
     // A fully-resolved pair still goes through the real probe path.
     const cleanVerdict = byKey.get('clean-pair')!;
     assert.strictEqual(cleanVerdict.bucket, 'compatible', JSON.stringify(cleanVerdict));
+
+    // carrick#707 R1d: a pair pre-gated by a member-level decay was never a
+    // comparison, and now says so in its own field with the member path — the
+    // half a bucket cannot carry. The clean pair, compared for real in the
+    // assembled workspace, is a fact.
+    assert.strictEqual(anyVerdict.resolved, false);
+    assert.match(anyVerdict.unresolved_reason ?? '', /metadata/);
+    assert.strictEqual(unknownVerdict.resolved, false);
+    assert.strictEqual(
+      cleanVerdict.resolved,
+      true,
+      `expected a fact, got: ${cleanVerdict.unresolved_reason}`
+    );
   });
 });
 
