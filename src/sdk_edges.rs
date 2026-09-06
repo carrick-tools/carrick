@@ -627,7 +627,6 @@ mod tests {
 
     fn blob(repo_name: &str) -> CloudRepoData {
         CloudRepoData {
-            boundary: None,
             repo_name: repo_name.to_string(),
             service_name: None,
             endpoints: vec![],
@@ -659,6 +658,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         }
     }
 

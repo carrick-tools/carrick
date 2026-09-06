@@ -703,7 +703,6 @@ impl CloudStorage for AwsStorage {
             } else {
                 warn!("No metadata found for repo: {}", adjacent.repo);
                 let repo_data = CloudRepoData {
-                    boundary: None,
                     repo_name: adjacent.repo.clone(),
                     service_name: None,
                     endpoints: Vec::new(),
@@ -735,6 +734,7 @@ impl CloudStorage for AwsStorage {
                     sdk_edges: None,
                     sdk_unresolved: None,
                     scanner_version: None,
+                    boundary: None,
                 };
                 repo_s3_urls.insert(adjacent.repo.clone(), adjacent.s3_url);
                 all_repo_data.push(repo_data);

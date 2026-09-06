@@ -2845,7 +2845,6 @@ fn build_cloud_data_from_mount_graph(
     );
 
     CloudRepoData {
-        boundary: None,
         repo_name: repo_name.to_string(),
         service_name,
         endpoints,
@@ -2880,6 +2879,7 @@ fn build_cloud_data_from_mount_graph(
         // "same commit, same scanner" (skip) from "same commit, newer
         // scanner" (re-index).
         scanner_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        boundary: None,
     }
 }
 
@@ -4315,7 +4315,6 @@ mod tests {
     /// A blank service payload, named, with nothing resolved.
     fn service_data(repo: &str, service: Option<&str>) -> CloudRepoData {
         CloudRepoData {
-            boundary: None,
             repo_name: repo.to_string(),
             service_name: service.map(str::to_string),
             endpoints: vec![],
@@ -4347,6 +4346,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         }
     }
 
@@ -4610,7 +4610,6 @@ mod tests {
         );
 
         let mut data = CloudRepoData {
-            boundary: None,
             repo_name: "acme-app".to_string(),
             service_name: None,
             endpoints: vec![op("src/routes/orders.ts:18")],
@@ -4690,6 +4689,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         relativize_cloud_paths(&mut data, repo_path);
@@ -4792,7 +4792,6 @@ mod tests {
         };
 
         let test_data = CloudRepoData {
-            boundary: None,
             repo_name: "express-single".to_string(),
             service_name: None,
             endpoints: vec![endpoint.clone()],
@@ -4824,6 +4823,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -4841,7 +4841,6 @@ mod tests {
         use crate::packages::Packages;
 
         let test_data = vec![CloudRepoData {
-            boundary: None,
             repo_name: "express-single".to_string(),
             service_name: None,
             endpoints: vec![],
@@ -4873,6 +4872,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         }];
 
         // Test Config merging
@@ -4928,7 +4928,6 @@ mod tests {
         };
 
         let test_data = vec![CloudRepoData {
-            boundary: None,
             repo_name: "express-single".to_string(),
             service_name: None,
             endpoints: vec![endpoint.clone()],
@@ -4960,6 +4959,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -5487,7 +5487,6 @@ mod tests {
         }
 
         let data = CloudRepoData {
-            boundary: None,
             repo_name: "express-single".to_string(),
             service_name: None,
             endpoints: vec![],
@@ -5519,6 +5518,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         // Staging unavailable: the request body has to carry the payload, so
@@ -5541,7 +5541,6 @@ mod tests {
         );
 
         let data = CloudRepoData {
-            boundary: None,
             repo_name: "express-single".to_string(),
             service_name: None,
             endpoints: vec![],
@@ -5573,6 +5572,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         let stripped = strip_ast_nodes(data, true);
@@ -5601,7 +5601,6 @@ mod tests {
             let mut file_results = HashMap::new();
             file_results.insert("src/big.ts".to_string(), result);
             CloudRepoData {
-                boundary: None,
                 repo_name: "orders-svc".to_string(),
                 service_name: None,
                 endpoints: vec![],
@@ -5638,6 +5637,7 @@ mod tests {
                 sdk_edges: None,
                 sdk_unresolved: None,
                 scanner_version: None,
+                boundary: None,
             }
         }
 
@@ -5682,7 +5682,6 @@ mod tests {
         const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024; // mirrors the guard
 
         let base = CloudRepoData {
-            boundary: None,
             repo_name: "consumer-svc".to_string(),
             service_name: None,
             endpoints: vec![],
@@ -5714,6 +5713,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         // Size the file_results filler so the payload lands just UNDER the 5MB
@@ -5864,7 +5864,6 @@ mod tests {
         );
 
         let data = CloudRepoData {
-            boundary: None,
             repo_name: "express-single".to_string(),
             service_name: None,
             endpoints: vec![],
@@ -5901,6 +5900,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -5942,7 +5942,6 @@ mod tests {
         packages.internal_names = crate::packages::collect_internal_package_names(&fixture);
 
         let mut data = CloudRepoData {
-            boundary: None,
             repo_name: "svc".to_string(),
             service_name: None,
             endpoints: vec![],
@@ -5974,6 +5973,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         attach_external_call_candidates(&mut data, &fixture_str, &files, &service);
@@ -6048,7 +6048,6 @@ mod tests {
         ];
 
         let mut data = CloudRepoData {
-            boundary: None,
             repo_name: "svc".to_string(),
             service_name: None,
             endpoints: vec![],
@@ -6080,6 +6079,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         attach_external_call_candidates(&mut data, &fixture_str, &files, &service);
@@ -6157,7 +6157,6 @@ mod tests {
         );
 
         let data = CloudRepoData {
-            boundary: None,
             repo_name: "svc".to_string(),
             service_name: None,
             endpoints: vec![],
@@ -6189,6 +6188,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -8760,7 +8760,6 @@ mod tests {
         bundled_types: &str,
     ) -> CloudRepoData {
         CloudRepoData {
-            boundary: None,
             repo_name: repo_name.to_string(),
             service_name: service_name.map(str::to_string),
             endpoints: vec![],
@@ -8792,6 +8791,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         }
     }
 }

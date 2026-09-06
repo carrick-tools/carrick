@@ -1086,7 +1086,6 @@ mod tests {
             resolution_source: None,
         });
         crate::cloud_storage::CloudRepoData {
-            boundary: None,
             repo_name: repo.to_string(),
             service_name: service.map(|s| s.to_string()),
             endpoints: vec![],
@@ -1118,6 +1117,7 @@ mod tests {
             sdk_edges: None,
             sdk_unresolved: None,
             scanner_version: None,
+            boundary: None,
         }
     }
 
