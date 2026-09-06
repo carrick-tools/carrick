@@ -25,7 +25,7 @@ mod aws_storage;
 pub use aws_storage::AwsStorage;
 pub(crate) use aws_storage::INLINE_PAYLOAD_LIMIT_BYTES;
 mod local_dir_storage;
-pub use local_dir_storage::{CACHE_DIR_ENV, LocalDirStorage};
+pub use local_dir_storage::{CACHE_DIR_ENV, ISOLATE_ENV, LocalDirStorage};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]

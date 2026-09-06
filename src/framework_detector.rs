@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use tracing::{debug, trace};
 
 /// Result of framework and library detection
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DetectionResult {
     pub frameworks: Vec<String>,
     pub data_fetchers: Vec<String>,

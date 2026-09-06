@@ -24,6 +24,7 @@ pub mod import_bindings;
 pub mod imported_request_member;
 pub mod intent_generator;
 pub mod local_http_wrapper;
+pub mod local_mode;
 pub mod logging;
 pub mod mount_graph;
 pub mod multi_agent_orchestrator;

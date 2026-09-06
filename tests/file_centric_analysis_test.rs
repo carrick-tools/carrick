@@ -286,6 +286,7 @@ fn test_processing_stats_tracking() {
         files_processed: 5,
         files_model_dispatched: 5,
         files_model_reused: 0,
+        files_model_not_asked: 0,
         files_skipped: 2,
         files_skipped_no_candidates: 1,
         files_parse_failed: 1,

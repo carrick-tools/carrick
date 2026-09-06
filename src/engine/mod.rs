@@ -231,6 +231,34 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         .await
         .map_err(|e| format!("Failed to download cross-repo data: {}", e))?;
 
+    // Local mode's join phase (carrick#708). Every service in the workspace
+    // was already scanned into the cache dir, one repo at a time, so there is
+    // nothing to analyse here: this run exists to join the blobs, run the type
+    // check over them, and hand the result back. Terminal, like the eval JSON
+    // branch below, and unreachable unless the indexer asked for it by naming
+    // an output path.
+    //
+    // The scan target is still a real repo, because the sidecar initialises
+    // against it and a type check with no sidecar produces no verdicts at all.
+    if let Some(out_path) = env::var(crate::local_mode::JOIN_OUT_ENV)
+        .ok()
+        .map(PathBuf::from)
+    {
+        let sp = logging::spinner("Joining the workspace...");
+        let analyzer = build_cross_repo_analyzer(all_repo_data, Vec::new(), sidecar).await?;
+        let results = analyzer.get_results();
+        crate::local_mode::LocalJoin::from_results(&results).write(&out_path)?;
+        logging::finish_spinner(
+            &sp,
+            &format!(
+                "Joined {} operation(s), {} edge(s)",
+                results.endpoints.len() + results.calls.len(),
+                results.cross_repo_matches.len()
+            ),
+        );
+        return Ok(());
+    }
+
     // 3. Resolve the services declared for this repo (one for the common
     //    single-service case; one per directory for a monorepo carrick.json).
     let repo_name = get_repository_name(repo_path);
@@ -1257,7 +1285,18 @@ async fn analyze_current_repo_incremental(
 
             // Get framework detection, guidance, and extraction config
             // (cached or fresh — all three share the package_json_hash gate)
-            let (detection, guidance, extraction_config) = if !pkg_changed {
+            let (detection, guidance, extraction_config) = if crate::local_mode::no_model() {
+                // Local mode (carrick#708): all three are model calls, and
+                // there is no model here. Stated empty rather than cached,
+                // so a later cloud scan of the same tree does not replay a
+                // laptop's silence as a detection result.
+                debug!("Local mode: skipping framework detection and guidance (no model)");
+                (
+                    DetectionResult::default(),
+                    crate::local_mode::offline_guidance(),
+                    None,
+                )
+            } else if !pkg_changed {
                 if let (Some(det), Some(guid)) = (&prev.cached_detection, &prev.cached_guidance) {
                     debug!("Reusing cached framework detection and guidance");
                     // A missing cached config (older cache entry, or an earlier
@@ -1562,6 +1601,14 @@ async fn generate_extraction_config(
     detection: &DetectionResult,
     packages: &Packages,
 ) -> Option<crate::services::type_sidecar::ExtractionConfig> {
+    // Local mode makes no model call at all, and this is one (carrick#708).
+    // Without the gate a laptop scan fires it, fails on the missing OIDC
+    // credential, and prints GitHub Actions advice to somebody who is not in
+    // CI — while the scan proceeds without unwrapping either way.
+    if crate::local_mode::no_model() {
+        debug!("Local mode: skipping extraction-config generation (no model)");
+        return None;
+    }
     let dependencies = packages.cleaned_dependency_names();
     match agent
         .fetch_extraction_config(detection, &dependencies)

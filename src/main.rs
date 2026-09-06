@@ -24,6 +24,7 @@ mod import_bindings;
 mod imported_request_member;
 mod intent_generator;
 mod local_http_wrapper;
+mod local_mode;
 mod logging;
 mod mount_graph;
 mod multi_agent_orchestrator;
@@ -145,6 +146,29 @@ ENVIRONMENT VARIABLES:
 
 #[tokio::main]
 async fn main() {
+    // The local read-only path (carrick#708) is chosen by the first argument
+    // and nothing else, so every existing invocation — `carrick .`,
+    // `carrick /repo --no-cache` — reaches the scan exactly as before.
+    let argv: Vec<String> = env::args().skip(1).collect();
+    if let Some(parsed) = local_mode::cli::parse(&argv) {
+        match parsed {
+            Ok(command) => {
+                // Only the writing commands log. `touch` and `check` run on
+                // every edit an editor makes: a run banner, a log file and a
+                // spinner are all noise in a hook's output, and the errors
+                // they can raise are printed directly.
+                if command.writes() {
+                    logging::init(false);
+                }
+                std::process::exit(local_mode::cli::run(command));
+            }
+            Err(message) => {
+                eprintln!("carrick: {message}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     let args = CliArgs::parse();
     logging::init(args.verbose);
 

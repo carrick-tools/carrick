@@ -20,6 +20,7 @@ Repo-wide truth lives at the root, not in `docs/`:
 | Location | What belongs there | Lifecycle |
 |---|---|---|
 | [`evals.md`](./evals.md) | How to run every eval and scanner run this repo hosts (local runs, Tier-A, cross-repo, OSS dispatch) | Kept current |
+| [`local-mode-output.md`](./local-mode-output.md) | The `carrick.check/0` output contract for local mode (`touch`/`check`), with its JSON schema in [`schemas/`](./schemas/) | Kept current: additive changes only |
 | [`reference/`](./reference/) | Durable explanations of how a subsystem works | Kept current: update in place, delete when obsolete |
 | [`archive/`](./archive/) | Shipped plans, handoffs, historical design records | Frozen: never updated, kept for context only |
 

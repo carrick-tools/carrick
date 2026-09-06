@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://carrick.tools/schemas/carrick-status-0.json",
+  "title": "carrick.status/0",
+  "description": "Output of `carrick status --json`: what the local index holds for a WORKSPACE, with no file in the question. Its own schema rather than a fileless form of carrick.check/0, so every response there stays about one file. Prose: docs/local-mode-output.md. Fields may be added; none is renamed or removed without notice.",
+  "oneOf": [{ "$ref": "#/$defs/result" }, { "$ref": "#/$defs/error" }],
+  "$defs": {
+    "result": {
+      "type": "object",
+      "required": ["schema", "workspace", "indexed_at", "services"],
+      "properties": {
+        "schema": { "const": "carrick.status/0" },
+        "workspace": {
+          "type": "string",
+          "description": "Absolute path of the folder holding carrick-workspace.json and .carrick/."
+        },
+        "indexed_at": {
+          "type": "string",
+          "description": "RFC 3339 time the last index or refresh finished."
+        },
+        "scanner_version": {
+          "type": "string",
+          "description": "Scanner release that wrote the index."
+        },
+        "services": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/service" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "service": {
+      "type": "object",
+      "required": [
+        "service",
+        "repo",
+        "index_commit",
+        "routes",
+        "calls",
+        "changed_since_index"
+      ],
+      "properties": {
+        "service": {
+          "type": "string",
+          "description": "serviceName from carrick.json, else the repo name."
+        },
+        "repo": {
+          "type": "string",
+          "description": "Absolute path of the repo this service belongs to. Services of one repo share a commit and a changed-file count."
+        },
+        "index_commit": { "type": "string" },
+        "indexed_at": { "type": "string" },
+        "routes": { "type": "integer", "minimum": 0 },
+        "calls": { "type": "integer", "minimum": 0 },
+        "changed_since_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Exact count of files in this service's repo that differ from index_commit or that git does not track."
+        },
+        "stale_files": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Up to 50 of them, repo-relative and sorted."
+        },
+        "stale_files_total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Always the exact number, whatever the list length."
+        },
+        "stale_files_truncated": {
+          "type": "boolean",
+          "description": "Whether stale_files is a sample rather than the whole set."
+        },
+        "boundary": {
+          "type": ["object", "null"],
+          "description": "ServiceBoundary for this service (src/boundary.rs), verbatim.",
+          "additionalProperties": true
+        },
+        "boundary_note": { "type": "string" },
+        "boundary_lines": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "The boundary as the CLI prints it. Print these bytes rather than re-wording the struct."
+        }
+      },
+      "additionalProperties": true
+    },
+    "error": {
+      "type": "object",
+      "required": ["schema", "error"],
+      "properties": {
+        "schema": { "const": "carrick.status/0" },
+        "error": {
+          "enum": ["not_indexed", "not_in_workspace", "index_unreadable"],
+          "description": "Exit code is 0 anyway: a read-only command never fails a session."
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}
