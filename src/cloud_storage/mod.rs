@@ -185,6 +185,23 @@ pub struct CompatVerdict {
     /// Scanner release that produced this verdict (`CARGO_PKG_VERSION`), so a
     /// reader can see how stale the verdict is relative to the current scanner.
     pub scanner_version: String,
+    /// Whether this verdict is a comparison between two KNOWN types, or the
+    /// absence of one (carrick#730/#734).
+    ///
+    /// `compatible` above cannot answer that: the probe gates are whole-type
+    /// only, so a producer carrying `any` three members down clears them all
+    /// and then reads compatible against any counterparty shape. `true` here
+    /// means a deep walk over both sides found no `any`/`unknown` at any
+    /// depth, so the answer is about the shapes the source declares.
+    ///
+    /// `None` means the scan did not state it — an older blob — never that the
+    /// verdict is unresolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<bool>,
+    /// Which side, and where in it, left the verdict unresolved. Present only
+    /// alongside `resolved: Some(false)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved_reason: Option<String>,
 }
 
 /// A consumer call that reaches a producer endpoint through a published npm
@@ -736,6 +753,7 @@ pub trait CloudStorage {
 pub fn attach_compat_verdicts(
     payloads: &mut [CloudRepoData],
     matches: &[crate::analyzer::CrossRepoMatch],
+    resolutions: &crate::analyzer::PairResolutions,
 ) {
     let scanner_version = env!("CARGO_PKG_VERSION");
     for payload in payloads.iter_mut() {
@@ -765,6 +783,11 @@ pub fn attach_compat_verdicts(
                 m.consumer_repo.clone(),
                 m.consumer_key.clone(),
             );
+            // The resolution rides with the verdict it belongs to, joined by
+            // the same key the overlay used, so a reader never has to pair
+            // them up itself. Absent when this run filed no outcome for the
+            // edge — nothing was checked, which is not "unresolved".
+            let resolution = resolutions.for_edge(m);
             let verdict = CompatVerdict {
                 producer_repo: m.producer_repo.clone(),
                 producer_key: m.producer_key.clone(),
@@ -777,6 +800,8 @@ pub fn attach_compat_verdicts(
                     m.mismatch_reason.clone()
                 },
                 scanner_version: scanner_version.to_string(),
+                resolved: resolution.map(|r| r.resolved),
+                unresolved_reason: resolution.and_then(|r| r.unresolved_reason.clone()),
             };
             by_pair
                 .entry(pair)
@@ -1170,6 +1195,139 @@ mod tests {
         }
     }
 
+    /// The stored verdict says whether it is a comparison or the absence of
+    /// one, joined to the same pair the overlay judged (carrick#734), and says
+    /// nothing at all when this run checked nothing.
+    #[test]
+    fn stored_verdicts_carry_their_resolution() {
+        use crate::analyzer::{PairCheckOutcome, PairResolutions};
+
+        let outcome = |identity: &str, resolved: bool, reason: Option<&str>| PairCheckOutcome {
+            pair_key: format!("p/{identity}~c/src/client.ts"),
+            pseudo_method: "GET".to_string(),
+            identity: identity.to_string(),
+            consumer_file: "src/client.ts".to_string(),
+            consumer_line: 1,
+            type_kind: ManifestTypeKind::Response,
+            bucket: crate::services::type_sidecar::VerdictBucket::Compatible,
+            gate: None,
+            diagnostic: None,
+            producer_alias: "P".to_string(),
+            consumer_alias: "C".to_string(),
+            producer_service: "order-service".to_string(),
+            consumer_service: "notification-service".to_string(),
+            resolved,
+            unresolved_reason: reason.map(str::to_string),
+        };
+        let resolutions = PairResolutions::from_outcomes(&[
+            outcome(
+                "/orders/:id",
+                false,
+                Some("the producer type carries `any` at `data`"),
+            ),
+            outcome("/health", true, None),
+        ]);
+
+        let mut payloads = vec![empty_repo(
+            "org/notification-service",
+            Some("notification-service"),
+        )];
+        let matches = vec![
+            edge(
+                "order-service",
+                "http|GET|/orders/:id",
+                "notification-service",
+                "http|GET|/orders/:id",
+                Some(true),
+                None,
+            ),
+            edge(
+                "order-service",
+                "http|GET|/health",
+                "notification-service",
+                "http|GET|/health",
+                Some(true),
+                None,
+            ),
+            // Checked by nobody this run: the verdict is persisted (the edge
+            // carries one) and states no resolution.
+            edge(
+                "order-service",
+                "http|GET|/unchecked",
+                "notification-service",
+                "http|GET|/unchecked",
+                Some(true),
+                None,
+            ),
+        ];
+
+        attach_compat_verdicts(&mut payloads, &matches, &resolutions);
+
+        // Round-trip: the two fields are the wire, not just the struct.
+        let json = serde_json::to_string(&payloads[0]).unwrap();
+        let back: CloudRepoData = serde_json::from_str(&json).unwrap();
+        let verdicts = back.compat_verdicts.unwrap();
+        let by_key = |key: &str| {
+            verdicts
+                .iter()
+                .find(|v| v.producer_key == key)
+                .unwrap_or_else(|| panic!("no verdict for {key}"))
+                .clone()
+        };
+
+        let unresolved = by_key("http|GET|/orders/:id");
+        assert_eq!(unresolved.resolved, Some(false));
+        assert_eq!(
+            unresolved.unresolved_reason.as_deref(),
+            Some("the producer type carries `any` at `data`"),
+            "a compatible-bucket verdict with an `any` on one side is not a comparison"
+        );
+
+        let resolved = by_key("http|GET|/health");
+        assert_eq!(resolved.resolved, Some(true));
+        assert_eq!(resolved.unresolved_reason, None);
+
+        // Unstated, and omitted from the wire rather than sent as `null` or
+        // as a claim that nothing resolved.
+        let unchecked = by_key("http|GET|/unchecked");
+        assert_eq!(unchecked.resolved, None);
+        let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let row = raw["compat_verdicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["producer_key"] == "http|GET|/unchecked")
+            .unwrap();
+        assert!(row.get("resolved").is_none(), "got: {row}");
+        assert!(row.get("unresolved_reason").is_none(), "got: {row}");
+        let resolved_row = raw["compat_verdicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["producer_key"] == "http|GET|/health")
+            .unwrap();
+        assert_eq!(resolved_row["resolved"], true);
+    }
+
+    /// A verdict written before these fields existed still reads, and reads as
+    /// "not stated" rather than as an unresolved verdict.
+    #[test]
+    fn older_stored_verdict_deserializes_without_a_resolution() {
+        let older = serde_json::json!({
+            "producer_repo": "order-service",
+            "producer_key": "http|GET|/orders/:id",
+            "consumer_repo": "notification-service",
+            "consumer_key": "http|GET|/orders/:id",
+            "compatible": false,
+            "mismatch_reason": "Order[] vs Order",
+            "scanner_version": "0.3.41"
+        });
+        let verdict: CompatVerdict = serde_json::from_value(older).unwrap();
+        assert_eq!(verdict.resolved, None);
+        assert_eq!(verdict.unresolved_reason, None);
+        assert!(!verdict.compatible);
+    }
+
     /// An old blob that predates `compat_verdicts` deserializes with the field
     /// defaulted to `None` — additive and backwards compatible.
     #[test]
@@ -1294,7 +1452,7 @@ mod tests {
             ),
         ];
 
-        attach_compat_verdicts(&mut payloads, &matches);
+        attach_compat_verdicts(&mut payloads, &matches, &Default::default());
         let verdicts = payloads[0]
             .compat_verdicts
             .clone()
@@ -1349,7 +1507,7 @@ mod tests {
             Some(false),
             Some("Order[] vs Order"),
         )];
-        attach_compat_verdicts(&mut payloads, &matches);
+        attach_compat_verdicts(&mut payloads, &matches, &Default::default());
         assert!(payloads[0].compat_verdicts.is_none());
     }
 
@@ -1376,7 +1534,7 @@ mod tests {
                 Some("mismatch"),
             ),
         ];
-        attach_compat_verdicts(&mut payloads, &matches);
+        attach_compat_verdicts(&mut payloads, &matches, &Default::default());
         let verdicts = payloads[0].compat_verdicts.clone().unwrap();
         assert_eq!(verdicts.len(), 1);
         assert!(!verdicts[0].compatible);
