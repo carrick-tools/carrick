@@ -75,8 +75,10 @@ attributed*.
 
 ## Current state (what actually runs today)
 
-Per service, at scan time (all in the source repo, full `node_modules`
-available):
+Per service, at scan time (all in the source repo, with `node_modules`
+available whenever the tree carries them — in CI the Action installs them
+before the scan when a lockfile is present, `scripts/install-scanned-deps.sh`;
+when it cannot, capture runs bare and step 8 below says what that costs):
 
 1. LLM file analysis emits type anchors per endpoint/call
    (`primary_type_symbol`, `type_import_source`, expression text, SWC spans).

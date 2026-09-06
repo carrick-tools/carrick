@@ -88,6 +88,12 @@ jobs:
       - name: Run cross-repo scorer unit tests
         run: cargo test --test eval_xrepo --verbose
 
+      # The Action's dependency-install step (carrick#706). Shells out to
+      # scripts/install-scanned-deps.sh over the action-install fixtures; the
+      # installing case uses a `file:` dependency, so it needs no registry.
+      - name: Run Action dependency-install tests
+        run: cargo test --test action_install_test --verbose
+
       # Fixture- and mock-driven; no live LLM, no env beyond what they set
       # themselves. route_request_anchor_test needs the sidecar built above.
       - name: Run fixture-driven extraction tests

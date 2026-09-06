@@ -1,0 +1,9 @@
+{
+  "name": "local-lib",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "postinstall": "node -e \"require('fs').writeFileSync(require('path').join(__dirname, 'postinstall-ran'), 'yes')\""
+  }
+}

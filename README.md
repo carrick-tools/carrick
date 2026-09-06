@@ -2,7 +2,7 @@
 
 Carrick is a live, type-aware, intent-aware cross-repo index of every TypeScript service in your GitHub org, exposed to AI coding agents over the Model Context Protocol.
 
-> Carrick is TypeScript only. Any `package.json`-based project works, whichever package manager you use — npm, pnpm, Yarn, or Bun. Carrick reads the manifest and never runs your install, so it needs no lockfile and no `node_modules`. Deno-native projects (no `package.json`) aren't supported yet. Cross-repo features need at least two services indexed in the same GitHub org; a single-service install still gets same-repo validation.
+> Carrick is TypeScript only. Any `package.json`-based project works, whichever package manager you use — npm, pnpm, Yarn, or Bun. When a lockfile sits at the path being scanned, the action installs your dependencies with lifecycle scripts disabled, so a type that resolves through a package is a real type rather than `any`; with no lockfile it scans the checkout as it stands, and one input turns the install off entirely ([details](#dependencies)). Deno-native projects (no `package.json`) aren't supported yet. Cross-repo features need at least two services indexed in the same GitHub org; a single-service install still gets same-repo validation.
 
 **Get started:** sign up at [app.carrick.tools](https://app.carrick.tools) · full documentation at [docs.carrick.tools](https://docs.carrick.tools)
 
@@ -74,6 +74,32 @@ jobs:
 No secrets required. The `id-token: write` permission lets the action mint a short-lived GitHub Actions OIDC token, which Carrick uses to verify the repo's identity and authorize the upload. On pull requests the Carrick App posts the drift comment itself, so the workflow needs no extra permissions and no comment-posting step. Just make sure the Carrick GitHub App is installed on the org and the repo is connected to a project in the dashboard.
 
 Pull requests opened from forks are skipped gracefully: GitHub withholds OIDC credentials from fork runs, so the action prints a notice and exits successfully instead of failing the check. The scan runs when a maintainer pushes the branch to the repository itself.
+
+### Dependencies
+
+Types that resolve through a package need that package on disk. On a checkout with no `node_modules`, every import from a dependency resolves to the compiler's error type and the endpoint types Carrick indexes collapse to `any`. So the action installs the scanned repo's dependencies before it scans:
+
+- It runs only when a lockfile sits at the path being analyzed. The lockfile picks the manager: `package-lock.json` runs `npm ci`, `pnpm-lock.yaml` runs `pnpm install --frozen-lockfile`, `yarn.lock` runs `yarn install`, `bun.lock`/`bun.lockb` runs `bun install`.
+- Lifecycle scripts are disabled in every case, so nothing in your repo executes during a scan.
+- The install is time-boxed to five minutes and is never fatal. If it fails or runs long, the action prints a warning and scans the checkout as it stands, exactly as it did before.
+- Nothing is installed if `node_modules` is already there, so a workflow that installs its own dependencies first is left alone. In a monorepo the install happens once at the path being scanned, not per service.
+- The package manager's download cache is restored between runs, keyed on the lockfile's hash.
+
+Turn it off with:
+
+```yaml
+      - uses: carrick-tools/carrick@v1
+        with:
+          install-dependencies: false
+```
+
+Private registries use your own credentials. Carrick adds no auth of its own: put the token your `.npmrc` reads in the job's environment and the install step inherits it.
+
+```yaml
+      - uses: carrick-tools/carrick@v1
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+```
 
 ## MCP tools
 
