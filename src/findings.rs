@@ -47,6 +47,71 @@ pub enum Severity {
     Advisory,
 }
 
+/// Which layer the rows behind a finding's edge come from (carrick#705,
+/// cloud#599). A finding is a `Fact` only when EVERY row that contributes to
+/// it — the producer endpoint and every consumer call site — is one the source
+/// states outright; a single row whose only source is the model makes the whole
+/// pairing a `Candidate`, because a pairing is no better than its weakest side.
+///
+/// Absent on the wire when the scan cannot state it (see
+/// [`EdgeSource::fold`]), which readers take as "not stated" — today's
+/// behaviour, never "candidate".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeSource {
+    Fact,
+    Candidate,
+}
+
+impl EdgeSource {
+    /// Fold the contributing rows' [`ResolutionSource`]s into one verdict.
+    ///
+    /// [`ResolutionSource`]: crate::agents::file_analyzer_agent::ResolutionSource
+    ///
+    /// - any row the model alone stated -> `Candidate`, a positive statement;
+    /// - otherwise, every row stated by a deterministic pass (and at least one
+    ///   row) -> `Fact`;
+    /// - otherwise `None`: a row that recorded no source at all (an older
+    ///   peer blob, or a row built outside the emit/join phase — every
+    ///   non-HTTP protocol's rows are in that set today) leaves the fold
+    ///   unable to claim `Fact`, and claiming `Candidate` off a silence would
+    ///   demote deterministic rows that simply do not carry the field.
+    pub fn fold(
+        sources: impl IntoIterator<Item = Option<crate::agents::file_analyzer_agent::ResolutionSource>>,
+    ) -> Option<Self> {
+        let mut any_row = false;
+        let mut all_stated = true;
+        for source in sources {
+            any_row = true;
+            match source {
+                Some(crate::agents::file_analyzer_agent::ResolutionSource::Model) => {
+                    return Some(EdgeSource::Candidate);
+                }
+                Some(_) => {}
+                None => all_stated = false,
+            }
+        }
+        (any_row && all_stated).then_some(EdgeSource::Fact)
+    }
+}
+
+/// How far the type layer got on a finding's pair (carrick#705, cloud#599).
+///
+/// `Resolved` is the compiler's answer on two fully-resolved sides: neither
+/// carries `any`, `unknown` or an unresolved reference at any depth. `NotChecked`
+/// says no verdict APPLIES to this finding kind (a wrong verb on a declared
+/// route is a fact about routing, not about types) and is deliberately
+/// distinct from `Unresolved`, which says a verdict was attempted and could
+/// not be reached. A reader that enforces only on facts must treat
+/// `NotChecked` as enforceable and `Unresolved` as not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerdictState {
+    Resolved,
+    Unresolved,
+    NotChecked,
+}
+
 /// One repo's pinned version of a conflicting package.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PackageVersionRef {
@@ -85,6 +150,11 @@ pub enum Finding {
         /// (mocks frequently encode the canonical contract) but should be
         /// presented with that caveat.
         producer_provenance: EndpointProvenance,
+        /// Whether every row behind this pairing is one the source states
+        /// (cloud#599). `None` when the scan could not state it.
+        edge_source: Option<EdgeSource>,
+        /// How far the type layer got on this pair (cloud#599).
+        verdict_state: Option<VerdictState>,
     },
     /// A consumer call matched a producer path but not its method. `method`
     /// is the consumer's attempt; `expected_method` is the producer's.
@@ -94,6 +164,13 @@ pub enum Finding {
         service: Option<String>,
         call_sites: Vec<String>,
         expected_method: String,
+        /// Whether every row behind this pairing is one the source states
+        /// (cloud#599). `None` when the scan could not state it.
+        edge_source: Option<EdgeSource>,
+        /// [`VerdictState::NotChecked`] whenever stated: a wrong verb on a
+        /// declared route is a fact about routing, and no type verdict bears
+        /// on it (cloud#599).
+        verdict_state: Option<VerdictState>,
     },
     /// A consumer call with no producer in the index.
     MissingEndpoint {
@@ -111,6 +188,11 @@ pub enum Finding {
         /// (#380). Orphaned mocks are expected (most mock handlers have no
         /// scanned consumer), so surfaces can de-noise on this.
         provenance: EndpointProvenance,
+        /// Whether the module serving this route also renders a view
+        /// (carrick#704/#713). A page's own data endpoint has no caller of its
+        /// own by design, so "nothing calls it" is not an observation about it
+        /// and the unconsumed section leaves it out (cloud#599).
+        view_module: bool,
     },
     /// A call whose URL is built from an env var not classified in
     /// carrick.json (`internalEnvVars` / `externalEnvVars`).
@@ -174,6 +256,8 @@ impl Finding {
             consumer_type: consumer_type.into(),
             detail: truncate_chars(detail, MAX_DETAIL_CHARS),
             producer_provenance: EndpointProvenance::default(),
+            edge_source: None,
+            verdict_state: None,
         }
     }
 
@@ -190,6 +274,8 @@ impl Finding {
             service,
             call_sites,
             expected_method: expected_method.into(),
+            edge_source: None,
+            verdict_state: None,
         }
     }
 
@@ -217,6 +303,7 @@ impl Finding {
             path: path.into(),
             service,
             provenance: EndpointProvenance::default(),
+            view_module: false,
         }
     }
 
@@ -233,6 +320,38 @@ impl Finding {
             } => *producer_provenance = producer,
             Finding::OrphanedEndpoint { provenance, .. } => *provenance = producer,
             _ => {}
+        }
+        self
+    }
+
+    /// State whether the rows behind this finding's edge are the source's or
+    /// the model's (cloud#599). `None` leaves the field off the wire, which
+    /// reads as "not stated". No-op for kinds that carry no edge.
+    pub fn with_edge_source(mut self, source: Option<EdgeSource>) -> Self {
+        match &mut self {
+            Finding::TypeMismatch { edge_source, .. }
+            | Finding::MethodMismatch { edge_source, .. } => *edge_source = source,
+            _ => {}
+        }
+        self
+    }
+
+    /// State how far the type layer got on this finding's pair (cloud#599).
+    /// No-op for kinds that carry no pair.
+    pub fn with_verdict_state(mut self, state: Option<VerdictState>) -> Self {
+        match &mut self {
+            Finding::TypeMismatch { verdict_state, .. }
+            | Finding::MethodMismatch { verdict_state, .. } => *verdict_state = state,
+            _ => {}
+        }
+        self
+    }
+
+    /// Mark an orphaned endpoint as served by a module that also renders a
+    /// view (carrick#704). No-op for every other kind.
+    pub fn with_view_module(mut self, is_view_module: bool) -> Self {
+        if let Finding::OrphanedEndpoint { view_module, .. } = &mut self {
+            *view_module = is_view_module;
         }
         self
     }
@@ -345,6 +464,8 @@ impl Serialize for Finding {
                 consumer_type,
                 detail,
                 producer_provenance,
+                edge_source,
+                verdict_state,
             } => {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
@@ -354,6 +475,14 @@ impl Serialize for Finding {
                 map.serialize_entry("consumer_type", consumer_type)?;
                 map.serialize_entry("detail", detail)?;
                 map.serialize_entry("producer_provenance", producer_provenance)?;
+                // Both omitted when unstated, so a scan that cannot say leaves
+                // the payload exactly as it was before these fields existed.
+                if let Some(edge_source) = edge_source {
+                    map.serialize_entry("edge_source", edge_source)?;
+                }
+                if let Some(verdict_state) = verdict_state {
+                    map.serialize_entry("verdict_state", verdict_state)?;
+                }
             }
             Finding::MethodMismatch {
                 method,
@@ -361,12 +490,20 @@ impl Serialize for Finding {
                 service,
                 call_sites,
                 expected_method,
+                edge_source,
+                verdict_state,
             } => {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
                 map.serialize_entry("service", service)?;
                 map.serialize_entry("call_sites", wire_call_sites(call_sites))?;
                 map.serialize_entry("expected_method", expected_method)?;
+                if let Some(edge_source) = edge_source {
+                    map.serialize_entry("edge_source", edge_source)?;
+                }
+                if let Some(verdict_state) = verdict_state {
+                    map.serialize_entry("verdict_state", verdict_state)?;
+                }
             }
             Finding::MissingEndpoint {
                 method,
@@ -384,11 +521,16 @@ impl Serialize for Finding {
                 path,
                 service,
                 provenance,
+                view_module,
             } => {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
                 map.serialize_entry("service", service)?;
                 map.serialize_entry("provenance", provenance)?;
+                // Skipped when false, so the common row is unchanged.
+                if *view_module {
+                    map.serialize_entry("view_module", view_module)?;
+                }
             }
             Finding::EnvVarCall {
                 method,
@@ -928,5 +1070,135 @@ mod tests {
         assert!(v.get("run_id").is_none());
         assert_eq!(v["head_sha"], "a".repeat(40));
         assert_eq!(v["delta"], serde_json::Value::Null);
+    }
+
+    /// The wire spellings cloud#599 codes against, pinned exactly: a renderer
+    /// that reads `edge_source == "fact"` must never meet `"Fact"`.
+    #[test]
+    fn source_fields_carry_their_wire_spellings() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+
+        let finding = Finding::type_mismatch(
+            "GET",
+            "/api/users/:id",
+            None,
+            vec!["server.ts:50".into()],
+            "User",
+            "UserV2",
+            "incompatible",
+        )
+        .with_edge_source(EdgeSource::fold([Some(ResolutionSource::Model)]))
+        .with_verdict_state(Some(VerdictState::Resolved));
+        let v = serde_json::to_value(&finding).unwrap();
+        assert_eq!(v["edge_source"], "candidate");
+        assert_eq!(v["verdict_state"], "resolved");
+
+        let finding = Finding::method_mismatch(
+            "GET",
+            "/api/orders",
+            None,
+            vec!["client.ts:12".into()],
+            "POST",
+        )
+        .with_edge_source(EdgeSource::fold([Some(ResolutionSource::FileBasedRoute)]))
+        .with_verdict_state(Some(VerdictState::NotChecked));
+        let v = serde_json::to_value(&finding).unwrap();
+        assert_eq!(v["edge_source"], "fact");
+        assert_eq!(v["verdict_state"], "not_checked");
+
+        let v = serde_json::to_value(
+            Finding::type_mismatch("GET", "/a", None, vec![], "A", "B", "d")
+                .with_verdict_state(Some(VerdictState::Unresolved)),
+        )
+        .unwrap();
+        assert_eq!(v["verdict_state"], "unresolved");
+    }
+
+    /// A finding the scan cannot place carries neither field, so a payload
+    /// from this scanner is byte-identical to a 0.3.41 one for that row and
+    /// the cloud's "not stated" branch keeps today's behaviour.
+    #[test]
+    fn unstated_source_fields_are_omitted() {
+        let v = serde_json::to_value(Finding::type_mismatch(
+            "GET",
+            "/a",
+            None,
+            vec![],
+            "A",
+            "B",
+            "d",
+        ))
+        .unwrap();
+        assert!(v.get("edge_source").is_none(), "got: {v}");
+        assert!(v.get("verdict_state").is_none(), "got: {v}");
+
+        let v = serde_json::to_value(Finding::method_mismatch("GET", "/a", None, vec![], "POST"))
+            .unwrap();
+        assert!(v.get("edge_source").is_none(), "got: {v}");
+        assert!(v.get("verdict_state").is_none(), "got: {v}");
+    }
+
+    /// A pairing is no better than its weakest row.
+    #[test]
+    fn edge_source_folds_over_every_contributing_row() {
+        use crate::agents::file_analyzer_agent::ResolutionSource::{
+            FileBasedRoute, ImportedMember, InlineLiteral, Model,
+        };
+
+        assert_eq!(
+            EdgeSource::fold([Some(FileBasedRoute), Some(ImportedMember)]),
+            Some(EdgeSource::Fact)
+        );
+        // The literal states the path; the role behind it is the model's, and
+        // the brief counts every non-`Model` source as deterministic.
+        assert_eq!(
+            EdgeSource::fold([Some(FileBasedRoute), Some(InlineLiteral)]),
+            Some(EdgeSource::Fact)
+        );
+        assert_eq!(
+            EdgeSource::fold([Some(FileBasedRoute), Some(Model)]),
+            Some(EdgeSource::Candidate),
+            "one model row makes the whole pairing a candidate"
+        );
+        // A model row still decides even when another row said nothing.
+        assert_eq!(
+            EdgeSource::fold([None, Some(Model)]),
+            Some(EdgeSource::Candidate)
+        );
+        assert_eq!(
+            EdgeSource::fold([Some(FileBasedRoute), None]),
+            None,
+            "a row that stated no source cannot be claimed as a fact"
+        );
+        assert_eq!(EdgeSource::fold([]), None, "no rows, nothing to state");
+    }
+
+    /// `view_module` rides an orphaned endpoint only when true, so the common
+    /// row is unchanged.
+    #[test]
+    fn view_module_rides_the_orphan_row_only_when_true() {
+        let v =
+            serde_json::to_value(Finding::orphaned_endpoint("GET", "/dashboard", None)).unwrap();
+        assert!(v.get("view_module").is_none(), "got: {v}");
+
+        let v = serde_json::to_value(
+            Finding::orphaned_endpoint("GET", "/dashboard", None).with_view_module(true),
+        )
+        .unwrap();
+        assert_eq!(v["view_module"], true);
+    }
+
+    /// Every builder is a no-op on a kind that carries no such field, so a
+    /// caller cannot silently attach one to the wrong finding.
+    #[test]
+    fn source_builders_are_no_ops_on_other_kinds() {
+        let finding = Finding::missing_endpoint("GET", "/a", None, vec![])
+            .with_edge_source(Some(EdgeSource::Candidate))
+            .with_verdict_state(Some(VerdictState::Unresolved))
+            .with_view_module(true);
+        assert_eq!(
+            finding,
+            Finding::missing_endpoint("GET", "/a", None, vec![])
+        );
     }
 }

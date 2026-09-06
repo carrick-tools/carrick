@@ -482,6 +482,15 @@ fn pair_verdict(peer: &SdkPeer, producer: &CrossRepoMatch) -> (Option<bool>, Opt
 /// so naming a symbol would mean inventing one. The hop the break travels
 /// through is spelled out in `detail`, ahead of the stored diagnostic.
 ///
+/// `edge_source` and `verdict_state` (cloud#599) are left UNSTATED on these
+/// rows. The pairing is three rows across two repos — the consumer's call into
+/// the package, the SDK member, and the producer's route — and this scan holds
+/// only the persisted verdict, not the sources of the two rows in the other
+/// repo. Saying "fact" would claim what this run cannot see, and saying
+/// "candidate" would demote a pairing that may be entirely deterministic; the
+/// absence reads as "not stated", which leaves these rows enforced as they are
+/// today.
+///
 /// Nothing is deduped against the direct findings, and in one shape that shows:
 /// a `carrick.json` whose `services` array holds BOTH the SDK service and a
 /// service that consumes it. The SDK's own pair is then checked this run and
