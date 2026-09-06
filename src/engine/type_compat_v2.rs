@@ -625,7 +625,7 @@ pub(crate) fn backfill_accepted(
         if record.capture_failure_reason.is_some()
             || record.self_check != "ok"
             || record.top_type_at_self_check
-            || record.deep_top_type_kind.is_some()
+            || !record.any_provenance.is_empty()
         {
             return false;
         }
@@ -644,7 +644,7 @@ pub(crate) fn backfill_accepted(
         {
             return false;
         }
-        if record.deep_top_type_kind.is_none() && rerun_record.deep_top_type_kind.is_some() {
+        if record.any_provenance.is_empty() && !rerun_record.any_provenance.is_empty() {
             return false;
         }
         if !record.top_type_at_self_check && rerun_record.top_type_at_self_check {
@@ -1025,7 +1025,16 @@ pub(crate) fn run_check(
     let mut probing: Vec<&BuiltPair> = Vec::new();
     for pair in &pairs {
         if let Some((bucket, reason)) = &pair.pre_verdict {
-            outcomes.push(outcome_for(pair, *bucket, None, Some(reason.clone())));
+            // A pre-verdicted pair never reached a probe, so nothing about it
+            // was compared: not a fact, and the pre-verdict reason is why.
+            outcomes.push(outcome_for(
+                pair,
+                *bucket,
+                None,
+                Some(reason.clone()),
+                false,
+                Some(reason.clone()),
+            ));
         } else {
             probing.push(pair);
         }
@@ -1066,11 +1075,15 @@ pub(crate) fn run_check(
                             verdict.bucket,
                             verdict.gate.clone(),
                             verdict.diagnostic.clone(),
+                            verdict.resolved,
+                            verdict.unresolved_reason.clone(),
                         )),
                         None => outcomes.push(outcome_for(
                             pair,
                             VerdictBucket::Unverifiable,
                             None,
+                            Some("the check returned no verdict for this pair".to_string()),
+                            false,
                             Some("the check returned no verdict for this pair".to_string()),
                         )),
                     }
@@ -1094,6 +1107,8 @@ pub(crate) fn run_check(
                         VerdictBucket::Unverifiable,
                         None,
                         Some(reason.clone()),
+                        false,
+                        Some(reason.clone()),
                     ));
                 }
             }
@@ -1112,6 +1127,8 @@ fn outcome_for(
     bucket: VerdictBucket,
     gate: Option<String>,
     diagnostic: Option<String>,
+    resolved: bool,
+    unresolved_reason: Option<String>,
 ) -> PairCheckOutcome {
     PairCheckOutcome {
         pair_key: pair.spec.pair_key.clone(),
@@ -1127,6 +1144,8 @@ fn outcome_for(
         consumer_alias: pair.consumer_alias.clone(),
         producer_service: pair.producer_service.clone(),
         consumer_service: pair.consumer_service.clone(),
+        resolved,
+        unresolved_reason,
     }
 }
 
@@ -1275,6 +1294,7 @@ mod tests {
             expanded_definition: None,
             primary_type_symbol: None,
             defined_in: None,
+            any_provenance: Vec::new(),
         }
     }
 
@@ -1439,6 +1459,7 @@ mod tests {
             primary_type_symbol_source: None,
             declaring_package: None,
             member_return_type: None,
+            any_provenance: Vec::new(),
         }
     }
 
@@ -1722,6 +1743,7 @@ mod tests {
             primary_type_symbol_source: None,
             declaring_package: None,
             member_return_type: None,
+            any_provenance: Vec::new(),
         };
 
         let infer = vec![
@@ -1848,6 +1870,7 @@ mod tests {
             primary_type_symbol_source: None,
             declaring_package: None,
             member_return_type: None,
+            any_provenance: Vec::new(),
         };
 
         let infer = vec![infer_item("Pub_Resolved"), infer_item("Pub_Unresolved")];
@@ -1903,8 +1926,7 @@ mod tests {
             self_check_detail: None,
             capture_failure_reason: failure.map(str::to_string),
             top_type_at_self_check: failure.is_some(),
-            deep_top_type_kind: None,
-            deep_top_type_path: None,
+            any_provenance: Vec::new(),
         }
     }
 
@@ -2053,7 +2075,12 @@ mod tests {
             record("A", "literal", "ok", None),
             record("B", "symbol", "ok", None),
         ];
-        deep[0].deep_top_type_kind = Some("any".to_string());
+        deep[0].any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+            path: "meta".to_string(),
+            kind: "any".to_string(),
+            reason: "declared".to_string(),
+            detail: None,
+        }];
         assert!(!backfill_accepted(&backfilled, &first, &deep));
 
         // A previously-usable sibling degrades in the re-run -> reject.
@@ -2111,6 +2138,7 @@ mod tests {
             primary_type_symbol_source: None,
             declaring_package: None,
             member_return_type: None,
+            any_provenance: Vec::new(),
         };
 
         let explicit = vec![

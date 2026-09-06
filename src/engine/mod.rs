@@ -2508,6 +2508,7 @@ fn add_protocol_manifest_entry(
         expanded_definition: None,
         primary_type_symbol,
         defined_in: None,
+        any_provenance: Vec::new(),
     });
 }
 
@@ -3396,6 +3397,31 @@ fn load_packages_for_service(
     Ok(packages)
 }
 
+/// Merge provenance entries into an existing list, deduped on
+/// `(path, reason)` and sorted by path.
+///
+/// Two layers report here and they see different things: the inferrer knows
+/// why it declined to read a payload, the capture self-check knows which
+/// members of the emitted declaration are `any`. Neither subsumes the other,
+/// so both are kept — but the same finding must not appear twice, and the
+/// order must not depend on which layer ran first, or `scan-twice.sh`
+/// byte-identity fails.
+fn merge_any_provenance(
+    into: &mut Vec<crate::services::type_sidecar::TypeProvenance>,
+    incoming: impl IntoIterator<Item = crate::services::type_sidecar::TypeProvenance>,
+) {
+    for item in incoming {
+        if into
+            .iter()
+            .any(|existing| existing.path == item.path && existing.reason == item.reason)
+        {
+            continue;
+        }
+        into.push(item);
+    }
+    into.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.reason.cmp(&b.reason)));
+}
+
 /// Resolve per-endpoint type definitions from the v2 capture stub tree.
 /// Populates `resolved_definition` and `expanded_definition` on each manifest entry.
 /// Non-fatal: if resolution fails, entries keep their None values and the MCP falls back to regex.
@@ -3407,6 +3433,12 @@ fn resolve_per_endpoint_definitions(
     let Some(ref mut manifest) = cloud_data.type_manifest else {
         return;
     };
+
+    // Capture-side provenance (carrick#376). Stamped for EVERY entry, including
+    // the ones whose `type_state` is Unknown and therefore print no definition
+    // at all: "no type here, and here is why" is the answer a reader needs, and
+    // it is exactly the entry the definition resolution below skips.
+    stamp_capture_provenance(manifest, stub_dir);
 
     // Collect unique aliases that have actual types (not Unknown)
     let aliases: Vec<String> = manifest
@@ -3444,6 +3476,50 @@ fn resolve_per_endpoint_definitions(
             warn!("Per-endpoint definition resolution failed: {}", e);
             debug!("Continuing without resolved definitions (MCP will use regex fallback)");
         }
+    }
+}
+
+/// Join the capture self-check's `any`/`unknown` findings onto the manifest.
+///
+/// The stub's own `carrick-manifest.json` is the record of what the emitted
+/// declaration tree actually says, which is what the index publishes — so it is
+/// the right source for "which fields of this endpoint's type are `any`".
+/// Non-fatal throughout: no manifest, unreadable manifest, or an alias with no
+/// record all leave the entry as it was. Absence is never a claim of
+/// cleanliness.
+fn stamp_capture_provenance(manifest: &mut [TypeManifestEntry], stub_dir: &Path) {
+    let path = stub_dir.join("carrick-manifest.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    #[derive(serde::Deserialize)]
+    struct StubManifest {
+        #[serde(default)]
+        aliases: Vec<crate::services::type_sidecar::CaptureAliasRecord>,
+    }
+    let Ok(parsed) = serde_json::from_str::<StubManifest>(&text) else {
+        warn!(
+            "capture manifest at {} could not be parsed for provenance",
+            path.display()
+        );
+        return;
+    };
+    let by_alias: HashMap<&str, &crate::services::type_sidecar::CaptureAliasRecord> = parsed
+        .aliases
+        .iter()
+        .map(|record| (record.alias.as_str(), record))
+        .collect();
+    for entry in manifest.iter_mut() {
+        let Some(record) = by_alias.get(entry.type_alias.as_str()) else {
+            continue;
+        };
+        if record.any_provenance.is_empty() {
+            continue;
+        }
+        merge_any_provenance(
+            &mut entry.any_provenance,
+            record.any_provenance.iter().cloned(),
+        );
     }
 }
 
@@ -3711,6 +3787,7 @@ fn add_manifest_pair(
             // which joins the LLM's real anchor symbol by `(file_path, line)`.
             primary_type_symbol: None,
             defined_in: None,
+            any_provenance: Vec::new(),
         });
     }
 }
@@ -3772,6 +3849,24 @@ fn enrich_manifest_with_type_resolution(
         }
     }
 
+    // Why an inference came back `any` (carrick#376). Joined on the same
+    // `alias` key as everything else here. The inferrer is the only layer that
+    // knows the difference between a type that IS `any` and a recovery that
+    // declined to guess, so its reason travels rather than being reconstructed
+    // from the text downstream.
+    let mut inferred_provenance: HashMap<
+        String,
+        Vec<crate::services::type_sidecar::TypeProvenance>,
+    > = HashMap::new();
+    for inferred in &type_resolution.inferred_types {
+        if inferred.any_provenance.is_empty() {
+            continue;
+        }
+        inferred_provenance
+            .entry(inferred.alias.clone())
+            .or_insert_with(|| inferred.any_provenance.clone());
+    }
+
     // Also check the bundled .d.ts content for defined types
     // This catches types that were successfully bundled but not in the manifest.
     // Exclude aliases defined as `= unknown` — those are placeholders for failed
@@ -3810,6 +3905,10 @@ fn enrich_manifest_with_type_resolution(
             && let Some(symbol) = inferred_symbols.get(&entry.type_alias)
         {
             entry.primary_type_symbol = Some(symbol.clone());
+        }
+
+        if let Some(provenance) = inferred_provenance.get(&entry.type_alias) {
+            merge_any_provenance(&mut entry.any_provenance, provenance.iter().cloned());
         }
 
         if let Some((type_string, is_explicit)) = resolved_types.get(&entry.type_alias) {
@@ -4651,6 +4750,7 @@ mod tests {
                 expanded_definition: Some(format!("import(\"{}\").Order", abs("src/types/order"))),
                 primary_type_symbol: None,
                 defined_in: None,
+                any_provenance: Vec::new(),
             }]),
             file_results: Some(file_results),
             cached_detection: None,
@@ -6552,6 +6652,7 @@ mod tests {
             expanded_definition: None,
             primary_type_symbol: None,
             defined_in: None,
+            any_provenance: Vec::new(),
         }
     }
 
@@ -6587,6 +6688,7 @@ mod tests {
             primary_type_symbol_source: None,
             declaring_package: None,
             member_return_type: None,
+            any_provenance: Vec::new(),
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -6618,6 +6720,7 @@ mod tests {
             primary_type_symbol_source: None,
             declaring_package: None,
             member_return_type: None,
+            any_provenance: Vec::new(),
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -6649,6 +6752,7 @@ mod tests {
             primary_type_symbol_source: None,
             declaring_package: None,
             member_return_type: None,
+            any_provenance: Vec::new(),
         }
     }
 

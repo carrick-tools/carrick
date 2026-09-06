@@ -31,6 +31,11 @@ import * as path from 'node:path';
 import type { CaptureAliasRecord, SelfCheckOutcome } from './api.js';
 import type { ResolvedAnchor } from './anchors.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
+import {
+  findDisqualifyingTopTypes,
+  provenanceOf,
+  type DeepTopType,
+} from './deep-walk.js';
 
 export interface SelfCheckArgs {
   stubDir: string;
@@ -171,183 +176,6 @@ function demotedRecord(anchor: ResolvedAnchor): CaptureAliasRecord {
   };
 }
 
-/** A disqualifying finding below the root of a captured type: an author-baked
- * `any`/`unknown`, or `budget_exhausted` — a subtree the walk could not finish
- * within its depth/node budget, treated as unverifiable (fail closed) rather
- * than silently clean. */
-interface DeepTopType {
-  kind: 'any' | 'unknown' | 'budget_exhausted';
-  /** Human-readable member path, e.g. `metadata`, `items<0>.meta`, `[index]`. */
-  path: string;
-}
-
-/**
- * Depth-bounded structural walk for a disqualifying top type at ANY depth:
- * a member, array element, index signature, type argument, or callable RETURN
- * that resolved to `any` (bidirectionally assignable — an arbitrary
- * counterparty shape reads compatible) or `unknown` (a failed-inference bake;
- * carries no shape information). The check phase's probe gates are WHOLE-type
- * only, so this walk owns the depths they cannot see. It is a genuine SUPERSET
- * of v1's text-scan disqualifier (`contains_disqualifying_top_type`) at ALL
- * depths/widths — so removing the `type_state == Unknown` pre-verdict (carrick
- * #448) never turns a shape v1 would have abstained on into a false-compatible.
- * The superset holds unconditionally because budget EXHAUSTION FAILS CLOSED
- * (returns the `budget_exhausted` sentinel, not "clean"): a subtree too deep or
- * wide to finish within budget is unverifiable, never silently compatible. A
- * bigger bound would only relocate the fail-open cliff; failing closed removes
- * it. v1's text scan is itself unbounded, so any disqualifier it would flag
- * that lies past this walk's finite budget is still caught — as
- * `budget_exhausted` rather than its exact kind.
- *
- * Cycle-safe. Two deliberate exceptions to "flag any/unknown anywhere":
- *  - callable PARAMETER types are NOT descended (only return types): a
- *    parameter `any` is contravariant and genuinely permissive (`(x: any) =>
- *    void` safely accepts a stricter counterparty), so it is not a masked
- *    mismatch and demoting it would over-demote a sound shape;
- *  - TypeScript's unresolved-reference `error` placeholder (`intrinsicName ===
- *    'error'`) is excluded (see `flagOf`): it heals when the check installs the
- *    pinned external, so it is a healable decay, not an author-baked `any`.
- * A type the walk cannot cheaply finish is NOT flagged — over-demoting a
- * legitimately fully-resolved type is the failure mode this guard must not have.
- */
-function findDisqualifyingTopType(
-  root: ts.Type,
-  program: ts.Program,
-  checker: ts.TypeChecker,
-  location: ts.Node
-): DeepTopType | undefined {
-  // Cover v1's inline-expander reach with margin so this structural walk is a
-  // genuine superset of v1's text-scan disqualifier AT DEPTH: anything v1 could
-  // expand-and-flag as `any`/`unknown`, this walk reaches too. v1's expander
-  // (`MAX_EXPANSION_DEPTH` in ../type-structural-expander.ts) reaches 12; 16
-  // clears it with margin. That constant is NOT imported: the capture bundle
-  // seam (`capture-v2-seam.test.ts`) forbids capture/ from importing across the
-  // boundary, so the value is pinned here and kept ">= MAX_EXPANSION_DEPTH" by
-  // that contract. The node budget scales with the deeper bound so a real
-  // deep-but-narrow type cannot exhaust it before the walk reaches a buried
-  // `any` — running out early would fail OPEN (read compatible).
-  const MAX_DEPTH = 16;
-  const MAX_VISITED = 4096;
-  const seen = new Set<ts.Type>();
-  let visited = 0;
-
-  const flagOf = (t: ts.Type): 'any' | 'unknown' | undefined => {
-    if (t.flags & ts.TypeFlags.Any) {
-      // TypeScript's unresolved-reference placeholder (e.g. `import('ext').Foo`
-      // on a bare checkout) carries `TypeFlags.Any` but `intrinsicName ===
-      // 'error'` — NOT an author-baked `any`. It resolves to the real type once
-      // the check phase installs the pinned external, so it must not count as a
-      // disqualifier: treating it as `any` would demote a healable external
-      // reference. Genuine author `any` carries `intrinsicName === 'any'`.
-      // (`intrinsicName` is internal but stable since TS 1.x — same standing as
-      // its use in anchors.ts.)
-      //
-      // The `error` placeholder also stands in for NON-healable causes (TS2304
-      // undefined name, TS2315 wrong-arity generic, a dangling internal
-      // specifier). Excluding those here is not a hole: each emits a diagnostic
-      // in the alias's own closure, so the closure-failure classification
-      // (`internalFailure` -> decayed_internal) or the check-phase POISON rule
-      // — NOT this deep walk — is their backstop, and both fail closed.
-      const name = (t as unknown as { intrinsicName?: string }).intrinsicName;
-      return name === 'error' ? undefined : 'any';
-    }
-    return t.flags & ts.TypeFlags.Unknown ? 'unknown' : undefined;
-  };
-
-  const walk = (t: ts.Type, path: string, depth: number): DeepTopType | undefined => {
-    // Genuine cycle handling — NOT fail-open. `t` is already on the walk stack
-    // (or was fully explored earlier), so the owning frame completes it;
-    // returning "clean" here is sound because a type reaches `seen` ONLY after a
-    // visit that fully completed clean. A visit that hit the budget below
-    // returns the `budget_exhausted` sentinel, which bubbles up (every frame
-    // propagates a truthy child return) and terminates the whole walk before
-    // any shallower re-entry — so `seen` never memoizes a truncated visit as
-    // clean. And a type fully explored clean at depth d1 is clean at any d2 < d1
-    // (the shallower reach is a superset of the deeper), so reusing it is safe.
-    if (seen.has(t)) return undefined;
-    // Budget exhaustion FAILS CLOSED. `return undefined` (clean) here would let
-    // an `any` buried past the depth/node budget read compatible — the
-    // fail-open cliff a bigger number only relocates. Instead abstain: the
-    // alias demotes to unverifiable, over-abstaining on a legitimately clean
-    // type deeper/wider than budget rather than ever false-compatible.
-    if (depth > MAX_DEPTH || visited > MAX_VISITED) {
-      return { kind: 'budget_exhausted', path: path === '' ? '<root>' : path };
-    }
-    seen.add(t);
-    visited++;
-
-    // Root-level top types are the caller's whole-type check (and the check
-    // phase's probe gates catch them); this walk owns depth > 0.
-    if (depth > 0) {
-      const kind = flagOf(t);
-      if (kind) return { kind, path };
-    }
-
-    if (t.flags & (ts.TypeFlags.Union | ts.TypeFlags.Intersection)) {
-      for (const part of (t as ts.UnionOrIntersectionType).types) {
-        const found = walk(part, path, depth + 1);
-        if (found) return found;
-      }
-      return undefined;
-    }
-
-    if (!(t.flags & ts.TypeFlags.Object)) return undefined;
-
-    // Callable members: descend the RETURN type of every call/construct
-    // signature — a return is a COVARIANT wire position, so `() => any`
-    // covariantly widens `() => string` and an `any` there masks a real
-    // mismatch exactly as a plain-member `any` does (v1's text scan flags it).
-    // PARAMETER types are deliberately NOT descended: a parameter `any` is
-    // contravariant and genuinely permissive (`(x: any) => void` safely
-    // accepts a stricter counterparty), so demoting it would over-demote a
-    // sound shape. Fall through afterwards so a hybrid callable
-    // (`{ (): T; data: any }`) still has its own members walked below.
-    for (const sig of [...t.getCallSignatures(), ...t.getConstructSignatures()]) {
-      const found = walk(sig.getReturnType(), `${path}()`, depth + 1);
-      if (found) return found;
-    }
-
-    // Type arguments: arrays, tuples, Promise<T>, Map<K, V>, ...
-    if ((t as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference) {
-      const args = checker.getTypeArguments(t as ts.TypeReference);
-      for (let i = 0; i < args.length; i++) {
-        const found = walk(args[i], `${path}<${i}>`, depth + 1);
-        if (found) return found;
-      }
-    }
-
-    // Index signatures: { [k: string]: T }, Record<string, T>.
-    for (const info of checker.getIndexInfosOfType(t)) {
-      const found = walk(info.type, `${path}[index]`, depth + 1);
-      if (found) return found;
-    }
-
-    for (const prop of t.getProperties()) {
-      // Skip the built-in method suite (`Array#map`, `Promise#then`, ...): a
-      // lib-declared member is machinery, never a wire payload, and descending
-      // its return type recurses (map -> U[] -> map -> ...) until it exhausts
-      // the budget — which pre-fail-closed silently read "clean" and now would
-      // over-abstain on every ordinary `T[]`. The element/value type is still
-      // covered via the type-argument branch above; a USER function-typed
-      // member (`getData: () => any`) is not lib-declared, so it is still walked.
-      const decl = prop.valueDeclaration ?? prop.declarations?.[0];
-      if (decl && program.isSourceFileDefaultLibrary(decl.getSourceFile())) {
-        continue;
-      }
-      const propType = checker.getTypeOfSymbolAtLocation(prop, location);
-      const found = walk(
-        propType,
-        path === '' ? prop.getName() : `${path}.${prop.getName()}`,
-        depth + 1
-      );
-      if (found) return found;
-    }
-    return undefined;
-  };
-
-  return walk(root, '', 0);
-}
-
 function checkedRecord(
   anchor: ResolvedAnchor,
   ctx: {
@@ -362,7 +190,7 @@ function checkedRecord(
 ): CaptureAliasRecord {
   const alias = anchor.request.alias;
   let topType = true;
-  let deep: DeepTopType | undefined;
+  let deepFindings: DeepTopType[] = [];
   const seeds: string[] = [];
 
   if (ctx.surfaceSource) {
@@ -372,7 +200,12 @@ function checkedRecord(
       topType =
         (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) !== 0;
       if (!topType) {
-        deep = findDisqualifyingTopType(type, ctx.program, ctx.checker, stmt.name);
+        deepFindings = findDisqualifyingTopTypes(
+          type,
+          ctx.program,
+          ctx.checker,
+          stmt.name
+        );
       }
       // Seed the closure with the alias's own import-type targets.
       const visit = (node: ts.Node) => {
@@ -432,12 +265,13 @@ function checkedRecord(
   // into the emitted `.d.ts` text — never a healable external decay. The check
   // phase must pre-gate exactly these: its probe gates are whole-type only and
   // cannot see a member-level any.
-  let unexplainedDeep: DeepTopType | undefined;
+  let unexplainedDeep: DeepTopType[] = [];
+  const deep = deepFindings[0];
   if (internalFailure) {
     outcome = 'decayed_internal';
     detail = `dangling internal specifier '${internalFailure}'`;
   } else if (topType || deep) {
-    // `deep` is only computed when `!topType`, so the two are mutually
+    // `deepFindings` is only computed when `!topType`, so the two are mutually
     // exclusive here.
     if (deep) {
       // A member-level disqualifier. Either an author-baked any/unknown (baked
@@ -445,7 +279,7 @@ function checkedRecord(
       // `budget_exhausted` sentinel (a subtree too deep/wide to finish). Record
       // it even when the closure ALSO carries a failing pinned external (which
       // would otherwise allowlist the alias) — fail closed.
-      unexplainedDeep = deep;
+      unexplainedDeep = deepFindings;
       outcome = 'decayed_internal';
       detail =
         deep.kind === 'budget_exhausted'
@@ -494,11 +328,8 @@ function checkedRecord(
     // wins, so it surfaces exactly when the re-aimed alias self-checks clean.
     self_check_detail: detail ?? anchor.reaimNote,
     top_type_at_self_check: topType,
-    ...(unexplainedDeep
-      ? {
-          deep_top_type_kind: unexplainedDeep.kind,
-          deep_top_type_path: unexplainedDeep.path,
-        }
+    ...(unexplainedDeep.length > 0
+      ? { any_provenance: unexplainedDeep.map(provenanceOf) }
       : {}),
   };
 }

@@ -658,7 +658,32 @@ export interface InferredType {
    * omit it.
    */
   primary_type_symbol_source?: string;
+  /**
+   * Why this inference carries `any`/`unknown` (carrick#376), recorded at the
+   * decision point that produced it rather than reconstructed downstream.
+   *
+   * The inferrer is the only layer that knows the difference between "the
+   * compiler resolved this to `any`" and "the recovery declined to read an
+   * unresolvable callee's argument because nothing said it was a serialiser".
+   * That difference is the whole answer to "why is this endpoint `any`", so it
+   * is recorded here and joined onto the manifest entry beside the capture
+   * surface's own findings.
+   *
+   * Sorted by `path`; absent (not empty) when the type carries no top type.
+   */
+  any_provenance?: TypeProvenance[];
 }
+
+/**
+ * Why a type carries `any`/`unknown` at a position, and where.
+ *
+ * Declared in the capture bundle (`./capture/api.ts`) because the capture
+ * self-check is one of the two producers; re-exported here so the rest of the
+ * sidecar reads it through the single sanctioned door rather than reaching
+ * across the bundle seam.
+ */
+export type TypeProvenance = import('./capture/api.js').TypeProvenance;
+export type TypeProvenanceReason = import('./capture/api.js').TypeProvenanceReason;
 
 /**
  * Source location information for a type

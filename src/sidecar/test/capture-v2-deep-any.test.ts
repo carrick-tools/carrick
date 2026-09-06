@@ -13,7 +13,7 @@
  *
  * Pins:
  *  1. capture: member/container any|unknown records decayed_internal with a
- *     deep_top_type_kind/path and a reason;
+ *     any_provenance (first finding) and a reason;
  *  2. capture: fully-resolved types (including function-typed members and
  *     unions) are NOT over-demoted;
  *  3. check: a pair whose side carries a deep `any` verdicts
@@ -106,8 +106,8 @@ describe('capture self-check: deep any/unknown decays, concrete types do not', (
   it('member-level any decays with a recorded reason and kind', () => {
     const rec = byAlias.get('M_MemberAny')!;
     assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
-    assert.strictEqual(rec.deep_top_type_kind, 'any');
-    assert.strictEqual(rec.deep_top_type_path, 'metadata');
+    assert.strictEqual(rec.any_provenance?.[0]?.kind, 'any');
+    assert.strictEqual(rec.any_provenance?.[0]?.path, 'metadata');
     assert.match(rec.self_check_detail ?? '', /carries 'any'/);
     // The root is NOT a top type — that is exactly why the old gate missed it.
     assert.strictEqual(rec.top_type_at_self_check, false);
@@ -116,21 +116,21 @@ describe('capture self-check: deep any/unknown decays, concrete types do not', (
   it('member-level unknown decays with kind unknown', () => {
     const rec = byAlias.get('M_MemberUnknown')!;
     assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
-    assert.strictEqual(rec.deep_top_type_kind, 'unknown');
+    assert.strictEqual(rec.any_provenance?.[0]?.kind, 'unknown');
   });
 
   it('nested member any is found below the first level', () => {
     const rec = byAlias.get('M_NestedAny')!;
     assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
-    assert.strictEqual(rec.deep_top_type_kind, 'any');
-    assert.strictEqual(rec.deep_top_type_path, 'outer.inner.leaked');
+    assert.strictEqual(rec.any_provenance?.[0]?.kind, 'any');
+    assert.strictEqual(rec.any_provenance?.[0]?.path, 'outer.inner.leaked');
   });
 
   it('container-decayed forms (any[], Promise<any>, Record<string, any>, index) decay', () => {
     for (const alias of ['C_ArrayAny', 'C_PromiseAny', 'C_RecordAny', 'C_IndexAny']) {
       const rec = byAlias.get(alias)!;
       assert.strictEqual(rec.self_check, 'decayed_internal', `${alias}: ${rec.self_check_detail}`);
-      assert.strictEqual(rec.deep_top_type_kind, 'any', alias);
+      assert.strictEqual(rec.any_provenance?.[0]?.kind, 'any', alias);
     }
   });
 
@@ -138,7 +138,7 @@ describe('capture self-check: deep any/unknown decays, concrete types do not', (
     for (const alias of ['OK_Concrete', 'OK_Union', 'OK_Array', 'OK_FuncMember']) {
       const rec = byAlias.get(alias)!;
       assert.strictEqual(rec.self_check, 'ok', `${alias}: ${rec.self_check_detail}`);
-      assert.strictEqual(rec.deep_top_type_kind, undefined, alias);
+      assert.strictEqual(rec.any_provenance?.[0]?.kind, undefined, alias);
     }
   });
 });
@@ -187,8 +187,8 @@ describe('capture self-check: deep any through a symbol anchor', () => {
     const byAlias = new Map(result.aliases.map((a) => [a.alias, a]));
     const order = byAlias.get('P_Order')!;
     assert.strictEqual(order.self_check, 'decayed_internal', order.self_check_detail);
-    assert.strictEqual(order.deep_top_type_kind, 'any');
-    assert.strictEqual(order.deep_top_type_path, 'meta');
+    assert.strictEqual(order.any_provenance?.[0]?.kind, 'any');
+    assert.strictEqual(order.any_provenance?.[0]?.path, 'meta');
     const clean = byAlias.get('P_Clean')!;
     assert.strictEqual(clean.self_check, 'ok', clean.self_check_detail);
   });
@@ -314,41 +314,41 @@ describe('capture self-check: callable-return any and deep-past-old-bound any', 
   it('a callable RETURN any decays with path <member>()', () => {
     const rec = byAlias.get('M_RetAny')!;
     assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
-    assert.strictEqual(rec.deep_top_type_kind, 'any');
-    assert.strictEqual(rec.deep_top_type_path, 'getData()');
+    assert.strictEqual(rec.any_provenance?.[0]?.kind, 'any');
+    assert.strictEqual(rec.any_provenance?.[0]?.path, 'getData()');
     assert.strictEqual(rec.top_type_at_self_check, false);
   });
 
   it('a construct-signature RETURN any decays', () => {
     const rec = byAlias.get('M_CtorRetAny')!;
     assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
-    assert.strictEqual(rec.deep_top_type_kind, 'any');
+    assert.strictEqual(rec.any_provenance?.[0]?.kind, 'any');
   });
 
   it('a callable RETURN unknown decays with kind unknown', () => {
     const rec = byAlias.get('M_RetUnknown')!;
     assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
-    assert.strictEqual(rec.deep_top_type_kind, 'unknown');
+    assert.strictEqual(rec.any_provenance?.[0]?.kind, 'unknown');
   });
 
   it('a hybrid callable ({ (): any; data }) still has its call return walked', () => {
     const rec = byAlias.get('M_HybridRetAny')!;
     assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
-    assert.strictEqual(rec.deep_top_type_kind, 'any');
+    assert.strictEqual(rec.any_provenance?.[0]?.kind, 'any');
   });
 
   it('an any at depth 11 (past the old MAX_DEPTH=8) decays', () => {
     const rec = byAlias.get('M_Deep11Any')!;
     assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
-    assert.strictEqual(rec.deep_top_type_kind, 'any');
-    assert.match(rec.deep_top_type_path ?? '', /l11$/);
+    assert.strictEqual(rec.any_provenance?.[0]?.kind, 'any');
+    assert.match(rec.any_provenance?.[0]?.path ?? '', /l11$/);
   });
 
   it('clean callable returns, clean deep nesting, and a parameter any are NOT over-demoted', () => {
     for (const alias of ['OK_RetClean', 'OK_CtorClean', 'OK_DeepClean', 'OK_ParamAny']) {
       const rec = byAlias.get(alias)!;
       assert.strictEqual(rec.self_check, 'ok', `${alias}: ${rec.self_check_detail}`);
-      assert.strictEqual(rec.deep_top_type_kind, undefined, alias);
+      assert.strictEqual(rec.any_provenance?.[0]?.kind, undefined, alias);
     }
   });
 });
@@ -432,7 +432,7 @@ describe('check phase: callable-return any and deep-past-8 any are never compati
 /**
  * PR #448 adversarial-review follow-up, hole 3: `blamedExternal` masking. On a
  * BARE checkout, an alias whose closure has a failing pinned external was
- * classified `allowlisted_external` and its `deep_top_type_kind` was NOT
+ * classified `allowlisted_external` and its first `any_provenance` finding was NOT
  * recorded — so an AUTHOR-baked deep `any` co-present with that external was
  * suppressed and read compatible at check.
  *
@@ -493,14 +493,14 @@ describe('capture self-check: author-baked deep any is not masked by a co-presen
   it('an author-baked deep any co-present with a failing external is recorded (not allowlisted)', () => {
     const rec = byAlias.get('AuthorAny')!;
     assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
-    assert.strictEqual(rec.deep_top_type_kind, 'any');
-    assert.strictEqual(rec.deep_top_type_path, 'getData()');
+    assert.strictEqual(rec.any_provenance?.[0]?.kind, 'any');
+    assert.strictEqual(rec.any_provenance?.[0]?.path, 'getData()');
   });
 
   it('a PURE external decay (no author any) still allowlists — the unresolved reference heals at check', () => {
     const rec = byAlias.get('PureExt')!;
     assert.strictEqual(rec.self_check, 'allowlisted_external', rec.self_check_detail);
-    assert.strictEqual(rec.deep_top_type_kind, undefined);
+    assert.strictEqual(rec.any_provenance?.[0]?.kind, undefined);
   });
 });
 
@@ -609,34 +609,34 @@ describe('capture self-check: budget exhaustion fails CLOSED', () => {
   it('a depth-17 any (past MAX_DEPTH) gates budget_exhausted, never clean', () => {
     const rec = byAlias.get('D17_any')!;
     assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
-    assert.strictEqual(rec.deep_top_type_kind, 'budget_exhausted');
+    assert.strictEqual(rec.any_provenance?.[0]?.kind, 'budget_exhausted');
   });
 
   it('a depth-20 any gates budget_exhausted', () => {
-    assert.strictEqual(byAlias.get('D20_any')!.deep_top_type_kind, 'budget_exhausted');
+    assert.strictEqual(byAlias.get('D20_any')!.any_provenance?.[0]?.kind, 'budget_exhausted');
   });
 
   it('8 Array-wrapped object levels (hop-depth 17) gates budget_exhausted', () => {
     const rec = byAlias.get('Arr8_any')!;
     assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
-    assert.strictEqual(rec.deep_top_type_kind, 'budget_exhausted');
+    assert.strictEqual(rec.any_provenance?.[0]?.kind, 'budget_exhausted');
   });
 
   it('a >4096-wide any gates budget_exhausted', () => {
-    assert.strictEqual(byAlias.get('W5000_any')!.deep_top_type_kind, 'budget_exhausted');
+    assert.strictEqual(byAlias.get('W5000_any')!.any_provenance?.[0]?.kind, 'budget_exhausted');
   });
 
   it('a depth-16 any WITHIN budget is caught as a real any (not budget_exhausted)', () => {
     const rec = byAlias.get('OK_D16_any')!;
     assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
-    assert.strictEqual(rec.deep_top_type_kind, 'any');
+    assert.strictEqual(rec.any_provenance?.[0]?.kind, 'any');
   });
 
   it('ordinary arrays of objects and clean nested arrays are NOT over-demoted', () => {
     for (const alias of ['OK_ArrayObjs', 'OK_NestedArrClean', 'OK_D16_clean']) {
       const rec = byAlias.get(alias)!;
       assert.strictEqual(rec.self_check, 'ok', `${alias}: ${rec.self_check_detail}`);
-      assert.strictEqual(rec.deep_top_type_kind, undefined, alias);
+      assert.strictEqual(rec.any_provenance?.[0]?.kind, undefined, alias);
     }
   });
 });
@@ -701,27 +701,27 @@ describe('capture self-check: shared + cyclic types gate (seen-set is not fail-o
     // Never `ok`: the truncated deep visit is not memoized clean for the
     // shallow reference. (Deep-first truncates -> budget_exhausted.)
     assert.ok(
-      rec.deep_top_type_kind === 'budget_exhausted' || rec.deep_top_type_kind === 'any',
-      `expected a decay kind, got ${rec.deep_top_type_kind}`
+      rec.any_provenance?.[0]?.kind === 'budget_exhausted' || rec.any_provenance?.[0]?.kind === 'any',
+      `expected a decay kind, got ${rec.any_provenance?.[0]?.kind}`
     );
   });
 
   it('the same shared type gates shallow-first too (any found before the deep reference)', () => {
     const rec = byAlias.get('T_ShallowFirst')!;
     assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
-    assert.ok(rec.deep_top_type_kind === 'any' || rec.deep_top_type_kind === 'budget_exhausted');
+    assert.ok(rec.any_provenance?.[0]?.kind === 'any' || rec.any_provenance?.[0]?.kind === 'budget_exhausted');
   });
 
   it('a cyclic type with a buried any terminates and gates (never ok/hang)', () => {
     const rec = byAlias.get('CyclicAny')!;
     assert.strictEqual(rec.self_check, 'decayed_internal', rec.self_check_detail);
-    assert.strictEqual(rec.deep_top_type_kind, 'any');
+    assert.strictEqual(rec.any_provenance?.[0]?.kind, 'any');
   });
 
   it('a genuinely clean cyclic type terminates and is NOT over-demoted', () => {
     const rec = byAlias.get('CyclicClean')!;
     assert.strictEqual(rec.self_check, 'ok', rec.self_check_detail);
-    assert.strictEqual(rec.deep_top_type_kind, undefined);
+    assert.strictEqual(rec.any_provenance?.[0]?.kind, undefined);
   });
 });
 

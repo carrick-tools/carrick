@@ -42,6 +42,7 @@ import {
   type AssembledWorkspace,
 } from './check-workspace.js';
 import { buildPoisonIndexes, type StubPoisonIndex } from './check-poison.js';
+import { probeDeepFindings } from './check-deep.js';
 
 export type CheckProgress = (phase: CheckProgressPhase, message: string) => void;
 
@@ -90,6 +91,8 @@ function unverifiableAll(
     gate,
     diagnostic,
     codes: [],
+    resolved: false,
+    unresolved_reason: diagnostic,
   }));
 }
 
@@ -163,6 +166,8 @@ export async function runCheck(
         gate: 'missing:stub',
         diagnostic: 'a stub for one side of this pair was not provided; compatibility cannot be verified.',
         codes: [],
+        resolved: false,
+        unresolved_reason: 'one side of this pair has no captured type surface',
       });
     }
   }
@@ -205,6 +210,11 @@ export async function runCheck(
             `capture; compatibility cannot be verified (a partially-unresolved ` +
             `type would let an arbitrary shape read compatible).`,
       codes: [],
+      resolved: false,
+      unresolved_reason:
+        hit.kind === 'budget_exhausted'
+          ? `the ${hit.side} type is too deep or wide to verify at '${hit.path}'`
+          : `the ${hit.side} type carries '${hit.kind}' at '${hit.path}'`,
     });
   }
   writeProbes(ws, probing);
@@ -319,6 +329,13 @@ export async function runCheck(
     return scope.all || scope.aliases.has(alias) ? scope.reason : undefined;
   };
 
+  // Fact-ness walk (carrick#707, R1d): the probe gates are whole-type only,
+  // so a compared pair is only a fact about two known types when neither side
+  // carries a member-level any/unknown HERE — after install, where the capture
+  // could not look (carrick#450). It sets `resolved` and nothing else; no
+  // bucket depends on it.
+  const deepByPair = probeDeepFindings(ws.probesDir, probing);
+
   const verdicts = sortVerdicts([
     ...probing.map((plan) =>
       classifyPair({
@@ -326,6 +343,7 @@ export async function runCheck(
         probeDiags: probeDiagsByPair.get(plan.pairId) ?? [],
         poisonReason,
         scrubCtx,
+        deepFindings: deepByPair.get(plan.pairId),
       })
     ),
     ...preGated,
@@ -387,12 +405,11 @@ function deepDecayOf(
   for (const side of ['producer', 'consumer'] as const) {
     const endpoint = plan.spec[side];
     const record = aliasRecords.get(endpoint.service_name)?.get(endpoint.alias);
-    if (record?.deep_top_type_kind) {
-      return {
-        side,
-        kind: record.deep_top_type_kind,
-        path: record.deep_top_type_path ?? '<unknown>',
-      };
+    // The capture emits every deep finding it made; the FIRST is the one the
+    // pre-gate reads, exactly as when the walk stopped at the first hit.
+    const finding = record?.any_provenance?.[0];
+    if (finding) {
+      return { side, kind: finding.kind, path: finding.path };
     }
   }
   return undefined;

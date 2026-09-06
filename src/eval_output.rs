@@ -682,6 +682,7 @@ mod tests {
             expanded_definition: None,
             primary_type_symbol: primary_type_symbol.map(String::from),
             defined_in: None,
+            any_provenance: Vec::new(),
         }
     }
 

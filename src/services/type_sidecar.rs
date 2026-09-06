@@ -319,14 +319,34 @@ pub struct CaptureAliasRecord {
     #[serde(default)]
     pub capture_failure_reason: Option<String>,
     pub top_type_at_self_check: bool,
-    /// Set when the self-check found a disqualifying `any`/`unknown` at
-    /// DEPTH (member / element / index signature / type argument) with no
-    /// failing-external explanation; the check phase pre-gates these pairs.
+    /// Every disqualifying `any`/`unknown` the self-check found at DEPTH
+    /// (member / element / index signature / type argument) with no failing
+    /// pinned-external explanation, sorted by member path.
+    ///
+    /// The FIRST entry is what the check phase pre-gates on. The rest exist so
+    /// a reader of the published type is told which fields are `any` and why
+    /// rather than being handed a bare `any` (carrick#376).
     #[serde(default)]
-    pub deep_top_type_kind: Option<String>,
-    /// Member path of the deep find, e.g. `metadata` or `items<0>.meta`.
-    #[serde(default)]
-    pub deep_top_type_path: Option<String>,
+    pub any_provenance: Vec<TypeProvenance>,
+}
+
+/// One `any`/`unknown` finding inside a captured or inferred type, with its
+/// position and its cause (carrick#376). Mirrors the sidecar's
+/// `TypeProvenance`; the sidecar owns the vocabulary and this side only
+/// carries it, so `reason` and `kind` stay `String`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TypeProvenance {
+    /// Member path of the finding: empty for the type's own root, otherwise
+    /// `sub`, `items<0>.meta`, `[index]`, `()` for a callable return.
+    pub path: String,
+    /// `any`, `unknown`, or `budget_exhausted`.
+    pub kind: String,
+    /// Categorized cause: `declared`, `budget_exhausted`,
+    /// `no_payload_evidence`, `machinery_envelope`, `not_recorded`.
+    pub reason: String,
+    /// One scrubbed sentence a reader can act on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Aggregate fidelity metric for one service's capture.
@@ -391,6 +411,19 @@ pub struct CheckVerdict {
     /// TS diagnostic codes attributed to this pair's probe, sorted.
     #[serde(default)]
     pub codes: Vec<i64>,
+    /// Whether this verdict is a FACT about two known types (carrick#707,
+    /// R1d): the bucket is `compatible` or `incompatible` AND a deep walk over
+    /// both sides, run after the pinned externals installed, found no
+    /// `any`/`unknown` at any depth. Every other outcome is `false`.
+    ///
+    /// `bucket` alone cannot say this: a side carrying `any` three members
+    /// down clears every whole-type probe gate and then reads compatible
+    /// against any counterparty at all.
+    #[serde(default)]
+    pub resolved: bool,
+    /// Why `resolved` is false. Absent exactly when it is true.
+    #[serde(default)]
+    pub unresolved_reason: Option<String>,
 }
 
 /// A service whose pairs are degraded wholesale (install failure or poison).
@@ -549,7 +582,14 @@ pub struct InferredType {
     /// only party that knows where the tsc-witnessed payload type lives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_type_symbol_source: Option<String>,
-    /// carrick#695 (`receiver_type` only): the package whose declaration file
+    /// Why this inference carries `any`/`unknown` (carrick#376), recorded by
+    /// the inferrer at the decision point that produced it. The inferrer is the
+    /// only layer that can tell "the compiler resolved this to `any`" from
+    /// "the recovery declined to read an unresolvable callee's argument
+    /// because nothing said it was a serialiser", and that difference is the
+    /// whole answer to why an endpoint reports `any`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub any_provenance: Vec<TypeProvenance>,
     /// declares the resolved type, when that file sits under a `node_modules`
     /// tree. `None` for a type the workspace declares itself AND for a type
     /// that did not resolve — absence is never evidence of locality, which is
@@ -2042,6 +2082,7 @@ mod tests {
             primary_type_symbol_source: None,
             declaring_package: None,
             member_return_type: None,
+            any_provenance: Vec::new(),
         }
     }
 
