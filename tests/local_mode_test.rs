@@ -197,10 +197,20 @@ fn local_mode_answers_and_follows_an_edit() {
     );
     let stale = check_json(root, route);
     assert_eq!(stale["stale"], serde_json::json!(true));
+    // Staleness is `stale`, never the verdict's state: `state` carries the
+    // type layer's word, the same one `verdict_state` uses on the PR payload
+    // (carrick#731). The row still says so in its detail, for a reader that
+    // sees one row and not the envelope.
     assert_eq!(
         stale["items"][0]["verdict"]["state"],
-        serde_json::json!("unresolved"),
-        "a verdict about a tree that has moved is unresolved:\n{stale:#}"
+        serde_json::json!("resolved"),
+        "the compiler's verdict is still the compiler's verdict:\n{stale:#}"
+    );
+    assert!(
+        stale["items"][0]["verdict"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("unresolved since your edit")),
+        "and the row says the tree has moved:\n{stale:#}"
     );
 
     // Refresh the one service that changed, and the break is the verdict.
@@ -246,6 +256,11 @@ fn local_mode_answers_and_follows_an_edit() {
         removed["items"][0]["verdict"]["result"],
         serde_json::json!("producer_removed"),
         "a route whose file is gone is a removed producer:\n{removed:#}"
+    );
+    assert_eq!(
+        removed["items"][0]["verdict"]["state"],
+        serde_json::json!("not_checked"),
+        "a removed producer is a routing fact, not a type verdict:\n{removed:#}"
     );
     assert_eq!(
         removed["items"][0]["counterparts"].as_array().map(Vec::len),

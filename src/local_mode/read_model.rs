@@ -82,10 +82,23 @@ pub struct Counterpart {
 }
 
 /// What the type check concluded about a row, at index time.
+///
+/// `state` carries the SAME three words, with the same meanings, as
+/// `verdict_state` on the PR-result payload (carrick#727, carrick#731):
+/// `resolved` = the compiler reached a verdict with no `any`/`unknown`/error
+/// on either side; `unresolved` = a verdict was attempted and a side was not
+/// resolvable; `not_checked` = no type verdict bears on this row at all. One
+/// vocabulary, because one agent reads both contracts in one session.
+///
+/// Staleness is NOT one of them. Whether the tree has moved since the index is
+/// `stale` and `changed_since_index` at the top level, which say it once for
+/// the whole file instead of per row.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct StoredVerdict {
+    pub state: String,
     /// `compatible`, `type_mismatch`, `method_mismatch` or `producer_removed`.
-    pub result: String,
+    /// `None` where the state is the whole statement.
+    pub result: Option<String>,
     pub detail: String,
 }
 

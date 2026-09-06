@@ -90,8 +90,14 @@ pub struct Counterpart {
 /// What the index concluded about one row.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
-    /// `resolved`, `unresolved` (the file changed since the index), or
-    /// `not_checked`.
+    /// The type layer's word, in the same vocabulary as `verdict_state` on the
+    /// PR-result payload (carrick#727, carrick#731): `resolved` = a compiler
+    /// verdict with no `any`/`unknown`/error on either side; `unresolved` = a
+    /// verdict was attempted and a side would not resolve; `not_checked` = no
+    /// type verdict bears on this row.
+    ///
+    /// Never a statement about freshness: `stale` and `changed_since_index` at
+    /// the top level say whether the tree has moved.
     pub state: String,
     pub result: Option<String>,
     pub detail: String,

@@ -148,11 +148,17 @@ fn project(
 
 /// The verdict `check` states for one row.
 ///
+/// `state` is the type layer's word and only that, in the same vocabulary as
+/// `verdict_state` on the PR-result payload (carrick#731): whether the
+/// compiler reached a verdict, whether it tried and a side would not resolve,
+/// or whether no type verdict bears on the row. Whether the tree has moved
+/// since the index is `stale` at the top level; it is said once for the file
+/// rather than smuggled into every row's state, and it is repeated in the
+/// detail so a reader of one row alone still learns it.
+///
 /// A deleted producer is decided here rather than at index time: the index
 /// records what the tree held, and whether a route's file still exists is a
-/// fact about the tree right now. Everything else was computed by the type
-/// check at index time and is repeated, marked `unresolved` when the file has
-/// moved under it.
+/// fact about the tree right now.
 fn verdict_for(
     item: &IndexedItem,
     counterparts: &[Counterpart],
@@ -163,7 +169,9 @@ fn verdict_for(
     if deleted && item.kind == super::read_model::ItemKind::Route {
         let consumers = counterparts.len();
         return Verdict {
-            state: "resolved".to_string(),
+            // A removed producer is a routing fact; no type verdict bears
+            // on it.
+            state: "not_checked".to_string(),
             result: Some("producer_removed".to_string()),
             detail: format!(
                 "this file is gone and the index still serves {} {} here: producer removed, {} consumer(s)",
@@ -190,15 +198,12 @@ fn verdict_for(
     };
 
     Verdict {
-        state: if stale {
-            "unresolved".to_string()
-        } else {
-            "resolved".to_string()
-        },
-        result: Some(stored.result.clone()),
+        state: stored.state.clone(),
+        result: stored.result.clone(),
         detail: if stale {
             format!(
-                "{} (unresolved since your edit: {} has changed since it was indexed)",
+                "{} (unresolved since your edit: {} has changed since it was indexed, so this \
+                 describes the tree the index was built on)",
                 stored.detail, repo.name
             )
         } else {

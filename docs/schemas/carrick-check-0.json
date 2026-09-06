@@ -7,9 +7,11 @@
   "$defs": {
     "result": {
       "type": "object",
+      "comment": "Every response this schema describes is about ONE file, which is why file, repo and service are required. The session-level summary with no file (carrick#728) is a separate command and will carry its own shape here rather than relaxing this list.",
       "required": [
         "schema",
         "file",
+        "repo",
         "service",
         "index_commit",
         "changed_since_index",
@@ -145,7 +147,7 @@
       "properties": {
         "state": {
           "enum": ["resolved", "unresolved", "not_checked"],
-          "description": "resolved = the index holds a verdict; unresolved = the file changed since the index; not_checked = matched, never compared."
+          "description": "The type layer's word, same vocabulary as verdict_state on the PR-result payload (carrick#727, carrick#731). resolved = a compiler verdict with no any/unknown/error on either side; unresolved = a verdict was attempted and a side would not resolve; not_checked = no type verdict bears on this row (method_mismatch, producer_removed, or nothing to compare). Never a statement about freshness: read `stale` for that."
         },
         "result": {
           "type": ["string", "null"],

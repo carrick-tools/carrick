@@ -457,7 +457,13 @@ fn verdict_for(
         .find(|finding| finding_names(finding, operation))
     {
         return Some(StoredVerdict {
-            result: finding.kind.clone(),
+            // A wrong verb is a routing fact, and no type verdict bears on it.
+            state: match finding.kind.as_str() {
+                "type_mismatch" => "resolved",
+                _ => "not_checked",
+            }
+            .to_string(),
+            result: Some(finding.kind.clone()),
             detail: finding.detail.clone(),
         });
     }
@@ -480,7 +486,8 @@ fn verdict_for(
         match edge.type_verdict {
             Some(crate::operation::TypeVerdict::Incompatible) => {
                 return Some(StoredVerdict {
-                    result: "type_mismatch".to_string(),
+                    state: "resolved".to_string(),
+                    result: Some("type_mismatch".to_string()),
                     detail: edge.mismatch_reason.clone().unwrap_or_else(|| {
                         "the compiler found the two types incompatible".to_string()
                     }),
@@ -488,14 +495,30 @@ fn verdict_for(
             }
             Some(crate::operation::TypeVerdict::Compatible) => {
                 verdict = Some(StoredVerdict {
-                    result: "compatible".to_string(),
+                    state: "resolved".to_string(),
+                    result: Some("compatible".to_string()),
                     detail: "the compiler compared both sides and found them compatible"
                         .to_string(),
                 });
             }
-            // Unverifiable and "never evaluated" are the same thing to a
-            // reader: nothing was compared, so nothing is claimed.
-            _ => {}
+            // A verdict was attempted and a side of the pair was not
+            // resolvable — `any`, `unknown`, or a type the capture could not
+            // reach. Distinct from never having been compared, and the
+            // difference is the whole reason this row is kept: a reader must
+            // not read "nothing was claimed" as "nothing is wrong".
+            Some(crate::operation::TypeVerdict::Unverifiable) if verdict.is_none() => {
+                verdict = Some(StoredVerdict {
+                    state: "unresolved".to_string(),
+                    result: None,
+                    detail: "the pair was compared and a side of it did not resolve to a \
+                             usable type, so nothing is claimed about it"
+                        .to_string(),
+                });
+            }
+            // A pair already compared successfully keeps that verdict: one
+            // unresolvable peer does not erase a real comparison.
+            Some(crate::operation::TypeVerdict::Unverifiable) => {}
+            None => {}
         }
     }
     verdict

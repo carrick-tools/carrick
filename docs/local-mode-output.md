@@ -149,9 +149,26 @@ read the facts, and a reader that reads to the end knows what is missing.
 
 | field | type | meaning |
 |---|---|---|
-| `state` | `"resolved"` \| `"unresolved"` \| `"not_checked"` | `resolved` = the index holds a verdict; `unresolved` = the file changed since the index, so the verdict describes an older tree; `not_checked` = matched, never compared |
-| `result` | `"compatible"` \| `"type_mismatch"` \| `"method_mismatch"` \| `"producer_removed"` \| null | null while `state` is `not_checked` |
+| `state` | `"resolved"` \| `"unresolved"` \| `"not_checked"` | the type layer's word, and only that |
+| `result` | `"compatible"` \| `"type_mismatch"` \| `"method_mismatch"` \| `"producer_removed"` \| null | null where `state` is the whole statement |
 | `detail` | string | one line, written to be read by a model |
+
+`state` uses the SAME three words with the SAME meanings as `verdict_state` on
+the PR-result payload (carrick#727, carrick#731), because one agent reads both
+contracts in one session:
+
+- **`resolved`** — the compiler reached a verdict, with no `any`, `unknown` or
+  error on either side. `result` is `compatible` or `type_mismatch`.
+- **`unresolved`** — a verdict was attempted and a side of the pair did not
+  resolve to a usable type, so nothing is claimed. `result` is null.
+- **`not_checked`** — no type verdict bears on this row: nothing pairs with it,
+  the pair was never compared, or the finding is a routing fact rather than a
+  type one (`method_mismatch`, `producer_removed`).
+
+**`state` never says anything about freshness.** Whether the tree has moved
+since the index is `stale` and `changed_since_index` at the top level, said
+once for the file. The verdict's `detail` repeats it in words for a reader that
+sees one row and not the envelope.
 
 `producer_removed` is the deleted-route case: the file is gone from disk, the
 index still holds the route, and its consumers are listed as counterparts.
@@ -232,9 +249,15 @@ Explicit paths, relative to the workspace file. No directory walk.
 
 Both take exactly one file. Neither answers for a workspace: with no path they
 print `carrick touch needs a file path` and exit 2, which is a usage error and
-not a read. A session-level summary (the workspace's services, their commits
-and their boundaries, with no file in the question) is a separate command and
-is not built — carrick#728.
+not a read, and nothing is written to stdout. That is why `file` (and `repo`,
+and `service`) are required in the schema: every response this contract
+describes is about one file.
+
+A session-level summary — the workspace's services, their commits, how far each
+has moved and what each one's boundary is, with no file in the question — is a
+separate command, **carrick#728**, and it will carry its own response shape in
+this document and its own entry in the schema rather than relaxing `required`
+here. A reader must not build a session line by calling `touch` with no path.
 
 ## Out of scope in this version
 
