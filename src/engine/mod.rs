@@ -6666,6 +6666,86 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // carrick#376: per-field `any` provenance reaches the manifest entry
+    // -----------------------------------------------------------------
+
+    fn provenance(path: &str, reason: &str) -> crate::services::type_sidecar::TypeProvenance {
+        crate::services::type_sidecar::TypeProvenance {
+            path: path.to_string(),
+            kind: "any".to_string(),
+            reason: reason.to_string(),
+            detail: Some("why".to_string()),
+        }
+    }
+
+    /// The capture self-check's findings reach the entry a reader sees, and
+    /// they reach it even when the entry has no printed type at all: "no type
+    /// here, and here is why" is the answer, and an Unknown entry is exactly
+    /// the one the definition resolution skips.
+    #[test]
+    fn capture_provenance_joins_the_manifest_by_alias() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("carrick-manifest.json"),
+            serde_json::json!({
+                "aliases": [{
+                    "alias": "OrderView",
+                    "anchor_kind": "infer",
+                    "source_file": "lib/api.ts",
+                    "anchor_origin": "deterministic-infer",
+                    "serialization": "structural_fallback",
+                    "self_check": "decayed_internal",
+                    "top_type_at_self_check": false,
+                    "any_provenance": [
+                        { "path": "meta", "kind": "any", "reason": "declared", "detail": "d" }
+                    ]
+                }]
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+
+        let mut manifest = vec![consumer_entry("OrderView"), consumer_entry("Untouched")];
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+        stamp_capture_provenance(&mut manifest, dir.path());
+
+        assert_eq!(manifest[0].any_provenance.len(), 1);
+        assert_eq!(manifest[0].any_provenance[0].path, "meta");
+        assert_eq!(manifest[0].any_provenance[0].reason, "declared");
+        assert!(
+            manifest[1].any_provenance.is_empty(),
+            "an alias with no capture record must be left alone, not blanked"
+        );
+    }
+
+    /// Two layers report here and neither subsumes the other, so both are
+    /// kept — but a repeated finding must not double up and the order must not
+    /// depend on which layer ran first, or scan-twice byte-identity fails.
+    #[test]
+    fn provenance_merge_is_deduped_and_order_independent() {
+        let inferrer = provenance("", "no_payload_evidence");
+        let capture_a = provenance("meta", "declared");
+        let capture_b = provenance("items<0>.id", "declared");
+
+        let mut one = Vec::new();
+        merge_any_provenance(&mut one, [inferrer.clone()]);
+        merge_any_provenance(&mut one, [capture_a.clone(), capture_b.clone()]);
+
+        let mut other = Vec::new();
+        merge_any_provenance(&mut other, [capture_b, capture_a]);
+        merge_any_provenance(&mut other, [inferrer.clone()]);
+
+        assert_eq!(one, other, "merge order must not change the published list");
+        assert_eq!(
+            one.iter().map(|p| p.path.as_str()).collect::<Vec<_>>(),
+            vec!["", "items<0>.id", "meta"]
+        );
+
+        merge_any_provenance(&mut one, [inferrer]);
+        assert_eq!(one.len(), 3, "the same finding must not be published twice");
+    }
+
     /// A genuine shape resolved by the sidecar promotes the entry to Implicit.
     #[test]
     fn enrich_promotes_resolved_consumer_shape() {
