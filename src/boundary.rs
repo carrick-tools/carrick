@@ -113,6 +113,14 @@ pub struct ServiceBoundary {
     /// so a row the model states there has no registration witness at all.
     /// `None` on a blob from a scanner that did not count it — absent is not
     /// the same as counting none.
+    ///
+    /// Not disjoint from `model_contradictions_discarded`, and the two must not
+    /// be added: one model row can raise both. A claimed route module that also
+    /// holds a route-shaped literal (a `fetch("/api/x")` in its loader is
+    /// enough) gets that row's path re-anchored to the literal first — one
+    /// discarded STATEMENT — and the re-anchored row then matches no derived
+    /// route and is dropped whole — one discarded ROW. Each count is true of a
+    /// different thing about the same row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_endpoints_discarded_in_claimed_modules: Option<usize>,
     /// Indexed routes with no resolved response type, so nothing on the

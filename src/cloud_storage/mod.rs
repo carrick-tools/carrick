@@ -966,6 +966,22 @@ mod tests {
             resolution_source: Some(ResolutionSource::FileBasedRoute),
             view_module: false,
         });
+        // A route whose module also renders a view (carrick#704).
+        graph.endpoints.push(ResolvedEndpoint {
+            method: "GET".to_string(),
+            path: "/admin".to_string(),
+            full_path: "/admin".to_string(),
+            handler: Some("loader".to_string()),
+            owner: "http".to_string(),
+            file_location: "app/routes/admin._index.tsx:7".to_string(),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: Some(ResolutionSource::FileBasedRoute),
+            view_module: true,
+        });
         graph.data_calls.push(DataFetchingCall {
             method: "POST".to_string(),
             target_url: "${process.env.GATEWAY_URL}/v1/quote".to_string(),
@@ -1000,6 +1016,80 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&calls[0]).unwrap()["resolution_source"],
             "whole_url_env"
+        );
+    }
+
+    /// carrick#704: `view_module` survives the one projection both cloud paths
+    /// go through, and reaches the wire only where it is true. The cloud reads
+    /// the mount-graph row for HTTP and this top-level copy as the fallback, so
+    /// both halves are asserted.
+    #[test]
+    fn mount_graph_projection_carries_the_view_module_marker() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
+
+        let mut graph = MountGraph::new();
+        let row = |path: &str, file: &str, view_module: bool| ResolvedEndpoint {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            full_path: path.to_string(),
+            handler: Some("loader".to_string()),
+            owner: "http".to_string(),
+            file_location: file.to_string(),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: Some(ResolutionSource::FileBasedRoute),
+            view_module,
+        };
+        graph
+            .endpoints
+            .push(row("/admin", "app/routes/admin._index.tsx:7", true));
+        graph.endpoints.push(row(
+            "/resources/things",
+            "app/routes/resources.things.tsx:9",
+            false,
+        ));
+        graph.data_calls.push(DataFetchingCall {
+            method: "GET".to_string(),
+            target_url: "/internal/audit".to_string(),
+            canonical_path: "/internal/audit".to_string(),
+            client: "fetch".to_string(),
+            file_location: "app/routes/settings.builds.tsx:19".to_string(),
+            call_kind: None,
+            repo_name: None,
+            service_name: None,
+            host: None,
+            line: Some(19),
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: None,
+        });
+
+        let (endpoints, calls) = mount_graph_to_api_details(&graph);
+        assert!(endpoints[0].view_module, "the view module keeps its marker");
+        assert!(!endpoints[1].view_module, "a resource route is not one");
+        assert!(!calls[0].view_module, "a call is never a view module");
+
+        // On the wire: present only where it is true, so the field costs
+        // nothing on the rows that are the majority.
+        let wire = serde_json::to_value(&endpoints[0]).unwrap();
+        assert_eq!(wire["view_module"], true);
+        assert!(
+            serde_json::to_value(&endpoints[1])
+                .unwrap()
+                .get("view_module")
+                .is_none(),
+            "a false marker is absent, not written onto every row"
+        );
+        assert!(
+            serde_json::to_value(&graph.endpoints[0])
+                .unwrap()
+                .get("view_module")
+                .is_some_and(|v| v == true),
+            "and the mount-graph row the cloud actually reads carries it too"
         );
     }
 
@@ -1143,6 +1233,12 @@ mod tests {
         let graph = data.mount_graph.expect("the blob carries its mount graph");
         assert!(graph.endpoints[0].resolution_source.is_none());
         assert!(graph.data_calls[0].resolution_source.is_none());
+
+        // carrick#704's field the same way: a blob with no `view_module` key
+        // reads as "not a view module" on the operation and on the mount-graph
+        // row behind it, never as missing data.
+        assert!(!data.endpoints[0].view_module);
+        assert!(!graph.endpoints[0].view_module);
     }
 
     /// A verdict round-trips through JSON keyed by canonical pair identity, and a

@@ -122,10 +122,12 @@ pub struct FileCentricAnalysisResult {
 #[derive(Debug, Default)]
 pub struct FileRouteDerivation {
     /// Whether a convention claimed this file AND states its whole route set
-    /// from the module's exports. False for a file no convention matched, and
-    /// for a convention that routes a single default export: there the served
-    /// methods are a runtime branch, so the derivation is silent about them
-    /// rather than complete.
+    /// from the module's exports. False for a file no convention matched; for
+    /// a convention that routes a single default export, where the served
+    /// methods are a runtime branch; and for a module that re-exports another
+    /// wholesale, where the export list is a lower bound rather than the whole
+    /// surface. In each of those the derivation is silent about the route set
+    /// rather than complete, so nothing may be discarded on its authority.
     pub claimed: bool,
     /// The endpoints derived from the file's location and its exported
     /// handlers. Empty when nothing was claimed, and empty when a claimed
@@ -4305,14 +4307,20 @@ impl FileOrchestrator {
             return FileRouteDerivation::default();
         };
 
+        let module = scanner.module_exports(file_path, content);
         // A convention that reads the method off an export name states this
         // module's WHOLE route set from its exports: every handler it exports
-        // is a row here, and an export that names no method is not a route. A
-        // convention that routes one default export cannot say that — the
-        // methods it serves are a runtime branch — so it claims the file for
-        // path derivation without claiming the route set.
-        let claimed = route.method_source == MethodSource::ExportName;
-        let exports = scanner.exported_handlers(file_path, content);
+        // is a row here, and an export that names no method is not a route.
+        //
+        // Two things stop that from being the whole answer. A convention that
+        // routes one default export cannot say it at all — the methods it
+        // serves are a runtime branch. And a module that re-exports another
+        // wholesale (`export * from "./route.server"`) exports bindings named
+        // in a file this reader never opened, so its own handler list is a
+        // lower bound; claiming it would discard a model row that correctly
+        // described the route the re-export serves.
+        let claimed = route.method_source == MethodSource::ExportName && !module.reexports_all;
+        let exports = module.handlers;
         // The module renders a view as well as serving the route when it also
         // default-exports: a fact from the export list, not a guess.
         let view_module = exports.iter().any(|handler| handler.name == "default");
@@ -11870,6 +11878,44 @@ export function serializeWidget(w) { return w; }
         );
         assert!(component_only.claimed);
         assert!(component_only.endpoints.is_empty());
+    }
+
+    /// A module that re-exports another wholesale does not state its route set
+    /// either: `export * from "./route.server"` exports bindings named in a
+    /// file this reader never opened, so the handler list is a lower bound.
+    /// Claiming it would discard a model row that correctly described the route
+    /// the re-export serves.
+    #[test]
+    fn test_file_based_endpoints_a_wholesale_reexport_does_not_claim_the_route_set() {
+        let scanner = SwcScanner::new();
+        let rel = Path::new("app/routes/api.v1.widgets.ts");
+
+        let opaque = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            rel,
+            rel,
+            "export * from \"./widgets.server\";\n",
+            &flat_conventions(),
+        );
+        assert!(
+            !opaque.claimed,
+            "the export list is a lower bound, so it states nothing to discard against"
+        );
+        assert!(opaque.endpoints.is_empty());
+
+        // A NAMED re-export names its binding, so the list is complete and the
+        // route is derived from it exactly as an inline export would be.
+        let named = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            rel,
+            rel,
+            "export { loader } from \"./widgets.server\";\n",
+            &flat_conventions(),
+        );
+        assert!(named.claimed);
+        assert_eq!(named.endpoints.len(), 1);
+        assert_eq!(named.endpoints[0].method, "GET");
+        assert_eq!(named.endpoints[0].path, "/api/v1/widgets");
     }
 
     /// The other half of the claim: a convention that routes a single default

@@ -280,6 +280,23 @@ pub struct ExportedHandler {
     pub declared_methods: Vec<String>,
 }
 
+/// Everything one module's top-level export list says, read in a single parse.
+///
+/// The handlers are the reason this exists; `reexports_all` is the reason it is
+/// a struct. A module that writes `export * from "./route.server"` exports
+/// bindings this reader cannot name — they are in another file — so its handler
+/// list is a lower bound rather than the module's whole surface, and a caller
+/// that treats "no handler here" as "this module serves nothing" would be wrong
+/// about it (carrick#704).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModuleExports {
+    /// One entry per exported binding this module names itself.
+    pub handlers: Vec<ExportedHandler>,
+    /// Whether the module re-exports another module wholesale (`export * from`),
+    /// which makes `handlers` incomplete by construction.
+    pub reexports_all: bool,
+}
+
 /// A route declared as data in a registry array
 /// (`{ method: 'GET', path: '/health', handler: healthCheckHandler }`). The
 /// HTTP method, path, and handler owner are all structural facts — no call site
@@ -569,6 +586,13 @@ impl SwcScanner {
     /// it. Returns one [`ExportedHandler`] per exported binding; `export default`
     /// is reported with the name `"default"`.
     pub fn exported_handlers(&self, file_path: &Path, content: &str) -> Vec<ExportedHandler> {
+        self.module_exports(file_path, content).handlers
+    }
+
+    /// The same parse, with the one fact about the export list that the handler
+    /// vector cannot carry: whether the module re-exports another wholesale.
+    /// See [`ModuleExports`].
+    pub fn module_exports(&self, file_path: &Path, content: &str) -> ModuleExports {
         use swc_common::{FileName, Spanned};
         use swc_ecma_parser::{Parser, StringInput, Syntax, lexer::Lexer};
 
@@ -603,7 +627,7 @@ impl SwcScanner {
         let mut parser = Parser::new_from(lexer);
         let module = match parser.parse_module() {
             Ok(m) => m,
-            Err(_) => return Vec::new(),
+            Err(_) => return ModuleExports::default(),
         };
 
         // Method guards are read per top-level *binding*, exported or not, so a
@@ -675,6 +699,7 @@ impl SwcScanner {
         }
 
         let mut out = Vec::new();
+        let mut reexports_all = false;
         let mut push = |name: String,
                         span: swc_common::Span,
                         method_guards: Vec<String>,
@@ -763,11 +788,18 @@ impl SwcScanner {
                     let declared = call_declared_methods(&e.expr);
                     push("default".to_string(), e.span(), guards, declared);
                 }
+                // `export * from "./x"`: the bindings are named in another
+                // module, so nothing is pushed and the list is recorded as
+                // incomplete.
+                ModuleDecl::ExportAll(_) => reexports_all = true,
                 _ => {}
             }
         }
 
-        out
+        ModuleExports {
+            handlers: out,
+            reexports_all,
+        }
     }
 
     /// Extract route-descriptor endpoints declared as data in a registry array

@@ -216,9 +216,15 @@ pub struct EndpointResult {
     /// extension (carrick#704): once a page module's read handler is
     /// recognised as the GET it is, a reader needs to tell a page's own data
     /// endpoint from an API surface a sibling service is expected to call.
-    /// `default` so an answer written before the field existed reads as
-    /// `false`.
-    #[serde(default)]
+    /// `skip_deserializing` is what makes "never from the model" true rather
+    /// than merely intended: `file_results` holds the model's raw answers, so
+    /// this field is on a shape the model's JSON is parsed into, and a
+    /// hallucinated key would otherwise be believed on a model-only row. The
+    /// value is recomputed from the module's exports on every scan, cold or
+    /// incremental, so nothing needs to round-trip. Skipped when false on the
+    /// way out for the same reason `resolution_source` is: `file_results` is
+    /// the bulk of the blob and the first thing the size limit drops.
+    #[serde(skip_deserializing, skip_serializing_if = "std::ops::Not::not")]
     pub view_module: bool,
 }
 
