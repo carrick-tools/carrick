@@ -67,6 +67,7 @@ fixture_targets=(
   e2e-scaffolding
   env-var-whole-url
   fastify-api
+  file-route-model-twin
   flat-routes-declared-method
   flat-routes-method-guard
   graphql-service
