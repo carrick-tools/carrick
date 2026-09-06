@@ -18,7 +18,8 @@ export type InferKind =
   | 'response_body'     // Find response body (.json()/.send()/ctx.body)
   | 'request_body'      // Find request body (req.body/ctx.request.body or call payloads)
   | 'signature_return'  // Function return for the signature hint — NO Promise/wrapper unwrapping
-  | 'function_param';   // Type of a single named parameter (explicit or contextually inferred)
+  | 'function_param'    // Type of a single named parameter (explicit or contextually inferred)
+  | 'receiver_type';    // Type of the RECEIVER of a member call (carrick#695)
 
 // ============================================================================
 // Extraction Config Types (Agent-Informed Payload Unwrapping)
@@ -614,6 +615,19 @@ export interface InferredType {
   infer_kind: InferKind;
   /** The unwrapped/extracted payload type (if different from type_string) */
   payload_type_string?: string;
+  /**
+   * carrick#695: for `receiver_type`, the package that DECLARES the resolved
+   * type, when its declaration file sits under a `node_modules` tree. Absent
+   * for a type the workspace itself declares, and absent when the type did not
+   * resolve — the caller must not read absence as "local".
+   */
+  declaring_package?: string;
+  /**
+   * carrick#695: for `receiver_type`, the awaited return type of the member
+   * invoked on that receiver. A fact returned alongside the receiver, never a
+   * classification on its own.
+   */
+  member_return_type?: string;
   /**
    * The deterministic source symbol of the resolved type (`Payment`), derived
    * from the ts-morph `Type`'s `getSymbol() || getAliasSymbol()` name with

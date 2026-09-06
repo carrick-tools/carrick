@@ -146,6 +146,12 @@ pub enum ResolutionSource {
     DescriptorRoute,
     /// A route table binding a literal path to an imported controller (#580).
     ClassController,
+    /// The compiler's answer for what the RECEIVER of a bare
+    /// `x.verb("/lit", arg)` site IS (carrick#695): an instance of a detected
+    /// server framework registers a route, an instance of a detected data
+    /// fetcher issues a request. The path and verb are the site's own
+    /// literals; only the ROLE comes from the type.
+    ReceiverType,
     /// The candidate's own route-shaped first-argument literal. The one source
     /// that states no row of its own: a bare `x.verb("/lit", arg)` carries no
     /// role, so whether it registers a route or requests one is the model's to
