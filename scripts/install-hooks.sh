@@ -10,17 +10,24 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
-HOOKS_DIR="$REPO_ROOT/.git/hooks"
 
 echo "🪢 Installing Carrick Git Hooks"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-# Check if .git directory exists
-if [ ! -d "$REPO_ROOT/.git" ]; then
-    echo "❌ Error: .git directory not found. Are you in a git repository?"
+# Asked of git rather than assembled from the repo root, because inside a
+# linked worktree `.git` is a FILE pointing at the real directory and this
+# script simply refused to run there — which is the checkout the hook's own
+# parallel-run problem shows up in (carrick#740). The COMMON dir is deliberate:
+# hooks live once per repository and every worktree runs the same file.
+if ! HOOKS_DIR="$(cd "$REPO_ROOT" && git rev-parse --git-common-dir)/hooks"; then
+    echo "❌ Error: not a git repository."
     exit 1
 fi
+case "$HOOKS_DIR" in
+    /*) ;;
+    *) HOOKS_DIR="$REPO_ROOT/$HOOKS_DIR" ;;
+esac
 
 # Create hooks directory if it doesn't exist
 mkdir -p "$HOOKS_DIR"
@@ -28,7 +35,11 @@ mkdir -p "$HOOKS_DIR"
 # Install pre-commit hook
 echo "Installing pre-commit hook..."
 
-cat > "$HOOKS_DIR/pre-commit" << 'EOF'
+# Written beside the hook and moved into place, never truncated in place: the
+# hooks directory is shared by every worktree of this repo, so a re-install can
+# land while another checkout's commit is part-way through reading its own copy
+# of the hook (carrick#740).
+cat > "$HOOKS_DIR/pre-commit.new" << 'EOF'
 #!/bin/bash
 #
 # Carrick Pre-Commit Hook
@@ -79,7 +90,11 @@ echo ""
 echo "Running clippy linter..."
 echo ""
 
-if ! cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/carrick-clippy-output.txt; then
+# Not captured to a file (carrick#740). A fixed path under /tmp is one file
+# shared by every checkout of this repo, so two hooks running at once delete
+# each other's copy mid-run and the second commit fails on a missing file
+# rather than on a failing check. Nothing ever read this one back.
+if ! cargo clippy --all-targets --all-features -- -D warnings 2>&1; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "❌ Clippy warnings found! Commit blocked."
@@ -88,11 +103,9 @@ if ! cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/ca
     echo "Fix the clippy warnings and try again."
     echo "To bypass this hook (not recommended): git commit --no-verify"
     echo ""
-    rm -f /tmp/carrick-clippy-output.txt
     exit 1
 fi
 
-rm -f /tmp/carrick-clippy-output.txt
 echo "✅ Clippy checks passed!"
 
 # Build the type sidecar first: several integration tests spawn
@@ -114,19 +127,14 @@ echo ""
 echo "Running Rust test suite..."
 echo ""
 
-if cargo test --quiet 2>&1 | tee /tmp/carrick-test-output.txt; then
-    # Count test results
-    PASSED=$(grep -o "test result: ok" /tmp/carrick-test-output.txt | wc -l | tr -d ' ')
-
+# Not captured either, and for the same reason: the only thing ever read back
+# out of this capture was a count nothing printed.
+if cargo test --quiet 2>&1; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "✅ Rust tests passed!"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
-
-    # Clean up
-    rm -f /tmp/carrick-test-output.txt
-
 else
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -136,9 +144,6 @@ else
     echo "Fix the failing tests and try again."
     echo "To bypass this hook (not recommended): git commit --no-verify"
     echo ""
-
-    # Clean up
-    rm -f /tmp/carrick-test-output.txt
 
     exit 1
 fi
@@ -153,7 +158,8 @@ exit 0
 EOF
 
 # Make hook executable
-chmod +x "$HOOKS_DIR/pre-commit"
+chmod +x "$HOOKS_DIR/pre-commit.new"
+mv "$HOOKS_DIR/pre-commit.new" "$HOOKS_DIR/pre-commit"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
