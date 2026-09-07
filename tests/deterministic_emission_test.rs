@@ -47,6 +47,11 @@
 //! `file-route-model-twin` is the third arrangement (carrick#660): the model
 //! answers for a route the file layout already states, so what is pinned is
 //! not the method or the target but WHO the row says stated it.
+//!
+//! A row surviving the silence is not the whole claim: a row whose TYPE the
+//! model has to supply is one silence away from a wrong contract, not a
+//! missing one. So the two controller fixtures also pin what their routes say
+//! about their response with no model answer (carrick#745).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -189,6 +194,43 @@ fn row_at(rows: &[serde_json::Value], file: &str, line: i64) -> serde_json::Valu
     found[0].clone()
 }
 
+/// carrick#745: a route emitted from a controller class must not publish the
+/// declaring CLASS as its response type.
+///
+/// The row's span is the whole handler METHOD, so every locator that reads a
+/// span resolves the smallest node containing it — the class — and the type
+/// comes out as that class's member list, which is a response type of nothing.
+/// Since carrick#727 these rows are facts, so the wrong shape blocks.
+///
+/// The negative half holds with or without a resolved type, which is what makes
+/// it worth asserting on a machine where the sidecar was never built (the type
+/// fields are then simply absent). The positive half — the handler's own return
+/// — is asserted where a type came back, and CI is where that is guaranteed.
+fn assert_response_is_the_handlers(row: &serde_json::Value, member_of_the_return: &str) {
+    let symbol = row["primary_type_symbol"].as_str().unwrap_or_default();
+    assert!(
+        !symbol.ends_with("Controller"),
+        "the declaring class is not this route's response type: {row:#?}"
+    );
+    let Some(definition) = row["expanded_definition"]
+        .as_str()
+        .or_else(|| row["resolved_definition"].as_str())
+    else {
+        eprintln!("no resolved type for {row:#?} — sidecar not built?");
+        return;
+    };
+    assert!(
+        definition.contains(member_of_the_return),
+        "the response must be the handler METHOD's return, got: {definition}"
+    );
+    // A member no return type of these handlers has, and every member list of
+    // the declaring class does.
+    assert!(
+        !definition.contains("=>"),
+        "a class's member list is not a response type: {definition}"
+    );
+}
+
 fn assert_none_at(rows: &[serde_json::Value], file: &str, line: i64) {
     assert!(
         !rows
@@ -324,6 +366,19 @@ fn a_silent_model_keeps_every_class_controller_route() {
         let row = row_at(&endpoints, file, line);
         assert_eq!(row["method"], method, "method at {file}:{line}");
         assert_eq!(row["path"], path, "path at {file}:{line}");
+        // carrick#745: every handler in this fixture declares `: void` — it
+        // writes its payload onto the context object, where this layer cannot
+        // read it. The row states no response type rather than publishing the
+        // declaring class (or the `void` the method returns, which self-checks
+        // clean and reads incompatible against every typed consumer).
+        assert!(
+            matches!(
+                row.get("type_state").and_then(|state| state.as_str()),
+                None | Some("Unknown")
+            ) && row.get("expanded_definition").is_none()
+                && row.get("resolved_definition").is_none(),
+            "a handler that declares no return value states no response type: {row:#?}"
+        );
     }
     assert_eq!(endpoints.len(), 13, "no other route: {endpoints:#?}");
 }
@@ -348,6 +403,7 @@ fn a_silent_model_keeps_every_decorator_route() {
             row["resolution_source"], "decorator_route",
             "source at line {line}"
         );
+        assert_response_is_the_handlers(&row, "id: string");
     }
     assert_eq!(
         endpoints.len(),

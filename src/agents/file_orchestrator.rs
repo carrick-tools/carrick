@@ -2702,6 +2702,73 @@ impl FileOrchestrator {
                     continue;
                 }
 
+                // A route a controller class declares (#580, carrick#732): the
+                // same shape one indirection along. The row's span is the whole
+                // HANDLER METHOD, so every locator that reads a span resolves
+                // the smallest node that CONTAINS it — the declaring class —
+                // and a class's member list is published as the route's request
+                // and response contract (carrick#745). Since carrick#727 those
+                // rows are facts, so the wrong shape blocks.
+                //
+                // The handler's own return is the response, and the line its
+                // declaration opens on is the anchor that resolves it. A model
+                // that described the file states a response expression of its
+                // own, which is the better anchor and is tried first; the
+                // handler is the fallback, so the row's type no longer depends
+                // on the model answering at all. The request side is skipped
+                // outright unless the model located a payload: a controller
+                // method's request body is a parameter this layer cannot name,
+                // exactly as a file-based route's is not recoverable from its
+                // signature.
+                if let Some(handler_line) = endpoint.handler_declaration_line {
+                    if !no_payload {
+                        let model_anchored = match endpoint.emission_style {
+                            Some(EmissionStyle::ReturnValue) => push_infer(
+                                &file_path_absolute,
+                                line_number,
+                                InferKind::FunctionReturn,
+                                response_alias.clone(),
+                                InferLocator::Text {
+                                    expression_text: endpoint.response_expression_text.as_deref(),
+                                    expression_line: endpoint.response_expression_line,
+                                },
+                            ),
+                            _ => push_infer(
+                                &file_path_absolute,
+                                line_number,
+                                InferKind::ResponseBody,
+                                response_alias.clone(),
+                                InferLocator::Text {
+                                    expression_text: endpoint.response_expression_text.as_deref(),
+                                    expression_line: endpoint.response_expression_line,
+                                },
+                            ),
+                        };
+                        if !model_anchored {
+                            push_infer(
+                                &file_path_absolute,
+                                handler_line,
+                                InferKind::FunctionReturn,
+                                response_alias.clone(),
+                                InferLocator::Line,
+                            );
+                        }
+                    }
+                    if should_infer_request_body(&method) {
+                        let _ = push_infer(
+                            &file_path_absolute,
+                            line_number,
+                            InferKind::RequestBody,
+                            request_alias.clone(),
+                            InferLocator::Text {
+                                expression_text: endpoint.payload_expression_text.as_deref(),
+                                expression_line: endpoint.payload_expression_line,
+                            },
+                        );
+                    }
+                    continue;
+                }
+
                 // Route response inference by the model's emission_style
                 // classification. `None` (field omitted — e.g. cached
                 // pre-emission-style analysis) falls back to imperative-send,
@@ -4461,6 +4528,7 @@ impl FileOrchestrator {
                     methods
                         .into_iter()
                         .map(|method| EndpointResult {
+                            handler_declaration_line: None,
                             candidate_id: format!("file-route:{}:{}", method, h.span_start),
                             line_number: h.line_number as i32,
                             owner_node: FILE_BASED_ROUTE_OWNER.to_string(),
@@ -4519,6 +4587,7 @@ impl FileOrchestrator {
                     .unwrap_or_else(|| ROUTE_DESCRIPTOR_OWNER.to_string());
                 EndpointResult {
                     view_module: false,
+                    handler_declaration_line: None,
                     candidate_id: format!("route-descriptor:{}:{}", method, d.span_start),
                     line_number: d.line_number as i32,
                     owner_node: handler.clone(),
@@ -4552,6 +4621,12 @@ impl FileOrchestrator {
     /// The owner is the class name, which matches no mount, so the joined path
     /// is used as-is — like a file-based, descriptor or class-controller
     /// route.
+    ///
+    /// The row also carries what the type layer needs to read the handler's
+    /// response without the model (carrick#745): the line the METHOD declares
+    /// itself on, and a no-payload claim where the method's annotation states
+    /// it returns no value. Without them the row's only anchor is the method's
+    /// span, which resolves the declaring CLASS.
     fn decorator_route_endpoints(
         scanner: &SwcScanner,
         file_path: &Path,
@@ -4562,6 +4637,7 @@ impl FileOrchestrator {
             .into_iter()
             .map(|route: DecoratorRoute| EndpointResult {
                 view_module: false,
+                handler_declaration_line: u32::try_from(route.declaration_line).ok(),
                 candidate_id: format!("decorator-route:{}:{}", route.method, route.span_start),
                 line_number: i32::try_from(route.line_number).unwrap_or(0),
                 owner_node: route.class_name,
@@ -4575,7 +4651,7 @@ impl FileOrchestrator {
                 payload_expression_line: None,
                 response_expression_text: None,
                 response_expression_line: None,
-                emission_style: None,
+                emission_style: route.returns_no_payload.then_some(EmissionStyle::NoPayload),
                 primary_type_symbol: None,
                 type_import_source: None,
                 resolution_source: None,
@@ -4606,6 +4682,11 @@ impl FileOrchestrator {
     /// Silent on anything it cannot resolve structurally: a non-relative
     /// specifier, a module that default-exports something other than a class
     /// declared in it, or a class with no method answering an HTTP method.
+    ///
+    /// Each row carries the handler's own declaration line and, where the
+    /// method's annotation states it returns no value, a no-payload claim: the
+    /// type layer anchors on the METHOD, never on the method's span, which
+    /// resolves the declaring class (carrick#745).
     fn class_controller_endpoints(
         scanner: &SwcScanner,
         resolver: &mut BindingResolver,
@@ -4640,10 +4721,12 @@ impl FileOrchestrator {
                 continue;
             };
             for method in controller.methods {
+                let returns_no_payload = method.returns_no_payload;
                 endpoints.push((
                     resolved.file.clone(),
                     EndpointResult {
                         view_module: false,
+                        handler_declaration_line: u32::try_from(method.declaration_line).ok(),
                         candidate_id: format!(
                             "class-controller:{}:{}",
                             method.http_method, method.span_start
@@ -4660,7 +4743,7 @@ impl FileOrchestrator {
                         payload_expression_line: None,
                         response_expression_text: None,
                         response_expression_line: None,
-                        emission_style: None,
+                        emission_style: returns_no_payload.then_some(EmissionStyle::NoPayload),
                         primary_type_symbol: None,
                         type_import_source: None,
                         resolution_source: None,
@@ -5202,6 +5285,7 @@ impl FileOrchestrator {
         method: &str,
     ) -> EndpointResult {
         EndpointResult {
+            handler_declaration_line: None,
             candidate_id: candidate.candidate_id.clone(),
             line_number: line,
             owner_node: candidate
@@ -5503,8 +5587,13 @@ impl FileOrchestrator {
                     }
                     // A fact the convention read off the module's structure,
                     // which the model has no way to state, travels onto the
-                    // row that is kept.
+                    // row that is kept — the module's view-ness, and the line
+                    // the handler a controller pass found declares itself on
+                    // (carrick#745), which is the type layer's anchor when the
+                    // model reported no response expression of its own.
                     endpoint.view_module = result.endpoints[index].view_module;
+                    endpoint.handler_declaration_line =
+                        result.endpoints[index].handler_declaration_line;
                     result.endpoints.remove(index);
                     deterministic_rows -= 1;
                     stats.model_rows_joined += 1;
@@ -8582,6 +8671,7 @@ export * from "./aFetch.js";"#,
                     pattern_matched: ".use(".to_string(),
                 }],
                 endpoints: vec![EndpointResult {
+                    handler_declaration_line: None,
                     view_module: false,
                     candidate_id: "span:100-140".to_string(),
                     line_number: 5,
@@ -8633,6 +8723,7 @@ export * from "./aFetch.js";"#,
         let orchestrator = FileOrchestrator::new(agent_service);
 
         let endpoint = |line_number: i32, method: &str, path: &str| EndpointResult {
+            handler_declaration_line: None,
             view_module: false,
             candidate_id: format!("span:{line_number}"),
             line_number,
@@ -8986,6 +9077,7 @@ export * from "./aFetch.js";"#,
             "src/routes/download.ts".to_string(),
             FileAnalysisResult {
                 endpoints: vec![EndpointResult {
+                    handler_declaration_line: None,
                     view_module: false,
                     candidate_id: "span:100-140".to_string(),
                     line_number: 5,
@@ -9037,6 +9129,7 @@ export * from "./aFetch.js";"#,
         let orchestrator = FileOrchestrator::new(agent_service);
 
         let endpoint = |path: &str| EndpointResult {
+            handler_declaration_line: None,
             view_module: false,
             candidate_id: "span:100-140".to_string(),
             line_number: 5,
@@ -9109,6 +9202,7 @@ export * from "./aFetch.js";"#,
             "tests/fixtures/mocks/service-a/src/index.ts".to_string(),
             FileAnalysisResult {
                 endpoints: vec![EndpointResult {
+                    handler_declaration_line: None,
                     view_module: false,
                     candidate_id: "span:1-2".to_string(),
                     line_number: 1,
@@ -9800,6 +9894,7 @@ export * from "./aFetch.js";"#,
                 graphql_consumer_locates: vec![],
                 mounts: vec![],
                 endpoints: vec![EndpointResult {
+                    handler_declaration_line: None,
                     view_module: false,
                     candidate_id: "span:1-40".to_string(),
                     line_number: 5,
@@ -9867,6 +9962,7 @@ export * from "./aFetch.js";"#,
         let orchestrator = FileOrchestrator::new(agent_service);
 
         let mk_endpoint = |line: u32, method: &str, path: &str| EndpointResult {
+            handler_declaration_line: None,
             view_module: false,
             candidate_id: format!("span:{line}"),
             line_number: line as i32,
@@ -10260,6 +10356,7 @@ export * from "./aFetch.js";"#,
                 graphql_consumer_locates: vec![],
                 mounts: vec![],
                 endpoints: vec![EndpointResult {
+                    handler_declaration_line: None,
                     view_module: false,
                     candidate_id: "file-route:GET:42".to_string(),
                     line_number: 7,
@@ -10312,6 +10409,84 @@ export * from "./aFetch.js";"#,
         assert!(alias.contains("Response"), "alias was {alias}");
     }
 
+    /// A route emitted from a controller class, in the shape both controller
+    /// passes emit: the span is the whole handler METHOD, the handler's own
+    /// declaration line is carried, and no response expression is stated.
+    fn controller_endpoint(method: &str) -> EndpointResult {
+        EndpointResult {
+            view_module: false,
+            // `@Post(":id/rename")` on line 29, `rename(...)` on line 30.
+            handler_declaration_line: Some(29),
+            candidate_id: "decorator-route:POST:734".to_string(),
+            line_number: 30,
+            owner_node: "UsersController".to_string(),
+            method: method.to_string(),
+            path: "/api/users/:id/rename".to_string(),
+            handler_name: "rename".to_string(),
+            pattern_matched: DECORATOR_ROUTE_PATTERN.to_string(),
+            // The landmine: the method's own span. Every locator that reads a
+            // span resolves the smallest node CONTAINING it — the class.
+            call_expression_span_start: Some(734),
+            call_expression_span_end: Some(825),
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            resolution_source: Some(ResolutionSource::DecoratorRoute),
+        }
+    }
+
+    #[test]
+    fn test_collect_type_requests_controller_route_anchors_on_the_handler() {
+        // carrick#745: with no model answer the response must be the handler
+        // METHOD's return, anchored on the line the method declares itself on
+        // — never the method's span, which resolves the declaring class and
+        // publishes its member list as the route's contract.
+        let infer = infer_for_endpoint(controller_endpoint("POST"));
+
+        assert_eq!(
+            infer.len(),
+            1,
+            "the response only: a controller method's request body is a \
+             parameter this layer cannot name, so nothing is asked about it: {infer:#?}"
+        );
+        let item = &infer[0];
+        assert_eq!(item.infer_kind, InferKind::FunctionReturn);
+        assert_eq!(
+            item.line_number, 29,
+            "the anchor is the DECLARATION's line, not the method name's: an \
+             arrow one line below the name ties with the method inside the \
+             sidecar's line tolerance and wins on being smaller"
+        );
+        assert!(
+            item.span_start.is_none() && item.span_end.is_none() && item.expression_text.is_none(),
+            "the method's span must not be sent: {item:?}"
+        );
+        let alias = item.alias.as_deref().unwrap_or_default();
+        assert!(alias.contains("Response"), "alias was {alias}");
+    }
+
+    #[test]
+    fn test_collect_type_requests_controller_route_prefers_the_model_anchor() {
+        // The model described the file: its response expression is the better
+        // anchor and is the one sent, exactly as for any other row. Only the
+        // SPAN fallback is the one this row may not use.
+        let mut endpoint = controller_endpoint("GET");
+        endpoint.response_expression_text = Some("this.users".to_string());
+        endpoint.response_expression_line = Some(31);
+
+        let infer = infer_for_endpoint(endpoint);
+        assert_eq!(infer.len(), 1);
+        let item = &infer[0];
+        assert_eq!(item.infer_kind, InferKind::ResponseBody);
+        assert_eq!(item.expression_text.as_deref(), Some("this.users"));
+        assert_eq!(item.expression_line, Some(31));
+        assert!(item.span_start.is_none() && item.span_end.is_none());
+    }
+
     /// Build a call-site endpoint with the given emission style. Carries both
     /// a response expression and SWC spans so the test proves the routing
     /// decision comes from `emission_style`, not from locator availability.
@@ -10321,6 +10496,7 @@ export * from "./aFetch.js";"#,
         emission_style: Option<EmissionStyle>,
     ) -> EndpointResult {
         EndpointResult {
+            handler_declaration_line: None,
             view_module: false,
             candidate_id: "span:100-200".to_string(),
             line_number: 12,
@@ -10510,6 +10686,7 @@ export * from "./aFetch.js";"#,
             mounts: vec![],
             endpoints: vec![
                 EndpointResult {
+                    handler_declaration_line: None,
                     view_module: false,
                     candidate_id: "span:590-650".to_string(),
                     line_number: 10,
@@ -10530,6 +10707,7 @@ export * from "./aFetch.js";"#,
                     resolution_source: None,
                 },
                 EndpointResult {
+                    handler_declaration_line: None,
                     view_module: false,
                     candidate_id: "span:700-740".to_string(),
                     line_number: 12,
@@ -10630,6 +10808,7 @@ export * from "./aFetch.js";"#,
             graphql_consumer_locates: vec![],
             mounts: vec![],
             endpoints: vec![EndpointResult {
+                handler_declaration_line: None,
                 view_module: false,
                 candidate_id: "span:1-2".to_string(),
                 line_number: 10,
@@ -10983,6 +11162,7 @@ export * from "./aFetch.js";"#,
             graphql_consumer_locates: vec![],
             mounts: vec![],
             endpoints: vec![EndpointResult {
+                handler_declaration_line: None,
                 view_module: false,
                 candidate_id: "span:1-2".to_string(),
                 line_number: 10,
@@ -11093,6 +11273,7 @@ export * from "./aFetch.js";"#,
                 mounts: vec![],
                 endpoints: vec![
                     EndpointResult {
+                        handler_declaration_line: None,
                         view_module: false,
                         candidate_id: "span:710-740".to_string(),
                         line_number: 5,
@@ -11113,6 +11294,7 @@ export * from "./aFetch.js";"#,
                         resolution_source: None,
                     },
                     EndpointResult {
+                        handler_declaration_line: None,
                         view_module: false,
                         candidate_id: "span:750-780".to_string(),
                         line_number: 10,
@@ -11336,6 +11518,7 @@ export default [
     /// collision is the point: the owner name cannot identify the module.
     fn plugin_endpoint(method: &str, path: &str) -> EndpointResult {
         EndpointResult {
+            handler_declaration_line: None,
             view_module: false,
             candidate_id: format!("span:{method}:{path}"),
             line_number: 4,
@@ -12280,6 +12463,7 @@ export { routes };
 
     fn synthetic_endpoint(method: &str, path: &str) -> EndpointResult {
         EndpointResult {
+            handler_declaration_line: None,
             view_module: false,
             candidate_id: format!("file-route:{}:0", method),
             line_number: 1,

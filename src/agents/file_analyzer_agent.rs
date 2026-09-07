@@ -232,6 +232,27 @@ pub struct EndpointResult {
     /// the bulk of the blob and the first thing the size limit drops.
     #[serde(skip_deserializing, skip_serializing_if = "std::ops::Not::not")]
     pub view_module: bool,
+    /// The 1-based line the route's HANDLER declaration opens on, when this
+    /// row was emitted from a controller class (carrick#745).
+    ///
+    /// A controller route states no response expression: the handler is a
+    /// method beside the route, and its RETURN is the response. The row's
+    /// span is that whole method declaration, which the response-body and
+    /// request-body locators read as the declaring CLASS — a class's member
+    /// list published as a route's contract. This is the anchor the type
+    /// layer resolves the handler function by instead, and it is the
+    /// declaration's own first line rather than the row's `line_number` (the
+    /// method's NAME) because a lookup by line tolerates a couple of lines
+    /// either way, and an arrow one line below the name would tie with the
+    /// method and win on being smaller.
+    ///
+    /// A fact of the class's AST, never the model's: `skip_deserializing` is
+    /// what makes that true rather than intended, exactly as it does for
+    /// `view_module`. Re-derived from the source on every scan, cold or
+    /// incremental, so nothing round-trips — and `file_results` holds the
+    /// model's raw answers, where this is always absent.
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub handler_declaration_line: Option<u32>,
 }
 
 /// Result of analyzing a single data-fetching call
@@ -1565,6 +1586,7 @@ mod tests {
     #[test]
     fn test_endpoint_result_serialization() {
         let endpoint = EndpointResult {
+            handler_declaration_line: None,
             view_module: false,
             candidate_id: "span:100-140".to_string(),
             line_number: 15,
@@ -1633,6 +1655,7 @@ mod tests {
             graphql_consumer_locates: vec![],
             mounts: vec![],
             endpoints: vec![EndpointResult {
+                handler_declaration_line: None,
                 view_module: false,
                 candidate_id: "span:10-50".to_string(),
                 line_number: 1,
@@ -1788,6 +1811,7 @@ mod tests {
                 pattern_matched: ".use(".to_string(),
             }],
             endpoints: vec![EndpointResult {
+                handler_declaration_line: None,
                 view_module: false,
                 candidate_id: "span:80-120".to_string(),
                 line_number: 10,
@@ -1997,6 +2021,7 @@ mod tests {
                 pattern_matched: "app.use".to_string(),
             }],
             endpoints: vec![EndpointResult {
+                handler_declaration_line: None,
                 view_module: false,
                 candidate_id: "span:130-180".to_string(),
                 line_number: 2,

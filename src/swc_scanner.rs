@@ -378,6 +378,13 @@ pub struct DecoratorRoute {
     /// its first decorator, which would report the route a line or two above
     /// the handler a reader is being sent to.
     pub line_number: usize,
+    /// 1-based line the method's DECLARATION opens on — its first decorator,
+    /// or the method itself when it carries none. See
+    /// [`class_member_declaration_line`].
+    pub declaration_line: usize,
+    /// Whether the method's own annotation states that it returns no value.
+    /// See [`declares_no_payload_return`].
+    pub returns_no_payload: bool,
     /// Start byte offset of the method.
     pub span_start: u32,
     /// End byte offset of the method.
@@ -417,6 +424,13 @@ pub struct ControllerMethod {
     pub http_method: String,
     /// 1-based line number of the method, in the controller's own file.
     pub line_number: usize,
+    /// 1-based line the method's DECLARATION opens on — its first decorator,
+    /// or the method itself when it carries none. See
+    /// [`class_member_declaration_line`].
+    pub declaration_line: usize,
+    /// Whether the method's own annotation states that it returns no value.
+    /// See [`declares_no_payload_return`].
+    pub returns_no_payload: bool,
     /// Start byte offset of the method.
     pub span_start: u32,
     /// End byte offset of the method.
@@ -1545,6 +1559,78 @@ fn unwrap_expr(expr: &Expr) -> &Expr {
 /// The HTTP method a controller method answers, or `None` when it answers
 /// none — a helper, not a route. See
 /// [`SwcScanner::default_export_controller_class`] for the rule.
+/// The 1-based line a class member's own DECLARATION opens on: its first
+/// decorator when it carries any, and the member itself otherwise
+/// (carrick#745).
+///
+/// A route emitted from a controller class states no response expression, so
+/// the type layer resolves the handler FUNCTION and reads its return. The line
+/// it resolves that function by has to be the declaration's first line: the
+/// row's own `line_number` is the method's NAME (where a reader is sent), and
+/// anchoring a function lookup there lets an arrow one line below the name tie
+/// with the method and win on being smaller. The member's own span start is
+/// the same line in every AST seen so far, but that is a property of the
+/// parser rather than a statement, so the two are compared here and the
+/// earlier one is taken.
+fn class_member_declaration_line(method: &ClassMethod, source_map: &Lrc<SourceMap>) -> usize {
+    let member = source_map.lookup_char_pos(method.span.lo).line;
+    method
+        .function
+        .decorators
+        .iter()
+        .map(|decorator| source_map.lookup_char_pos(decorator.span.lo).line)
+        .min()
+        .map_or(member, |first| first.min(member))
+}
+
+/// Whether a handler's DECLARED return states that it returns no value
+/// (carrick#745).
+///
+/// A controller handler annotated `: void` writes its payload somewhere this
+/// layer cannot read — an assignment onto a context object, a helper, a
+/// stream. Its return type is therefore the truth about the FUNCTION and a
+/// falsehood about the ROUTE, and publishing it as the response contract is
+/// the failure carrick#498 already caught on the subscriber side: a `void`
+/// contract self-checks clean and reads incompatible against every correctly
+/// typed consumer. The row says "no payload" instead, and the manifest keeps
+/// its honest unknown.
+///
+/// Only an ANNOTATION counts. An unannotated handler states nothing here and
+/// is left to the compiler, which is the better instrument for what a body
+/// returns. `Promise<void>` is the same statement written by an async
+/// handler — the wrapper is TypeScript's own, not a library's.
+fn declares_no_payload_return(function: &Function) -> bool {
+    fn states_no_value(ts_type: &TsType) -> bool {
+        match ts_type {
+            TsType::TsKeywordType(keyword) => matches!(
+                keyword.kind,
+                TsKeywordTypeKind::TsVoidKeyword
+                    | TsKeywordTypeKind::TsUndefinedKeyword
+                    | TsKeywordTypeKind::TsNeverKeyword
+            ),
+            TsType::TsTypeRef(reference) => {
+                let TsEntityName::Ident(name) = &reference.type_name else {
+                    return false;
+                };
+                if name.sym.as_ref() != "Promise" {
+                    return false;
+                }
+                reference
+                    .type_params
+                    .as_ref()
+                    .and_then(|params| params.params.first())
+                    .is_some_and(|inner| states_no_value(inner))
+            }
+            _ => false,
+        }
+    }
+
+    function
+        .return_type
+        .as_ref()
+        .is_some_and(|annotation| states_no_value(&annotation.type_ann))
+}
+
 fn controller_method(
     method: &ClassMethod,
     source_map: &Lrc<SourceMap>,
@@ -1571,6 +1657,8 @@ fn controller_method(
         // the first decorator, which would report the route a line or two
         // above the handler a reader is being sent to.
         line_number: source_map.lookup_char_pos(method.key.span().lo).line,
+        declaration_line: class_member_declaration_line(method, source_map),
+        returns_no_payload: declares_no_payload_return(&method.function),
         span_start: span.lo.0,
         span_end: span.hi.0,
     })
@@ -1718,6 +1806,8 @@ struct VerbDecoratedMethod {
     decorator_origin: String,
     name: String,
     line_number: usize,
+    declaration_line: usize,
+    returns_no_payload: bool,
     span_start: u32,
     span_end: u32,
 }
@@ -1764,6 +1854,8 @@ impl DecoratorRouteVisitor {
                     // first decorator, which would report the route a line or
                     // two above the handler a reader is being sent to.
                     line_number: self.source_map.lookup_char_pos(method.key.span().lo).line,
+                    declaration_line: class_member_declaration_line(method, &self.source_map),
+                    returns_no_payload: declares_no_payload_return(&method.function),
                     span_start: method.span.lo.0,
                     span_end: method.span.hi.0,
                 });
@@ -1848,6 +1940,8 @@ impl Visit for DecoratorRouteVisitor {
                 class_name: class_name.clone(),
                 handler: method.name,
                 line_number: method.line_number,
+                declaration_line: method.declaration_line,
+                returns_no_payload: method.returns_no_payload,
                 span_start: method.span_start,
                 span_end: method.span_end,
             });
@@ -4791,6 +4885,13 @@ export default new ReportController();
         // The decorated method is reported at its own line, not at the first
         // decorator's, so the index points at the handler.
         assert_eq!(class.methods[1].line_number, 9);
+        // Its DECLARATION opens at the first decorator, two lines above
+        // (carrick#745): that is the line the type layer resolves the handler
+        // function by. Neither method annotates its return, so neither states
+        // anything about a payload.
+        assert_eq!(class.methods[1].declaration_line, 7);
+        assert_eq!(class.methods[0].declaration_line, 5);
+        assert!(class.methods.iter().all(|m| !m.returns_no_payload));
     }
 
     /// #537: the config-object call form. The client is a bare binding (here a
@@ -5419,6 +5520,57 @@ export class UsersController {
                     "rename".to_string(),
                     13
                 ),
+            ]
+        );
+    }
+
+    /// carrick#745: the route also carries where its HANDLER declares itself
+    /// and what that declaration says about a payload, because the row's own
+    /// line is the method's NAME and its span is the whole member — neither of
+    /// which resolves to the handler function on its own.
+    #[test]
+    fn a_decorated_route_carries_its_handler_declaration_and_payload_claim() {
+        let content = r#"
+import { Controller, Get, Post } from './framework';
+import { Tag } from './docs';
+import { User } from './types';
+
+@Controller('api/users')
+export class UsersController {
+  @Tag('people')
+  @Get()
+  list(): User[] { return []; }
+
+  @Post(':id/audit')
+  audit(): Promise<void> { return Promise.resolve(); }
+
+  @Get(':id')
+  find() { return null; }
+}
+"#;
+        let routes = SwcScanner::new().decorator_routes(&PathBuf::from("controller.ts"), content);
+        let stated: Vec<(&str, usize, usize, bool)> = routes
+            .iter()
+            .map(|route| {
+                (
+                    route.handler.as_str(),
+                    route.line_number,
+                    route.declaration_line,
+                    route.returns_no_payload,
+                )
+            })
+            .collect();
+        assert_eq!(
+            stated,
+            vec![
+                // Two decorators above the name: the declaration opens at the
+                // first of them, three lines above the method's body.
+                ("list", 10, 8, false),
+                // `Promise<void>` is the async spelling of "no value", so the
+                // route states no payload rather than publishing `void`.
+                ("audit", 13, 12, true),
+                // No annotation states nothing: the compiler answers.
+                ("find", 16, 15, false),
             ]
         );
     }

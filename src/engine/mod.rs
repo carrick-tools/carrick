@@ -5212,6 +5212,7 @@ mod tests {
             endpoints: endpoints
                 .into_iter()
                 .map(|path| EndpointResult {
+                    handler_declaration_line: None,
                     view_module: false,
                     candidate_id: "cand_123".to_string(),
                     line_number: 10,
@@ -5713,6 +5714,7 @@ mod tests {
                     graphql_consumer_locates: vec![],
                     mounts: vec![],
                     endpoints: vec![EndpointResult {
+                        handler_declaration_line: None,
                         view_module: false,
                         candidate_id: large_string.clone(),
                         line_number: 1,
@@ -7664,6 +7666,7 @@ mod tests {
     /// borrow witness.
     fn endpoint_with_handler(handler_name: &str) -> EndpointResult {
         EndpointResult {
+            handler_declaration_line: None,
             view_module: false,
             candidate_id: "span:1-2".to_string(),
             line_number: 7,
