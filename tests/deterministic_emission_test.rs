@@ -18,8 +18,11 @@
 //!   base-plus-path target a row of its own, so it is now asserted present.
 //! - `demo-services-shape`: every row in `decoys.ts` — a bare path literal
 //!   with no base (which no structural rule may claim), a base declared as a
-//!   string literal, a base injected as an option, and a class whose methods
-//!   carry verb decorators but whose declaration states no prefix.
+//!   string literal, a base injected as an option, a class whose methods
+//!   carry verb decorators but whose declaration states no prefix, and a route
+//!   REGISTRATION whose prefix comes from the environment (carrick#744: the
+//!   binding's declared default is a path, so the base is not an origin and
+//!   the registration is not a call).
 //! - `new-url-target`: `catalogue.ts:13`, the inline decoy, which states its
 //!   own target and reaches no URL constructor.
 //! - `imported-request-member`: `legacy.ts`'s local call, which resolves
@@ -444,9 +447,11 @@ fn a_silent_model_keeps_every_env_base_path_call() {
     }
 
     // The decoys: a bare literal with no base at all, a base declared as a
-    // string literal, and a base injected as an option. None of the three is a
-    // statement this rule may claim.
-    for line in [8, 18, 27] {
+    // string literal, a base injected as an option, and — carrick#744 — a
+    // route REGISTRATION written in this rule's own shape, whose base is
+    // declared with a PATH default and is therefore a prefix, not an origin.
+    // None of the four is a statement this rule may claim.
+    for line in [8, 18, 27, 62] {
         assert_none_at(&calls, "src/decoys.ts", line);
     }
     assert_eq!(calls.len(), 4, "no other call: {calls:#?}");

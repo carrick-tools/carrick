@@ -648,6 +648,40 @@ fn url_literal_path(literal: &str) -> Option<&str> {
     Some(if path.len() > 1 { path } else { "" })
 }
 
+/// Whether a base binding's declared default says the base is a route PREFIX
+/// rather than an ORIGIN (carrick#744).
+///
+/// A target that opens with an env-backed binding and continues with literal
+/// path text is read as a request to a base plus a path. A route REGISTRATION
+/// written the same way — `app.get(`${PREFIX}/users`, handler)` — is
+/// indistinguishable at that level, and where the model says nothing about the
+/// file it reaches the index as a FACT that this service calls another one.
+///
+/// The binding's own default settles it, because it is the value the source
+/// says the base takes when the environment supplies none:
+/// `process.env.USER_SERVICE_URL || "http://localhost:3001"` defaults to an
+/// origin, and `process.env.API_PREFIX || "/api"` defaults to a path. A base
+/// whose declared default is a path is not an origin, and what is written
+/// after it is not another service's route.
+///
+/// A path and nothing else: a scheme-relative origin (`//host/api`) states a
+/// host, and a default that is neither (a flag, a name) states nothing this
+/// may act on. Not every base carries a default, so this narrows the exposure
+/// rather than closing it.
+pub fn base_default_states_a_path(base: &str, fallbacks: &EnvFallbackMap) -> bool {
+    // The map is keyed under both the local binding and the environment
+    // variable, and the base slot is written as either.
+    let env_name = base
+        .strip_prefix("process.env.")
+        .or_else(|| base.strip_prefix("import.meta.env."))
+        .unwrap_or(base);
+    let Some(default) = fallbacks.get(base).or_else(|| fallbacks.get(env_name)) else {
+        return false;
+    };
+    let default = default.trim();
+    default.starts_with('/') && !default.starts_with("//")
+}
+
 /// Whether an absolute URL literal's host is a LOOPBACK address — this machine,
 /// under any of the spellings a developer writes.
 pub fn is_loopback_origin(literal: &str) -> bool {
@@ -1100,6 +1134,49 @@ mod tests {
                 "a loopback default is this machine, whatever its spelling"
             );
         }
+    }
+
+    /// carrick#744: what a base binding's declared default says the base IS.
+    #[test]
+    fn a_declared_default_tells_a_route_prefix_from_an_origin() {
+        let fallbacks = |source: &str| {
+            let tmp_dir = tempfile::tempdir().expect("tempdir");
+            let file_path = tmp_dir.path().join("input.ts");
+            std::fs::write(&file_path, source).expect("write file");
+            let cm: Lrc<SourceMap> = Default::default();
+            let handler =
+                Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(cm.clone()));
+            let module = parse_file(&file_path, &cm, &handler).expect("parsed module");
+            EnvAliasExtractor::build_bindings(&module).env_fallbacks
+        };
+
+        let prefix = fallbacks(r#"const PREFIX = process.env.API_PREFIX || "/api";"#);
+        // Under either spelling of the base slot: the map is keyed by both.
+        assert!(base_default_states_a_path("PREFIX", &prefix));
+        assert!(base_default_states_a_path(
+            "process.env.API_PREFIX",
+            &prefix
+        ));
+
+        let origin =
+            fallbacks(r#"const BASE = process.env.USER_SERVICE_URL ?? "http://localhost:3001";"#);
+        assert!(!base_default_states_a_path("BASE", &origin));
+        assert!(!base_default_states_a_path(
+            "process.env.USER_SERVICE_URL",
+            &origin
+        ));
+
+        // A scheme-relative default states a HOST, and a default that is
+        // neither states nothing this may act on.
+        let scheme_relative = fallbacks(r#"const BASE = process.env.CDN_URL || "//cdn.example";"#);
+        assert!(!base_default_states_a_path("BASE", &scheme_relative));
+        let neither = fallbacks(r#"const BASE = process.env.STAGE || "production";"#);
+        assert!(!base_default_states_a_path("BASE", &neither));
+
+        // No default at all: the source states nothing, and the rule is silent
+        // rather than guessing.
+        let undeclared = fallbacks(r#"const BASE = process.env.USER_SERVICE_URL;"#);
+        assert!(!base_default_states_a_path("BASE", &undeclared));
     }
 
     #[test]
