@@ -134,9 +134,8 @@ describe('expandTypeStructural union order at the depth backstop (#775)', () => 
   });
 
   it('prints a mixed union the same way at the backstop as above it', () => {
-    // Intrinsics keep their compiler order ahead of the sorted literals, and
-    // the two paths agree — the backstop is a depth bound on recursion, not a
-    // second normal form.
+    // One rule for every member, and the two paths agree — the backstop is a
+    // depth bound on recursion, not a second normal form.
     const union = aliasType(
       'Maybe',
       `export type Maybe = 'b' | null | 'a' | number;`,
@@ -148,12 +147,7 @@ describe('expandTypeStructural union order at the depth backstop (#775)', () => 
     );
     const aboveIt = expandTypeStructural(union, new Set(), 0);
     assert.strictEqual(atBackstop, aboveIt);
-    // The two intrinsics lead in their (fixed, program-independent) compiler
-    // id order, whichever way round that is; the literals follow, sorted.
-    assert.ok(
-      /^(null|number) \| (null|number) \| "a" \| "b"$/.test(atBackstop),
-      `intrinsics must lead and literals must sort: ${atBackstop}`,
-    );
+    assert.strictEqual(atBackstop, '"a" | "b" | null | number');
   });
 
   it('leaves a non-union backstop print alone', () => {

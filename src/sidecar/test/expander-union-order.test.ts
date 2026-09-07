@@ -68,7 +68,7 @@ describe('expandTypeStructural union member order (#735)', () => {
     );
   });
 
-  it('keeps intrinsics in the compiler order ahead of the sorted members', () => {
+  it('sorts intrinsics by text like every other member', () => {
     const project = new Project({
       useInMemoryFileSystem: true,
       compilerOptions: { strict: true },
@@ -81,11 +81,15 @@ describe('expandTypeStructural union member order (#735)', () => {
       `,
     );
     const expanded = expandTypeStructural(sf.getTypeAliasOrThrow('Mixed').getType());
-    // undefined < null < number is the checker's own construction order, kept;
-    // the two lazily-created members follow, sorted by their rendered text.
+    // This used to keep the intrinsics ahead of the rest in compiler-id order,
+    // on the grounds that it reproduced the compiler's own print. It does not:
+    // `typeToString` prints `number | null` where the ids say `null | number`.
+    // Once carrick#775 put the compiler's prints under the same canonical rule,
+    // an id-ordered exception meant one union could print two ways depending on
+    // which path rendered it, so there is now one rule for every member.
     assert.strictEqual(
       expanded,
-      'undefined | null | number | "lit" | { z: string; }',
+      '"lit" | null | number | undefined | { z: string; }',
     );
   });
 
