@@ -29,6 +29,20 @@ export interface ResolvedAnchor {
    * builder-chain anchor moved off its config descriptor, stays traceable.
    */
   reaimNote?: string;
+  /**
+   * carrick#766: why an alias ABSTAINED — the surface line is `unknown`
+   * because nothing was resolvable, not because a step failed.
+   *
+   * Deliberately NOT `failureReason`. The scanner's literal backfill
+   * (`backfill_anchors`, engine/type_compat_v2.rs) keys on
+   * `capture_failure_reason` and re-anchors any alias carrying one off the v1
+   * bundle's text. For an alias whose v1 answer was itself blind that text is
+   * a bare element symbol, and re-anchoring it would publish a confident
+   * contract whose array-ness was guessed — the #349/#306 false mismatch. An
+   * abstain has nothing better to fall back to, so it must not look
+   * backfillable; the reason rides `self_check_detail` instead.
+   */
+  abstainReason?: string;
 }
 
 /** Repo-root-relative source file -> extensionless specifier from entryDir. */
@@ -288,6 +302,42 @@ function finishInferAnchor(
       if (!isTopType(recovered)) type = recovered;
     }
   }
+  // carrick#766: a LINE-ONLY anchor whose type came back a bare top type has
+  // no evidence on either side, so it must abstain.
+  //
+  // The two halves of an infer anchor are the locator and the type at it. A
+  // span, an expression text or a parameter name is the scanner NAMING the
+  // payload: whatever that node's type turns out to be — including a whole
+  // `any` decayed through an uninstalled dependency — is a located fact about
+  // the payload, and the deep-any walk, the check's IsAny gate and the literal
+  // backfill are all built on it being published. Those anchors are untouched
+  // here.
+  //
+  // A line alone names nothing. `firstExpressionOnLine` picks whatever comes
+  // first on the line, which on a re-export statement is the first exported
+  // binding. When THAT resolves to a top type the capture holds no payload and
+  // no type, and `export type <alias> = any;` states "a type was inferred and
+  // it collapsed" — a claim the scan cannot back. The honest word is `unknown`
+  // ("no contract stated here"), with the node the line resolved as the reason.
+  //
+  // Live shape: a route whose handlers are built by a framework factory and
+  // re-exported at the bottom of the file. Both of the file's operations
+  // anchor at the export statement, the v1 walk abstains there (carrick#771),
+  // and the alias falls to this line-only locator, which resolves the first
+  // exported binding's identifier.
+  if (isTopType(type) && isLineOnly(request)) {
+    return {
+      request,
+      aliasText: 'unknown',
+      serialization: 'structural_fallback',
+      abstainReason:
+        `line-only locator resolved ` +
+        `${describeNode(sourceFile, request.source_file, located)} whose type is a ` +
+        `bare top type ('${checker.typeToString(type)}'); the anchor names no ` +
+        `payload span, expression or parameter, so it abstains rather than ` +
+        `publish a top type as a contract`,
+    };
+  }
   // carrick#371 fail-closed guard: a producer anchor whose resolved type IS or
   // CONTAINS framework machinery (a raw `Response`/`Request`, a wrapper envelope
   // `{ response: Response; error }`, a wrapper function `(req) => Promise<Response>`)
@@ -318,6 +368,41 @@ function finishInferAnchor(
     serialization: 'node_builder',
     ...(reaimNote ? { reaimNote } : {}),
   };
+}
+
+/**
+ * True when the anchor carries a LINE and nothing else — no payload span, no
+ * expression text, no parameter name. Such an anchor states where to look, not
+ * what to look at, so a top type resolved from it is not a fact about any
+ * payload (carrick#766).
+ */
+function isLineOnly(request: InferAnchorRequest): boolean {
+  return (
+    request.span_start == null &&
+    request.span_end == null &&
+    !request.expression_text &&
+    !request.param_name
+  );
+}
+
+/**
+ * `<kind> at <file>:<line> (`<text>`)` for a node a locator resolved — what a
+ * reader needs to see why an alias abstained. The path is the REPO-RELATIVE
+ * one off the request, not `sourceFile.fileName`: the reason is published on
+ * the capture record, and an absolute path there is the scanner's checkout
+ * directory. The text is collapsed to one line and truncated, since a resolved
+ * node can be a whole function body.
+ */
+function describeNode(
+  sourceFile: ts.SourceFile,
+  sourceFileRel: string,
+  node: ts.Node
+): string {
+  const line =
+    sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
+  const raw = node.getText(sourceFile).replace(/\s+/g, ' ').trim();
+  const text = raw.length > 80 ? `${raw.slice(0, 77)}...` : raw;
+  return `${ts.SyntaxKind[node.kind]} at ${sourceFileRel}:${line} (\`${text}\`)`;
 }
 
 function isTopType(type: ts.Type): boolean {
