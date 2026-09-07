@@ -36,6 +36,7 @@ const SOURCE = path.join(BARE, SOURCE_REL);
 const DECAYED_ALIAS = 'Endpoint_reexported_Response';
 const CLEAN_ALIAS = 'Endpoint_clean_Response';
 const LOCATED_ALIAS = 'Endpoint_located_Response';
+const LINE_ONLY_SHAPE_ALIAS = 'Endpoint_lineOnlyShape_Response';
 
 /** Byte span and 1-based line of the sole occurrence of `text` in the fixture. */
 function spanOf(text: string): { start: number; end: number; line: number } {
@@ -97,6 +98,15 @@ function capture(): Captured {
         // The argument, not the call: `respond(...)` returns void.
         span_start: locatedPayload.start + 'respond('.length,
         span_end: locatedPayload.end - 1,
+      },
+      {
+        kind: 'infer',
+        alias: LINE_ONLY_SHAPE_ALIAS,
+        source_file: SOURCE_REL,
+        anchor_origin: 'deterministic-infer',
+        // LINE ONLY, exactly as a consumer call-result locator arrives: no
+        // span, no expression text, no parameter name (carrick#788).
+        line_number: lineOf('const accepted = await acceptBatch();'),
       },
     ],
   });
@@ -203,6 +213,38 @@ describe('an infer anchor that resolves a bare top type abstains (#766)', () => 
     assert.ok(
       surfaceDeclares(captured.surface, LOCATED_ALIAS, 'any'),
       `a located payload keeps its decayed print:\n${captured.surface}`
+    );
+  });
+
+  it('keeps a line-only anchor that resolved a REAL shape (#788)', () => {
+    // The gate is `top type AND line-only`, not line-only alone, and this is
+    // the half of that conjunction nothing else here covers. A line-only
+    // locator is how every consumer `call_result` row arrives — the scanner
+    // records the call's line and nothing more — and on the largest indexed
+    // service those rows resolve real shapes and are served as the contract.
+    // If the abstain ever widened to "the locator named no payload", this
+    // population goes to `unknown` and the index loses rows it serves today,
+    // which is the loss carrick#788 was filed against.
+    const record = captured.records.get(LINE_ONLY_SHAPE_ALIAS);
+    assert.ok(record, 'no record for the line-only shape alias');
+    assert.strictEqual(
+      record.top_type_at_self_check,
+      false,
+      'the fixture binding must resolve to a real type for this pin to mean anything'
+    );
+    assert.strictEqual(
+      record.serialization,
+      'node_builder',
+      'a resolved line-only anchor prints through the node builder, not the abstain'
+    );
+    assert.ok(
+      !surfaceDeclares(captured.surface, LINE_ONLY_SHAPE_ALIAS, 'unknown'),
+      `a line-only anchor that resolved a shape must not abstain:\n${captured.surface}`
+    );
+    assert.match(
+      captured.surface,
+      new RegExp(`export type ${LINE_ONLY_SHAPE_ALIAS} = \\{\\s*batchId: string;`),
+      `the line-only anchor must keep its captured shape:\n${captured.surface}`
     );
   });
 
