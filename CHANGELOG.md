@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.46](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.45...carrick-v0.3.46) (2026-09-07)
+
+
+### Bug Fixes
+
+* **sidecar:** one canonical union order, in the compiler's print too ([#775](https://github.com/carrick-tools/carrick/issues/775)) ([#791](https://github.com/carrick-tools/carrick/issues/791)) ([1eceb60](https://github.com/carrick-tools/carrick/commit/1eceb606e317cbe89920dcc523253fbe70dc1c7f))
+
 ## [0.3.45](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.44...carrick-v0.3.45) (2026-09-07)
 
 
