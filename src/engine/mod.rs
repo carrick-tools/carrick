@@ -653,7 +653,11 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     //     are read, and the result is its own relationship, never folded back
     //     into `endpoints`/`calls`. Computed outside the upload branch because
     //     the PR comment renders them and a PR run never uploads.
-    let sdk_join = crate::sdk_edges::join(&sdk_join_input, &results.cross_repo_matches);
+    let sdk_join = crate::sdk_edges::join(
+        &sdk_join_input,
+        &results.cross_repo_matches,
+        &analyzer.pair_resolutions(),
+    );
     if !sdk_join.is_empty() {
         debug!(
             "SDK edges: {} resolved, {} unresolved group(s)",

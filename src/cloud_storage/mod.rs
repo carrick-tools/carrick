@@ -258,6 +258,25 @@ pub struct SdkEdge {
     pub mismatch_reason: Option<String>,
     /// Scanner release that produced this edge (`CARGO_PKG_VERSION`).
     pub scanner_version: String,
+    /// Whether the verdict above is a comparison between two KNOWN types, or
+    /// the absence of one — the same field [`CompatVerdict::resolved`] carries,
+    /// for the same reason (carrick#730/#737, cloud#622).
+    ///
+    /// `type_compatible` cannot answer that on its own: the probe gates are
+    /// whole-type only, so a producer carrying `any` three members down clears
+    /// them and then reads compatible against any counterparty shape. Without
+    /// this field the cloud renders such an edge as type agreement, which is
+    /// exactly the read cloud#617 removed from the direct pairs.
+    ///
+    /// `None` means this run did not state it — the resolution rode with a
+    /// verdict from a scan that predates the field, or no verdict was stored at
+    /// all. Never read it as "unresolved".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<bool>,
+    /// Which side, and where in it, left the verdict unresolved. Present only
+    /// alongside `resolved: Some(false)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved_reason: Option<String>,
 }
 
 /// SDK-mediated calls the join could not turn into an edge, aggregated per
