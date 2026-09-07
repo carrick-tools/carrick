@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.44](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.43...carrick-v0.3.44) (2026-09-07)
+
+
+### Bug Fixes
+
+* **sidecar:** a line anchor never reads the next declaration in the file ([#771](https://github.com/carrick-tools/carrick/issues/771)) ([6a71528](https://github.com/carrick-tools/carrick/commit/6a71528cc9fd351eaf308130b5a31bb54853d8e8))
+* **sidecar:** anchor a stated contract on the name the source writes ([#769](https://github.com/carrick-tools/carrick/issues/769)) ([37b2e7a](https://github.com/carrick-tools/carrick/commit/37b2e7a4e3963a4cd3cf1e0adc19520cb89da6ec))
+
+
+### Documentation
+
+* **sidecar:** rewrite the protocol section from the validators ([#764](https://github.com/carrick-tools/carrick/issues/764)) ([94bc559](https://github.com/carrick-tools/carrick/commit/94bc5596061e11c208571a843a61bade8ce04267))
+
 ## [0.3.43](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.42...carrick-v0.3.43) (2026-09-07)
 
 
