@@ -459,16 +459,31 @@ export class TypeInferrer {
           const recoveredAnchor = recovered.anchorType
             ? this.unwrapArrayLevels(recovered.anchorType)
             : undefined;
+          const resolvedSymbol = recoveredAnchor
+            ? this.primaryTypeSymbol(recoveredAnchor.element)
+            : undefined;
+          // carrick#768: the resolved type of a stated annotation carries no
+          // symbol when the alias resolves to an INSTANTIATED type (the
+          // schema-first `type Body = Infer<typeof Schema>` shape) — the
+          // compiler answers the synthetic `__type` and the route loses the
+          // one name a reader could import. The annotation as WRITTEN still
+          // names it, so read the anchor off the type node when the resolved
+          // type had none. Fallback only: a resolved symbol is the better
+          // answer and keeps its precedence.
+          const stated = recovered.statedTypeNode;
+          const writtenAnchor =
+            resolvedSymbol === undefined && stated
+              ? this.writtenAnchorOf(stated)
+              : undefined;
           return this.createInferredType(
             request,
             recovered.typeString,
             recovered.isExplicit,
             this.getNodeLocation(recovered.node),
             undefined,
-            recoveredAnchor
-              ? this.primaryTypeSymbol(recoveredAnchor.element)
-              : undefined,
-            recoveredAnchor?.depth
+            resolvedSymbol ?? writtenAnchor?.symbol,
+            writtenAnchor ? writtenAnchor.depth : recoveredAnchor?.depth,
+            writtenAnchor?.source
           );
         }
         // Nothing recoverable. Reject a wrapper envelope that IS or CONTAINS
@@ -2259,12 +2274,14 @@ export class TypeInferrer {
     isExplicit: boolean;
     node: Node;
     anchorType?: Type;
+    statedTypeNode?: Node;
   } | null {
     const candidates: Array<{
       typeString: string;
       isExplicit: boolean;
       node: Node;
       anchorType: Type;
+      statedTypeNode?: Node;
     }> = [];
 
     const returned = this.responseReturnedExpressions(func);
@@ -2290,6 +2307,7 @@ export class TypeInferrer {
           isExplicit: true,
           node: payloadNode,
           anchorType: this.unwrapPromiseType(stated.getType()),
+          statedTypeNode: stated,
         });
         continue;
       }
@@ -2337,6 +2355,8 @@ export class TypeInferrer {
       // A union joined several payloads, so there is no single anchor — the
       // same rule the wrapper-unwrap path applies.
       anchorType: distinct.length === 1 ? distinct[0].anchorType : undefined,
+      statedTypeNode:
+        distinct.length === 1 ? distinct[0].statedTypeNode : undefined,
     };
   }
 
@@ -2704,6 +2724,80 @@ export class TypeInferrer {
         Node.isVariableDeclaration(d)
     );
     return declaring?.getSourceFile().getFilePath();
+  }
+
+  /**
+   * The anchor a `satisfies X` / `as X` / `<X>` annotation states IN SOURCE:
+   * the name written at the annotation, where its type is declared, and the
+   * array levels wrapped around it (`satisfies Order[]` → `Order`, depth 1).
+   *
+   * carrick#768: reading the anchor off the RESOLVED type works for an
+   * interface, whose type carries its own symbol, and fails for
+   *
+   *     export type OrderBody = Inferred<typeof OrderSchema>;
+   *
+   * because the alias resolves to an instantiated type TypeScript keeps no
+   * alias symbol on, so `getSymbol()` answers the synthetic `__type`. The
+   * route then published a correct shape with no name, and
+   * `primary_type_symbol` is precisely how a reader gets from a route to the
+   * type its consumer imports. The annotation names it either way, so read
+   * the name from the AST and confirm it against the declaration it resolves
+   * to. This is the fallback for a resolved type that anchored nothing, never
+   * an override of one that did.
+   *
+   * Four things are rejected, so a name only anchors when it is genuinely the
+   * contract a consumer would import:
+   *  - a generic instantiation (`satisfies Envelope<Order>`) names the
+   *    WRAPPER, and a bare `Envelope` is not the payload;
+   *  - a name resolving to no type declaration — an import of a value, a
+   *    re-export the checker cannot follow — is not importable as a type;
+   *  - a declaration in the TypeScript default library, and every
+   *    `BUILTIN_ANCHOR_SYMBOLS` name, which describe machinery not contracts;
+   *  - an inline annotation (`satisfies { id: string }`), which names nothing.
+   */
+  private writtenAnchorOf(
+    typeNode: Node
+  ): { symbol: string; source: string; depth: number } | undefined {
+    const MAX_ANCHOR_ARRAY_DEPTH = 10;
+    let current = typeNode;
+    let depth = 0;
+    while (Node.isArrayTypeNode(current) && depth < MAX_ANCHOR_ARRAY_DEPTH) {
+      current = current.getElementTypeNode();
+      depth++;
+    }
+
+    if (!Node.isTypeReference(current)) return undefined;
+    // A type reference carrying arguments names the wrapper, not the payload.
+    if (current.getTypeArguments().length > 0) return undefined;
+
+    const entityName = current.getTypeName();
+    // `ns.Order` states `Order`; the qualifier is the module, not the type.
+    const identifier = Node.isQualifiedName(entityName)
+      ? entityName.getRight()
+      : entityName;
+    const name = identifier.getText();
+    if (!name || name.startsWith('__') || BUILTIN_ANCHOR_SYMBOLS.has(name)) {
+      return undefined;
+    }
+
+    const symbol = identifier.getSymbol();
+    if (!symbol) return undefined;
+    const resolved = symbol.getAliasedSymbol() ?? symbol;
+    const declaration = resolved
+      .getDeclarations()
+      .find(
+        (d) =>
+          Node.isTypeAliasDeclaration(d) ||
+          Node.isInterfaceDeclaration(d) ||
+          Node.isClassDeclaration(d) ||
+          Node.isEnumDeclaration(d)
+      );
+    if (!declaration) return undefined;
+
+    const sourceFile = declaration.getSourceFile();
+    if (sourceFile.compilerNode.hasNoDefaultLib) return undefined;
+
+    return { symbol: name, source: sourceFile.getFilePath(), depth };
   }
 
   /**
