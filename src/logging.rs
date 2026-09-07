@@ -31,9 +31,9 @@ pub fn run_id() -> &'static str {
 ///
 /// 2. **File layer** (best effort): when `~/.carrick/logs/` is writable, appends
 ///    `DEBUG`-level logs with timestamps to `carrick.log.YYYY-MM-DD` (daily
-///    rotation). If the directory can't be created the file layer is skipped
-///    and only the terminal layer is active — in that case the run preamble
-///    only reaches stderr.
+///    rotation, [`RETAINED_LOG_DAYS`] days kept). If the directory can't be
+///    created the file layer is skipped and only the terminal layer is active
+///    — in that case the run preamble only reaches stderr.
 pub fn init(verbose: bool) {
     let terminal_filter = if verbose {
         EnvFilter::new("debug")
@@ -51,14 +51,26 @@ pub fn init(verbose: bool) {
     // Try to set up file logging to ~/.carrick/logs/
     let log_dir = dirs::home_dir().map(|h| h.join(".carrick").join("logs"));
 
-    if let Some(ref dir) = log_dir
-        && std::fs::create_dir_all(dir).is_ok()
-    {
+    // Daily rotation with a retention cap. Rotation alone bounded nothing —
+    // nothing deleted an old file, and 143 GB of them filled a disk
+    // mid-session (carrick#741). The file name is unchanged,
+    // `carrick.log.<date>` exactly as `get_log_file_path` computes it, so the
+    // run-log upload still finds today's file and ships this run's bytes from
+    // RUN_START_OFFSET.
+    let file_appender = log_dir.as_ref().and_then(|dir| {
+        std::fs::create_dir_all(dir).ok()?;
         // Capture the current size of today's log file *before* we write
         // anything. Anything past this offset belongs to this run.
         let _ = RUN_START_OFFSET.set(current_log_file_size());
+        rolling::Builder::new()
+            .rotation(rolling::Rotation::DAILY)
+            .filename_prefix("carrick.log")
+            .max_log_files(RETAINED_LOG_DAYS)
+            .build(dir)
+            .ok()
+    });
 
-        let file_appender = rolling::daily(dir, "carrick.log");
+    if let Some(file_appender) = file_appender {
         let file_layer = fmt::layer()
             .with_writer(file_appender)
             .with_ansi(false)
@@ -70,6 +82,7 @@ pub fn init(verbose: bool) {
             .with(file_layer)
             .try_init();
         emit_run_preamble();
+        warn_if_log_is_large();
         return;
     }
 
@@ -78,6 +91,40 @@ pub fn init(verbose: bool) {
         .with(terminal_layer)
         .try_init();
     emit_run_preamble();
+}
+
+/// How many days of debug logs `~/.carrick/logs/` keeps.
+///
+/// The file layer writes at DEBUG whatever the terminal is set to, so a day
+/// of scanning a large repo is measured in gigabytes and nothing but this cap
+/// removes it: the appender's daily rotation only starts a new file. Three
+/// days covers "what happened in the run I am asking about", which is all the
+/// local copy is for — the cloud gets this run's slice at upload time.
+const RETAINED_LOG_DAYS: usize = 3;
+
+/// Size at which today's log file is worth mentioning: nothing about a
+/// scanner says "check your home directory", and the first symptom of not
+/// knowing was a disk that filled mid-run (carrick#741).
+const LOG_SIZE_NOTICE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Say where the log is and how big it has got, once it is large enough that
+/// someone would want to know. Silent below the threshold, which is every
+/// ordinary run.
+fn warn_if_log_is_large() {
+    let Some(path) = get_log_file_path() else {
+        return;
+    };
+    let size = current_log_file_size();
+    if size < LOG_SIZE_NOTICE_BYTES {
+        return;
+    }
+    tracing::warn!(
+        "Today's Carrick debug log is {:.1} GB ({}). {} day(s) are kept; delete the \
+         directory to reclaim the space.",
+        size as f64 / (1024.0 * 1024.0 * 1024.0),
+        path.display(),
+        RETAINED_LOG_DAYS
+    );
 }
 
 fn current_log_file_size() -> u64 {
@@ -217,4 +264,43 @@ pub fn finish_spinner_warn(pb: &ProgressBar, msg: &str) {
     }
     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
     pb.finish_with_message(format!("\x1b[33m⚠\x1b[0m {}", msg));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// The retention cap must not change the file name.
+    ///
+    /// `get_log_file_path` computes `carrick.log.<date>` by hand, and the
+    /// run-log upload reads this run's bytes from an offset into that exact
+    /// file. A builder that spelled the name differently would leave both
+    /// pointing at nothing, and the upload would go quiet rather than fail.
+    #[test]
+    fn the_capped_appender_writes_the_name_the_upload_path_looks_for() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let mut appender = rolling::Builder::new()
+            .rotation(rolling::Rotation::DAILY)
+            .filename_prefix("carrick.log")
+            .max_log_files(RETAINED_LOG_DAYS)
+            .build(dir.path())
+            .expect("build appender");
+        writeln!(appender, "a line").expect("write");
+        appender.flush().expect("flush");
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let expected = dir.path().join(format!("carrick.log.{}", today));
+        assert!(
+            expected.is_file(),
+            "expected {}, found {:?}",
+            expected.display(),
+            std::fs::read_dir(dir.path())
+                .expect("read dir")
+                .filter_map(Result::ok)
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
+        );
+    }
 }
