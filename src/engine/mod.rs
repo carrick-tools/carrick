@@ -3278,7 +3278,17 @@ fn discover_files_and_symbols(
 
     // Find files scoped to this service's directory (+ include roots).
     let ignore_patterns = service_ignore_patterns(service);
+    let walk_started = Instant::now();
     let (files, _) = find_service_files(repo_path, service, &ignore_patterns);
+    // Timed separately from the parse that follows: the walk and the parse
+    // scale with different things, and a scan that spends minutes in the walk
+    // is a walk reaching somewhere it should not (carrick#751).
+    info!(
+        "Discovered {} file(s) under {} in {:.1}s",
+        files.len(),
+        service.directory.as_deref().unwrap_or("the repo root"),
+        walk_started.elapsed().as_secs_f64()
+    );
 
     // Zero files means the scan target is wrong (typo'd path, empty checkout):
     // proceeding would upload an empty service and silently erase its
