@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use swc_common::{
@@ -324,22 +324,38 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // to claim. A run that lost files to failed analyzer calls indexed less
     // than it was asked to, and a tick next to "Analyzed" is the first half of
     // reporting success on a partial index (#461).
+    //
+    // A run that lost its type layer is the same shape of half-success: the
+    // route surface survives, so nothing downstream fails, and only a gate
+    // that asks for a type notices (carrick#748). It reaches the finish line
+    // for the same reason, and the Action log for the only reason it can —
+    // the Action tees this output and prints nothing of its own.
     let lost_files = crate::scan_health::lost_file_count();
+    let types_lost = crate::scan_health::types_summary_line();
+    let mut headline = format!("Analyzed {} ({} service(s))", repo_name, services.len());
     if lost_files > 0 {
-        logging::finish_spinner_warn(
-            &sp,
-            &format!(
-                "Analyzed {} ({} service(s)); {} of {} files were not analysed",
-                repo_name,
-                services.len(),
-                lost_files,
-                crate::scan_health::attempted_count()
-            ),
-        );
+        headline.push_str(&format!(
+            "; {} of {} files were not analysed",
+            lost_files,
+            crate::scan_health::attempted_count()
+        ));
+    }
+    if let Some(ref types_lost) = types_lost {
+        headline.push_str(&format!("; {}", types_lost));
+    }
+    if lost_files > 0 || types_lost.is_some() {
+        logging::finish_spinner_warn(&sp, &headline);
     } else {
-        logging::finish_spinner(
-            &sp,
-            &format!("Analyzed {} ({} service(s))", repo_name, services.len()),
+        logging::finish_spinner(&sp, &headline);
+    }
+    if let Some(ref types_lost) = types_lost {
+        warn!("{}", types_lost);
+        logging::annotate(
+            logging::Annotation::Warning,
+            &format!(
+                "Carrick indexed {} without types: {}",
+                repo_name, types_lost
+            ),
         );
     }
 
@@ -2988,12 +3004,13 @@ fn scope_sidecar_to_service(sidecar: Option<&TypeSidecar>, repo_path: &str, serv
         service_root.display()
     );
     sidecar.start_init(&service_root, service.tsconfig.as_deref());
-    if let Err(e) = sidecar.wait_ready(Duration::from_secs(30)) {
+    if let Err(e) = sidecar.wait_ready(crate::services::type_sidecar::ready_budget()) {
         warn!(
             "Sidecar re-init for service '{}' failed: {} — type extraction may be skipped \
              for this service",
             label, e
         );
+        crate::scan_health::record_types_unavailable(label, &e.to_string());
     }
 }
 
@@ -3037,9 +3054,16 @@ fn resolve_types_if_available(
     cloud_data: &mut CloudRepoData,
 ) -> Option<PathBuf> {
     let Some(sidecar) = sidecar else {
-        let detail = "sidecar unavailable (not found, failed to start, or failed to \
-                      initialize)"
-            .to_string();
+        // The reason the run recorded at spawn, not a list of everything that
+        // could have gone wrong: this string is what the boundary line reads
+        // out to whoever is looking at a service with no types.
+        let detail =
+            match crate::scan_health::types_unavailable_reason(crate::scan_health::WHOLE_SCAN) {
+                Some(reason) => format!("sidecar unavailable: {}", reason),
+                None => "sidecar unavailable (not found, failed to start, or failed to \
+                     initialize)"
+                    .to_string(),
+            };
         cloud_data.type_extraction_status = Some(format!("type extraction skipped: {}", detail));
         cloud_data.types_degraded = Some(TypeDegradation {
             stage: "spawn".to_string(),
@@ -3049,7 +3073,7 @@ fn resolve_types_if_available(
     };
 
     debug!("Starting sidecar type resolution");
-    match sidecar.wait_ready(Duration::from_secs(10)) {
+    match sidecar.wait_ready(crate::services::type_sidecar::ready_budget()) {
         Ok(()) => {
             match file_orchestrator.resolve_types_with_sidecar(
                 sidecar,
@@ -3135,6 +3159,10 @@ fn resolve_types_if_available(
                 stage: "init".to_string(),
                 detail: e.to_string(),
             });
+            crate::scan_health::record_types_unavailable(
+                config.service_name.as_deref().unwrap_or("(root)"),
+                &e.to_string(),
+            );
             None
         }
     }

@@ -50,10 +50,10 @@ mod wrapper_request_shape;
 
 use crate::cloud_storage::{AwsStorage, LocalDirStorage, MockStorage};
 use crate::services::TypeSidecar;
+use crate::services::type_sidecar;
 use engine::run_analysis_engine_with_sidecar;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 /// CLI arguments for the carrick analyzer
@@ -139,6 +139,15 @@ ENVIRONMENT VARIABLES:
                                     analyzer results is reported and fails,
                                     rather than overwriting the index with a
                                     thinner one
+    CARRICK_SIDECAR_READY_TIMEOUT_SECS
+                                    How long to wait for the type sidecar to
+                                    build its TypeScript program (default 180).
+                                    Raise it for a large monorepo whose
+                                    dependencies are installed
+    CARRICK_ALLOW_MISSING_TYPES     Scan and exit 0 even when the type sidecar
+                                    never became ready. Off by default: such a
+                                    run would index every endpoint with no
+                                    request or response types
 "#
         );
     }
@@ -237,24 +246,55 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     // STEP 2: Wait for sidecar to be ready (if spawned) before analysis
     // The sidecar initializes in parallel, so it should be ready by now
     // =======================================================================
+    let budget = type_sidecar::ready_budget();
     let sidecar_ready = if let Some(ref sidecar) = sidecar {
         debug!("Waiting for sidecar to be ready...");
-        match sidecar.wait_ready(Duration::from_secs(30)) {
+        match sidecar.wait_ready(budget) {
             Ok(()) => {
                 logging::finish_spinner(&sp, "Sidecar ready");
                 true
             }
             Err(e) => {
-                warn!("Sidecar failed to initialize: {}", e);
                 logging::finish_spinner_warn(&sp, "Sidecar unavailable");
+                // Without the sidecar every endpoint this run indexes carries
+                // no request or response type. The scan can still produce a
+                // route surface, so nothing downstream fails and the run
+                // reports success — which is how a rescan replaced a typed
+                // index with a typeless one and only an external gate's type
+                // rows noticed (carrick#748). Stop here instead: before the
+                // analysis, so the LLM spend is not paid for a typeless
+                // result, and before the upload, so the typed index already
+                // in the cloud survives.
+                if scan_health::should_fail_on_missing_types(
+                    e.is_environmental(),
+                    scan_health::allow_missing_types_from_env(),
+                ) {
+                    let message = format!(
+                        "The type sidecar was not ready within {}s ({}), so this scan \
+                         would index every endpoint with no request or response types. \
+                         Aborting before the analysis so the existing index keeps its \
+                         types. Raise the budget with {}, or set {}=1 to scan without \
+                         types anyway.",
+                        budget.as_secs(),
+                        e,
+                        type_sidecar::READY_TIMEOUT_ENV,
+                        scan_health::ALLOW_MISSING_TYPES_ENV,
+                    );
+                    logging::annotate(logging::Annotation::Error, &message);
+                    return Err(message.into());
+                }
+                warn!("Sidecar failed to initialize: {}", e);
+                scan_health::record_types_unavailable(scan_health::WHOLE_SCAN, &e.to_string());
                 false
             }
         }
     } else if sidecar_found {
         logging::finish_spinner_warn(&sp, "Sidecar failed to start");
+        scan_health::record_types_unavailable(scan_health::WHOLE_SCAN, "sidecar failed to start");
         false
     } else {
         logging::finish_spinner_warn(&sp, "Sidecar not found");
+        scan_health::record_types_unavailable(scan_health::WHOLE_SCAN, "sidecar not found");
         false
     };
 

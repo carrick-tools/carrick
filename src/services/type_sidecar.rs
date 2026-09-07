@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -674,6 +675,58 @@ pub struct TypeResolutionResult {
 }
 
 // ============================================================================
+// Time budgets
+// ============================================================================
+
+/// Env override for the readiness budget, in whole seconds. `0` is rejected
+/// (a zero budget makes every scan typeless); an unparseable value falls back
+/// to the default.
+pub const READY_TIMEOUT_ENV: &str = "CARRICK_SIDECAR_READY_TIMEOUT_SECS";
+
+/// How long the scan waits for the sidecar to finish building its TypeScript
+/// program, at spawn and at every per-service re-init.
+///
+/// One number, used by every `wait_ready` call site in the scanner. It was
+/// four (30 s at spawn, 10 s in the signature pass and the resolve step, 60 s
+/// in the v2 check), which meant a program that took 40 s to build was ready
+/// for one caller and unavailable to the next (carrick#748).
+///
+/// The value is the cost of the thing being waited for, not a guess at user
+/// patience: the sidecar builds a program over the whole service, and once
+/// the scanned repo's dependencies are installed (carrick#706) that program
+/// includes `node_modules`, which on a large monorepo took just under a
+/// minute. Losing the type layer costs every route its request and response
+/// types, so minutes of waiting are cheaper than a typeless index. It does
+/// not scale with the program's size because nothing structural about that
+/// size is known at spawn time, and a guess would be a heuristic.
+const READY_TIMEOUT_DEFAULT: Duration = Duration::from_secs(180);
+
+/// How long a single request/response exchange with an initialized sidecar
+/// may take.
+///
+/// Deliberately generous: before carrick#748 these deadlines were not
+/// enforced at all (the read blocked in `read_line` and only checked the
+/// clock between lines), so their only job now is to stop a wedged sidecar
+/// hanging the scan forever, not to cut short work that is progressing.
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// How long to wait for the sidecar to acknowledge a shutdown request. Short
+/// on purpose: the process is killed straight after.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The readiness budget for this run: [`READY_TIMEOUT_DEFAULT`] unless
+/// [`READY_TIMEOUT_ENV`] overrides it.
+pub fn ready_budget() -> Duration {
+    match std::env::var(READY_TIMEOUT_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) | Err(_) => READY_TIMEOUT_DEFAULT,
+            Ok(secs) => Duration::from_secs(secs),
+        },
+        Err(_) => READY_TIMEOUT_DEFAULT,
+    }
+}
+
+// ============================================================================
 // V8 heap sizing
 // ============================================================================
 
@@ -830,12 +883,19 @@ fn max_old_space_arg() -> Option<String> {
 /// let result = sidecar.resolve_types(&[]).unwrap();
 /// ```
 pub struct TypeSidecar {
-    /// Child process handle
-    child: Child,
+    /// Child process handle. Behind a mutex because a readiness timeout kills
+    /// it from a `&self` method (`Child::kill` needs `&mut`).
+    child: Mutex<Child>,
     /// Stdin for sending requests (wrapped in mutex for thread safety)
     stdin: Mutex<ChildStdin>,
-    /// Stdout for reading responses (wrapped in mutex for thread safety)
-    stdout: Mutex<BufReader<ChildStdout>>,
+    /// Lines the sidecar wrote to stdout, in order, delivered by the reader
+    /// thread spawned in [`TypeSidecar::spawn`]. Reading through a channel
+    /// rather than blocking on `read_line` is what makes every timeout in
+    /// this module a real deadline: a `read_line` on a blocking pipe waits
+    /// forever for a line that never comes, and the elapsed check around it
+    /// only fires once one does (carrick#748). Disconnected means the
+    /// sidecar's stdout hit EOF: the process is gone.
+    responses: Mutex<Receiver<String>>,
     /// Current state of the sidecar
     state: Arc<Mutex<SidecarState>>,
     /// Time when spawn() was called
@@ -886,6 +946,29 @@ impl TypeSidecar {
             .take()
             .ok_or_else(|| SidecarError::SpawnFailed("Failed to get stdout".to_string()))?;
 
+        // Read stdout on a background thread, one line per message, into a
+        // channel. Every reader in this module then waits on the channel with
+        // a deadline it can actually honour. Dropping the sender on EOF or a
+        // read error is how a dead sidecar surfaces as `ProcessDied` rather
+        // than as a wait that never returns.
+        let (tx, rx) = channel::<String>();
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        if tx.send(line).is_err() {
+                            break; // client gone
+                        }
+                    }
+                    Err(e) => {
+                        debug!("[type_sidecar] stdout read ended: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
         // Pipe sidecar stderr through tracing on a background thread
         if let Some(stderr) = child.stderr.take() {
             thread::spawn(move || {
@@ -904,9 +987,9 @@ impl TypeSidecar {
         );
 
         Ok(Self {
-            child,
+            child: Mutex::new(child),
             stdin: Mutex::new(stdin),
-            stdout: Mutex::new(BufReader::new(stdout)),
+            responses: Mutex::new(rx),
             state: Arc::new(Mutex::new(SidecarState::Spawning)),
             spawn_time,
             request_counter: Mutex::new(0),
@@ -965,6 +1048,17 @@ impl TypeSidecar {
     /// This blocks until the sidecar is ready or the timeout expires.
     /// If `start_init()` was called, this will wait for the init response.
     ///
+    /// The timeout is the WHOLE wait, not one leg of it. Before carrick#748
+    /// the init read was handed the full budget and the poll loop below then
+    /// spent the same budget again, so a caller asking for 30 s could wait
+    /// nearly 60; the read now gets whatever is left of the caller's budget.
+    ///
+    /// A sidecar that misses the deadline is killed. It is unusable either
+    /// way — the scan has already decided to run without types — and leaving
+    /// it alive costs a compiler-sized process churning for the rest of the
+    /// run, and risks its late `ready` frame being read as the answer to the
+    /// NEXT init (the per-service re-init in `scope_sidecar_to_service`).
+    ///
     /// # Arguments
     /// * `timeout` - Maximum time to wait
     ///
@@ -979,8 +1073,9 @@ impl TypeSidecar {
             if *state == SidecarState::Initializing {
                 drop(state); // Release lock before reading
 
-                // Read the init response
-                match self.read_response_with_timeout(timeout) {
+                // Read the init response within what is left of the budget.
+                let remaining = timeout.saturating_sub(start.elapsed());
+                match self.read_response_with_timeout(remaining) {
                     Ok(response) => {
                         let mut state = self.state.lock().unwrap();
                         if response.status == "ready" {
@@ -1000,8 +1095,14 @@ impl TypeSidecar {
                         }
                     }
                     Err(e) => {
-                        let mut state = self.state.lock().unwrap();
-                        *state = SidecarState::Failed(e.to_string());
+                        {
+                            let mut state = self.state.lock().unwrap();
+                            *state = SidecarState::Failed(e.to_string());
+                        }
+                        // An `InitFailed` sidecar answered and is still
+                        // usable for another service's init; one that missed
+                        // the deadline or died is not.
+                        self.abandon(&e);
                         return Err(e);
                     }
                 }
@@ -1021,7 +1122,31 @@ impl TypeSidecar {
             }
         }
 
+        {
+            let mut state = self.state.lock().unwrap();
+            *state = SidecarState::Failed(SidecarError::Timeout.to_string());
+        }
+        self.abandon(&SidecarError::Timeout);
         Err(SidecarError::Timeout)
+    }
+
+    /// Kill the sidecar after a readiness failure that leaves it unusable.
+    ///
+    /// Only for `Timeout`, `ProcessDied` and `IoError`: the process is either
+    /// gone already or still building a program nobody will wait for. Leaving
+    /// it alive burns a compiler-sized process for the rest of the scan, and
+    /// its late `ready` frame would still be sitting in the channel when the
+    /// next service re-inits — which would read as that service's success.
+    fn abandon(&self, error: &SidecarError) {
+        match error {
+            SidecarError::Timeout | SidecarError::ProcessDied | SidecarError::IoError(_) => {}
+            _ => return,
+        }
+        debug!("[type_sidecar] Killing sidecar after {}", error);
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     /// Resolve explicit types by bundling symbols.
@@ -1057,7 +1182,7 @@ impl TypeSidecar {
         };
 
         self.send_request(&request)?;
-        self.read_response_with_timeout(Duration::from_secs(60))
+        self.read_response_with_timeout(OPERATION_TIMEOUT)
     }
 
     /// Infer implicit types at specified locations.
@@ -1098,7 +1223,7 @@ impl TypeSidecar {
         };
 
         self.send_request(&request)?;
-        self.read_response_with_timeout(Duration::from_secs(60))
+        self.read_response_with_timeout(OPERATION_TIMEOUT)
     }
 
     /// Resolve surface type definitions from a v2 capture stub package.
@@ -1127,7 +1252,7 @@ impl TypeSidecar {
         };
 
         self.send_request(&request)?;
-        let response = self.read_response_with_timeout(Duration::from_secs(30))?;
+        let response = self.read_response_with_timeout(OPERATION_TIMEOUT)?;
 
         if response.status != "success" {
             let errors = response.errors.unwrap_or_default();
@@ -1171,8 +1296,8 @@ impl TypeSidecar {
 
         self.send_request(&request)?;
         // Compiler-heavy: declaration emit + per-alias self-check over the
-        // whole anchor closure. Sized like the sidecar's own CI budget.
-        let value = self.read_result_value(&request_id, Duration::from_secs(300))?;
+        // whole anchor closure, so it waits on the shared operation budget.
+        let value = self.read_result_value(&request_id, OPERATION_TIMEOUT)?;
         if value.get("status").and_then(|s| s.as_str()) != Some("success") {
             return Err(SidecarError::CaptureFailed(frame_errors(&value)));
         }
@@ -1217,10 +1342,9 @@ impl TypeSidecar {
         };
 
         self.send_request(&request)?;
-        // Keepalives arrive every ~1.5s during install/check, so a 120s
-        // per-frame deadline detects a dead sidecar without capping the
-        // install itself.
-        let value = self.read_result_value(&request_id, Duration::from_secs(120))?;
+        // Keepalives arrive every ~1.5s during install/check, so a per-frame
+        // deadline detects a dead sidecar without capping the install itself.
+        let value = self.read_result_value(&request_id, OPERATION_TIMEOUT)?;
         if value.get("status").and_then(|s| s.as_str()) != Some("success") {
             return Err(SidecarError::CheckFailed(frame_errors(&value)));
         }
@@ -1404,7 +1528,7 @@ impl TypeSidecar {
         };
 
         self.send_request(&request)?;
-        self.read_response_with_timeout(Duration::from_secs(5))
+        self.read_response_with_timeout(SHUTDOWN_TIMEOUT)
     }
 
     /// Shutdown the sidecar gracefully.
@@ -1500,40 +1624,33 @@ impl TypeSidecar {
         request_id: &str,
         timeout: Duration,
     ) -> Result<serde_json::Value, SidecarError> {
-        let mut stdout = self.stdout.lock().unwrap();
-        let mut line = String::new();
+        let responses = self.responses.lock().unwrap();
         let mut frame_start = Instant::now();
 
         loop {
-            if frame_start.elapsed() > timeout {
+            let remaining = timeout.saturating_sub(frame_start.elapsed());
+            if remaining.is_zero() {
                 return Err(SidecarError::Timeout);
             }
-            line.clear();
-            match stdout.read_line(&mut line) {
-                Ok(0) => return Err(SidecarError::ProcessDied),
-                Ok(_) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
-                        SidecarError::DeserializationError(format!("{}: {}", e, trimmed))
-                    })?;
-                    if value.get("request_id").and_then(|id| id.as_str()) != Some(request_id) {
-                        continue;
-                    }
-                    if value.get("status").and_then(|s| s.as_str()) == Some("progress") {
-                        frame_start = Instant::now();
-                        continue;
-                    }
-                    return Ok(value);
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                Err(e) => return Err(SidecarError::IoError(e.to_string())),
+            let line = match responses.recv_timeout(remaining) {
+                Ok(line) => line,
+                Err(RecvTimeoutError::Timeout) => return Err(SidecarError::Timeout),
+                Err(RecvTimeoutError::Disconnected) => return Err(SidecarError::ProcessDied),
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
             }
+            let value: serde_json::Value = serde_json::from_str(trimmed)
+                .map_err(|e| SidecarError::DeserializationError(format!("{}: {}", e, trimmed)))?;
+            if value.get("request_id").and_then(|id| id.as_str()) != Some(request_id) {
+                continue;
+            }
+            if value.get("status").and_then(|s| s.as_str()) == Some("progress") {
+                frame_start = Instant::now();
+                continue;
+            }
+            return Ok(value);
         }
     }
 
@@ -1541,47 +1658,35 @@ impl TypeSidecar {
         &self,
         timeout: Duration,
     ) -> Result<SidecarResponse, SidecarError> {
-        let mut stdout = self.stdout.lock().unwrap();
-        let mut line = String::new();
-
-        // Set up timeout using a simple polling approach
-        // Note: For production, consider using async I/O
+        let responses = self.responses.lock().unwrap();
+        // One deadline for the whole call, so the lines this skips (a blank
+        // line, a keepalive) draw the budget down instead of resetting it.
+        // That is the 0.3.42 shape: a blank line arrived, the loop skipped
+        // it, and the elapsed check that only ran between reads then reported
+        // a timeout nearly twice the stated budget (carrick#748).
         let start = Instant::now();
 
         loop {
-            if start.elapsed() > timeout {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
                 return Err(SidecarError::Timeout);
             }
+            let line = match responses.recv_timeout(remaining) {
+                Ok(line) => line,
+                Err(RecvTimeoutError::Timeout) => return Err(SidecarError::Timeout),
+                // stdout hit EOF: the process is gone.
+                Err(RecvTimeoutError::Disconnected) => return Err(SidecarError::ProcessDied),
+            };
 
-            // Try to read a line
-            match stdout.read_line(&mut line) {
-                Ok(0) => {
-                    // EOF - process may have died
-                    return Err(SidecarError::ProcessDied);
-                }
-                Ok(_) => {
-                    // Got a line, parse it
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        line.clear();
-                        continue;
-                    }
-
-                    let response: SidecarResponse = serde_json::from_str(trimmed).map_err(|e| {
-                        SidecarError::DeserializationError(format!("{}: {}", e, trimmed))
-                    })?;
-
-                    return Ok(response);
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No data yet, sleep a bit
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                Err(e) => {
-                    return Err(SidecarError::IoError(e.to_string()));
-                }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
             }
+
+            let response: SidecarResponse = serde_json::from_str(trimmed)
+                .map_err(|e| SidecarError::DeserializationError(format!("{}: {}", e, trimmed)))?;
+
+            return Ok(response);
         }
     }
 }
@@ -1783,7 +1888,9 @@ impl Drop for TypeSidecar {
         thread::sleep(Duration::from_millis(100));
 
         // Force kill if still running
-        let _ = self.child.kill();
+        if let Ok(child) = self.child.get_mut() {
+            let _ = child.kill();
+        }
     }
 }
 
@@ -1816,6 +1923,24 @@ pub enum SidecarError {
     CaptureFailed(String),
     /// v2 check failed
     CheckFailed(String),
+}
+
+impl SidecarError {
+    /// Whether this failure is environmental — the machine or this run having
+    /// a bad day — rather than a repeatable property of the checkout.
+    ///
+    /// A missed deadline, a dead process or a broken pipe say nothing about
+    /// the code being scanned and will not reproduce on the next run, so a
+    /// scan may treat them as reasons to stop. An initialization error (the
+    /// sidecar answered, with a complaint about a tsconfig) or a sidecar that
+    /// is not installed reproduce every time, and stopping on those would
+    /// make a repo permanently red.
+    pub fn is_environmental(&self) -> bool {
+        matches!(
+            self,
+            SidecarError::Timeout | SidecarError::ProcessDied | SidecarError::IoError(_)
+        )
+    }
 }
 
 impl std::fmt::Display for SidecarError {

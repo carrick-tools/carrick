@@ -182,6 +182,33 @@ pub fn finish_spinner(pb: &ProgressBar, msg: &str) {
     pb.finish_with_message(format!("\x1b[32m✓\x1b[0m {}", msg));
 }
 
+/// Severity of a GitHub Actions annotation.
+pub enum Annotation {
+    Warning,
+    Error,
+}
+
+/// Emit a GitHub Actions annotation for `msg`, when running in one.
+///
+/// The Action tees the scanner's own output and nothing else, so a line the
+/// scanner does not print is a line the Action log does not carry. An
+/// annotation additionally surfaces on the run summary and next to the step,
+/// which is where someone looks when a scan finished but did less than it was
+/// asked to. Outside Actions this prints nothing: the same fact reaches a
+/// local run through the warning it accompanies.
+pub fn annotate(level: Annotation, msg: &str) {
+    if std::env::var("GITHUB_ACTIONS").is_err() {
+        return;
+    }
+    let tag = match level {
+        Annotation::Warning => "warning",
+        Annotation::Error => "error",
+    };
+    // Annotations are one line: a newline would end the command and print the
+    // rest as ordinary log text.
+    eprintln!("::{}::{}", tag, msg.replace('\n', " "));
+}
+
 /// Finish a spinner with a warning marker.
 pub fn finish_spinner_warn(pb: &ProgressBar, msg: &str) {
     if !is_tty() {

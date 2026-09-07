@@ -15,10 +15,18 @@
 //! and the question "did this run lose anything" is about the run, not about
 //! any one of them.
 //!
+//! The type layer is counted here for the same reason: a sidecar that never
+//! becomes ready costs every endpoint its request and response types while
+//! leaving the route surface intact, so the run looks like a success from
+//! every angle except a gate that asks for a type (carrick#748).
+//!
 //! What belongs here is loss the scan cannot account for: a call the cloud
-//! never answered. Deterministic exclusions do not — a file that fails to parse
-//! is a known, repeatable limitation, and putting it here would make a repo
-//! with one unparseable file permanently red.
+//! never answered, a sidecar that missed its budget on this machine.
+//! Deterministic exclusions do not — a file that fails to parse is a known,
+//! repeatable limitation, and putting it here would make a repo with one
+//! unparseable file permanently red. The same line divides an environmental
+//! sidecar failure from a repeatable one; see
+//! [`crate::services::type_sidecar::SidecarError::is_environmental`].
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -26,6 +34,16 @@ use std::sync::{Mutex, OnceLock};
 /// Set this to let a run finish green despite losing files. The loss is still
 /// reported; only the verdict changes.
 pub const ALLOW_PARTIAL_ENV: &str = "CARRICK_ALLOW_PARTIAL_ANALYSIS";
+
+/// Set this to let a run continue with no type layer. The loss is still
+/// reported; only the verdict changes.
+///
+/// Separate from [`ALLOW_PARTIAL_ENV`] because the two losses are different
+/// and stop at different points: a lost file aborts before the upload, so the
+/// existing index is not thinned; a sidecar that never becomes ready aborts
+/// before the analysis, because nothing after that point can recover the
+/// types and the whole LLM spend would buy a typeless index (carrick#748).
+pub const ALLOW_MISSING_TYPES_ENV: &str = "CARRICK_ALLOW_MISSING_TYPES";
 
 /// How many lost files are named individually before the list is truncated.
 const MAX_NAMED_FILES: usize = 10;
@@ -42,6 +60,10 @@ struct Registry {
     attempted: usize,
     /// One entry per file the analyzer never answered for: (path, reason code).
     lost: Vec<(String, String)>,
+    /// One entry per scope that got no type layer: (scope, reason). The scope
+    /// is a service name, or [`WHOLE_SCAN`] when the sidecar never became
+    /// ready at all and every service in the run is typeless.
+    types_unavailable: Vec<(String, String)>,
 }
 
 impl Registry {
@@ -53,6 +75,54 @@ impl Registry {
     /// Records that `path` has no analysis, and why.
     fn record_unanalysed_file(&mut self, path: &str, reason: &str) {
         self.lost.push((path.to_string(), reason.to_string()));
+    }
+
+    /// Records that `scope` has no type layer this run, and why.
+    ///
+    /// First reason wins: one sidecar failure is seen by several stages (the
+    /// per-service re-init, then the resolve step), and the summary counts
+    /// scopes that lost their types, not stages that noticed.
+    fn record_types_unavailable(&mut self, scope: &str, reason: &str) {
+        if self.types_unavailable.iter().any(|(s, _)| s == scope) {
+            return;
+        }
+        self.types_unavailable
+            .push((scope.to_string(), reason.to_string()));
+    }
+
+    /// Why `scope` has no type layer, if it was recorded as losing one.
+    fn types_unavailable_reason(&self, scope: &str) -> Option<String> {
+        self.types_unavailable
+            .iter()
+            .find(|(recorded, _)| recorded == scope)
+            .map(|(_, reason)| reason.clone())
+    }
+
+    /// One line naming what lost its types and why, or `None` when nothing
+    /// did.
+    ///
+    /// Says what the loss costs, not just that it happened: a run that keeps
+    /// every route but drops every request and response type reads as a
+    /// success everywhere except the one gate that asks for a type, which is
+    /// how 0.3.42 shipped a typeless index for a 33-service repo and only the
+    /// type rows of an external gate noticed (carrick#748).
+    fn types_summary_line(&self) -> Option<String> {
+        if self.types_unavailable.is_empty() {
+            return None;
+        }
+
+        let scopes = self
+            .types_unavailable
+            .iter()
+            .map(|(scope, reason)| format!("{} ({})", scope, reason))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        Some(format!(
+            "no type layer for {}: this run's endpoints carry no request or response \
+             types",
+            scopes
+        ))
     }
 
     /// How many files were lost.
@@ -165,7 +235,56 @@ pub fn summary_line() -> Option<String> {
 
 /// Whether [`ALLOW_PARTIAL_ENV`] is set for this run.
 pub fn allow_partial_from_env() -> bool {
-    std::env::var(ALLOW_PARTIAL_ENV).is_ok_and(|v| !v.is_empty() && v != "0" && v != "false")
+    env_flag(ALLOW_PARTIAL_ENV)
+}
+
+/// Whether [`ALLOW_MISSING_TYPES_ENV`] is set for this run.
+pub fn allow_missing_types_from_env() -> bool {
+    env_flag(ALLOW_MISSING_TYPES_ENV)
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0" && v != "false")
+}
+
+/// The scope recorded when the whole run is typeless, not one service.
+pub const WHOLE_SCAN: &str = "this scan";
+
+/// Records that `scope` has no type layer in this run's index, and why.
+pub fn record_types_unavailable(scope: &str, reason: &str) {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .record_types_unavailable(scope, reason);
+}
+
+/// Why `scope` has no type layer, if it was recorded as losing one.
+pub fn types_unavailable_reason(scope: &str) -> Option<String> {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .types_unavailable_reason(scope)
+}
+
+/// One line naming what lost its types and why, or `None` when nothing did.
+pub fn types_summary_line() -> Option<String> {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .types_summary_line()
+}
+
+/// Whether a readiness failure must stop the run before it spends anything.
+///
+/// Pure, so the policy is testable without the process environment. The split
+/// is between an environmental failure and a repeatable one: a sidecar that
+/// missed its budget or died is a machine having a bad day, and a scan that
+/// continues past it replaces a typed index with a typeless one. A sidecar
+/// that is not installed, or that answered with an error, is a property of
+/// this checkout — it would fail identically on every run, and making a repo
+/// permanently red is the thing this module's doc comment forbids.
+pub fn should_fail_on_missing_types(fatal: bool, allow_missing: bool) -> bool {
+    fatal && !allow_missing
 }
 
 /// Whether the run must fail. Pure, so the policy is testable without touching
@@ -243,6 +362,69 @@ mod tests {
         );
         // Twelve paths, ten named.
         assert!(summary.contains("and 2 more"), "summary: {summary}");
+    }
+
+    /// A run that lost its type layer says so on the same line it reports the
+    /// rest of its health, naming the scope and the reason.
+    #[test]
+    fn a_typeless_run_names_the_scope_and_the_reason() {
+        let mut run = run();
+        assert_eq!(run.types_summary_line(), None);
+
+        run.record_types_unavailable(WHOLE_SCAN, "Sidecar operation timed out");
+
+        let summary = run
+            .types_summary_line()
+            .expect("a lost type layer must produce a summary");
+        assert!(
+            summary.contains("this scan (Sidecar operation timed out)"),
+            "summary: {summary}"
+        );
+        // What it cost, not just that it happened.
+        assert!(
+            summary.contains("no request or response types"),
+            "summary: {summary}"
+        );
+        assert_eq!(
+            run.types_unavailable_reason(WHOLE_SCAN).as_deref(),
+            Some("Sidecar operation timed out")
+        );
+        assert_eq!(run.types_unavailable_reason("webapp"), None);
+    }
+
+    /// One failure seen by two stages is one loss. The per-service re-init and
+    /// the resolve step both notice the same dead sidecar.
+    #[test]
+    fn a_scope_is_recorded_once_with_its_first_reason() {
+        let mut run = run();
+        run.record_types_unavailable("webapp", "Sidecar operation timed out");
+        run.record_types_unavailable("webapp", "Sidecar not ready: already failed");
+
+        let summary = run.types_summary_line().unwrap();
+        assert!(
+            summary.contains("webapp (Sidecar operation timed out)"),
+            "summary: {summary}"
+        );
+        assert!(!summary.contains("already failed"), "summary: {summary}");
+    }
+
+    /// The fail/warn split: an environmental failure stops the run, a
+    /// repeatable one never does, and the opt-out overrides the first.
+    #[test]
+    fn only_an_environmental_type_loss_fails_the_run() {
+        use crate::services::type_sidecar::SidecarError;
+
+        assert!(SidecarError::Timeout.is_environmental());
+        assert!(SidecarError::ProcessDied.is_environmental());
+        assert!(SidecarError::IoError("broken pipe".into()).is_environmental());
+        // A sidecar that answered with a complaint, or is not installed,
+        // would fail identically on every run.
+        assert!(!SidecarError::InitFailed("bad tsconfig".into()).is_environmental());
+        assert!(!SidecarError::SpawnFailed("no node".into()).is_environmental());
+
+        assert!(should_fail_on_missing_types(true, false));
+        assert!(!should_fail_on_missing_types(true, true));
+        assert!(!should_fail_on_missing_types(false, false));
     }
 
     /// The reason comes from the cloud's own error code when there is one.
