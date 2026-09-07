@@ -45,3 +45,17 @@ export async function sendBatchSummary(): Promise<void> {
   const summary = await createLoaderRoute('summary');
   respond(summary);
 }
+
+// A LINE-ONLY anchor that resolves a real shape (carrick#788). This is the
+// live consumer `call_result` shape: the scanner records the call's line and
+// nothing else — no span, no expression text, no parameter name — and the
+// binding the line resolves has a concrete type. #766's abstain is gated on
+// the type being a bare top type, so this anchor must keep printing its
+// shape; an abstain that widened to "line-only" alone would take it to
+// `unknown` and lose a row the index serves today.
+declare function acceptBatch(): Promise<{ batchId: string }>;
+
+export async function enqueueBatch(): Promise<void> {
+  const accepted = await acceptBatch();
+  respond(accepted);
+}
