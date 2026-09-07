@@ -39,6 +39,20 @@ export interface LoadResult {
 }
 
 /**
+ * Source-file patterns used when the repo declares no tsconfig, relative to
+ * the repo root. `node_modules` is excluded explicitly: a glob that matches
+ * anything at the repo root would otherwise pull the whole installed tree in.
+ */
+const DEFAULT_SOURCE_PATTERNS = [
+  'src/**/*.ts',
+  'src/**/*.tsx',
+  'lib/**/*.ts',
+  'app/**/*.ts',
+  'app/**/*.tsx',
+  '*.ts',
+];
+
+/**
  * Default compiler options used when no tsconfig.json is found
  */
 const DEFAULT_COMPILER_OPTIONS: CompilerOptions = {
@@ -105,6 +119,14 @@ const TARGET_MAP: Record<string, number> = {
 /**
  * ProjectLoader - Manages ts-morph Project initialization and access
  *
+ * `load()` decides what the project will be built from and returns; the
+ * ts-morph project itself is built on first use and memoised. Readiness is a
+ * gate on the whole type layer — when it was gated on program construction, a
+ * repo with its dependencies installed could walk past the caller's budget and
+ * lose types for every service at once (carrick#749). Building on demand puts
+ * that cost inside the request that needs it, where a failure costs one
+ * service instead of all of them.
+ *
  * Usage:
  *   const loader = new ProjectLoader({ repoRoot: '/path/to/repo' });
  *   const result = loader.load();
@@ -114,6 +136,8 @@ const TARGET_MAP: Record<string, number> = {
  */
 export class ProjectLoader {
   private project: Project | null = null;
+  /** Set by `load()`; builds the ts-morph project on first `getProject()`. */
+  private buildProject: (() => Project) | null = null;
   private readonly repoRoot: string;
   private readonly tsconfigPath: string | undefined;
   private readonly tsconfigSnapshot: TsconfigSnapshot | undefined;
@@ -141,7 +165,10 @@ export class ProjectLoader {
   }
 
   /**
-   * Load the TypeScript project
+   * Decide what the project will be built from.
+   *
+   * Validates the repo root and resolves the tsconfig, both cheap; the
+   * ts-morph project is built by the first `getProject()`.
    *
    * @returns LoadResult indicating success or failure
    */
@@ -166,33 +193,39 @@ export class ProjectLoader {
 
       // Priority 1: Use tsconfig snapshot if provided (for synthetic monorepo)
       if (this.tsconfigSnapshot) {
-        this.log('Loading project with tsconfig snapshot');
-        const compilerOptions = this.snapshotToCompilerOptions(this.tsconfigSnapshot);
-        this.project = new Project({
-          compilerOptions,
-          skipAddingFilesFromTsConfig: true,
-        });
-        this.addDefaultSourceFiles();
+        const snapshot = this.tsconfigSnapshot;
+        this.log('Project will load with tsconfig snapshot');
+        this.buildProject = () => {
+          const project = new Project({
+            compilerOptions: this.snapshotToCompilerOptions(snapshot),
+            skipAddingFilesFromTsConfig: true,
+          });
+          this.addDefaultSourceFiles(project);
+          return project;
+        };
       }
       // Priority 2: Use tsconfig.json file
       else {
         const tsconfigPath = this.findTsConfig();
 
         if (tsconfigPath) {
-          this.log(`Loading project with tsconfig: ${tsconfigPath}`);
-          this.project = new Project({
-            tsConfigFilePath: tsconfigPath,
-            skipAddingFilesFromTsConfig: false,
-          });
+          this.log(`Project will load with tsconfig: ${tsconfigPath}`);
+          this.buildProject = () =>
+            new Project({
+              tsConfigFilePath: tsconfigPath,
+              skipAddingFilesFromTsConfig: false,
+            });
         } else {
           this.log('No tsconfig.json found, using default compiler options');
-          this.project = new Project({
-            compilerOptions: DEFAULT_COMPILER_OPTIONS,
-            skipAddingFilesFromTsConfig: true,
-          });
-
-          // Add source files from common locations
-          this.addDefaultSourceFiles();
+          this.buildProject = () => {
+            const project = new Project({
+              compilerOptions: DEFAULT_COMPILER_OPTIONS,
+              skipAddingFilesFromTsConfig: true,
+            });
+            // Add source files from common locations
+            this.addDefaultSourceFiles(project);
+            return project;
+          };
         }
       }
 
@@ -204,7 +237,7 @@ export class ProjectLoader {
 
       this.initialized = true;
       this.initTimeMs = Math.round(performance.now() - startTime);
-      this.log(`Project loaded successfully in ${this.initTimeMs}ms`);
+      this.log(`Project resolved in ${this.initTimeMs}ms (built on first use)`);
 
       return {
         success: true,
@@ -285,15 +318,24 @@ export class ProjectLoader {
   }
 
   /**
-   * Get the loaded ts-morph Project
+   * Get the ts-morph Project, building it on first call.
    *
    * @returns The Project instance
-   * @throws Error if project hasn't been successfully loaded
+   * @throws Error if load() has not succeeded, or if the build fails
    */
   getProject(): Project {
-    if (!this.project || !this.initialized) {
+    if (!this.initialized || !this.buildProject) {
       throw new Error(
         'Project not initialized. Call load() first and ensure it succeeds.'
+      );
+    }
+    if (!this.project) {
+      const startTime = performance.now();
+      this.project = this.buildProject();
+      const buildTimeMs = Math.round(performance.now() - startTime);
+      this.log(
+        `Project built in ${buildTimeMs}ms ` +
+          `(${this.project.getSourceFiles().length} source files)`
       );
     }
     return this.project;
@@ -365,31 +407,43 @@ export class ProjectLoader {
   }
 
   /**
-   * Add source files from common project locations when no tsconfig is found
+   * Add source files from common project locations when no tsconfig is found.
+   *
+   * Files are globbed and added one by one rather than through
+   * `addSourceFilesAtPaths`, which registers every descendant directory of any
+   * directory a pattern hit in. One `.ts` file at the repo root is enough to
+   * make that walk the entire installed tree: on a large monorepo with
+   * dependencies installed it cost 40 s and added nothing the compiler needs
+   * (carrick#749).
    */
-  private addDefaultSourceFiles(): void {
-    if (!this.project) return;
+  private addDefaultSourceFiles(project: Project): void {
+    const globs = DEFAULT_SOURCE_PATTERNS.map((pattern) =>
+      path.join(this.repoRoot, pattern)
+    );
+    // Negated last so it applies to every pattern above it.
+    globs.push(`!${path.join(this.repoRoot, '**/node_modules/**')}`);
 
-    const patterns = [
-      path.join(this.repoRoot, 'src/**/*.ts'),
-      path.join(this.repoRoot, 'src/**/*.tsx'),
-      path.join(this.repoRoot, 'lib/**/*.ts'),
-      path.join(this.repoRoot, 'app/**/*.ts'),
-      path.join(this.repoRoot, 'app/**/*.tsx'),
-      path.join(this.repoRoot, '*.ts'),
-    ];
+    let filePaths: string[] = [];
+    try {
+      filePaths = project.getFileSystem().globSync(globs);
+    } catch (err) {
+      this.logError(
+        `Default source file glob failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+      return;
+    }
 
-    // Filter patterns to only include directories that exist
-    for (const pattern of patterns) {
+    for (const filePath of filePaths) {
       try {
-        this.project.addSourceFilesAtPaths(pattern);
+        project.addSourceFileAtPath(filePath);
       } catch {
-        // Ignore errors for non-existent paths
+        // A file that disappeared between glob and read is not fatal.
       }
     }
 
-    const fileCount = this.project.getSourceFiles().length;
-    this.log(`Added ${fileCount} source files from default patterns`);
+    this.log(
+      `Added ${project.getSourceFiles().length} source files from default patterns`
+    );
   }
 
   /**

@@ -42,12 +42,45 @@ import type {
 // ===========================================================================
 
 let projectLoader: ProjectLoader | null = null;
-let typeBundler: TypeBundler | null = null;
-let surfaceEmitter: SurfaceEmitter | null = null;
-let typeInferrer: TypeInferrer | null = null;
 let monorepoBuilder: MonorepoBuilder | null = null;
-let definitionResolver: DefinitionResolver | null = null;
 let initTimeMs: number | null = null;
+
+/**
+ * The components that read the init'd ts-morph project. Built together with
+ * the project on first use and dropped on re-init, so re-scoping the sidecar
+ * to another service can never serve the previous service's program.
+ */
+interface ProjectComponents {
+  typeBundler: TypeBundler;
+  surfaceEmitter: SurfaceEmitter;
+  typeInferrer: TypeInferrer;
+  definitionResolver: DefinitionResolver;
+}
+
+let components: ProjectComponents | null = null;
+
+/**
+ * Get the project-backed components, building the project if this is the
+ * first request that needs it.
+ *
+ * @throws if init has not run, or if the project cannot be built
+ */
+function projectComponents(): ProjectComponents {
+  if (!projectLoader?.isInitialized()) {
+    throw new Error('Sidecar not initialized. Call init first.');
+  }
+  if (!components) {
+    const project = projectLoader.getProject();
+    const repoRoot = projectLoader.getRepoRoot();
+    components = {
+      typeBundler: new TypeBundler({ project, repoRoot }),
+      surfaceEmitter: new SurfaceEmitter({ project, repoRoot }),
+      typeInferrer: new TypeInferrer({ project }),
+      definitionResolver: new DefinitionResolver({ project }),
+    };
+  }
+  return components;
+}
 
 // ===========================================================================
 // Request Handlers
@@ -62,6 +95,9 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
   try {
     log(`Initializing with repo_root: ${request.repo_root}`);
 
+    // Re-init re-scopes the sidecar to another root: drop everything built
+    // over the previous project before resolving the new one.
+    components = null;
     projectLoader = new ProjectLoader({
       repoRoot: request.repo_root,
       tsconfigPath: request.tsconfig_path,
@@ -80,22 +116,9 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
       };
     }
 
-    // Initialize bundler, surface emitter, and inferrer
-    const project = projectLoader.getProject();
-    const repoRoot = projectLoader.getRepoRoot();
-
-    typeBundler = new TypeBundler({
-      project,
-      repoRoot,
-    });
-
-    surfaceEmitter = new SurfaceEmitter({
-      project,
-      repoRoot,
-    });
-
-    typeInferrer = new TypeInferrer({ project });
-    definitionResolver = new DefinitionResolver({ project });
+    // The project and everything that reads it are built by the first request
+    // that needs them, so readiness costs the same on a bare checkout as on
+    // one with its dependencies installed (carrick#749).
 
     // Initialize monorepo builder (doesn't need project)
     monorepoBuilder = new MonorepoBuilder();
@@ -126,18 +149,10 @@ function handleInit(request: SidecarRequest & { action: 'init' }): InitResponse 
  * Handle the 'bundle' action - bundle explicit types (legacy)
  */
 function handleBundle(request: SidecarRequest & { action: 'bundle' }): BundleResponse {
-  if (!projectLoader?.isInitialized() || !typeBundler) {
-    return {
-      request_id: request.request_id,
-      status: 'error',
-      errors: ['Sidecar not initialized. Call init first.'],
-    };
-  }
-
   try {
     log(`Bundling ${request.symbols.length} symbol(s)`);
 
-    const result = typeBundler.bundle(request.symbols);
+    const result = projectComponents().typeBundler.bundle(request.symbols);
 
     if (!result.success) {
       return {
@@ -173,18 +188,10 @@ function handleBundle(request: SidecarRequest & { action: 'bundle' }): BundleRes
  * Handle the 'emit_surface' action - emit a surface .d.ts with rewritten specifiers
  */
 function handleEmitSurface(request: SidecarRequest & { action: 'emit_surface' }): EmitSurfaceResponse {
-  if (!projectLoader?.isInitialized() || !surfaceEmitter) {
-    return {
-      request_id: request.request_id,
-      status: 'error',
-      errors: ['Sidecar not initialized. Call init first.'],
-    };
-  }
-
   try {
     log(`Emitting surface for repo '${request.repo_name}' with ${request.payloads.length} payload(s)`);
 
-    const result = surfaceEmitter.emit(
+    const result = projectComponents().surfaceEmitter.emit(
       request.repo_name,
       request.payloads,
       request.output_path
@@ -305,18 +312,13 @@ async function handleCheckV2Async(
  * Handle the 'infer' action - infer implicit types
  */
 function handleInfer(request: SidecarRequest & { action: 'infer' }): InferResponse {
-  if (!projectLoader?.isInitialized() || !typeInferrer) {
-    return {
-      request_id: request.request_id,
-      status: 'error',
-      errors: ['Sidecar not initialized. Call init first.'],
-    };
-  }
-
   try {
     log(`Inferring ${request.requests.length} type(s)`);
 
-    const result = typeInferrer.infer(request.requests, request.extraction_config);
+    const result = projectComponents().typeInferrer.infer(
+      request.requests,
+      request.extraction_config
+    );
 
     return {
       request_id: request.request_id,
@@ -426,18 +428,10 @@ function handleCheckCompatibility(request: SidecarRequest & { action: 'check_com
 function handleResolveDefinitions(
   request: SidecarRequest & { action: 'resolve_definitions' },
 ): ResolveDefinitionsResponse {
-  if (!projectLoader?.isInitialized() || !definitionResolver) {
-    return {
-      request_id: request.request_id,
-      status: 'error',
-      errors: ['Sidecar not initialized. Call init first.'],
-    };
-  }
-
   try {
     log(`Resolving ${request.aliases.length} type alias(es) from ${request.stub_dir}`);
 
-    const results = definitionResolver.resolveFromStub(
+    const results = projectComponents().definitionResolver.resolveFromStub(
       request.stub_dir,
       request.aliases,
     );

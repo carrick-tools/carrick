@@ -78,7 +78,19 @@ Communication uses JSON over stdio:
 
 ### Actions
 
-#### `init` - Initialize TypeScript Project
+#### `init` - Point the sidecar at a project
+
+Resolves which tsconfig (or default patterns) the project will be built from
+and answers immediately. The ts-morph project itself is built by the first
+request that reads it — `bundle`, `emit_surface`, `infer` or
+`resolve_definitions` — and reused after that; `capture_v2` and `check_v2` are
+stateless and build their own. So `init` costs the same on a repo with its
+dependencies installed as on a bare checkout, and the time a large program
+takes to build is charged to a request's deadline rather than to readiness
+(carrick#749).
+
+Re-initialising re-scopes the sidecar to another root, and drops the previous
+project along with everything built over it.
 
 ```json
 {
