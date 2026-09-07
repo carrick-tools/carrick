@@ -34,6 +34,7 @@ mod operation;
 mod packages;
 mod parser;
 mod receiver_origin;
+mod receiver_type;
 mod scan_health;
 mod sdk_edges;
 mod sdk_surface;

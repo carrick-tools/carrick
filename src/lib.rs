@@ -34,6 +34,7 @@ pub mod operation;
 pub mod packages;
 pub mod parser;
 pub mod receiver_origin;
+pub mod receiver_type;
 pub mod scan_health;
 pub mod sdk_edges;
 pub mod sdk_surface;

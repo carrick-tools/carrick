@@ -1,6 +1,7 @@
 extern crate swc_common;
 extern crate swc_ecma_parser;
 
+use crate::receiver_type::{ReceiverTypeCollector, ReceiverTypes};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -652,6 +653,11 @@ pub struct FunctionDefinitionExtractor {
     /// consumes it immediately after discovery to populate
     /// `FunctionDefinition::calls`, and nothing downstream sees it.
     pub callee_refs: HashMap<String, Vec<CalleeRef>>,
+    /// Definition key → the classes that definition declares its own local
+    /// bindings to be ([`crate::receiver_type`], carrick#776). Keyed like
+    /// `callee_refs` because it exists to resolve those call sites' receivers,
+    /// and because a name means different things in different scopes.
+    pub declared_types: HashMap<String, ReceiverTypes>,
     current_file_path: PathBuf,
     source_map: swc_common::sync::Lrc<swc_common::SourceMap>,
     /// Names of functions that are exported (populated by visit_export_decl / visit_named_export)
@@ -674,6 +680,7 @@ impl FunctionDefinitionExtractor {
         Self {
             function_definitions: HashMap::new(),
             callee_refs: HashMap::new(),
+            declared_types: HashMap::new(),
             current_file_path: file_path,
             source_map,
             exported_names: HashSet::new(),
@@ -719,6 +726,16 @@ impl FunctionDefinitionExtractor {
             None => (Vec::new(), build_tokens(&params, &[], &[])),
         };
         self.callee_refs.insert(key.to_string(), refs);
+
+        let mut types = ReceiverTypeCollector::default();
+        for param in &function.params {
+            types.record_pat(&param.pat);
+        }
+        if let Some(body) = &function.body {
+            body.visit_with(&mut types);
+        }
+        self.declared_types.insert(key.to_string(), types.finish());
+
         tokens
     }
 
@@ -732,6 +749,14 @@ impl FunctionDefinitionExtractor {
         let collector = self.walk_body(&*arrow.body);
         let tokens = build_tokens(&params, &collector.identifiers, &collector.literals);
         self.callee_refs.insert(key.to_string(), collector.out);
+
+        let mut types = ReceiverTypeCollector::default();
+        for pat in &arrow.params {
+            types.record_pat(pat);
+        }
+        arrow.body.visit_with(&mut types);
+        self.declared_types.insert(key.to_string(), types.finish());
+
         tokens
     }
 

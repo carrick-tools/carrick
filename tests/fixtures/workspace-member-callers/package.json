@@ -1,0 +1,7 @@
+{
+  "name": "workspace-member-callers",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "workspaces": ["packages/*"]
+}

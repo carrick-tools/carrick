@@ -1,0 +1,10 @@
+{
+  "name": "@fixture/app",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/reader.ts",
+  "dependencies": {
+    "@fixture/core": "workspace:*",
+    "vendor-runs": "^1.0.0"
+  }
+}

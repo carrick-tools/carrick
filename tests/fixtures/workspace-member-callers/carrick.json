@@ -1,0 +1,3 @@
+{
+  "services": [{ "name": "app", "directory": "packages/app" }]
+}

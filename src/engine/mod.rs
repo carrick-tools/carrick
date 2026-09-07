@@ -3382,6 +3382,7 @@ fn discover_files_and_symbols(
                         .collect(),
                     callees: func_extractor.callee_refs,
                     imports: file_imports,
+                    declared_types: func_extractor.declared_types,
                 },
             );
             per_file_definitions.push((file_path.clone(), func_extractor.function_definitions));
@@ -3398,7 +3399,18 @@ fn discover_files_and_symbols(
     // Resolve the collected call sites into `FunctionDefinition::calls` while
     // the per-file scopes are still in hand. Deterministic and LLM-free, so it
     // runs on every path, `CARRICK_SKIP_INTENTS` included.
-    crate::call_graph::resolve_call_edges(&mut all_function_definitions, &per_file_calls, &keys);
+    //
+    // The walk above is scoped to ONE service, so the manifest index is what
+    // lets a call into a sibling workspace package resolve at all (carrick#776).
+    let repo_root = std::path::Path::new(repo_path);
+    let workspace = crate::workspace_resolver::WorkspaceIndex::build(repo_root);
+    crate::call_graph::resolve_call_edges(
+        &mut all_function_definitions,
+        &per_file_calls,
+        &keys,
+        &workspace,
+        repo_root,
+    );
 
     debug!(
         "Extracted {} imported symbols and {} function definitions from {} files",
