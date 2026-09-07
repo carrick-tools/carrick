@@ -3,9 +3,10 @@
 //! The budget is a wall-clock promise: a scan that waits three minutes for a
 //! type layer has to be able to say so, and the caller's number has to be the
 //! number. Before this, the readiness read blocked in `read_line` on a pipe
-//! that never delivered a line, so the elapsed check around it only ran once
-//! one did — a stated 30 s budget was observed spending 57 s and then
-//! reporting a timeout anyway.
+//! that owed it a line, so the elapsed check around it only ran once one
+//! arrived — the incident's read returned the sidecar's own `ready` frame
+//! after 57 s against a stated 30 s budget, and the check that followed then
+//! discarded that answer as a timeout.
 //!
 //! These tests drive a stand-in sidecar: a few lines of Node that speak the
 //! same stdout protocol badly on purpose. They need `node` on PATH (CI has it
@@ -30,11 +31,19 @@ const BUDGET: Duration = Duration::from_secs(2);
 /// past the budget and past any plausible doubling of it.
 const HARNESS_LIMIT: Duration = Duration::from_secs(20);
 
+/// Whether these tests can run at all. A developer without node gets a skip;
+/// CI does not, because a skip that reads as a pass would make this file's
+/// green tick mean nothing (the runner installs node for the sidecar build).
 fn node_available() -> bool {
-    std::process::Command::new("node")
+    let available = std::process::Command::new("node")
         .arg("--version")
         .output()
-        .is_ok()
+        .is_ok();
+    assert!(
+        available || std::env::var("CI").is_err(),
+        "node is not on PATH in CI, so these timing tests would silently not run"
+    );
+    available
 }
 
 /// Write a stand-in sidecar script and return its path. The directory is
@@ -86,9 +95,10 @@ fn time_wait(
 
 /// A sidecar that never answers must cost the stated budget, once.
 ///
-/// The upper bound is the assertion that matters: the old shape spent the
-/// budget in the init read and then polled for the budget again, so this
-/// would land at roughly twice `BUDGET` — when it returned at all.
+/// The upper bound is the assertion that matters. The old read waited on the
+/// pipe with no deadline at all, so against a stand-in that writes nothing
+/// this did not return: the budget was a number checked between lines that
+/// never came.
 #[test]
 fn a_silent_sidecar_times_out_at_the_stated_budget() {
     if !node_available() {
@@ -110,16 +120,16 @@ fn a_silent_sidecar_times_out_at_the_stated_budget() {
     );
     assert!(
         elapsed < BUDGET * 2,
-        "the wait cost about twice the stated budget ({elapsed:?} against {BUDGET:?}): the \
-         init read and the poll loop are each spending the whole budget again (carrick#748)"
+        "the wait cost far more than the stated budget ({elapsed:?} against {BUDGET:?}): \
+         the readiness read is not bounded by the caller's budget (carrick#748)"
     );
 }
 
 /// A line that is not an answer must draw the budget down, not reset it.
 ///
-/// This is the 0.3.42 shape exactly: something reached stdout, the read loop
-/// skipped it, and the elapsed check that only runs between reads then
-/// reported a timeout long after the budget was gone.
+/// A skipped line is where a per-read deadline leaks into a per-line one: the
+/// loop that reads the next line has to inherit what is left of the caller's
+/// budget, not start it again.
 #[test]
 fn a_blank_line_does_not_extend_the_budget() {
     if !node_available() {

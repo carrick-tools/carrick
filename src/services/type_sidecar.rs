@@ -1048,16 +1048,23 @@ impl TypeSidecar {
     /// This blocks until the sidecar is ready or the timeout expires.
     /// If `start_init()` was called, this will wait for the init response.
     ///
-    /// The timeout is the WHOLE wait, not one leg of it. Before carrick#748
-    /// the init read was handed the full budget and the poll loop below then
-    /// spent the same budget again, so a caller asking for 30 s could wait
-    /// nearly 60; the read now gets whatever is left of the caller's budget.
+    /// The timeout is the whole wait and it is real. Before carrick#748 the
+    /// init read blocked in `read_line` on a pipe that owed it a line, so the
+    /// budget bounded nothing: the incident's read returned the sidecar's own
+    /// `ready` frame after 57 s against a stated 30. Worse, the answer was
+    /// then thrown away — the clock check that followed the read saw 57 s
+    /// against the 30 s budget and reported a timeout, so a sidecar that had
+    /// finished building its program was recorded as unavailable and left
+    /// running. Both halves are fixed here: the read is bounded by what is
+    /// left of the budget, and an answer returns on the spot rather than
+    /// through a second check of a clock it has already satisfied.
     ///
-    /// A sidecar that misses the deadline is killed. It is unusable either
-    /// way — the scan has already decided to run without types — and leaving
-    /// it alive costs a compiler-sized process churning for the rest of the
-    /// run, and risks its late `ready` frame being read as the answer to the
-    /// NEXT init (the per-service re-init in `scope_sidecar_to_service`).
+    /// A sidecar that genuinely misses the deadline is killed. It is unusable
+    /// either way — the scan has already decided to run without types — and
+    /// leaving it alive costs a compiler-sized process churning for the rest
+    /// of the run, and risks its late `ready` frame being read as the answer
+    /// to the NEXT init (the per-service re-init in
+    /// `scope_sidecar_to_service`).
     ///
     /// # Arguments
     /// * `timeout` - Maximum time to wait
@@ -1085,6 +1092,13 @@ impl TypeSidecar {
                                 response.init_time_ms,
                                 self.spawn_time.elapsed()
                             );
+                            // Return on the answer, not through the wait
+                            // below. The read was already bounded by the
+                            // budget, so an answer is in time by
+                            // construction; falling through to a clock check
+                            // is how a sidecar that answered "ready" was
+                            // reported as a timeout and killed (carrick#748).
+                            return Ok(());
                         } else {
                             let error = response
                                 .errors
@@ -1659,11 +1673,9 @@ impl TypeSidecar {
         timeout: Duration,
     ) -> Result<SidecarResponse, SidecarError> {
         let responses = self.responses.lock().unwrap();
-        // One deadline for the whole call, so the lines this skips (a blank
-        // line, a keepalive) draw the budget down instead of resetting it.
-        // That is the 0.3.42 shape: a blank line arrived, the loop skipped
-        // it, and the elapsed check that only ran between reads then reported
-        // a timeout nearly twice the stated budget (carrick#748).
+        // One deadline for the whole call, so a line this skips (a blank
+        // line, a frame for another request) draws the budget down instead of
+        // handing the next read a fresh copy of it.
         let start = Instant::now();
 
         loop {
