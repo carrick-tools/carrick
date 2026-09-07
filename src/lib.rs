@@ -33,6 +33,7 @@ pub mod oidc;
 pub mod operation;
 pub mod packages;
 pub mod parser;
+pub mod phase_timing;
 pub mod receiver_origin;
 pub mod scan_health;
 pub mod sdk_edges;

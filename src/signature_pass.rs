@@ -69,6 +69,10 @@ fn infer_missing_types(
 
     debug!("Inferring {} unannotated signature slot(s)", requests.len());
 
+    // Timed on its own: the phase line's `signatures` covers this round trip
+    // AND the scanner-side request build, and only the split says which grew
+    // (carrick#767).
+    let round_trip = std::time::Instant::now();
     let response = match sidecar.infer_types(&requests, None) {
         Ok(response) => response,
         Err(e) => {
@@ -76,6 +80,12 @@ fn infer_missing_types(
             return;
         }
     };
+
+    debug!(
+        "Signature inference: {} slot(s) in {:.1}s of sidecar time",
+        requests.len(),
+        round_trip.elapsed().as_secs_f64()
+    );
 
     let Some(inferred) = response.inferred_types else {
         return;

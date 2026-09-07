@@ -33,6 +33,7 @@ mod oidc;
 mod operation;
 mod packages;
 mod parser;
+mod phase_timing;
 mod receiver_origin;
 mod scan_health;
 mod sdk_edges;

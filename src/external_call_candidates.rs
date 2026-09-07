@@ -256,34 +256,151 @@ pub struct ExternalCallCandidate {
     pub subpath: Option<String>,
 }
 
-/// Scan the whole workspace and return the SDK-mediated call candidates that
-/// belong to the service whose files are `service_files`.
+/// The whole-workspace SDK pass, built once per scan and answered per service.
 ///
-/// The scan is workspace-wide because ownership is: the file that imports a
+/// The pass is workspace-wide because ownership is: the file that imports a
 /// vendor client and the file that calls through it are routinely in different
 /// packages. Attribution is per service: a row survives when its file is
-/// reachable from `service_files` by following internal import edges, which is
-/// the same question as "does this service's deployment contain that code?".
+/// reachable from the service's files by following internal import edges,
+/// which is the same question as "does this service's deployment contain that
+/// code?".
 ///
-/// `service_files` is expected to be the service's already-filtered source list
-/// from [`crate::file_finder::find_service_files`], and the workspace pass uses
-/// the same walk over `repo_root`, so test trees, story files, and
-/// vendored/build directories are excluded by the scanner's existing rules
-/// rather than by anything invented here.
+/// Held across services because none of the expensive part depends on the
+/// service. The shape this replaces rebuilt everything for every service — the
+/// repo-wide walk, an SWC parse of every source file in it, the ownership
+/// fixpoint — and reasoned that "one extra parse pass per service costs less
+/// than threading a cache through the engine would". Measured on a 33-service
+/// monorepo it was a flat ~8 s per service and the single largest item in the
+/// analysis phase (carrick#767).
 ///
-/// Computed fresh per service. One extra parse pass per service costs less than
-/// threading a cache through the engine would, and keeps this entry point a
-/// pure function of the tree on disk.
-pub fn scan_workspace(service_files: &[PathBuf], repo_root: &Path) -> Vec<ExternalCallCandidate> {
-    let index = WorkspaceIndex::build(repo_root);
-    if !index.has_external_packages() {
-        return Vec::new();
+/// A service whose own file list reaches outside the repo-wide walk still gets
+/// its own pass. The walk skips `dist`, `build` and `.next` RELATIVE TO THE
+/// REPO ROOT, so a service configured at a path named after one of them is
+/// scanned by its own walk and skipped by the repo-wide one; its fact set is
+/// genuinely a different one and sharing would silently drop its rows.
+#[derive(Debug, Default)]
+pub struct WorkspaceScan {
+    built: Option<Built>,
+}
+
+/// Everything the shared pass holds for one repo root.
+#[derive(Debug)]
+struct Built {
+    repo_root: PathBuf,
+    /// `None` when the repo declares no external packages at all: every
+    /// service's row set is empty and no walk or parse is worth doing.
+    index: Option<WorkspaceIndex>,
+    pass: Option<SharedPass>,
+}
+
+/// The repo-wide pass: its file set (repo-relative, for the coverage test),
+/// the parsed facts, and the rows the ownership fixpoint produced from them.
+#[derive(Debug)]
+struct SharedPass {
+    files: BTreeSet<PathBuf>,
+    workspace: Workspace,
+    rows_by_file: BTreeMap<PathBuf, BTreeSet<ExternalCallCandidate>>,
+}
+
+impl WorkspaceScan {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    let workspace = Workspace::parse(repo_root, &index, service_files);
-    let ownership = workspace.resolve_ownership();
-    let rows_by_file = workspace.rows(&ownership);
+    /// The SDK-mediated call candidates that belong to the service whose files
+    /// are `service_files`.
+    ///
+    /// `service_files` is expected to be the service's already-filtered source
+    /// list from [`crate::file_finder::find_service_files`], and the workspace
+    /// pass uses the same walk over `repo_root`, so test trees, story files,
+    /// and vendored/build directories are excluded by the scanner's existing
+    /// rules rather than by anything invented here.
+    pub fn rows_for_service(
+        &mut self,
+        service_files: &[PathBuf],
+        repo_root: &Path,
+    ) -> Vec<ExternalCallCandidate> {
+        if self
+            .built
+            .as_ref()
+            .is_none_or(|built| built.repo_root != repo_root)
+        {
+            self.built = Some(Built::for_repo(repo_root));
+        }
+        let built = self.built.as_ref().expect("built directly above");
+        let Some(index) = built.index.as_ref() else {
+            return Vec::new();
+        };
 
+        if let Some(pass) = built.pass.as_ref()
+            && covered_by(pass, service_files, repo_root)
+        {
+            return collect_rows(
+                &pass.workspace,
+                &pass.rows_by_file,
+                service_files,
+                repo_root,
+            );
+        }
+
+        // This service's own walk sees files the repo-wide walk skips, so the
+        // shared pass has no facts for them: build this service's own.
+        let workspace = Workspace::parse(repo_root, index, service_files);
+        let ownership = workspace.resolve_ownership();
+        let rows_by_file = workspace.rows(&ownership);
+        collect_rows(&workspace, &rows_by_file, service_files, repo_root)
+    }
+}
+
+impl Built {
+    fn for_repo(repo_root: &Path) -> Self {
+        let index = WorkspaceIndex::build(repo_root);
+        if !index.has_external_packages() {
+            return Self {
+                repo_root: repo_root.to_path_buf(),
+                index: None,
+                pass: None,
+            };
+        }
+        // No service files: the shared pass is the repo-wide walk and nothing
+        // else, which is exactly what the per-service pass computed for every
+        // service whose files that walk already covers (its `extend` of them
+        // was a no-op after the dedup).
+        let workspace = Workspace::parse(repo_root, &index, &[]);
+        let ownership = workspace.resolve_ownership();
+        let rows_by_file = workspace.rows(&ownership);
+        let files = workspace.files.iter().cloned().collect();
+        Self {
+            repo_root: repo_root.to_path_buf(),
+            index: Some(index),
+            pass: Some(SharedPass {
+                files,
+                workspace,
+                rows_by_file,
+            }),
+        }
+    }
+}
+
+/// Whether every one of the service's files is already in the shared pass.
+///
+/// The test is on the file SET, not on counts: a service file the shared pass
+/// never parsed has no facts, so it would seed nothing and silently cost the
+/// service its rows.
+fn covered_by(pass: &SharedPass, service_files: &[PathBuf], repo_root: &Path) -> bool {
+    service_files.iter().all(|file| {
+        let relative = file.strip_prefix(repo_root).unwrap_or(file);
+        pass.files.contains(relative)
+    })
+}
+
+/// The rows of every file reachable from the service's own, capped.
+fn collect_rows(
+    workspace: &Workspace,
+    rows_by_file: &BTreeMap<PathBuf, BTreeSet<ExternalCallCandidate>>,
+    service_files: &[PathBuf],
+    repo_root: &Path,
+) -> Vec<ExternalCallCandidate> {
     let mut rows: BTreeSet<ExternalCallCandidate> = BTreeSet::new();
     for file in workspace.reachable_from(service_files, repo_root) {
         if let Some(file_rows) = rows_by_file.get(&file) {
@@ -880,6 +997,7 @@ struct FileFacts {
 }
 
 /// Every source file in the repo, reduced to facts.
+#[derive(Debug)]
 struct Workspace {
     files: Vec<PathBuf>,
     facts: Vec<FileFacts>,
@@ -2272,7 +2390,7 @@ mod tests {
             ..Default::default()
         };
         let (files, _) = find_service_files(&root.to_string_lossy(), &service, IGNORE_PATTERNS);
-        scan_workspace(&files, &root)
+        WorkspaceScan::new().rows_for_service(&files, &root)
     }
 
     fn rows_for(rows: &[ExternalCallCandidate], file: &str) -> Vec<(usize, String, String)> {
@@ -3058,6 +3176,34 @@ mod tests {
                 vec![(3, "sendNotice".to_string(), "courier-sdk".to_string())]
             );
         }
+
+        /// One [`WorkspaceScan`] answering every service says exactly what a
+        /// fresh one per service says — including for the service rooted in an
+        /// excluded directory, whose fact set the shared pass does not hold
+        /// and which therefore still gets its own.
+        ///
+        /// This is the whole claim of building the pass once (carrick#767):
+        /// the saving is in what is not recomputed, and nothing about the
+        /// answer may move.
+        #[test]
+        fn one_shared_pass_answers_every_service_as_its_own_would() {
+            let root = fixture_root();
+            let services = ["apps/api", "apps/worker", "apps/build", "apps/relay"];
+            let mut shared = WorkspaceScan::new();
+            for directory in services {
+                let service = Config {
+                    directory: Some(directory.to_string()),
+                    ..Default::default()
+                };
+                let (files, _) =
+                    find_service_files(&root.to_string_lossy(), &service, IGNORE_PATTERNS);
+                assert_eq!(
+                    shared.rows_for_service(&files, &root),
+                    WorkspaceScan::new().rows_for_service(&files, &root),
+                    "{directory} answered differently from a pass of its own"
+                );
+            }
+        }
     }
 
     /// Two scans of the same tree produce byte-identical rows.
@@ -3303,7 +3449,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            scan_workspace(&[root.join("app.ts")], root),
+            WorkspaceScan::new().rows_for_service(&[root.join("app.ts")], root),
             Vec::new(),
             "no declared dependencies means no candidates"
         );
