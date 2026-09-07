@@ -11,20 +11,15 @@
 //! out of scope here — the named types in a signature become drill-downable via
 //! the bundle pipeline in follow-up work (issues #116/#117).
 
-use crate::services::type_sidecar::{InferKind, InferRequestItem, TypeSidecar};
+use crate::services::type_sidecar::{InferKind, InferRequestItem, TypeSidecar, ready_budget};
 use crate::visitor::FunctionDefinition;
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Duration;
 use tracing::{debug, warn};
 
 /// Shown in the signature hint when a return type is neither annotated nor
 /// successfully inferred.
 const RETURN_UNKNOWN: &str = "unknown";
-
-/// How long to wait for the sidecar to become ready before giving up on
-/// signature inference (matches the type-resolution path).
-const SIDECAR_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Which slot of a function signature an inference request targets.
 #[derive(Debug, Clone, PartialEq)]
@@ -48,7 +43,7 @@ pub fn populate_function_signatures(
     repo_path: &str,
 ) {
     if let Some(sidecar) = sidecar {
-        match sidecar.wait_ready(SIDECAR_READY_TIMEOUT) {
+        match sidecar.wait_ready(ready_budget()) {
             Ok(()) => infer_missing_types(sidecar, function_definitions, repo_path),
             Err(e) => debug!("Sidecar not ready for signature inference: {e}"),
         }

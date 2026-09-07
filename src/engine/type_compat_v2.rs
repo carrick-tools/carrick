@@ -2394,7 +2394,7 @@ mod tests {
         let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
         sidecar.start_init(&orders_repo, None);
         sidecar
-            .wait_ready(std::time::Duration::from_secs(60))
+            .wait_ready(crate::services::type_sidecar::ready_budget())
             .expect("sidecar init");
 
         // Aliases exactly as the manifest builder derives them.
@@ -2568,7 +2568,7 @@ mod tests {
         let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
         sidecar.start_init(&notif_repo, None);
         sidecar
-            .wait_ready(std::time::Duration::from_secs(60))
+            .wait_ready(crate::services::type_sidecar::ready_budget())
             .expect("sidecar init");
 
         let key = OperationKey::http("GET", "/notifications/:id");
@@ -2780,7 +2780,7 @@ mod tests {
         let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
         sidecar.start_init(&notif_repo, None);
         sidecar
-            .wait_ready(std::time::Duration::from_secs(60))
+            .wait_ready(crate::services::type_sidecar::ready_budget())
             .expect("sidecar init");
 
         let key = OperationKey::http("GET", "/health");

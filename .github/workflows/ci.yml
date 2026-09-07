@@ -72,6 +72,13 @@ jobs:
       - name: Run sidecar integration tests
         run: cargo test --test sidecar_integration_test --verbose
 
+      # Timing assertions on the readiness budget: its own step so the waits
+      # are not competing with another test binary for the machine. Needs node
+      # (installed above) to run its stand-in sidecar, and fails rather than
+      # skips if node is missing, so a green tick means the waits were timed.
+      - name: Run sidecar readiness timing tests
+        run: cargo test --test sidecar_readiness_test --verbose
+
       - name: Run URL alias matching tests
         run: cargo test --test url_alias_matching_test --verbose
 
