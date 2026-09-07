@@ -86,7 +86,7 @@
 //! it. A default import of such a package carries `default` and correctly
 //! finds no member.
 
-use crate::analyzer::CrossRepoMatch;
+use crate::analyzer::{CrossRepoMatch, PairResolutions};
 use crate::cloud_storage::{CloudRepoData, CompatVerdict, SdkEdge, SdkUnresolved};
 use crate::external_call_candidates::{CallMechanism, ExternalCallCandidate};
 use crate::findings::Finding;
@@ -246,7 +246,15 @@ impl SdkJoinInput {
 
 /// Resolve every current service's SDK call candidates against the peers'
 /// published surfaces and the cross-repo edges those peers' own calls formed.
-pub fn join(input: &SdkJoinInput, matches: &[CrossRepoMatch]) -> SdkJoin {
+///
+/// `resolutions` answers, for an edge this run checked, whether the verdict is
+/// a comparison between two known types — the fact the cloud needs to keep a
+/// verdict produced over an `any` from reading as type agreement (cloud#622).
+pub fn join(
+    input: &SdkJoinInput,
+    matches: &[CrossRepoMatch],
+    resolutions: &PairResolutions,
+) -> SdkJoin {
     let scanner_version = env!("CARGO_PKG_VERSION");
 
     // Producer side of every match, keyed by the consumer that formed it. The
@@ -376,7 +384,7 @@ pub fn join(input: &SdkJoinInput, matches: &[CrossRepoMatch]) -> SdkJoin {
                 for producer in producers {
                     matched = true;
                     let consumer_location = format!("{}:{}", candidate.file, candidate.line);
-                    let (type_compatible, mismatch_reason) = pair_verdict(peer, producer);
+                    let verdict = pair_verdict(peer, producer, resolutions);
                     edges.insert(
                         (
                             consumer.service_id.clone(),
@@ -394,9 +402,11 @@ pub fn join(input: &SdkJoinInput, matches: &[CrossRepoMatch]) -> SdkJoin {
                             sdk_location: format!("{}:{}", member.file, member.line),
                             producer_repo: producer.producer_repo.clone(),
                             producer_key: producer.producer_key.clone(),
-                            type_compatible,
-                            mismatch_reason,
+                            type_compatible: verdict.type_compatible,
+                            mismatch_reason: verdict.mismatch_reason,
                             scanner_version: scanner_version.to_string(),
+                            resolved: verdict.resolved,
+                            unresolved_reason: verdict.unresolved_reason,
                         },
                     );
                 }
@@ -436,9 +446,23 @@ pub fn join(input: &SdkJoinInput, matches: &[CrossRepoMatch]) -> SdkJoin {
 ///
 /// The lookup key is the match's four canonical fields. `CompatVerdict` stores
 /// no location, so this cannot key on the SDK call site; see the module docs.
-fn pair_verdict(peer: &SdkPeer, producer: &CrossRepoMatch) -> (Option<bool>, Option<String>) {
+fn pair_verdict(
+    peer: &SdkPeer,
+    producer: &CrossRepoMatch,
+    resolutions: &PairResolutions,
+) -> SdkVerdict {
     if producer.type_compatible.is_some() {
-        return (producer.type_compatible, producer.mismatch_reason.clone());
+        // Checked this run, so the resolution is this run's too: the same
+        // lookup `attach_compat_verdicts` makes for a direct pair, keyed by the
+        // same edge. Absent when no outcome was filed for the edge — nothing
+        // was checked, which is not "unresolved".
+        let resolution = resolutions.for_edge(producer);
+        return SdkVerdict {
+            type_compatible: producer.type_compatible,
+            mismatch_reason: producer.mismatch_reason.clone(),
+            resolved: resolution.map(|r| r.resolved),
+            unresolved_reason: resolution.and_then(|r| r.unresolved_reason.clone()),
+        };
     }
     let stored = peer.compat_verdicts.iter().find(|verdict| {
         verdict.producer_repo == producer.producer_repo
@@ -447,14 +471,20 @@ fn pair_verdict(peer: &SdkPeer, producer: &CrossRepoMatch) -> (Option<bool>, Opt
             && verdict.consumer_key == producer.consumer_key
     });
     match stored {
-        Some(verdict) => (
-            Some(verdict.compatible),
-            if verdict.compatible {
+        // The SDK repo's own scan stated the resolution alongside the verdict,
+        // so it is carried verbatim rather than recomputed: this run never saw
+        // the two types. A blob written before the field existed states
+        // nothing, and nothing is what this edge then says.
+        Some(verdict) => SdkVerdict {
+            type_compatible: Some(verdict.compatible),
+            mismatch_reason: if verdict.compatible {
                 None
             } else {
                 verdict.mismatch_reason.clone()
             },
-        ),
+            resolved: verdict.resolved,
+            unresolved_reason: verdict.unresolved_reason.clone(),
+        },
         None => {
             debug!(
                 "No type verdict for {} → {} ({}): neither this run nor '{}'s own scan stored one",
@@ -463,9 +493,20 @@ fn pair_verdict(peer: &SdkPeer, producer: &CrossRepoMatch) -> (Option<bool>, Opt
                 producer.producer_repo,
                 peer.service_id
             );
-            (None, None)
+            SdkVerdict::default()
         }
     }
+}
+
+/// The verdict half of an [`SdkEdge`], as one value so the two halves — the
+/// answer and whether the answer compared anything — can never be filled from
+/// different sources.
+#[derive(Default)]
+struct SdkVerdict {
+    type_compatible: Option<bool>,
+    mismatch_reason: Option<String>,
+    resolved: Option<bool>,
+    unresolved_reason: Option<String>,
 }
 
 /// Project every INCOMPATIBLE SDK edge into a [`Finding::TypeMismatch`], so a
@@ -483,13 +524,20 @@ fn pair_verdict(peer: &SdkPeer, producer: &CrossRepoMatch) -> (Option<bool>, Opt
 /// through is spelled out in `detail`, ahead of the stored diagnostic.
 ///
 /// `edge_source` and `verdict_state` (cloud#599) are left UNSTATED on these
-/// rows. The pairing is three rows across two repos — the consumer's call into
-/// the package, the SDK member, and the producer's route — and this scan holds
-/// only the persisted verdict, not the sources of the two rows in the other
-/// repo. Saying "fact" would claim what this run cannot see, and saying
-/// "candidate" would demote a pairing that may be entirely deterministic; the
-/// absence reads as "not stated", which leaves these rows enforced as they are
-/// today.
+/// rows. For `edge_source` that is a fact about this scan: the pairing is three
+/// rows across two repos — the consumer's call into the package, the SDK
+/// member, and the producer's route — and this scan holds only the persisted
+/// verdict, not the sources of the two rows in the other repo. Saying "fact"
+/// would claim what this run cannot see, and saying "candidate" would demote a
+/// pairing that may be entirely deterministic; the absence reads as "not
+/// stated", which leaves these rows enforced as they are today.
+///
+/// `verdict_state` is a different case since cloud#622: `SdkEdge::resolved` now
+/// rides on the edge, so this function COULD state it, and an edge whose
+/// verdict compared nothing is still emitted here as an enforced mismatch.
+/// Stamping the state (and what the PR check should then do with it) is
+/// carrick#758, kept out of the wire change so it does not ride on the same
+/// release.
 ///
 /// Nothing is deduped against the direct findings, and in one shape that shows:
 /// a `carrick.json` whose `services` array holds BOTH the SDK service and a
@@ -761,14 +809,26 @@ mod tests {
         }
     }
 
+    /// The join with no pair outcomes filed — the shape of a run whose type
+    /// check did not evaluate the SDK repo's own pair, which is every run where
+    /// the SDK repo is a peer rather than a current service.
     fn run(
         repos: &[CloudRepoData],
         consumers: &[CloudRepoData],
         matches: &[CrossRepoMatch],
     ) -> SdkJoin {
+        run_with(repos, consumers, matches, &PairResolutions::default())
+    }
+
+    fn run_with(
+        repos: &[CloudRepoData],
+        consumers: &[CloudRepoData],
+        matches: &[CrossRepoMatch],
+        resolutions: &PairResolutions,
+    ) -> SdkJoin {
         let all: Vec<&CloudRepoData> = repos.iter().chain(consumers.iter()).collect();
         let input = SdkJoinInput::collect(all.into_iter(), consumers.iter());
-        join(&input, matches)
+        join(&input, matches, resolutions)
     }
 
     fn reasons(join: &SdkJoin) -> Vec<(String, String, usize)> {
@@ -1326,6 +1386,194 @@ mod tests {
         assert_eq!(edge.mismatch_reason.as_deref(), Some("checked this run"));
     }
 
+    /// A `PairCheckOutcome` for the SDK repo's own call, keyed the way
+    /// `verdict_key_of_edge` reads [`sdk_to_producer_match`]: the producer key's
+    /// method and path, and the SDK repo's own call site.
+    fn sdk_pair_outcome(resolved: bool, reason: Option<&str>) -> crate::analyzer::PairCheckOutcome {
+        crate::analyzer::PairCheckOutcome {
+            pair_key: "payments-api/Payment~ledger-sdk/PaymentBody".to_string(),
+            pseudo_method: "POST".to_string(),
+            identity: "/v1/payments".to_string(),
+            consumer_file: "src/resources/payments.ts".to_string(),
+            consumer_line: 32,
+            type_kind: crate::cloud_storage::ManifestTypeKind::Response,
+            bucket: crate::services::type_sidecar::VerdictBucket::Compatible,
+            gate: None,
+            diagnostic: None,
+            producer_alias: "Payment".to_string(),
+            consumer_alias: "PaymentBody".to_string(),
+            producer_service: "payments-api".to_string(),
+            consumer_service: "ledger-sdk".to_string(),
+            resolved,
+            unresolved_reason: reason.map(str::to_string),
+        }
+    }
+
+    /// When the SDK repo is itself a current service, its pair is checked this
+    /// run — and the resolution of that check rides onto the edge, so a
+    /// `compatible` produced over an `any` is not readable as type agreement
+    /// (cloud#622).
+    #[test]
+    fn this_runs_resolution_rides_with_this_runs_verdict() {
+        let resolutions = PairResolutions::from_outcomes(&[sdk_pair_outcome(
+            false,
+            Some("the producer type carries `any` at `data`"),
+        )]);
+        let joined = run_with(
+            &[producer(), sdk_repo()],
+            &[consumer_with(candidate("ledger.payments.create"))],
+            &[sdk_to_producer_match()],
+            &resolutions,
+        );
+
+        let edge = &joined.edges()[0];
+        assert_eq!(edge.type_compatible, Some(true));
+        assert_eq!(
+            edge.resolved,
+            Some(false),
+            "a verdict that compared nothing must say so on the edge"
+        );
+        assert_eq!(
+            edge.unresolved_reason.as_deref(),
+            Some("the producer type carries `any` at `data`")
+        );
+    }
+
+    /// The other half of the same fact: a check that walked two known types
+    /// says so, and carries no reason.
+    #[test]
+    fn a_resolved_check_this_run_reaches_the_edge() {
+        let resolutions = PairResolutions::from_outcomes(&[sdk_pair_outcome(true, None)]);
+        let joined = run_with(
+            &[producer(), sdk_repo()],
+            &[consumer_with(candidate("ledger.payments.create"))],
+            &[sdk_to_producer_match()],
+            &resolutions,
+        );
+
+        let edge = &joined.edges()[0];
+        assert_eq!(edge.resolved, Some(true));
+        assert!(edge.unresolved_reason.is_none());
+    }
+
+    /// No outcome was filed for the pair: nothing was checked this run, which
+    /// is "not stated" and never "unresolved".
+    #[test]
+    fn a_verdict_with_no_outcome_filed_states_no_resolution() {
+        let joined = run(
+            &[producer(), sdk_repo()],
+            &[consumer_with(candidate("ledger.payments.create"))],
+            &[sdk_to_producer_match()],
+        );
+
+        let edge = &joined.edges()[0];
+        assert_eq!(edge.type_compatible, Some(true));
+        assert_eq!(edge.resolved, None);
+        assert!(edge.unresolved_reason.is_none());
+    }
+
+    /// The stored path carries the SDK repo's own resolution verbatim: this run
+    /// never saw those two types, so it cannot recompute one.
+    #[test]
+    fn a_stored_resolution_is_carried_verbatim() {
+        let mut stored = stored_verdict(true);
+        stored.resolved = Some(false);
+        stored.unresolved_reason =
+            Some("the consumer type carries `unknown` at `body.items`".to_string());
+
+        let joined = run(
+            &[producer(), sdk_repo_storing(vec![stored])],
+            &[consumer_with(candidate("ledger.payments.create"))],
+            &[unjudged_match()],
+        );
+
+        let edge = &joined.edges()[0];
+        assert_eq!(edge.type_compatible, Some(true));
+        assert_eq!(edge.resolved, Some(false));
+        assert_eq!(
+            edge.unresolved_reason.as_deref(),
+            Some("the consumer type carries `unknown` at `body.items`")
+        );
+    }
+
+    /// A verdict from a scan that predates the resolution states none, and this
+    /// side must not invent one from `compatible`.
+    #[test]
+    fn a_stored_verdict_without_a_resolution_states_none() {
+        let joined = run(
+            &[producer(), sdk_repo_storing(vec![stored_verdict(true)])],
+            &[consumer_with(candidate("ledger.payments.create"))],
+            &[unjudged_match()],
+        );
+
+        let edge = &joined.edges()[0];
+        assert_eq!(edge.type_compatible, Some(true));
+        assert_eq!(edge.resolved, None);
+        assert!(edge.unresolved_reason.is_none());
+    }
+
+    /// The two fields are the WIRE, not just the struct: present when stated,
+    /// and omitted entirely — never `null` — when they are not.
+    #[test]
+    fn the_resolution_is_on_the_wire_and_absent_when_unstated() {
+        let unresolved = PairResolutions::from_outcomes(&[sdk_pair_outcome(
+            false,
+            Some("the producer type carries `any` at `data`"),
+        )]);
+        for (resolutions, stated) in [(&unresolved, true), (&PairResolutions::default(), false)] {
+            let joined = run_with(
+                &[producer(), sdk_repo()],
+                &[consumer_with(candidate("ledger.payments.create"))],
+                &[sdk_to_producer_match()],
+                resolutions,
+            );
+            let mut payloads = vec![blob("checkout")];
+            attach_sdk_edges(&mut payloads, &joined);
+
+            let json = serde_json::to_string(&payloads[0]).unwrap();
+            let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let row = &raw["sdk_edges"][0];
+            if stated {
+                assert_eq!(row["resolved"], false, "got: {row}");
+                assert_eq!(
+                    row["unresolved_reason"], "the producer type carries `any` at `data`",
+                    "got: {row}"
+                );
+            } else {
+                assert!(row.get("resolved").is_none(), "got: {row}");
+                assert!(row.get("unresolved_reason").is_none(), "got: {row}");
+            }
+
+            let back: CloudRepoData = serde_json::from_str(&json).unwrap();
+            let edge = &back.sdk_edges.unwrap()[0];
+            assert_eq!(edge.resolved, stated.then_some(false));
+        }
+    }
+
+    /// An edge written before these fields existed still reads, and reads as
+    /// "not stated" rather than as an unresolved verdict.
+    #[test]
+    fn an_older_sdk_edge_deserializes_without_a_resolution() {
+        let older = serde_json::json!({
+            "consumer_repo": "checkout",
+            "consumer_location": "src/checkout.ts:42",
+            "package": SDK_PACKAGE,
+            "import_symbol": "default",
+            "callee": "ledger.payments.create",
+            "sdk_repo": "ledger-sdk",
+            "sdk_member": "payments.create",
+            "sdk_location": "src/resources/payments.ts:28",
+            "producer_repo": "payments-api",
+            "producer_key": PRODUCER_KEY,
+            "type_compatible": true,
+            "scanner_version": "0.3.42"
+        });
+        let edge: SdkEdge = serde_json::from_value(older).unwrap();
+        assert_eq!(edge.type_compatible, Some(true));
+        assert_eq!(edge.resolved, None);
+        assert_eq!(edge.unresolved_reason, None);
+    }
+
     /// The whole reason the lookup key is a four-tuple: a verdict stored for a
     /// DIFFERENT pair must never be carried onto this edge. Fabricating a
     /// `true` here is the #324 fail-open trap.
@@ -1419,6 +1667,8 @@ mod tests {
             mismatch_reason: (compatible == Some(false))
                 .then(|| "Property 'amountCents' is missing".to_string()),
             scanner_version: "0.0.0-test".to_string(),
+            resolved: None,
+            unresolved_reason: None,
         };
 
         let findings = type_mismatch_findings(&[edge(Some(true)), edge(None), edge(Some(false))]);
@@ -1466,6 +1716,8 @@ mod tests {
             type_compatible: Some(false),
             mismatch_reason: None,
             scanner_version: "0.0.0-test".to_string(),
+            resolved: None,
+            unresolved_reason: None,
         };
         let findings = type_mismatch_findings(&[edge]);
         assert_eq!(

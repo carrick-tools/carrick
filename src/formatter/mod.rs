@@ -1282,6 +1282,8 @@ mod tests {
             type_compatible: Some(true),
             mismatch_reason: None,
             scanner_version: "0.0.0-test".to_string(),
+            resolved: None,
+            unresolved_reason: None,
         }
     }
 
