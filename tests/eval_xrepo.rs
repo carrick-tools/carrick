@@ -20,8 +20,8 @@
 //!   5. **type-anchor accuracy** (row 5) — `expected.primary_type_symbol ==
 //!      actual.primary_type_symbol` (null==null ok) over ops in both sets.
 //!   6. **type-resolution correctness** (row 6) — `type_state` exact eq AND
-//!      whitespace-collapsed resolved-type eq, over ops in both sets that carry an
-//!      expected resolved type.
+//!      resolved-type eq up to whitespace and union member order, over ops in
+//!      both sets that carry an expected resolved type.
 //!   7. **cross-repo match P/R/F1** (row 7) — `expected-output.json.matches` vs
 //!      `EvalProjection.cross_repo_matches`, keyed by
 //!      `(producer_repo, norm(producer_key), consumer_repo, norm(consumer_key))`,
@@ -133,6 +133,225 @@ fn norm_key(key: &str) -> String {
 /// -type eq"). Authors and the sidecar disagree only on incidental spacing.
 fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A rendered type text reduced to a form that does not depend on the order a
+/// union's members were written in (carrick#735).
+///
+/// A union is a set. The sidecar now prints its members in a canonical order,
+/// which is not the order the corpus labels were authored in — those record
+/// what the compiler printed on the day they were written. The answer key is
+/// not edited to chase a printer change, so the COMPARISON absorbs the
+/// difference instead: both sides are reduced here, and two texts are equal iff
+/// they carry the same members at every nesting level.
+///
+/// The order imposed here is plain lexicographic and deliberately does NOT
+/// mirror the sidecar's (intrinsics by compiler id, then by text). It does not
+/// have to: both sides go through this function, so any total order decides
+/// equality the same way, and a label written in an order the printer would
+/// never emit still scores as equal to the type it names.
+///
+/// Only union order is normalised. Property order, names, optionality and
+/// member texts are compared as written — reordering those would weaken the
+/// metric rather than describe the same type.
+fn canonical_type_text(s: &str) -> String {
+    canon_type(&collapse_ws(s))
+}
+
+/// Canonicalise one type expression: split its top-level union members, reduce
+/// each, sort them.
+fn canon_type(s: &str) -> String {
+    let s = s.trim();
+    let parts = split_top_level(s, '|');
+    if parts.len() > 1 {
+        let mut members: Vec<String> = parts.iter().map(|p| canon_type(p)).collect();
+        members.sort();
+        return members.join(" | ");
+    }
+    canon_atom(s)
+}
+
+/// Canonicalise a single (non-union) type expression by descending into the
+/// structures that can hold a union: object bodies, parenthesised groups,
+/// tuples, and generic arguments. Anything else — a name, a literal, a function
+/// signature — is compared as written.
+fn canon_atom(s: &str) -> String {
+    let s = s.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    // A function type's `=>` makes its parentheses a parameter list, not a
+    // group. Left verbatim rather than mis-parsed.
+    if find_top_level(s, "=>").is_some() {
+        return s.to_string();
+    }
+
+    let mut core = s;
+    let mut suffix = String::new();
+    while core.ends_with("[]") {
+        core = core[..core.len() - 2].trim_end();
+        suffix.push_str("[]");
+    }
+
+    if is_wrapped(core, '(', ')') {
+        return format!("({}){}", canon_type(&core[1..core.len() - 1]), suffix);
+    }
+    if is_wrapped(core, '{', '}') {
+        let inner = &core[1..core.len() - 1];
+        let members: Vec<String> = split_top_level(inner, ';')
+            .iter()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .map(|m| canon_member(&m))
+            .collect();
+        if members.is_empty() {
+            return format!("{{}}{suffix}");
+        }
+        return format!("{{ {}; }}{}", members.join("; "), suffix);
+    }
+    if is_wrapped(core, '[', ']') {
+        let elements: Vec<String> = split_top_level(&core[1..core.len() - 1], ',')
+            .iter()
+            .map(|e| canon_type(e))
+            .collect();
+        return format!("[{}]{}", elements.join(", "), suffix);
+    }
+    if let Some(open) = generic_open(core) {
+        let name = core[..open].trim();
+        let args: Vec<String> = split_top_level(&core[open + 1..core.len() - 1], ',')
+            .iter()
+            .map(|a| canon_type(a))
+            .collect();
+        return format!("{}<{}>{}", name, args.join(", "), suffix);
+    }
+    format!("{core}{suffix}")
+}
+
+/// Canonicalise one object member: the key as written, the type reduced.
+fn canon_member(member: &str) -> String {
+    match find_top_level(member, ":") {
+        Some(at) => format!("{}: {}", member[..at].trim(), canon_type(&member[at + 1..])),
+        None => member.trim().to_string(),
+    }
+}
+
+/// Split on `sep` at bracket depth zero and outside string literals.
+fn split_top_level(s: &str, sep: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut scan = Scanner::new();
+    for ch in s.chars() {
+        let depth_before = scan.depth;
+        scan.feed(ch);
+        if ch == sep && depth_before == 0 && scan.depth == 0 && !scan.in_string_before {
+            out.push(current.clone());
+            current.clear();
+            continue;
+        }
+        current.push(ch);
+    }
+    out.push(current);
+    out
+}
+
+/// Byte offset of `needle` at bracket depth zero and outside string literals.
+fn find_top_level(s: &str, needle: &str) -> Option<usize> {
+    let mut scan = Scanner::new();
+    for (index, ch) in s.char_indices() {
+        let depth_before = scan.depth;
+        let in_string_before = scan.in_string;
+        scan.feed(ch);
+        if depth_before == 0 && !in_string_before && s[index..].starts_with(needle) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// True when `s` opens with `open`, closes with `close`, and that opener's
+/// match is the final character — so the whole expression is one group.
+fn is_wrapped(s: &str, open: char, close: char) -> bool {
+    if !s.starts_with(open) || !s.ends_with(close) || s.len() < 2 {
+        return false;
+    }
+    let mut scan = Scanner::new();
+    for (index, ch) in s.char_indices() {
+        scan.feed(ch);
+        if scan.depth == 0 && index + ch.len_utf8() < s.len() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Byte offset of the `<` opening a `Name<...>` whose `>` is the final
+/// character, if this atom is a generic reference.
+fn generic_open(s: &str) -> Option<usize> {
+    if !s.ends_with('>') {
+        return None;
+    }
+    let at = find_top_level(s, "<")?;
+    if at == 0 {
+        return None;
+    }
+    let mut scan = Scanner::new();
+    for (index, ch) in s.char_indices() {
+        scan.feed(ch);
+        if index >= at && scan.depth == 0 {
+            return if index + ch.len_utf8() == s.len() {
+                Some(at)
+            } else {
+                None
+            };
+        }
+    }
+    None
+}
+
+/// Bracket/string state while walking a rendered type text. `<`/`>` count as
+/// brackets so a generic argument's separators stay nested; the `>` of a `=>`
+/// does not, since it closes nothing.
+struct Scanner {
+    depth: i32,
+    in_string: bool,
+    quote: char,
+    previous: char,
+    /// Whether the scanner was inside a string BEFORE the current character —
+    /// what a caller testing the current character needs to know.
+    in_string_before: bool,
+}
+
+impl Scanner {
+    fn new() -> Self {
+        Self {
+            depth: 0,
+            in_string: false,
+            quote: '\0',
+            previous: '\0',
+            in_string_before: false,
+        }
+    }
+
+    fn feed(&mut self, ch: char) {
+        self.in_string_before = self.in_string;
+        if self.in_string {
+            if ch == self.quote && self.previous != '\\' {
+                self.in_string = false;
+            }
+        } else {
+            match ch {
+                '"' | '\'' | '`' => {
+                    self.in_string = true;
+                    self.quote = ch;
+                }
+                '{' | '[' | '(' | '<' => self.depth += 1,
+                '}' | ']' | ')' => self.depth -= 1,
+                '>' if self.previous != '=' => self.depth -= 1,
+                _ => {}
+            }
+        }
+        self.previous = ch;
+    }
 }
 
 /// P/R/F1 with the contract §1.4 convention: precision is 1.0 when nothing is
@@ -796,11 +1015,12 @@ fn score_type_anchor_accuracy(
 
 /// Type-resolution correctness (contract §6 row 6): over ops in both sets that
 /// carry an expected resolved type, the fraction where `type_state` is exactly
-/// equal AND the whitespace-collapsed resolved type is equal. The corpus
-/// `resolved_type` labels are the fully-inlined structural form (ts-morph
-/// `getText()` with NoTruncation), so the actual is `expanded_definition`,
-/// falling back to `resolved_definition` (the name-preserving DefinitionResolver
-/// form) only when no inlined definition was emitted.
+/// equal AND the resolved type is equal up to whitespace and union member order
+/// (`canonical_type_text`, carrick#735). The corpus `resolved_type` labels are
+/// the fully-inlined structural form (ts-morph `getText()` with NoTruncation),
+/// so the actual is `expanded_definition`, falling back to
+/// `resolved_definition` (the name-preserving DefinitionResolver form) only
+/// when no inlined definition was emitted.
 fn score_type_resolution_accuracy(
     repo_expected: &[(String, ExpectedRepo)],
     proj: &EvalProjection,
@@ -828,7 +1048,8 @@ fn score_type_resolution_accuracy(
                     .as_deref()
                     .or(actual.resolved_definition.as_deref());
                 let state_ok = ts == actual.type_state.as_deref();
-                let rt_ok = actual_rt.map(collapse_ws) == Some(collapse_ws(expected_rt));
+                let rt_ok =
+                    actual_rt.map(canonical_type_text) == Some(canonical_type_text(expected_rt));
                 state_ok && rt_ok
             }) {
                 correct += 1;
@@ -2692,6 +2913,103 @@ mod scoring_tests {
         // a correct, b wrong (state mismatch) → 0.5.
         assert!(
             (score_type_resolution_accuracy(&repos, &proj, TIER_CAPABILITY) - 0.5).abs() < 1e-9
+        );
+    }
+
+    /// carrick#735: the sidecar prints a union's members in a canonical order,
+    /// which is not the order the corpus labels were authored in. The label is
+    /// the answer key and is not edited to follow a printer change, so the
+    /// comparison ignores member order — and only member order. A different
+    /// member SET is still a miss.
+    #[test]
+    fn type_resolution_ignores_union_member_order() {
+        let repos = vec![(
+            "support-desk".to_string(),
+            serde_json::from_value::<ExpectedRepo>(serde_json::json!({
+                "endpoints": [
+                    { "method": "GET", "path": "/tickets/:id",
+                      "resolved_type": "{ id: string; status: \"OPEN\" | \"ESCALATED\" | \"CLOSED\"; }",
+                      "type_state": "Explicit", "tier": "capability" },
+                    { "method": "GET", "path": "/tickets",
+                      "resolved_type": "{ id: string; status: \"OPEN\" | \"ESCALATED\" | \"CLOSED\"; }",
+                      "type_state": "Explicit", "tier": "capability" }
+                ]
+            }))
+            .unwrap(),
+        )];
+        let mut proj = empty_proj();
+        let mut reordered = http_ep("GET", "/tickets/:id");
+        // Same members, canonical order → a hit.
+        reordered.expanded_definition =
+            Some("{ id: string; status: \"CLOSED\" | \"ESCALATED\" | \"OPEN\"; }".to_string());
+        reordered.type_state = Some("Explicit".to_string());
+        let mut wrong_set = http_ep("GET", "/tickets");
+        // A member the label does not carry → still a miss, whatever the order.
+        wrong_set.expanded_definition =
+            Some("{ id: string; status: \"CLOSED\" | \"ESCALATED\" | \"PENDING\"; }".to_string());
+        wrong_set.type_state = Some("Explicit".to_string());
+        proj.endpoints.push(reordered);
+        proj.endpoints.push(wrong_set);
+        assert!(
+            (score_type_resolution_accuracy(&repos, &proj, TIER_CAPABILITY) - 0.5).abs() < 1e-9
+        );
+    }
+
+    /// The union-order normalisation must not quietly equate different types.
+    #[test]
+    fn canonical_type_text_ignores_order_only() {
+        // Order only, at the top level and nested inside an object member.
+        assert_eq!(
+            canonical_type_text("\"OPEN\" | \"ESCALATED\" | \"CLOSED\""),
+            canonical_type_text("\"CLOSED\" | \"ESCALATED\" | \"OPEN\"")
+        );
+        assert_eq!(
+            canonical_type_text("{ id: string; status: \"a\" | \"b\"; }"),
+            canonical_type_text("{ id: string; status: \"b\" | \"a\" }")
+        );
+        assert_eq!(
+            canonical_type_text("(\"a\" | \"b\")[]"),
+            canonical_type_text("(\"b\" | \"a\")[]")
+        );
+        assert_eq!(
+            canonical_type_text("Promise<string | null>"),
+            canonical_type_text("Promise<null | string>")
+        );
+
+        // Everything that is not member order still separates.
+        assert_ne!(
+            canonical_type_text("\"a\" | \"b\""),
+            canonical_type_text("\"a\" | \"c\"")
+        );
+        assert_ne!(
+            canonical_type_text("\"a\" | \"b\""),
+            canonical_type_text("\"a\" | \"b\" | \"c\"")
+        );
+        assert_ne!(
+            canonical_type_text("{ a: string; b: number; }"),
+            canonical_type_text("{ b: number; a: string; }"),
+        );
+        assert_ne!(
+            canonical_type_text("{ a?: string; }"),
+            canonical_type_text("{ a: string; }")
+        );
+        assert_ne!(
+            canonical_type_text("string[]"),
+            canonical_type_text("string")
+        );
+        // A `|` inside a string literal is not a member separator.
+        assert_eq!(
+            canonical_type_text("\"a|b\" | \"c\""),
+            canonical_type_text("\"c\" | \"a|b\"")
+        );
+        assert_ne!(
+            canonical_type_text("\"a|b\""),
+            canonical_type_text("\"a\" | \"b\"")
+        );
+        // A function type's arrow is left alone rather than mis-parsed.
+        assert_eq!(
+            canonical_type_text("{ cb: (x: any) => void; }"),
+            canonical_type_text("{ cb: (x: any) => void }")
         );
     }
 

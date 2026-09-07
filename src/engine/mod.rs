@@ -3569,12 +3569,19 @@ fn resolve_per_endpoint_definitions(
     // it is exactly the entry the definition resolution below skips.
     stamp_capture_provenance(manifest, stub_dir);
 
-    // Collect unique aliases that have actual types (not Unknown)
+    // Collect unique aliases that have actual types (not Unknown).
+    //
+    // A `BTreeSet`, not a `HashSet`: the sidecar resolves the aliases in the
+    // order they arrive, and the compiler hands out type ids in the order it
+    // creates types, so the request order used to reach the printed form of a
+    // union (carrick#735). A `HashSet` iterates under a per-process random
+    // seed, which made that order — and the bytes of the request — differ
+    // between two runs of the same binary over an unchanged tree.
     let aliases: Vec<String> = manifest
         .iter()
         .filter(|e| e.type_state != ManifestTypeState::Unknown)
         .map(|e| e.type_alias.clone())
-        .collect::<std::collections::HashSet<_>>()
+        .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
 

@@ -115,14 +115,16 @@ describe('array_depth wraps a bundled symbol in TS array levels (#248)', () => {
     assert.strictEqual(bundle.status, 'success', `bundle failed: ${JSON.stringify(bundle.errors)}`);
     const dts = bundle.dts_content ?? '';
 
-    // The union must be parenthesised before the `[]`, never `... | "guest"[]`.
-    // (ts-morph normalises string-literal members to double quotes.)
+    // The union must be parenthesised before the `[]`, never `... | "user"[]`.
+    // (ts-morph normalises string-literal members to double quotes.) The
+    // members print in the expander's canonical order — sorted by rendered
+    // text, not declaration order — since carrick#735; the set is unchanged.
     assert.ok(
-      noWs(dts).includes('("admin"|"user"|"guest")[]'),
+      noWs(dts).includes('("admin"|"guest"|"user")[]'),
       `union element must be parenthesised under the array wrap, got:\n${dts}`,
     );
     assert.ok(
-      !/"guest"\[\]/.test(noWs(dts)),
+      !/"user"\[\]/.test(noWs(dts)),
       `must NOT misparse the last union member as an array, got:\n${dts}`,
     );
   });
