@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.43](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.42...carrick-v0.3.43) (2026-09-07)
+
+
+### Bug Fixes
+
+* **hooks:** stop the pre-commit hook sharing one /tmp file between checkouts ([#763](https://github.com/carrick-tools/carrick/issues/763)) ([be9f14c](https://github.com/carrick-tools/carrick/commit/be9f14c6a3e08019fac11c51fdb853fdeea97efc)), closes [#740](https://github.com/carrick-tools/carrick/issues/740)
+* **scanner:** a base declared with a path default is a prefix, not an origin ([#762](https://github.com/carrick-tools/carrick/issues/762)) ([e24e397](https://github.com/carrick-tools/carrick/commit/e24e3974ede9e93f694255a4b1be04130710356e)), closes [#744](https://github.com/carrick-tools/carrick/issues/744)
+* **scanner:** a controller route states its handler's response, not its class ([#757](https://github.com/carrick-tools/carrick/issues/757)) ([53009cf](https://github.com/carrick-tools/carrick/commit/53009cfc413bbe28a84e16ac274b43e320ae88a8)), closes [#745](https://github.com/carrick-tools/carrick/issues/745)
+* **scanner:** an SDK edge says whether its verdict compared anything (cloud[#622](https://github.com/carrick-tools/carrick/issues/622)) ([#759](https://github.com/carrick-tools/carrick/issues/759)) ([b3c91d3](https://github.com/carrick-tools/carrick/commit/b3c91d3bcb07aa8950696260bc0f913f2d2f21bd))
+* **scanner:** keep three days of debug logs, and say when the day's file is large ([#754](https://github.com/carrick-tools/carrick/issues/754)) ([b4b1699](https://github.com/carrick-tools/carrick/commit/b4b16996fd760f49c47e08e5a212a29367640143))
+* **scanner:** never walk into an installed node_modules ([#753](https://github.com/carrick-tools/carrick/issues/753)) ([ffa2180](https://github.com/carrick-tools/carrick/commit/ffa2180f51d2364104e3f4b2d28e242cc2dfd011))
+* **scanner:** one sidecar readiness budget, honoured to the second, loud when missed ([#750](https://github.com/carrick-tools/carrick/issues/750)) ([1e21ce3](https://github.com/carrick-tools/carrick/commit/1e21ce382746bd647aec1357f22fee8fa89f4e88))
+* **sidecar:** canonical union member order so a type prints one way ([#761](https://github.com/carrick-tools/carrick/issues/761)) ([94b3ef6](https://github.com/carrick-tools/carrick/commit/94b3ef6e9065b8aac1f69da4ec114132a5a0ec6c))
+* **sidecar:** stop init walking every directory under the repo root ([#749](https://github.com/carrick-tools/carrick/issues/749)) ([#752](https://github.com/carrick-tools/carrick/issues/752)) ([ca32af1](https://github.com/carrick-tools/carrick/commit/ca32af1d524505a7dff37ad6851316ee9292e3b0))
+
 ## [0.3.42](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.41...carrick-v0.3.42) (2026-09-07)
 
 
