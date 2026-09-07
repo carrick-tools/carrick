@@ -218,6 +218,19 @@ interface UnwrapResult {
    * same as the structural machinery verdict rather than as a resolved type.
    */
   verifiedMachinery?: boolean;
+  /**
+   * A union resolved SOME of its branches and not others (carrick#166). The
+   * names here are the branches that read as `unknown`; `typeString` is
+   * `unknown` rather than a join of the branches that did read, because a
+   * contract known to be partial is a false match and worse than the top type
+   * it replaced. Distinct from `verifiedMachinery`, which means NOTHING
+   * resolved and the return-statement recovery should take over.
+   *
+   * Type NAMES only, never printed text: a printed type whose module the use
+   * site does not import carries an absolute path, and this reaches a reader
+   * as a provenance `detail`.
+   */
+  unreadUnionBranches?: string[];
 }
 
 /**
@@ -425,6 +438,28 @@ export class TypeInferrer {
     const unwrapResult = this.unwrapTypeWithConfig(awaitedType, func, extractionConfig);
     if (unwrapResult.wasUnwrapped && !unwrapResult.verifiedMachinery) {
       typeString = unwrapResult.typeString;
+      // carrick#166: the union read some branches and not others, so the
+      // `unknown` it answered with is a decision, not an absence. Say which
+      // branches were unread — a reader can act on "this route also returns a
+      // wrapper nothing could see inside" in a way they cannot act on a shrug.
+      if (unwrapResult.unreadUnionBranches) {
+        const unread = unwrapResult.unreadUnionBranches;
+        // The COUNT is of branches; the names are deduped, because two
+        // branches of the same wrapper carry the same name and listing it
+        // twice says nothing.
+        const names = [...new Set(unread)].sort().join(', ');
+        provenance = [
+          {
+            path: '',
+            kind: 'unknown',
+            reason: 'machinery_envelope',
+            detail:
+              `${unread.length} of this handler's return branches resolved to transport ` +
+              `no rule could read a payload out of (${names}), so publishing the branches ` +
+              'that did read would state part of the contract as the whole of it',
+          },
+        ];
+      }
     } else {
       // Either no wrapper rule fired, or one verified the wrapper's identity
       // and recovered no payload from it. Either way the resolved return
@@ -1585,6 +1620,8 @@ export class TypeInferrer {
     if (type.isUnion()) {
       const unionTypes = type.getUnionTypes();
       const unwrappedParts: string[] = [];
+      /** Branches that read as `unknown`: verified machinery, no payload. */
+      const unreadBranches: string[] = [];
       let anyUnwrapped = false;
 
       for (const unionType of unionTypes) {
@@ -1593,24 +1630,51 @@ export class TypeInferrer {
         if (result.wasUnwrapped) {
           anyUnwrapped = true;
         }
+        if (result.typeString.trim() === 'unknown') {
+          unreadBranches.push(this.pathFreeTypeLabel(unionType));
+        }
       }
 
       if (anyUnwrapped) {
-        // Dedupe and join. A member that collapsed to `unknown` (verified
-        // machinery with no recoverable payload) must not pollute the join —
-        // `unknown | User` would read downstream as a real composite type
-        // instead of partially-unresolved.
         const unique = [...new Set(unwrappedParts)];
         const informative = unique.filter((part) => part !== 'unknown');
-        const parts = informative.length > 0 ? informative : unique;
+
+        // Every branch collapsed, so the union as a whole recovered no
+        // payload — the same standing as a single verified-machinery
+        // collapse, and the caller's own recovery should still get a turn.
+        if (informative.length === 0) {
+          return {
+            typeString: 'unknown',
+            isExplicit: false,
+            wasUnwrapped: true,
+            verifiedMachinery: true,
+          };
+        }
+
+        // carrick#166: SOME branches read and some did not. Joining the ones
+        // that did states a partial contract as the whole one — on the live
+        // repro, one guard branch's status envelope stood in for a handler
+        // that also returns the real payload — and a contract known to be
+        // partial is a false match, which is worse than the `any` it
+        // replaced. Answer `unknown` and carry the reason instead. This is
+        // NOT the verified-machinery verdict: the union did resolve
+        // something, so the return-statement recovery is not the right next
+        // move, and reading a payload out of the unread branches is its own
+        // work.
+        if (unreadBranches.length > 0) {
+          return {
+            typeString: 'unknown',
+            isExplicit: false,
+            wasUnwrapped: true,
+            unreadUnionBranches: unreadBranches,
+          };
+        }
+
         return {
-          typeString: parts.length === 1 ? parts[0] : parts.join(' | '),
+          typeString:
+            informative.length === 1 ? informative[0] : informative.join(' | '),
           isExplicit: false,
           wasUnwrapped: true,
-          // Every branch collapsed, so the union as a whole recovered no
-          // payload — the same standing as a single verified-machinery
-          // collapse, and the caller's own recovery should still get a turn.
-          verifiedMachinery: informative.length === 0,
         };
       }
     }
@@ -2950,6 +3014,24 @@ export class TypeInferrer {
       return name;
     }
     return typeText(type, enclosingNode);
+  }
+
+  /**
+   * A type's own name, or `an unnamed branch` when it has none.
+   *
+   * Unlike `namedTypeLabel` this never falls back to the printed form, because
+   * its output reaches a reader as a provenance `detail`, and the printed form
+   * of a type whose declaring module the use site does not import is
+   * `import("/abs/path").Name`. The bar for a detail is "one scrubbed sentence,
+   * never an absolute path", so an anonymous branch is described rather than
+   * printed.
+   */
+  private pathFreeTypeLabel(type: Type): string {
+    const name = (type.getSymbol() ?? type.getAliasSymbol())?.getName();
+    if (name && !name.startsWith('__') && name !== 'unknown') {
+      return name;
+    }
+    return 'an unnamed branch';
   }
 
   private resolveTargetNode(
