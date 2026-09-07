@@ -1,5 +1,5 @@
 import axios from "axios";
-import { Get } from "./framework";
+import { app, Get } from "./framework";
 import { ApiTags } from "./docs";
 
 // 1. A bare path literal with no base at all. Whether this registers a route
@@ -51,3 +51,12 @@ export class Tagged {
     return "tagged";
   }
 }
+
+// 6. A route REGISTRATION whose prefix comes from the environment. The target
+// opens with an env-backed binding and continues with literal path text, which
+// is the shape a request to a base plus a path is written in — except that the
+// binding's declared default is a PATH, not an origin. A base that defaults to
+// a path is not an origin, and this file calls nobody.
+const PREFIX = process.env.API_PREFIX || "/api";
+
+app.get(`${PREFIX}/users`, () => "registered, not requested");

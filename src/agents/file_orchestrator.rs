@@ -31,9 +31,9 @@ use crate::{
     engine::type_compat_v2::{ReceiverRole, classify_receiver},
     env_alias::{
         EnvAliasExtractor, EnvAliasMap, EnvFallbackMap, EnvSchemaIndex, LiteralBaseMap,
-        WholeUrlFallbackMap, exported_env_aliases, merge_imported_env_aliases, module_env_schema,
-        resolve_target_env_alias, resolve_target_literal_base, resolve_whole_url_target,
-        whole_url_local_default,
+        WholeUrlFallbackMap, base_default_states_a_path, exported_env_aliases,
+        merge_imported_env_aliases, module_env_schema, resolve_target_env_alias,
+        resolve_target_literal_base, resolve_whole_url_target, whole_url_local_default,
     },
     file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
     framework_detector::DetectionResult,
@@ -1490,6 +1490,7 @@ impl FileOrchestrator {
                             &[],
                             &EnvAliasMap::new(),
                             &WholeUrlFallbackMap::new(),
+                            &EnvFallbackMap::new(),
                             &route_endpoints,
                             &descriptor_endpoints,
                             &decorator_endpoints,
@@ -2049,6 +2050,7 @@ impl FileOrchestrator {
                 &pf.local_wrapper_calls,
                 &pf.env_alias_map,
                 &pf.whole_url_fallbacks,
+                &pf.env_fallbacks,
                 &pf.route_endpoints,
                 &pf.descriptor_endpoints,
                 &pf.decorator_endpoints,
@@ -4928,6 +4930,10 @@ impl FileOrchestrator {
         local_wrapper_calls: &[LocalWrapperCall],
         aliases: &EnvAliasMap,
         whole_url_fallbacks: &WholeUrlFallbackMap,
+        // What every env-backed binding in this file was DECLARED to fall
+        // back to, which is what tells a base from a route prefix
+        // (carrick#744).
+        env_fallbacks: &EnvFallbackMap,
         route_endpoints: &[EndpointResult],
         descriptor_endpoints: &[EndpointResult],
         decorator_endpoints: &[EndpointResult],
@@ -5013,9 +5019,15 @@ impl FileOrchestrator {
             // The verb has to be the call's own, for the same reason the
             // whole-URL rule requires it: a target states no verb, and one
             // inferred from anywhere else would index the wrong operation.
+            //
+            // A base whose declared default is a PATH is not an origin
+            // (carrick#744): `app.get(`${PREFIX}/users`, handler)` under
+            // `const PREFIX = process.env.API_PREFIX || "/api"` writes this
+            // shape to REGISTER a route, and the source says which it is.
             if let Some(base_path) = candidate.base_path_target.as_ref()
                 && let RequestShapeSignal::Known(shape) = &candidate.request_shape
                 && (base_path.base_reads_env || aliases.contains_key(&base_path.base))
+                && !base_default_states_a_path(&base_path.base, env_fallbacks)
             {
                 let target = base_path.target();
                 claim(Resolved {
@@ -12893,6 +12905,7 @@ export { routes };
             local_wrapper_calls,
             aliases,
             whole_url_fallbacks,
+            &EnvFallbackMap::new(),
             route_endpoints,
             &[],
             &[],
