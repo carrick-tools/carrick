@@ -19,8 +19,8 @@
  * than throwing.
  *
  * Union and intersection members are printed in a canonical order that does not
- * depend on when the checker created each member type — see `canonicalMembers`
- * (carrick#735).
+ * depend on when the checker created each member type — see `orderMembers`
+ * (carrick#735), which the depth backstop applies too (carrick#775).
  *
  * Shared by `definition-resolver.ts` (bundle alias resolution) and
  * `type-inferrer.ts` (consumer-side inference), so both paths emit the same
@@ -49,7 +49,7 @@ export function expandTypeStructural(
   seen: Set<number> = new Set(),
   depth = 0,
 ): string {
-  if (depth > MAX_EXPANSION_DEPTH) return namedText(type);
+  if (depth > MAX_EXPANSION_DEPTH) return backstopText(type);
 
   // Primitives & literals: nothing to inline.
   if (
@@ -128,6 +128,29 @@ export function expandTypeStructural(
 }
 
 /**
+ * The print for a type the recursion bound stopped at (carrick#775).
+ *
+ * `namedText` is the compiler's own print, and for a union that print is in
+ * type-id order — the creation-order artefact `canonicalMembers` exists to
+ * remove. Stopping the recursion must not also stop the normalisation: a union
+ * at depth 13 is as much a set as one at depth 2, and a diff reader comparing
+ * two `expanded_definition` strings cannot tell which depth a member came from.
+ *
+ * So the members are rendered by NAME — no recursion, which is the whole point
+ * of the bound — and put in the same canonical order as the expanded path.
+ * Everything else falls through to the compiler's print unchanged.
+ */
+function backstopText(type: Type): string {
+  if (type.isUnion()) {
+    return orderMembers(type.getUnionTypes(), namedText).join(' | ');
+  }
+  if (type.isIntersection()) {
+    return orderMembers(type.getIntersectionTypes(), namedText).join(' & ');
+  }
+  return namedText(type);
+}
+
+/**
  * Render every member of a union/intersection and put them in a canonical
  * order (carrick#735).
  *
@@ -160,11 +183,26 @@ function canonicalMembers(
   seen: Set<number>,
   depth: number,
 ): string[] {
+  return orderMembers(members, (member) =>
+    expandTypeStructural(member, seen, depth + 1),
+  );
+}
+
+/**
+ * The canonical order itself, over whatever text `render` gives each member.
+ * Shared by the expanded path (`canonicalMembers`, which renders structurally)
+ * and the depth backstop (`backstopText`, which renders by name), so one union
+ * cannot be ordered two ways depending on how deep it sits.
+ */
+function orderMembers(
+  members: Type[],
+  render: (member: Type) => string,
+): string[] {
   const rendered = members.map((member, index) => ({
     index,
     intrinsic: isIntrinsicType(member),
     id: (member.compilerType as { id?: number }).id ?? 0,
-    text: expandTypeStructural(member, seen, depth + 1),
+    text: render(member),
   }));
   rendered.sort((a, b) => {
     if (a.intrinsic !== b.intrinsic) return a.intrinsic ? -1 : 1;
