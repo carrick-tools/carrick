@@ -109,6 +109,7 @@ fn test_file_analysis_result_structures() {
 
     // Test EndpointResult structure
     let endpoint = EndpointResult {
+        handler_declaration_line: None,
         view_module: false,
         candidate_id: "span:100-140".to_string(),
         line_number: 15,
@@ -181,6 +182,7 @@ fn test_file_analysis_result_serialization() {
         }],
         endpoints: vec![
             EndpointResult {
+                handler_declaration_line: None,
                 view_module: false,
                 candidate_id: "span:300-340".to_string(),
                 line_number: 10,
@@ -201,6 +203,7 @@ fn test_file_analysis_result_serialization() {
                 resolution_source: None,
             },
             EndpointResult {
+                handler_declaration_line: None,
                 view_module: false,
                 candidate_id: "span:350-400".to_string(),
                 line_number: 15,
@@ -401,6 +404,7 @@ fn test_cross_file_import_resolution() {
             mounts: vec![],
             endpoints: vec![
                 EndpointResult {
+                    handler_declaration_line: None,
                     view_module: false,
                     candidate_id: "span:470-500".to_string(),
                     line_number: 5,
@@ -421,6 +425,7 @@ fn test_cross_file_import_resolution() {
                     resolution_source: None,
                 },
                 EndpointResult {
+                    handler_declaration_line: None,
                     view_module: false,
                     candidate_id: "span:510-540".to_string(),
                     line_number: 10,
@@ -441,6 +446,7 @@ fn test_cross_file_import_resolution() {
                     resolution_source: None,
                 },
                 EndpointResult {
+                    handler_declaration_line: None,
                     view_module: false,
                     candidate_id: "span:550-580".to_string(),
                     line_number: 15,
@@ -475,6 +481,7 @@ fn test_cross_file_import_resolution() {
             mounts: vec![],
             endpoints: vec![
                 EndpointResult {
+                    handler_declaration_line: None,
                     view_module: false,
                     candidate_id: "span:590-620".to_string(),
                     line_number: 5,
@@ -495,6 +502,7 @@ fn test_cross_file_import_resolution() {
                     resolution_source: None,
                 },
                 EndpointResult {
+                    handler_declaration_line: None,
                     view_module: false,
                     candidate_id: "span:630-660".to_string(),
                     line_number: 10,
@@ -701,6 +709,7 @@ fn test_nested_router_mounts() {
             pubsub_operations: vec![],
             mounts: vec![],
             endpoints: vec![EndpointResult {
+                handler_declaration_line: None,
                 view_module: false,
                 candidate_id: "span:830-860".to_string(),
                 line_number: 5,
@@ -743,6 +752,7 @@ fn test_multiple_http_methods_on_same_path() {
         mounts: vec![],
         endpoints: vec![
             EndpointResult {
+                handler_declaration_line: None,
                 view_module: false,
                 candidate_id: "span:870-900".to_string(),
                 line_number: 5,
@@ -763,6 +773,7 @@ fn test_multiple_http_methods_on_same_path() {
                 resolution_source: None,
             },
             EndpointResult {
+                handler_declaration_line: None,
                 view_module: false,
                 candidate_id: "span:910-940".to_string(),
                 line_number: 10,
@@ -783,6 +794,7 @@ fn test_multiple_http_methods_on_same_path() {
                 resolution_source: None,
             },
             EndpointResult {
+                handler_declaration_line: None,
                 view_module: false,
                 candidate_id: "span:950-980".to_string(),
                 line_number: 15,
@@ -803,6 +815,7 @@ fn test_multiple_http_methods_on_same_path() {
                 resolution_source: None,
             },
             EndpointResult {
+                handler_declaration_line: None,
                 view_module: false,
                 candidate_id: "span:990-1020".to_string(),
                 line_number: 20,

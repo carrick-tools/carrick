@@ -204,6 +204,7 @@ fn analyzer_result(
     }
 
     let endpoint = EndpointResult {
+        handler_declaration_line: None,
         view_module: false,
         candidate_id: format!("span:{}-{}", registration_span, span_end),
         line_number: REGISTRATION_LINE,
