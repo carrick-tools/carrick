@@ -1,128 +1,355 @@
 # TypeSidecar - Compiler-Based Type Extraction
 
-The TypeSidecar is a warm-standby Node.js process that provides TypeScript type resolution capabilities to the Carrick analysis engine. It uses the full TypeScript compiler (via `ts-morph`) to extract and bundle types, enabling accurate type checking across repositories.
+The TypeSidecar is a warm-standby Node.js process that gives the Carrick analysis engine real TypeScript type resolution. It drives the compiler through `ts-morph`, so a type is whatever the compiler says it is rather than whatever a regex could reach.
 
 ## Overview
 
 ### Why a Sidecar?
 
-The sidecar architecture solves several problems with the previous position-based type extraction:
-
-1. **Accuracy**: Uses TypeScript's compiler for type resolution instead of fragile UTF-16 position calculations
-2. **Type Inference**: Can extract types even when developers don't provide explicit annotations
-3. **Parallel Startup**: Spawns immediately at CLI start; initializes while SWC scanning proceeds
-4. **Warm Standby**: Process stays alive between requests for fast subsequent queries (~50ms)
+1. **Accuracy**: type resolution through the compiler, not UTF-16 position arithmetic
+2. **Inference**: a type at a location, whether or not the author annotated it
+3. **Parallel startup**: spawned at CLI start; the SWC scan proceeds while it initialises
+4. **Warm standby**: the process, and the program it built, survive between requests
 
 ### Capabilities
 
-- **Symbol-Based Resolution**: Resolve type symbols by name (e.g., `User`, `Response<Order[]>`)
-- **Type Inference**: Infer types at specific file locations using TypeScript's inference engine
-- **Dependency Bundling**: Generate flat `.d.ts` files with all transitive dependencies
-- **Manifest Generation**: Track which endpoints map to which types
+- **Capture**: emit a per-service declaration stub package with the compiler's own `.d.ts` emit (`capture_v2`)
+- **Judge**: typecheck generated probes over those stubs in a scratch workspace, one verdict per matched pair (`check_v2`)
+- **Inference**: resolve the type at a file/line locator, unwrapping framework machinery by the caller's rules (`infer`)
+- **Definition resolution**: the as-written and fully-inlined structural form of a captured alias (`resolve_definitions`)
 
 ## Building
 
 ```bash
-# From the sidecar directory
 cd src/sidecar
-
-# Install dependencies
 npm install
-
-# Build TypeScript
-npm run build
-
-# Run tests
-npm test
+npm run build   # tsc, output in dist/
+npm test        # node --test over dist/test
 ```
 
-The build output goes to `dist/` directory.
+`npm test` runs the COMPILED tests, so a stale `dist/` makes the suite lie. The Rust integration tests spawn `dist/src/index.js` for the same reason; the pre-commit hook rebuilds it.
 
 ## Usage
 
 ### From Rust
 
-The sidecar is managed by the `TypeSidecar` struct in `src/services/type_sidecar.rs`:
+The sidecar is managed by `TypeSidecar` in `src/services/type_sidecar.rs`:
 
 ```rust
 use crate::services::type_sidecar::TypeSidecar;
 
-// Spawn sidecar at CLI startup (non-blocking)
+// Spawn at CLI startup and start init in the background (non-blocking)
 let sidecar = TypeSidecar::spawn(&sidecar_path)?;
+sidecar.start_init(&absolute_repo_path, None);
 
-// Wait for initialization
-sidecar.wait_for_init(&repo_root, None)?;
-
-// Resolve types
-let result = sidecar.resolve_all_types(&explicit_symbols, &infer_requests, &[])?;
+// Requests block until the sidecar is ready, then until they answer
+let result = sidecar.resolve_all_types(&explicit_symbols, &infer_requests, None)?;
+let captured = sidecar.capture_v2(&repo_root, service_name, &anchors, &out_dir, None)?;
 ```
 
-### Standalone Testing
+### Standalone
 
 ```bash
-# Start the sidecar
-node dist/index.js
-
-# Send JSON requests via stdin (one per line)
-{"request_id": "1", "action": "init", "repo_root": "/path/to/repo"}
-{"request_id": "2", "action": "bundle", "symbols": [{"name": "User", "source_file": "src/types.ts"}]}
-{"request_id": "3", "action": "shutdown"}
+node dist/src/index.js
 ```
+
+Then write one JSON request per line on stdin. Every example below is a real request: they are validated against `src/validators.ts`, which is the authority on the shape.
 
 ## Message Protocol
 
-Communication uses JSON over stdio:
-- **stdin**: JSON requests (one per line)
-- **stdout**: JSON responses (one per line)
-- **stderr**: Log messages (for debugging)
+JSON over stdio:
+- **stdin**: one JSON request per line
+- **stdout**: one JSON response per line, and nothing else
+- **stderr**: logs
+
+Every request carries `request_id` and `action`. Every response echoes `request_id` and carries `status`.
+
+### Which actions need a project
+
+`init` resolves a project; `bundle`, `emit_surface`, `infer` and `resolve_definitions` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`.
+
+`capture_v2`, `check_v2`, `build_workspace`, `check_compatibility`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
 ### Actions
 
+| Action | Needs `init` | Purpose |
+|---|---|---|
+| `init` | — | Point the sidecar at a repo/service root |
+| `capture_v2` | no | Emit a per-service declaration stub package |
+| `check_v2` | no | Typecheck matched pairs across captured stubs |
+| `infer` | yes | Resolve the type at a set of locators |
+| `resolve_definitions` | yes | As-written and structural form of captured aliases |
+| `emit_surface` | yes | Emit a surface `.d.ts` with rewritten specifiers |
+| `bundle` | yes | Legacy symbol bundling (superseded by `capture_v2`) |
+| `build_workspace` | no | Assemble a synthetic monorepo from repo metadata |
+| `check_compatibility` | no | Assignability checks inside such a workspace |
+| `health` | no | Readiness and init cost |
+| `shutdown` | no | Graceful exit |
+
 #### `init` - Point the sidecar at a project
 
-Resolves which tsconfig (or default patterns) the project will be built from
-and answers immediately. The ts-morph project itself is built by the first
-request that reads it — `bundle`, `emit_surface`, `infer` or
-`resolve_definitions` — and reused after that; `capture_v2` and `check_v2` are
-stateless and build their own. So `init` costs the same on a repo with its
-dependencies installed as on a bare checkout, and the time a large program
-takes to build is charged to a request's deadline rather than to readiness
-(carrick#749).
+Resolves which tsconfig (or default patterns) the project will be built from and answers immediately. The ts-morph project itself is built by the first request that reads it — `bundle`, `emit_surface`, `infer` or `resolve_definitions` — and reused after that. So `init` costs the same on a repo with its dependencies installed as on a bare checkout, and the time a large program takes to build is charged to a request's deadline rather than to readiness (carrick#749).
 
-Re-initialising re-scopes the sidecar to another root, and drops the previous
-project along with everything built over it.
+Re-initialising re-scopes the sidecar to another root, and drops the previous project along with everything built over it.
 
 ```json
 {
-  "request_id": "unique-id",
+  "request_id": "1",
   "action": "init",
   "repo_root": "/absolute/path/to/repo",
-  "tsconfig_path": "tsconfig.json"  // optional, relative to repo_root
+  "tsconfig_path": "tsconfig.json"
+}
+```
+
+`tsconfig_path` is optional and relative to `repo_root`. `tsconfig_snapshot` and `pinned_dependencies` are optional and carry another repo's compiler options / exact versions when the sidecar has to stand in for a tree it cannot see.
+
+Response:
+```json
+{ "request_id": "1", "status": "ready", "init_time_ms": 523 }
+```
+
+#### `capture_v2` - Emit a service's declaration stubs
+
+The v2 "tsc as serializer" capture. Stateless: it builds its own program from the service's tsconfig, aliases each anchor into a surface entry, and writes a stub package (declaration tree + `carrick-manifest.json` + exact-version pins) into `out_dir`. The full contract is `src/capture/api.ts`.
+
+An anchor is one of four kinds, discriminated on `kind`:
+
+```json
+{
+  "request_id": "2",
+  "action": "capture_v2",
+  "repo_root": "/absolute/path/to/repo",
+  "service_name": "orders-api",
+  "out_dir": "/absolute/path/to/.carrick/stubs/orders-api",
+  "tsconfig_path": "tsconfig.json",
+  "anchors": [
+    {
+      "kind": "symbol",
+      "alias": "Endpoint_a1b2_Response",
+      "symbol_name": "Order",
+      "source_file": "src/types/order.ts",
+      "anchor_origin": "llm-symbol",
+      "array_depth": 1
+    },
+    {
+      "kind": "handler_return",
+      "alias": "Endpoint_c3d4_Response",
+      "symbol_name": "getOrder",
+      "source_file": "src/routes/orders.ts",
+      "anchor_origin": "llm-symbol"
+    },
+    {
+      "kind": "infer",
+      "alias": "Endpoint_e5f6_Request",
+      "source_file": "src/routes/orders.ts",
+      "anchor_origin": "deterministic-infer",
+      "line_number": 42,
+      "expression_text": "req.body",
+      "unwrap": "awaited"
+    },
+    {
+      "kind": "literal",
+      "alias": "Endpoint_0011_Response",
+      "type_text": "{ ok: boolean }",
+      "anchor_origin": "anchor-backfill"
+    }
+  ]
+}
+```
+
+`anchor_origin` is one of `llm-symbol`, `deterministic-infer`, `anchor-backfill`.
+
+Response (`result` is a `CaptureStubResult`, abbreviated here):
+```json
+{
+  "request_id": "2",
+  "status": "success",
+  "result": {
+    "success": true,
+    "stub_dir": "/absolute/path/to/.carrick/stubs/orders-api",
+    "package_name": "@carrick/orders-api",
+    "emitted_files": ["types/surface.d.ts", "types/src/types/order.d.ts"],
+    "pinned_dependencies": { "zod": "3.23.8" },
+    "unpinned_externals": [],
+    "aliases": [
+      {
+        "alias": "Endpoint_a1b2_Response",
+        "anchor_kind": "symbol",
+        "symbol_name": "Order",
+        "source_file": "src/types/order.ts",
+        "anchor_origin": "llm-symbol",
+        "serialization": "declaration_emit",
+        "self_check": "ok"
+      }
+    ],
+    "bare_checkout": false,
+    "ts_version": "5.8.3",
+    "errors": []
+  }
+}
+```
+
+#### `check_v2` - Judge matched pairs
+
+Assembles the given stub packages into a scratch synthetic monorepo, installs the pins, and typechecks one generated probe per pair. Stateless. This is the only action that answers with more than one frame: while it installs and checks it emits `status: "progress"` keepalives, then exactly one terminal `success` or `error` frame. A client must skip progress frames rather than treat the first frame as the answer.
+
+```json
+{
+  "request_id": "3",
+  "action": "check_v2",
+  "stubs": [
+    { "service_name": "orders-api", "stub_dir": "/abs/.carrick/stubs/orders-api" },
+    { "service_name": "web", "stub_dir": "/abs/.carrick/stubs/web" }
+  ],
+  "pairs": [
+    {
+      "pair_key": "http|GET|/orders/:id",
+      "protocol": "http",
+      "type_kind": "response",
+      "producer": { "service_name": "orders-api", "alias": "Endpoint_a1b2_Response" },
+      "consumer": { "service_name": "web", "alias": "Endpoint_9f8e_Response" }
+    }
+  ],
+  "keep_workspace": false
+}
+```
+
+`protocol` is one of `http`, `graphql`, `socket`, `pubsub`; `type_kind` is `request`, `response` or `both`. `workspace_root` is optional (defaults to the OS temp dir); `keep_workspace` keeps the assembled tree on disk.
+
+Progress frames, zero or more:
+```json
+{ "request_id": "3", "status": "progress", "phase": "installing", "message": "check installing" }
+```
+
+Terminal frame (`result` is a `CheckResult`, abbreviated):
+```json
+{
+  "request_id": "3",
+  "status": "success",
+  "result": {
+    "success": true,
+    "workspace_dir": "/tmp/carrick-check-xxxx",
+    "isolation": "pnpm",
+    "install_ok": true,
+    "ts_version": "5.8.3",
+    "verdicts": [
+      {
+        "pair_id": "8f1c0a2b",
+        "pair_key": "http|GET|/orders/:id",
+        "bucket": "compatible",
+        "codes": []
+      }
+    ],
+    "degraded_services": [],
+    "errors": []
+  }
+}
+```
+
+#### `infer` - Resolve the type at a locator
+
+Each item locates one expression. The fields are `file_path`, `line_number` and `infer_kind`; a locator is completed by a span (`span_start` + `span_end`), by `expression_text` (+ optional `expression_line`), or by the line alone for the kinds that anchor on a function (`function_return`, `signature_return`, `function_param`, `response_body`, `request_body`). Anything else is rejected per item, and that item alone pads to `unknown` — a bad item never sinks the batch.
+
+`infer_kind` is one of `function_return`, `expression`, `call_result`, `variable`, `response_body`, `request_body`, `signature_return`, `function_param`, `receiver_type`.
+
+`extraction_config` carries the caller's unwrap rules (wrapper symbols, origin module globs, payload paths). **Live behaviour depends on it**: without it the inferrer cannot unwrap a framework envelope, so a probe written without one does not reproduce what a real scan sees.
+
+```json
+{
+  "request_id": "4",
+  "action": "infer",
+  "requests": [
+    {
+      "file_path": "src/routes/users.ts",
+      "line_number": 25,
+      "infer_kind": "response_body",
+      "alias": "Endpoint_7a6b_Response",
+      "expression_text": "res.json(users)",
+      "expression_line": 25
+    },
+    {
+      "file_path": "src/routes/users.ts",
+      "line_number": 40,
+      "infer_kind": "function_param",
+      "param_name": "body"
+    }
+  ],
+  "extraction_config": {
+    "rules": [
+      {
+        "wrapperSymbols": ["ApiResponse"],
+        "originModuleGlobs": ["**/lib/http.ts"],
+        "payloadGenericIndex": 0,
+        "unwrapRecursively": true
+      }
+    ]
+  }
 }
 ```
 
 Response:
 ```json
 {
-  "request_id": "unique-id",
-  "status": "ready",
-  "init_time_ms": 523
+  "request_id": "4",
+  "status": "success",
+  "inferred_types": [
+    {
+      "alias": "Endpoint_7a6b_Response",
+      "type_string": "{ id: string; name: string; }[]",
+      "is_explicit": false,
+      "infer_kind": "response_body",
+      "source_location": { "file_path": "src/routes/users.ts", "start_line": 25, "end_line": 25 }
+    }
+  ],
+  "errors": []
 }
 ```
 
-#### `bundle` - Bundle Explicit Types
+#### `resolve_definitions` - Read aliases out of a capture stub
+
+Resolves surface aliases from a stub package's declaration tree (`<stub_dir>/types/surface.d.ts`), in a dedicated throwaway project so the warm project never sees stub files. Returns two forms per alias: `definition` as written (named refs preserved) and `expanded` fully structural, with named members inlined. Union members print in a canonical order, so the same tree always yields the same string (carrick#735).
+
+An alias that does not resolve is skipped, not failed.
 
 ```json
 {
-  "request_id": "unique-id",
-  "action": "bundle",
-  "symbols": [
+  "request_id": "5",
+  "action": "resolve_definitions",
+  "stub_dir": "/absolute/path/to/.carrick/stubs/orders-api",
+  "aliases": ["Endpoint_a1b2_Response", "Endpoint_c3d4_Request"]
+}
+```
+
+Response:
+```json
+{
+  "request_id": "5",
+  "status": "success",
+  "definitions": [
     {
-      "name": "User",
-      "source_file": "src/types/user.ts",
-      "endpoint_method": "GET",
-      "endpoint_path": "/api/users/:id",
-      "is_producer": true
+      "type_alias": "Endpoint_a1b2_Response",
+      "definition": "interface Order { id: string; total: Money }",
+      "expanded": "{ id: string; total: { amountCents: number; currency: string; }; }"
+    }
+  ]
+}
+```
+
+#### `emit_surface` - Emit a surface `.d.ts`
+
+Writes one file declaring each payload as an alias, with import specifiers rewritten so the file stands alone. Needs an init'd project.
+
+```json
+{
+  "request_id": "6",
+  "action": "emit_surface",
+  "repo_name": "orders-api",
+  "output_path": "/absolute/path/to/.carrick/surface/orders-api.d.ts",
+  "payloads": [
+    {
+      "alias": "Endpoint_a1b2_Response",
+      "type_string": "Order",
+      "source_file": "src/types/order.ts"
     }
   ]
 }
@@ -131,35 +358,61 @@ Response:
 Response:
 ```json
 {
-  "request_id": "unique-id",
+  "request_id": "6",
   "status": "success",
-  "dts_content": "export interface User { id: string; name: string; }",
+  "output_path": "/absolute/path/to/.carrick/surface/orders-api.d.ts",
+  "surface_content": "export type Endpoint_a1b2_Response = Order;",
   "manifest": [
+    { "alias": "Endpoint_a1b2_Response", "type_string": "Order", "rewritten_imports": [] }
+  ]
+}
+```
+
+#### `bundle` - Legacy symbol bundling
+
+Superseded by `capture_v2`, which emits through the compiler instead of reprinting declarations. Kept for the paths that still call it. Needs an init'd project.
+
+```json
+{
+  "request_id": "7",
+  "action": "bundle",
+  "symbols": [
     {
-      "method": "GET",
-      "path": "/api/users/:id",
-      "is_producer": true,
-      "type_alias": "User",
-      "source_file": "src/types/user.ts"
+      "symbol_name": "User",
+      "source_file": "src/types/user.ts",
+      "alias": "Endpoint_1122_Response",
+      "array_depth": 1
     }
-  ],
+  ]
+}
+```
+
+Response:
+```json
+{
+  "request_id": "7",
+  "status": "success",
+  "dts_content": "export type Endpoint_1122_Response = { id: string; name: string; }[];",
+  "manifest": [{ "alias": "Endpoint_1122_Response", "type_string": "{ id: string; name: string; }[]" }],
   "symbol_failures": []
 }
 ```
 
-#### `infer` - Infer Implicit Types
+#### `build_workspace` - Assemble a synthetic monorepo
+
+Writes a workspace holding one stub package per repo, from metadata alone (no checkout required). Stateless.
 
 ```json
 {
-  "request_id": "unique-id",
-  "action": "infer",
-  "requests": [
+  "request_id": "8",
+  "action": "build_workspace",
+  "workspace_root": "/absolute/path/to/.carrick/workspace",
+  "repos": [
     {
-      "source_file": "src/routes/users.ts",
-      "line": 25,
-      "kind": "handler_return",
-      "endpoint_method": "GET",
-      "endpoint_path": "/api/users"
+      "repoName": "orders-api",
+      "dependencies": { "zod": "3.23.8" },
+      "tsconfig": { "compilerOptions": { "module": "ESNext", "strict": true } },
+      "surfaceContent": "export type Endpoint_a1b2_Response = { id: string };"
     }
   ]
 }
@@ -168,54 +421,73 @@ Response:
 Response:
 ```json
 {
-  "request_id": "unique-id",
+  "request_id": "8",
   "status": "success",
-  "inferred_types": [
+  "workspace_path": "/absolute/path/to/.carrick/workspace",
+  "stub_packages": ["/absolute/path/to/.carrick/workspace/packages/orders-api"],
+  "checker_path": "/absolute/path/to/.carrick/workspace/packages/checker"
+}
+```
+
+#### `check_compatibility` - Assignability inside a built workspace
+
+```json
+{
+  "request_id": "9",
+  "action": "check_compatibility",
+  "workspace_root": "/absolute/path/to/.carrick/workspace",
+  "checks": [
     {
-      "source_file": "src/routes/users.ts",
-      "line": 25,
-      "inferred_type": "User[]",
-      "dts_content": "export interface User { id: string; name: string; }",
-      "endpoint_method": "GET",
-      "endpoint_path": "/api/users"
+      "source_repo": "orders-api",
+      "source_alias": "Endpoint_a1b2_Response",
+      "target_repo": "web",
+      "target_alias": "Endpoint_9f8e_Response",
+      "direction": "source_extends_target"
     }
   ]
 }
 ```
 
-#### `health` - Check Status
-
-```json
-{
-  "request_id": "unique-id",
-  "action": "health"
-}
-```
+`direction` is one of `source_extends_target`, `target_extends_source`, `bidirectional`.
 
 Response:
 ```json
 {
-  "request_id": "unique-id",
-  "status": "ready",
-  "init_time_ms": 523
+  "request_id": "9",
+  "status": "success",
+  "results": [
+    {
+      "source_repo": "orders-api",
+      "source_alias": "Endpoint_a1b2_Response",
+      "target_repo": "web",
+      "target_alias": "Endpoint_9f8e_Response",
+      "compatible": true
+    }
+  ],
+  "diagnostics": []
 }
 ```
 
-#### `shutdown` - Graceful Exit
+#### `health` - Readiness
 
 ```json
-{
-  "request_id": "unique-id",
-  "action": "shutdown"
-}
+{ "request_id": "10", "action": "health" }
 ```
 
-Response:
+Response — `ready` once `init` has resolved a project, `not_ready` before that:
 ```json
-{
-  "request_id": "unique-id",
-  "status": "success"
-}
+{ "request_id": "10", "status": "ready", "init_time_ms": 523 }
+```
+
+#### `shutdown` - Graceful exit
+
+```json
+{ "request_id": "11", "action": "shutdown" }
+```
+
+Response, written before the process exits:
+```json
+{ "request_id": "11", "status": "success" }
 ```
 
 ## Architecture
@@ -224,19 +496,14 @@ Response:
 ┌─────────────────────────────────────────────────────────────────┐
 │                       TypeSidecar (Node.js)                      │
 │                                                                  │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────┐   │
-│  │ ProjectLoader │    │ TypeBundler  │    │ TypeInferrer     │   │
-│  │              │    │              │    │                  │   │
-│  │ - Load tsconfig   │ - Resolve symbols  │ - Infer at location  │
-│  │ - Init ts-morph   │ - Bundle .d.ts     │ - Extract types      │
-│  │ - Validate        │ - Generate manifest│ - Handle handlers    │
-│  └──────────────┘    └──────────────┘    └──────────────────┘   │
+│  stdin ──► JSON parse ──► validate (zod) ──► route ──► stdout    │
 │                                                                  │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │                    Message Loop (index.ts)                │   │
-│  │                                                           │   │
-│  │  stdin ──► JSON parse ──► Route ──► Handle ──► stdout     │   │
-│  └──────────────────────────────────────────────────────────┘   │
+│  project-backed (built lazily after init):                       │
+│    TypeBundler · SurfaceEmitter · TypeInferrer                   │
+│    DefinitionResolver                                            │
+│                                                                  │
+│  stateless (own program / own workspace per request):            │
+│    capture/ (capture_v2, check_v2) · MonorepoBuilder             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -244,58 +511,49 @@ Response:
 
 | File | Description |
 |------|-------------|
-| `src/index.ts` | Main entry point, message loop |
-| `src/types.ts` | TypeScript interfaces for requests/responses |
-| `src/validators.ts` | Zod schemas for request validation |
-| `src/project-loader.ts` | TypeScript project initialization |
-| `src/bundler.ts` | Type bundling with dts-bundle-generator |
-| `src/type-inferrer.ts` | Type inference using TypeScript compiler |
-| `test/` | Integration tests |
+| `src/index.ts` | Entry point, message loop, dispatch, response/progress frames |
+| `src/types.ts` | Request/response interfaces |
+| `src/validators.ts` | Zod schemas; the authority on request shape |
+| `src/project-loader.ts` | tsconfig resolution and ts-morph project construction |
+| `src/bundler.ts` | Legacy symbol bundling and surface emission |
+| `src/type-inferrer.ts` | Inference at a locator, with extraction-config unwrapping |
+| `src/definition-resolver.ts` | Alias resolution out of a capture stub tree |
+| `src/type-structural-expander.ts` | Shared structural rendering of a resolved type |
+| `src/monorepo-builder.ts` | Synthetic workspace build and assignability checks |
+| `src/capture/` | capture_v2 and check_v2; contract in `capture/api.ts` |
+| `test/` | Compiled and run by `npm test` |
 
 ## Error Handling
 
-All responses include a `status` field:
-- `"ready"` - Sidecar initialized and ready
-- `"success"` - Request completed successfully
-- `"error"` - Request failed (check `errors` array)
-- `"not_ready"` - Sidecar not yet initialized
+`status` on every response:
+- `"ready"` / `"not_ready"` — `init` and `health` only
+- `"success"` — the request answered
+- `"error"` — the request failed; read `errors`
+- `"progress"` — a `check_v2` keepalive, never terminal
 
-Error responses include an `errors` array with details:
+A request that fails validation answers with `status: "error"` and the zod message, e.g. `Invalid request: requests.0.infer_kind: Required`:
 ```json
-{
-  "request_id": "unique-id",
-  "status": "error",
-  "errors": ["Symbol 'Foo' not found in src/types.ts"]
-}
+{ "request_id": "4", "status": "error", "errors": ["Invalid request: ..."] }
 ```
+
+Per-item failures inside `infer` and `bundle` do not fail the batch: they arrive as `errors` / `symbol_failures` beside the results that succeeded.
 
 ## Performance
 
-- **Cold start**: ~500ms (TypeScript compiler initialization)
-- **Warm requests**: ~50ms per batch
-- **Memory**: ~100-200MB depending on project size
+- **Init**: resolution only, so it does not scale with the tree; the program is built by the first request that reads it
+- **Warm requests**: fast for small batches; a first `infer` on a large program pays the build
+- **Memory**: grows with the program; `CARRICK_SIDECAR_MAX_OLD_SPACE_MB` raises the heap cap
 
-The parallel startup strategy ensures the sidecar is ready by the time type resolution is needed:
-
-```
-CLI Start ────┬──► Spawn Sidecar (init in background)
-              │
-              ├──► SWC Scan Files (~100ms)
-              │
-              ├──► LLM Analysis (~2-5s)
-              │
-              └──► Type Resolution (sidecar now ready)
-```
+The Rust client's readiness budget is `CARRICK_SIDECAR_READY_TIMEOUT_SECS`.
 
 ## Debugging
 
-Enable verbose logging by checking stderr output:
+stderr carries the log:
 
 ```bash
-node dist/index.js 2>&1 | tee sidecar.log
+node dist/src/index.js 2>sidecar.log
 ```
 
-Log format:
 ```
 [sidecar] Process started
 [sidecar] Initializing with repo_root: /path/to/repo
@@ -305,6 +563,6 @@ Log format:
 
 ## See Also
 
-- `src/services/type_sidecar.rs` - Rust client for the sidecar
-- `docs/archive/compiler-sidecar-architecture/ARCHITECTURE.md` - Full architecture documentation
-- `docs/archive/compiler-sidecar-architecture/IMPLEMENTATION_PLAN.md` - Implementation plan
+- `src/services/type_sidecar.rs` — the Rust client
+- `src/sidecar/src/capture/api.ts` — the capture/check contract (anchors, stub result, verdicts)
+- `src/engine/type_compat_v2.rs` — how the driver builds pairs and reads verdicts
