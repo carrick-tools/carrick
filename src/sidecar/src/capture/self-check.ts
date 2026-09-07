@@ -326,7 +326,10 @@ function checkedRecord(
     self_check: outcome,
     // A #438/#439 re-aim note is provenance only; a real decay detail always
     // wins, so it surfaces exactly when the re-aimed alias self-checks clean.
-    self_check_detail: detail ?? anchor.reaimNote,
+    // An abstain (carrick#766) is the most specific statement available: the
+    // surface line is `unknown` because this layer wrote it that way, so its
+    // reason outranks whatever the closure walk blames.
+    self_check_detail: anchor.abstainReason ?? detail ?? anchor.reaimNote,
     top_type_at_self_check: topType,
     ...(unexplainedDeep.length > 0
       ? { any_provenance: unexplainedDeep.map(provenanceOf) }
