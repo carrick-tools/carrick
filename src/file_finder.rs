@@ -160,6 +160,37 @@ pub fn endpoint_provenance(path: &Path, root_dir: &Path) -> EndpointProvenance {
     }
 }
 
+/// The entries of a source walk below `dir`: everything the scan may read,
+/// with the ignored directories never entered.
+///
+/// Pruning at the directory rather than filtering at the file is not an
+/// optimisation, it is the difference between a walk that terminates in
+/// seconds and one that does not terminate usefully at all. The walk follows
+/// symlinks, because a service's source can be linked in from elsewhere in the
+/// repo. An installed `node_modules` is built out of symlinks: every workspace
+/// dependency is a link back into the repo's own source, and those links form
+/// a graph with no cycles for the walker's ancestor detection to catch and one
+/// distinct path per route through the dependency graph. On a synthetic
+/// workspace of 16 packages with two dependencies each, 97 real files were
+/// visited 40,477 times; on a real monorepo whose dependencies were installed
+/// for the first time, this cost a scan sixteen minutes of silence
+/// (carrick#748, carrick#706).
+///
+/// Sorted so the walk is the same on every host: readdir order differs between
+/// APFS and ext4, and any "first/last one wins" over an unsorted walk is a
+/// host-dependent result (#569 found one).
+fn source_entries<'a>(
+    root: &'a Path,
+    ignore_patterns: &'a [&'a str],
+) -> impl Iterator<Item = walkdir::DirEntry> + 'a {
+    WalkDir::new(root)
+        .sort_by_file_name()
+        .follow_links(true)
+        .into_iter()
+        .filter_entry(move |entry| !is_ignored(entry.path(), root, ignore_patterns))
+        .filter_map(|e| e.ok())
+}
+
 /// Find all JavaScript and TypeScript files in a directory
 /// Also looks for carrick.json configuration file
 /// Returns (js_ts_files, config_file_option)
@@ -174,22 +205,10 @@ pub fn find_files(dir: &str, ignore_patterns: &[&str]) -> (Vec<PathBuf>, Option<
     let mut config_file = None;
     let root_path = Path::new(dir);
 
-    // Sorted so the walk is the same on every host: readdir order differs
-    // between APFS and ext4, and any "first/last one wins" over an unsorted
-    // walk is a host-dependent result (#569 found one).
-    for entry in WalkDir::new(dir)
-        .sort_by_file_name()
-        .follow_links(true)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+    for entry in source_entries(root_path, ignore_patterns) {
         let path = entry.path();
 
         if !path.is_file() {
-            continue;
-        }
-
-        if is_ignored(path, root_path, ignore_patterns) {
             continue;
         }
 
@@ -212,6 +231,27 @@ pub fn find_files(dir: &str, ignore_patterns: &[&str]) -> (Vec<PathBuf>, Option<
     (js_ts_files, config_file)
 }
 
+/// Where a service's own tree starts: its `directory` under the repo root, or
+/// the repo root itself for a single-service repo.
+fn service_root(repo_root: &Path, service: &crate::config::Config) -> PathBuf {
+    match &service.directory {
+        Some(dir) => repo_root.join(dir),
+        None => repo_root.to_path_buf(),
+    }
+}
+
+/// A service's own `package.json`, if it has one.
+///
+/// The file at the service root and nowhere else: a scan must pick the same
+/// manifest on every host, and the root is the only one that is unambiguously
+/// the service's. No walk — the caller that only wants the manifest was
+/// walking the whole service tree to reach a path it already knew, once per
+/// service (carrick#748).
+pub fn find_service_manifest(repo_path: &Path, service: &crate::config::Config) -> Option<PathBuf> {
+    let manifest = service_root(repo_path, service).join("package.json");
+    manifest.is_file().then_some(manifest)
+}
+
 /// Find JS/TS files for a single service, scoped to its `directory` plus any
 /// extra `include` source roots (e.g. shared libraries copied in at build
 /// time), all relative to `repo_path`. Also returns that service's
@@ -228,17 +268,13 @@ pub fn find_service_files(
     ignore_patterns: &[&str],
 ) -> (Vec<PathBuf>, Option<PathBuf>) {
     let root = Path::new(repo_path);
-    let service_root = match &service.directory {
-        Some(dir) => root.join(dir),
-        None => root.to_path_buf(),
-    };
+    let service_root = service_root(root, service);
 
     // The carrick.json lives at the repo root, not per service directory, so the
     // config returned here is ignored — config resolution is handled separately.
     let (mut files, _config) = find_files(&service_root.to_string_lossy(), ignore_patterns);
 
-    let manifest = service_root.join("package.json");
-    let package_json = manifest.is_file().then_some(manifest);
+    let package_json = find_service_manifest(root, service);
 
     for inc in &service.include {
         let inc_path = root.join(inc);
@@ -365,6 +401,79 @@ mod tests {
     }
 
     const ARTIFACT_IGNORES: &[&str] = &["node_modules", "dist", "build", ".next"];
+
+    /// Build a pnpm workspace as installed: every package's `node_modules`
+    /// holds a symlink to each workspace package it depends on, and those
+    /// point back into the repo's own source. Edges run forward only, so
+    /// there is no cycle for a walker's ancestor detection to catch.
+    fn installed_workspace(root: &Path, packages: usize, fanout: usize) {
+        for i in 1..=packages {
+            let pkg = root.join("packages").join(format!("pkg{i}"));
+            fs::create_dir_all(pkg.join("src")).expect("package src");
+            File::create(pkg.join("src").join("index.ts")).expect("package source");
+            File::create(pkg.join("package.json")).expect("package manifest");
+        }
+        for i in 1..=packages {
+            let links = root
+                .join("packages")
+                .join(format!("pkg{i}"))
+                .join("node_modules")
+                .join("@repo");
+            fs::create_dir_all(&links).expect("link dir");
+            for hop in 1..=fanout {
+                let j = i + hop;
+                if j > packages {
+                    continue;
+                }
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(
+                    Path::new("../../../").join(format!("pkg{j}")),
+                    links.join(format!("pkg{j}")),
+                )
+                .expect("workspace link");
+            }
+        }
+    }
+
+    /// The walk must not enter an ignored directory, only decline its files.
+    ///
+    /// Filtering at the file leaves the same file set and a wildly different
+    /// cost: an installed `node_modules` links back into the repo's own
+    /// source, and each route through the workspace dependency graph is a
+    /// distinct path to the same files. This shape — 12 packages, two
+    /// dependencies each, 24 real source files — is visited thousands of
+    /// times by a walk that descends into the links (carrick#748).
+    #[test]
+    #[cfg(unix)]
+    fn the_walk_never_enters_an_installed_node_modules() {
+        let tmp = tempdir().expect("temp dir");
+        let root = tmp.path();
+        installed_workspace(root, 12, 2);
+
+        let visited: Vec<PathBuf> = source_entries(root, ARTIFACT_IGNORES)
+            .map(|entry| entry.path().to_path_buf())
+            .collect();
+
+        assert!(
+            !visited
+                .iter()
+                .any(|p| p.components().any(|c| c.as_os_str() == "node_modules")),
+            "the walk entered an installed node_modules; {} entries visited",
+            visited.len()
+        );
+        // 12 packages, each a directory plus src/, index.ts and package.json,
+        // plus the root and packages/. Every real entry once, nothing twice.
+        assert_eq!(
+            visited.len(),
+            2 + 12 * 4,
+            "entries visited: {:?}",
+            visited.len()
+        );
+
+        // The file set is what it always was.
+        let (files, _) = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
+        assert_eq!(files.len(), 12, "source files: {files:?}");
+    }
 
     #[test]
     fn find_files_ignore_matches_segments_not_substrings() {

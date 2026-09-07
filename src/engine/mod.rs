@@ -279,11 +279,29 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // 4. Analyze each service (incremental per service where possible).
     let sp = logging::spinner("Analyzing repository...");
     let mut current_services_data = Vec::with_capacity(services.len());
-    for service in &services {
+    for (index, service) in services.iter().enumerate() {
+        // One line per service, at info, before the work starts. A scan of a
+        // large monorepo spends most of its wall clock inside this loop, and
+        // without a mark per iteration a stall is a silence with nothing to
+        // attribute it to: the 0.3.42 incident cost sixteen minutes between
+        // two unrelated log lines, and reading which service it was in took
+        // the whole investigation (carrick#748).
+        let label = service.service_name.as_deref().unwrap_or("(root)");
+        info!(
+            "Analyzing service {} ({}/{})",
+            label,
+            index + 1,
+            services.len()
+        );
+        let service_started = Instant::now();
+
         let packages = load_packages_for_service(repo_path, service)?;
+        let packages_took = service_started.elapsed();
 
         // Scope the sidecar's type extraction to this service's directory/tsconfig.
+        let sidecar_started = Instant::now();
         scope_sidecar_to_service(sidecar, repo_path, service);
+        let sidecar_took = sidecar_started.elapsed();
 
         // Incremental cache is per service: match on repo + service name so
         // editing one service does not invalidate the others.
@@ -296,6 +314,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
                 .cloned()
         };
 
+        let analysis_started = Instant::now();
         let data = analyze_current_repo_incremental(
             repo_path,
             service,
@@ -304,6 +323,15 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
             previous_data.as_ref(),
         )
         .await?;
+
+        info!(
+            "Analyzed service {} in {:.1}s (packages {:.1}s, sidecar {:.1}s, analysis {:.1}s)",
+            label,
+            service_started.elapsed().as_secs_f64(),
+            packages_took.as_secs_f64(),
+            sidecar_took.as_secs_f64(),
+            analysis_started.elapsed().as_secs_f64(),
+        );
 
         if data.bundled_types.is_some() {
             debug!(
@@ -3439,8 +3467,8 @@ fn load_packages_for_service(
     repo_path: &str,
     service: &Config,
 ) -> Result<Packages, Box<dyn std::error::Error>> {
-    let ignore_patterns = service_ignore_patterns(service);
-    let (_, package_json_path) = find_service_files(repo_path, service, &ignore_patterns);
+    let package_json_path =
+        crate::file_finder::find_service_manifest(std::path::Path::new(repo_path), service);
     let mut packages = if let Some(package_path) = package_json_path {
         debug!("Found package.json: {}", package_path.display());
         Packages::new(vec![package_path.clone()])
