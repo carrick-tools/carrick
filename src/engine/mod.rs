@@ -279,6 +279,10 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // 4. Analyze each service (incremental per service where possible).
     let sp = logging::spinner("Analyzing repository...");
     let mut current_services_data = Vec::with_capacity(services.len());
+    // One workspace pass for the whole scan. Every service asks it the same
+    // question about the same tree, and rebuilding it per service was the
+    // largest fixed cost in the analysis phase (carrick#767).
+    let mut workspace_scan = crate::external_call_candidates::WorkspaceScan::new();
     for (index, service) in services.iter().enumerate() {
         // One line per service, at info, before the work starts. A scan of a
         // large monorepo spends most of its wall clock inside this loop, and
@@ -315,22 +319,37 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         };
 
         let analysis_started = Instant::now();
+        let requests_before = crate::agent_service::request_counts();
+        crate::phase_timing::start_service();
         let data = analyze_current_repo_incremental(
             repo_path,
             service,
             &packages,
             sidecar,
             previous_data.as_ref(),
+            &mut workspace_scan,
         )
         .await?;
 
+        // `analysis` used to be the whole phase and nothing said what was in
+        // it (carrick#767). The breakdown after the colon adds up to it, and
+        // the request counts say how many round trips this service made —
+        // which is what distinguishes work that grew from waiting that grew.
+        let phases = crate::phase_timing::take_line().unwrap_or_else(|| "not recorded".to_string());
+        let requests = crate::agent_service::requests_between(
+            &requests_before,
+            &crate::agent_service::request_counts(),
+        );
         info!(
-            "Analyzed service {} in {:.1}s (packages {:.1}s, sidecar {:.1}s, analysis {:.1}s)",
+            "Analyzed service {} in {:.1}s (packages {:.1}s, sidecar {:.1}s, analysis {:.1}s: \
+             {}; requests {})",
             label,
             service_started.elapsed().as_secs_f64(),
             packages_took.as_secs_f64(),
             sidecar_took.as_secs_f64(),
             analysis_started.elapsed().as_secs_f64(),
+            phases,
+            requests,
         );
 
         if data.bundled_types.is_some() {
@@ -499,6 +518,22 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     } else {
         (false, std::collections::HashSet::new())
     };
+
+    // What the analysis phase put on the wire, once, for the whole scan. A
+    // per-service count says which service made its calls; this says whether
+    // the scan made any at all — the question a boundary reading "0 file(s)
+    // sent to the analyzer" beside thousands of cloud-side invocations cannot
+    // answer (carrick#767).
+    info!(
+        "Analysis issued {} cloud request(s): {}",
+        crate::agent_service::request_counts()
+            .values()
+            .sum::<usize>(),
+        crate::agent_service::requests_between(
+            &std::collections::BTreeMap::new(),
+            &crate::agent_service::request_counts(),
+        ),
+    );
 
     // 6. Cross-repo analysis (reuse already-downloaded data).
     // Remove this repo's downloaded copies so the freshly-analyzed services
@@ -1238,6 +1273,7 @@ async fn analyze_current_repo_incremental(
     packages: &Packages,
     sidecar: Option<&TypeSidecar>,
     previous_data: Option<&CloudRepoData>,
+    workspace: &mut crate::external_call_candidates::WorkspaceScan,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     let start = Instant::now();
 
@@ -1253,6 +1289,7 @@ async fn analyze_current_repo_incremental(
     let cm: Lrc<SourceMap> = Default::default();
     let (files, all_imported_symbols, function_definitions, repo_name) =
         discover_files_and_symbols(repo_path, config, cm.clone())?;
+    crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
 
     // 3. Check if we can use incremental mode
     let can_use_incremental = previous_data.and_then(|prev| {
@@ -1392,6 +1429,7 @@ async fn analyze_current_repo_incremental(
 
             let normalizer = UrlNormalizer::new(config);
             let service_root = service_scan_root(repo_path, config);
+            crate::phase_timing::mark(crate::phase_timing::Phase::Cache);
             // Analysis runs over EVERY discovered file, cached or not: the
             // deterministic layer is re-derived from the AST on every scan and
             // only the model's answer is replayed. That is what lets a resolver
@@ -1413,6 +1451,7 @@ async fn analyze_current_repo_incremental(
                     sidecar,
                 )
                 .await?;
+            crate::phase_timing::mark(crate::phase_timing::Phase::Model);
 
             let merged_results = normalize_file_results_keys(&analysis.file_results, repo_path);
             let raw_model_results =
@@ -1430,6 +1469,7 @@ async fn analyze_current_repo_incremental(
                 // needs the repo root to reach the modules on disk.
                 std::path::Path::new(repo_path),
             );
+            crate::phase_timing::mark(crate::phase_timing::Phase::Graph);
 
             // Deterministic protocol scans run BEFORE the graph is projected:
             // the GraphQL consumer file set folds transport data calls out of
@@ -1438,6 +1478,7 @@ async fn analyze_current_repo_incremental(
             let protocol_extractions =
                 scan_protocol_extractions(repo_path, service, &files, &merged_results);
             fold_graphql_transport_calls(&mut mount_graph, &protocol_extractions.graphql);
+            crate::phase_timing::mark(crate::phase_timing::Phase::Protocols);
 
             // Generate function intents (also strips body_source before upload).
             // Run on the same path as the full analysis so incremental scans
@@ -1459,9 +1500,11 @@ async fn analyze_current_repo_incremental(
                 &prev_intents,
             )
             .await;
+            crate::phase_timing::mark(crate::phase_timing::Phase::Intents);
 
             // Compose function signatures, inferring unannotated slots via sidecar.
             populate_function_signatures(sidecar, &mut function_definitions, repo_path);
+            crate::phase_timing::mark(crate::phase_timing::Phase::Signatures);
 
             let elapsed = start.elapsed();
             debug!(
@@ -1483,8 +1526,9 @@ async fn analyze_current_repo_incremental(
                 &protocol_extractions,
                 &merged_results,
             );
-            attach_external_call_candidates(&mut cloud_data, repo_path, &files, config);
+            attach_external_call_candidates(&mut cloud_data, repo_path, &files, config, workspace);
             attach_sdk_surface(&mut cloud_data, repo_path, config);
+            crate::phase_timing::mark(crate::phase_timing::Phase::Surface);
 
             // Populate cache fields. The cache holds the MODEL's answers, not
             // the joined rows: see CACHE_VERSION. Nothing is stripped from them
@@ -1542,6 +1586,8 @@ async fn analyze_current_repo_incremental(
                 file_orchestrator.collect_pubsub_infer_requests(&merged_results, repo_path),
             );
 
+            crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
+
             // Type resolution via sidecar (+ v2 capture stub for this service)
             let stub_dir = resolve_types_if_available(
                 sidecar,
@@ -1555,6 +1601,7 @@ async fn analyze_current_repo_incremental(
                 &protocol_infer,
                 &mut cloud_data,
             );
+            crate::phase_timing::mark(crate::phase_timing::Phase::Types);
 
             if let Some(bundled_types) = cloud_data.bundled_types.take() {
                 let updated =
@@ -1566,6 +1613,7 @@ async fn analyze_current_repo_incremental(
             if let (Some(sidecar), Some(stub_dir)) = (sidecar, stub_dir.as_deref()) {
                 resolve_per_endpoint_definitions(sidecar, &mut cloud_data, stub_dir);
             }
+            crate::phase_timing::mark(crate::phase_timing::Phase::Definitions);
             if let Some(stub_dir) = stub_dir {
                 let _ = std::fs::remove_dir_all(&stub_dir);
             }
@@ -1583,6 +1631,10 @@ async fn analyze_current_repo_incremental(
                 &analysis.stats,
                 repo_path,
             ));
+            // Everything between the marks above: manifest assembly, the
+            // deterministic attachments, relativisation. Named so the printed
+            // phases add up to `analysis` rather than falling short of it.
+            crate::phase_timing::mark(crate::phase_timing::Phase::Other);
 
             return Ok(cloud_data);
         } else {
@@ -1601,8 +1653,15 @@ async fn analyze_current_repo_incremental(
     let prev_intents = previous_data
         .map(|prev| intents_by_hash(&prev.function_definitions))
         .unwrap_or_default();
-    let cloud_data =
-        analyze_current_repo(repo_path, config, packages, sidecar, &prev_intents).await?;
+    let cloud_data = analyze_current_repo(
+        repo_path,
+        config,
+        packages,
+        sidecar,
+        &prev_intents,
+        workspace,
+    )
+    .await?;
 
     let elapsed = start.elapsed();
     debug!("Full analysis complete in {:.1}s", elapsed.as_secs_f64());
@@ -2862,9 +2921,15 @@ fn attach_external_call_candidates(
     repo_path: &str,
     files: &[PathBuf],
     config: &Config,
+    workspace: &mut crate::external_call_candidates::WorkspaceScan,
 ) {
     let repo_root = std::path::Path::new(repo_path);
-    let sdk_rows = crate::external_call_candidates::scan_workspace(files, repo_root);
+    let started = Instant::now();
+    let sdk_rows = workspace.rows_for_service(files, repo_root);
+    debug!(
+        "External call candidates: workspace pass in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
     let normalizer = UrlNormalizer::new(config);
     let http_rows = cloud_data
         .mount_graph
@@ -2901,7 +2966,12 @@ fn attach_external_call_candidates(
 /// channel, and the join says so.
 fn attach_sdk_surface(cloud_data: &mut CloudRepoData, repo_path: &str, config: &Config) {
     let repo_root = std::path::Path::new(repo_path);
+    let started = Instant::now();
     let members = crate::sdk_surface::scan(repo_root, &service_scan_root(repo_path, config));
+    debug!(
+        "SDK surface: entry walk in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
     debug!(
         "SDK surface: {} member(s) for {}",
         members.len(),
@@ -3156,7 +3226,8 @@ fn resolve_types_if_available(
                     // manifest join keys. The #413 borrow-witness demotion and
                     // the inference-resolved array depths are applied exactly
                     // as resolve_all_types does (#306).
-                    run_capture_for_service(
+                    crate::phase_timing::mark(crate::phase_timing::Phase::Types);
+                    let captured = run_capture_for_service(
                         sidecar,
                         file_orchestrator,
                         file_results,
@@ -3167,7 +3238,9 @@ fn resolve_types_if_available(
                         extra_infer,
                         &type_resolution,
                         cloud_data,
-                    )
+                    );
+                    crate::phase_timing::mark(crate::phase_timing::Phase::Capture);
+                    captured
                 }
                 Err(e) => {
                     warn!("Type resolution failed: {}", e);
@@ -4137,6 +4210,7 @@ async fn analyze_current_repo(
     packages: &Packages,
     sidecar: Option<&TypeSidecar>,
     prev_intents_by_hash: &HashMap<String, String>,
+    workspace: &mut crate::external_call_candidates::WorkspaceScan,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     // Canonicalize repo_path for consistent path normalization between runs
     let canonical = std::fs::canonicalize(repo_path)
@@ -4158,6 +4232,7 @@ async fn analyze_current_repo(
         files.len(),
         function_definitions.len()
     );
+    crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
 
     // 3. Create MultiAgentOrchestrator (auth is via GitHub Actions OIDC)
     let orchestrator = MultiAgentOrchestrator::new(cm.clone());
@@ -4195,6 +4270,7 @@ async fn analyze_current_repo(
             sidecar,
         )
         .await?;
+    crate::phase_timing::mark(crate::phase_timing::Phase::Model);
 
     // 4b. Generate function intents using LLM
     let mut function_definitions = function_definitions;
@@ -4211,9 +4287,11 @@ async fn analyze_current_repo(
         )
         .await;
     }
+    crate::phase_timing::mark(crate::phase_timing::Phase::Intents);
 
     // 4c. Compose function signatures, inferring unannotated slots via sidecar.
     populate_function_signatures(sidecar, &mut function_definitions, repo_path);
+    crate::phase_timing::mark(crate::phase_timing::Phase::Signatures);
 
     // 4d. Deterministic protocol scans run BEFORE the graph is projected: the
     // GraphQL consumer file set folds transport data calls out of the mount
@@ -4227,6 +4305,7 @@ async fn analyze_current_repo(
         &protocol_extractions.graphql,
     );
     let analysis_result = analysis_result;
+    crate::phase_timing::mark(crate::phase_timing::Phase::Protocols);
 
     // Cloud-bound paths must be repo-relative. The incremental path gets
     // this from build_cloud_data_from_mount_graph; this full path constructs
@@ -4249,8 +4328,9 @@ async fn analyze_current_repo(
         &protocol_extractions,
         &analysis_result.file_results,
     );
-    attach_external_call_candidates(&mut cloud_data, repo_path, &files, config);
+    attach_external_call_candidates(&mut cloud_data, repo_path, &files, config, workspace);
     attach_sdk_surface(&mut cloud_data, repo_path, config);
+    crate::phase_timing::mark(crate::phase_timing::Phase::Surface);
 
     let mut manifest_entries =
         build_type_manifest_entries(&analysis_result.mount_graph, config, repo_path);
@@ -4310,6 +4390,8 @@ async fn analyze_current_repo(
         file_orchestrator.collect_pubsub_infer_requests(&analysis_result.file_results, repo_path),
     );
 
+    crate::phase_timing::mark(crate::phase_timing::Phase::Manifest);
+
     let stub_dir = resolve_types_if_available(
         sidecar,
         &file_orchestrator,
@@ -4323,6 +4405,8 @@ async fn analyze_current_repo(
         &mut cloud_data,
     );
 
+    crate::phase_timing::mark(crate::phase_timing::Phase::Types);
+
     if let Some(bundled_types) = cloud_data.bundled_types.take() {
         let updated = append_missing_aliases(bundled_types, cloud_data.type_manifest.as_ref());
         cloud_data.bundled_types = Some(updated);
@@ -4335,6 +4419,7 @@ async fn analyze_current_repo(
     if let Some(stub_dir) = &stub_dir {
         let _ = std::fs::remove_dir_all(stub_dir);
     }
+    crate::phase_timing::mark(crate::phase_timing::Phase::Definitions);
 
     // 7. Populate cache fields for future incremental runs. The MODEL's raw
     // answers, verbatim — the same rule the incremental branch caches under
@@ -4367,6 +4452,7 @@ async fn analyze_current_repo(
         &analysis_result.stats,
         repo_path,
     ));
+    crate::phase_timing::mark(crate::phase_timing::Phase::Other);
 
     Ok(cloud_data)
 }
@@ -6254,7 +6340,13 @@ mod tests {
             boundary: None,
         };
 
-        attach_external_call_candidates(&mut data, &fixture_str, &files, &service);
+        attach_external_call_candidates(
+            &mut data,
+            &fixture_str,
+            &files,
+            &service,
+            &mut crate::external_call_candidates::WorkspaceScan::new(),
+        );
 
         let rows = data
             .external_call_candidates
@@ -6360,7 +6452,13 @@ mod tests {
             boundary: None,
         };
 
-        attach_external_call_candidates(&mut data, &fixture_str, &files, &service);
+        attach_external_call_candidates(
+            &mut data,
+            &fixture_str,
+            &files,
+            &service,
+            &mut crate::external_call_candidates::WorkspaceScan::new(),
+        );
 
         let rows = data.external_call_candidates.expect("rows");
         assert!(

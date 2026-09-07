@@ -1,10 +1,10 @@
 use crate::oidc::OidcProvider;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, warn};
@@ -38,6 +38,57 @@ pub fn rate_limit_tripped() -> bool {
 /// Trip the quota circuit breaker. Idempotent.
 fn trip_rate_limit() {
     RATE_LIMITED.store(true, Ordering::Relaxed);
+}
+
+/// How many requests this scan has issued to each cloud route.
+///
+/// Process-global for the same reason the breaker above is: a scan builds
+/// several `AgentService` instances and the count that matters is the one the
+/// whole run issued. Counted at the entry point, BEFORE the mock short-circuit,
+/// so an offline run reports what a real scan would send rather than what it
+/// actually sent — which is the only way to state request volume without
+/// paying for it (carrick#767).
+///
+/// A cached answer replayed by the scanner never reaches here, so a route
+/// counted here is a round trip the run really made: the number is the answer
+/// to "the boundary says nothing was sent, so where did those invocations come
+/// from". One per CALL, not per HTTP attempt — a call the retry loop repeats
+/// is one row here and more than one invocation in the cloud.
+static REQUEST_COUNTS: OnceLock<Mutex<BTreeMap<String, usize>>> = OnceLock::new();
+
+fn request_counts_map() -> &'static Mutex<BTreeMap<String, usize>> {
+    REQUEST_COUNTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn record_request(path: &str) {
+    let mut counts = request_counts_map().lock().unwrap();
+    *counts.entry(path.to_string()).or_insert(0) += 1;
+}
+
+/// Requests issued per route so far this scan.
+pub fn request_counts() -> BTreeMap<String, usize> {
+    request_counts_map().lock().unwrap().clone()
+}
+
+/// The requests issued between two snapshots, as the per-service line prints
+/// them. Routes with no request in the window are omitted; a window with none
+/// at all reads `none`, which is a statement and not an empty string.
+pub fn requests_between(
+    before: &BTreeMap<String, usize>,
+    after: &BTreeMap<String, usize>,
+) -> String {
+    let parts: Vec<String> = after
+        .iter()
+        .filter_map(|(route, count)| {
+            let delta = count - before.get(route).copied().unwrap_or(0);
+            (delta > 0).then(|| format!("{} {}", route.trim_start_matches('/'), delta))
+        })
+        .collect();
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(", ")
+    }
 }
 
 /// Whether a cloud error envelope signals backend quota / rate-limit
@@ -271,6 +322,10 @@ impl AgentService {
                 format!("Failed to acquire semaphore permit: {}", e),
             )
         })?;
+
+        // Counted here, before the mock short-circuit and after the semaphore:
+        // this is every request the scan would put on the wire.
+        record_request(task_path);
 
         if env::var("CARRICK_MOCK_ALL").is_ok() {
             return Ok(generate_mock_for_task(task_path, body, mock_seed));

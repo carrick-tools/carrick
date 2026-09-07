@@ -6491,9 +6491,17 @@ impl FileOrchestrator {
             extra_infer.len()
         );
 
+        // Timed on its own for the same reason the signature pass is: the
+        // phase line's `types` covers this round trip plus the scanner-side
+        // request collection (carrick#767).
+        let round_trip = std::time::Instant::now();
         let result = sidecar
             .resolve_all_types(&explicit, &infer, extraction_config)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+        debug!(
+            "[FileOrchestrator] Sidecar type resolution round trip: {:.1}s",
+            round_trip.elapsed().as_secs_f64()
+        );
 
         let result = self.append_inline_aliases(result, inline_aliases);
 
