@@ -270,6 +270,7 @@ pub fn finish_spinner_warn(pb: &ProgressBar, msg: &str) {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::Path;
 
     /// The retention cap must not change the file name.
     ///
@@ -296,11 +297,58 @@ mod tests {
             expected.is_file(),
             "expected {}, found {:?}",
             expected.display(),
-            std::fs::read_dir(dir.path())
-                .expect("read dir")
-                .filter_map(Result::ok)
-                .map(|e| e.file_name())
-                .collect::<Vec<_>>()
+            log_files(dir.path())
         );
+    }
+
+    /// The cap must delete, and it must do so on an ordinary run.
+    ///
+    /// If it only pruned when the clock crossed midnight, a machine already
+    /// holding six days of logs would keep holding them however many scans it
+    /// ran, which is the case carrick#741 was reported from.
+    #[test]
+    fn the_cap_deletes_the_days_it_is_past_on_the_first_write() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for day in ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04"] {
+            std::fs::write(dir.path().join(format!("carrick.log.{day}")), "old\n")
+                .expect("seed old log");
+        }
+
+        let mut appender = rolling::Builder::new()
+            .rotation(rolling::Rotation::DAILY)
+            .filename_prefix("carrick.log")
+            .max_log_files(RETAINED_LOG_DAYS)
+            .build(dir.path())
+            .expect("build appender");
+        writeln!(appender, "a line").expect("write");
+        appender.flush().expect("flush");
+
+        let kept = log_files(dir.path());
+        assert!(
+            kept.len() <= RETAINED_LOG_DAYS,
+            "kept {} files, cap is {}: {:?}",
+            kept.len(),
+            RETAINED_LOG_DAYS,
+            kept
+        );
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert!(
+            kept.contains(&format!("carrick.log.{}", today)),
+            "today's file was pruned: {kept:?}"
+        );
+        assert!(
+            !kept.contains(&"carrick.log.2026-09-01".to_string()),
+            "the oldest file survived: {kept:?}"
+        );
+    }
+
+    fn log_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 }
