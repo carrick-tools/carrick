@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.45](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.44...carrick-v0.3.45) (2026-09-07)
+
+
+### Bug Fixes
+
+* **call-graph:** resolve receivers a file declares, and imports from sibling workspace packages ([#783](https://github.com/carrick-tools/carrick/issues/783)) ([065c005](https://github.com/carrick-tools/carrick/commit/065c0050c034f3f95baf20af1f591ab3bb9f8088))
+* **sidecar:** a line-only anchor that resolves nothing abstains ([#779](https://github.com/carrick-tools/carrick/issues/779)) ([24690aa](https://github.com/carrick-tools/carrick/commit/24690aa887c1e9d0b95e2f95c077558c6e20efb6))
+* **sidecar:** a union that read only some branches answers unknown ([#773](https://github.com/carrick-tools/carrick/issues/773)) ([91c2e62](https://github.com/carrick-tools/carrick/commit/91c2e62deb164fd38e9c519164b556aff59d0340))
+* **sidecar:** canonical union order at the expansion depth backstop ([#778](https://github.com/carrick-tools/carrick/issues/778)) ([075d282](https://github.com/carrick-tools/carrick/commit/075d282eafc66dfcfa9da692e2322d4d83f5988e))
+
+
+### Performance
+
+* **engine:** build the workspace call-candidate pass once per scan ([#787](https://github.com/carrick-tools/carrick/issues/787)) ([f5aa6c1](https://github.com/carrick-tools/carrick/commit/f5aa6c17ae161e5d94e6c2ecbf02ad7f90186149)), closes [#767](https://github.com/carrick-tools/carrick/issues/767)
+
 ## [0.3.44](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.43...carrick-v0.3.44) (2026-09-07)
 
 
