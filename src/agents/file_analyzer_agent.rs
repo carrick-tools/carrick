@@ -140,6 +140,9 @@ pub enum ResolutionSource {
     /// A binding holding the WHOLE request URL, read from an environment
     /// variable (carrick#572/#632).
     WholeUrlEnv,
+    /// A request whose target is an env-backed base binding followed by a
+    /// literal path (carrick#733): `` axios.get(`${API_URL}/api/users/${id}`) ``.
+    EnvBasePath,
     /// The path a `new URL(path, base)` states for the call's target
     /// (carrick#610).
     NewUrl,
@@ -149,6 +152,9 @@ pub enum ResolutionSource {
     DescriptorRoute,
     /// A route table binding a literal path to an imported controller (#580).
     ClassController,
+    /// A route a class declares with decorators: a prefix on the class, a verb
+    /// and a path on the method (carrick#732).
+    DecoratorRoute,
     /// The compiler's answer for what the RECEIVER of a bare
     /// `x.verb("/lit", arg)` site IS (carrick#695): an instance of a detected
     /// server framework registers a route, an instance of a detected data

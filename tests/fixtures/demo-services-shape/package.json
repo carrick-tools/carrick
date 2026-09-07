@@ -1,0 +1,7 @@
+{
+  "name": "demo-services-shape",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fixture: a decorator-routed producer and an env-base-plus-path consumer (carrick#732, carrick#733)",
+  "main": "src/orders.ts"
+}

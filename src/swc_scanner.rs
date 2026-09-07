@@ -103,6 +103,13 @@ pub struct CandidateTarget {
     /// join (carrick#666).
     #[serde(skip)]
     pub receiver_ident: Option<String>,
+    /// The base binding and literal path this call's target states, when it is
+    /// written as a template literal or a concatenation (carrick#733). Read
+    /// off the AST because the raw first-argument snippet is one truncated
+    /// line of source; not serialized, for the same reason as `request_spec` —
+    /// the JSON candidate context the prompt receives is unchanged.
+    #[serde(skip)]
+    pub base_path_target: Option<BasePathTarget>,
 }
 
 /// The HTTP method and URL a call declares as data on one object-literal
@@ -318,6 +325,62 @@ pub struct RouteDescriptorEndpoint {
     /// Start byte offset of the descriptor object literal.
     pub span_start: u32,
     /// End byte offset of the descriptor object literal.
+    pub span_end: u32,
+}
+
+/// A request target written as a base binding followed by a literal path
+/// (carrick#733): `` `${API_URL}/api/users/${id}` ``, or the same statement
+/// written as a concatenation.
+///
+/// Structural only. Whether the base is backed by the ENVIRONMENT is a
+/// property of the file's bindings, not of this expression, so it is settled
+/// by the caller against the env-alias map — see
+/// [`SwcScanner::base_path_target`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BasePathTarget {
+    /// The base slot as the source spells it: a binding name (`API_URL`), or
+    /// the environment read itself (`process.env.API_URL`).
+    pub base: String,
+    /// True when `base` IS the environment read, so no binding has to be
+    /// resolved to know where the origin comes from.
+    pub base_reads_env: bool,
+    /// Everything after the base, opening with `/`, with interpolations left
+    /// in the source's own spelling (`/api/users/${id}`). The URL normalizer
+    /// is the one place that turns those into path parameters.
+    pub path: String,
+}
+
+impl BasePathTarget {
+    /// The target this states, in the spelling a row persists.
+    pub fn target(&self) -> String {
+        format!("${{{}}}{}", self.base, self.path)
+    }
+}
+
+/// A route a class declares with decorators (carrick#732): the prefix on the
+/// class, the verb and the path on the method.
+///
+/// Read from the shape and never from a package name: see
+/// [`SwcScanner::decorator_routes`] for the rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecoratorRoute {
+    /// The HTTP method the verb-named method decorator states, uppercased.
+    pub method: String,
+    /// The full route: the class decorator's prefix joined to the method
+    /// decorator's path, in the router's canonical spelling.
+    pub path: String,
+    /// The declaring class — the route's owner. A class name matches no mount,
+    /// so the path above stands as written.
+    pub class_name: String,
+    /// The method's own name: the route's handler.
+    pub handler: String,
+    /// 1-based line number of the method's NAME. The method's span opens at
+    /// its first decorator, which would report the route a line or two above
+    /// the handler a reader is being sent to.
+    pub line_number: usize,
+    /// Start byte offset of the method.
+    pub span_start: u32,
+    /// End byte offset of the method.
     pub span_end: u32,
 }
 
@@ -827,6 +890,51 @@ impl SwcScanner {
         };
         module.visit_with(&mut visitor);
         visitor.endpoints
+    }
+
+    /// The routes the classes in `content` declare with decorators
+    /// (carrick#732).
+    ///
+    /// A class that carries a decorator with a path argument, and whose
+    /// methods carry decorators named after HTTP verbs, states its whole route
+    /// set in one file: the prefix, the verb and the method path are literals
+    /// beside the handler. Nothing here names a package or a framework — the
+    /// shape is the signal:
+    ///
+    /// * the METHOD decorator's callee name is one of the seven verbs
+    ///   [`VERB_NAMED_METHODS`] holds (case-insensitive), and it takes zero
+    ///   arguments or one string literal. Zero is the prefix's own route
+    ///   (`@Get()` under `@Controller("api/users")` serves `/api/users`); one
+    ///   is the path below the prefix. Reading the NAME is what a verb
+    ///   decorator states and a content-type or role decorator does not.
+    /// * the CLASS decorator is a call with exactly one string-literal
+    ///   argument, and it comes from the same place as the verbs — the module
+    ///   they were all imported from, or this module when they are declared
+    ///   here. That is what tells the routing decorator from a documentation
+    ///   tag that also takes one string, with no name appearing here. Two
+    ///   candidates from the verbs' own module state two prefixes and the
+    ///   class states nothing: the same "two statements disagree, so drop"
+    ///   rule the rest of the scanner applies.
+    ///
+    /// A class with no verb-decorated method contributes nothing, and neither
+    /// does one whose decorator carries no string argument: `@Controller()`
+    /// with the prefix left implicit is a real shape, but reading it would
+    /// mean treating every no-argument class decorator as a routing claim.
+    pub fn decorator_routes(&self, file_path: &Path, content: &str) -> Vec<DecoratorRoute> {
+        if !may_declare_decorators(content) {
+            return Vec::new();
+        }
+        let Some((sm, module)) = parse_standalone_module(file_path, content) else {
+            return Vec::new();
+        };
+
+        let mut visitor = DecoratorRouteVisitor {
+            source_map: sm,
+            imports: collect_import_locals(&module),
+            routes: Vec::new(),
+        };
+        module.visit_with(&mut visitor);
+        visitor.routes
     }
 
     /// Collect every `router('/path', …, controller)` binding in `content`
@@ -1498,6 +1606,255 @@ fn declared_http_method(decorators: &[Decorator]) -> Option<String> {
 /// more likely to have a `connect` or `trace` helper than to serve one.
 const VERB_NAMED_METHODS: &[&str] = &["get", "post", "put", "patch", "delete", "head", "options"];
 
+/// The origin a decorator declared in the scanned module itself carries, so a
+/// class decorator and a verb decorator that are both local compare equal.
+/// A module specifier can never be this: it is not a path.
+const LOCAL_DECORATOR_ORIGIN: &str = "<declared in this module>";
+
+/// The cooked text of one template-literal chunk, falling back to its raw
+/// text when the chunk carries an escape the parser did not cook.
+fn quasi_text(quasi: &TplElement) -> String {
+    quasi
+        .cooked
+        .as_ref()
+        .map(|cooked| cooked.to_string())
+        .unwrap_or_else(|| quasi.raw.to_string())
+}
+
+/// Flatten a left-associated `a + b + c` into its parts, in source order.
+/// Anything that is not an addition is one part.
+fn flatten_add_parts<'a>(expr: &'a Expr, parts: &mut Vec<&'a Expr>) {
+    match unwrap_expr(expr) {
+        Expr::Bin(bin) if bin.op == BinaryOp::Add => {
+            flatten_add_parts(&bin.left, parts);
+            flatten_add_parts(&bin.right, parts);
+        }
+        other => parts.push(other),
+    }
+}
+
+/// Whether `content` could carry a decorator at all, without parsing it.
+///
+/// A decorator's `@` opens a line or follows whitespace and is followed by an
+/// identifier. An import specifier's `@scope/pkg` follows a quote, and an
+/// address in a string follows the local part, so both fall out. A necessary
+/// condition only: the parse decides.
+fn may_declare_decorators(content: &str) -> bool {
+    let bytes = content.as_bytes();
+    bytes.iter().enumerate().any(|(index, byte)| {
+        *byte == b'@'
+            && bytes
+                .get(index + 1)
+                .is_some_and(|next| next.is_ascii_alphabetic() || *next == b'_')
+            && match index.checked_sub(1) {
+                None => true,
+                Some(previous) => bytes[previous].is_ascii_whitespace(),
+            }
+    })
+}
+
+/// A decorator's callee name and its arguments, for the `@Name(args)` form.
+/// A decorator that is a bare identifier (`@Injectable`) or a member
+/// expression states nothing this reads.
+fn decorator_call(decorator: &Decorator) -> Option<(String, &[ExprOrSpread])> {
+    let Expr::Call(call) = &*decorator.expr else {
+        return None;
+    };
+    let Callee::Expr(callee) = &call.callee else {
+        return None;
+    };
+    let Expr::Ident(ident) = unwrap_expr(callee) else {
+        return None;
+    };
+    Some((ident.sym.to_string(), call.args.as_slice()))
+}
+
+/// The single string-literal argument a decorator carries, `Some("")` for a
+/// decorator called with no arguments at all, and `None` for anything else.
+fn decorator_string_argument(args: &[ExprOrSpread]) -> Option<String> {
+    match args {
+        [] => Some(String::new()),
+        [arg] if arg.spread.is_none() => match &*arg.expr {
+            Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Join a class decorator's prefix to a method decorator's path, in the
+/// router's canonical spelling. Either half may be empty; the result always
+/// opens with a slash.
+fn join_decorator_path(prefix: &str, path: &str) -> String {
+    let prefix = prefix.trim().trim_matches('/');
+    let path = path.trim().trim_matches('/');
+    match (prefix.is_empty(), path.is_empty()) {
+        (true, true) => "/".to_string(),
+        (true, false) => format!("/{path}"),
+        (false, true) => format!("/{prefix}"),
+        (false, false) => format!("/{prefix}/{path}"),
+    }
+}
+
+/// Collects the routes a decorated class declares. See
+/// [`SwcScanner::decorator_routes`] for the rule and why it names no
+/// framework.
+struct DecoratorRouteVisitor {
+    source_map: Lrc<SourceMap>,
+    /// Local binding name -> module specifier, for this file's value imports.
+    /// Read to tell whether a class decorator and the verbs on its methods
+    /// come from the same place.
+    imports: HashMap<String, String>,
+    routes: Vec<DecoratorRoute>,
+}
+
+/// One verb-decorated method of a class: what its decorator states, and where
+/// the method itself is.
+struct VerbDecoratedMethod {
+    http_method: String,
+    path: String,
+    /// Where the verb decorator came from: the module it was imported from,
+    /// or this module when it is declared here.
+    decorator_origin: String,
+    name: String,
+    line_number: usize,
+    span_start: u32,
+    span_end: u32,
+}
+
+impl DecoratorRouteVisitor {
+    /// Every route a decorated method of `class` states, before the prefix is
+    /// known. A method carrying two verb decorators serves two routes and is
+    /// reported twice.
+    fn verb_decorated_methods(&self, class: &Class) -> Vec<VerbDecoratedMethod> {
+        let mut methods = Vec::new();
+        for member in &class.body {
+            let ClassMember::Method(method) = member else {
+                continue;
+            };
+            // Constructors, getters and setters are not request handlers.
+            if method.kind != MethodKind::Method {
+                continue;
+            }
+            let name = match &method.key {
+                PropName::Ident(id) => id.sym.to_string(),
+                PropName::Str(s) => s.value.to_string(),
+                _ => continue,
+            };
+            for decorator in &method.function.decorators {
+                let Some((decorator_name, args)) = decorator_call(decorator) else {
+                    continue;
+                };
+                // The seven verbs, not every method [`is_http_method`]
+                // accepts: `@Trace()` and `@Connect()` are far likelier to be
+                // observability or lifecycle than a route, which is the same
+                // call `VERB_NAMED_METHODS` already makes for method NAMES.
+                if !VERB_NAMED_METHODS.contains(&decorator_name.to_lowercase().as_str()) {
+                    continue;
+                }
+                let Some(path) = decorator_string_argument(args) else {
+                    continue;
+                };
+                methods.push(VerbDecoratedMethod {
+                    http_method: decorator_name.trim().to_uppercase(),
+                    path,
+                    decorator_origin: self.origin(&decorator_name),
+                    name: name.clone(),
+                    // The method's NAME, not its span: the span opens at the
+                    // first decorator, which would report the route a line or
+                    // two above the handler a reader is being sent to.
+                    line_number: self.source_map.lookup_char_pos(method.key.span().lo).line,
+                    span_start: method.span.lo.0,
+                    span_end: method.span.hi.0,
+                });
+            }
+        }
+        methods
+    }
+
+    /// Where a decorator's name comes from: the module it was imported from,
+    /// or this module when nothing imports it.
+    fn origin(&self, name: &str) -> String {
+        self.imports
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| LOCAL_DECORATOR_ORIGIN.to_string())
+    }
+
+    /// The prefix the class decorator states, or `None` when the class states
+    /// no single one.
+    ///
+    /// The routing decorator is the one that comes from the same place as the
+    /// verbs on the methods. That is what tells `@Controller("api/users")`
+    /// from the `@ApiTags("people")` beside it, without either name appearing
+    /// here — and it is checked even when only one class decorator carries a
+    /// string, because a class whose prefix decorator takes NO argument
+    /// (`@Controller()`) would otherwise hand its routes a documentation
+    /// tag's string as a prefix.
+    ///
+    /// Two candidates from a verb's own module state two prefixes, and the
+    /// class states nothing: the same "two statements disagree, so drop" rule
+    /// the rest of the scanner applies.
+    fn class_prefix(&self, class: &Class, methods: &[VerbDecoratedMethod]) -> Option<String> {
+        let verb_origins: HashSet<&str> = methods
+            .iter()
+            .map(|method| method.decorator_origin.as_str())
+            .collect();
+        let mut candidates = class.decorators.iter().filter_map(|decorator| {
+            let (name, args) = decorator_call(decorator)?;
+            let [arg] = args else {
+                return None;
+            };
+            if arg.spread.is_some() {
+                return None;
+            }
+            let Expr::Lit(Lit::Str(literal)) = &*arg.expr else {
+                return None;
+            };
+            verb_origins
+                .contains(self.origin(&name).as_str())
+                .then(|| literal.value.to_string())
+        });
+        match (candidates.next(), candidates.next()) {
+            (Some(prefix), None) => Some(prefix),
+            (Some(_), Some(_)) => {
+                tracing::debug!(
+                    "A class carries two decorators from the verbs' own module that each \
+                     state a string: no decorator route emitted"
+                );
+                None
+            }
+            (None, _) => None,
+        }
+    }
+}
+
+impl Visit for DecoratorRouteVisitor {
+    fn visit_class_decl(&mut self, node: &ClassDecl) {
+        node.visit_children_with(self);
+
+        let methods = self.verb_decorated_methods(&node.class);
+        if methods.is_empty() {
+            return;
+        }
+        let Some(prefix) = self.class_prefix(&node.class, &methods) else {
+            return;
+        };
+        let class_name = node.ident.sym.to_string();
+        for method in methods {
+            self.routes.push(DecoratorRoute {
+                path: join_decorator_path(&prefix, &method.path),
+                method: method.http_method,
+                class_name: class_name.clone(),
+                handler: method.name,
+                line_number: method.line_number,
+                span_start: method.span_start,
+                span_end: method.span_end,
+            });
+        }
+    }
+}
+
 /// Collects `router('/path', …, controller)` bindings. See
 /// [`SwcScanner::controller_route_bindings`] for the shape and why it is gated
 /// on imports rather than on any framework name.
@@ -2075,6 +2432,88 @@ impl CandidateVisitor {
         }
     }
 
+    /// The base-plus-path target this call's first argument states
+    /// (carrick#733), or `None` for any other shape.
+    ///
+    /// Two spellings of one statement are read: a template literal that OPENS
+    /// with an interpolation, and a `+` concatenation that opens with the same
+    /// expression. The base slot must be a bare binding name or a
+    /// `process.env` read; everything after it must be path text opening with
+    /// `/`, so a target that states no path of its own (the whole-URL binding
+    /// shape, carrick#572) is left to the rule that owns it, and a target
+    /// whose very next part is another expression states no literal path at
+    /// all.
+    ///
+    /// Interpolations inside the path are kept verbatim, in the source's own
+    /// spelling: they are path parameters, and the URL normalizer is the one
+    /// place that turns them into `:param`.
+    fn base_path_target(&self, call: &CallExpr) -> Option<BasePathTarget> {
+        let arg = call.args.first()?;
+        if arg.spread.is_some() {
+            return None;
+        }
+        let (base_expr, path) = match unwrap_expr(&arg.expr) {
+            Expr::Tpl(tpl) => {
+                // The template opens with its first interpolation: anything
+                // before it is text the base does not begin.
+                if !quasi_text(tpl.quasis.first()?).is_empty() {
+                    return None;
+                }
+                let base: &Expr = tpl.exprs.first()?;
+                let mut path = String::new();
+                for index in 1..tpl.quasis.len() {
+                    path.push_str(&quasi_text(&tpl.quasis[index]));
+                    if let Some(expr) = tpl.exprs.get(index) {
+                        path.push_str(&self.interpolation_text(expr)?);
+                    }
+                }
+                (base, path)
+            }
+            expr @ Expr::Bin(bin) if bin.op == BinaryOp::Add => {
+                let mut parts = Vec::new();
+                flatten_add_parts(expr, &mut parts);
+                let (base, rest) = parts.split_first()?;
+                let mut path = String::new();
+                for part in rest {
+                    match unwrap_expr(part) {
+                        Expr::Lit(Lit::Str(literal)) => path.push_str(&literal.value),
+                        other => path.push_str(&self.interpolation_text(other)?),
+                    }
+                }
+                (*base, path)
+            }
+            _ => return None,
+        };
+
+        if !path.starts_with('/') {
+            return None;
+        }
+        let (base, base_reads_env) = match unwrap_expr(base_expr) {
+            Expr::Ident(ident) => (ident.sym.to_string(), false),
+            other => (
+                format!("process.env.{}", crate::env_alias::process_env_name(other)?),
+                true,
+            ),
+        };
+        Some(BasePathTarget {
+            base,
+            base_reads_env,
+            path,
+        })
+    }
+
+    /// One interpolation of a base-plus-path target, in the source's own
+    /// spelling. `None` when the expression's own text cannot stand inside a
+    /// target: it spans lines, or it carries the delimiters a target uses.
+    fn interpolation_text(&self, expr: &Expr) -> Option<String> {
+        let snippet = self.source_map.span_to_snippet(expr.span()).ok()?;
+        let snippet = snippet.trim();
+        if snippet.is_empty() || snippet.contains(['\n', '`', '{', '}']) {
+            return None;
+        }
+        Some(format!("${{{snippet}}}"))
+    }
+
     /// Emit a candidate for `call`, deduplicating by span so the multiple
     /// broadened signals never double-count one call site.
     fn push_candidate(
@@ -2110,6 +2549,10 @@ impl CandidateVisitor {
         // (carrick-cloud#386).
         let request_shape = call_request_shape(call, callee_property.as_deref());
         let receiver_ident = Self::receiver_ident(&call.callee);
+        // A target written as a base binding plus a literal path
+        // (carrick#733). Structural, and read here rather than from the
+        // snippet above: the snippet is one truncated line.
+        let base_path_target = self.base_path_target(call);
 
         self.candidates.push(CandidateTarget {
             protocol: Protocol::Http,
@@ -2126,6 +2569,7 @@ impl CandidateVisitor {
             new_url_path,
             request_shape,
             receiver_ident,
+            base_path_target,
         });
     }
 
@@ -2164,6 +2608,7 @@ impl CandidateVisitor {
             new_url_path: None,
             request_shape: RequestShapeSignal::NotARequest,
             receiver_ident: None,
+            base_path_target: None,
         });
     }
 
@@ -4758,6 +5203,7 @@ async function fetchUser(id: string) {
             new_url_path: None,
             request_shape: RequestShapeSignal::NotARequest,
             receiver_ident: Some("app".to_string()),
+            base_path_target: None,
         };
 
         let hint = candidate.format_hint();
@@ -4909,6 +5355,201 @@ createRouter()
             span_b.1,
             file_b_content.len()
         );
+    }
+
+    fn decorator_routes(content: &str) -> Vec<(String, String, String, usize)> {
+        let scanner = SwcScanner::new();
+        let mut routes: Vec<(String, String, String, usize)> = scanner
+            .decorator_routes(&PathBuf::from("controller.ts"), content)
+            .into_iter()
+            .map(|route| (route.method, route.path, route.handler, route.line_number))
+            .collect();
+        routes.sort();
+        routes
+    }
+
+    fn base_path_targets(content: &str) -> Vec<(String, bool, String)> {
+        scan_test_content(content)
+            .candidates
+            .into_iter()
+            .filter_map(|candidate| candidate.base_path_target)
+            .map(|target| (target.base, target.base_reads_env, target.path))
+            .collect()
+    }
+
+    /// carrick#732: the prefix on the class, the verb and the path on each
+    /// method, and the line of the method's own name.
+    #[test]
+    fn a_decorated_class_declares_the_routes_its_decorators_state() {
+        let content = r#"
+import { Controller, Get, Post } from './framework';
+
+@Controller('api/users')
+export class UsersController {
+  @Get()
+  list() { return []; }
+
+  @Get(':id')
+  find() { return null; }
+
+  @Post(':id/rename')
+  rename() { return null; }
+
+  helper() { return 1; }
+}
+"#;
+        assert_eq!(
+            decorator_routes(content),
+            vec![
+                (
+                    "GET".to_string(),
+                    "/api/users".to_string(),
+                    "list".to_string(),
+                    7
+                ),
+                (
+                    "GET".to_string(),
+                    "/api/users/:id".to_string(),
+                    "find".to_string(),
+                    10
+                ),
+                (
+                    "POST".to_string(),
+                    "/api/users/:id/rename".to_string(),
+                    "rename".to_string(),
+                    13
+                ),
+            ]
+        );
+    }
+
+    /// A decorator that is not named after an HTTP method states no route, and
+    /// neither does a class whose declaration carries no string argument.
+    #[test]
+    fn only_a_verb_named_decorator_under_a_stated_prefix_is_a_route() {
+        // `@All()` is a real routing decorator and deliberately falls out: it
+        // names no HTTP method, so there is no verb to index the route under.
+        let content = r#"
+import { Controller, All, Accept } from './framework';
+
+@Controller('api/things')
+export class ThingsController {
+  @All()
+  any() { return null; }
+
+  @Accept('text/csv')
+  csv() { return null; }
+}
+"#;
+        assert!(decorator_routes(content).is_empty());
+
+        let unprefixed = r#"
+import { Injectable, Get } from './framework';
+
+@Injectable()
+export class ThingsController {
+  @Get('thing')
+  thing() { return null; }
+}
+"#;
+        assert!(decorator_routes(unprefixed).is_empty());
+    }
+
+    /// Two class decorators that both state a string: the routing one is the
+    /// one imported from the same module as the verbs.
+    #[test]
+    fn a_second_class_decorator_is_broken_by_the_verb_decorators_module() {
+        let content = r#"
+import { Controller, Get } from './framework';
+import { ApiTags } from './docs';
+
+@ApiTags('people')
+@Controller('api/users')
+export class UsersController {
+  @Get(':id')
+  find() { return null; }
+}
+"#;
+        assert_eq!(
+            decorator_routes(content),
+            vec![(
+                "GET".to_string(),
+                "/api/users/:id".to_string(),
+                "find".to_string(),
+                9
+            )]
+        );
+
+        // Both from the same module: nothing singles one out, so the class
+        // states two prefixes and no route is reported.
+        let ambiguous = content.replace("from './docs'", "from './framework'");
+        assert!(decorator_routes(&ambiguous).is_empty());
+
+        // The trap the same-module rule exists for: the routing decorator
+        // takes no argument, so the only string on the class is the
+        // documentation tag's. Reading it would serve `/people/:id`, which
+        // nothing registers.
+        let implicit_prefix = content.replace("@Controller('api/users')", "@Controller()");
+        assert!(decorator_routes(&implicit_prefix).is_empty());
+    }
+
+    /// carrick#733: a target written as an env-backed base plus a literal
+    /// path, in either spelling.
+    #[test]
+    fn a_base_plus_path_target_is_read_off_the_call() {
+        let template = r#"
+const API_URL = process.env.API_URL || 'http://localhost:3001';
+async function find(id: string) {
+  return axios.get(`${API_URL}/api/users/${id}`);
+}
+"#;
+        assert_eq!(
+            base_path_targets(template),
+            vec![("API_URL".to_string(), false, "/api/users/${id}".to_string())]
+        );
+
+        let concatenated = r#"
+async function list() {
+  return axios.get(API_URL + '/api/users');
+}
+"#;
+        assert_eq!(
+            base_path_targets(concatenated),
+            vec![("API_URL".to_string(), false, "/api/users".to_string())]
+        );
+
+        let at_the_site = r#"
+async function health() {
+  return fetch(`${process.env.API_URL}/api/health`, { method: 'GET' });
+}
+"#;
+        assert_eq!(
+            base_path_targets(at_the_site),
+            vec![(
+                "process.env.API_URL".to_string(),
+                true,
+                "/api/health".to_string()
+            )]
+        );
+    }
+
+    /// The shapes that state no base-plus-path: a bare literal, a target that
+    /// states no path of its own (the whole-URL binding), and one whose text
+    /// does not open with the base.
+    #[test]
+    fn a_target_that_is_not_a_base_plus_a_path_states_none() {
+        for content in [
+            "async function bare() { return axios.get('/api/users/1'); }",
+            "async function whole() { return axios.get(`${url}`); }",
+            "async function binding() { return axios.get(url); }",
+            "async function origin() { return axios.get(`https://${host}/api/x`); }",
+            "async function query() { return axios.get(`${API_URL}?q=1`); }",
+        ] {
+            assert!(
+                base_path_targets(content).is_empty(),
+                "expected no base-plus-path target in {content}"
+            );
+        }
     }
 
     #[test]

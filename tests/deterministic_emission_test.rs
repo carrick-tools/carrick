@@ -12,10 +12,14 @@
 //! those rows are the model's own reading and no deterministic source states
 //! them:
 //!
-//! - `env-var-whole-url`: `helpdesk.ts:20` (a base-plus-path target — the
-//!   whole-URL rule fires only where the call states no path of its own), and
-//!   every `ledger.ts` row except line 31 (an injected base, a bare relative
-//!   path, a schema-declared variable with no `??` path).
+//! - `env-var-whole-url`: every `ledger.ts` row except line 31 (an injected
+//!   base, a bare relative path, a schema-declared variable with no `??`
+//!   path). `helpdesk.ts:20` used to be listed here too; carrick#733 made a
+//!   base-plus-path target a row of its own, so it is now asserted present.
+//! - `demo-services-shape`: every row in `decoys.ts` — a bare path literal
+//!   with no base (which no structural rule may claim), a base declared as a
+//!   string literal, a base injected as an option, and a class whose methods
+//!   carry verb decorators but whose declaration states no prefix.
 //! - `new-url-target`: `catalogue.ts:13`, the inline decoy, which states its
 //!   own target and reaches no URL constructor.
 //! - `imported-request-member`: `legacy.ts`'s local call, which resolves
@@ -34,7 +38,7 @@
 //! - `e2e-scaffolding`: every row. Its one endpoint comes from the generated
 //!   mock reading the prompt, not from a deterministic source.
 //!
-//! The contradicting cassette is exercised on the three fixtures whose
+//! The contradicting cassette is exercised on the fixtures whose
 //! deterministic rows sit at a candidate span the model can answer at. It is
 //! inert for `class-controller-api`, `flat-routes-method-guard` and
 //! `e2e-scaffolding` (their rows have no call-site candidate to answer at) and
@@ -230,8 +234,17 @@ fn a_silent_model_keeps_every_whole_url_env_call() {
     assert_eq!(quote["method"], "POST");
     assert_eq!(quote["target_url"], "${process.env.GATEWAY_URL}/v1/quote");
 
+    // carrick#733: the base-plus-path call in the same file is now stated by
+    // the env-backed base and the literal beside it, not by the model.
+    let items = row_at(&calls, "src/helpdesk.ts", 20);
+    assert_eq!(items["method"], "GET");
+    assert_eq!(
+        items["target_url"],
+        "${process.env.CATALOG_URL}/api/v1/items"
+    );
+    assert_eq!(items["resolution_source"], "env_base_path");
+
     // The model's own readings, absent as documented at the top of the file.
-    assert_none_at(&calls, "src/helpdesk.ts", 20);
     assert_none_at(&calls, "src/ledger.ts", 12);
     assert_none_at(&calls, "src/ledger.ts", 22);
 }
@@ -315,6 +328,74 @@ fn a_silent_model_keeps_every_class_controller_route() {
     assert_eq!(endpoints.len(), 13, "no other route: {endpoints:#?}");
 }
 
+/// carrick#732: a class that states its prefix on the declaration and its verb
+/// and path on each method declares its whole route set in one file, so the
+/// routes survive the model saying nothing about it.
+#[test]
+fn a_silent_model_keeps_every_decorator_route() {
+    let endpoints = rows(&empty_scan("demo-services-shape"), "endpoints");
+
+    for (line, method, path, handler) in [
+        (20, "GET", "/api/users", "list"),
+        (25, "GET", "/api/users/:id", "find"),
+        (30, "POST", "/api/users/:id/rename", "rename"),
+    ] {
+        let row = row_at(&endpoints, "src/users.controller.ts", line);
+        assert_eq!(row["method"], method, "method at line {line}");
+        assert_eq!(row["path"], path, "path at line {line}");
+        assert_eq!(row["handler"], handler, "handler at line {line}");
+        assert_eq!(
+            row["resolution_source"], "decorator_route",
+            "source at line {line}"
+        );
+    }
+    assert_eq!(
+        endpoints.len(),
+        3,
+        "neither decoy class states a prefix the verbs' own module supplies, and a \
+         `@Trace()` method is not a route: {endpoints:#?}"
+    );
+}
+
+/// carrick#733: a request whose origin is an env-backed binding and whose path
+/// is written at the call site states its whole target there, in either
+/// spelling — a template literal or a concatenation.
+#[test]
+fn a_silent_model_keeps_every_env_base_path_call() {
+    let calls = rows(&empty_scan("demo-services-shape"), "calls");
+
+    for (line, method, target) in [
+        (
+            9,
+            "GET",
+            "${process.env.USER_SERVICE_URL}/api/users/${userId}",
+        ),
+        (
+            14,
+            "POST",
+            "${process.env.USER_SERVICE_URL}/api/users/${userId}/rename",
+        ),
+        (23, "GET", "${process.env.USER_SERVICE_URL}/api/users"),
+        (29, "GET", "${process.env.USER_SERVICE_URL}/api/health"),
+    ] {
+        let row = row_at(&calls, "src/orders.ts", line);
+        assert_eq!(row["method"], method, "method at line {line}");
+        assert_eq!(row["target_url"], target, "target at line {line}");
+        assert_eq!(
+            row["resolution_source"], "env_base_path",
+            "source at line {line}"
+        );
+    }
+
+    // The decoys: a bare literal with no base at all, a base declared as a
+    // string literal, and a base injected as an option. None of the three is a
+    // statement this rule may claim.
+    for line in [8, 18, 27] {
+        assert_none_at(&calls, "src/decoys.ts", line);
+    }
+    assert_eq!(calls.len(), 4, "no other call: {calls:#?}");
+}
+
 /// The three fixtures whose rows are all the model's own reading. Pinned so a
 /// change that starts emitting for them is a deliberate one, and so the list
 /// at the top of this file stays honest.
@@ -384,6 +465,49 @@ fn a_contradicting_model_loses_the_method_and_the_target() {
     assert_eq!(
         quote["handler"], "gatewayClient",
         "the model still contributes what determinism does not state"
+    );
+
+    for call in &calls {
+        let target = call["target_url"].as_str().unwrap_or_default();
+        assert!(
+            !target.contains("/invented/"),
+            "an invented path reached the index: {call:#?}"
+        );
+        assert_ne!(call["method"], "OPTIONS", "an invented verb: {call:#?}");
+    }
+}
+
+/// The same, where the deterministic statement is the env-backed base and the
+/// path written beside it (carrick#733).
+#[test]
+fn a_contradicting_model_loses_to_the_env_base_and_its_path() {
+    let dir = cassette("demo-services-shape", &|stem| match stem {
+        "orders" => format!(
+            r#"{{"mounts":[],"endpoints":[],"data_calls":[{},{},{}]}}"#,
+            contradiction_naming(9, "userClient"),
+            contradiction(14, ""),
+            contradiction(23, ""),
+        ),
+        _ => NOTHING.to_string(),
+    });
+    let calls = rows(&scan("demo-services-shape", dir.path()), "calls");
+
+    let enrich = row_at(&calls, "src/orders.ts", 9);
+    assert_eq!(enrich["method"], "GET", "the callee states the verb");
+    assert_eq!(
+        enrich["target_url"],
+        "${process.env.USER_SERVICE_URL}/api/users/${userId}"
+    );
+    assert_eq!(
+        enrich["handler"], "userClient",
+        "the model still contributes what determinism does not state"
+    );
+
+    let rename = row_at(&calls, "src/orders.ts", 14);
+    assert_eq!(rename["method"], "POST");
+    assert_eq!(
+        rename["target_url"],
+        "${process.env.USER_SERVICE_URL}/api/users/${userId}/rename"
     );
 
     for call in &calls {
@@ -508,6 +632,46 @@ fn a_model_answer_at_a_file_route_keeps_the_convention_as_the_source() {
     assert_eq!(
         joined["primary_type_symbol"], "Order",
         "and the type anchor it read"
+    );
+}
+
+/// The model's answer for a decorator-declared route, anchored on the
+/// decorator candidate the scanner raises for the verb.
+const DECORATOR_TWIN: &str = r#"{"mounts":[],"data_calls":[],"endpoints":[{
+    "candidate_id":"@line:24","line_number":24,"owner_node":"app","method":"GET",
+    "path":"/api/users/:id","handler_name":"findUser","pattern_matched":"@Get",
+    "payload_expression_text":null,"payload_expression_line":null,
+    "response_expression_text":"user","response_expression_line":26,
+    "primary_type_symbol":"User","type_import_source":null}]}"#;
+
+/// carrick#732 with the #712 rule: a route the decorators declare keeps the
+/// decorators as its source when the model describes it too, and the model
+/// contributes the type anchor the decorators do not state.
+#[test]
+fn a_model_answer_at_a_decorator_route_keeps_the_decorators_as_the_source() {
+    let dir = cassette("demo-services-shape", &|stem| match stem {
+        "users.controller" => DECORATOR_TWIN.to_string(),
+        _ => NOTHING.to_string(),
+    });
+    let endpoints = rows(&scan("demo-services-shape", dir.path()), "endpoints");
+
+    // The joined row is placed at the candidate the model answered at — the
+    // decorator itself, one line above the handler.
+    let joined = row_at(&endpoints, "src/users.controller.ts", 24);
+    assert_eq!(joined["method"], "GET");
+    assert_eq!(joined["path"], "/api/users/:id");
+    assert_eq!(
+        joined["resolution_source"], "decorator_route",
+        "a joined row keeps the source of the deterministic twin it folded into"
+    );
+    assert_eq!(
+        joined["primary_type_symbol"], "User",
+        "the model still contributes what determinism does not state"
+    );
+    assert_eq!(
+        endpoints.len(),
+        3,
+        "the model's row folded rather than doubling the route: {endpoints:#?}"
     );
 }
 

@@ -13,9 +13,11 @@ DECLARED.
   `const url = process.env.HELPDESK_URL ?? "http://localhost:7100/api/answer"`.
   The call site states no path. The only path this request has anywhere in the
   source is inside the fallback literal.
-- `listItems()` at line 20 is the base-plus-path shape that already resolved:
-  `fetch(`${base}/api/v1/items`, …)`. It is here so the new rule can be shown
-  not to disturb it.
+- `listItems()` at line 20 is the base-plus-path shape: `fetch(`${base}/api/v1/items`, …)`.
+  It was here so the whole-URL rule could be shown not to disturb it, and since
+  carrick#733 it is a row of its own — the base is env-backed and the path is
+  written at the call site, so the source states the whole request and the
+  model's silence cannot lose it.
 
 `src/toolset.ts` holds one more, for carrick#632. Same binding shape, but the
 request sits in an arrow function that is a property of an object literal handed
