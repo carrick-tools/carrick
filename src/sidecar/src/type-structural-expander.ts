@@ -20,7 +20,9 @@
  *
  * Union and intersection members are printed in a canonical order that does not
  * depend on when the checker created each member type — see `orderMembers`
- * (carrick#735), which the depth backstop applies too (carrick#775).
+ * (carrick#735), which the depth backstop applies too, and which `namedText`
+ * applies as text to everything the walk hands back to the compiler's own
+ * print (carrick#775).
  *
  * Shared by `definition-resolver.ts` (bundle alias resolution) and
  * `type-inferrer.ts` (consumer-side inference), so both paths emit the same
@@ -28,6 +30,7 @@
  */
 
 import { type Symbol, type Type, ts } from 'ts-morph';
+import { canonicalizeUnionsInText } from './type-text-canonicalizer.js';
 
 /**
  * Bound on the structural-expansion recursion. Deep enough for every realistic
@@ -163,17 +166,21 @@ function backstopText(type: Type): string {
  *
  * The order carries no meaning: a union is a set, and the check phase compares
  * these strings by typechecking them, which is order-insensitive. So we impose
- * one:
+ * one — every member sorts by its own rendered text, compared by UTF-16 code
+ * unit. That is a pure function of the members, with no dependence on when the
+ * checker happened to create any of them.
  *
- *  - intrinsics (`string`, `null`, `undefined`, `number`, `true`/`false`, …)
- *    keep their compiler id order. Those ids are assigned when the checker is
- *    constructed, before a single source file is read, so their relative order
- *    is fixed for a given TypeScript version and cannot vary between runs.
- *    Keeping it means `string | null` still prints the way the compiler prints
- *    it, and only the unstable part of the order moves.
- *  - everything else (literals, objects, arrays, named types) sorts by its own
- *    rendered text, compared by UTF-16 code unit — a pure function of the
- *    member, with no dependence on when the checker happened to create it.
+ * #735 carved out an exception for the intrinsics (`string`, `null`, `number`,
+ * …), keeping them ahead of the rest in compiler-id order on the grounds that
+ * their ids are fixed before any source file is read, so `string | null` would
+ * still print the way the compiler prints it. The second half of that is not
+ * true: the compiler's printer does not use id order. On a union of
+ * `null | number` the checker's ids give `null` first and `typeToString` prints
+ * `number | null`, so keeping id order reproduced neither the compiler's print
+ * nor — once carrick#775 put the compiler's own prints under the same rule —
+ * the other path's. One rule for every member is the only way a union prints
+ * one way wherever it is rendered, and it costs nothing the exception was
+ * actually buying. `type-text-canonicalizer.ts` applies the same rule to text.
  *
  * Ties can only happen between two members that render identically, in which
  * case the joined output is the same whichever way round they go.
@@ -200,43 +207,13 @@ function orderMembers(
 ): string[] {
   const rendered = members.map((member, index) => ({
     index,
-    intrinsic: isIntrinsicType(member),
-    id: (member.compilerType as { id?: number }).id ?? 0,
     text: render(member),
   }));
   rendered.sort((a, b) => {
-    if (a.intrinsic !== b.intrinsic) return a.intrinsic ? -1 : 1;
-    if (a.intrinsic && b.intrinsic) return a.id - b.id;
     if (a.text !== b.text) return a.text < b.text ? -1 : 1;
     return a.index - b.index;
   });
   return rendered.map((entry) => entry.text);
-}
-
-/**
- * True for the types the checker creates up front (`any`, `unknown`, `string`,
- * `number`, `bigint`, `boolean`/`true`/`false`, `symbol`, `void`, `undefined`,
- * `null`, `never`), whose ids — and therefore whose relative order inside a
- * union — are the same in every program. String/number/enum literal types are
- * NOT in this set: they are created on demand while checking, which is the
- * instability `canonicalMembers` normalises away.
- */
-const INTRINSIC_TYPE_FLAGS =
-  ts.TypeFlags.Any |
-  ts.TypeFlags.Unknown |
-  ts.TypeFlags.String |
-  ts.TypeFlags.Number |
-  ts.TypeFlags.BigInt |
-  ts.TypeFlags.Boolean |
-  ts.TypeFlags.BooleanLiteral |
-  ts.TypeFlags.ESSymbol |
-  ts.TypeFlags.Void |
-  ts.TypeFlags.Undefined |
-  ts.TypeFlags.Null |
-  ts.TypeFlags.Never;
-
-function isIntrinsicType(type: Type): boolean {
-  return (type.getFlags() & INTRINSIC_TYPE_FLAGS) !== 0;
 }
 
 /** Render a single property as `name[?]: <expanded>`. */
@@ -319,8 +296,21 @@ function isLibraryType(type: Type): boolean {
  * the compiler can't throw on an invalid node context (tuples and some
  * generic instantiations do), falling back to the bare `getText()` and
  * finally to `unknown` so a single bad type never aborts the whole resolve.
+ *
+ * This is the ONE place the walk hands a subtree back to the compiler's own
+ * print — for a library type, a type with no properties to walk, a tuple, a
+ * function, a cycle, or the depth backstop. Everything inside that print is in
+ * type-id order, which is creation order, so the unions it contains are put in
+ * the same canonical order the walk gives the ones it renders itself
+ * (carrick#775). Doing it here rather than at each caller means no bail-out
+ * path can print a union one way while the walk prints it another.
  */
 export function namedText(type: Type): string {
+  return canonicalizeUnionsInText(compilerText(type));
+}
+
+/** The compiler's print, with the two fallbacks. */
+function compilerText(type: Type): string {
   try {
     return type.getText(
       undefined,
