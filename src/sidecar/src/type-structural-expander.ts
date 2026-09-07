@@ -18,6 +18,10 @@
  * that can't be safely expanded falls back to the non-expanded text rather
  * than throwing.
  *
+ * Union and intersection members are printed in a canonical order that does not
+ * depend on when the checker created each member type — see `canonicalMembers`
+ * (carrick#735).
+ *
  * Shared by `definition-resolver.ts` (bundle alias resolution) and
  * `type-inferrer.ts` (consumer-side inference), so both paths emit the same
  * structural form rather than a dangling name.
@@ -66,18 +70,14 @@ export function expandTypeStructural(
     return namedText(type);
   }
 
-  // Unions / intersections: expand each member.
+  // Unions / intersections: expand each member, in canonical order.
   if (type.isUnion()) {
-    return type
-      .getUnionTypes()
-      .map((member) => expandTypeStructural(member, seen, depth + 1))
-      .join(' | ');
+    return canonicalMembers(type.getUnionTypes(), seen, depth).join(' | ');
   }
   if (type.isIntersection()) {
-    return type
-      .getIntersectionTypes()
-      .map((member) => expandTypeStructural(member, seen, depth + 1))
-      .join(' & ');
+    return canonicalMembers(type.getIntersectionTypes(), seen, depth).join(
+      ' & ',
+    );
   }
 
   // Tuples are array-like but must keep their `[a, b]` shape, not be walked
@@ -127,6 +127,80 @@ export function expandTypeStructural(
   return namedText(type);
 }
 
+/**
+ * Render every member of a union/intersection and put them in a canonical
+ * order (carrick#735).
+ *
+ * The compiler stores a union's constituents sorted by type id, and ids are
+ * handed out in the order the checker CREATES types. A literal type is created
+ * the first time some declaration is checked, and it is then interned — so on
+ * a tree where `"PENDING" | "TIMED_OUT"` and `"TIMED_OUT" | "PENDING"` are both
+ * declared, whichever declaration is reached first decides the printed order of
+ * BOTH. Two runs over an unchanged tree can therefore print one type two ways.
+ *
+ * The order carries no meaning: a union is a set, and the check phase compares
+ * these strings by typechecking them, which is order-insensitive. So we impose
+ * one:
+ *
+ *  - intrinsics (`string`, `null`, `undefined`, `number`, `true`/`false`, …)
+ *    keep their compiler id order. Those ids are assigned when the checker is
+ *    constructed, before a single source file is read, so their relative order
+ *    is fixed for a given TypeScript version and cannot vary between runs.
+ *    Keeping it means `string | null` still prints the way the compiler prints
+ *    it, and only the unstable part of the order moves.
+ *  - everything else (literals, objects, arrays, named types) sorts by its own
+ *    rendered text, compared by UTF-16 code unit — a pure function of the
+ *    member, with no dependence on when the checker happened to create it.
+ *
+ * Ties can only happen between two members that render identically, in which
+ * case the joined output is the same whichever way round they go.
+ */
+function canonicalMembers(
+  members: Type[],
+  seen: Set<number>,
+  depth: number,
+): string[] {
+  const rendered = members.map((member, index) => ({
+    index,
+    intrinsic: isIntrinsicType(member),
+    id: (member.compilerType as { id?: number }).id ?? 0,
+    text: expandTypeStructural(member, seen, depth + 1),
+  }));
+  rendered.sort((a, b) => {
+    if (a.intrinsic !== b.intrinsic) return a.intrinsic ? -1 : 1;
+    if (a.intrinsic && b.intrinsic) return a.id - b.id;
+    if (a.text !== b.text) return a.text < b.text ? -1 : 1;
+    return a.index - b.index;
+  });
+  return rendered.map((entry) => entry.text);
+}
+
+/**
+ * True for the types the checker creates up front (`any`, `unknown`, `string`,
+ * `number`, `bigint`, `boolean`/`true`/`false`, `symbol`, `void`, `undefined`,
+ * `null`, `never`), whose ids — and therefore whose relative order inside a
+ * union — are the same in every program. String/number/enum literal types are
+ * NOT in this set: they are created on demand while checking, which is the
+ * instability `canonicalMembers` normalises away.
+ */
+const INTRINSIC_TYPE_FLAGS =
+  ts.TypeFlags.Any |
+  ts.TypeFlags.Unknown |
+  ts.TypeFlags.String |
+  ts.TypeFlags.Number |
+  ts.TypeFlags.BigInt |
+  ts.TypeFlags.Boolean |
+  ts.TypeFlags.BooleanLiteral |
+  ts.TypeFlags.ESSymbol |
+  ts.TypeFlags.Void |
+  ts.TypeFlags.Undefined |
+  ts.TypeFlags.Null |
+  ts.TypeFlags.Never;
+
+function isIntrinsicType(type: Type): boolean {
+  return (type.getFlags() & INTRINSIC_TYPE_FLAGS) !== 0;
+}
+
 /** Render a single property as `name[?]: <expanded>`. */
 function expandProperty(prop: Symbol, seen: Set<number>, depth: number): string {
   const optional = (prop.getFlags() & ts.SymbolFlags.Optional) !== 0;
@@ -149,9 +223,7 @@ function expandProperty(prop: Symbol, seen: Set<number>, depth: number): string 
     if (nonUndefined.length === 1) {
       propType = nonUndefined[0];
     } else if (nonUndefined.length > 1) {
-      const inner = nonUndefined
-        .map((member) => expandTypeStructural(member, seen, depth + 1))
-        .join(' | ');
+      const inner = canonicalMembers(nonUndefined, seen, depth).join(' | ');
       return `${name}?: ${inner}`;
     }
   }
