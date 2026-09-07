@@ -1,0 +1,153 @@
+//! Call edges into a sibling workspace package (carrick#776).
+//!
+//! Drives the real scanner binary — offline, cassette-mocked LLM — over
+//! `tests/fixtures/workspace-member-callers/`, where the one scanned service
+//! calls members on a client class another package publishes under a manifest
+//! subpath. Asserts on the UPLOADED BLOB rather than the projection, because
+//! the edges live in `function_definitions[].calls` and that is what the
+//! cross-service caller join inverts.
+//!
+//! Pre-fix baseline: `call_graph` resolved neither half of these sites — a
+//! receiver bound to an instance resolved to nothing, and a non-relative
+//! specifier resolved to nothing — so both positive assertions FAIL on the
+//! pre-fix scanner by construction. The four negative sites are the answer key
+//! for what must still resolve to nothing.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Command;
+
+/// One resolved edge, as the blob records it.
+#[derive(Debug, PartialEq, Eq)]
+struct Edge {
+    callee: String,
+    callee_file: String,
+    call_site_line: u64,
+}
+
+fn fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-member-callers")
+}
+
+/// Scan the fixture offline and return every function's resolved call edges,
+/// keyed by definition key.
+fn scan_edges() -> HashMap<String, Vec<Edge>> {
+    let storage = tempfile::tempdir().expect("temp storage dir");
+    let cache = tempfile::tempdir().expect("temp cache dir");
+    let cassettes = fixture_dir().join("__llm__");
+    assert!(cassettes.exists(), "fixture cassette dir missing");
+
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_carrick"));
+    let mut cmd = Command::new(&bin);
+    cmd.arg(fixture_dir())
+        // The blob is only written when the scan believes it should upload,
+        // and `CARRICK_OUTPUT_JSON` suppresses that — so this harness reads
+        // the local storage dir instead of the eval projection.
+        .env("CARRICK_LOCAL_STORAGE_DIR", storage.path())
+        .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
+        .env("CARRICK_CACHE_DIR", cache.path())
+        .env("CARRICK_MOCK_ALL", "1")
+        .env(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            format!("{}/", cassettes.display()),
+        )
+        .env("CARRICK_SKIP_INTENTS", "1");
+    // Same ambient-CI stripping as the other fixture harnesses: keeps repo
+    // identity tied to the scanned dir and the upload decision deterministic.
+    for var in [
+        "GITHUB_REPOSITORY",
+        "GITHUB_REF",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_SHA",
+        "GITHUB_RUN_ID",
+        "GITHUB_ACTIONS",
+        "GITHUB_WORKSPACE",
+        "CI",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+    ] {
+        cmd.env_remove(var);
+    }
+    let output = cmd.output().expect("failed to spawn carrick");
+    assert!(
+        output.status.success(),
+        "fixture scan exited non-zero:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut blobs = std::fs::read_dir(storage.path())
+        .expect("storage dir")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect::<Vec<_>>();
+    blobs.sort();
+    assert_eq!(blobs.len(), 1, "expected one uploaded blob, got {blobs:?}");
+
+    let blob: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&blobs[0]).expect("read blob")).expect("parse blob");
+    blob["function_definitions"]
+        .as_object()
+        .expect("blob has no function_definitions")
+        .iter()
+        .map(|(key, def)| {
+            let edges = def["calls"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|call| Edge {
+                    callee: call["name"].as_str().unwrap_or_default().to_string(),
+                    callee_file: call["file_path"].as_str().unwrap_or_default().to_string(),
+                    call_site_line: call["call_site_line"].as_u64().unwrap_or_default(),
+                })
+                .collect();
+            (key.clone(), edges)
+        })
+        .collect()
+}
+
+#[test]
+fn a_typed_receiver_records_an_edge_into_the_sibling_package() {
+    let edges = scan_edges();
+    assert_eq!(
+        edges.get("readRun").map(Vec::as_slice),
+        Some(
+            [Edge {
+                callee: "RunClient.subscribeToRun".to_string(),
+                callee_file: "packages/core/src/v2/client/index.ts".to_string(),
+                call_site_line: 10,
+            }]
+            .as_slice()
+        ),
+        "all edges were {edges:?}"
+    );
+}
+
+#[test]
+fn a_constructed_receiver_records_an_edge_into_the_sibling_package() {
+    let edges = scan_edges();
+    assert_eq!(
+        edges.get("readStream").map(Vec::as_slice),
+        Some(
+            [Edge {
+                callee: "RunClient.fetchStream".to_string(),
+                callee_file: "packages/core/src/v2/client/index.ts".to_string(),
+                call_site_line: 16,
+            }]
+            .as_slice()
+        ),
+        "all edges were {edges:?}"
+    );
+}
+
+#[test]
+fn a_receiver_the_file_does_not_declare_records_nothing() {
+    let edges = scan_edges();
+    for caller in ["readUnbound", "readVendor", "readAmbiguous", "inner"] {
+        assert_eq!(
+            edges.get(caller).map(Vec::as_slice),
+            Some([].as_slice()),
+            "{caller} must record no edge; all edges were {edges:?}"
+        );
+    }
+}

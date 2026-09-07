@@ -20,9 +20,22 @@
 //! - `this.foo(...)` — the enclosing class's `Class.foo` key, in the same
 //!   file. A same-named method on another class cannot match.
 //! - `obj.foo(...)` — `obj` as a class in the same file (`Class.staticFn()`),
-//!   an imported class, a namespace import (`import * as ns`), or a named
+//!   an imported class, a namespace import (`import * as ns`), a named
 //!   import of a namespace RE-export (`export * as ns from "./m"` in the
-//!   module it comes from, carrick#679). Anything else produces no edge.
+//!   module it comes from, carrick#679), or a receiver the file DECLARES the
+//!   class of — `client: ApiClient`, `const client = new ApiClient()`
+//!   ([`crate::receiver_type`], carrick#776). Anything else produces no edge.
+//!
+//! An import is followed through a relative specifier and through a WORKSPACE
+//! PACKAGE one (`@scope/core/v3`), because in a monorepo the class a package
+//! publishes is the one its siblings actually call and a relative-only walk
+//! cannot reach it (carrick#776). The package's own manifest says which file
+//! the specifier names ([`crate::workspace_resolver`]); an external
+//! dependency has no source in this repo and still produces no edge. A target
+//! outside the service being scanned is read on demand, since only this
+//! service's files are in the per-file index — and the edge it produces
+//! carries the sibling's file, which is exactly what the cross-service join
+//! needs to invert it.
 //!
 //! Resolution is keyed on **(file, definition key)** throughout, taken from the
 //! per-file extractor output rather than from the merged function map, so a
@@ -35,11 +48,21 @@
 
 use crate::agents::file_orchestrator::FileOrchestrator;
 use crate::import_bindings::{BindingResolver, ResolvedBinding};
+use crate::parser::parse_file;
+use crate::receiver_type::ReceiverTypes;
 use crate::visitor::{
-    CalleeRef, CalleeShape, FunctionCallRef, FunctionDefinition, ImportedSymbol, SymbolKind,
+    CalleeRef, CalleeShape, FunctionCallRef, FunctionDefinition, FunctionDefinitionExtractor,
+    ImportedSymbol, SymbolKind,
 };
+use crate::workspace_resolver::{Resolution, WorkspaceIndex};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use swc_common::{
+    SourceMap,
+    errors::{ColorConfig, Handler},
+    sync::Lrc,
+};
+use swc_ecma_visit::VisitWith;
 use tracing::debug;
 
 /// The export name a default export is published under (mirrors
@@ -63,11 +86,20 @@ pub struct FileCallIndex {
     pub callees: HashMap<String, Vec<CalleeRef>>,
     /// Local binding → the import that introduced it.
     pub imports: HashMap<String, ImportedSymbol>,
+    /// Definition key → the classes that definition declares its own local
+    /// bindings to be, for the receivers that are instances rather than
+    /// classes (carrick#776). Scoped per definition, like `callees`, because a
+    /// name means different things in different functions.
+    pub declared_types: HashMap<String, ReceiverTypes>,
 }
 
 /// Where a resolved call lands.
-struct Target<'a> {
-    file: &'a Path,
+///
+/// Owns its path rather than borrowing the per-file index: a target may sit in
+/// a workspace sibling that is not in the index at all and was parsed on
+/// demand to answer this one call.
+struct Target {
+    file: PathBuf,
     key: String,
     line: u32,
 }
@@ -212,12 +244,20 @@ pub fn merge_definitions(
 /// `keys` comes from [`merge_definitions`]: a caller whose definition key
 /// collided with another file's is stored under a re-keyed row, and looking it
 /// up under its plain key would find nothing and silently drop its edges.
+///
+/// `workspace` is the repo's manifest index. `per_file` holds only the service
+/// being scanned, so a call into a sibling workspace package would otherwise
+/// resolve to nothing however plainly the source names it (carrick#776); the
+/// index says which file the package specifier means, and the target is parsed
+/// on demand.
 pub fn resolve_call_edges(
     function_definitions: &mut HashMap<String, FunctionDefinition>,
     per_file: &HashMap<PathBuf, FileCallIndex>,
     keys: &RekeyIndex,
+    workspace: &WorkspaceIndex,
+    repo_root: &Path,
 ) {
-    let mut resolver = CallResolver::new(per_file);
+    let mut resolver = CallResolver::new(per_file, workspace, repo_root);
 
     // Sorted so a resolution cache built while walking one file cannot make a
     // later file's result depend on HashMap iteration order.
@@ -242,7 +282,7 @@ pub fn resolve_call_edges(
 
             let mut edges: Vec<FunctionCallRef> = Vec::new();
             for callee in &index.callees[caller_key] {
-                let Some(target) = resolver.resolve(index, callee) else {
+                let Some(target) = resolver.resolve(index, caller_key, callee) else {
                     continue;
                 };
                 // Direct recursion is not a dependency: it would make the
@@ -280,24 +320,93 @@ fn dedupe_edges(edges: &mut Vec<FunctionCallRef>) {
 /// Resolves call sites against the per-file index, caching import lookups.
 struct CallResolver<'a> {
     per_file: &'a HashMap<PathBuf, FileCallIndex>,
+    workspace: &'a WorkspaceIndex,
+    repo_root: PathBuf,
     bindings: BindingResolver,
     /// (importer, local binding) → the module that declares it. Every function
     /// in a file that calls the same import would otherwise re-walk the barrel
     /// chain; `None` is cached too, so an unresolvable specifier is paid for
     /// once.
     resolved_imports: HashMap<(PathBuf, String), Option<ResolvedBinding>>,
+    /// Definition tables for files OUTSIDE the scanned service, parsed the
+    /// first time an edge reaches one. `None` for a file that does not parse,
+    /// so a broken sibling costs one parse rather than one per call site.
+    external: HashMap<PathBuf, Option<HashMap<String, u32>>>,
+    /// Quiet diagnostics for those parses: a sibling that fails to parse is a
+    /// resolution miss, not something to shout about mid-scan.
+    source_map: Lrc<SourceMap>,
+    handler: Handler,
 }
 
 impl<'a> CallResolver<'a> {
-    fn new(per_file: &'a HashMap<PathBuf, FileCallIndex>) -> Self {
+    fn new(
+        per_file: &'a HashMap<PathBuf, FileCallIndex>,
+        workspace: &'a WorkspaceIndex,
+        repo_root: &Path,
+    ) -> Self {
+        let source_map: Lrc<SourceMap> = Default::default();
+        let handler =
+            Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(source_map.clone()));
         Self {
             per_file,
+            workspace,
+            repo_root: repo_root.to_path_buf(),
             bindings: BindingResolver::new(),
             resolved_imports: HashMap::new(),
+            external: HashMap::new(),
+            source_map,
+            handler,
         }
     }
 
-    fn resolve(&mut self, index: &'a FileCallIndex, callee: &CalleeRef) -> Option<Target<'a>> {
+    /// The first key that names a definition in `file`, whether the file is in
+    /// the scanned service or a workspace sibling read on demand.
+    fn lookup_in_file(
+        &mut self,
+        file: &Path,
+        keys: impl IntoIterator<Item = String>,
+    ) -> Option<Target> {
+        if let Some(index) = self.per_file.get(file) {
+            let path = index.path.clone();
+            return keys
+                .into_iter()
+                .find_map(|key| index.definitions.get(&key).map(|line| (key, *line)))
+                .map(|(key, line)| Target {
+                    file: path,
+                    key,
+                    line,
+                });
+        }
+        if !self.external.contains_key(file) {
+            let definitions = parse_file(file, &self.source_map, &self.handler).map(|module| {
+                let mut extractor =
+                    FunctionDefinitionExtractor::new(file.to_path_buf(), self.source_map.clone());
+                module.visit_with(&mut extractor);
+                extractor.finalize_exports();
+                extractor
+                    .function_definitions
+                    .iter()
+                    .map(|(key, def)| (key.clone(), def.line_number))
+                    .collect::<HashMap<String, u32>>()
+            });
+            self.external.insert(file.to_path_buf(), definitions);
+        }
+        let definitions = self.external.get(file)?.as_ref()?;
+        keys.into_iter()
+            .find_map(|key| definitions.get(&key).map(|line| (key, *line)))
+            .map(|(key, line)| Target {
+                file: file.to_path_buf(),
+                key,
+                line,
+            })
+    }
+
+    fn resolve(
+        &mut self,
+        index: &'a FileCallIndex,
+        caller_key: &str,
+        callee: &CalleeRef,
+    ) -> Option<Target> {
         match &callee.shape {
             CalleeShape::Bare => self.resolve_bare(index, &callee.name),
             // `this.x()` is the enclosing class's own member, so it can only
@@ -307,80 +416,107 @@ impl<'a> CallResolver<'a> {
                 let key = format!("{class}.{}", callee.name);
                 same_file(index, key)
             }
-            CalleeShape::Member(object) => self.resolve_member(index, object, &callee.name),
+            CalleeShape::Member(object) => {
+                self.resolve_member(index, caller_key, object, &callee.name)
+            }
         }
     }
 
     /// `foo(...)`: a same-file definition, else the module the file imports
     /// `foo` from, else nothing.
-    fn resolve_bare(&mut self, index: &'a FileCallIndex, name: &str) -> Option<Target<'a>> {
+    fn resolve_bare(&mut self, index: &'a FileCallIndex, name: &str) -> Option<Target> {
         if let Some(target) = same_file(index, name.to_string()) {
             return Some(target);
         }
 
-        let symbol = index.imports.get(name)?;
-        let binding = self.resolve_import(&index.path, symbol)?;
-        let target_index = self.per_file.get(&binding.file)?;
+        let symbol = index.imports.get(name)?.clone();
+        let binding = self.resolve_import(&index.path, &symbol)?;
 
         // The module may declare the export under a different local name
         // (`function impl() {}; export { impl as helper }`), so try the name
         // the defining module used first, then the published names.
-        let candidates = [
+        let candidates: Vec<String> = [
             binding.local_name.clone(),
             Some(symbol.imported_name.clone()),
             Some(name.to_string()),
-        ];
-        candidates
-            .into_iter()
-            .flatten()
-            .find_map(|key| same_file(target_index, key))
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        self.lookup_in_file(&binding.file, candidates)
     }
 
-    /// `obj.foo(...)`: `obj` as a class in this file, an imported class, or a
-    /// namespace import. An `obj` bound to a class INSTANCE is not resolved —
-    /// that needs `new X()` tracking — and produces no edge rather than a
-    /// guess.
+    /// `obj.foo(...)`: `obj` as a class in this file, an imported class, a
+    /// namespace import, or a receiver whose class the file declares.
+    ///
+    /// The three receiver forms are tried in the order the file states them
+    /// most directly. A receiver the file says nothing about — a destructured
+    /// binding, the result of an untyped call — still produces no edge rather
+    /// than a guess.
     fn resolve_member(
         &mut self,
         index: &'a FileCallIndex,
+        caller_key: &str,
         object: &str,
         name: &str,
-    ) -> Option<Target<'a>> {
+    ) -> Option<Target> {
+        // `obj` names the class itself: `Class.staticFn()`, or an imported
+        // class or namespace.
+        if let Some(target) = self.resolve_class_member(index, object, name) {
+            return Some(target);
+        }
+
+        // `obj` is an INSTANCE whose class the file declares — a typed
+        // parameter, a `new X()` local. The class name is then resolved
+        // exactly as a class named directly at the call site would be
+        // (carrick#776).
+        let declared = index.declared_types.get(caller_key)?.get(object)?.clone();
+        if declared == object {
+            return None;
+        }
+        self.resolve_class_member(index, &declared, name)
+    }
+
+    /// `class.foo(...)` where `class` is a binding that NAMES a class or a
+    /// module: declared here, imported, or a namespace.
+    fn resolve_class_member(
+        &mut self,
+        index: &'a FileCallIndex,
+        class: &str,
+        name: &str,
+    ) -> Option<Target> {
         // `Class.staticFn()` on a class declared in this file.
-        if let Some(target) = member_keys(object, name)
+        if let Some(target) = member_keys(class, name)
             .into_iter()
             .find_map(|key| same_file(index, key))
         {
             return Some(target);
         }
 
-        let symbol = index.imports.get(object)?;
+        let symbol = index.imports.get(class)?.clone();
 
         // `import { queues } from "./index.js"` where the entry writes
         // `export * as queues from "./queues.js"`: the name binds a MODULE one
         // hop away, so `queues.list()` is that module's own `list`. Tried
         // first because the value walk below answers `None` for such a name
         // and caches that answer (carrick#679).
-        if let Some(target) = self.resolve_namespace_member(&index.path, symbol, name) {
+        if let Some(target) = self.resolve_namespace_member(&index.path, &symbol, name) {
             return Some(target);
         }
 
-        let binding = self.resolve_import(&index.path, symbol)?;
-        let target_index = self.per_file.get(&binding.file)?;
+        let binding = self.resolve_import(&index.path, &symbol)?;
 
         if matches!(symbol.kind, SymbolKind::Namespace) {
             // `import * as helpers` → `helpers.foo()` is the module's own
             // top-level `foo`.
-            return same_file(target_index, name.to_string());
+            return self.lookup_in_file(&binding.file, [name.to_string()]);
         }
 
-        let class = binding
+        let declaring_class = binding
             .local_name
             .clone()
             .unwrap_or_else(|| symbol.imported_name.clone());
-        member_keys(&class, name)
-            .into_iter()
-            .find_map(|key| same_file(target_index, key))
+        self.lookup_in_file(&binding.file, member_keys(&declaring_class, name))
     }
 
     /// `ns.foo(...)` where `ns` is a NAMED import of a namespace re-export
@@ -396,7 +532,7 @@ impl<'a> CallResolver<'a> {
         importer: &Path,
         symbol: &ImportedSymbol,
         name: &str,
-    ) -> Option<Target<'a>> {
+    ) -> Option<Target> {
         if !matches!(symbol.kind, SymbolKind::Named) {
             return None;
         }
@@ -405,19 +541,27 @@ impl<'a> CallResolver<'a> {
             .bindings
             .resolve_namespace_export(&target, &symbol.imported_name)?;
         let binding = self.bindings.resolve_export(&module, name)?;
-        let target_index = self.per_file.get(&binding.file)?;
         // The declaring module may name it differently (`function impl() {};
         // export { impl as list }`).
-        binding
+        let candidates: Vec<String> = binding
             .local_name
             .clone()
-            .and_then(|local| same_file(target_index, local))
-            .or_else(|| same_file(target_index, name.to_string()))
+            .into_iter()
+            .chain([name.to_string()])
+            .collect();
+        self.lookup_in_file(&binding.file, candidates)
     }
 
     /// The module that declares `symbol` as imported by `importer`, or `None`
-    /// for a package/alias specifier (out of scope: reaching those needs the
-    /// sidecar's tsconfig knowledge) or an unresolvable export.
+    /// for an external package, a tsconfig path alias (out of scope: reaching
+    /// those needs the sidecar's tsconfig knowledge) or an unresolvable
+    /// export.
+    ///
+    /// A WORKSPACE package specifier is not out of scope: the repo's own
+    /// manifests say which file `@scope/core/v3` names, and the file is in
+    /// this checkout (carrick#776). It is tried only after the relative
+    /// resolver declines, so a relative specifier keeps the answer it always
+    /// had.
     fn resolve_import(
         &mut self,
         importer: &Path,
@@ -428,7 +572,8 @@ impl<'a> CallResolver<'a> {
             return cached.clone();
         }
 
-        let resolved = FileOrchestrator::resolve_relative_import(importer, &symbol.source)
+        let resolved = self
+            .resolve_specifier(importer, &symbol.source)
             .and_then(|target| match symbol.kind {
                 // A namespace import names the module itself, not one export.
                 SymbolKind::Namespace => Some(ResolvedBinding {
@@ -442,14 +587,36 @@ impl<'a> CallResolver<'a> {
         self.resolved_imports.insert(cache_key, resolved.clone());
         resolved
     }
+
+    /// The file a specifier names: relative first, then the workspace package
+    /// the repo's manifests declare.
+    fn resolve_specifier(&self, importer: &Path, specifier: &str) -> Option<PathBuf> {
+        if let Some(target) = FileOrchestrator::resolve_relative_import(importer, specifier) {
+            return Some(target);
+        }
+        let Resolution::Internal(relative) = self.workspace.resolve(importer, specifier) else {
+            return None;
+        };
+        let target = self.repo_root.join(relative);
+        // Canonical when that stays inside the repo — it is what `per_file` is
+        // keyed by, so an in-service target is found rather than re-parsed.
+        // A package directory that is itself a symlink out of the tree
+        // canonicalizes to a path the cloud boundary cannot strip the repo root
+        // from, and an absolute path in the blob is a locator nothing can
+        // invert; the plain join is under the root by construction.
+        match target.canonicalize() {
+            Ok(canonical) if canonical.starts_with(&self.repo_root) => Some(canonical),
+            _ => target.is_file().then_some(target),
+        }
+    }
 }
 
 /// Exact-key lookup in one file's definitions. Keys are matched whole, so a
 /// bare `foo()` can never reach a `Class.foo` method.
-fn same_file(index: &FileCallIndex, key: String) -> Option<Target<'_>> {
+fn same_file(index: &FileCallIndex, key: String) -> Option<Target> {
     let line = *index.definitions.get(&key)?;
     Some(Target {
-        file: &index.path,
+        file: index.path.clone(),
         key,
         line,
     })
@@ -482,6 +649,18 @@ mod tests {
     /// Parse each `(relative path, source)` pair into the same shape discovery
     /// builds: the merged definition map plus the per-file call index.
     fn scan(files: &[(&str, &str)]) -> (TempDir, HashMap<String, FunctionDefinition>) {
+        scan_service(files, "")
+    }
+
+    /// The same, with the scan scoped to ONE service: only files whose
+    /// relative path starts with `scope` are indexed, exactly as a multi-service
+    /// `carrick.json` scopes discovery. Everything else is written to disk and
+    /// reachable only the way production reaches it — through the repo's own
+    /// manifests.
+    fn scan_service(
+        files: &[(&str, &str)],
+        scope: &str,
+    ) -> (TempDir, HashMap<String, FunctionDefinition>) {
         let dir = TempDir::new().expect("tempdir");
         let root = dir.path().canonicalize().expect("canonical tempdir");
         let mut paths = Vec::new();
@@ -491,7 +670,9 @@ mod tests {
                 fs::create_dir_all(parent).expect("mkdir");
             }
             fs::write(&path, source).expect("write");
-            paths.push(path);
+            if name.starts_with(scope) && !name.ends_with(".json") {
+                paths.push(path);
+            }
         }
 
         let cm: Lrc<SourceMap> = Default::default();
@@ -519,6 +700,7 @@ mod tests {
                     .collect(),
                 callees: functions.callee_refs,
                 imports: imports.imported_symbols,
+                declared_types: functions.declared_types,
             };
             per_file.insert(path.clone(), index);
             per_file_definitions.push((path.clone(), functions.function_definitions));
@@ -531,8 +713,20 @@ mod tests {
             keys,
         } = merge_definitions(per_file_definitions, &root.to_string_lossy());
 
-        resolve_call_edges(&mut definitions, &per_file, &keys);
+        let workspace = WorkspaceIndex::build(&root);
+        resolve_call_edges(&mut definitions, &per_file, &keys, &workspace, &root);
         (dir, definitions)
+    }
+
+    /// The file where a caller's first edge lands, repo-relative-ish (the
+    /// tempdir root is stripped by suffix matching at the assert).
+    fn callee_files(defs: &HashMap<String, FunctionDefinition>, caller: &str) -> Vec<String> {
+        defs.get(caller)
+            .unwrap_or_else(|| panic!("no definition for {caller}"))
+            .calls
+            .iter()
+            .map(|c| c.file_path.clone())
+            .collect()
     }
 
     fn callee_names(defs: &HashMap<String, FunctionDefinition>, caller: &str) -> Vec<String> {
@@ -893,5 +1087,163 @@ mod tests {
         )]);
 
         assert!(callee_names(&defs, "countdown").is_empty());
+    }
+
+    /// carrick#776: the receiver is an INSTANCE, and the class it is an
+    /// instance of is stated by the parameter's own type annotation. The class
+    /// is published by a sibling WORKSPACE package under a manifest subpath,
+    /// and that package is not in the scanned service's file list at all.
+    #[test]
+    fn a_typed_receiver_resolves_through_a_workspace_subpath() {
+        let (dir, defs) = scan_service(
+            &[
+                (
+                    "package.json",
+                    r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+                ),
+                (
+                    "packages/core/package.json",
+                    r#"{"name":"@fixture/core","exports":{"./v2":{"import":{"@fixture/source":"./src/v2/index.ts","default":"./dist/v2/index.js"}}}}"#,
+                ),
+                (
+                    "packages/core/src/v2/index.ts",
+                    "export * from \"./client.js\";\n",
+                ),
+                (
+                    "packages/core/src/v2/client.ts",
+                    "export class RunClient {\n  subscribeToRun(id: string) {\n    return id;\n  }\n}\n",
+                ),
+                (
+                    "packages/app/package.json",
+                    r#"{"name":"@fixture/app","dependencies":{"@fixture/core":"workspace:*"}}"#,
+                ),
+                (
+                    "packages/app/src/reader.ts",
+                    "import type { RunClient } from \"@fixture/core/v2\";\n\
+                     export function readRun(id: string, client: RunClient) {\n  \
+                     return client.subscribeToRun(id);\n}\n",
+                ),
+            ],
+            "packages/app",
+        );
+
+        assert_eq!(callee_names(&defs, "readRun"), ["RunClient.subscribeToRun"]);
+        assert!(
+            callee_files(&defs, "readRun")[0].ends_with("packages/core/src/v2/client.ts"),
+            "the edge must point at the sibling package's source, not its build output: {:?}",
+            callee_files(&defs, "readRun")
+        );
+        drop(dir);
+    }
+
+    /// A receiver constructed on the spot states its class as flatly as an
+    /// annotation does.
+    #[test]
+    fn a_constructed_receiver_resolves_to_its_class() {
+        let (dir, defs) = scan(&[
+            (
+                "client.ts",
+                "export class RunClient {\n  fetchStream(id: string) {\n    return id;\n  }\n}\n",
+            ),
+            (
+                "reader.ts",
+                "import { RunClient } from \"./client\";\n\
+                 export function readStream(id: string) {\n  \
+                 const client = new RunClient();\n  \
+                 return client.fetchStream(id);\n}\n",
+            ),
+        ]);
+
+        assert_eq!(callee_names(&defs, "readStream"), ["RunClient.fetchStream"]);
+        drop(dir);
+    }
+
+    /// A name the file states nothing about still resolves to nothing, and a
+    /// name bound to two classes in one scope resolves to neither.
+    #[test]
+    fn an_undeclared_or_contested_receiver_resolves_to_nothing() {
+        let (dir, defs) = scan(&[
+            (
+                "client.ts",
+                "export class RunClient {\n  subscribeToRun(id: string) {\n    return id;\n  }\n}\n\
+                 export class BatchClient {\n  subscribeToRun(id: string) {\n    return id;\n  }\n}\n",
+            ),
+            (
+                "reader.ts",
+                "import { RunClient, BatchClient } from \"./client\";\n\
+                 export function readUnbound(id: string, client) {\n  \
+                 return client.subscribeToRun(id);\n}\n\
+                 export function readContested(id: string, client: RunClient) {\n  \
+                 const inner = (client: BatchClient) => client.subscribeToRun(id);\n  \
+                 return inner;\n}\n",
+            ),
+        ]);
+
+        assert!(callee_names(&defs, "readUnbound").is_empty());
+        assert!(callee_names(&defs, "readContested").is_empty());
+        drop(dir);
+    }
+
+    /// An EXTERNAL package has no source in this repo, so a receiver typed by
+    /// one produces no edge however plainly the file names the class.
+    #[test]
+    fn a_receiver_typed_by_an_external_package_resolves_to_nothing() {
+        let (dir, defs) = scan_service(
+            &[
+                (
+                    "package.json",
+                    r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+                ),
+                (
+                    "packages/app/package.json",
+                    r#"{"name":"@fixture/app","dependencies":{"vendor-runs":"^1.0.0"}}"#,
+                ),
+                (
+                    "packages/app/src/reader.ts",
+                    "import type { VendorClient } from \"vendor-runs\";\n\
+                     export function readRun(id: string, client: VendorClient) {\n  \
+                     return client.subscribeToRun(id);\n}\n",
+                ),
+            ],
+            "packages/app",
+        );
+
+        assert!(callee_names(&defs, "readRun").is_empty());
+        drop(dir);
+    }
+
+    /// A bare call into a sibling workspace package resolves too: the gap was
+    /// the specifier, not the call shape.
+    #[test]
+    fn a_bare_call_resolves_through_a_workspace_package_name() {
+        let (dir, defs) = scan_service(
+            &[
+                (
+                    "package.json",
+                    r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+                ),
+                (
+                    "packages/core/package.json",
+                    r#"{"name":"@fixture/core","main":"./src/index.ts"}"#,
+                ),
+                (
+                    "packages/core/src/index.ts",
+                    "export function formatRun(id: string) {\n  return id;\n}\n",
+                ),
+                (
+                    "packages/app/package.json",
+                    r#"{"name":"@fixture/app","dependencies":{"@fixture/core":"workspace:*"}}"#,
+                ),
+                (
+                    "packages/app/src/reader.ts",
+                    "import { formatRun } from \"@fixture/core\";\n\
+                     export function readRun(id: string) {\n  return formatRun(id);\n}\n",
+                ),
+            ],
+            "packages/app",
+        );
+
+        assert_eq!(callee_names(&defs, "readRun"), ["formatRun"]);
+        drop(dir);
     }
 }
