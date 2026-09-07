@@ -546,7 +546,20 @@ function literalResolvesLocally(
 // position and binding shape, never a method name, library, or topic string.
 // ===========================================================================
 
-/** v1's `findFunctionByLine` tolerance, mirrored so the two paths agree. */
+/**
+ * v1's `findFunctionByLine` tolerance, mirrored so the two paths agree on how
+ * far an anchor may be from the function it names.
+ *
+ * The two paths no longer agree on what a FORWARD match may cross:
+ * `findFunctionByLine` now rejects a candidate the anchor line's own statement
+ * does not lead to, because reading the next declaration in the file published
+ * a private helper's return type as a route's response contract (carrick#766).
+ * Here a forward candidate is only ever a candidate — `handlerCandidates` hands
+ * back a list and the caller keeps the first whose PARAMETER NAME matches, so a
+ * neighbouring declaration has to match the name to be read at all. That is a
+ * narrower exposure, not none; carrick#770 tracks porting the guard with a case
+ * that fails without it.
+ */
 const HANDLER_LINE_TOLERANCE = 2;
 
 /**

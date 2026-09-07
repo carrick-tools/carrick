@@ -3007,25 +3007,61 @@ export class TypeInferrer {
    * the function's start line as recorded by the scanner. Ties break toward the
    * innermost (smallest) function. Returns undefined if nothing is close enough,
    * to avoid binding to an unrelated function.
+   *
+   * The tolerance is one-directional in effect (carrick#766). Looking BACK is
+   * free: a function starting before the anchor is one the anchor sits inside
+   * or just after, which is what an anchor recorded on a signature or body line
+   * means. Looking FORWARD is how the anchor reaches a handler that starts a
+   * line or two into the registration or binding it names — and it is also how,
+   * unguarded, an anchor landing on a statement that declares no function
+   * (`export { action, loader };`) was answered by the NEXT declaration in the
+   * file. That answer is silent: nothing about it says it came from a
+   * neighbouring helper.
+   *
+   * So a forward candidate must be one the anchor line's own statement leads
+   * to: rejected when a statement begins at or after the anchor line and does
+   * not contain it. Nothing but trivia may sit between the anchor and the
+   * function it is taken to name. With no candidate left the caller abstains,
+   * which is the honest answer and the one a consumer check can act on.
    */
   private findFunctionByLine(
     sourceFile: SourceFile,
     line: number
   ): FunctionLike | undefined {
     const LINE_TOLERANCE = 2;
-    const functions = sourceFile.getDescendants().filter(
-      (node): node is FunctionLike =>
+    const functions: FunctionLike[] = [];
+    /** Statements opening inside the forward window, in source order. */
+    const windowStatements: Node[] = [];
+    for (const node of sourceFile.getDescendants()) {
+      if (
         Node.isFunctionDeclaration(node) ||
         Node.isArrowFunction(node) ||
         Node.isFunctionExpression(node) ||
         Node.isMethodDeclaration(node)
-    );
+      ) {
+        functions.push(node);
+      }
+      if (Node.isStatement(node)) {
+        const start = node.getStartLineNumber();
+        if (start >= line && start <= line + LINE_TOLERANCE) {
+          windowStatements.push(node);
+        }
+      }
+    }
+
+    const separatedFromAnchor = (fn: FunctionLike): boolean =>
+      windowStatements.some(
+        (statement) =>
+          statement.getStartLineNumber() < fn.getStartLineNumber() &&
+          !(statement.getStart() <= fn.getStart() && statement.getEnd() >= fn.getEnd())
+      );
 
     let best: FunctionLike | undefined;
     let bestDelta = Infinity;
     for (const fn of functions) {
       const delta = Math.abs(fn.getStartLineNumber() - line);
       if (delta > LINE_TOLERANCE) continue;
+      if (fn.getStartLineNumber() > line && separatedFromAnchor(fn)) continue;
       const isCloser = delta < bestDelta;
       const isInnermostTie =
         delta === bestDelta &&
