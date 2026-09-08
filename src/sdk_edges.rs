@@ -476,11 +476,15 @@ fn pair_verdict(
         // the two types. A blob written before the field existed states
         // nothing, and nothing is what this edge then says.
         Some(verdict) => SdkVerdict {
-            type_compatible: Some(verdict.compatible),
-            mismatch_reason: if verdict.compatible {
-                None
-            } else {
+            // A stored `unverifiable` row carries no boolean at all
+            // (carrick#811), and there is none to invent here: `false` would
+            // read as a detected mismatch. Such a row still says what it says,
+            // through `resolved: false` and the reason beside it.
+            type_compatible: verdict.compatible,
+            mismatch_reason: if verdict.compatible == Some(false) {
                 verdict.mismatch_reason.clone()
+            } else {
+                None
             },
             resolved: verdict.resolved,
             unresolved_reason: verdict.unresolved_reason.clone(),
@@ -1321,7 +1325,12 @@ mod tests {
             producer_key: PRODUCER_KEY.to_string(),
             consumer_repo: "ledger-sdk".to_string(),
             consumer_key: "http|POST|/v1/payments".to_string(),
-            compatible,
+            verdict: Some(if compatible {
+                crate::operation::TypeVerdict::Compatible
+            } else {
+                crate::operation::TypeVerdict::Incompatible
+            }),
+            compatible: Some(compatible),
             mismatch_reason: (!compatible)
                 .then(|| "Property 'amountCents' is missing in type 'Payment'".to_string()),
             scanner_version: "0.0.0-test".to_string(),
