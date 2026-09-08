@@ -108,7 +108,8 @@ jobs:
         run: cargo test --test action_install_test --verbose
 
       # Fixture- and mock-driven; no live LLM, no env beyond what they set
-      # themselves. route_request_anchor_test needs the sidecar built above.
+      # themselves. route_request_anchor_test and span_locator_units_test need
+      # the sidecar built above.
       - name: Run fixture-driven extraction tests
         run: >-
           cargo test --verbose
@@ -132,6 +133,7 @@ jobs:
           --test socket_extraction_test
           --test socket_namespace_test
           --test socket_type_alias_test
+          --test span_locator_units_test
           --test workspace_member_callers_test
           --test workspace_package_client_test
 
