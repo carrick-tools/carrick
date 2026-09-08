@@ -211,6 +211,135 @@ pub fn type_declaration_line(
     })
 }
 
+// ============================================================================
+// The bundled `.d.ts` and its unresolved-alias placeholder
+// ============================================================================
+
+/// Trailing marker stamped onto every `= unknown` alias statement Carrick
+/// itself writes into the bundled `.d.ts`, for one meaning: **no shape reached
+/// the bundle for this alias**.
+///
+/// Two writers stamp it, for the same fact seen at two moments —
+/// [`append_alias_declaration`] when v1 was asked for an alias and could not
+/// answer, and [`append_missing_aliases`] when an alias never reached the
+/// bundle at all. Without the marker the first of those was indistinguishable
+/// from a developer-authored `type X = unknown` in a real API type, and a
+/// reader promoted it to a defined type (carrick#780).
+///
+/// A developer's own `= unknown` carries no marker and is therefore never
+/// mistaken for a placeholder: its edge keeps its resolved state rather than
+/// being silently downgraded (#244).
+pub const MISSING_ALIAS_MARKER: &str = "// carrick:missing-alias";
+
+/// Whether the bundled `.d.ts` carries any type-space declaration of `alias`
+/// (type, interface, class, enum, or namespace) — including the placeholder,
+/// which is a declaration like any other. Ask
+/// [`dts_alias_is_trivially_unknown`] to tell the two apart.
+pub fn dts_defines_alias(content: &str, alias: &str) -> bool {
+    let escaped = regex::escape(alias);
+    let pattern = format!(r"\b(type|interface|class|enum|namespace)\s+{}\b", escaped);
+    match regex::Regex::new(&pattern) {
+        Ok(re) => re.is_match(content),
+        Err(_) => false,
+    }
+}
+
+/// Whether the only statement the bundle carries for `alias` is a
+/// Carrick-injected placeholder — identified by [`MISSING_ALIAS_MARKER`] on the
+/// same line, never by the `= unknown` text alone.
+pub fn dts_alias_is_trivially_unknown(content: &str, alias: &str) -> bool {
+    let escaped = regex::escape(alias);
+    let marker = regex::escape(MISSING_ALIAS_MARKER);
+    // Anchor on the exact form the writers emit:
+    //   export type <alias> = unknown; // carrick:missing-alias
+    // The optional `export`, generics, and modifiers are tolerated, but the
+    // trailing marker on the same line is what actually identifies it as ours.
+    let pattern = format!(r"\btype\s+{escaped}\b[^\n]*=\s*unknown\s*;[^\n]*{marker}");
+    match regex::Regex::new(&pattern) {
+        Ok(re) => re.is_match(content),
+        Err(_) => false,
+    }
+}
+
+/// Append `export type <alias> = <type_string>;` to a bundled `.d.ts`.
+///
+/// A bare `unknown` type string is not a shape — it is the writer saying it has
+/// none — so the statement is stamped with [`MISSING_ALIAS_MARKER`]. Every
+/// alias statement Carrick composes goes through here so that the marker
+/// cannot be forgotten at one of the sites; the bundler's own extracted
+/// declarations (which carry real source text) do not.
+pub fn append_alias_declaration(dts: &mut String, alias: &str, type_string: &str) {
+    let body = type_string.trim().trim_end_matches(';');
+    if !dts.is_empty() && !dts.ends_with('\n') {
+        dts.push('\n');
+    }
+    dts.push_str("export type ");
+    dts.push_str(alias);
+    dts.push_str(" = ");
+    dts.push_str(body);
+    dts.push(';');
+    if body.trim() == "unknown" {
+        dts.push(' ');
+        dts.push_str(MISSING_ALIAS_MARKER);
+    }
+    dts.push('\n');
+}
+
+/// Replace an alias's placeholder statement with a real type, marker and all.
+///
+/// Returns `false` when the bundle has no placeholder for `alias` (either it
+/// carries a real declaration already, or it says nothing about the alias), so
+/// the caller can append instead. The marker goes with the `= unknown` it
+/// described: leaving it behind would leave the bundle stating "no shape
+/// reached the bundle" on a line that now carries one.
+pub fn replace_unresolved_alias(content: &mut String, alias: &str, type_string: &str) -> bool {
+    let escaped = regex::escape(alias);
+    let marker = regex::escape(MISSING_ALIAS_MARKER);
+    let pattern = format!(r"export\s+type\s+{escaped}\s*=\s*unknown\s*;[^\S\n]*(?:{marker})?");
+    let Ok(re) = regex::Regex::new(&pattern) else {
+        return false;
+    };
+    if !re.is_match(content) {
+        return false;
+    }
+    let replacement = format!(
+        "export type {} = {};",
+        alias,
+        type_string.trim().trim_end_matches(';')
+    );
+    *content = re.replace(content, replacement.as_str()).to_string();
+    true
+}
+
+/// Append a marked `= unknown` placeholder for every manifest alias the bundle
+/// says nothing about, so that "no shape reached the bundle" is stated for the
+/// alias rather than left to a reader to infer from the alias's absence.
+pub fn append_missing_aliases(
+    content: String,
+    manifest: Option<&Vec<crate::cloud_storage::TypeManifestEntry>>,
+) -> String {
+    let Some(entries) = manifest else {
+        return content;
+    };
+
+    let mut updated = content;
+    let mut seen = std::collections::HashSet::new();
+
+    for entry in entries {
+        if !seen.insert(entry.type_alias.clone()) {
+            continue;
+        }
+
+        if dts_defines_alias(&updated, &entry.type_alias) {
+            continue;
+        }
+
+        append_alias_declaration(&mut updated, &entry.type_alias, "unknown");
+    }
+
+    updated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +479,149 @@ mod tests {
             build_display_name(&OperationKey::http("DELETE", "/items/:id"), "Response"),
             "DELETE /items/:id → Response"
         );
+    }
+
+    // ---- carrick#780: the placeholder says which it is ---------------------
+
+    /// A bare `unknown` is Carrick saying it has no shape, and says so in the
+    /// text. A real type string is a shape and carries no marker — otherwise
+    /// every resolved inline alias would read as unresolved.
+    #[test]
+    fn only_a_bare_unknown_declaration_carries_the_marker() {
+        let mut dts = String::new();
+        append_alias_declaration(&mut dts, "Endpoint_abc_Response", "unknown");
+        append_alias_declaration(&mut dts, "Endpoint_def_Response", "{ id: string }");
+        append_alias_declaration(&mut dts, "Endpoint_ghi_Response", "unknown;");
+
+        assert!(
+            dts_alias_is_trivially_unknown(&dts, "Endpoint_abc_Response"),
+            "the placeholder must be readable as one: {dts}"
+        );
+        assert!(
+            dts_alias_is_trivially_unknown(&dts, "Endpoint_ghi_Response"),
+            "a trailing semicolon in the type string is the same statement: {dts}"
+        );
+        assert!(
+            !dts_alias_is_trivially_unknown(&dts, "Endpoint_def_Response"),
+            "a resolved shape must never be marked: {dts}"
+        );
+        assert!(
+            dts_defines_alias(&dts, "Endpoint_abc_Response"),
+            "the placeholder is still a declaration the bundle can compile"
+        );
+        assert_eq!(
+            dts.matches(MISSING_ALIAS_MARKER).count(),
+            2,
+            "one marker per placeholder, none elsewhere: {dts}"
+        );
+    }
+
+    /// A developer's own `type X = unknown` in a real API type is not a
+    /// placeholder, in any of the forms it can be written (#244).
+    #[test]
+    fn an_authored_unknown_is_never_read_as_the_placeholder() {
+        for form in [
+            "export type OrderView = unknown;\n",
+            "type OrderView = unknown;\n",
+            "export type OrderView<T> = unknown;\n",
+            "export declare type OrderView = unknown;\n",
+            "export type OrderView = unknown; // genuinely unknown\n",
+        ] {
+            assert!(
+                !dts_alias_is_trivially_unknown(form, "OrderView"),
+                "authored form must not match the placeholder gate: {form:?}"
+            );
+        }
+    }
+
+    /// When an inline alias arrives with the real type, it replaces the
+    /// placeholder statement AND the marker: a line carrying a shape must not
+    /// go on saying no shape reached the bundle.
+    #[test]
+    fn replacing_a_placeholder_takes_the_marker_with_it() {
+        let mut dts = String::new();
+        append_alias_declaration(&mut dts, "OrderView", "unknown");
+        append_alias_declaration(&mut dts, "Payment", "unknown");
+
+        assert!(replace_unresolved_alias(
+            &mut dts,
+            "OrderView",
+            "{ id: string }"
+        ));
+
+        assert!(
+            dts.contains("export type OrderView = { id: string };"),
+            "the real type must land: {dts}"
+        );
+        assert!(
+            !dts_alias_is_trivially_unknown(&dts, "OrderView"),
+            "the replaced alias must stop reading as unresolved: {dts}"
+        );
+        assert_eq!(
+            dts.matches(MISSING_ALIAS_MARKER).count(),
+            1,
+            "only the untouched placeholder keeps its marker: {dts}"
+        );
+        assert!(
+            !replace_unresolved_alias(&mut dts, "OrderView", "{ id: number }"),
+            "a line that already carries a shape is not a placeholder to replace"
+        );
+    }
+
+    /// The two writers agree: an alias that never reached the bundle gets the
+    /// same statement, in the same form, as one v1 was asked for and could not
+    /// answer.
+    #[test]
+    fn a_missing_alias_gets_the_same_statement_as_an_unresolved_one() {
+        let mut asked = String::new();
+        append_alias_declaration(&mut asked, "OrderView", "unknown");
+
+        let missing = append_missing_aliases(String::new(), Some(&vec![entry("OrderView")]));
+
+        assert_eq!(asked, missing);
+        assert!(dts_alias_is_trivially_unknown(&missing, "OrderView"));
+    }
+
+    /// An alias the bundle already declares keeps its declaration.
+    #[test]
+    fn append_missing_aliases_leaves_a_declared_alias_alone() {
+        let dts = "export interface Payment { id: string }\n".to_string();
+
+        let out = append_missing_aliases(dts, Some(&vec![entry("Payment")]));
+
+        assert!(!out.contains("Payment = unknown"), "got: {out}");
+        assert!(!dts_alias_is_trivially_unknown(&out, "Payment"));
+    }
+
+    fn entry(type_alias: &str) -> crate::cloud_storage::TypeManifestEntry {
+        use crate::cloud_storage::{
+            ManifestRole, ManifestTypeKind, ManifestTypeState, TypeEvidence, TypeManifestEntry,
+        };
+        let evidence = TypeEvidence {
+            file_path: "lib/api.ts".to_string(),
+            span_start: None,
+            span_end: None,
+            line_number: 5,
+            infer_kind: crate::services::type_sidecar::InferKind::CallResult,
+            is_explicit: false,
+            type_state: ManifestTypeState::Unknown,
+        };
+        TypeManifestEntry {
+            key: OperationKey::http("GET", "/orders/:id"),
+            role: ManifestRole::Consumer,
+            type_kind: ManifestTypeKind::Response,
+            type_alias: type_alias.to_string(),
+            file_path: "lib/api.ts".to_string(),
+            line_number: 5,
+            is_explicit: false,
+            type_state: ManifestTypeState::Unknown,
+            evidence,
+            resolved_definition: None,
+            expanded_definition: None,
+            primary_type_symbol: None,
+            defined_in: None,
+            any_provenance: Vec::new(),
+            v1_unresolved: false,
+        }
     }
 }

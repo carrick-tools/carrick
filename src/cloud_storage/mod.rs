@@ -135,6 +135,24 @@ pub struct TypeManifestEntry {
     /// guessing, and an entry with no type at all has nothing to walk.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub any_provenance: Vec<crate::services::type_sidecar::TypeProvenance>,
+    /// The v1 side was ASKED for this alias and had no shape to give
+    /// (carrick#780) — the bundle carries only Carrick's own marked
+    /// `= unknown` placeholder for it.
+    ///
+    /// Recorded rather than re-derived, because it is the one fact that says
+    /// which side answered: `type_state` used to become `Implicit` here purely
+    /// because the placeholder statement read like a declaration, and an entry
+    /// then published a capture answer as though v1 had produced it. The
+    /// capture is still consulted for these — it is the layer that resolves
+    /// what v1 could not, and a handful of real shapes come from exactly this
+    /// path — but the state it earns is now the capture's own.
+    ///
+    /// Scan-local: every scan rebuilds the manifest and re-enriches it before
+    /// anything reads this, so it is deliberately not serialized into the index
+    /// blob. Publishing it (so a reader could be told which layer answered) is
+    /// a blob-contract question, not a scanner-internal one.
+    #[serde(skip)]
+    pub v1_unresolved: bool,
 }
 
 /// The declaration site of a manifest entry's anchor symbol (carrick#649).
@@ -956,6 +974,7 @@ mod tests {
             primary_type_symbol: None,
             defined_in: None,
             any_provenance: Vec::new(),
+            v1_unresolved: false,
         };
 
         let json: serde_json::Value = serde_json::to_value(&entry).unwrap();

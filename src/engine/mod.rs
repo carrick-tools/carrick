@@ -23,8 +23,9 @@ use crate::services::{
 };
 use crate::signature_pass::populate_function_signatures;
 use crate::type_manifest::{
-    build_manifest_type_alias_with_site_id, build_site_id, is_http_method,
-    normalize_manifest_method, parse_file_location,
+    append_missing_aliases, build_manifest_type_alias_with_site_id, build_site_id,
+    dts_alias_is_trivially_unknown, dts_defines_alias, is_http_method, normalize_manifest_method,
+    parse_file_location,
 };
 use crate::url_normalizer::UrlNormalizer;
 use crate::utils::get_repository_name;
@@ -2675,6 +2676,7 @@ fn add_protocol_manifest_entry(
         primary_type_symbol,
         defined_in: None,
         any_provenance: Vec::new(),
+        v1_unresolved: false,
     });
 }
 
@@ -3655,21 +3657,7 @@ fn resolve_per_endpoint_definitions(
     // it is exactly the entry the definition resolution below skips.
     stamp_capture_provenance(manifest, stub_dir);
 
-    // Collect unique aliases that have actual types (not Unknown).
-    //
-    // A `BTreeSet`, not a `HashSet`: the sidecar resolves the aliases in the
-    // order they arrive, and the compiler hands out type ids in the order it
-    // creates types, so the request order used to reach the printed form of a
-    // union (carrick#735). A `HashSet` iterates under a per-process random
-    // seed, which made that order — and the bytes of the request — differ
-    // between two runs of the same binary over an unchanged tree.
-    let aliases: Vec<String> = manifest
-        .iter()
-        .filter(|e| e.type_state != ManifestTypeState::Unknown)
-        .map(|e| e.type_alias.clone())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let aliases = aliases_to_resolve(manifest);
 
     if aliases.is_empty() {
         return;
@@ -3682,23 +3670,92 @@ fn resolve_per_endpoint_definitions(
 
     match sidecar.resolve_definitions(&stub_dir.to_string_lossy(), &aliases) {
         Ok(resolved) => {
-            let lookup: std::collections::HashMap<String, _> = resolved
-                .into_iter()
-                .map(|r| (r.type_alias.clone(), r))
-                .collect();
-            for entry in manifest.iter_mut() {
-                if let Some(r) = lookup.get(&entry.type_alias) {
-                    entry.resolved_definition = Some(r.definition.clone());
-                    entry.expanded_definition = Some(r.expanded.clone());
-                }
-            }
-            debug!("Resolved {} type definition(s)", lookup.len());
+            let count = apply_resolved_definitions(manifest, resolved);
+            debug!("Resolved {} type definition(s)", count);
         }
         Err(e) => {
             warn!("Per-endpoint definition resolution failed: {}", e);
             debug!("Continuing without resolved definitions (MCP will use regex fallback)");
         }
     }
+}
+
+/// The aliases to ask the capture stub about: every entry carrying a type, plus
+/// every entry the v1 side abstained on (carrick#780).
+///
+/// The second half is the division of labour the capture exists for — an infer
+/// anchor is derived precisely for the aliases v1 inference could not resolve —
+/// and it used to happen by accident, because v1's unmarked placeholder read as
+/// a declaration and left the entry `Implicit`. Marking the placeholder without
+/// asking here would have silently dropped the shapes the capture does resolve.
+///
+/// A `BTreeSet`, not a `HashSet`: the sidecar resolves the aliases in the order
+/// they arrive, and the compiler hands out type ids in the order it creates
+/// types, so the request order used to reach the printed form of a union
+/// (carrick#735). A `HashSet` iterates under a per-process random seed, which
+/// made that order — and the bytes of the request — differ between two runs of
+/// the same binary over an unchanged tree.
+fn aliases_to_resolve(manifest: &[TypeManifestEntry]) -> Vec<String> {
+    manifest
+        .iter()
+        .filter(|e| e.type_state != ManifestTypeState::Unknown || e.v1_unresolved)
+        .map(|e| e.type_alias.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Write the capture's answers onto the manifest, and let a real shape settle
+/// the state of an entry the v1 side abstained on.
+///
+/// Two different questions are asked of the capture's answer for such an entry,
+/// and they have different thresholds:
+///
+///  - **is there anything to publish?** An answer that is itself a bare `any`
+///    or `unknown` describes nothing, so it is not written: the entry keeps no
+///    definition, reads `Unknown`, and its `any_provenance` says why. Writing
+///    it would publish `any` — "this endpoint accepts anything" — where the
+///    truth is "no layer could see this type". A shape with a top type
+///    somewhere INSIDE it still describes a payload and is published, with its
+///    provenance (carrick#376).
+///  - **does it settle the state?** Only a shape with no disqualifying top type
+///    anywhere in it, the same notion the check phase uses. That promotion is
+///    scoped to entries the v1 side abstained on; `type_state` reflecting the
+///    capture surface for entries v1 DID answer is carrick#449 and is untouched
+///    here.
+///
+/// Returns how many aliases the capture answered for.
+fn apply_resolved_definitions(
+    manifest: &mut [TypeManifestEntry],
+    resolved: Vec<crate::services::type_sidecar::ResolvedDefinitionResult>,
+) -> usize {
+    let lookup: HashMap<String, _> = resolved
+        .into_iter()
+        .map(|r| (r.type_alias.clone(), r))
+        .collect();
+    for entry in manifest.iter_mut() {
+        let Some(r) = lookup.get(&entry.type_alias) else {
+            continue;
+        };
+        let v1_abstained = entry.v1_unresolved && entry.type_state == ManifestTypeState::Unknown;
+
+        if v1_abstained
+            && (r.expanded.trim().is_empty() || type_compat_v2::text_is_bare_top_type(&r.expanded))
+        {
+            continue;
+        }
+
+        entry.resolved_definition = Some(r.definition.clone());
+        entry.expanded_definition = Some(r.expanded.clone());
+
+        if v1_abstained && !type_compat_v2::contains_disqualifying_top_type(&r.expanded) {
+            entry.is_explicit = false;
+            entry.type_state = ManifestTypeState::Implicit;
+            entry.evidence.is_explicit = false;
+            entry.evidence.type_state = ManifestTypeState::Implicit;
+        }
+    }
+    lookup.len()
 }
 
 /// Join the capture self-check's `any`/`unknown` findings onto the manifest.
@@ -4010,6 +4067,7 @@ fn add_manifest_pair(
             primary_type_symbol: None,
             defined_in: None,
             any_provenance: Vec::new(),
+            v1_unresolved: false,
         });
     }
 }
@@ -4107,10 +4165,10 @@ fn enrich_manifest_with_type_resolution(
     };
 
     // A type is genuinely unresolved when it resolves to `unknown`/`any`/empty,
-    // or when the bundled .d.ts only carries the trivial `= unknown` placeholder
-    // that append_missing_aliases injects for a missing alias. Either way the
-    // shape never reached the bundle, so the entry must read `Unknown` — never a
-    // promoted state that asserts a shape we don't actually have.
+    // or when the bundled .d.ts only carries the marked `= unknown` placeholder
+    // Carrick writes for an alias no shape reached. Either way the shape never
+    // reached the bundle, so the entry must read `Unknown` — never a promoted
+    // state that asserts a shape we don't actually have.
     let dts_trivially_unknown = |alias: &str| {
         bundled_dts
             .map(|dts| dts_alias_is_trivially_unknown(dts, alias))
@@ -4119,6 +4177,16 @@ fn enrich_manifest_with_type_resolution(
 
     // Update manifest entries
     for entry in manifest.iter_mut() {
+        // The v1 side was asked for this alias and answered with a placeholder.
+        // Recorded on the entry because the two facts that follow from it are
+        // read at different moments: the state below (which must not claim a
+        // shape v1 does not have) and the capture consultation in
+        // `resolve_per_endpoint_definitions` (which must still happen — the
+        // capture is the layer that resolves what v1 could not). An alias the
+        // bundle says NOTHING about is a different fact: no v1 request was ever
+        // built for it, so there is nothing for it to have abstained from.
+        entry.v1_unresolved = dts_trivially_unknown(&entry.type_alias);
+
         // Fill the deterministic anchor ONLY when the LLM left it unset, so the
         // ops where the model already emitted a correct symbol (POST /payments,
         // socket) are never regressed. Stamping runs before enrichment, so any
@@ -4519,76 +4587,11 @@ async fn build_cross_repo_analyzer(
     Ok(analyzer)
 }
 
-/// Trailing marker stamped onto every `= unknown` alias that
-/// `append_missing_aliases` injects for a manifest entry that never reached the
-/// bundle. It lets `dts_alias_is_trivially_unknown` recognise *our* placeholder
-/// without misclassifying a developer-authored `type X = unknown` in a real API
-/// type (which keeps its resolved shape rather than being downgraded).
-const MISSING_ALIAS_MARKER: &str = "// carrick:missing-alias";
-
-fn append_missing_aliases(content: String, manifest: Option<&Vec<TypeManifestEntry>>) -> String {
-    let Some(entries) = manifest else {
-        return content;
-    };
-
-    let mut updated = content;
-    let mut seen = std::collections::HashSet::new();
-
-    for entry in entries {
-        if !seen.insert(entry.type_alias.clone()) {
-            continue;
-        }
-
-        if dts_defines_alias(&updated, &entry.type_alias) {
-            continue;
-        }
-
-        if !updated.is_empty() && !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        updated.push_str("export type ");
-        updated.push_str(&entry.type_alias);
-        updated.push_str(" = unknown; ");
-        updated.push_str(MISSING_ALIAS_MARKER);
-        updated.push('\n');
-    }
-
-    updated
-}
-
-fn dts_defines_alias(content: &str, alias: &str) -> bool {
-    let escaped = regex::escape(alias);
-    let pattern = format!(r"\b(type|interface|class|enum|namespace)\s+{}\b", escaped);
-    match regex::Regex::new(&pattern) {
-        Ok(re) => re.is_match(content),
-        Err(_) => false,
-    }
-}
-
-/// Returns true only when the .d.ts carries the *Carrick-injected* `= unknown`
-/// placeholder for this alias, identified by the `MISSING_ALIAS_MARKER` comment
-/// that `append_missing_aliases` stamps on it. A developer-authored
-/// `type X = unknown` in a real API type carries no marker and is therefore not
-/// treated as a placeholder, so its cross-repo edge keeps its resolved state
-/// instead of being silently downgraded to `Unknown` (#244).
-fn dts_alias_is_trivially_unknown(content: &str, alias: &str) -> bool {
-    let escaped = regex::escape(alias);
-    let marker = regex::escape(MISSING_ALIAS_MARKER);
-    // Anchor on the exact form append_missing_aliases emits:
-    //   export type <alias> = unknown; // carrick:missing-alias
-    // The optional `export`, generics, and modifiers are tolerated, but the
-    // trailing marker on the same line is what actually identifies it as ours.
-    let pattern = format!(r"\btype\s+{escaped}\b[^\n]*=\s*unknown\s*;[^\n]*{marker}");
-    match regex::Regex::new(&pattern) {
-        Ok(re) => re.is_match(content),
-        Err(_) => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzer::ApiEndpointDetails;
+    use crate::type_manifest::MISSING_ALIAS_MARKER;
 
     /// The incremental upload path stamps the running release, same as the
     /// full-analysis path. Miss it here and every incremental scan — the common
@@ -4986,6 +4989,7 @@ mod tests {
                 primary_type_symbol: None,
                 defined_in: None,
                 any_provenance: Vec::new(),
+                v1_unresolved: false,
             }]),
             file_results: Some(file_results),
             cached_detection: None,
@@ -6902,6 +6906,7 @@ mod tests {
             primary_type_symbol: None,
             defined_in: None,
             any_provenance: Vec::new(),
+            v1_unresolved: false,
         }
     }
 
@@ -7131,6 +7136,56 @@ mod tests {
         );
     }
 
+    /// carrick#780, case (a): the statement the v1 side writes when it was
+    /// ASKED for an alias and has no shape. Composed here by the writer itself,
+    /// so the test states the real coupling: whatever
+    /// `append_alias_declaration` emits for a bare `unknown` must read as
+    /// unresolved, not as a declaration. Unmarked, this promoted 212 entries of
+    /// one indexed service to `Implicit` on the strength of a placeholder.
+    #[test]
+    fn enrich_reads_the_v1_placeholder_as_unresolved() {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        let resolution = empty_resolution();
+        let mut dts = String::new();
+        crate::type_manifest::append_alias_declaration(&mut dts, "OrderView", "unknown");
+
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, Some(&dts));
+
+        assert_eq!(
+            manifest[0].type_state,
+            ManifestTypeState::Unknown,
+            "v1's own placeholder must not read as a defined type: {dts}"
+        );
+        assert!(
+            manifest[0].v1_unresolved,
+            "the entry must record that the v1 side abstained, so the capture is still asked"
+        );
+        assert_eq!(
+            aliases_to_resolve(&manifest),
+            vec!["OrderView".to_string()],
+            "an alias v1 abstained on is exactly the one the capture exists to answer"
+        );
+    }
+
+    /// carrick#780, case (b): a *developer-authored* `type X = unknown` reaching
+    /// the bundle as the real declaration of a real API type. It carries no
+    /// marker, nobody abstained, and the entry keeps the state its resolution
+    /// gave it.
+    #[test]
+    fn enrich_does_not_read_an_authored_unknown_as_an_abstention() {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        let resolution = empty_resolution();
+        let authored = "export type OrderView = unknown;\n";
+
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, Some(authored));
+
+        assert!(
+            !manifest[0].v1_unresolved,
+            "a developer's own `= unknown` is not the v1 side abstaining"
+        );
+        assert_ne!(manifest[0].type_state, ManifestTypeState::Unknown);
+    }
+
     /// The Carrick-injected `= unknown` placeholder (carrying the marker) in the
     /// bundled .d.ts must NOT promote the entry, even if the bundle nominally
     /// "defines" the alias — it is downgraded to `Unknown` (#235).
@@ -7213,6 +7268,99 @@ mod tests {
         assert!(
             dts_alias_is_trivially_unknown(&out, "OrderView"),
             "the injected marker must be detected by the placeholder gate, got: {out}"
+        );
+    }
+
+    // ---- carrick#780: what the capture's answer settles ---------------------
+
+    fn captured(
+        alias: &str,
+        expanded: &str,
+    ) -> crate::services::type_sidecar::ResolvedDefinitionResult {
+        crate::services::type_sidecar::ResolvedDefinitionResult {
+            type_alias: alias.to_string(),
+            definition: expanded.to_string(),
+            expanded: expanded.to_string(),
+        }
+    }
+
+    /// An entry the v1 side abstained on is answered by the capture, and a real
+    /// shape from there settles its state. This is the path the 2 genuinely
+    /// resolved rows of one indexed service's 212 came down; marking the
+    /// placeholder without it would have dropped them.
+    #[test]
+    fn a_real_capture_shape_settles_a_v1_abstention() {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        manifest[0].v1_unresolved = true;
+
+        let count = apply_resolved_definitions(
+            &mut manifest,
+            vec![captured("OrderView", "{ bulkActionId: string; }")],
+        );
+
+        assert_eq!(count, 1);
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Implicit);
+        assert!(!manifest[0].is_explicit, "the capture inferred it");
+        assert_eq!(manifest[0].evidence.type_state, ManifestTypeState::Implicit);
+    }
+
+    /// A capture answer that IS a top type describes nothing, so an entry v1
+    /// abstained on publishes no definition at all rather than the word `any`.
+    /// 210 of one indexed service's 212 rows are exactly this: the bundle said
+    /// `unknown`, the capture said `any`, and the row read `Implicit`.
+    #[test]
+    fn a_shapeless_capture_answer_publishes_nothing() {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        manifest[0].v1_unresolved = true;
+
+        apply_resolved_definitions(&mut manifest, vec![captured("OrderView", "any")]);
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+        assert_eq!(
+            manifest[0].resolved_definition, None,
+            "`any` is not a contract to publish; the row's provenance says why there is none"
+        );
+        assert_eq!(manifest[0].expanded_definition, None);
+    }
+
+    /// A shape with a top type inside it still describes a payload: it is
+    /// published (its `any_provenance` names the decayed members, carrick#376)
+    /// but it does not settle the state.
+    #[test]
+    fn a_partly_decayed_capture_shape_is_published_but_stays_unknown() {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        manifest[0].v1_unresolved = true;
+
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured("OrderView", "{ id: string; payload: any; }")],
+        );
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+        assert_eq!(
+            manifest[0].expanded_definition.as_deref(),
+            Some("{ id: string; payload: any; }"),
+            "a shape is worth publishing even when it cannot settle the state"
+        );
+    }
+
+    /// The promotion is scoped to entries v1 abstained on. An entry that is
+    /// `Unknown` for any other reason keeps that state whatever the capture
+    /// says; reflecting the capture surface generally is carrick#449.
+    #[test]
+    fn the_capture_does_not_promote_an_entry_v1_never_abstained_on() {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        assert!(!manifest[0].v1_unresolved);
+
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured("OrderView", "{ id: string; }")],
+        );
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+        assert_eq!(
+            manifest[0].resolved_definition.as_deref(),
+            Some("{ id: string; }")
         );
     }
 

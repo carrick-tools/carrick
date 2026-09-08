@@ -6591,20 +6591,14 @@ impl FileOrchestrator {
             if !seen.insert(alias.clone()) {
                 continue;
             }
-            if Self::dts_defines_alias(&combined, &alias) {
-                if Self::replace_unknown_alias(&mut combined, &alias, &type_string) {
-                    continue;
-                }
+            if crate::type_manifest::dts_defines_alias(&combined, &alias) {
+                // Either the placeholder is replaced by this real type (marker
+                // and all), or the bundle already carries a real declaration
+                // and the inline alias has nothing to add.
+                crate::type_manifest::replace_unresolved_alias(&mut combined, &alias, &type_string);
                 continue;
             }
-            if !combined.is_empty() && !combined.ends_with('\n') {
-                combined.push('\n');
-            }
-            combined.push_str("export type ");
-            combined.push_str(&alias);
-            combined.push_str(" = ");
-            combined.push_str(type_string.trim().trim_end_matches(';'));
-            combined.push_str(";\n");
+            crate::type_manifest::append_alias_declaration(&mut combined, &alias, &type_string);
         }
 
         if !combined.is_empty() {
@@ -6880,33 +6874,6 @@ impl FileOrchestrator {
             dir = d.parent();
         }
         None
-    }
-
-    fn dts_defines_alias(content: &str, alias: &str) -> bool {
-        let escaped = regex::escape(alias);
-        let pattern = format!(r"\b(type|interface|class|enum|namespace)\s+{}\b", escaped);
-        match regex::Regex::new(&pattern) {
-            Ok(re) => re.is_match(content),
-            Err(_) => false,
-        }
-    }
-
-    fn replace_unknown_alias(content: &mut String, alias: &str, type_string: &str) -> bool {
-        let escaped = regex::escape(alias);
-        let pattern = format!(r"export\s+type\s+{}\s*=\s*unknown\s*;", escaped);
-        let Ok(re) = regex::Regex::new(&pattern) else {
-            return false;
-        };
-        if !re.is_match(content) {
-            return false;
-        }
-        let replacement = format!(
-            "export type {} = {};",
-            alias,
-            type_string.trim().trim_end_matches(';')
-        );
-        *content = re.replace(content, replacement).to_string();
-        true
     }
 
     fn normalize_consumer_method(method: Option<&str>) -> Option<String> {
