@@ -22,7 +22,8 @@
 //!   carry verb decorators but whose declaration states no prefix, and a route
 //!   REGISTRATION whose prefix comes from the environment (carrick#744: the
 //!   binding's declared default is a path, so the base is not an origin and
-//!   the registration is not a call).
+//!   the registration is not a call), and a class carrying two argument-less
+//!   decorators from the verbs' own module, which state two prefixes.
 //! - `new-url-target`: `catalogue.ts:13`, the inline decoy, which states its
 //!   own target and reaches no URL constructor.
 //! - `imported-request-member`: `legacy.ts`'s local call, which resolves
@@ -410,10 +411,40 @@ fn a_silent_model_keeps_every_decorator_route() {
     }
     assert_eq!(
         endpoints.len(),
-        3,
+        6,
         "neither decoy class states a prefix the verbs' own module supplies, and a \
          `@Trace()` method is not a route: {endpoints:#?}"
     );
+}
+
+/// carrick#804, settling carrick#743: a routing decorator called with NO
+/// argument states the empty prefix, and `@Sse` states a GET.
+///
+/// Read against the same empty cassette as the routes above, because the point
+/// is that these are the source's own statements: before this the class
+/// contributed nothing deterministic and its routes were the model's, which is
+/// how a path the application does not serve reached the index as an endpoint.
+#[test]
+fn a_silent_model_keeps_the_routes_of_an_implicitly_prefixed_class() {
+    let endpoints = rows(&empty_scan("demo-services-shape"), "endpoints");
+
+    for (line, method, path, handler) in [
+        (14, "GET", "/", "getHello"),
+        (19, "GET", "/health", "getHealth"),
+        (29, "GET", "/realtime/stream", "stream"),
+    ] {
+        let row = row_at(&endpoints, "src/app.controller.ts", line);
+        assert_eq!(row["method"], method, "method at line {line}");
+        assert_eq!(row["path"], path, "path at line {line}");
+        assert_eq!(row["handler"], handler, "handler at line {line}");
+        assert_eq!(
+            row["resolution_source"], "decorator_route",
+            "source at line {line}"
+        );
+    }
+    // The decoy: two argument-less decorators from the verbs' own module state
+    // two prefixes, so the class states none.
+    assert_none_at(&endpoints, "src/decoys.ts", 72);
 }
 
 /// carrick#733: a request whose origin is an env-backed binding and whose path
@@ -731,7 +762,54 @@ fn a_model_answer_at_a_decorator_route_keeps_the_decorators_as_the_source() {
     );
     assert_eq!(
         endpoints.len(),
-        3,
+        6,
+        "the model's row folded rather than doubling the route: {endpoints:#?}"
+    );
+}
+
+/// The model's answer for the same route, naming it after the handler: the
+/// exact row carrick#804 was filed on. `@Get()` under `@Controller()` serves
+/// `/`, and `GET /getHello` is a path the application does not serve.
+const HANDLER_NAMED_ROUTE: &str = r#"{"mounts":[],"data_calls":[],"endpoints":[{
+    "candidate_id":"@line:13","line_number":13,"owner_node":"app","method":"GET",
+    "path":"/getHello","handler_name":"getHello","pattern_matched":"@Get",
+    "payload_expression_text":null,"payload_expression_line":null,
+    "response_expression_text":"hello","response_expression_line":15,
+    "primary_type_symbol":null,"type_import_source":null}]}"#;
+
+/// carrick#804: a model row that contradicts the DECLARATION it sits inside is
+/// corrected by it, not published beside it.
+///
+/// A decorated method's span opens at its first decorator and the model answers
+/// at the decorator's own call, so the model's row sits strictly inside the
+/// deterministic row's span. That containment is what says the two are the same
+/// registration, however far apart their paths are — and the source that read
+/// the path off the declaration is the one that wins.
+#[test]
+fn a_model_route_named_after_its_handler_is_corrected_by_the_declaration() {
+    let dir = cassette("demo-services-shape", &|stem| match stem {
+        "app.controller" => HANDLER_NAMED_ROUTE.to_string(),
+        _ => NOTHING.to_string(),
+    });
+    let endpoints = rows(&scan("demo-services-shape", dir.path()), "endpoints");
+
+    let joined = row_at(&endpoints, "src/app.controller.ts", 13);
+    assert_eq!(joined["method"], "GET");
+    assert_eq!(
+        joined["path"], "/",
+        "the declaration states the path, not the handler's name"
+    );
+    assert_eq!(
+        joined["resolution_source"], "decorator_route",
+        "a corrected row is stated by the decorators"
+    );
+    assert!(
+        !endpoints.iter().any(|row| row["path"] == "/getHello"),
+        "an invented route must not reach the index beside the real one: {endpoints:#?}"
+    );
+    assert_eq!(
+        endpoints.len(),
+        6,
         "the model's row folded rather than doubling the route: {endpoints:#?}"
     );
 }

@@ -1699,6 +1699,29 @@ const VERB_NAMED_METHODS: &[&str] = &["get", "post", "put", "patch", "delete", "
 /// A module specifier can never be this: it is not a path.
 const LOCAL_DECORATOR_ORIGIN: &str = "<declared in this module>";
 
+/// The HTTP method a ROUTE DECORATOR's name states, or `None` when the name
+/// states no method.
+///
+/// The seven verbs [`VERB_NAMED_METHODS`] holds, plus one more word: `sse`.
+/// A server-sent-events route is served over an ordinary GET whose response
+/// is a stream, so a decorator named after it states a route and states GET —
+/// and until it is read here such a route can only ever be the model's
+/// reading, which means it can never enforce.
+///
+/// `sse` is protocol vocabulary, the same standing `publish` and `subscribe`
+/// already have in the pub/sub gate: a transport's own name for a thing, not a
+/// library's. No package supplies it and no list of libraries is consulted
+/// here. This is deliberately narrower than the method NAME rule
+/// [`VERB_NAMED_METHODS`] serves: a method merely NAMED `sse` is not a route,
+/// while a decorator is a registration by construction.
+fn decorator_http_method(decorator_name: &str) -> Option<String> {
+    let name = decorator_name.trim().to_lowercase();
+    if VERB_NAMED_METHODS.contains(&name.as_str()) {
+        return Some(name.to_uppercase());
+    }
+    (name == "sse").then(|| "GET".to_string())
+}
+
 /// The cooked text of one template-literal chunk, falling back to its raw
 /// text when the chunk carries an escape the parser did not cook.
 fn quasi_text(quasi: &TplElement) -> String {
@@ -1835,18 +1858,18 @@ impl DecoratorRouteVisitor {
                 let Some((decorator_name, args)) = decorator_call(decorator) else {
                     continue;
                 };
-                // The seven verbs, not every method [`is_http_method`]
-                // accepts: `@Trace()` and `@Connect()` are far likelier to be
-                // observability or lifecycle than a route, which is the same
-                // call `VERB_NAMED_METHODS` already makes for method NAMES.
-                if !VERB_NAMED_METHODS.contains(&decorator_name.to_lowercase().as_str()) {
+                // Not every method [`is_http_method`] accepts: `@Trace()` and
+                // `@Connect()` are far likelier to be observability or
+                // lifecycle than a route, which is the same call
+                // `VERB_NAMED_METHODS` already makes for method NAMES.
+                let Some(http_method) = decorator_http_method(&decorator_name) else {
                     continue;
-                }
+                };
                 let Some(path) = decorator_string_argument(args) else {
                     continue;
                 };
                 methods.push(VerbDecoratedMethod {
-                    http_method: decorator_name.trim().to_uppercase(),
+                    http_method,
                     path,
                     decorator_origin: self.origin(&decorator_name),
                     name: name.clone(),
@@ -1879,44 +1902,88 @@ impl DecoratorRouteVisitor {
     /// The routing decorator is the one that comes from the same place as the
     /// verbs on the methods. That is what tells `@Controller("api/users")`
     /// from the `@ApiTags("people")` beside it, without either name appearing
-    /// here — and it is checked even when only one class decorator carries a
-    /// string, because a class whose prefix decorator takes NO argument
-    /// (`@Controller()`) would otherwise hand its routes a documentation
-    /// tag's string as a prefix.
+    /// here.
     ///
-    /// Two candidates from a verb's own module state two prefixes, and the
-    /// class states nothing: the same "two statements disagree, so drop" rule
-    /// the rest of the scanner applies.
-    fn class_prefix(&self, class: &Class, methods: &[VerbDecoratedMethod]) -> Option<String> {
+    /// Two tiers, and the first one that has any candidate at all decides
+    /// (carrick#804, settling carrick#743):
+    ///
+    /// 1. a same-origin decorator carrying ONE string literal — the prefix it
+    ///    states;
+    /// 2. failing that, a same-origin decorator carrying NO arguments — the
+    ///    empty prefix, so the class's routes hang off the root. `@Controller()`
+    ///    is as common a shape as `@Controller("users")`, and declining it did
+    ///    not leave those routes unread: it left them to the model, which named
+    ///    one after its handler and put a path the application does not serve
+    ///    into the index. An invented route is worse than a missing one — a
+    ///    consumer call that matches nothing is visible, a producer nothing
+    ///    serves is not.
+    ///
+    /// The tiers do not compete, which is what keeps this from costing recall:
+    /// a class whose routing decorator states a string is read exactly as
+    /// before, however many argument-less decorators sit beside it. Only a
+    /// class where NOTHING states a string reaches tier 2.
+    ///
+    /// Within a tier, two candidates state two prefixes and the class states
+    /// nothing: the same "two statements disagree, so drop" rule the rest of
+    /// the scanner applies.
+    ///
+    /// The corroboration is what makes tier 2 a reading rather than a guess:
+    /// an argument-less class decorator on its own says nothing, and the verbs
+    /// beside it are what say this class routes. A class with no
+    /// verb-decorated method never reaches here.
+    fn class_prefix<'a>(
+        &self,
+        class: &'a Class,
+        methods: &[VerbDecoratedMethod],
+    ) -> Option<String> {
         let verb_origins: HashSet<&str> = methods
             .iter()
             .map(|method| method.decorator_origin.as_str())
             .collect();
-        let mut candidates = class.decorators.iter().filter_map(|decorator| {
+        let same_origin_arguments = |decorator: &'a Decorator| -> Option<&'a [ExprOrSpread]> {
             let (name, args) = decorator_call(decorator)?;
-            let [arg] = args else {
-                return None;
-            };
-            if arg.spread.is_some() {
-                return None;
-            }
-            let Expr::Lit(Lit::Str(literal)) = &*arg.expr else {
-                return None;
-            };
             verb_origins
                 .contains(self.origin(&name).as_str())
-                .then(|| literal.value.to_string())
-        });
-        match (candidates.next(), candidates.next()) {
-            (Some(prefix), None) => Some(prefix),
-            (Some(_), Some(_)) => {
+                .then_some(args)
+        };
+        let stated: Vec<String> = class
+            .decorators
+            .iter()
+            .filter_map(same_origin_arguments)
+            .filter_map(|args| {
+                let [arg] = args else {
+                    return None;
+                };
+                if arg.spread.is_some() {
+                    return None;
+                }
+                match &*arg.expr {
+                    Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string()),
+                    _ => None,
+                }
+            })
+            .collect();
+        let candidates = if stated.is_empty() {
+            class
+                .decorators
+                .iter()
+                .filter_map(same_origin_arguments)
+                .filter(|args| args.is_empty())
+                .map(|_| String::new())
+                .collect()
+        } else {
+            stated
+        };
+        match candidates.len() {
+            1 => candidates.into_iter().next(),
+            0 => None,
+            _ => {
                 tracing::debug!(
                     "A class carries two decorators from the verbs' own module that each \
-                     state a string: no decorator route emitted"
+                     state a prefix: no decorator route emitted"
                 );
                 None
             }
-            (None, _) => None,
         }
     }
 }
@@ -5575,10 +5642,9 @@ export class UsersController {
         );
     }
 
-    /// A decorator that is not named after an HTTP method states no route, and
-    /// neither does a class whose declaration carries no string argument.
+    /// A decorator that is not named after an HTTP method states no route.
     #[test]
-    fn only_a_verb_named_decorator_under_a_stated_prefix_is_a_route() {
+    fn only_a_verb_named_decorator_is_a_route() {
         // `@All()` is a real routing decorator and deliberately falls out: it
         // names no HTTP method, so there is no verb to index the route under.
         let content = r#"
@@ -5594,17 +5660,79 @@ export class ThingsController {
 }
 "#;
         assert!(decorator_routes(content).is_empty());
+    }
 
-        let unprefixed = r#"
-import { Injectable, Get } from './framework';
+    /// carrick#804, settling carrick#743: a routing decorator called with no
+    /// argument states the EMPTY prefix, so the class's routes hang off the
+    /// root. The verbs beside it are the corroboration; a class with none
+    /// never reaches the rule.
+    #[test]
+    fn a_class_decorator_with_no_argument_states_the_empty_prefix() {
+        let content = r#"
+import { Controller, Get } from './framework';
 
-@Injectable()
+@Controller()
 export class ThingsController {
   @Get('thing')
   thing() { return null; }
+
+  @Get()
+  root() { return null; }
 }
 "#;
-        assert!(decorator_routes(unprefixed).is_empty());
+        assert_eq!(
+            decorator_routes(content),
+            vec![
+                ("GET".to_string(), "/".to_string(), "root".to_string(), 10),
+                (
+                    "GET".to_string(),
+                    "/thing".to_string(),
+                    "thing".to_string(),
+                    7
+                ),
+            ]
+        );
+
+        // Two argument-less decorators from the verbs' own module state two
+        // prefixes, and nothing on the declaration says which one routes.
+        let ambiguous = content
+            .replace(
+                "import { Controller, Get }",
+                "import { Controller, Scoped, Get }",
+            )
+            .replace("@Controller()", "@Controller()\n@Scoped()");
+        assert!(decorator_routes(&ambiguous).is_empty());
+
+        // A class with no decorator of its own states no prefix, whatever its
+        // methods carry: reading one there would make every undecorated class
+        // a routing claim.
+        let undecorated = content.replace("@Controller()\n", "");
+        assert!(decorator_routes(&undecorated).is_empty());
+    }
+
+    /// carrick#804: a server-sent-events route is a GET whose response is a
+    /// stream. `sse` is protocol vocabulary, so the decorator states a route
+    /// and states the verb, without a package being named.
+    #[test]
+    fn a_server_sent_events_decorator_states_a_get_route() {
+        let content = r#"
+import { Controller, Sse } from './framework';
+
+@Controller('realtime')
+export class RealtimeController {
+  @Sse('stream')
+  stream() { return null; }
+}
+"#;
+        assert_eq!(
+            decorator_routes(content),
+            vec![(
+                "GET".to_string(),
+                "/realtime/stream".to_string(),
+                "stream".to_string(),
+                7
+            )]
+        );
     }
 
     /// Two class decorators that both state a string: the routing one is the
@@ -5639,10 +5767,15 @@ export class UsersController {
 
         // The trap the same-module rule exists for: the routing decorator
         // takes no argument, so the only string on the class is the
-        // documentation tag's. Reading it would serve `/people/:id`, which
-        // nothing registers.
+        // documentation tag's. Reading that string would serve `/people/:id`,
+        // which nothing registers; reading the argument-less decorator from
+        // the verbs' own module serves `/:id`, which is what the class
+        // declares (carrick#804).
         let implicit_prefix = content.replace("@Controller('api/users')", "@Controller()");
-        assert!(decorator_routes(&implicit_prefix).is_empty());
+        assert_eq!(
+            decorator_routes(&implicit_prefix),
+            vec![("GET".to_string(), "/:id".to_string(), "find".to_string(), 9)]
+        );
     }
 
     /// carrick#733: a target written as an env-backed base plus a literal

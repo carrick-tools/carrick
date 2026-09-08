@@ -1,6 +1,6 @@
 # `demo-services-shape`
 
-Fixture for carrick#732, carrick#733 and carrick#744: the two shapes a
+Fixture for carrick#732, carrick#733, carrick#744 and carrick#804: the two shapes a
 three-service demo is written in, reduced to one repo. A decorator-routed
 producer, a consumer whose origin comes from the environment and whose path is
 written at the call site, and the decoys that must stay silent.
@@ -33,6 +33,18 @@ environment with a local default, and each call writes its own path:
 - the same statement written as a concatenation (`USER_SERVICE_URL + "/api/users"`);
 - the environment read at the call site, with no binding in between.
 
+`src/app.controller.ts` is the producer whose routing decorator states no path
+at all (carrick#804, settling carrick#743):
+
+- `@Controller()` with the prefix left implicit. What singles it out is the same
+  thing that singles out a prefix that states a string: it comes from the module
+  the verbs come from. `@Get()` under it serves `/`.
+- `@Get("health")` serves `/health`.
+- `@Sse("stream")` under `@Controller("realtime")` serves `GET /realtime/stream`.
+  A server-sent-events route is a GET whose response is a stream, and `sse` is
+  protocol vocabulary rather than a library's name — the same standing
+  `publish` and `subscribe` already have.
+
 `src/framework.ts` and `src/docs.ts` stand in for whatever libraries a service
 uses. `framework.ts` also exports the server the prefix decoy registers on. Their names carry no weight: the scanner reads the shape of the
 decorators. `docs.ts` exists so a decorator that also takes one string, from
@@ -51,6 +63,7 @@ somewhere else, is present to be told apart from the routing one, and
 | 36 | `class Unprefixed` with `@Get("orphan")` | the declaration states no prefix, and reading one here would make every undecorated class a routing claim |
 | 48 | `class Tagged` with only `@ApiTags("people")` | the only string on the declaration comes from a module that supplies no verb. A routing decorator taking no argument leaves the prefix implicit, and reading the tag's string instead would put `/people/:id` — a path nothing serves — into the index as a FACT |
 | 62 | `` app.get(`${PREFIX}/users`, handler) `` under `const PREFIX = process.env.API_PREFIX \|\| "/api"` | a route REGISTRATION written in the base-plus-path shape. The base is env-backed and a literal path follows it, which is what `orders.ts` does — but this binding's declared default is a PATH, not an origin, so the base is a route prefix and the file calls nobody (carrick#744) |
+| 72 | `class Ambiguous` with `@Controller()` and `@Scoped()` | two argument-less decorators from the verbs' own module state two prefixes, and nothing on the declaration says which one routes: the same "two statements disagree, so drop" rule a class stating two prefix strings meets |
 
 ## The answer key
 
@@ -59,6 +72,9 @@ somewhere else, is present to be told apart from the routing one, and
 | `users.controller.ts:20` | `GET /api/users` (`list`) | `decorator_route` |
 | `users.controller.ts:25` | `GET /api/users/:id` (`find`) | `decorator_route` |
 | `users.controller.ts:30` | `POST /api/users/:id/rename` (`rename`) | `decorator_route` |
+| `app.controller.ts:14` | `GET /` (`getHello`) | `decorator_route` |
+| `app.controller.ts:19` | `GET /health` (`getHealth`) | `decorator_route` |
+| `app.controller.ts:29` | `GET /realtime/stream` (`stream`) | `decorator_route` |
 | `orders.ts:9` | `GET ${process.env.USER_SERVICE_URL}/api/users/${userId}` | `env_base_path` |
 | `orders.ts:14` | `POST ${process.env.USER_SERVICE_URL}/api/users/${userId}/rename` | `env_base_path` |
 | `orders.ts:23` | `GET ${process.env.USER_SERVICE_URL}/api/users` | `env_base_path` |
@@ -84,6 +100,7 @@ pre-declares away.
 ## No cassette
 
 There is no `__llm__/` directory: every test over this fixture supplies its own
-cassette. `deterministic_emission_test` runs it three ways — a model that
-answers nothing, a model that contradicts every row, and a model that answers
-for a route the decorators already state.
+cassette. `deterministic_emission_test` runs it four ways — a model that
+answers nothing, a model that contradicts every row, a model that answers for a
+route the decorators already state, and a model that names an
+implicitly-prefixed route after its handler (the row carrick#804 was filed on).
