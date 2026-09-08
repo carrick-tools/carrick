@@ -9412,13 +9412,13 @@ export * from "./aFetch.js";"#,
         );
     }
 
-    /// A call to a DECLARED external domain keeps its origin on
-    /// `canonical_path` — the key `mount_graph_to_api_details` uploads and the
-    /// matcher looks up. Stripping it there is what made a declared third-party
-    /// call arrive at matching as a bare `/user`, indistinguishable from an
-    /// internal call and reported as a missing endpoint.
+    /// A call to a literal external host keeps its origin on `canonical_path`
+    /// — the key `mount_graph_to_api_details` uploads and the matcher looks up.
+    /// Stripping it there is what made a third-party call arrive at matching as
+    /// a bare `/user`, indistinguishable from an internal call and reported as
+    /// a missing endpoint. A loopback origin is the one that still strips.
     #[test]
-    fn declared_external_absolute_url_keeps_its_host_on_the_match_key() {
+    fn a_literal_host_keeps_its_origin_on_the_match_key() {
         let orchestrator = FileOrchestrator::new(AgentService::new());
         let config = crate::config::Config {
             external_domains: ["https://api.vendor.test".to_string()]
@@ -9436,7 +9436,7 @@ export * from "./aFetch.js";"#,
                 endpoints: vec![],
                 data_calls: vec![
                     call_with_span(12, "https://api.vendor.test/v1/charges", Some(200)),
-                    call_with_span(18, "https://orders.undeclared.test/orders", Some(210)),
+                    call_with_span(18, "http://localhost:7100/orders", Some(210)),
                 ],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -9459,8 +9459,8 @@ export * from "./aFetch.js";"#,
         assert_eq!(
             keys,
             vec!["/orders", "https://api.vendor.test/v1/charges"],
-            "a declared-external host survives on the key; an undeclared origin \
-             is still stripped so a self-call can match"
+            "a literal host survives on the key; a loopback origin is still \
+             stripped so a self-call can match"
         );
     }
 
