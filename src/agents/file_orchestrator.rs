@@ -2460,7 +2460,14 @@ impl FileOrchestrator {
                     });
                 }
             };
-        /// Locator for type inference: either SWC byte-offset spans or Gemini expression text + line
+        // Source text of each file a span locator addresses, read once and kept
+        // for the rest of the collection. Converting a span into the sidecar's
+        // numbering needs the bytes between the file's start and the site, and
+        // a file that states one operation usually states several.
+        let mut file_source: HashMap<String, Option<String>> = HashMap::new();
+        /// Locator for type inference: either the SWC byte-offset span the
+        /// operation stored (converted to the sidecar's numbering on the way
+        /// out) or the model's expression text + line
         enum InferLocator<'a> {
             Span {
                 span_start: Option<u32>,
@@ -2490,12 +2497,46 @@ impl FileOrchestrator {
                     let (Some(start), Some(end)) = (span_start, span_end) else {
                         return false;
                     };
+                    // The span goes out in the sidecar's numbering, not the
+                    // scanner's (carrick#806). What the operation carries is an
+                    // SWC position: a UTF-8 byte offset counted from
+                    // `SWC_SPAN_BASE`. The sidecar addresses nodes by ts-morph
+                    // position, which TypeScript counts in UTF-16 code units
+                    // from zero, and it resolves this locator by containment —
+                    // so a span in the wrong numbering excludes the node it
+                    // names and the SMALLEST ENCLOSING one answers in its
+                    // place, silently and about something else. The base alone
+                    // does that on any file; the units diverge on top of it,
+                    // cumulatively, from a file's first multi-byte character
+                    // onwards.
+                    //
+                    // Converted here rather than stored converted: the byte
+                    // span is a join key (it matches a deterministic row to its
+                    // model row, and `candidate_id` is built from the same
+                    // numbers and keys the raw model-result cache), so a
+                    // converted span on the operation would silently miss that
+                    // cache on every non-ASCII file.
+                    if !file_source.contains_key(file_path) {
+                        let source = std::fs::read_to_string(file_path).ok();
+                        if source.is_none() {
+                            warn!(
+                                "[FileOrchestrator] Could not read {} to put its spans in the sidecar's numbering; span-located type requests for this file are dropped",
+                                file_path
+                            );
+                        }
+                        file_source.insert(file_path.to_string(), source);
+                    }
+                    // No source, no conversion, no request: an unconverted span
+                    // does not locate the site, it locates whatever encloses it.
+                    let Some(source) = file_source.get(file_path).and_then(Option::as_deref) else {
+                        return false;
+                    };
                     infer_requests.push(InferRequestItem {
                         file_path: file_path.to_string(),
                         line_number,
                         infer_kind,
-                        span_start: Some(start),
-                        span_end: Some(end),
+                        span_start: Some(Self::sidecar_position(source, start)),
+                        span_end: Some(Self::sidecar_position(source, end)),
                         expression_text: None,
                         expression_line: None,
                         alias: Some(alias),
@@ -5331,7 +5372,11 @@ impl FileOrchestrator {
     }
 
     /// The ts-morph position of an SWC span into `content`: file-relative, and
-    /// counted in UTF-16 code units rather than bytes (carrick#805). See
+    /// counted in UTF-16 code units rather than bytes (carrick#805, carrick#806).
+    /// Every span the sidecar is sent passes through here — the receiver-type
+    /// request below, and the type layer's span locator in
+    /// [`collect_type_requests`](Self::collect_type_requests), which the capture
+    /// anchors are built from in turn. See
     /// [`resolve_receiver_roles`](Self::resolve_receiver_roles) for why the
     /// conversion sits at the request and not at the candidate.
     fn sidecar_position(content: &str, span: u32) -> u32 {
@@ -10206,10 +10251,28 @@ export * from "./aFetch.js";"#,
         );
     }
 
+    /// A repo holding one source file long enough to contain the spans a
+    /// fabricated analyzer result names.
+    ///
+    /// A span locator is converted into the sidecar's numbering against the
+    /// file's own text (carrick#806), so a row naming a file nothing wrote
+    /// carries no span request at all — which is the honest answer, and it
+    /// means a test that fabricates a span must fabricate its source too.
+    fn repo_with_source(relative: &str, byte_length: usize) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let file = repo.path().join(relative);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent).expect("source dir");
+        }
+        std::fs::write(&file, "x".repeat(byte_length)).expect("source file");
+        repo
+    }
+
     #[test]
     fn test_collect_type_requests_skips_non_url_data_calls() {
         let agent_service = AgentService::new();
         let orchestrator = FileOrchestrator::new(agent_service);
+        let repo = repo_with_source("src/service.ts", 500);
 
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -10274,8 +10337,12 @@ export * from "./aFetch.js";"#,
             Path::new(""),
         );
         let config = Config::default();
-        let (_explicit, infer, _inline) =
-            orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
+        let (_explicit, infer, _inline) = orchestrator.collect_type_requests(
+            &file_results,
+            &repo.path().to_string_lossy(),
+            &graph,
+            &config,
+        );
 
         assert_eq!(infer.len(), 1);
     }
@@ -10337,6 +10404,7 @@ export * from "./aFetch.js";"#,
     fn test_collect_type_requests_assigns_call_ids() {
         let agent_service = AgentService::new();
         let orchestrator = FileOrchestrator::new(agent_service);
+        let repo = repo_with_source("src/service.ts", 700);
 
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -10401,8 +10469,12 @@ export * from "./aFetch.js";"#,
             Path::new(""),
         );
         let config = Config::default();
-        let (_explicit, infer, _inline) =
-            orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
+        let (_explicit, infer, _inline) = orchestrator.collect_type_requests(
+            &file_results,
+            &repo.path().to_string_lossy(),
+            &graph,
+            &config,
+        );
 
         let mut aliases: Vec<String> = infer.into_iter().filter_map(|item| item.alias).collect();
         aliases.sort();
