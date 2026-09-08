@@ -4134,6 +4134,11 @@ export class TypeInferrer {
     // slack admits both conventions; the size-delta pick below still prefers
     // the call whose extent matches the span, so the exactly-covered inner
     // call always beats its enclosing registration.
+    //
+    // Both producers of a span request now convert at the request boundary
+    // (carrick#805, carrick#806), so nothing sends the other convention any
+    // more and the slack only widens the candidate set. Removing it is
+    // carrick#823, which wants its own before/after.
     const SPAN_SLACK = 2;
     const callExpressions = sourceFile
       .getDescendantsOfKind(SyntaxKind.CallExpression);

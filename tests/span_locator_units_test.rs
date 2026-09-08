@@ -27,6 +27,7 @@ use carrick::agents::file_analyzer_agent::{DataCallResult, FileAnalysisResult};
 use carrick::agents::file_orchestrator::FileOrchestrator;
 use carrick::config::Config;
 use carrick::services::type_sidecar::{InferKind, InferRequestItem, TypeSidecar};
+use carrick::swc_scanner::SWC_SPAN_BASE;
 use carrick::url_normalizer::UrlNormalizer;
 use tempfile::TempDir;
 
@@ -63,10 +64,6 @@ const HEADER: &str = "// Requisições à API: os plantões são carregados aqui
 const CALL_TEXT: &str = "client.get('https://widgets.example.com/widgets')";
 
 const ALIAS_FRAGMENT: &str = "_Response_Call";
-
-/// SWC counts a file's first byte as position one; the scanner stores that
-/// position unconverted, because it is also the key its rows join on.
-const SWC_SPAN_BASE: u32 = 1;
 
 fn write_repo(root: &Path, source: &str) {
     fs::create_dir_all(root.join("src")).expect("src dir");
