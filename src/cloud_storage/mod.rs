@@ -34,7 +34,7 @@ pub enum ManifestRole {
     Consumer,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ManifestTypeKind {
     Request,
@@ -167,6 +167,78 @@ pub struct TypeHome {
     pub symbol: String,
 }
 
+/// One DIRECTION of a pairing's type check: the request types compared against
+/// each other, or the response types (carrick#822).
+///
+/// A pairing is two independent comparisons that happen to share a producer
+/// and a consumer. Folding them into one verdict lost the only thing a reader
+/// needs to act: which half the answer is about. On a real pair the request
+/// halves proved a mismatch (`passwordHash` missing) while the response halves
+/// compared nothing (the consumer's response type is `any`), and the folded row
+/// stated both side by side with no way to tell them apart — a proven mismatch
+/// read as "the check compared nothing".
+///
+/// `verdict` and `resolved` answer different questions and both are needed.
+/// `verdict` is what the probe returned. `resolved` is whether it returned it
+/// over two KNOWN types: the probe gates are whole-type only, so a side
+/// carrying `any` three members down clears every gate and then reads
+/// compatible against any counterparty shape. A `compatible` verdict with
+/// `resolved: false` establishes nothing.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DirectionVerdict {
+    /// What the check returned for THIS direction: `compatible`,
+    /// `incompatible`, or `unverifiable` (reached and could not verify).
+    pub verdict: crate::operation::TypeVerdict,
+    /// The mismatch diagnostic, present iff `verdict == incompatible`. Named
+    /// `reason` and not `mismatch_reason` because on this struct there is only
+    /// one reason a verdict can carry, and it is this direction's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Whether `verdict` is a comparison between two KNOWN types on this
+    /// direction, or the absence of one (carrick#730/#734). True only when the
+    /// check's deep walk over both sides of THIS direction found no
+    /// `any`/`unknown` at any depth.
+    pub resolved: bool,
+    /// Which side, and where in it, left this direction unresolved. Present
+    /// only alongside `resolved: false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved_reason: Option<String>,
+}
+
+impl Ord for DirectionVerdict {
+    /// Field order only, so the structs that embed this stay sortable. NOT the
+    /// verdict precedence — that is [`crate::operation::TypeVerdict::combine`]
+    /// (incompatible > unverifiable > compatible), and nothing may derive a
+    /// worst-wins fold from this ordering.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        fn rank(v: crate::operation::TypeVerdict) -> u8 {
+            match v {
+                crate::operation::TypeVerdict::Compatible => 0,
+                crate::operation::TypeVerdict::Incompatible => 1,
+                crate::operation::TypeVerdict::Unverifiable => 2,
+            }
+        }
+        (
+            rank(self.verdict),
+            &self.reason,
+            self.resolved,
+            &self.unresolved_reason,
+        )
+            .cmp(&(
+                rank(other.verdict),
+                &other.reason,
+                other.resolved,
+                &other.unresolved_reason,
+            ))
+    }
+}
+
+impl PartialOrd for DirectionVerdict {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// A persisted per-pair type-compatibility verdict, keyed by CANONICAL pair
 /// identity (never display labels — that is the #324 fail-open trap). Emitted at
 /// scan time from the cross-repo [`crate::analyzer::CrossRepoMatch`] edges this
@@ -193,53 +265,30 @@ pub struct CompatVerdict {
     /// equal to the persisted `DataFetchingCall::canonical_path` for every edge
     /// that yields a match).
     pub consumer_key: String,
-    /// The three-way verdict the check produced for this pair, uncollapsed
-    /// (carrick#811): `compatible`, `incompatible`, or `unverifiable` — the
-    /// check reached the pair and could not verify it, which is an answer and
-    /// not silence.
+    /// The check's answer for the REQUEST direction — the consumer's request
+    /// body against the producer's declared request type.
     ///
-    /// Written on EVERY row this scanner persists. `Option` only so a blob
-    /// from a scanner that predates the field still deserializes; absent here
-    /// means an older scan, never "unverifiable".
+    /// Absent when the check filed no outcome for this direction (no request
+    /// type on one side, so there was nothing to compare), which is not a
+    /// verdict of any kind. A row with neither direction present is never
+    /// persisted: an absent row means nothing was compared, and that is the
+    /// only thing absence means.
     ///
-    /// A pair the check never reached has no row at all, so absence from
-    /// `compat_verdicts` means one thing only: nothing was compared.
+    /// Replaces the folded `verdict`/`compatible`/`mismatch_reason`/`resolved`
+    /// pair-level fields (carrick#822). A blob written by a scanner that
+    /// predates the split carries those instead and neither direction here; the
+    /// old keys are gone from this struct, so such a row deserializes with both
+    /// directions `None` and states nothing, never "compatible".
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verdict: Option<crate::operation::TypeVerdict>,
-    /// `Some(true)` = the check found the request/response types compatible,
-    /// `Some(false)` = incompatible.
-    ///
-    /// ABSENT on an `unverifiable` row, because there is no boolean that says
-    /// "the check could not tell": `false` there would read as a detected
-    /// mismatch to any reader that only knows this field. Read `verdict`
-    /// first; this stays for the readers keyed on the boolean.
+    pub request: Option<DirectionVerdict>,
+    /// The check's answer for the RESPONSE direction — the producer's declared
+    /// response type against what the consumer's call site expects back. Absent
+    /// on the same terms as [`CompatVerdict::request`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compatible: Option<bool>,
-    /// Populated iff `compatible == Some(false)`: the human-readable mismatch
-    /// reason the check emitted. The reason an `unverifiable` row carries is
-    /// `unresolved_reason` below, not this.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mismatch_reason: Option<String>,
+    pub response: Option<DirectionVerdict>,
     /// Scanner release that produced this verdict (`CARGO_PKG_VERSION`), so a
     /// reader can see how stale the verdict is relative to the current scanner.
     pub scanner_version: String,
-    /// Whether this verdict is a comparison between two KNOWN types, or the
-    /// absence of one (carrick#730/#734).
-    ///
-    /// `compatible` above cannot answer that: the probe gates are whole-type
-    /// only, so a producer carrying `any` three members down clears them all
-    /// and then reads compatible against any counterparty shape. `true` here
-    /// means a deep walk over both sides found no `any`/`unknown` at any
-    /// depth, so the answer is about the shapes the source declares.
-    ///
-    /// `None` means the scan did not state it — an older blob — never that the
-    /// verdict is unresolved.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved: Option<bool>,
-    /// Which side, and where in it, left the verdict unresolved. Present only
-    /// alongside `resolved: Some(false)`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unresolved_reason: Option<String>,
 }
 
 /// A consumer call that reaches a producer endpoint through a published npm
@@ -286,35 +335,23 @@ pub struct SdkEdge {
     /// `http|POST|/v1/payments`), byte-identical to the producer endpoint's own
     /// key so the cloud de-orphans by exact match.
     pub producer_key: String,
-    /// The verdict for the SDK→producer pair, carried verbatim from the
-    /// `CrossRepoMatch` the SDK's own call formed. `None` = compat was not
-    /// evaluated for that edge, never "compatible".
+    /// The REQUEST direction of the SDK→producer pair, carried verbatim from
+    /// the `CrossRepoMatch` the SDK's own call formed — or, when the SDK repo
+    /// is not a current service this run, from the [`CompatVerdict`] the SDK
+    /// repo's own scan persisted for the same canonical pair.
+    ///
+    /// `None` = nothing was compared for this direction, never "compatible"
+    /// (#324). That includes an edge whose verdict came off a peer blob written
+    /// before the per-direction split: those rows state no direction at all,
+    /// and nothing is what this edge then says until the peer rescans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub type_compatible: Option<bool>,
-    /// Populated iff `type_compatible == Some(false)`.
+    pub request: Option<DirectionVerdict>,
+    /// The RESPONSE direction of the same pair, on the same terms as
+    /// [`SdkEdge::request`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mismatch_reason: Option<String>,
+    pub response: Option<DirectionVerdict>,
     /// Scanner release that produced this edge (`CARGO_PKG_VERSION`).
     pub scanner_version: String,
-    /// Whether the verdict above is a comparison between two KNOWN types, or
-    /// the absence of one — the same field [`CompatVerdict::resolved`] carries,
-    /// for the same reason (carrick#730/#737, cloud#622).
-    ///
-    /// `type_compatible` cannot answer that on its own: the probe gates are
-    /// whole-type only, so a producer carrying `any` three members down clears
-    /// them and then reads compatible against any counterparty shape. Without
-    /// this field the cloud renders such an edge as type agreement, which is
-    /// exactly the read cloud#617 removed from the direct pairs.
-    ///
-    /// `None` means this run did not state it — the resolution rode with a
-    /// verdict from a scan that predates the field, or no verdict was stored at
-    /// all. Never read it as "unresolved".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved: Option<bool>,
-    /// Which side, and where in it, left the verdict unresolved. Present only
-    /// alongside `resolved: Some(false)`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unresolved_reason: Option<String>,
 }
 
 /// SDK-mediated calls the join could not turn into an edge, aggregated per
@@ -796,6 +833,36 @@ pub trait CloudStorage {
     ) -> Result<(), StorageError>;
 }
 
+/// The wire form of one direction's outcome. The two structs are deliberately
+/// separate: [`crate::analyzer::PairDirectionOutcome`] is scan-internal and may
+/// gain fields no reader is promised, this one is the contract.
+pub(crate) fn direction_verdict(
+    outcome: &crate::analyzer::PairDirectionOutcome,
+) -> DirectionVerdict {
+    DirectionVerdict {
+        verdict: outcome.verdict,
+        reason: outcome.reason.clone(),
+        resolved: outcome.resolved,
+        unresolved_reason: outcome.unresolved_reason.clone(),
+    }
+}
+
+/// Fold an incoming direction into a stored one, worst-wins by
+/// [`crate::operation::TypeVerdict::combine`]. A direction only one side states
+/// is kept as stated: the other call site compared nothing there, and nothing
+/// never overrides an answer.
+fn merge_direction(stored: &mut Option<DirectionVerdict>, incoming: &Option<DirectionVerdict>) {
+    let Some(incoming) = incoming else { return };
+    match stored {
+        None => *stored = Some(incoming.clone()),
+        Some(existing) => {
+            if existing.verdict.combine(incoming.verdict) != existing.verdict {
+                *existing = incoming.clone();
+            }
+        }
+    }
+}
+
 /// Attach per-pair type-compat verdicts to each service payload, for the cross-repo
 /// edges where that service is the CONSUMER. Reads the verdicts off the
 /// `CrossRepoMatch` edges `get_results` produced (compat already overlaid), and
@@ -812,14 +879,14 @@ pub trait CloudStorage {
 /// are deduped worst-wins via [`TypeVerdict::combine`] (incompatible >
 /// unverifiable > compatible), so a real mismatch is never masked by a sibling
 /// call site that happened to agree, and a pair that compared nothing is never
-/// upgraded by one that did.
+/// upgraded by one that did. That dedup runs PER DIRECTION (carrick#822): a
+/// sibling call site that resolved the response half cannot upgrade this row's
+/// request half, and vice versa.
 pub fn attach_compat_verdicts(
     payloads: &mut [CloudRepoData],
     matches: &[crate::analyzer::CrossRepoMatch],
-    resolutions: &crate::analyzer::PairResolutions,
+    directions: &crate::analyzer::PairDirections,
 ) {
-    use crate::operation::TypeVerdict;
-
     let scanner_version = env!("CARGO_PKG_VERSION");
     for payload in payloads.iter_mut() {
         let service_id = payload
@@ -837,59 +904,44 @@ pub fn attach_compat_verdicts(
             if m.consumer_repo != service_id {
                 continue;
             }
-            let Some(verdict) = m.type_verdict else {
+            // The directions this run filed for the edge, joined by the same
+            // key the per-edge overlay used, so a reader never has to pair a
+            // verdict with its resolution itself.
+            let dirs = directions.for_edge(m);
+            if dirs.is_empty() {
                 // No pair outcome reached this edge — persist nothing, so an
                 // absent row means "not compared" and nothing else (fail
-                // closed). An edge the check REACHED always has a verdict
-                // here, including the unverifiable one.
+                // closed).
                 continue;
-            };
+            }
             let pair = (
                 m.producer_repo.clone(),
                 m.producer_key.clone(),
                 m.consumer_repo.clone(),
                 m.consumer_key.clone(),
             );
-            // The resolution rides with the verdict it belongs to, joined by
-            // the same key the overlay used, so a reader never has to pair
-            // them up itself. Absent when this run filed no outcome for the
-            // edge — nothing was checked, which is not "unresolved".
-            let resolution = resolutions.for_edge(m);
             let row = CompatVerdict {
                 producer_repo: m.producer_repo.clone(),
                 producer_key: m.producer_key.clone(),
                 consumer_repo: m.consumer_repo.clone(),
                 consumer_key: m.consumer_key.clone(),
-                verdict: Some(verdict),
-                // No boolean says "could not tell", so an unverifiable row
-                // carries none rather than a `false` a reader would show as a
-                // detected mismatch.
-                compatible: match verdict {
-                    TypeVerdict::Compatible => Some(true),
-                    TypeVerdict::Incompatible => Some(false),
-                    TypeVerdict::Unverifiable => None,
-                },
-                mismatch_reason: if verdict == TypeVerdict::Incompatible {
-                    m.mismatch_reason.clone()
-                } else {
-                    None
-                },
+                request: dirs.request.as_ref().map(direction_verdict),
+                response: dirs.response.as_ref().map(direction_verdict),
                 scanner_version: scanner_version.to_string(),
-                resolved: resolution.map(|r| r.resolved),
-                unresolved_reason: resolution.and_then(|r| r.unresolved_reason.clone()),
             };
             by_pair
                 .entry(pair)
                 .and_modify(|existing| {
-                    // Worst-wins on the same canonical pair, by the one
-                    // precedence the scanner states (`TypeVerdict::combine`):
-                    // the row is replaced only when the new verdict is worse
-                    // than the stored one, so equal verdicts keep the first —
-                    // and `matches` is sorted, so that is deterministic.
-                    let stored = existing.verdict.unwrap_or(TypeVerdict::Unverifiable);
-                    if stored.combine(verdict) != stored {
-                        *existing = row.clone();
-                    }
+                    // Worst-wins on the same canonical pair, PER DIRECTION, by
+                    // the one precedence the scanner states
+                    // (`TypeVerdict::combine`): a direction is replaced only
+                    // when the incoming verdict is worse than the stored one,
+                    // so equal verdicts keep the first — and `matches` is
+                    // sorted, so that is deterministic. Folding the two
+                    // directions together here would put back exactly the
+                    // conflation carrick#822 removed.
+                    merge_direction(&mut existing.request, &row.request);
+                    merge_direction(&mut existing.response, &row.response);
                 })
                 .or_insert(row);
         }
@@ -1269,9 +1321,9 @@ mod tests {
             match_score: 1.0,
             type_compatible,
             // The overlay sets both halves together, so a test edge that
-            // states one states the other. An edge the check REACHED but could
-            // not verify is `(None, Some(Unverifiable))`, which no bool can
-            // express — `unverifiable_edge` below builds that one.
+            // states one states the other. Since carrick#822 the stored row is
+            // built from the check outcomes, not from these fields: use
+            // `directions(&[...])` to state what the check found.
             type_verdict: type_compatible.map(|c| {
                 if c {
                     crate::operation::TypeVerdict::Compatible
@@ -1285,75 +1337,174 @@ mod tests {
         }
     }
 
-    /// The stored verdict says whether it is a comparison or the absence of
-    /// one, joined to the same pair the overlay judged (carrick#734), and says
-    /// nothing at all when this run checked nothing.
-    #[test]
-    fn stored_verdicts_carry_their_resolution() {
-        use crate::analyzer::{PairCheckOutcome, PairResolutions};
+    /// The same edge at a different call site. Two call sites on one canonical
+    /// producer/consumer pair is the shape the per-pair dedup exists for, and
+    /// they are only distinct edges when their locations differ.
+    fn edge_at(
+        producer_repo: &str,
+        producer_key: &str,
+        consumer_repo: &str,
+        consumer_key: &str,
+        location: &str,
+    ) -> CrossRepoMatch {
+        let mut e = edge(
+            producer_repo,
+            producer_key,
+            consumer_repo,
+            consumer_key,
+            None,
+            None,
+        );
+        e.consumer_location = Some(location.to_string());
+        e
+    }
 
-        let outcome = |identity: &str, resolved: bool, reason: Option<&str>| PairCheckOutcome {
-            pair_key: format!("p/{identity}~c/src/client.ts"),
-            pseudo_method: "GET".to_string(),
-            identity: identity.to_string(),
-            consumer_file: "src/client.ts".to_string(),
+    /// One check outcome for one direction of one edge, keyed exactly as the v2
+    /// checker keys it: the producer key's method and path, and the edge's own
+    /// call-site file. Production feeds `attach_compat_verdicts` from these; a
+    /// test states the edge and its outcomes in one place rather than setting a
+    /// verdict on the edge and hoping the two agree.
+    #[allow(clippy::too_many_arguments)]
+    fn outcome(
+        e: &CrossRepoMatch,
+        type_kind: ManifestTypeKind,
+        bucket: crate::services::type_sidecar::VerdictBucket,
+        diagnostic: Option<&str>,
+        resolved: bool,
+        unresolved_reason: Option<&str>,
+    ) -> crate::analyzer::PairCheckOutcome {
+        let rest = e.producer_key.split_once('|').expect("http key").1;
+        let (method, path) = rest.split_once('|').expect("http key");
+        crate::analyzer::PairCheckOutcome {
+            pair_key: format!("{}~{}", e.producer_key, e.consumer_key),
+            pseudo_method: method.to_uppercase(),
+            identity: path.to_string(),
+            consumer_file: e
+                .consumer_location
+                .clone()
+                .unwrap_or_else(|| "src/client.ts".to_string()),
             consumer_line: 1,
-            type_kind: ManifestTypeKind::Response,
-            bucket: crate::services::type_sidecar::VerdictBucket::Compatible,
+            type_kind,
+            bucket,
             gate: None,
-            diagnostic: None,
+            diagnostic: diagnostic.map(String::from),
             producer_alias: "P".to_string(),
             consumer_alias: "C".to_string(),
-            producer_service: "order-service".to_string(),
-            consumer_service: "notification-service".to_string(),
+            producer_service: e.producer_repo.clone(),
+            consumer_service: e.consumer_repo.clone(),
             resolved,
-            unresolved_reason: reason.map(str::to_string),
-        };
-        let resolutions = PairResolutions::from_outcomes(&[
-            outcome(
-                "/orders/:id",
-                false,
-                Some("the producer type carries `any` at `data`"),
+            unresolved_reason: unresolved_reason.map(String::from),
+        }
+    }
+
+    /// A compatible outcome that compared two known types.
+    fn compatible_outcome(
+        e: &CrossRepoMatch,
+        type_kind: ManifestTypeKind,
+    ) -> crate::analyzer::PairCheckOutcome {
+        outcome(
+            e,
+            type_kind,
+            crate::services::type_sidecar::VerdictBucket::Compatible,
+            None,
+            true,
+            None,
+        )
+    }
+
+    /// An incompatible outcome carrying its diagnostic.
+    fn incompatible_outcome(
+        e: &CrossRepoMatch,
+        type_kind: ManifestTypeKind,
+        diagnostic: &str,
+    ) -> crate::analyzer::PairCheckOutcome {
+        outcome(
+            e,
+            type_kind,
+            crate::services::type_sidecar::VerdictBucket::Incompatible,
+            Some(diagnostic),
+            true,
+            None,
+        )
+    }
+
+    /// A gate-caught outcome: the check reached this direction and could not
+    /// verify it, and says which side carried the `any`.
+    fn unverifiable_outcome(
+        e: &CrossRepoMatch,
+        type_kind: ManifestTypeKind,
+        reason: &str,
+    ) -> crate::analyzer::PairCheckOutcome {
+        outcome(
+            e,
+            type_kind,
+            crate::services::type_sidecar::VerdictBucket::GateCaughtBakedAny,
+            None,
+            false,
+            Some(reason),
+        )
+    }
+
+    fn directions(
+        outcomes: &[crate::analyzer::PairCheckOutcome],
+    ) -> crate::analyzer::PairDirections {
+        crate::analyzer::PairDirections::from_outcomes(outcomes)
+    }
+
+    /// carrick#822, the row this ticket is about: the request halves proved a
+    /// mismatch while the response halves compared nothing. The blob states
+    /// both, each on its own direction, so a reader can act on the mismatch
+    /// without the unresolved response taking the whole row down with it.
+    #[test]
+    fn each_direction_carries_its_own_verdict_and_resolution() {
+        let broken = edge(
+            "order-service",
+            "http|POST|/users/managers",
+            "notification-service",
+            "http|POST|/users/managers",
+            None,
+            None,
+        );
+        let clean = edge(
+            "order-service",
+            "http|GET|/health",
+            "notification-service",
+            "http|GET|/health",
+            None,
+            None,
+        );
+        // Checked by nobody this run: no direction, so no row at all.
+        let unchecked = edge(
+            "order-service",
+            "http|GET|/unchecked",
+            "notification-service",
+            "http|GET|/unchecked",
+            None,
+            None,
+        );
+        let dirs = directions(&[
+            incompatible_outcome(
+                &broken,
+                ManifestTypeKind::Request,
+                "Property 'passwordHash' is missing",
             ),
-            outcome("/health", true, None),
+            unverifiable_outcome(
+                &broken,
+                ManifestTypeKind::Response,
+                "the consumer type carries `any` at `<0>`",
+            ),
+            compatible_outcome(&clean, ManifestTypeKind::Request),
+            compatible_outcome(&clean, ManifestTypeKind::Response),
         ]);
 
         let mut payloads = vec![empty_repo(
             "org/notification-service",
             Some("notification-service"),
         )];
-        let matches = vec![
-            edge(
-                "order-service",
-                "http|GET|/orders/:id",
-                "notification-service",
-                "http|GET|/orders/:id",
-                Some(true),
-                None,
-            ),
-            edge(
-                "order-service",
-                "http|GET|/health",
-                "notification-service",
-                "http|GET|/health",
-                Some(true),
-                None,
-            ),
-            // Checked by nobody this run: the verdict is persisted (the edge
-            // carries one) and states no resolution.
-            edge(
-                "order-service",
-                "http|GET|/unchecked",
-                "notification-service",
-                "http|GET|/unchecked",
-                Some(true),
-                None,
-            ),
-        ];
+        let matches = vec![broken, clean, unchecked];
+        attach_compat_verdicts(&mut payloads, &matches, &dirs);
 
-        attach_compat_verdicts(&mut payloads, &matches, &resolutions);
-
-        // Round-trip: the two fields are the wire, not just the struct.
+        // Round-trip: the directions are the wire, not just the struct.
         let json = serde_json::to_string(&payloads[0]).unwrap();
         let back: CloudRepoData = serde_json::from_str(&json).unwrap();
         let verdicts = back.compat_verdicts.unwrap();
@@ -1365,60 +1516,93 @@ mod tests {
                 .clone()
         };
 
-        let unresolved = by_key("http|GET|/orders/:id");
-        assert_eq!(unresolved.resolved, Some(false));
+        let split = by_key("http|POST|/users/managers");
+        let request = split.request.expect("the request direction is stated");
+        assert_eq!(request.verdict, crate::operation::TypeVerdict::Incompatible);
         assert_eq!(
-            unresolved.unresolved_reason.as_deref(),
-            Some("the producer type carries `any` at `data`"),
-            "a compatible-bucket verdict with an `any` on one side is not a comparison"
+            request.reason.as_deref(),
+            Some("Property 'passwordHash' is missing"),
+            "the proven mismatch keeps its diagnostic"
+        );
+        assert!(request.resolved, "the request halves were both known types");
+        let response = split.response.expect("the response direction is stated");
+        assert_eq!(
+            response.verdict,
+            crate::operation::TypeVerdict::Unverifiable
+        );
+        assert!(!response.resolved);
+        assert_eq!(
+            response.unresolved_reason.as_deref(),
+            Some("the consumer type carries `any` at `<0>`"),
+            "and the unresolved side names itself, on its own half"
         );
 
-        let resolved = by_key("http|GET|/health");
-        assert_eq!(resolved.resolved, Some(true));
-        assert_eq!(resolved.unresolved_reason, None);
+        let clean_row = by_key("http|GET|/health");
+        assert_eq!(
+            clean_row.request.as_ref().map(|d| d.verdict),
+            Some(crate::operation::TypeVerdict::Compatible)
+        );
+        assert!(clean_row.response.as_ref().is_some_and(|d| d.resolved));
 
-        // Unstated, and omitted from the wire rather than sent as `null` or
-        // as a claim that nothing resolved.
-        let unchecked = by_key("http|GET|/unchecked");
-        assert_eq!(unchecked.resolved, None);
+        // A direction the check never reached is omitted from the wire rather
+        // than sent as `null` or as a claim that nothing resolved.
+        assert!(
+            !verdicts
+                .iter()
+                .any(|v| v.producer_key == "http|GET|/unchecked"),
+            "an unchecked pair has no row"
+        );
         let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let row = raw["compat_verdicts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|v| v["producer_key"] == "http|GET|/unchecked")
-            .unwrap();
-        assert!(row.get("resolved").is_none(), "got: {row}");
-        assert!(row.get("unresolved_reason").is_none(), "got: {row}");
-        let resolved_row = raw["compat_verdicts"]
+        let clean_raw = raw["compat_verdicts"]
             .as_array()
             .unwrap()
             .iter()
             .find(|v| v["producer_key"] == "http|GET|/health")
             .unwrap();
-        assert_eq!(resolved_row["resolved"], true);
+        assert_eq!(clean_raw["request"]["verdict"], "compatible");
+        assert_eq!(clean_raw["request"]["resolved"], true);
+        assert!(
+            clean_raw["request"].get("reason").is_none(),
+            "a compatible direction carries no diagnostic: {clean_raw}"
+        );
+        assert!(
+            clean_raw["request"].get("unresolved_reason").is_none(),
+            "nor an unresolution: {clean_raw}"
+        );
+        for gone in ["verdict", "compatible", "mismatch_reason", "resolved"] {
+            assert!(
+                clean_raw.get(gone).is_none(),
+                "the folded field `{gone}` is replaced, not kept beside: {clean_raw}"
+            );
+        }
     }
 
-    /// A verdict written before these fields existed still reads, and reads as
-    /// "not stated" rather than as an unresolved verdict.
+    /// A verdict written before the per-direction split (carrick#822) still
+    /// deserializes, and states NOTHING: its folded fields are not on this
+    /// struct, and there is no direction to reconstruct them into — the row
+    /// never said which half its verdict was about. Nothing is the honest read,
+    /// and it is never "compatible" (#324).
     #[test]
-    fn older_stored_verdict_deserializes_without_a_resolution() {
+    fn a_folded_verdict_from_an_older_scan_states_no_direction() {
         let older = serde_json::json!({
             "producer_repo": "order-service",
             "producer_key": "http|GET|/orders/:id",
             "consumer_repo": "notification-service",
             "consumer_key": "http|GET|/orders/:id",
+            "verdict": "incompatible",
             "compatible": false,
             "mismatch_reason": "Order[] vs Order",
-            "scanner_version": "0.3.41"
+            "resolved": false,
+            "unresolved_reason": "the consumer type carries `any` at `<0>`",
+            "scanner_version": "0.3.48"
         });
         let verdict: CompatVerdict = serde_json::from_value(older).unwrap();
-        assert_eq!(verdict.resolved, None);
-        assert_eq!(verdict.unresolved_reason, None);
-        assert_eq!(verdict.compatible, Some(false));
-        // The tri-state is absent on a blob written before it existed, and
-        // absent reads as "this scan did not state it" — never "unverifiable".
-        assert_eq!(verdict.verdict, None);
+        assert_eq!(verdict.request, None);
+        assert_eq!(verdict.response, None);
+        // The identity survives, so the row still joins and still says which
+        // scanner wrote it.
+        assert_eq!(verdict.producer_key, "http|GET|/orders/:id");
+        assert_eq!(verdict.scanner_version, "0.3.48");
     }
 
     /// An old blob that predates `compat_verdicts` deserializes with the field
@@ -1507,45 +1691,45 @@ mod tests {
         assert!(!graph.endpoints[0].view_module);
     }
 
-    /// A verdict round-trips through JSON keyed by canonical pair identity, and a
-    /// `None` (unevaluated) edge is omitted, not serialized as compatible.
+    /// The stored rows carry the canonical pair identity the cloud
+    /// reconstructs, and survive the wire round trip.
     #[test]
     fn compat_verdicts_round_trip_keyed_canonically() {
         let mut payloads = vec![empty_repo(
             "org/notification-service",
             Some("notification-service"),
         )];
-        let matches = vec![
-            // Evaluated + incompatible → persisted with reason.
-            edge(
-                "order-service",
-                "http|GET|/orders/:id",
-                "notification-service",
-                "http|GET|/orders/:id",
-                Some(false),
-                Some("Order[] vs Order"),
-            ),
-            // Evaluated + compatible → persisted, no reason.
-            edge(
-                "order-service",
-                "http|GET|/health",
-                "notification-service",
-                "http|GET|/health",
-                Some(true),
-                None,
-            ),
-            // Not evaluated → NOT persisted (fail closed).
-            edge(
-                "order-service",
-                "http|POST|/orders",
-                "notification-service",
-                "http|POST|/orders",
-                None,
-                None,
-            ),
-        ];
+        let broken = edge(
+            "order-service",
+            "http|GET|/orders/:id",
+            "notification-service",
+            "http|GET|/orders/:id",
+            None,
+            None,
+        );
+        let clean = edge(
+            "order-service",
+            "http|GET|/health",
+            "notification-service",
+            "http|GET|/health",
+            None,
+            None,
+        );
+        let unchecked = edge(
+            "order-service",
+            "http|POST|/orders",
+            "notification-service",
+            "http|POST|/orders",
+            None,
+            None,
+        );
+        let dirs = directions(&[
+            incompatible_outcome(&broken, ManifestTypeKind::Response, "Order[] vs Order"),
+            compatible_outcome(&clean, ManifestTypeKind::Response),
+        ]);
+        let matches = vec![broken, clean, unchecked];
 
-        attach_compat_verdicts(&mut payloads, &matches, &Default::default());
+        attach_compat_verdicts(&mut payloads, &matches, &dirs);
         let verdicts = payloads[0]
             .compat_verdicts
             .clone()
@@ -1560,14 +1744,15 @@ mod tests {
             .iter()
             .find(|v| v.producer_key == "http|GET|/orders/:id")
             .unwrap();
-        assert_eq!(incompat.compatible, Some(false));
+        let response = incompat.response.as_ref().expect("response direction");
         assert_eq!(
-            incompat.verdict,
-            Some(crate::operation::TypeVerdict::Incompatible)
+            response.verdict,
+            crate::operation::TypeVerdict::Incompatible
         );
-        assert_eq!(
-            incompat.mismatch_reason.as_deref(),
-            Some("Order[] vs Order")
+        assert_eq!(response.reason.as_deref(), Some("Order[] vs Order"));
+        assert!(
+            incompat.request.is_none(),
+            "no request outcome was filed, so no request direction is claimed"
         );
         assert_eq!(incompat.consumer_repo, "notification-service");
         assert_eq!(incompat.scanner_version, env!("CARGO_PKG_VERSION"));
@@ -1576,12 +1761,12 @@ mod tests {
             .iter()
             .find(|v| v.producer_key == "http|GET|/health")
             .unwrap();
-        assert_eq!(compat.compatible, Some(true));
+        let compat_response = compat.response.as_ref().expect("response direction");
         assert_eq!(
-            compat.verdict,
-            Some(crate::operation::TypeVerdict::Compatible)
+            compat_response.verdict,
+            crate::operation::TypeVerdict::Compatible
         );
-        assert!(compat.mismatch_reason.is_none());
+        assert!(compat_response.reason.is_none());
 
         // The unevaluated POST /orders pair is absent — the cloud reads its
         // absence as "not compared", never "compatible".
@@ -1600,140 +1785,128 @@ mod tests {
         let mut payloads = vec![empty_repo("org/order-service", Some("order-service"))];
         // order-service is the PRODUCER here, notification-service the consumer:
         // this verdict belongs on notification-service's blob, not order-service's.
-        let matches = vec![edge(
+        let e = edge(
             "order-service",
             "http|GET|/orders/:id",
             "notification-service",
             "http|GET|/orders/:id",
-            Some(false),
-            Some("Order[] vs Order"),
-        )];
-        attach_compat_verdicts(&mut payloads, &matches, &Default::default());
+            None,
+            None,
+        );
+        let dirs = directions(&[incompatible_outcome(
+            &e,
+            ManifestTypeKind::Response,
+            "Order[] vs Order",
+        )]);
+        attach_compat_verdicts(&mut payloads, &[e], &dirs);
         assert!(payloads[0].compat_verdicts.is_none());
     }
 
     /// When two call sites hit the same producer/consumer canonical pair and
-    /// disagree, the incompatible verdict wins (a real risk is never masked).
+    /// disagree, the incompatible verdict wins on that DIRECTION (a real risk
+    /// is never masked), and the other direction is untouched by it.
     #[test]
     fn attach_compat_verdicts_dedup_incompatible_wins() {
         let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
-        let matches = vec![
-            edge(
-                "producer",
-                "http|GET|/x",
-                "consumer",
-                "http|GET|/x",
-                Some(true),
-                None,
-            ),
-            edge(
-                "producer",
-                "http|GET|/x",
-                "consumer",
-                "http|GET|/x",
-                Some(false),
-                Some("mismatch"),
-            ),
-        ];
-        attach_compat_verdicts(&mut payloads, &matches, &Default::default());
+        let agrees = edge_at("producer", "http|GET|/x", "consumer", "http|GET|/x", "a.ts");
+        let breaks = edge_at("producer", "http|GET|/x", "consumer", "http|GET|/x", "b.ts");
+        let dirs = directions(&[
+            compatible_outcome(&agrees, ManifestTypeKind::Request),
+            compatible_outcome(&agrees, ManifestTypeKind::Response),
+            incompatible_outcome(&breaks, ManifestTypeKind::Request, "mismatch"),
+            compatible_outcome(&breaks, ManifestTypeKind::Response),
+        ]);
+        attach_compat_verdicts(&mut payloads, &[agrees, breaks], &dirs);
         let verdicts = payloads[0].compat_verdicts.clone().unwrap();
         assert_eq!(verdicts.len(), 1);
-        assert_eq!(verdicts[0].compatible, Some(false));
-        assert_eq!(verdicts[0].mismatch_reason.as_deref(), Some("mismatch"));
-    }
-
-    /// An edge the check REACHED but could not verify: no boolean can say it,
-    /// so the overlay leaves `type_compatible` unset and states the verdict.
-    fn unverifiable_edge(producer_key: &str, consumer_repo: &str) -> CrossRepoMatch {
-        let mut e = edge(
-            "producer",
-            producer_key,
-            consumer_repo,
-            producer_key,
-            None,
-            None,
+        let request = verdicts[0].request.as_ref().unwrap();
+        assert_eq!(request.verdict, crate::operation::TypeVerdict::Incompatible);
+        assert_eq!(request.reason.as_deref(), Some("mismatch"));
+        assert_eq!(
+            verdicts[0].response.as_ref().unwrap().verdict,
+            crate::operation::TypeVerdict::Compatible,
+            "the request-side break does not smear onto the response half"
         );
-        e.type_verdict = Some(crate::operation::TypeVerdict::Unverifiable);
-        e
     }
 
-    /// carrick#811: a pair the check reached and could not verify is PERSISTED,
-    /// as the third state — not dropped into the same silence as a pair nobody
-    /// checked. The row carries no `compatible` boolean, because there is no
-    /// boolean that means "could not tell" and `false` would read as a
-    /// detected mismatch.
+    /// carrick#811: a direction the check reached and could not verify is
+    /// PERSISTED, as the third state — not dropped into the same silence as a
+    /// pair nobody checked.
     #[test]
-    fn an_unverifiable_pair_is_persisted_as_the_third_state() {
-        use crate::analyzer::{PairCheckOutcome, PairResolutions};
-
+    fn an_unverifiable_direction_is_persisted_as_the_third_state() {
         let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
-        let matches = vec![unverifiable_edge("http|GET|/orders/:id", "consumer")];
-        // The judge's own flag and sentence, joined to the same pair.
-        let outcomes = vec![PairCheckOutcome {
-            pair_key: "p/orders~c/src/client.ts".to_string(),
-            pseudo_method: "GET".to_string(),
-            identity: "/orders/:id".to_string(),
-            consumer_file: "src/client.ts".to_string(),
-            consumer_line: 1,
-            type_kind: ManifestTypeKind::Response,
-            bucket: crate::services::type_sidecar::VerdictBucket::GateCaughtBakedAny,
-            gate: Some("capture:producer:any".to_string()),
-            diagnostic: None,
-            producer_alias: "P".to_string(),
-            consumer_alias: "C".to_string(),
-            producer_service: "producer".to_string(),
-            consumer_service: "consumer".to_string(),
-            resolved: false,
-            unresolved_reason: Some("the producer type carries 'any' at 'tenant'".to_string()),
-        }];
-        attach_compat_verdicts(
-            &mut payloads,
-            &matches,
-            &PairResolutions::from_outcomes(&outcomes),
+        let e = edge(
+            "producer",
+            "http|GET|/orders/:id",
+            "consumer",
+            "http|GET|/orders/:id",
+            None,
+            None,
         );
+        // The judge's own flag and sentence, joined to the same pair.
+        let dirs = directions(&[unverifiable_outcome(
+            &e,
+            ManifestTypeKind::Response,
+            "the producer type carries 'any' at 'tenant'",
+        )]);
+        attach_compat_verdicts(&mut payloads, &[e], &dirs);
 
         let verdicts = payloads[0].compat_verdicts.clone().unwrap();
         assert_eq!(verdicts.len(), 1, "the reached pair is stored");
+        let response = verdicts[0].response.as_ref().unwrap();
         assert_eq!(
-            verdicts[0].verdict,
-            Some(crate::operation::TypeVerdict::Unverifiable)
+            response.verdict,
+            crate::operation::TypeVerdict::Unverifiable
         );
-        assert_eq!(verdicts[0].compatible, None);
-        assert_eq!(verdicts[0].mismatch_reason, None);
-        assert_eq!(verdicts[0].resolved, Some(false));
+        assert_eq!(response.reason, None);
+        assert!(!response.resolved);
         assert_eq!(
-            verdicts[0].unresolved_reason.as_deref(),
+            response.unresolved_reason.as_deref(),
             Some("the producer type carries 'any' at 'tenant'")
+        );
+        assert!(
+            verdicts[0].request.is_none(),
+            "the request half was never reached and claims nothing"
         );
     }
 
-    /// The wire, read as the cloud reads it: `verdict` serializes to the exact
-    /// three strings `CompatVerdict.verdict` in the mcp-server types declares,
-    /// and an unverifiable row omits `compatible` entirely rather than
-    /// carrying a `false` a boolean-only reader would show as a mismatch.
+    /// The wire, read as the cloud reads it: each direction's `verdict`
+    /// serializes to the exact three strings the mcp-server types declare, and
+    /// a direction that compared nothing carries no diagnostic to mistake for
+    /// one.
     #[test]
-    fn verdict_rides_the_wire_as_the_three_declared_strings() {
+    fn each_direction_rides_the_wire_as_the_three_declared_strings() {
         let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
-        let matches = vec![
-            edge(
-                "producer",
-                "http|GET|/a",
-                "consumer",
-                "http|GET|/a",
-                Some(true),
-                None,
-            ),
-            edge(
-                "producer",
-                "http|GET|/b",
-                "consumer",
-                "http|GET|/b",
-                Some(false),
-                Some("A vs B"),
-            ),
-            unverifiable_edge("http|GET|/c", "consumer"),
-        ];
-        attach_compat_verdicts(&mut payloads, &matches, &Default::default());
+        let a = edge(
+            "producer",
+            "http|GET|/a",
+            "consumer",
+            "http|GET|/a",
+            None,
+            None,
+        );
+        let b = edge(
+            "producer",
+            "http|GET|/b",
+            "consumer",
+            "http|GET|/b",
+            None,
+            None,
+        );
+        let c = edge(
+            "producer",
+            "http|GET|/c",
+            "consumer",
+            "http|GET|/c",
+            None,
+            None,
+        );
+        let dirs = directions(&[
+            compatible_outcome(&a, ManifestTypeKind::Request),
+            incompatible_outcome(&b, ManifestTypeKind::Request, "A vs B"),
+            unverifiable_outcome(&c, ManifestTypeKind::Request, "a side carries `any`"),
+        ]);
+        attach_compat_verdicts(&mut payloads, &[a, b, c], &dirs);
 
         let raw: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&payloads[0]).unwrap()).unwrap();
@@ -1746,21 +1919,24 @@ mod tests {
                 .unwrap()
                 .clone()
         };
-        assert_eq!(row("http|GET|/a")["verdict"], "compatible");
-        assert_eq!(row("http|GET|/a")["compatible"], true);
-        assert_eq!(row("http|GET|/b")["verdict"], "incompatible");
-        assert_eq!(row("http|GET|/b")["compatible"], false);
+        assert_eq!(row("http|GET|/a")["request"]["verdict"], "compatible");
+        assert_eq!(row("http|GET|/b")["request"]["verdict"], "incompatible");
+        assert_eq!(row("http|GET|/b")["request"]["reason"], "A vs B");
 
         let unverifiable = row("http|GET|/c");
-        assert_eq!(unverifiable["verdict"], "unverifiable");
+        assert_eq!(unverifiable["request"]["verdict"], "unverifiable");
+        assert_eq!(unverifiable["request"]["resolved"], false);
         assert!(
-            unverifiable.get("compatible").is_none(),
-            "no boolean means 'could not tell': {unverifiable}"
+            unverifiable["request"].get("reason").is_none(),
+            "a direction that compared nothing has no mismatch to state: {unverifiable}"
         );
-        assert!(unverifiable.get("mismatch_reason").is_none());
+        assert!(
+            unverifiable.get("response").is_none(),
+            "and the unreached half is absent from the wire: {unverifiable}"
+        );
     }
 
-    /// An edge no pair outcome reached carries no verdict, and absence from
+    /// An edge no pair outcome reached carries no direction, and absence from
     /// `compat_verdicts` therefore means exactly one thing: not compared.
     #[test]
     fn an_unreached_edge_is_still_absent() {
@@ -1777,31 +1953,25 @@ mod tests {
         assert!(payloads[0].compat_verdicts.is_none());
     }
 
-    /// Worst-wins across call sites now spans all three states: a pair that
-    /// compared nothing is never upgraded by a sibling call site that agreed,
-    /// and a real mismatch still outranks both.
+    /// Worst-wins across call sites spans all three states, per direction: a
+    /// direction that compared nothing is never upgraded by a sibling call site
+    /// that agreed.
     #[test]
     fn attach_compat_verdicts_dedup_unverifiable_beats_compatible() {
         let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
-        let matches = vec![
-            edge(
-                "producer",
-                "http|GET|/x",
-                "consumer",
-                "http|GET|/x",
-                Some(true),
-                None,
-            ),
-            unverifiable_edge("http|GET|/x", "consumer"),
-        ];
-        attach_compat_verdicts(&mut payloads, &matches, &Default::default());
+        let agrees = edge_at("producer", "http|GET|/x", "consumer", "http|GET|/x", "a.ts");
+        let blind = edge_at("producer", "http|GET|/x", "consumer", "http|GET|/x", "b.ts");
+        let dirs = directions(&[
+            compatible_outcome(&agrees, ManifestTypeKind::Request),
+            unverifiable_outcome(&blind, ManifestTypeKind::Request, "a side carries `any`"),
+        ]);
+        attach_compat_verdicts(&mut payloads, &[agrees, blind], &dirs);
         let verdicts = payloads[0].compat_verdicts.clone().unwrap();
         assert_eq!(verdicts.len(), 1);
         assert_eq!(
-            verdicts[0].verdict,
-            Some(crate::operation::TypeVerdict::Unverifiable)
+            verdicts[0].request.as_ref().unwrap().verdict,
+            crate::operation::TypeVerdict::Unverifiable
         );
-        assert_eq!(verdicts[0].compatible, None);
     }
 
     /// ...and an incompatible verdict still wins over an unverifiable one,
@@ -1809,24 +1979,17 @@ mod tests {
     #[test]
     fn attach_compat_verdicts_dedup_incompatible_beats_unverifiable() {
         let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
-        let matches = vec![
-            unverifiable_edge("http|GET|/x", "consumer"),
-            edge(
-                "producer",
-                "http|GET|/x",
-                "consumer",
-                "http|GET|/x",
-                Some(false),
-                Some("mismatch"),
-            ),
-        ];
-        attach_compat_verdicts(&mut payloads, &matches, &Default::default());
+        let blind = edge_at("producer", "http|GET|/x", "consumer", "http|GET|/x", "a.ts");
+        let breaks = edge_at("producer", "http|GET|/x", "consumer", "http|GET|/x", "b.ts");
+        let dirs = directions(&[
+            unverifiable_outcome(&blind, ManifestTypeKind::Request, "a side carries `any`"),
+            incompatible_outcome(&breaks, ManifestTypeKind::Request, "mismatch"),
+        ]);
+        attach_compat_verdicts(&mut payloads, &[blind, breaks], &dirs);
         let verdicts = payloads[0].compat_verdicts.clone().unwrap();
         assert_eq!(verdicts.len(), 1);
-        assert_eq!(
-            verdicts[0].verdict,
-            Some(crate::operation::TypeVerdict::Incompatible)
-        );
-        assert_eq!(verdicts[0].mismatch_reason.as_deref(), Some("mismatch"));
+        let request = verdicts[0].request.as_ref().unwrap();
+        assert_eq!(request.verdict, crate::operation::TypeVerdict::Incompatible);
+        assert_eq!(request.reason.as_deref(), Some("mismatch"));
     }
 }

@@ -9,7 +9,7 @@ use crate::{
     extractor::CoreExtractor,
     findings::{Finding, PackageVersionRef, tier},
     mount_graph::MountGraph,
-    operation::OperationKey,
+    operation::{OperationKey, TypeVerdict},
     packages::Packages,
     type_manifest::parse_file_location,
     url_normalizer::UrlNormalizer,
@@ -531,57 +531,142 @@ fn verdict_key_of_edge(edge: &CrossRepoMatch) -> Option<VerdictKey> {
     Some((method, normalize_compat_path(&path), consumer))
 }
 
-/// Whether one pair's verdict is a fact about two known types, and why not when
-/// it is not (carrick#730/#734).
+/// The `TypeVerdict` a check bucket states. One definition, so the per-edge
+/// overlay and the per-direction store can never disagree about what a bucket
+/// means.
+fn verdict_of_bucket(bucket: crate::services::type_sidecar::VerdictBucket) -> TypeVerdict {
+    use crate::services::type_sidecar::VerdictBucket;
+    match bucket {
+        VerdictBucket::Incompatible => TypeVerdict::Incompatible,
+        // A gate that caught a baked `any` is the check reaching the pair and
+        // being unable to verify it, which is the third state, not silence.
+        VerdictBucket::Unverifiable | VerdictBucket::GateCaughtBakedAny => {
+            TypeVerdict::Unverifiable
+        }
+        VerdictBucket::Compatible => TypeVerdict::Compatible,
+    }
+}
+
+/// One DIRECTION of one pair's check: what the probe returned, and whether it
+/// returned it over two known types (carrick#730/#734/#822).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PairResolution {
-    /// True only when the bucket is compatible/incompatible AND the check's
-    /// deep walk found no `any`/`unknown` on either side, so a comparison
-    /// really happened between two known shapes.
+pub struct PairDirectionOutcome {
+    /// The three-way answer for this direction alone.
+    pub verdict: TypeVerdict,
+    /// The mismatch diagnostic, present iff `verdict == Incompatible`.
+    pub reason: Option<String>,
+    /// True only when the check's deep walk found no `any`/`unknown` on either
+    /// side of THIS direction, so a comparison really happened between two
+    /// known shapes.
     pub resolved: bool,
-    /// Which side, and where in it, left the verdict unresolved. `None`
+    /// Which side, and where in it, left this direction unresolved. `None`
     /// exactly when `resolved`.
     pub unresolved_reason: Option<String>,
 }
 
-/// Every checked pair's resolution, joined to an edge by the same key the
-/// verdict overlay uses.
-///
-/// Built once and read wherever a reader needs to say whether a verdict is a
-/// comparison or the absence of one — the structured finding's `verdict_state`
-/// and the blob's `CompatVerdict`. Kept OFF [`CrossRepoMatch`] deliberately:
-/// that struct is the eval projection, and a field there would move every
-/// recorded row without changing a single answer.
-#[derive(Debug, Default)]
-pub struct PairResolutions {
-    by_key: HashMap<VerdictKey, PairResolution>,
+/// Both directions of one edge's check. Either may be absent: the check files
+/// an outcome per `(pair, type_kind)`, and a pair with no request type on one
+/// side produces no request outcome at all — which is not a verdict.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EdgeDirections {
+    pub request: Option<PairDirectionOutcome>,
+    pub response: Option<PairDirectionOutcome>,
 }
 
-impl PairResolutions {
-    /// Index the outcomes. An unresolved answer wins a key collision: two
-    /// type_kinds for one pair are one pairing, and it is only a fact when
-    /// both halves are.
+impl EdgeDirections {
+    /// Whether the check filed anything at all for this edge.
+    pub fn is_empty(&self) -> bool {
+        self.request.is_none() && self.response.is_none()
+    }
+}
+
+/// Every checked pair's outcome, kept per DIRECTION and joined to an edge by
+/// the same key the verdict overlay uses.
+///
+/// Per-direction because a pairing is two independent comparisons that share a
+/// producer and a consumer, and folding them destroys the only thing a reader
+/// can act on. The fold used to run two different ways at once — worst-bucket
+/// for the verdict, conjunction for the resolution — so one row could state a
+/// request-side mismatch and a response-side unresolution with nothing to say
+/// which was which (carrick#822).
+///
+/// Read wherever a reader must say what the check found and whether it
+/// compared anything: the blob's [`crate::cloud_storage::CompatVerdict`] and
+/// [`crate::cloud_storage::SdkEdge`]. Kept OFF [`CrossRepoMatch`]
+/// deliberately: that struct is the eval projection, and a field there would
+/// move every recorded row without changing a single answer.
+#[derive(Debug, Default)]
+pub struct PairDirections {
+    by_key: HashMap<(VerdictKey, crate::cloud_storage::ManifestTypeKind), PairDirectionOutcome>,
+}
+
+impl PairDirections {
+    /// Index the outcomes per `(edge key, type_kind)`.
+    ///
+    /// Several manifest pairs can still land on one direction of one edge. They
+    /// collapse exactly as the per-edge overlay collapses them, but WITHIN the
+    /// direction: the verdict is worst-wins by [`TypeVerdict::combine`], the
+    /// diagnostic is the first incompatible one in outcome order (sorted by
+    /// `pair_key` upstream), and `resolved` is the conjunction — one
+    /// unresolved comparison means this direction is not a fact.
     pub fn from_outcomes(outcomes: &[PairCheckOutcome]) -> Self {
-        let mut by_key: HashMap<VerdictKey, PairResolution> = HashMap::new();
+        let mut by_key: HashMap<
+            (VerdictKey, crate::cloud_storage::ManifestTypeKind),
+            PairDirectionOutcome,
+        > = HashMap::new();
         for outcome in outcomes {
+            let verdict = verdict_of_bucket(outcome.bucket);
             let entry = by_key
-                .entry(verdict_key_of_outcome(outcome))
-                .or_insert_with(|| PairResolution {
+                .entry((verdict_key_of_outcome(outcome), outcome.type_kind))
+                .or_insert_with(|| PairDirectionOutcome {
+                    verdict,
+                    reason: None,
                     resolved: true,
                     unresolved_reason: None,
                 });
+            entry.verdict = entry.verdict.combine(verdict);
+            if verdict == TypeVerdict::Incompatible && entry.reason.is_none() {
+                entry.reason = Some(
+                    outcome
+                        .diagnostic
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| {
+                            "producer and consumer types are incompatible".to_string()
+                        }),
+                );
+            }
             if !outcome.resolved && entry.resolved {
                 entry.resolved = false;
                 entry.unresolved_reason = outcome.unresolved_reason.clone();
             }
         }
+        // A diagnostic only ever belongs to an incompatible verdict. When a
+        // worse-wins collapse could not happen this is already true; the guard
+        // states it so no later edit can leave a reason on a verdict that does
+        // not mean one.
+        for entry in by_key.values_mut() {
+            if entry.verdict != TypeVerdict::Incompatible {
+                entry.reason = None;
+            }
+        }
         Self { by_key }
     }
 
-    /// The resolution for one edge, or `None` when no outcome was filed for it
-    /// — the pair was never checked, which is not the same as unresolved.
-    pub fn for_edge(&self, edge: &CrossRepoMatch) -> Option<&PairResolution> {
-        self.by_key.get(&verdict_key_of_edge(edge)?)
+    /// Both directions for one edge. Empty when no outcome was filed for it —
+    /// the pair was never checked, which is not the same as unresolved.
+    pub fn for_edge(&self, edge: &CrossRepoMatch) -> EdgeDirections {
+        let Some(key) = verdict_key_of_edge(edge) else {
+            return EdgeDirections::default();
+        };
+        use crate::cloud_storage::ManifestTypeKind;
+        EdgeDirections {
+            request: self
+                .by_key
+                .get(&(key.clone(), ManifestTypeKind::Request))
+                .cloned(),
+            response: self.by_key.get(&(key, ManifestTypeKind::Response)).cloned(),
+        }
     }
 }
 
@@ -591,8 +676,8 @@ pub(crate) fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [
     let mut compatible: HashSet<VerdictKey> = HashSet::new();
     for outcome in outcomes {
         let key = verdict_key_of_outcome(outcome);
-        match outcome.bucket {
-            crate::services::type_sidecar::VerdictBucket::Incompatible => {
+        match verdict_of_bucket(outcome.bucket) {
+            TypeVerdict::Incompatible => {
                 // Multiple type_kinds for one pair collapse to the first
                 // reason in outcome order (sorted by pair_key upstream).
                 incompatible.entry(key).or_insert_with(|| {
@@ -605,11 +690,10 @@ pub(crate) fn apply_pair_outcomes(outcomes: &[PairCheckOutcome], matches: &mut [
                         })
                 });
             }
-            crate::services::type_sidecar::VerdictBucket::Unverifiable
-            | crate::services::type_sidecar::VerdictBucket::GateCaughtBakedAny => {
+            TypeVerdict::Unverifiable => {
                 unverifiable.insert(key);
             }
-            crate::services::type_sidecar::VerdictBucket::Compatible => {
+            TypeVerdict::Compatible => {
                 compatible.insert(key);
             }
         }
@@ -1085,9 +1169,12 @@ pub struct PairCheckOutcome {
     /// Consumer call-site file, as recorded on the manifest entry.
     pub consumer_file: String,
     pub consumer_line: u32,
-    /// Kept on the outcome for the WP4 structured-findings swap and the
-    /// integration tests; the edge join collapses kinds deliberately.
-    #[allow(dead_code)]
+    /// Which direction of the pairing this outcome is about. Load-bearing on
+    /// the wire since carrick#822: [`PairDirections`] keys on it, so the blob
+    /// can say the request halves proved a mismatch while the response halves
+    /// compared nothing. The per-EDGE overlay
+    /// ([`apply_pair_outcomes`]) still collapses kinds deliberately — that
+    /// struct is the eval projection and the findings input.
     pub type_kind: crate::cloud_storage::ManifestTypeKind,
     pub bucket: crate::services::type_sidecar::VerdictBucket,
     /// For gate buckets: which side and which gate fired.
@@ -1144,14 +1231,14 @@ impl Analyzer {
 
     /// Store the structured v2 check outcomes for this run. Not calling this
     /// leaves compat unevaluated: every edge keeps `type_compatible: None`.
-    /// Every checked pair's resolution, for a reader that must say whether a
-    /// stored verdict is a comparison or the absence of one (carrick#734).
-    /// Empty when the check never ran, which reads as "no pair was checked"
-    /// rather than "no pair resolved".
-    pub fn pair_resolutions(&self) -> PairResolutions {
+    /// Every checked pair's outcome per direction, for a reader that must say
+    /// what the check found on each half and whether that half compared
+    /// anything (carrick#734/#822). Empty when the check never ran, which reads
+    /// as "no pair was checked" rather than "no pair resolved".
+    pub fn pair_directions(&self) -> PairDirections {
         match self.pair_outcomes.as_ref() {
-            Some(outcomes) => PairResolutions::from_outcomes(outcomes),
-            None => PairResolutions::default(),
+            Some(outcomes) => PairDirections::from_outcomes(outcomes),
+            None => PairDirections::default(),
         }
     }
 
@@ -5447,52 +5534,109 @@ mod tests {
         }
     }
 
-    /// The resolution index joins an edge by the same key the verdict overlay
-    /// used, an unresolved half of a pair wins, and an edge nobody checked
-    /// gets nothing rather than `unresolved`.
+    /// The direction index joins an edge by the same key the verdict overlay
+    /// used, keeps the two halves of one pairing APART (carrick#822), and gives
+    /// an edge nobody checked nothing rather than `unresolved`.
     #[test]
-    fn pair_resolutions_join_by_the_verdict_key() {
-        let mut resolved_row = outcome(
+    fn pair_directions_join_by_the_verdict_key_and_keep_the_halves_apart() {
+        use crate::cloud_storage::ManifestTypeKind;
+
+        // The request half proved a mismatch over two known types.
+        let mut request_row = outcome(
+            "GET",
+            "/api/orders/:id",
+            PAYMENTS_CONSUMER_LOC,
+            VerdictBucket::Incompatible,
+            Some("Property 'passwordHash' is missing"),
+        );
+        request_row.type_kind = ManifestTypeKind::Request;
+        request_row.resolved = true;
+        // The same pair, other type_kind, deep-walked to an `any`. Before the
+        // split this took the whole row down with it.
+        let mut response_row = outcome(
             "GET",
             "/api/orders/:id",
             PAYMENTS_CONSUMER_LOC,
             VerdictBucket::Compatible,
             None,
         );
-        resolved_row.resolved = true;
-        // The same pair, other type_kind, deep-walked to an `any`: the pairing
-        // is only a fact when both halves are.
-        let mut unresolved_row = resolved_row.clone();
-        unresolved_row.resolved = false;
-        unresolved_row.unresolved_reason =
+        response_row.type_kind = ManifestTypeKind::Response;
+        response_row.resolved = false;
+        response_row.unresolved_reason =
             Some("the consumer type carries `any` at `body.meta`".to_string());
 
-        let resolutions =
-            PairResolutions::from_outcomes(&[resolved_row.clone(), unresolved_row.clone()]);
+        let dirs = PairDirections::from_outcomes(&[request_row.clone(), response_row.clone()]);
         // Param spelling differs from the outcome's identity on purpose: the
         // shared key normalizes both sides, and a second spelling of it would
         // miss on exactly these routes.
         let matched = edge("http|GET|/api/orders/:orderId");
-        let found = resolutions
-            .for_edge(&matched)
-            .expect("edge joins a verdict");
-        assert!(!found.resolved);
+        let found = dirs.for_edge(&matched);
+
+        let request = found.request.clone().expect("the request half is stated");
+        assert_eq!(request.verdict, TypeVerdict::Incompatible);
         assert_eq!(
-            found.unresolved_reason.as_deref(),
+            request.reason.as_deref(),
+            Some("Property 'passwordHash' is missing")
+        );
+        assert!(
+            request.resolved,
+            "the response half's `any` does not reach this one"
+        );
+
+        let response = found.response.clone().expect("the response half is stated");
+        assert_eq!(response.verdict, TypeVerdict::Compatible);
+        assert!(!response.resolved);
+        assert_eq!(
+            response.unresolved_reason.as_deref(),
             Some("the consumer type carries `any` at `body.meta`")
         );
 
         // Order must not decide it.
-        let flipped = PairResolutions::from_outcomes(&[unresolved_row, resolved_row]);
-        assert_eq!(flipped.for_edge(&matched), Some(found));
+        let flipped = PairDirections::from_outcomes(&[response_row, request_row]);
+        assert_eq!(flipped.for_edge(&matched), found);
 
         // A producer nobody filed an outcome for: absent, not unresolved.
-        assert_eq!(resolutions.for_edge(&edge("http|GET|/api/other")), None);
+        assert!(dirs.for_edge(&edge("http|GET|/api/other")).is_empty());
 
         // A shared-external-contract edge carries no producer contract at all.
         let mut peer = matched.clone();
         peer.relationship = carrick_match::MatchRelationship::SharedExternalContract;
-        assert_eq!(resolutions.for_edge(&peer), None);
+        assert!(dirs.for_edge(&peer).is_empty());
+    }
+
+    /// Two manifest pairs landing on ONE direction of one edge collapse exactly
+    /// as the per-edge overlay collapses them — worst-wins verdict, first
+    /// diagnostic, conjunction on `resolved` — but only within that direction.
+    #[test]
+    fn several_outcomes_on_one_direction_collapse_worst_wins() {
+        use crate::cloud_storage::ManifestTypeKind;
+
+        let mut clean = outcome(
+            "GET",
+            "/api/orders/:id",
+            PAYMENTS_CONSUMER_LOC,
+            VerdictBucket::Compatible,
+            None,
+        );
+        clean.type_kind = ManifestTypeKind::Request;
+        clean.resolved = true;
+        let mut broken = clean.clone();
+        broken.bucket = VerdictBucket::Incompatible;
+        broken.diagnostic = Some("Type 'A' is not assignable to type 'B'".to_string());
+        broken.resolved = false;
+        broken.unresolved_reason = Some("the producer type carries `any` at `data`".to_string());
+
+        let dirs = PairDirections::from_outcomes(&[clean, broken]);
+        let request = dirs
+            .for_edge(&edge("http|GET|/api/orders/:id"))
+            .request
+            .expect("the request half is stated");
+        assert_eq!(request.verdict, TypeVerdict::Incompatible);
+        assert_eq!(
+            request.reason.as_deref(),
+            Some("Type 'A' is not assignable to type 'B'")
+        );
+        assert!(!request.resolved);
     }
 
     /// A consumer location outside the GitHub Actions workspace passes through

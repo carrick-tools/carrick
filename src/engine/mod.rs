@@ -692,7 +692,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     let sdk_join = crate::sdk_edges::join(
         &sdk_join_input,
         &results.cross_repo_matches,
-        &analyzer.pair_resolutions(),
+        &analyzer.pair_directions(),
     );
     if !sdk_join.is_empty() {
         debug!(
@@ -742,7 +742,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         crate::cloud_storage::attach_compat_verdicts(
             &mut payloads,
             &results.cross_repo_matches,
-            &analyzer.pair_resolutions(),
+            &analyzer.pair_directions(),
         );
         // SDK edges ride along on the same terms as the verdicts: small,
         // consumer-side, canonical-keyed, and attached before the size guard.
@@ -6125,15 +6125,36 @@ mod tests {
             consumer_location: Some("src/client.ts".to_string()),
             match_score: 1.0,
             type_compatible: Some(false),
-            // The overlay sets both halves together, and persistence now keys
-            // on the verdict (carrick#811), so a match that is missing it
-            // stores nothing and this setup would not inflate anything.
             type_verdict: Some(crate::operation::TypeVerdict::Incompatible),
             mismatch_reason: Some("y".repeat(400)),
             producer_provenance: Default::default(),
             relationship: carrick_match::MatchRelationship::ProducerConsumer,
         }];
-        crate::cloud_storage::attach_compat_verdicts(&mut payloads, &matches, &Default::default());
+        // Persistence keys on the check's own outcomes (carrick#811/#822), so a
+        // match with no outcome filed for it stores nothing and this setup
+        // would not inflate anything.
+        let outcomes = vec![crate::analyzer::PairCheckOutcome {
+            pair_key: "p/Order~c/src/client.ts".to_string(),
+            pseudo_method: "GET".to_string(),
+            identity: "/api/orders/:id".to_string(),
+            consumer_file: "src/client.ts".to_string(),
+            consumer_line: 1,
+            type_kind: crate::cloud_storage::ManifestTypeKind::Response,
+            bucket: crate::services::type_sidecar::VerdictBucket::Incompatible,
+            gate: None,
+            diagnostic: Some("y".repeat(400)),
+            producer_alias: "Order".to_string(),
+            consumer_alias: "OrderView".to_string(),
+            producer_service: "producer-svc".to_string(),
+            consumer_service: "consumer-svc".to_string(),
+            resolved: true,
+            unresolved_reason: None,
+        }];
+        crate::cloud_storage::attach_compat_verdicts(
+            &mut payloads,
+            &matches,
+            &crate::analyzer::PairDirections::from_outcomes(&outcomes),
+        );
         assert!(
             serde_json::to_string(&payloads[0]).unwrap().len() > MAX_PAYLOAD_BYTES,
             "test setup: verdicts must push the payload over the cap"
