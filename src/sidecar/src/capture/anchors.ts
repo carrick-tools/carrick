@@ -633,17 +633,8 @@ function literalResolvesLocally(
 
 /**
  * v1's `findFunctionByLine` tolerance, mirrored so the two paths agree on how
- * far an anchor may be from the function it names.
- *
- * The two paths no longer agree on what a FORWARD match may cross:
- * `findFunctionByLine` now rejects a candidate the anchor line's own statement
- * does not lead to, because reading the next declaration in the file published
- * a private helper's return type as a route's response contract (carrick#766).
- * Here a forward candidate is only ever a candidate — `handlerCandidates` hands
- * back a list and the caller keeps the first whose PARAMETER NAME matches, so a
- * neighbouring declaration has to match the name to be read at all. That is a
- * narrower exposure, not none; carrick#770 tracks porting the guard with a case
- * that fails without it.
+ * far an anchor may be from the function it names — and, since carrick#770, on
+ * what a forward match may cross (see [`separatedFromAnchor`]).
  */
 const HANDLER_LINE_TOLERANCE = 2;
 
@@ -726,6 +717,15 @@ function callsStartingOnLine(
 /**
  * Functions declared within the line tolerance of `line`, ordered innermost
  * (smallest span) first so a nested handler wins over its enclosing function.
+ *
+ * The tolerance is one-directional in effect, the same rule the v1 inferrer's
+ * `findFunctionByLine` applies (carrick#766/#770). Looking BACK is free: a
+ * function starting before the anchor is one the anchor sits inside or just
+ * after. Looking FORWARD reaches a handler that starts a line or two into the
+ * registration the anchor names — and, unguarded, also reaches the next
+ * declaration in the file when the anchor lands on a statement that declares no
+ * function at all. Nothing but trivia may sit between the anchor and the
+ * function it is taken to name.
  */
 function functionsNearLine(
   sourceFile: ts.SourceFile,
@@ -742,8 +742,77 @@ function functionsNearLine(
     node.forEachChild(visit);
   };
   visit(sourceFile);
-  return found.sort(
-    (a, b) => a.getEnd() - a.getStart() - (b.getEnd() - b.getStart())
+  const windowStatements = statementsOpeningInWindow(sourceFile, line);
+  return found
+    .filter(
+      (fn) =>
+        startLineOf(sourceFile, fn) <= line ||
+        !separatedFromAnchor(sourceFile, windowStatements, fn)
+    )
+    .sort((a, b) => a.getEnd() - a.getStart() - (b.getEnd() - b.getStart()));
+}
+
+/**
+ * Statements opening inside the forward window `[line, line + tolerance]`.
+ *
+ * Statement LIST members, not every node the checker calls a statement: the
+ * members of a source file, a block, a module block or a case clause are the
+ * things that can stand between an anchor and a later declaration. Collected
+ * from the lists themselves because the raw compiler API has no total
+ * "is this a statement" predicate the way ts-morph does.
+ */
+function statementsOpeningInWindow(
+  sourceFile: ts.SourceFile,
+  line: number
+): ts.Statement[] {
+  const found: ts.Statement[] = [];
+  const consider = (statements: ts.NodeArray<ts.Statement>) => {
+    for (const statement of statements) {
+      const start = startLineOf(sourceFile, statement);
+      if (start >= line && start <= line + HANDLER_LINE_TOLERANCE) {
+        found.push(statement);
+      }
+    }
+  };
+  const visit = (node: ts.Node) => {
+    if (
+      ts.isSourceFile(node) ||
+      ts.isBlock(node) ||
+      ts.isModuleBlock(node) ||
+      ts.isCaseClause(node) ||
+      ts.isDefaultClause(node)
+    ) {
+      consider(node.statements);
+    }
+    node.forEachChild(visit);
+  };
+  visit(sourceFile);
+  return found;
+}
+
+/**
+ * Whether a statement opening in the forward window stands between the anchor
+ * and `fn` — it begins on an earlier line than `fn` and does not contain it.
+ *
+ * `broker.register('key', (payload) => …)` spread over three lines is one
+ * statement that CONTAINS its handler, so the handler is reachable.
+ * `export { handler };` followed by `function buildQuery(payload)` is two
+ * statements, and the second is not what the first names.
+ */
+function separatedFromAnchor(
+  sourceFile: ts.SourceFile,
+  windowStatements: ts.Statement[],
+  fn: ts.SignatureDeclaration
+): boolean {
+  const fnStart = fn.getStart(sourceFile);
+  const fnLine = startLineOf(sourceFile, fn);
+  return windowStatements.some(
+    (statement) =>
+      startLineOf(sourceFile, statement) < fnLine &&
+      !(
+        statement.getStart(sourceFile) <= fnStart &&
+        statement.getEnd() >= fn.getEnd()
+      )
   );
 }
 
