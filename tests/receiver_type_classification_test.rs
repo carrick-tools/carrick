@@ -41,6 +41,30 @@ app.get("/widgets", (req, res) => res.send("ok"));
 api.get("/widgets", { retries: 2 });
 "#;
 
+/// The same file with multi-byte text above the sites (carrick#805).
+///
+/// The scanner records an SWC span — a UTF-8 BYTE offset — and the sidecar
+/// resolves it against a ts-morph position, which TypeScript counts in UTF-16
+/// code units. Every character in this header costs one more byte than it
+/// costs a unit, so both sites below it sit past the slack the sidecar's span
+/// lookup allows, and an unconverted span resolves to the enclosing call or to
+/// nothing.
+///
+/// The header is prose, not a shape: nothing in the pipeline reads it. What it
+/// changes is only where in the file the two sites are, which is the whole
+/// point — the answer must not depend on that.
+const APP_TS_NON_ASCII: &str = r#"// Requisições à API: os plantões são carregados aqui.
+// Não há nada de especial nestas linhas além dos acentos.
+import { createServer } from "server-fw";
+import { createClient } from "http-fetcher";
+
+const app = createServer();
+const api = createClient();
+
+app.get("/widgets", (req, res) => res.send("ok"));
+api.get("/widgets", { retries: 2 });
+"#;
+
 const SERVER_DTS: &str = r#"export declare class Server {
   get(path: string, handler: (req: unknown, res: { send(body: string): void }) => void): void;
 }
@@ -66,7 +90,7 @@ fn write_package(root: &Path, name: &str, dts: &str) {
 
 /// The fixture repo. `installed` writes the two declaration packages; without
 /// them both receivers resolve to `any`, which is the CI checkout's shape.
-fn write_repo(root: &Path, installed: bool) {
+fn write_repo(root: &Path, installed: bool, source: &str) {
     fs::create_dir_all(root.join("src")).expect("src dir");
     fs::write(
         root.join("tsconfig.json"),
@@ -84,7 +108,7 @@ fn write_repo(root: &Path, installed: bool) {
 }"#,
     )
     .expect("tsconfig");
-    fs::write(root.join("src/app.ts"), APP_TS).expect("app.ts");
+    fs::write(root.join("src/app.ts"), source).expect("app.ts");
     if installed {
         write_package(root, "server-fw", SERVER_DTS);
         write_package(root, "http-fetcher", CLIENT_DTS);
@@ -147,7 +171,7 @@ struct Rows {
     unresolved: usize,
 }
 
-async fn deterministic_rows(installed: bool) -> Option<Rows> {
+async fn deterministic_rows(installed: bool, source: &str) -> Option<Rows> {
     if !is_node_available() {
         eprintln!("Skipping test: Node.js not available");
         return None;
@@ -159,7 +183,7 @@ async fn deterministic_rows(installed: bool) -> Option<Rows> {
 
     let temp = TempDir::new().expect("temp dir");
     let root = temp.path().join("api");
-    write_repo(&root, installed);
+    write_repo(&root, installed, source);
 
     let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
     sidecar.start_init(&root, None);
@@ -238,7 +262,7 @@ async fn deterministic_rows(installed: bool) -> Option<Rows> {
 #[tokio::test]
 #[serial]
 async fn two_identically_shaped_sites_split_on_what_their_receivers_are() {
-    let Some(rows) = deterministic_rows(true).await else {
+    let Some(rows) = deterministic_rows(true, APP_TS).await else {
         return;
     };
 
@@ -266,7 +290,7 @@ async fn two_identically_shaped_sites_split_on_what_their_receivers_are() {
 #[tokio::test]
 #[serial]
 async fn a_checkout_with_no_installed_dependencies_states_neither() {
-    let Some(rows) = deterministic_rows(false).await else {
+    let Some(rows) = deterministic_rows(false, APP_TS).await else {
         return;
     };
 
@@ -282,5 +306,42 @@ async fn a_checkout_with_no_installed_dependencies_states_neither() {
         "no row claims a role it could not read: {:?} {:?}",
         rows.endpoints,
         rows.calls
+    );
+}
+
+/// carrick#805: the same two sites, below a header of multi-byte text.
+///
+/// Every site in a file is addressed by a span, and the units the scanner
+/// counts in are not the units the sidecar reads. On an ASCII file the two
+/// agree; from a file's first multi-byte character onwards they drift, and the
+/// drift grows with every one after it. On the repo this was found on, ten of
+/// 102 sites on one shared client were classified and the rest fell to the
+/// model — the ten above the point where the drift outgrew the sidecar's slack.
+///
+/// A fixture that is pure ASCII cannot see any of this, which is why every one
+/// of them was green while it was broken.
+#[tokio::test]
+#[serial]
+async fn a_site_below_multi_byte_text_is_classified_like_any_other() {
+    let Some(rows) = deterministic_rows(true, APP_TS_NON_ASCII).await else {
+        return;
+    };
+
+    assert_eq!(
+        rows.classified_endpoints, 1,
+        "the server-typed receiver states a route wherever in the file it sits"
+    );
+    assert_eq!(
+        rows.classified_calls, 1,
+        "the client-typed receiver states a request wherever in the file it sits"
+    );
+    assert_eq!(
+        rows.unresolved, 0,
+        "both receivers resolved: the spans reached the nodes they name"
+    );
+    assert_eq!(rows.emitted_by_receiver_type, 2);
+    assert_eq!(
+        rows.calls,
+        vec![("GET".to_string(), "/widgets".to_string())]
     );
 }

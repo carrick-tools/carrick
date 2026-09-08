@@ -34,6 +34,18 @@ use crate::wrapper_request_shape::{RequestShapeSignal, call_request_shape};
 
 /// A candidate API call site detected by the SWC scanner.
 /// This is passed as a "hint" to the LLM to ensure 100% recall.
+///
+/// The byte position SWC gives a file's FIRST byte. Every scan here parses one
+/// file into a SourceMap of its own, so a span's raw position is that file's
+/// offset plus this — subtract it to get a file-relative one.
+///
+/// Nothing inside the scanner does: the raw positions are the join keys
+/// (`candidate_id` is `span:<start>-<end>`, and it keys the raw model-result
+/// cache). The subtraction belongs at the boundary where a span is handed to
+/// something that counts from zero, which is the type sidecar
+/// ([`crate::utils::utf16_offset`] converts the units at the same point).
+pub const SWC_SPAN_BASE: u32 = 1;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CandidateTarget {
     /// Protocol family this call site belongs to. Routes the candidate to
@@ -44,9 +56,11 @@ pub struct CandidateTarget {
     pub protocol: Protocol,
     /// Stable identifier for this call site within the file
     pub candidate_id: String,
-    /// Start byte offset of the call expression
+    /// Start byte offset of the call expression, in SWC's own numbering (see
+    /// [`SWC_SPAN_BASE`]).
     pub span_start: u32,
-    /// End byte offset of the call expression
+    /// End byte offset of the call expression, in SWC's own numbering (see
+    /// [`SWC_SPAN_BASE`]).
     pub span_end: u32,
     /// 1-based line number where the call was detected
     pub line_number: usize,
@@ -3743,6 +3757,24 @@ mod tests {
 
     fn scan_test_content(content: &str) -> ScanResult {
         scan_test_content_with_fetchers(content, &[])
+    }
+
+    /// [`SWC_SPAN_BASE`] is a claim about SWC's numbering that every span sent
+    /// to the type sidecar subtracts (carrick#805). Nothing else asserts it:
+    /// the sidecar's span lookup allows two units of slack, so a base off by
+    /// one is absorbed there and only surfaces once that slack goes.
+    #[test]
+    fn a_candidate_span_is_the_files_byte_offset_plus_the_base() {
+        let content = "fetch('/a');";
+        let result = scan_test_content(content);
+        let candidate = result
+            .candidates
+            .first()
+            .expect("the call raises a candidate");
+
+        let call = content.find("fetch").expect("the call is in the source") as u32;
+        assert_eq!(candidate.span_start, call + SWC_SPAN_BASE);
+        assert_eq!(candidate.span_end, content.len() as u32 - 1 + SWC_SPAN_BASE);
     }
 
     fn scan_test_content_with_fetchers(content: &str, data_fetchers: &[String]) -> ScanResult {
