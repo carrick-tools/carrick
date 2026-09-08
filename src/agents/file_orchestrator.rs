@@ -3769,7 +3769,11 @@ impl FileOrchestrator {
     ///
     /// Returns an empty list for anything that is not a workspace package: an
     /// external dependency has no source in this repo to read.
-    fn package_surface_modules(
+    ///
+    /// Also read by [`crate::call_graph`], which indexes the same surface by
+    /// `Class.member` to resolve a receiver whose origin is this package
+    /// (carrick#781).
+    pub(crate) fn package_surface_modules(
         specifier: &str,
         workspace: &WorkspaceIndex,
         repo_root: &Path,

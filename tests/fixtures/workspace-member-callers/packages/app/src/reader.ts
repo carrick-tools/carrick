@@ -1,4 +1,4 @@
-import { RunClient } from "@fixture/core/v2";
+import { RunClient, runClientManager } from "@fixture/core/v2";
 import type { VendorClient } from "vendor-runs";
 
 /**
@@ -53,4 +53,30 @@ export class UntypedManager {
   readStreamUntyped(runId: string, streamKey: string) {
     return this.apiClient.fetchStream(runId, streamKey);
   }
+}
+
+/**
+ * The file states no class for the receiver — only that its value came out of
+ * a binding imported from a workspace package (carrick#781). One class in that
+ * package's published surface declares this member, so the edge is answerable.
+ */
+export function readRunByOrigin(runId: string) {
+  const client = runClientManager.clientOrThrow();
+  return client.subscribeToRun(runId);
+}
+
+/** The same origin, but two classes in the surface declare this member. */
+export function readStreamByOrigin(runId: string, streamKey: string) {
+  const client = runClientManager.clientOrThrow();
+  return client.fetchStream(runId, streamKey);
+}
+
+/**
+ * A nested parameter shadows the origin, and the nested call site is folded
+ * into this function's — so the origin must not answer for it.
+ */
+export function readContestedByOrigin(runId: string) {
+  const client = runClientManager.clientOrThrow();
+  const nested = (client: VendorClient) => client.subscribeToRun(runId);
+  return nested;
 }

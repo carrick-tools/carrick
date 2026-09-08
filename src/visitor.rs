@@ -1,6 +1,7 @@
 extern crate swc_common;
 extern crate swc_ecma_parser;
 
+use crate::receiver_origin::{ReceiverOriginCollector, ReceiverOrigins};
 use crate::receiver_type::{ReceiverTypeCollector, ReceiverTypes, class_field_types};
 use std::{
     collections::{HashMap, HashSet},
@@ -691,6 +692,16 @@ pub struct FunctionDefinitionExtractor {
     /// `callee_refs` because it exists to resolve those call sites' receivers,
     /// and because a name means different things in different scopes.
     pub declared_types: HashMap<String, ReceiverTypes>,
+    /// Definition key → the module specifiers this definition's own local
+    /// bindings trace their value back to ([`crate::receiver_origin`],
+    /// carrick#781). Keyed like `declared_types`, and read only after it
+    /// declines: an origin says the receiver belongs to a package, never which
+    /// class it is.
+    pub receiver_origins: HashMap<String, ReceiverOrigins>,
+    /// The module scope every body in this file starts from — its value
+    /// imports and its top-level declarators — cloned per function, so a
+    /// parameter shadows it wherever one appears.
+    module_origins: ReceiverOriginCollector,
     /// Class name → the classes that class declares its own FIELDS to be
     /// ([`crate::receiver_type::class_field_types`], carrick#782). Keyed by
     /// class rather than by definition because a field belongs to the class,
@@ -719,6 +730,8 @@ impl FunctionDefinitionExtractor {
             function_definitions: HashMap::new(),
             callee_refs: HashMap::new(),
             declared_types: HashMap::new(),
+            receiver_origins: HashMap::new(),
+            module_origins: ReceiverOriginCollector::per_function(),
             field_types: HashMap::new(),
             current_file_path: file_path,
             source_map,
@@ -792,6 +805,16 @@ impl FunctionDefinitionExtractor {
         }
         self.declared_types.insert(key.to_string(), types.finish());
 
+        let mut origins = self.module_origins.clone();
+        for param in &function.params {
+            origins.record_shadow(&param.pat);
+        }
+        if let Some(body) = &function.body {
+            body.visit_with(&mut origins);
+        }
+        self.receiver_origins
+            .insert(key.to_string(), origins.finish());
+
         tokens
     }
 
@@ -812,6 +835,14 @@ impl FunctionDefinitionExtractor {
         }
         arrow.body.visit_with(&mut types);
         self.declared_types.insert(key.to_string(), types.finish());
+
+        let mut origins = self.module_origins.clone();
+        for pat in &arrow.params {
+            origins.record_shadow(pat);
+        }
+        arrow.body.visit_with(&mut origins);
+        self.receiver_origins
+            .insert(key.to_string(), origins.finish());
 
         tokens
     }
@@ -1343,6 +1374,13 @@ impl Visit for FunctionDefinitionExtractor {
 
         // Continue visiting child nodes
         var_decl.visit_children_with(self);
+    }
+
+    /// Seed the module scope before any body is walked: a function's own
+    /// statements are recorded on top of it (carrick#781).
+    fn visit_module(&mut self, module: &Module) {
+        self.module_origins.record_module_scope(module);
+        module.visit_children_with(self);
     }
 
     /// Track the enclosing class name so members can be indexed as `Class.member`.
