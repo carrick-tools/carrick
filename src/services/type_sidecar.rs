@@ -1462,28 +1462,29 @@ impl TypeSidecar {
         if had_explicit_dts {
             for req in &explicit {
                 if let Some(alias) = &req.alias
-                    && Self::dts_defines_alias(&combined_dts, alias)
+                    && crate::type_manifest::dts_defines_alias(&combined_dts, alias)
                 {
                     appended_aliases.insert(alias.clone());
                 }
-                if Self::dts_defines_alias(&combined_dts, &req.symbol_name) {
+                if crate::type_manifest::dts_defines_alias(&combined_dts, &req.symbol_name) {
                     appended_aliases.insert(req.symbol_name.clone());
                 }
             }
         }
 
+        // Every statement written here goes through `append_alias_declaration`,
+        // which stamps `MISSING_ALIAS_MARKER` on a bare `unknown`. All three
+        // loops below can write one — an inference that came back untyped, a
+        // symbol the bundler failed on, an infer request that produced no
+        // answer at all — and each of them means the same thing: v1 was asked
+        // for this alias and has no shape. Unmarked, a reader could not tell
+        // that from a developer's own `type X = unknown` and promoted it to a
+        // defined type (carrick#780).
         let mut append_alias = |alias: &str, type_string: &str| -> bool {
             if !appended_aliases.insert(alias.to_string()) {
                 return false;
             }
-            if !combined_dts.is_empty() && !combined_dts.ends_with('\n') {
-                combined_dts.push('\n');
-            }
-            combined_dts.push_str("export type ");
-            combined_dts.push_str(alias);
-            combined_dts.push_str(" = ");
-            combined_dts.push_str(type_string.trim().trim_end_matches(';'));
-            combined_dts.push_str(";\n");
+            crate::type_manifest::append_alias_declaration(&mut combined_dts, alias, type_string);
             true
         };
 
@@ -1564,17 +1565,6 @@ impl TypeSidecar {
         let mut counter = self.request_counter.lock().unwrap();
         *counter += 1;
         format!("req-{}", counter)
-    }
-
-    /// Check whether a bundled DTS string already defines a given alias
-    /// (as a type, interface, class, enum, or namespace declaration).
-    fn dts_defines_alias(content: &str, alias: &str) -> bool {
-        let escaped = regex::escape(alias);
-        let pattern = format!(r"\b(type|interface|class|enum|namespace)\s+{}\b", escaped);
-        match regex::Regex::new(&pattern) {
-            Ok(re) => re.is_match(content),
-            Err(_) => false,
-        }
     }
 
     fn is_untyped_response_type(type_string: &str) -> bool {
@@ -2509,19 +2499,25 @@ mod tests {
     #[test]
     fn test_dts_defines_alias_matches_interface() {
         let dts = "export interface Endpoint_abc_Response {\n  id: string;\n}\n";
-        assert!(TypeSidecar::dts_defines_alias(dts, "Endpoint_abc_Response"));
+        assert!(crate::type_manifest::dts_defines_alias(
+            dts,
+            "Endpoint_abc_Response"
+        ));
     }
 
     #[test]
     fn test_dts_defines_alias_matches_type() {
         let dts = "export type Endpoint_abc_Response = { id: string };\n";
-        assert!(TypeSidecar::dts_defines_alias(dts, "Endpoint_abc_Response"));
+        assert!(crate::type_manifest::dts_defines_alias(
+            dts,
+            "Endpoint_abc_Response"
+        ));
     }
 
     #[test]
     fn test_dts_defines_alias_no_false_positive() {
         let dts = "export interface Endpoint_abc_Request {\n  id: string;\n}\n";
-        assert!(!TypeSidecar::dts_defines_alias(
+        assert!(!crate::type_manifest::dts_defines_alias(
             dts,
             "Endpoint_abc_Response"
         ));
@@ -2530,7 +2526,7 @@ mod tests {
     #[test]
     fn test_dts_defines_alias_matches_enum() {
         let dts = "export enum Status { Active, Inactive }\n";
-        assert!(TypeSidecar::dts_defines_alias(dts, "Status"));
+        assert!(crate::type_manifest::dts_defines_alias(dts, "Status"));
     }
 
     #[test]
@@ -2571,11 +2567,11 @@ mod tests {
         if had_explicit_dts {
             for req in &explicit {
                 if let Some(alias) = &req.alias
-                    && TypeSidecar::dts_defines_alias(&combined_dts, alias)
+                    && crate::type_manifest::dts_defines_alias(&combined_dts, alias)
                 {
                     appended_aliases.insert(alias.clone());
                 }
-                if TypeSidecar::dts_defines_alias(&combined_dts, &req.symbol_name) {
+                if crate::type_manifest::dts_defines_alias(&combined_dts, &req.symbol_name) {
                     appended_aliases.insert(req.symbol_name.clone());
                 }
             }

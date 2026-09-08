@@ -210,10 +210,18 @@ fn usable_inferred_text(text: &str) -> Option<&str> {
 fn inference_was_blind(inf: &crate::services::type_sidecar::InferredType) -> bool {
     inf.primary_type_symbol.is_none()
         && inf.array_depth.is_none()
-        && matches!(
-            inf.type_string.trim().trim_end_matches(';').trim(),
-            "any" | "unknown"
-        )
+        && text_is_bare_top_type(&inf.type_string)
+}
+
+/// True when a printed type text carries no shape whatever: it IS a top type,
+/// rather than a shape with one somewhere inside it. `{ ok: boolean; count:
+/// any }` still describes a payload and is not this; `any` describes nothing.
+///
+/// Deliberately narrower than [`contains_disqualifying_top_type`], which is the
+/// compat question ("could this read compatible against anything?"). This is
+/// the publication question ("is there anything here to show a reader?").
+pub(crate) fn text_is_bare_top_type(text: &str) -> bool {
+    matches!(text.trim().trim_end_matches(';').trim(), "any" | "unknown")
 }
 
 /// Aliases whose deterministic inference ran and came back blind for EVERY
@@ -1295,6 +1303,7 @@ mod tests {
             primary_type_symbol: None,
             defined_in: None,
             any_provenance: Vec::new(),
+            v1_unresolved: false,
         }
     }
 
