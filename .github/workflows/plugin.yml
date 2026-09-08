@@ -16,12 +16,14 @@ on:
     paths:
       - "npm/**"
       - "plugin/**"
+      - "src/sidecar/**"
       - ".github/workflows/plugin.yml"
   pull_request:
     branches: [main, develop]
     paths:
       - "npm/**"
       - "plugin/**"
+      - "src/sidecar/**"
       - ".github/workflows/plugin.yml"
 
 jobs:
@@ -60,3 +62,27 @@ jobs:
       - name: Build the VS Code extension
         working-directory: plugin/vscode
         run: npm ci && npm run build
+
+      # The tarball, installed the way a user installs it. Two failures live
+      # only here and in nothing above: a `.ts` the package imports, which Node
+      # refuses to strip under node_modules, and a runtime dependency the
+      # sidecar had only because its own `npm ci` installed devDependencies.
+      # `npm pack` runs prepack, which builds the emit, bundles the sidecar and
+      # fails on an undeclared import.
+      - name: Build the type sidecar
+        working-directory: src/sidecar
+        run: npm ci && npm run build
+
+      - name: Install the packed package as a user would
+        run: |
+          set -euo pipefail
+          (cd npm/carrick && npm pack --pack-destination "$RUNNER_TEMP")
+          mkdir -p "$RUNNER_TEMP/probe"
+          cd "$RUNNER_TEMP/probe"
+          echo '{"name":"probe","private":true}' > package.json
+          npm install --ignore-scripts "$RUNNER_TEMP"/carrick-*.tgz
+          ./node_modules/.bin/carrick --version
+          # No platform package on this machine, so the resolver's message is
+          # what a user with an unpublished platform sees. It must be a
+          # message, not a stack trace.
+          ./node_modules/.bin/carrick check nothing.ts 2>&1 | tee /dev/stderr | grep -q "is not installed"
