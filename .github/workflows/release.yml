@@ -14,7 +14,6 @@ jobs:
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
-      version: ${{ steps.release.outputs.version }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
@@ -59,6 +58,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Read the version from the tag
+        id: version
+        shell: bash
+        run: |
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          echo "version=${TAG##*v}" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -86,15 +92,24 @@ jobs:
           node npm/platform/build.mjs \
             --platform "${{ matrix.platform }}" \
             --arch "${{ matrix.arch }}" \
-            --version "${{ needs.release-please.outputs.version }}" \
+            --version "${{ steps.version.outputs.version }}" \
             --binary "$BINARY" \
             --out dist/platform
+
+      # Packed here, not in the publish job: upload-artifact does not carry a
+      # file's mode, so a binary uploaded as a file arrives 0644 and every
+      # install of it fails with EACCES. A tarball keeps the executable bit.
+      - name: Pack the platform package
+        shell: bash
+        run: |
+          cd "dist/platform/${{ matrix.platform }}-${{ matrix.arch }}"
+          npm pack --pack-destination "$GITHUB_WORKSPACE/dist/tarballs"
 
       - name: Upload the platform package
         uses: actions/upload-artifact@v4
         with:
           name: platform-${{ matrix.platform }}-${{ matrix.arch }}
-          path: dist/platform/${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/tarballs/*.tgz
           retention-days: 1
 
   # Publishing is keyless: npm trusted publishing exchanges the job's OIDC
@@ -125,14 +140,15 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: platform-*
-          path: dist/platform
+          path: dist/tarballs
+          merge-multiple: true
 
       - name: Publish the platform packages
         run: |
           set -euo pipefail
-          for dir in dist/platform/*/; do
-            echo "publishing $dir"
-            (cd "$dir" && npm publish --access public)
+          for tarball in dist/tarballs/*.tgz; do
+            echo "publishing $tarball"
+            npm publish --access public "$tarball"
           done
 
       - name: Build the type sidecar
