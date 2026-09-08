@@ -80,6 +80,20 @@ test("the templates are importable by the tool that has to render the same bytes
   assert.ok(fs.existsSync(path.join(packageRoot, "src", "templates.ts")));
 });
 
+test("the host manifests name this CLI's commands, and travel with the package", () => {
+  // `--plugin-dir` has to name a directory an npm install actually has, so the
+  // manifests are copied in at prepack; the repo's copy is the source.
+  assert.ok((pkg["files"] as string[]).includes("plugin"));
+  const hooks = readJson(path.join(repoRoot, "plugin", "hooks", "hooks.json"));
+  const commands = Object.values(hooks["hooks"]).flatMap((groups: any) =>
+    groups.flatMap((group: any) => group.hooks.map((entry: any) => entry.command)),
+  );
+  assert.deepEqual(commands.sort(), ["carrick hook post-edit", "carrick hook session-start"]);
+  const lsp = readJson(path.join(repoRoot, "plugin", ".lsp.json"));
+  assert.equal(lsp["carrick"]["command"], "carrick");
+  assert.deepEqual(lsp["carrick"]["args"], ["lsp", "--stdio", "--hooks-installed"]);
+});
+
 test("the node floor is the sidecar's floor", () => {
   assert.equal(pkg["engines"]["node"], ">=24");
   const sidecar = readJson(path.join(repoRoot, "src", "sidecar", "package.json"));

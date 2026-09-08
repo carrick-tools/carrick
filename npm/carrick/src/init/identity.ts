@@ -9,7 +9,7 @@
 // This states the identity. Spending an allowance against it is the cloud's
 // side (carrick-cloud#601) and is not wired here.
 
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 
 export type Identity = {
   /** The GitHub login, when the source could name one. */
@@ -30,11 +30,12 @@ export type IdentityOptions = {
 };
 
 function defaultGhStatus(): string {
-  // stderr, because that is where `gh auth status` writes on older versions.
-  return execFileSync("gh", ["auth", "status"], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  // Both streams: `gh auth status` writes to stderr on older versions and to
+  // stdout on newer ones, and a run that reads one of them finds nothing on
+  // half the machines it runs on.
+  const run = spawnSync("gh", ["auth", "status"], { encoding: "utf8" });
+  if (run.error) throw run.error;
+  return `${run.stdout ?? ""}\n${run.stderr ?? ""}`;
 }
 
 /** The login out of `gh auth status`, whatever wording it used. */

@@ -92,6 +92,18 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
+// The Claude Code plugin is three manifests naming this CLI's commands. It
+// ships here so `--plugin-dir` names a directory an npm install actually has;
+// the copy is gitignored and plugin/ stays the source.
+const plugin = path.join(packageRoot, "plugin");
+fs.rmSync(plugin, { recursive: true, force: true });
+fs.mkdirSync(plugin, { recursive: true });
+for (const entry of [".claude-plugin", ".lsp.json", "hooks"]) {
+  fs.cpSync(path.join(packageRoot, "..", "..", "plugin", entry), path.join(plugin, entry), {
+    recursive: true,
+  });
+}
+
 // The licence travels with the tarball. npm only picks up a LICENSE file that
 // sits in the package directory, and this one is the repo's.
 fs.copyFileSync(path.join(packageRoot, "..", "..", "LICENSE.md"), path.join(packageRoot, "LICENSE.md"));

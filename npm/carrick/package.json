@@ -32,6 +32,7 @@
   "files": [
     "bin",
     "dist",
+    "plugin",
     "sidecar",
     "templates",
     "LICENSE.md"

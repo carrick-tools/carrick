@@ -6,3 +6,5 @@ dist/
 sidecar/
 # Copied from the repo root by prepack.
 LICENSE.md
+# Copied from the repo's plugin/ by prepack.
+plugin/

@@ -17,7 +17,7 @@ import { describeIdentity, githubIdentity } from "./identity.ts";
 import { findRepos, mergeWorkspace } from "./repos.ts";
 import { mergeCarrickHooks } from "./settings.ts";
 import { renderTemplate } from "../templates.ts";
-import { resolveNativeBinary, nativeEnv } from "../native.ts";
+import { resolveNativeBinary, nativeEnv, packageRoot } from "../native.ts";
 
 const WORKSPACE_FILE = "carrick-workspace.json";
 const SETTINGS_FILE = path.join(".claude", "settings.json");
@@ -207,8 +207,10 @@ export async function init(argv: string[]): Promise<number> {
     say("    code --install-extension carrick-tools.carrick");
     say();
   }
-  say("Claude Code reads the hooks above with no plugin. For the language server:");
-  say(`    claude --plugin-dir <this checkout>/plugin`);
+  say(`Start Claude Code in this folder — the hooks above are ${SETTINGS_FILE} here, and`);
+  say("the index covers every repo in it. The hooks need no plugin; the language server does:");
+  const plugin = path.join(packageRoot(), "plugin");
+  say(`    claude --plugin-dir ${fs.existsSync(plugin) ? plugin : "<carrick checkout>/plugin"}`);
   say();
   say("Then: edit a file with a route or a call in it, and Carrick answers on the edit.");
   return 0;
