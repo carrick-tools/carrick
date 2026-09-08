@@ -71,76 +71,19 @@ runs:
       with:
         node-version: "24"
 
-    - name: Download Carrick
+    - name: Resolve the Carrick version
       if: steps.fork-check.outputs.skip != 'true'
-      id: download
+      id: version
       shell: bash
-      env:
-        GH_TOKEN: ${{ github.token }}
       run: |
-        # The repo that hosts this action's releases. GITHUB_ACTION_REPOSITORY
-        # is set by the runner for action steps, so release downloads follow
-        # the action if the repo moves orgs; the literal is a fallback for
-        # runners that don't set it.
-        ACTION_REPO="${GITHUB_ACTION_REPOSITORY:-carrick-tools/carrick}"
-
-        ASSET="carrick-action-linux.tar.gz"
-        JQ_ASSET_URL=".assets[] | select(.name==\"$ASSET\") | .browser_download_url"
-
-        # `gh api` prints the JSON error body to stdout on a 404 (e.g. a release
-        # tag that doesn't exist). Captured into DOWNLOAD_URL that blob is
-        # non-empty, so it slips past the `-z` fallback guards below and is
-        # handed to curl as a "URL". Only accept a value that is actually one.
-        valid_url() { case "$1" in https://*) return 0 ;; *) return 1 ;; esac; }
-
-        # Pin the binary to the release matching this action checkout:
-        # release-please bumps Cargo.toml in the same commit it tags, so the
-        # version here identifies the release this ref shipped with. Without
-        # this, every run floated to the latest release regardless of which
-        # action ref the workflow pinned.
+        # Pin to the release matching this action checkout: release-please
+        # bumps Cargo.toml and npm/carrick/package.json in the same commit it
+        # tags, so the version here identifies what this ref shipped with.
+        # Without the pin every run would float to the latest published
+        # package regardless of which action ref the workflow pinned.
         VERSION=$(grep -m1 '^version' "$GITHUB_ACTION_PATH/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
-        echo "Resolving Carrick release for version $VERSION"
-
-        # release-please tags releases as carrick-v<version>.
-        DOWNLOAD_URL=$(gh api "repos/$ACTION_REPO/releases/tags/carrick-v$VERSION" \
-          --jq "$JQ_ASSET_URL" 2>/dev/null || true)
-        valid_url "$DOWNLOAD_URL" || DOWNLOAD_URL=""
-
-        if [ -z "$DOWNLOAD_URL" ]; then
-          # Fallback for any other tag scheme: match a release whose tag ends
-          # with this version.
-          DOWNLOAD_URL=$(gh api "repos/$ACTION_REPO/releases" --paginate \
-            --jq ".[] | select(.tag_name | endswith(\"$VERSION\")) | $JQ_ASSET_URL" \
-            2>/dev/null | head -n 1 || true)
-          valid_url "$DOWNLOAD_URL" || DOWNLOAD_URL=""
-        fi
-
-        if [ -z "$DOWNLOAD_URL" ]; then
-          echo "::warning::No release found matching version $VERSION (expected when running from an untagged ref); falling back to the latest release"
-          DOWNLOAD_URL=$(gh api "repos/$ACTION_REPO/releases/latest" --jq "$JQ_ASSET_URL" 2>/dev/null || true)
-          valid_url "$DOWNLOAD_URL" || DOWNLOAD_URL=""
-        fi
-
-        if [ -z "$DOWNLOAD_URL" ]; then
-          echo "::error::Could not resolve a download URL for $ASSET from any release of $ACTION_REPO"
-          exit 1
-        fi
-
-        # Extract into a scratch directory: extracting into the workspace
-        # would clobber any carrick/sidecar paths in the user's repo
-        # and pollute their scan root.
-        DIST_DIR="$RUNNER_TEMP/carrick-dist"
-        mkdir -p "$DIST_DIR"
-        echo "Downloading $DOWNLOAD_URL"
-        curl -fsSL --retry 3 --retry-delay 2 -o "$DIST_DIR/$ASSET" "$DOWNLOAD_URL"
-        tar -xzf "$DIST_DIR/$ASSET" -C "$DIST_DIR"
-        chmod +x "$DIST_DIR/carrick"
-        echo "dist-dir=$DIST_DIR" >> "$GITHUB_OUTPUT"
-
-    - name: Install sidecar dependencies
-      if: steps.fork-check.outputs.skip != 'true'
-      shell: bash
-      run: cd "${{ steps.download.outputs.dist-dir }}/sidecar" && npm ci
+        echo "Using carrick@$VERSION"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
     # The scanned repo's own dependencies, not Carrick's. Without them every
     # import from a package resolves to the compiler's `error` type and the
@@ -199,8 +142,12 @@ runs:
         # RUNNER_TEMP so it never pollutes the user's workspace.
         LOG_FILE="$RUNNER_TEMP/carrick-analysis.log"
 
+        # One artefact: the npm package carries the binary for this runner
+        # (an optional dependency npm resolves by os and cpu) and the type
+        # sidecar with its dependencies, so there is nothing to download,
+        # untar or `npm ci` here.
         set +e
-        "${{ steps.download.outputs.dist-dir }}/carrick" "${{ inputs.path }}" 2>&1 | tee "$LOG_FILE"
+        npx --yes "carrick@${{ steps.version.outputs.version }}" "${{ inputs.path }}" 2>&1 | tee "$LOG_FILE"
         EXIT_CODE=${PIPESTATUS[0]}
         set -e
 

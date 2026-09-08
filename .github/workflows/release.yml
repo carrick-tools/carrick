@@ -14,21 +14,55 @@ jobs:
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
 
-  publish:
+  # One binary per platform npm can install. The names are the npm platform and
+  # arch strings, because that is what `carrick`'s resolver asks for
+  # (npm/carrick/src/native.ts) — a rust target triple is a detail of this job.
+  binaries:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created }}
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            arch: x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - platform: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: darwin
+            arch: arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+          - platform: darwin
+            arch: x64
+            runner: macos-13
+            target: x86_64-apple-darwin
+          # Nothing in this repo has ever been built or run on Windows. It is
+          # allowed to fail rather than hold up a release: a platform package
+          # that does not publish leaves an optional dependency that resolves
+          # to nothing, which npm skips with a warning.
+          - platform: win32
+            arch: x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            optional: true
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.optional == true }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo dependencies
         uses: actions/cache@v4
@@ -37,41 +71,77 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-${{ matrix.arch }}-cargo-release-
+
+      - name: Build binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build the platform package
+        shell: bash
+        run: |
+          BINARY="target/${{ matrix.target }}/release/carrick"
+          [ "${{ matrix.platform }}" = "win32" ] && BINARY="$BINARY.exe"
+          node npm/platform/build.mjs \
+            --platform "${{ matrix.platform }}" \
+            --arch "${{ matrix.arch }}" \
+            --version "${{ needs.release-please.outputs.version }}" \
+            --binary "$BINARY" \
+            --out dist/platform
+
+      - name: Upload the platform package
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/platform/${{ matrix.platform }}-${{ matrix.arch }}
+          retention-days: 1
+
+  # Publishing is keyless: npm trusted publishing exchanges the job's OIDC
+  # token for the right to publish these names, so there is no npm token in
+  # this repository and every tarball carries provenance.
+  publish:
+    needs: [release-please, binaries]
+    if: ${{ needs.release-please.outputs.release_created }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "24"
-          cache: "npm"
-          cache-dependency-path: src/sidecar/package-lock.json
+          registry-url: "https://registry.npmjs.org"
 
-      - name: Build binary
-        run: cargo build --release --target x86_64-unknown-linux-gnu
+      # Trusted publishing needs npm 11.5.1 or newer; the one bundled with Node
+      # 24 is older than that on some images.
+      - name: Update npm
+        run: npm install -g npm@latest
 
-      - name: Build sidecar
+      - name: Download the platform packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: platform-*
+          path: dist/platform
+
+      - name: Publish the platform packages
+        run: |
+          set -euo pipefail
+          for dir in dist/platform/*/; do
+            echo "publishing $dir"
+            (cd "$dir" && npm publish --access public)
+          done
+
+      - name: Build the type sidecar
         run: cd src/sidecar && npm ci && npm run build
 
-      - name: Create release archive
-        run: |
-          mkdir -p release/sidecar
-          cp target/x86_64-unknown-linux-gnu/release/carrick release/
-          cp -r src/sidecar/dist release/sidecar/dist
-          cp src/sidecar/package.json release/sidecar/
-          cp src/sidecar/package-lock.json release/sidecar/
-          cd release
-          tar -czf carrick-action-linux.tar.gz carrick sidecar
-
-      - name: Upload release artifact
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.release-please.outputs.tag_name }}
-          files: release/carrick-action-linux.tar.gz
-          make_latest: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # prepack builds the emit and bundles the sidecar, and fails when the
+      # sidecar imports something the package does not declare.
+      - name: Publish carrick
+        run: cd npm/carrick && npm ci && npm publish --access public
 
       - name: Update v1 moving tag
         run: |
