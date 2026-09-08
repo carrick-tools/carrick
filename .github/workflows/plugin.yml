@@ -84,5 +84,9 @@ jobs:
           ./node_modules/.bin/carrick --version
           # No platform package on this machine, so the resolver's message is
           # what a user with an unpublished platform sees. It must be a
-          # message, not a stack trace.
-          ./node_modules/.bin/carrick check nothing.ts 2>&1 | tee /dev/stderr | grep -q "is not installed"
+          # message, not a stack trace — and a non-zero exit here is the
+          # expected one, so it is captured rather than run through a pipeline
+          # that `pipefail` would then fail on.
+          MISSING=$(./node_modules/.bin/carrick check nothing.ts 2>&1 || true)
+          echo "$MISSING"
+          echo "$MISSING" | grep -q "is not installed"
