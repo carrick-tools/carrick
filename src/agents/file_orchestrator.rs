@@ -2038,7 +2038,7 @@ impl FileOrchestrator {
             sidecar,
             pending
                 .iter()
-                .map(|pf| (pf.path_str.as_str(), &pf.candidate_map)),
+                .map(|pf| (pf.path_str.as_str(), pf.content.as_str(), &pf.candidate_map)),
             framework_detection,
             &mut stats,
         );
@@ -5330,6 +5330,17 @@ impl FileOrchestrator {
         }
     }
 
+    /// The ts-morph position of an SWC span into `content`: file-relative, and
+    /// counted in UTF-16 code units rather than bytes (carrick#805). See
+    /// [`resolve_receiver_roles`](Self::resolve_receiver_roles) for why the
+    /// conversion sits at the request and not at the candidate.
+    fn sidecar_position(content: &str, span: u32) -> u32 {
+        crate::utils::utf16_offset(
+            content,
+            span.saturating_sub(crate::swc_scanner::SWC_SPAN_BASE) as usize,
+        )
+    }
+
     /// Ask the type sidecar what the receiver of every bare
     /// `x.verb("/lit", arg)` site is, and map the answers onto roles
     /// (carrick#695).
@@ -5340,9 +5351,24 @@ impl FileOrchestrator {
     /// became ready, a request error, a receiver that did not resolve, a
     /// package in neither detection list — yields no entry, which leaves the
     /// site exactly where it is today: the model's to classify.
+    ///
+    /// The spans go out in the sidecar's own numbering, not the scanner's
+    /// (carrick#805). A candidate carries an SWC position: a UTF-8 byte offset
+    /// counted from [`SWC_SPAN_BASE`]. The sidecar resolves it against ts-morph
+    /// positions, which TypeScript counts in UTF-16 code units from zero. The
+    /// two agree on an ASCII file and diverge, cumulatively, from a file's
+    /// first multi-byte character onwards, so an unconverted span past one
+    /// resolved to the enclosing call or to nothing at all — and on a repo
+    /// written in a language with accented characters that was almost every
+    /// site in the service.
+    ///
+    /// Converted here rather than stored converted, because the byte span is
+    /// what joins this pass's answers back to the candidate, and
+    /// `candidate_id` — built from the same numbers — keys the raw
+    /// model-result cache.
     fn resolve_receiver_roles<'a>(
         sidecar: Option<&TypeSidecar>,
-        files: impl Iterator<Item = (&'a str, &'a HashMap<String, CandidateTarget>)>,
+        files: impl Iterator<Item = (&'a str, &'a str, &'a HashMap<String, CandidateTarget>)>,
         detection: &DetectionResult,
         stats: &mut ProcessingStats,
     ) -> HashMap<String, HashMap<u32, ReceiverRole>> {
@@ -5360,7 +5386,7 @@ impl FileOrchestrator {
         // alias -> (file, span). The alias is the join key on the way back.
         let mut sites: HashMap<String, (String, u32)> = HashMap::new();
         let mut requests: Vec<InferRequestItem> = Vec::new();
-        for (path_str, candidate_map) in files {
+        for (path_str, content, candidate_map) in files {
             let mut candidates: Vec<&CandidateTarget> = candidate_map
                 .values()
                 .filter(|candidate| candidate.protocol == Protocol::Http)
@@ -5377,8 +5403,8 @@ impl FileOrchestrator {
                 requests.push(InferRequestItem {
                     file_path: path_str.to_string(),
                     line_number: u32::try_from(candidate.line_number).unwrap_or(1).max(1),
-                    span_start: Some(candidate.span_start),
-                    span_end: Some(candidate.span_end),
+                    span_start: Some(Self::sidecar_position(content, candidate.span_start)),
+                    span_end: Some(Self::sidecar_position(content, candidate.span_end)),
                     expression_text: None,
                     expression_line: None,
                     infer_kind: InferKind::ReceiverType,

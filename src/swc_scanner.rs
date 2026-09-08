@@ -34,6 +34,18 @@ use crate::wrapper_request_shape::{RequestShapeSignal, call_request_shape};
 
 /// A candidate API call site detected by the SWC scanner.
 /// This is passed as a "hint" to the LLM to ensure 100% recall.
+///
+/// The byte position SWC gives a file's FIRST byte. Every scan here parses one
+/// file into a SourceMap of its own, so a span's raw position is that file's
+/// offset plus this — subtract it to get a file-relative one.
+///
+/// Nothing inside the scanner does: the raw positions are the join keys
+/// (`candidate_id` is `span:<start>-<end>`, and it keys the raw model-result
+/// cache). The subtraction belongs at the boundary where a span is handed to
+/// something that counts from zero, which is the type sidecar
+/// ([`crate::utils::utf16_offset`] converts the units at the same point).
+pub const SWC_SPAN_BASE: u32 = 1;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CandidateTarget {
     /// Protocol family this call site belongs to. Routes the candidate to
@@ -44,9 +56,11 @@ pub struct CandidateTarget {
     pub protocol: Protocol,
     /// Stable identifier for this call site within the file
     pub candidate_id: String,
-    /// Start byte offset of the call expression
+    /// Start byte offset of the call expression, in SWC's own numbering (see
+    /// [`SWC_SPAN_BASE`]).
     pub span_start: u32,
-    /// End byte offset of the call expression
+    /// End byte offset of the call expression, in SWC's own numbering (see
+    /// [`SWC_SPAN_BASE`]).
     pub span_end: u32,
     /// 1-based line number where the call was detected
     pub line_number: usize,

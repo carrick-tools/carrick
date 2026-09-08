@@ -409,22 +409,6 @@ impl CallSiteExtractor {
         value
     }
 
-    /// Convert byte offset to UTF-16 offset (for ts-morph compatibility)
-    fn byte_offset_to_utf16_offset(content: &str, byte_offset: usize) -> usize {
-        let mut utf16_offset = 0;
-        let mut current_byte = 0;
-
-        for c in content.chars() {
-            if current_byte >= byte_offset {
-                break;
-            }
-            current_byte += c.len_utf8();
-            utf16_offset += c.len_utf16();
-        }
-
-        utf16_offset
-    }
-
     /// Extract type annotations from function parameters (for function expressions)
     fn extract_function_param_types(&self, params: &[Param]) -> Vec<HandlerParamType> {
         params
@@ -453,7 +437,7 @@ impl CallSiteExtractor {
                     // Convert to UTF-16 using the source already held in the SourceMap
                     // (no per-param disk re-read).
                     let utf16_offset =
-                        Self::byte_offset_to_utf16_offset(&loc.file.src, file_relative_byte) as u32;
+                        crate::utils::utf16_offset(&loc.file.src, file_relative_byte);
 
                     return Some(HandlerParamType {
                         param_name: name,
@@ -488,8 +472,7 @@ impl CallSiteExtractor {
                         // Convert to UTF-16 using the source already held in the SourceMap
                         // (no per-param disk re-read).
                         let utf16_offset =
-                            Self::byte_offset_to_utf16_offset(&loc.file.src, file_relative_byte)
-                                as u32;
+                            crate::utils::utf16_offset(&loc.file.src, file_relative_byte);
 
                         return Some(HandlerParamType {
                             param_name: name,
@@ -995,8 +978,7 @@ impl Visit for CallSiteExtractor {
                         // Convert to UTF-16 using the source already held in the SourceMap
                         // (no per-param disk re-read).
                         let utf16_offset =
-                            Self::byte_offset_to_utf16_offset(&loc.file.src, file_relative_byte)
-                                as u32;
+                            crate::utils::utf16_offset(&loc.file.src, file_relative_byte);
 
                         let result_type_info = ResultTypeInfo {
                             type_string: type_string.clone(),
