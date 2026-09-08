@@ -480,6 +480,41 @@ fn http_route(producer_key: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// One direction's cell in the SDK table (carrick#822). The two halves of a
+/// pairing are separate comparisons, so they are rendered separately: a
+/// request-side mismatch beside a response side that compared nothing is a
+/// true and actionable row, and the old single cell could only show one of
+/// them.
+///
+/// An absent direction is "unverified" — the scan filed nothing for that half,
+/// which is never agreement (#324).
+fn direction_cell(label: &str, dir: Option<&crate::cloud_storage::DirectionVerdict>) -> String {
+    use crate::operation::TypeVerdict;
+    let Some(dir) = dir else {
+        return format!("{label}: unverified");
+    };
+    let answer = match dir.verdict {
+        TypeVerdict::Compatible => "compatible".to_string(),
+        TypeVerdict::Incompatible => format!(
+            "**INCOMPATIBLE**: {}",
+            code_span(dir.reason.as_deref().unwrap_or("no reason recorded"))
+        ),
+        TypeVerdict::Unverifiable => "unverifiable".to_string(),
+    };
+    if dir.resolved {
+        format!("{label}: {answer}")
+    } else {
+        format!(
+            "{label}: {answer} (compared nothing: {})",
+            code_span(
+                dir.unresolved_reason
+                    .as_deref()
+                    .unwrap_or("a side carries `any`")
+            )
+        )
+    }
+}
+
 /// The collapsed "Consumers via SDK" block: who reaches this project's
 /// endpoints through a published npm client rather than over a URL.
 ///
@@ -514,18 +549,11 @@ fn format_sdk_section(
                 Some((method, path)) => format!("`{} {}`", code_span(method), code_span(path)),
                 None => format!("`{}`", code_span(&edge.producer_key)),
             };
-            let verdict = match edge.type_compatible {
-                Some(true) => "compatible".to_string(),
-                Some(false) => format!(
-                    "**INCOMPATIBLE**: {}",
-                    code_span(
-                        edge.mismatch_reason
-                            .as_deref()
-                            .unwrap_or("no reason recorded")
-                    )
-                ),
-                None => "unverified".to_string(),
-            };
+            let verdict = format!(
+                "{}<br>{}",
+                direction_cell("request", edge.request.as_ref()),
+                direction_cell("response", edge.response.as_ref())
+            );
             output.push_str(&format!(
                 "| `{}` | `{}` | `{}` → `{}` | {} (`{}`) | {} |\n",
                 code_span(&edge.consumer_repo),
@@ -544,14 +572,14 @@ fn format_sdk_section(
         // one the SDK repo's own scan stored for its call to the producer, so
         // an edge without one says the SDK repo has not stored a verdict for
         // that pair — silence would read as "compared and fine".
-        let unverified = edges
-            .iter()
-            .filter(|edge| edge.type_compatible.is_none())
-            .count();
+        let is_unverified = |edge: &&crate::cloud_storage::SdkEdge| {
+            edge.request.is_none() && edge.response.is_none()
+        };
+        let unverified = edges.iter().filter(is_unverified).count();
         if unverified > 0 {
             let sdk_repos: BTreeSet<&str> = edges
                 .iter()
-                .filter(|edge| edge.type_compatible.is_none())
+                .filter(is_unverified)
                 .map(|edge| edge.sdk_repo.as_str())
                 .collect();
             output.push_str(&format!(
@@ -1279,10 +1307,21 @@ mod tests {
             sdk_location: "src/resources/payments.ts:28".to_string(),
             producer_repo: "payments-api".to_string(),
             producer_key: producer_key.to_string(),
-            type_compatible: Some(true),
-            mismatch_reason: None,
+            request: Some(direction(crate::operation::TypeVerdict::Compatible, None)),
+            response: Some(direction(crate::operation::TypeVerdict::Compatible, None)),
             scanner_version: "0.0.0-test".to_string(),
-            resolved: None,
+        }
+    }
+
+    /// One direction's stored answer, resolved unless a reason says otherwise.
+    fn direction(
+        verdict: crate::operation::TypeVerdict,
+        reason: Option<&str>,
+    ) -> crate::cloud_storage::DirectionVerdict {
+        crate::cloud_storage::DirectionVerdict {
+            verdict,
+            reason: reason.map(String::from),
+            resolved: true,
             unresolved_reason: None,
         }
     }
@@ -1324,7 +1363,8 @@ mod tests {
     }
 
     /// The section states the whole relationship on one row: who calls, from
-    /// where, through what, onto which endpoint, and what the types say.
+    /// where, through what, onto which endpoint, and what the types say on
+    /// EACH direction (carrick#822).
     #[test]
     fn sdk_section_lists_each_edge_end_to_end() {
         let output = format_analysis_results(
@@ -1334,7 +1374,7 @@ mod tests {
         );
 
         assert!(output.contains("<summary><strong>Consumers via SDK (1)</strong></summary>"));
-        assert!(output.contains("| `checkout` | `src/checkout.ts:42` | `ledger.payments.create` \u{2192} `@fixture/ledger-sdk` | `POST /v1/payments` (`payments-api`) | compatible |"));
+        assert!(output.contains("| `checkout` | `src/checkout.ts:42` | `ledger.payments.create` \u{2192} `@fixture/ledger-sdk` | `POST /v1/payments` (`payments-api`) | request: compatible<br>response: compatible |"));
     }
 
     /// A pair with no stored verdict must not read as compatible, and the
@@ -1342,32 +1382,67 @@ mod tests {
     #[test]
     fn sdk_section_reports_an_unevaluated_pair_as_unverified() {
         let mut edge = sdk_edge("http|POST|/v1/payments");
-        edge.type_compatible = None;
+        edge.request = None;
+        edge.response = None;
         let output = format_analysis_results(
             result_with_sdk(vec![edge], vec![]),
             &topology_baseline(),
             None,
         );
-        assert!(output.contains("| unverified |"));
-        assert!(!output.contains("| compatible |"));
+        assert!(output.contains("request: unverified<br>response: unverified"));
+        assert!(!output.contains(": compatible"));
         assert!(output.contains(
             "1 edge unverified: no type verdict is stored in `ledger-sdk`'s own scan for that \
              call. Re-scan it to produce one."
         ));
     }
 
-    /// An incompatible edge names the break in its row.
+    /// A row whose request half broke and whose response half compared nothing
+    /// states both, on their own halves — the read carrick#822 exists for.
     #[test]
-    fn sdk_section_reports_an_incompatible_pair_with_its_reason() {
+    fn sdk_section_states_a_broken_request_beside_an_unresolved_response() {
         let mut edge = sdk_edge("http|POST|/v1/payments");
-        edge.type_compatible = Some(false);
-        edge.mismatch_reason = Some("Property 'amountCents' is missing".to_string());
+        edge.request = Some(direction(
+            crate::operation::TypeVerdict::Incompatible,
+            Some("Property 'passwordHash' is missing"),
+        ));
+        edge.response = Some(crate::cloud_storage::DirectionVerdict {
+            verdict: crate::operation::TypeVerdict::Unverifiable,
+            reason: None,
+            resolved: false,
+            unresolved_reason: Some("the consumer type carries `any` at `<0>`".to_string()),
+        });
         let output = format_analysis_results(
             result_with_sdk(vec![edge], vec![]),
             &topology_baseline(),
             None,
         );
-        assert!(output.contains("| **INCOMPATIBLE**: Property 'amountCents' is missing |"));
+        assert!(
+            output.contains("request: **INCOMPATIBLE**: Property 'passwordHash' is missing"),
+            "the proven mismatch is stated: {output}"
+        );
+        assert!(
+            output.contains(
+                "response: unverifiable (compared nothing: the consumer type carries any at <0>)"
+            ),
+            "and the unresolved half is stated beside it, not instead of it: {output}"
+        );
+    }
+
+    /// An incompatible edge names the break in its row.
+    #[test]
+    fn sdk_section_reports_an_incompatible_pair_with_its_reason() {
+        let mut edge = sdk_edge("http|POST|/v1/payments");
+        edge.request = Some(direction(
+            crate::operation::TypeVerdict::Incompatible,
+            Some("Property 'amountCents' is missing"),
+        ));
+        let output = format_analysis_results(
+            result_with_sdk(vec![edge], vec![]),
+            &topology_baseline(),
+            None,
+        );
+        assert!(output.contains("request: **INCOMPATIBLE**: Property 'amountCents' is missing"));
         // Every edge carries a verdict, so the unverified footnote stays away.
         assert!(!output.contains("unverified"));
     }
@@ -1378,8 +1453,10 @@ mod tests {
     #[test]
     fn an_incompatible_sdk_edge_counts_toward_the_pr_verdict() {
         let mut edge = sdk_edge("http|POST|/v1/payments");
-        edge.type_compatible = Some(false);
-        edge.mismatch_reason = Some("Property 'amountCents' is missing".to_string());
+        edge.request = Some(direction(
+            crate::operation::TypeVerdict::Incompatible,
+            Some("Property 'amountCents' is missing"),
+        ));
 
         let mut result = result_with_sdk(vec![edge.clone()], vec![]);
         // The engine appends exactly this before rendering.
@@ -1390,9 +1467,11 @@ mod tests {
         assert!(output.contains("<!-- CARRICK_ISSUE_COUNT:1 -->"));
         assert!(output.contains("[!CAUTION]"));
         assert!(output.contains("**1 contract risk**"));
-        // The risk row cites the consumer's own call site and the hop.
+        // The risk row cites the consumer's own call site, the hop, and which
+        // direction broke.
         assert!(output.contains("<summary><strong>Contract risks (1)</strong></summary>"));
         assert!(output.contains("reached through `@fixture/ledger-sdk`"));
+        assert!(output.contains("the request types are incompatible"));
     }
 
     /// "There are no such calls" and "this package is called and nothing is
