@@ -1,7 +1,7 @@
 extern crate swc_common;
 extern crate swc_ecma_parser;
 
-use crate::receiver_type::{ReceiverTypeCollector, ReceiverTypes};
+use crate::receiver_type::{ReceiverTypeCollector, ReceiverTypes, class_field_types};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -189,6 +189,14 @@ pub enum CalleeShape {
     Bare,
     /// `this.foo(...)` / `this.#foo(...)`, inside the named class.
     ThisMember(String),
+    /// `this.field.foo(...)`, inside the named class: the receiver is a FIELD
+    /// of that class, so the class body says what it is (carrick#782).
+    ThisFieldMember {
+        /// The class whose body the call site sits in.
+        class: String,
+        /// The field the receiver names — `#field` for a private one.
+        field: String,
+    },
     /// `obj.foo(...)`, where `obj` is a plain identifier.
     Member(String),
 }
@@ -399,11 +407,16 @@ impl CalleeCollector<'_> {
         self.source_map.lookup_char_pos(span.lo).line as u32
     }
 
-    /// Record the callee of one call site. Anything that is not a bare
-    /// identifier or a single-level member access on an identifier or `this`
-    /// (`a.b.c()`, `super.x()`, `getHandler()()`) is deliberately dropped: it
-    /// cannot be resolved to a definition without type information, and a
-    /// guess here is exactly the false edge this pass exists to remove.
+    /// Record the callee of one call site. Four shapes are kept: a bare
+    /// identifier, a member access on an identifier or on `this`, and
+    /// `this.field.foo()` — a two-level chain whose root the enclosing class
+    /// body declares (carrick#782).
+    ///
+    /// Everything else (`a.b.c()`, `super.x()`, `getHandler()()`) is
+    /// deliberately dropped: it cannot be resolved to a definition without
+    /// type information, and a guess here is exactly the false edge this pass
+    /// exists to remove. `this.field` is the one two-level receiver the file
+    /// itself makes a statement about.
     fn record(&mut self, callee: &Expr, span: swc_common::Span) {
         let line = self.line(span);
         match Self::unwrap_expr(callee) {
@@ -433,6 +446,26 @@ impl CalleeCollector<'_> {
                         shape: CalleeShape::Member(obj.sym.to_string()),
                         line,
                     }),
+                    // `this.field.foo()`. Nothing wider: `a.b.c()` needs the
+                    // VALUE of `a.b`, which no statement in the file gives.
+                    Expr::Member(inner) => {
+                        let Some(class) = self.enclosing_class.clone() else {
+                            return;
+                        };
+                        if !matches!(Self::unwrap_expr(&inner.obj), Expr::This(_)) {
+                            return;
+                        }
+                        let field = match &inner.prop {
+                            MemberProp::Ident(prop) => prop.sym.to_string(),
+                            MemberProp::PrivateName(prop) => format!("#{}", prop.name),
+                            MemberProp::Computed(_) => return,
+                        };
+                        self.out.push(CalleeRef {
+                            name,
+                            shape: CalleeShape::ThisFieldMember { class, field },
+                            line,
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -658,6 +691,11 @@ pub struct FunctionDefinitionExtractor {
     /// `callee_refs` because it exists to resolve those call sites' receivers,
     /// and because a name means different things in different scopes.
     pub declared_types: HashMap<String, ReceiverTypes>,
+    /// Class name → the classes that class declares its own FIELDS to be
+    /// ([`crate::receiver_type::class_field_types`], carrick#782). Keyed by
+    /// class rather than by definition because a field belongs to the class,
+    /// and every method of it sees the same field.
+    pub field_types: HashMap<String, ReceiverTypes>,
     current_file_path: PathBuf,
     source_map: swc_common::sync::Lrc<swc_common::SourceMap>,
     /// Names of functions that are exported (populated by visit_export_decl / visit_named_export)
@@ -681,6 +719,7 @@ impl FunctionDefinitionExtractor {
             function_definitions: HashMap::new(),
             callee_refs: HashMap::new(),
             declared_types: HashMap::new(),
+            field_types: HashMap::new(),
             current_file_path: file_path,
             source_map,
             exported_names: HashSet::new(),
@@ -706,6 +745,23 @@ impl FunctionDefinitionExtractor {
         };
         node.visit_with(&mut collector);
         collector
+    }
+
+    /// Record what one class declares its fields to be. Two classes of one
+    /// name in a single file state two different things about the same key,
+    /// so the table is emptied rather than picked between.
+    fn record_field_types(&mut self, name: &str, class: &Class) {
+        let fields = class_field_types(class);
+        match self.field_types.get(name) {
+            Some(existing) if *existing == fields => {}
+            Some(_) => {
+                self.field_types
+                    .insert(name.to_string(), ReceiverTypes::new());
+            }
+            None => {
+                self.field_types.insert(name.to_string(), fields);
+            }
+        }
     }
 
     /// Record the call sites of a `Function` node (declaration, method,
@@ -1291,6 +1347,7 @@ impl Visit for FunctionDefinitionExtractor {
 
     /// Track the enclosing class name so members can be indexed as `Class.member`.
     fn visit_class_decl(&mut self, class: &ClassDecl) {
+        self.record_field_types(class.ident.sym.as_ref(), &class.class);
         let prev = self.current_class.replace(class.ident.sym.to_string());
         let prev_collisions = std::mem::replace(
             &mut self.current_class_collisions,
@@ -1306,7 +1363,10 @@ impl Visit for FunctionDefinitionExtractor {
     /// no stable qualified name and must not be attributed to an outer class.
     fn visit_class_expr(&mut self, class: &ClassExpr) {
         let prev = match &class.ident {
-            Some(ident) => self.current_class.replace(ident.sym.to_string()),
+            Some(ident) => {
+                self.record_field_types(ident.sym.as_ref(), &class.class);
+                self.current_class.replace(ident.sym.to_string())
+            }
             None => self.current_class.take(),
         };
         let prev_collisions = std::mem::replace(

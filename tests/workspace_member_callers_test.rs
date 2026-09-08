@@ -140,10 +140,41 @@ fn a_constructed_receiver_records_an_edge_into_the_sibling_package() {
     );
 }
 
+/// `this.field.member()`, with the field declared by a constructor parameter
+/// property (carrick#782). Dropped at COLLECTION before the fix — a two-level
+/// chain never became a `CalleeRef` — so this assertion fails on the pre-fix
+/// scanner however the receiver is declared.
+#[test]
+fn a_this_field_receiver_records_an_edge_into_the_sibling_package() {
+    let edges = scan_edges();
+    assert_eq!(
+        edges
+            .get("RunMetadataManager.readStreamThroughField")
+            .map(Vec::as_slice),
+        Some(
+            [Edge {
+                callee: "RunClient.fetchStream".to_string(),
+                callee_file: "packages/core/src/v2/client/index.ts".to_string(),
+                call_site_line: 45,
+            }]
+            .as_slice()
+        ),
+        "all edges were {edges:?}"
+    );
+}
+
 #[test]
 fn a_receiver_the_file_does_not_declare_records_nothing() {
     let edges = scan_edges();
-    for caller in ["readUnbound", "readVendor", "readAmbiguous", "inner"] {
+    for caller in [
+        "readUnbound",
+        "readVendor",
+        "readAmbiguous",
+        "inner",
+        // The field is initialised with `new RunClient()` but never
+        // annotated, so the class body declares nothing about it.
+        "UntypedManager.readStreamUntyped",
+    ] {
         assert_eq!(
             edges.get(caller).map(Vec::as_slice),
             Some([].as_slice()),

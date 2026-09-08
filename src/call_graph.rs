@@ -19,6 +19,11 @@
 //!   package function, and produces no edge.
 //! - `this.foo(...)` — the enclosing class's `Class.foo` key, in the same
 //!   file. A same-named method on another class cannot match.
+//! - `this.field.foo(...)` — the receiver is a field of the enclosing class,
+//!   and the class body declares which class the field is
+//!   ([`crate::receiver_type::class_field_types`], carrick#782). The field's
+//!   class identifier is then resolved exactly as one named directly at the
+//!   call site is. An unannotated field declares nothing and produces no edge.
 //! - `obj.foo(...)` — `obj` as a class in the same file (`Class.staticFn()`),
 //!   an imported class, a namespace import (`import * as ns`), a named
 //!   import of a namespace RE-export (`export * as ns from "./m"` in the
@@ -91,6 +96,10 @@ pub struct FileCallIndex {
     /// classes (carrick#776). Scoped per definition, like `callees`, because a
     /// name means different things in different functions.
     pub declared_types: HashMap<String, ReceiverTypes>,
+    /// Class name → the classes that class declares its own FIELDS to be, for
+    /// a `this.field.foo()` receiver (carrick#782). Keyed by class, not by
+    /// definition: a field belongs to the class and every method sees it.
+    pub field_types: HashMap<String, ReceiverTypes>,
 }
 
 /// Where a resolved call lands.
@@ -416,6 +425,12 @@ impl<'a> CallResolver<'a> {
                 let key = format!("{class}.{}", callee.name);
                 same_file(index, key)
             }
+            // `this.field.x()`: the class body says what the field is, and
+            // that class identifier resolves like any other (carrick#782).
+            CalleeShape::ThisFieldMember { class, field } => {
+                let declared = index.field_types.get(class)?.get(field)?.clone();
+                self.resolve_class_member(index, &declared, &callee.name)
+            }
             CalleeShape::Member(object) => {
                 self.resolve_member(index, caller_key, object, &callee.name)
             }
@@ -701,6 +716,7 @@ mod tests {
                 callees: functions.callee_refs,
                 imports: imports.imported_symbols,
                 declared_types: functions.declared_types,
+                field_types: functions.field_types,
             };
             per_file.insert(path.clone(), index);
             per_file_definitions.push((path.clone(), functions.function_definitions));
@@ -1244,6 +1260,141 @@ mod tests {
         );
 
         assert_eq!(callee_names(&defs, "readRun"), ["formatRun"]);
+        drop(dir);
+    }
+
+    /// `this.field.member()` inside a class: the class body declares the
+    /// field, through a constructor parameter property, and the class it names
+    /// is published by a sibling workspace package (carrick#782).
+    #[test]
+    fn a_this_field_receiver_resolves_through_the_class_body() {
+        let (dir, defs) = scan_service(
+            &[
+                (
+                    "package.json",
+                    r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+                ),
+                (
+                    "packages/core/package.json",
+                    r#"{"name":"@fixture/core","exports":{"./v2":"./src/v2/client.ts"}}"#,
+                ),
+                (
+                    "packages/core/src/v2/client.ts",
+                    "export class RunClient {\n  fetchStream(id: string) {\n    return id;\n  }\n}\n",
+                ),
+                (
+                    "packages/app/package.json",
+                    r#"{"name":"@fixture/app","dependencies":{"@fixture/core":"workspace:*"}}"#,
+                ),
+                (
+                    "packages/app/src/manager.ts",
+                    "import type { RunClient } from \"@fixture/core/v2\";\n\
+                     export class RunMetadataManager {\n  \
+                     constructor(private readonly apiClient: RunClient) {}\n  \
+                     read(id: string) {\n    \
+                     return this.apiClient.fetchStream(id);\n  }\n}\n",
+                ),
+            ],
+            "packages/app",
+        );
+
+        assert_eq!(
+            callee_names(&defs, "RunMetadataManager.read"),
+            ["RunClient.fetchStream"]
+        );
+        assert!(
+            callee_files(&defs, "RunMetadataManager.read")[0]
+                .ends_with("packages/core/src/v2/client.ts"),
+            "the edge must point at the sibling package's source: {:?}",
+            callee_files(&defs, "RunMetadataManager.read")
+        );
+        drop(dir);
+    }
+
+    /// An annotated property declares the field just as a parameter property
+    /// does, and a private one is reached under its `#` key.
+    #[test]
+    fn an_annotated_property_and_a_private_one_both_resolve() {
+        let (dir, defs) = scan(&[
+            (
+                "client.ts",
+                "export class RunClient {\n  fetchStream(id: string) {\n    return id;\n  }\n}\n",
+            ),
+            (
+                "manager.ts",
+                "import type { RunClient } from \"./client\";\n\
+                 export class Manager {\n  \
+                 private client: RunClient;\n  \
+                 #backup: RunClient;\n  \
+                 read(id: string) {\n    \
+                 return this.client.fetchStream(id);\n  }\n  \
+                 readBackup(id: string) {\n    \
+                 return this.#backup.fetchStream(id);\n  }\n}\n",
+            ),
+        ]);
+
+        assert_eq!(
+            callee_names(&defs, "Manager.read"),
+            ["RunClient.fetchStream"]
+        );
+        assert_eq!(
+            callee_names(&defs, "Manager.readBackup"),
+            ["RunClient.fetchStream"]
+        );
+        drop(dir);
+    }
+
+    /// The negatives this shape must keep: a field the class body leaves
+    /// unannotated states nothing however it is initialised, a chain one level
+    /// deeper is not read at all, and a `this` inside a nested class is that
+    /// class's `this`, not the outer one's.
+    #[test]
+    fn an_unannotated_field_and_a_deeper_chain_resolve_to_nothing() {
+        let (dir, defs) = scan(&[
+            (
+                "client.ts",
+                "export class RunClient {\n  fetchStream(id: string) {\n    return id;\n  }\n}\n",
+            ),
+            (
+                "manager.ts",
+                "import { RunClient } from \"./client\";\n\
+                 export class Manager {\n  \
+                 client = new RunClient();\n  \
+                 deps: Deps;\n  \
+                 readUnannotated(id: string) {\n    \
+                 return this.client.fetchStream(id);\n  }\n  \
+                 readDeeper(id: string) {\n    \
+                 return this.deps.client.fetchStream(id);\n  }\n}\n",
+            ),
+        ]);
+
+        assert!(callee_names(&defs, "Manager.readUnannotated").is_empty());
+        assert!(callee_names(&defs, "Manager.readDeeper").is_empty());
+        drop(dir);
+    }
+
+    /// A field of the OUTER class is not in scope for a class declared inside
+    /// a method: `this` there is the inner class's.
+    #[test]
+    fn a_this_field_inside_a_nested_class_resolves_to_nothing() {
+        let (dir, defs) = scan(&[
+            (
+                "client.ts",
+                "export class RunClient {\n  fetchStream(id: string) {\n    return id;\n  }\n}\n",
+            ),
+            (
+                "manager.ts",
+                "import type { RunClient } from \"./client\";\n\
+                 export class Manager {\n  \
+                 private client: RunClient;\n  \
+                 read(id: string) {\n    \
+                 return class Inner {\n      \
+                 run() {\n        \
+                 return this.client.fetchStream(id);\n      }\n    };\n  }\n}\n",
+            ),
+        ]);
+
+        assert!(callee_names(&defs, "Manager.read").is_empty());
         drop(dir);
     }
 }
