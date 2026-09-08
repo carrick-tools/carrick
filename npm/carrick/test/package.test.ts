@@ -72,6 +72,14 @@ test("the entry point imports the emit, never the TypeScript", () => {
   assert.doesNotMatch(hookTable, /\.ts"/);
 });
 
+test("the templates are importable by the tool that has to render the same bytes", () => {
+  // The hosted scaffold tool depends on this package at a pinned version and
+  // renders from here. Without an export map it would have to reach into
+  // dist/ by path, which is not a contract anyone should rely on.
+  assert.equal(pkg["exports"]["./templates"], "./dist/templates.js");
+  assert.ok(fs.existsSync(path.join(packageRoot, "src", "templates.ts")));
+});
+
 test("the node floor is the sidecar's floor", () => {
   assert.equal(pkg["engines"]["node"], ">=24");
   const sidecar = readJson(path.join(repoRoot, "src", "sidecar", "package.json"));

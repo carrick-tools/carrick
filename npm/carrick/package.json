@@ -22,6 +22,10 @@
   "bin": {
     "carrick": "bin/carrick.mjs"
   },
+  "exports": {
+    "./templates": "./dist/templates.js",
+    "./package.json": "./package.json"
+  },
   "engines": {
     "node": ">=24"
   },
