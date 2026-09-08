@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.47](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.46...carrick-v0.3.47) (2026-09-08)
+
+
+### Features
+
+* **call-graph:** resolve `this.<field>.<member>()` through the class body ([#796](https://github.com/carrick-tools/carrick/issues/796)) ([4e0e2ec](https://github.com/carrick-tools/carrick/commit/4e0e2ecdadb8bd89566a7c1f279a2bfc4db29432)), closes [#782](https://github.com/carrick-tools/carrick/issues/782)
+* **call-graph:** resolve a receiver whose origin is a workspace package ([#801](https://github.com/carrick-tools/carrick/issues/801)) ([1b8422d](https://github.com/carrick-tools/carrick/commit/1b8422dc64c31820e2fd0c871f8904034ffb1312)), closes [#781](https://github.com/carrick-tools/carrick/issues/781)
+
+
+### Bug Fixes
+
+* **capture:** a line-only anchor no longer reads the next declaration ([#800](https://github.com/carrick-tools/carrick/issues/800)) ([aa4b7d6](https://github.com/carrick-tools/carrick/commit/aa4b7d6d233992445e9e1ee8d074b57e06b506af)), closes [#770](https://github.com/carrick-tools/carrick/issues/770)
+* **types:** mark v1's unresolved-alias placeholder so the reader can tell it from a declaration ([#799](https://github.com/carrick-tools/carrick/issues/799)) ([6488a43](https://github.com/carrick-tools/carrick/commit/6488a437ca3cac1b978b54f72d41bafb8ef02031)), closes [#780](https://github.com/carrick-tools/carrick/issues/780)
+
 ## [0.3.46](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.45...carrick-v0.3.46) (2026-09-07)
 
 
