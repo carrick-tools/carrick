@@ -40,9 +40,12 @@ jobs:
             arch: arm64
             runner: macos-latest
             target: aarch64-apple-darwin
+          # Both Mac targets on the same Apple-silicon runner: the x86_64
+          # target needs `rustup target add` and nothing else, and the
+          # Intel-runner labels are being retired.
           - platform: darwin
             arch: x64
-            runner: macos-13
+            runner: macos-latest
             target: x86_64-apple-darwin
           # Nothing in this repo has ever been built or run on Windows. It is
           # allowed to fail rather than hold up a release: a platform package
