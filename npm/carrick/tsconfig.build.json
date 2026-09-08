@@ -1,0 +1,18 @@
+{
+  // The published JavaScript. Node refuses to strip types for anything under
+  // node_modules, so an installed package cannot ship the .ts files the tests
+  // and the checkout run directly — it ships this emit instead.
+  // `rewriteRelativeImportExtensions` is what lets the source keep its `.ts`
+  // specifiers and the emit resolve to `.js`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    "allowImportingTsExtensions": false,
+    "rewriteRelativeImportExtensions": true,
+    "declaration": false,
+    "sourceMap": true
+  },
+  "include": ["src/**/*.ts"]
+}

@@ -9,6 +9,10 @@
 // the import itself is a syntax error, and a syntax error is not an answer to
 // "which Node do I need".
 //
+// What it imports is `dist/`, not `src/`: Node refuses to strip types for any
+// file under node_modules, so the published package carries the emit and the
+// checkout builds it (`npm run build`, and `prepack` before a publish).
+//
 // Nothing here re-enters `carrick` on PATH: the binary is resolved to an
 // absolute path (src/native.ts). A shim that shelled out to its own name would
 // loop forever the moment the platform package went missing.
@@ -32,8 +36,8 @@ if (nodeMajor() < NODE_FLOOR) {
 }
 
 const HOOKS = {
-  "post-edit": "../src/hook/post-edit.ts",
-  "session-start": "../src/hook/session-start.ts",
+  "post-edit": "../dist/hook/post-edit.js",
+  "session-start": "../dist/hook/session-start.js",
 };
 
 const argv = process.argv.slice(2);
@@ -41,7 +45,7 @@ const [command, ...rest] = argv;
 
 /** Run the scanner binary, streaming its output and answering with its code. */
 async function runNative(args) {
-  const { resolveNativeBinary, nativeEnv } = await import("../src/native.ts");
+  const { resolveNativeBinary, nativeEnv } = await import("../dist/native.js");
   const lookup = resolveNativeBinary();
   if (!lookup.binary) {
     process.stderr.write(`carrick: ${lookup.problem}\n`);
@@ -72,7 +76,7 @@ async function runNative(args) {
  * one process, not two, and no dependence on the install being global.
  */
 async function pointAtNativeBinary() {
-  const { resolveNativeBinary, resolveSidecarDir } = await import("../src/native.ts");
+  const { resolveNativeBinary, resolveSidecarDir } = await import("../dist/native.js");
   if (!process.env["CARRICK_BIN"]) {
     const lookup = resolveNativeBinary();
     if (lookup.binary) process.env["CARRICK_BIN"] = lookup.binary;
@@ -102,6 +106,7 @@ function extraHelp() {
     "    carrick hook post-edit       Claude Code PostToolUse hook (reads the tool",
     "                                 payload on stdin)",
     "    carrick hook session-start   Claude Code SessionStart hook",
+    "    carrick templates workflow   print the CI workflow to add to a repo",
     "",
   ].join("\n");
 }
@@ -109,7 +114,7 @@ function extraHelp() {
 switch (command) {
   case "lsp": {
     await pointAtNativeBinary();
-    await import("../src/server.ts");
+    await import("../dist/server.js");
     break;
   }
   case "hook": {
@@ -126,8 +131,12 @@ switch (command) {
     break;
   }
   case "init": {
-    const { init } = await import("../src/init/run.ts");
+    const { init } = await import("../dist/init/run.js");
     process.exit(await init(rest));
+  }
+  case "templates": {
+    const { templates } = await import("../dist/init/run.js");
+    process.exit(templates(rest));
   }
   case "--version":
   case "-V": {
@@ -139,7 +148,7 @@ switch (command) {
   case undefined: {
     // The scanner owns its own help, including the environment variables, so
     // print that and add what this package puts on top of it.
-    const { resolveNativeBinary, nativeEnv } = await import("../src/native.ts");
+    const { resolveNativeBinary, nativeEnv } = await import("../dist/native.js");
     const lookup = resolveNativeBinary();
     if (lookup.binary) {
       await new Promise((resolve) => {
@@ -152,7 +161,7 @@ switch (command) {
       process.stderr.write(`carrick: ${lookup.problem}\n`);
     }
     process.stderr.write(extraHelp());
-    process.exit(command === undefined ? 1 : 0);
+    process.exit(0);
   }
   default:
     await runNative(argv);

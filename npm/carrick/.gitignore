@@ -1,5 +1,8 @@
 node_modules/
 *.log
 *.tgz
+dist/
 # Built by scripts/bundle-sidecar.mjs from src/sidecar/dist.
 sidecar/
+# Copied from the repo root by prepack.
+LICENSE.md

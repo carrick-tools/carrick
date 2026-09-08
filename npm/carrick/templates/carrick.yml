@@ -1,0 +1,32 @@
+name: Carrick
+
+on:
+  push:
+    branches: [{{DEFAULT_BRANCH}}]
+  pull_request:
+    branches: [{{DEFAULT_BRANCH}}]
+  # Carrick Cloud sends this when a sibling repo in the same project changes
+  # on its main branch, so this repo's cross-repo results catch up without
+  # anyone pushing. If you add deploy steps to this file, gate them on
+  # github.event_name so a sibling change never deploys this repo.
+  repository_dispatch:
+    types: [carrick-sibling-updated]
+  # Rescan on demand (Actions tab, or: gh workflow run carrick.yml). After a
+  # Carrick release the index only refreshes on the next scan.
+  workflow_dispatch:
+
+permissions:
+  # Mint a short-lived OIDC token Carrick exchanges for keyless upload auth
+  # (no upload secret to configure).
+  id-token: write
+  contents: read
+
+jobs:
+  carrick:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        # Full git history lets Carrick diff against the last scan and run incrementally.
+        with:
+          fetch-depth: 0
+      - uses: {{ACTION_REF}}

@@ -52,10 +52,24 @@ test("the version tracks the scanner's, because the Action installs it by that n
   );
 });
 
-test("what ships: the entry point, the source, the sidecar and the templates", () => {
-  for (const entry of ["bin", "src", "sidecar", "templates"]) {
+test("what ships: the entry point, the emit, the sidecar and the templates", () => {
+  for (const entry of ["bin", "dist", "sidecar", "templates"]) {
     assert.ok((pkg["files"] as string[]).includes(entry), `files is missing ${entry}`);
   }
+});
+
+test("the entry point imports the emit, never the TypeScript", () => {
+  // Node refuses to strip types for any file under node_modules, so a `.ts`
+  // import here works in this checkout and throws on every installed copy.
+  const entry = fs.readFileSync(path.join(packageRoot, "bin", "carrick.mjs"), "utf8");
+  const imports = [...entry.matchAll(/import\("([^"]+)"\)/g)].map((match) => match[1]);
+  const relative = imports.filter((specifier) => specifier?.startsWith("."));
+  assert.ok(relative.length > 0, "the entry point imports nothing of its own");
+  for (const specifier of relative) {
+    assert.match(specifier ?? "", /^\.\.\/dist\//, `${specifier} is not in the published emit`);
+  }
+  const hookTable = /const HOOKS = \{([^}]+)\}/.exec(entry)?.[1] ?? "";
+  assert.doesNotMatch(hookTable, /\.ts"/);
 });
 
 test("the node floor is the sidecar's floor", () => {
@@ -72,6 +86,16 @@ test("the sidecar's dependencies are declared here, since nothing installs insid
       `${name} is a sidecar dependency and is not declared by npm/carrick/package.json`,
     );
   }
+});
+
+test("the tools the sidecar spawns are dependencies too, not just the ones it imports", () => {
+  // `pnpm` and `tsc` are run as processes, so no import scan finds them, and
+  // the release tarball only ever had them because its `npm ci` installed the
+  // sidecar's devDependencies. Here they have to be real dependencies.
+  const sidecar = readJson(path.join(repoRoot, "src", "sidecar", "package.json"));
+  const dev = sidecar["devDependencies"] ?? {};
+  assert.equal(pkg["dependencies"]["pnpm"], dev["pnpm"], "pnpm must be pinned to the version the sidecar vendors");
+  assert.ok(pkg["dependencies"]["typescript"], "typescript is spawned as tsc and imported by the capture");
 });
 
 test("a platform package declares no command of its own", () => {

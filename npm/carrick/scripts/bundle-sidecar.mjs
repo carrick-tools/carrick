@@ -36,7 +36,9 @@ if (!fs.existsSync(path.join(source, entry))) {
 // is the one thing the copy needs, because dist/ is ESM.
 fs.rmSync(target, { recursive: true, force: true });
 fs.mkdirSync(target, { recursive: true });
-fs.cpSync(path.join(source, "dist"), path.join(target, "dist"), { recursive: true });
+// dist/src only: the sidecar's emit also holds its own test build, which is
+// megabytes of fixtures nobody installs it for.
+fs.cpSync(path.join(source, "dist", "src"), path.join(target, "dist", "src"), { recursive: true });
 fs.writeFileSync(
   path.join(target, "package.json"),
   `${JSON.stringify(
@@ -51,17 +53,47 @@ fs.writeFileSync(
   )}\n`,
 );
 
-const declared = JSON.parse(fs.readFileSync(path.join(source, "package.json"), "utf8"));
+// What the built sidecar actually imports, which is the only list that
+// matters. Its own package.json is not it: `typescript` sits in the sidecar's
+// devDependencies and is imported at run time, and the release tarball only
+// ever worked because the `npm ci` it ran installed dev dependencies too.
+// Nothing installs inside sidecar/ here, so an undeclared import is a crash on
+// a user's machine with no types and no explanation.
+function importedPackages(dir) {
+  const names = new Set();
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const target = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      for (const name of importedPackages(target)) names.add(name);
+      continue;
+    }
+    if (!entry.name.endsWith(".js")) continue;
+    const body = fs.readFileSync(target, "utf8");
+    for (const match of body.matchAll(/^\s*(?:import|export)[^;\n]*?from\s*["']([^"'$]+)["']/gm)) {
+      const specifier = match[1];
+      if (specifier.startsWith(".") || specifier.startsWith("node:")) continue;
+      const parts = specifier.split("/");
+      names.add(specifier.startsWith("@") ? `${parts[0]}/${parts[1]}` : parts[0]);
+    }
+  }
+  return names;
+}
+
 const carrying = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
-const missing = Object.entries(declared.dependencies ?? {}).filter(
-  ([name]) => !(name in (carrying.dependencies ?? {})),
+const declared = new Set(Object.keys(carrying.dependencies ?? {}));
+const missing = [...importedPackages(path.join(target, "dist", "src"))].filter(
+  (name) => !declared.has(name),
 );
 if (missing.length > 0) {
   process.stderr.write(
-    `The sidecar depends on ${missing.map(([name]) => name).join(", ")}, which npm/carrick/package.json does not declare. ` +
-      `Add them to its dependencies: nothing installs inside sidecar/, so an undeclared one is missing at run time.\n`,
+    `The built sidecar imports ${missing.sort().join(", ")}, which npm/carrick/package.json does not declare as a dependency. ` +
+      `Add them: nothing installs inside sidecar/, so an undeclared import is missing at run time.\n`,
   );
   process.exit(1);
 }
+
+// The licence travels with the tarball. npm only picks up a LICENSE file that
+// sits in the package directory, and this one is the repo's.
+fs.copyFileSync(path.join(packageRoot, "..", "..", "LICENSE.md"), path.join(packageRoot, "LICENSE.md"));
 
 process.stdout.write(`bundled the sidecar into ${path.relative(packageRoot, target)}\n`);
