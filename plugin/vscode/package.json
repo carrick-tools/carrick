@@ -13,7 +13,10 @@
   "engines": {
     "vscode": "^1.90.0"
   },
-  "categories": ["Programming Languages", "Linters"],
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
   "activationEvents": [
     "onLanguage:typescript",
     "onLanguage:typescriptreact"
@@ -23,20 +26,10 @@
     "configuration": {
       "title": "Carrick",
       "properties": {
-        "carrick.serverPath": {
-          "type": "string",
-          "default": "",
-          "description": "Path to the Carrick language server entry point. Empty means the copy that ships with this extension."
-        },
-        "carrick.nodePath": {
-          "type": "string",
-          "default": "node",
-          "description": "Node 24 or newer to run the server with."
-        },
         "carrick.binary": {
           "type": "string",
           "default": "",
-          "description": "Path to the carrick CLI. Empty means the carrick on PATH."
+          "description": "Path to the carrick CLI. Empty means the carrick on PATH (npm install -g carrick)."
         }
       }
     }

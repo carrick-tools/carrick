@@ -1,0 +1,69 @@
+{
+  "name": "carrick",
+  "version": "0.3.48",
+  "description": "The API contract index for a TypeScript workspace: what the other services do with the routes and calls in the file you are editing, in your editor and in your agent's context",
+  "keywords": [
+    "typescript",
+    "monorepo",
+    "api",
+    "contracts",
+    "lsp",
+    "claude-code"
+  ],
+  "homepage": "https://carrick.tools",
+  "bugs": "https://github.com/carrick-tools/carrick/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/carrick-tools/carrick.git",
+    "directory": "npm/carrick"
+  },
+  "license": "SEE LICENSE IN LICENSE.md",
+  "type": "module",
+  "bin": {
+    "carrick": "bin/carrick.mjs"
+  },
+  "exports": {
+    "./templates": "./dist/templates.js",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "plugin",
+    "sidecar",
+    "templates",
+    "LICENSE.md"
+  ],
+  "scripts": {
+    "test": "tsc --noEmit && npm run build && node --test 'test/**/*.test.ts'",
+    "typecheck": "tsc --noEmit",
+    "selftest": "node test/selftest.ts",
+    "bundle": "node scripts/bundle-sidecar.mjs",
+    "prepack": "npm run build && node scripts/bundle-sidecar.mjs",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "pnpm": "10.34.5",
+    "ts-morph": "^25.0.1",
+    "typescript": "^5.8.0",
+    "zod": "^3.23.0"
+  },
+  "optionalDependencies": {
+    "@carrick-tools/cli-darwin-arm64": "0.3.48",
+    "@carrick-tools/cli-darwin-x64": "0.3.48",
+    "@carrick-tools/cli-linux-arm64": "0.3.48",
+    "@carrick-tools/cli-linux-x64": "0.3.48",
+    "@carrick-tools/cli-win32-x64": "0.3.48"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.2"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

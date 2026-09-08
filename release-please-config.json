@@ -12,6 +12,21 @@
         { "type": "docs", "section": "Documentation" },
         { "type": "ci", "section": "CI/CD" },
         { "type": "chore", "section": "Miscellaneous", "hidden": true }
+      ],
+      "extra-files": [
+        { "type": "json", "path": "npm/carrick/package.json", "jsonpath": "$.version" },
+        { "type": "json", "path": "npm/carrick/package-lock.json", "jsonpath": "$.version" },
+        { "type": "json", "path": "npm/carrick/package-lock.json", "jsonpath": "$.packages[''].version" },
+        { "type": "json", "path": "npm/carrick/package.json", "jsonpath": "$.optionalDependencies['@carrick-tools/cli-darwin-arm64']" },
+        { "type": "json", "path": "npm/carrick/package.json", "jsonpath": "$.optionalDependencies['@carrick-tools/cli-darwin-x64']" },
+        { "type": "json", "path": "npm/carrick/package.json", "jsonpath": "$.optionalDependencies['@carrick-tools/cli-linux-arm64']" },
+        { "type": "json", "path": "npm/carrick/package.json", "jsonpath": "$.optionalDependencies['@carrick-tools/cli-linux-x64']" },
+        { "type": "json", "path": "npm/carrick/package.json", "jsonpath": "$.optionalDependencies['@carrick-tools/cli-win32-x64']" },
+        { "type": "json", "path": "npm/carrick/package-lock.json", "jsonpath": "$.packages[''].optionalDependencies['@carrick-tools/cli-darwin-arm64']" },
+        { "type": "json", "path": "npm/carrick/package-lock.json", "jsonpath": "$.packages[''].optionalDependencies['@carrick-tools/cli-darwin-x64']" },
+        { "type": "json", "path": "npm/carrick/package-lock.json", "jsonpath": "$.packages[''].optionalDependencies['@carrick-tools/cli-linux-arm64']" },
+        { "type": "json", "path": "npm/carrick/package-lock.json", "jsonpath": "$.packages[''].optionalDependencies['@carrick-tools/cli-linux-x64']" },
+        { "type": "json", "path": "npm/carrick/package-lock.json", "jsonpath": "$.packages[''].optionalDependencies['@carrick-tools/cli-win32-x64']" }
       ]
     }
   },
