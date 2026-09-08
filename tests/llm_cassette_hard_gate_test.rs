@@ -23,6 +23,15 @@
 //! The golden is portable with no masking because the scanner emits
 //! repo-relative paths; the assertion below holds that property.
 //!
+//! The fixture's `carrick.json` declares `orders.internal` in
+//! `internalDomains`, which is what its client has always been calling: a
+//! sibling service in the same system, reached at a real hostname. Since
+//! carrick-cloud#656 an origin only leaves the match key when something says
+//! it is not a third party, and a declaration is what says it here — so the
+//! declaration is part of the fixture's shape, not a workaround. Remove it and
+//! the call keys verbatim and carries no contract type, which is what any
+//! undeclared literal host does.
+//!
 //! Site-suffixed aliases (`_Call<id>` on a consumer, `_At<id>` on a producer)
 //! are compared verbatim: `build_site_id` hashes the REPO-RELATIVE site path
 //! (#355), so the ids are identical on every machine and need no masking.

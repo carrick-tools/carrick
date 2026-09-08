@@ -8,20 +8,42 @@
 //!
 //! In real microservices deployments:
 //! - Service A defines: `GET /users/:id`
-//! - Service B calls: `fetch(\`http://user-service.internal/users/${id}\`)`
+//! - Service B calls: `fetch(\`${USER_SERVICE_URL}/users/${id}\`)`
 //!
-//! The call URL is `http://user-service.internal/users/123`, but the endpoint path is `/users/:id`.
+//! The call URL carries a base and a `123` where the route declares `:id`.
 //! Without normalization, no calls match any endpoints.
 //!
 //! ## URL Patterns Handled
 //!
-//! 1. Full URLs: `https://user-service.internal/api/users` → `/api/users`
-//! 2. Env var patterns: `ENV_VAR:SERVICE_URL:/users` → `/users`
-//! 3. Template literals: `${API_URL}/users/${id}` → `/users/:id`
-//! 4. Query strings: `/users?page=1` → `/users`
-//! 5. Trailing slashes: `/users/` → `/users`
+//! 1. Env var patterns: `ENV_VAR:SERVICE_URL:/users` → `/users`
+//! 2. Template literals: `${API_URL}/users/${id}` → `/users/:id`
+//! 3. Query strings: `/users?page=1` → `/users`
+//! 4. Trailing slashes: `/users/` → `/users`
+//!
+//! ## What an ORIGIN does to the key
+//!
+//! An origin written at the call site is only stripped when it states nothing
+//! about who serves the call:
+//!
+//! - a base declared in `internalEnvVars`/`internalDomains` — the declaration
+//!   says it is this system, so the bare path is the comparable key;
+//! - a plain relative path — there is no origin to strip;
+//! - a LOOPBACK literal (`http://localhost:PORT/...`) — it names this machine,
+//!   which is what lets a service's self-call match its own endpoint.
+//!
+//! Every other literal host stays on the key, host and all, declared or not
+//! (carrick-cloud#656). The origin IS the classification there: stripped, a
+//! call to `https://api.stripe.com/v1/charges` keys as `/v1/charges`, which
+//! reads exactly like an internal call to a producer nobody declares — and the
+//! reader reports a working third-party API as a missing endpoint. An
+//! undeclared host cannot be told from a third party, and `internalDomains` is
+//! the declaration that says otherwise.
+//!
+//! [`UrlNormalizer::consumer_call_path`] is where that rule lives, with the
+//! shapes that keep their strip for want of a host to read.
 
 use crate::config::Config;
+use crate::env_alias::is_loopback_origin;
 use std::collections::HashSet;
 
 /// Result of URL normalization
@@ -534,22 +556,31 @@ impl UrlNormalizer {
         self.normalize(url).path
     }
 
-    /// Canonical path to key a CONSUMER data call on. Strips the origin for:
-    /// a declared-internal env-var base (carrick.json `internalEnvVars`), a plain
-    /// relative path (no host), or a LITERAL absolute URL
-    /// (`scheme://host[:port]/path`, incl. protocol-relative `//host/path`) — the
-    /// origin of a concrete URL is a structural prefix, so stripping it never
-    /// depends on a hostname allowlist. This is what lets a service's self-call
-    /// over its own `http://localhost:PORT/...` surface canonicalize to the bare
-    /// path and match its own endpoint (a literal origin that survived into the
-    /// key could match nothing and evaded the self-call / decoy checks).
+    /// Canonical path to key a CONSUMER data call on.
     ///
-    /// The one exception is a host DECLARED in `externalDomains`: it is kept
-    /// VERBATIM, like a declared-external env-var base. For a declared host the
-    /// origin is not incidental prefix, it is the classification — stripped, the
-    /// key is a bare path that reads exactly like an internal call, and the
-    /// declaration can no longer exclude it from matching. `internalDomains`
+    /// The origin is stripped only when it states nothing about who serves the
+    /// call: a base declared in `internalEnvVars`/`internalDomains`, a plain
+    /// relative path with no origin at all, or a LOOPBACK literal
+    /// (`http://localhost:PORT/...`, and its `127.0.0.1`/`0.0.0.0`/`::1`
+    /// spellings). The loopback case is what lets a service's self-call over
+    /// its own surface canonicalize to the bare path and match its own
+    /// endpoint.
+    ///
+    /// Every OTHER literal host is kept VERBATIM, host and all, whether or not
+    /// it was declared in `externalDomains` (carrick-cloud#656). The origin is
+    /// the classification there: stripped, the key is a bare path that reads
+    /// exactly like an internal call, so a working third-party API is reported
+    /// as a missing endpoint. `externalDomains` is empty in every carrick.json
+    /// until someone fills it in, which is the state a first scan of any repo
+    /// runs in, so this cannot depend on the declaration. `internalDomains`
     /// still wins for a host named in both.
+    ///
+    /// Two absolute shapes keep their strip for want of a host to read. A
+    /// protocol-relative `//host/path` key would fail the bare `http(s)://`
+    /// prefix test every reader of this key applies, so keeping it whole would
+    /// produce a shape nothing downstream recognises as external. And an origin
+    /// whose host is interpolated (`https://${apiHost}/v1`) names no host at
+    /// all — [`Self::absolute_host`] returns `None` for it.
     ///
     /// An UNKNOWN/undeclared ENV-VAR base (`${SOME_URL}/charges`,
     /// `${process.env.STRIPE_URL}/charges` — not in `internalEnvVars`) is still
@@ -583,23 +614,41 @@ impl UrlNormalizer {
         if normalized.is_internal {
             return normalized.path;
         }
-        // A host the service DECLARED in `externalDomains` keeps its origin,
-        // even though a literal absolute origin is otherwise a structural
-        // prefix to strip. The origin IS the classification here: stripped, the
-        // key is a bare `/user` that no longer carries the declaration, so
-        // every downstream consumer of the key (`find_matching_endpoints_with_
-        // normalizer`, the uploaded call in `mount_graph_to_api_details`) reads
-        // the call as internal and reports it as a missing endpoint. Trimmed,
-        // not raw: `canonical_path_has_literal_segment` and
+        // A literal host that is not this machine keeps its origin. The origin
+        // IS the classification: stripped, the key is a bare `/user` that
+        // reads exactly like an internal call, so every downstream consumer of
+        // the key (`find_matching_endpoints_with_normalizer`, the uploaded call
+        // in `mount_graph_to_api_details`) reports a working third-party call
+        // as a missing endpoint.
+        //
+        // Undeclared as well as declared (carrick-cloud#656). `externalDomains`
+        // is empty in every carrick.json until someone fills it in, which is
+        // the normal first-run case, and an undeclared `https://api.stripe.com`
+        // is no more an internal path than a declared one. Keying it as one
+        // makes the first thing a new user sees a defect report about an API
+        // that works.
+        //
+        // What is left to strip is exactly what the strip exists for: a
+        // service's self-call over its own `http://localhost:PORT/...` surface,
+        // whose origin is this machine and carries no classification at all.
+        // An undeclared host that IS internal has `internalDomains` to say so,
+        // which is checked above and still wins.
+        //
+        // Trimmed, not raw: `canonical_path_has_literal_segment` and
         // `is_valid_route_shape` gate on a bare `http(s)://` prefix, so a
         // surviving source quote would drop the call as noise instead.
         //
-        // Scheme-prefixed only, not every `is_absolute_url` shape: a
-        // protocol-relative `//host/path` key would fail the same `http(s)://`
-        // prefix test that every reader of this key applies, so keeping it
-        // whole would produce a shape nothing downstream recognises as
-        // external. That shape keeps its existing strip.
-        if normalized.is_external && has_scheme {
+        // Two shapes deliberately keep their strip. A protocol-relative
+        // `//host/path` key would fail that same `http(s)://` prefix test, so
+        // keeping it whole would produce a shape nothing downstream recognises
+        // as external. And an origin whose host is interpolated
+        // (`https://${apiHost}/v1`) names no host at all — `absolute_host`
+        // returns `None` for it — so there is nothing to classify by.
+        if has_scheme
+            && self
+                .absolute_host(trimmed)
+                .is_some_and(|_| !is_loopback_origin(trimmed))
+        {
             return trimmed.to_string();
         }
         if is_relative_path || is_absolute_url {
@@ -1095,21 +1144,26 @@ mod tests {
             "${process.env.STRIPE_URL}/charges"
         );
 
-        // A LITERAL absolute URL has its origin (`scheme://host[:port]`) stripped
-        // for the key even with a query interpolation — the origin of a concrete
-        // URL is a structural prefix, so this needs no hostname allowlist. The raw
-        // target is retained separately on the call (`target_url`) for
-        // classification; only the match key is canonicalized. This is what lets a
-        // self-call over the service's own `http://localhost:PORT/...` surface
-        // canonicalize to its bare path and match its own endpoint.
+        // A LOOPBACK origin is stripped for the key even with a query
+        // interpolation: it names this machine and classifies nothing, which is
+        // what lets a self-call over the service's own `http://localhost:PORT/...`
+        // surface canonicalize to its bare path and match its own endpoint. The
+        // raw target is retained separately on the call (`target_url`).
         assert_eq!(
-            normalizer.consumer_call_path("https://orders.internal/api/orders?user=${userId}"),
+            normalizer.consumer_call_path("http://localhost:4002/api/orders?user=${userId}"),
             "/api/orders"
         );
-        // A literal origin with `${...}` PATH segments → bare param path.
+        // A loopback origin with `${...}` PATH segments → bare param path.
         assert_eq!(
             normalizer.consumer_call_path("http://localhost:4002/warehouses/${wid}/stock/${sku}"),
             "/warehouses/:wid/stock/:sku"
+        );
+        // Any other literal host is kept whole, declared or not
+        // (carrick-cloud#656): see
+        // `consumer_call_path_keeps_an_undeclared_absolute_host_verbatim`.
+        assert_eq!(
+            normalizer.consumer_call_path("https://orders.internal/api/orders?user=${userId}"),
+            "https://orders.internal/api/orders?user=${userId}"
         );
 
         // A declared-internal base with a param interpolation collapses to a clean
@@ -1202,14 +1256,72 @@ mod tests {
             "/user"
         );
 
-        // Unchanged: an UNDECLARED absolute origin is still a structural prefix
-        // and is still stripped, which is what lets a self-call match.
+        // A loopback origin is still stripped, which is what lets a self-call
+        // match.
         assert_eq!(
             normalizer.consumer_call_path("http://localhost:4002/warehouses/${wid}"),
             "/warehouses/:wid"
         );
+    }
+
+    /// An UNDECLARED literal host keeps its origin too (carrick-cloud#656).
+    ///
+    /// `externalDomains` is empty in every carrick.json until someone fills it
+    /// in, which is the normal first-run case, and an undeclared third-party
+    /// host is no more an internal path than a declared one. Stripping it made
+    /// a working `POST https://api.resend.com/emails` key as `POST /emails`,
+    /// which matched no producer and was reported to the user as a missing
+    /// internal endpoint.
+    ///
+    /// This is the contract the cloud reads the field under: the base is
+    /// stripped only for a declared-internal base or a plain relative path,
+    /// and an external or unknown base is kept verbatim, host and all, so a
+    /// third-party call can never collide with an internal producer's path.
+    #[test]
+    fn consumer_call_path_keeps_an_undeclared_absolute_host_verbatim() {
+        // Nothing declared, the shape of a carrick.json nobody has edited.
+        let normalizer = UrlNormalizer::default_permissive();
+
+        assert_eq!(
+            normalizer.consumer_call_path("https://api.resend.com/emails"),
+            "https://api.resend.com/emails"
+        );
+        // A host that IS internal but undeclared is kept too. It reads as
+        // external and matches nothing, which is visible; the alternative is a
+        // bare path that could collide with any producer. `internalDomains` is
+        // the declaration that says otherwise, and it still wins.
         assert_eq!(
             normalizer.consumer_call_path("https://orders.internal/api/orders"),
+            "https://orders.internal/api/orders"
+        );
+        let declared_internal = UrlNormalizer::new(&Config {
+            internal_domains: ["orders.internal".to_string()].into_iter().collect(),
+            ..Default::default()
+        });
+        assert_eq!(
+            declared_internal.consumer_call_path("https://orders.internal/api/orders"),
+            "/api/orders"
+        );
+
+        // Loopback, under every spelling, still strips: the origin is this
+        // machine and states nothing about who serves the call.
+        for loopback in [
+            "http://localhost:3000/api/orders",
+            "http://127.0.0.1:3000/api/orders",
+            "http://0.0.0.0:3000/api/orders",
+            "http://[::1]:3000/api/orders",
+        ] {
+            assert_eq!(
+                normalizer.consumer_call_path(loopback),
+                "/api/orders",
+                "loopback origin {loopback}"
+            );
+        }
+
+        // An origin whose HOST is interpolated names no host, so there is
+        // nothing to classify by and the existing strip stands.
+        assert_eq!(
+            normalizer.consumer_call_path("https://${apiHost}/api/orders"),
             "/api/orders"
         );
     }

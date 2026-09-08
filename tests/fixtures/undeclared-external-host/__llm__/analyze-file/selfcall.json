@@ -1,0 +1,20 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:5",
+      "line_number": 5,
+      "target": "http://localhost:7100/emails",
+      "method": "POST",
+      "call_kind": "internal_http",
+      "pattern_matched": "fetch",
+      "call_expression_text": null,
+      "call_expression_line": 5,
+      "payload_expression_text": null,
+      "payload_expression_line": 8,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

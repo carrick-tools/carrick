@@ -88,6 +88,12 @@ jobs:
       - name: Run xrepo harness test
         run: cargo test --test xrepo_harness_test --verbose
 
+      # An absolute third-party URL keeps its origin on the match key whether
+      # or not the host was declared (carrick-cloud#656). Spawns the binary
+      # over a cassetted fixture; no model call and no network.
+      - name: Run undeclared external host test
+        run: cargo test --test undeclared_external_host_test --verbose
+
       # Cross-repo scorer math only. Default `cargo test` skips the #[ignore]d
       # live scorer + mock smoke (both spawn the binary / cost money), so this is
       # cheap, deterministic, and never triggers a scan. The live scorer runs via
