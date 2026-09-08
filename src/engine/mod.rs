@@ -3456,6 +3456,7 @@ fn discover_files_and_symbols(
                     callees: func_extractor.callee_refs,
                     imports: file_imports,
                     declared_types: func_extractor.declared_types,
+                    field_types: func_extractor.field_types,
                 },
             );
             per_file_definitions.push((file_path.clone(), func_extractor.function_definitions));

@@ -16,13 +16,19 @@ existed.
 default condition names build output, and the source is what the scan has to
 read.
 
-Two of the five sites in `packages/app/src/reader.ts` record an edge. The
-other three are answer keys for what must NOT resolve:
+Three of the seven sites in `packages/app/src/reader.ts` record an edge. The
+other four are answer keys for what must NOT resolve:
 
 - `readUnbound` — the receiver is a cast, so the file declares no class.
 - `readVendor` — the receiver's class is declared by an external package, which
   has no source in this repo.
 - `readAmbiguous` — one name is bound to two different classes in one scope.
+- `UntypedManager.readStreamUntyped` — the receiver is a class field the body
+  never annotates, so the class states nothing about it (carrick#782).
+
+`RunMetadataManager.readStreamThroughField` is the third resolving site: the
+receiver is `this.apiClient`, a constructor parameter property, which the class
+body declares as plainly as an annotated parameter does.
 
 Every `__llm__` cassette is empty, so a row exists here only because a
 deterministic pass emitted it.

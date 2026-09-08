@@ -33,3 +33,24 @@ export function readAmbiguous(runId: string, client: RunClient) {
   const inner = (client: VendorClient) => client.subscribeToRun(runId);
   return inner;
 }
+
+/**
+ * The receiver is a FIELD of the enclosing class, declared by a constructor
+ * parameter property, so the class body states its class (carrick#782).
+ */
+export class RunMetadataManager {
+  constructor(private readonly apiClient: RunClient) {}
+
+  readStreamThroughField(runId: string, streamKey: string) {
+    return this.apiClient.fetchStream(runId, streamKey);
+  }
+}
+
+/** A field the class body leaves unannotated states nothing. */
+export class UntypedManager {
+  private apiClient = new RunClient("https://runs.example.test");
+
+  readStreamUntyped(runId: string, streamKey: string) {
+    return this.apiClient.fetchStream(runId, streamKey);
+  }
+}

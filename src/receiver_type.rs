@@ -47,6 +47,15 @@
 //! and once without. Mirrors [`crate::receiver_origin`], which answers the
 //! same question for a value that traces back to an import rather than to a
 //! declared type.
+//!
+//! A CLASS FIELD is the same statement one level out (carrick#782). `this.x`
+//! is not a local binding — it belongs to the class, not to the method — so
+//! [`class_field_types`] reads the class body once and the table is keyed by
+//! class rather than by function. It reads exactly what a field DECLARES: an
+//! annotated instance property, a `#private` one, or a constructor parameter
+//! property. A field left unannotated states nothing, whatever its
+//! initialiser, and is recorded as contested so a same-named annotation
+//! elsewhere in the class cannot answer for it.
 
 use std::collections::HashMap;
 
@@ -55,6 +64,55 @@ use swc_ecma_visit::{Visit, VisitWith};
 
 /// Local binding name -> the type identifier declared for it.
 pub type ReceiverTypes = HashMap<String, String>;
+
+/// Which class each FIELD of one class is declared to be (carrick#782).
+///
+/// Instance fields only: `this.x` inside a method names an instance member,
+/// and a static field is reached through the class name, which
+/// [`crate::call_graph`] already resolves without this table. A private field
+/// is keyed `#name`, matching how a `this.#x()` call site is recorded.
+pub fn class_field_types(class: &Class) -> ReceiverTypes {
+    let mut collector = ReceiverTypeCollector::default();
+    for member in &class.body {
+        match member {
+            ClassMember::ClassProp(prop) if !prop.is_static => {
+                let PropName::Ident(key) = &prop.key else {
+                    continue;
+                };
+                let declared = prop.type_ann.as_deref().and_then(annotated_type_name);
+                collector.record(key.sym.to_string(), declared);
+            }
+            ClassMember::PrivateProp(prop) if !prop.is_static => {
+                let declared = prop.type_ann.as_deref().and_then(annotated_type_name);
+                collector.record(format!("#{}", prop.key.name), declared);
+            }
+            // `constructor(private readonly client: ApiClient)` declares a
+            // field in the same breath as the parameter. The defaulted form
+            // (`= new ApiClient()`) declares the same field.
+            ClassMember::Constructor(constructor) => {
+                for param in &constructor.params {
+                    let ParamOrTsParamProp::TsParamProp(prop) = param else {
+                        continue;
+                    };
+                    let binding = match &prop.param {
+                        TsParamPropParam::Ident(ident) => Some(ident),
+                        TsParamPropParam::Assign(assign) => match &*assign.left {
+                            Pat::Ident(ident) => Some(ident),
+                            _ => None,
+                        },
+                    };
+                    let Some(binding) = binding else {
+                        continue;
+                    };
+                    let declared = binding.type_ann.as_deref().and_then(annotated_type_name);
+                    collector.record(binding.id.sym.to_string(), declared);
+                }
+            }
+            _ => {}
+        }
+    }
+    collector.finish()
+}
 
 /// The class identifier a type annotation names, or `None` when the
 /// annotation is anything but an unqualified type reference.
@@ -246,6 +304,106 @@ mod tests {
     fn a_destructured_binding_states_nothing() {
         let types = types("function run({ client }: Deps) { return client.list(); }");
         assert_eq!(types.get("client"), None);
+    }
+
+    /// Walk the module and read the fields of its first class declaration.
+    fn fields(source: &str) -> ReceiverTypes {
+        let (_, module) = parse_standalone_module(Path::new("fields.ts"), source).expect("parses");
+        let class = module
+            .body
+            .iter()
+            .find_map(|item| match item {
+                ModuleItem::Stmt(Stmt::Decl(Decl::Class(class))) => Some(&class.class),
+                ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => match &export.decl {
+                    Decl::Class(class) => Some(&class.class),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("a class declaration");
+        class_field_types(class)
+    }
+
+    #[test]
+    fn an_annotated_field_states_its_class() {
+        let fields = fields(
+            r#"
+            export class Manager {
+              private readonly client: ApiClient;
+              #cache: CacheClient;
+              static shared: SharedClient;
+            }
+            "#,
+        );
+        assert_eq!(fields.get("client").map(String::as_str), Some("ApiClient"));
+        assert_eq!(
+            fields.get("#cache").map(String::as_str),
+            Some("CacheClient")
+        );
+        // A static field is reached through the class name, not `this`.
+        assert_eq!(fields.get("shared"), None);
+    }
+
+    #[test]
+    fn a_constructor_parameter_property_states_its_class() {
+        let fields = fields(
+            r#"
+            export class Manager {
+              constructor(
+                private readonly client: ApiClient,
+                public cache: CacheClient = new CacheClient(),
+                plain: ApiClient,
+              ) {}
+            }
+            "#,
+        );
+        assert_eq!(fields.get("client").map(String::as_str), Some("ApiClient"));
+        assert_eq!(fields.get("cache").map(String::as_str), Some("CacheClient"));
+        // A plain parameter is not a field: no modifier, so nothing is
+        // assigned to `this`.
+        assert_eq!(fields.get("plain"), None);
+    }
+
+    #[test]
+    fn an_unannotated_field_states_nothing() {
+        let fields = fields(
+            r#"
+            export class Manager {
+              client = new ApiClient();
+              other;
+              constructor(private readonly deps) {}
+            }
+            "#,
+        );
+        assert_eq!(fields.get("client"), None);
+        assert_eq!(fields.get("other"), None);
+        assert_eq!(fields.get("deps"), None);
+    }
+
+    #[test]
+    fn a_field_declared_two_different_ways_is_dropped() {
+        let fields = fields(
+            r#"
+            export class Manager {
+              client: ApiClient;
+              constructor(private readonly client: BatchClient) {}
+            }
+            "#,
+        );
+        assert_eq!(fields.get("client"), None);
+    }
+
+    #[test]
+    fn a_field_annotated_once_and_left_bare_once_is_dropped() {
+        let fields = fields(
+            r#"
+            export class Manager {
+              client: ApiClient;
+              constructor(public client = makeClient()) {}
+            }
+            "#,
+        );
+        assert_eq!(fields.get("client"), None);
     }
 
     #[test]
