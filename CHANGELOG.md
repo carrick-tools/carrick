@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.48](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.47...carrick-v0.3.48) (2026-09-08)
+
+
+### Bug Fixes
+
+* **cloud-storage:** persist the verdict for a pair the check could not verify ([#817](https://github.com/carrick-tools/carrick/issues/817)) ([209aba8](https://github.com/carrick-tools/carrick/commit/209aba8a689968732827c7abe72e57f49994fd12))
+* **matching:** an undeclared absolute host keeps its origin on the match key (carrick-cloud[#656](https://github.com/carrick-tools/carrick/issues/656)) ([#819](https://github.com/carrick-tools/carrick/issues/819)) ([fbf4006](https://github.com/carrick-tools/carrick/commit/fbf400683818dcbdf8886ccf30b4ffbcafd82b7c))
+* **parser:** a .js file holding JSX parses ([#803](https://github.com/carrick-tools/carrick/issues/803)) ([#809](https://github.com/carrick-tools/carrick/issues/809)) ([b9cdba9](https://github.com/carrick-tools/carrick/commit/b9cdba9d76b145ef068a47f7fad60a0b87945075))
+* **receiver-type:** send the sidecar ts-morph positions, not SWC byte offsets ([#812](https://github.com/carrick-tools/carrick/issues/812)) ([b6b648c](https://github.com/carrick-tools/carrick/commit/b6b648c30c1961af1c9c743b38c2b0a61e8090df))
+* **routes:** a routing decorator with no argument states the empty prefix, and @Sse states a GET ([#804](https://github.com/carrick-tools/carrick/issues/804)) ([#810](https://github.com/carrick-tools/carrick/issues/810)) ([e67bd3f](https://github.com/carrick-tools/carrick/commit/e67bd3f923e9146bc4650f0b2cad11770eb56721))
+
+
+### Documentation
+
+* **fixtures:** say why llm-mocked-api declares an internal domain ([#821](https://github.com/carrick-tools/carrick/issues/821)) ([1961745](https://github.com/carrick-tools/carrick/commit/1961745a83a6e6f324028fdff2dd90036827ae11))
+
 ## [0.3.47](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.46...carrick-v0.3.47) (2026-09-08)
 
 
