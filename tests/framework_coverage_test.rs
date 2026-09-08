@@ -256,6 +256,33 @@ fn react_jsx_fixture_captures_fetch_calls() {
     );
 }
 
+#[test]
+fn react_js_entry_point_holding_jsx_parses() {
+    // carrick#803: JSX used to be enabled by extension, so `.jsx` parsed and a
+    // `.js` file holding JSX did not — and `.js` holding JSX is the entry point
+    // every React Native app is scaffolded with. The file failed to parse and
+    // was excluded from the index along with every call site in it.
+    let file = fixture_path("react-app/App.js");
+    let result = scan(&file);
+
+    assert!(
+        !result.parse_failed,
+        "react-app/App.js holds JSX and must parse"
+    );
+
+    let fetch_count = result
+        .candidates
+        .iter()
+        .filter(|c| c.callee_object == "fetch" && c.callee_property.is_none())
+        .count();
+    assert!(
+        fetch_count >= 2,
+        "expected >=2 fetch() candidates inside a .js component, got {}: {:?}",
+        fetch_count,
+        objects(&result.candidates)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Class controllers — routes bound in a route table, handlers in another file
 // ---------------------------------------------------------------------------
