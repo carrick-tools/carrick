@@ -22,7 +22,7 @@ use swc_common::{
     sync::Lrc,
 };
 use swc_ecma_ast::*;
-use swc_ecma_parser::{EsSyntax, TsSyntax};
+
 use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::local_http_wrapper::{LocalWrapperCall, collect_local_wrapper_calls};
@@ -546,42 +546,11 @@ impl SwcScanner {
         messaging_clients: &[String],
     ) -> ScanResult {
         use swc_common::{FileName, GLOBALS, Globals, Mark};
-        use swc_ecma_parser::{Parser, StringInput, Syntax, lexer::Lexer};
+        use swc_ecma_parser::{Parser, StringInput, lexer::Lexer};
         use swc_ecma_transforms_base::resolver;
         use swc_ecma_visit::VisitMutWith;
 
-        // Determine syntax based on file extension. Decorators must be enabled
-        // so NestJS-style `@Controller('users')` / `@Get(':id')` parse into
-        // `Decorator` nodes that the visitor can traverse.
-        let (syntax, is_typescript) = if let Some(ext) = file_path.extension() {
-            match ext.to_string_lossy().as_ref() {
-                "ts" => (
-                    Syntax::Typescript(TsSyntax {
-                        decorators: true,
-                        ..Default::default()
-                    }),
-                    true,
-                ),
-                "tsx" => (
-                    Syntax::Typescript(TsSyntax {
-                        tsx: true,
-                        decorators: true,
-                        ..Default::default()
-                    }),
-                    true,
-                ),
-                "jsx" => (
-                    Syntax::Es(EsSyntax {
-                        jsx: true,
-                        ..Default::default()
-                    }),
-                    false,
-                ),
-                _ => (Syntax::Es(Default::default()), false),
-            }
-        } else {
-            (Syntax::Es(Default::default()), false)
-        };
+        let (syntax, is_typescript) = crate::parser::syntax_for_path(file_path);
 
         // Create a fresh SourceMap for each file to ensure per-file byte offsets.
         // SWC's SourceMap maintains cumulative offsets across new_source_file() calls,
@@ -671,24 +640,9 @@ impl SwcScanner {
     /// See [`ModuleExports`].
     pub fn module_exports(&self, file_path: &Path, content: &str) -> ModuleExports {
         use swc_common::{FileName, Spanned};
-        use swc_ecma_parser::{Parser, StringInput, Syntax, lexer::Lexer};
+        use swc_ecma_parser::{Parser, StringInput, lexer::Lexer};
 
-        let syntax = match file_path.extension().and_then(|e| e.to_str()) {
-            Some("ts") => Syntax::Typescript(TsSyntax {
-                decorators: true,
-                ..Default::default()
-            }),
-            Some("tsx") => Syntax::Typescript(TsSyntax {
-                tsx: true,
-                decorators: true,
-                ..Default::default()
-            }),
-            Some("jsx") => Syntax::Es(EsSyntax {
-                jsx: true,
-                ..Default::default()
-            }),
-            _ => Syntax::Es(Default::default()),
-        };
+        let (syntax, _) = crate::parser::syntax_for_path(file_path);
 
         let sm: Lrc<SourceMap> = Default::default();
         let source_file = sm.new_source_file(
@@ -1407,24 +1361,9 @@ pub(crate) fn parse_standalone_module(
     content: &str,
 ) -> Option<(Lrc<SourceMap>, Module)> {
     use swc_common::FileName;
-    use swc_ecma_parser::{Parser, StringInput, Syntax, lexer::Lexer};
+    use swc_ecma_parser::{Parser, StringInput, lexer::Lexer};
 
-    let syntax = match file_path.extension().and_then(|e| e.to_str()) {
-        Some("ts") => Syntax::Typescript(TsSyntax {
-            decorators: true,
-            ..Default::default()
-        }),
-        Some("tsx") => Syntax::Typescript(TsSyntax {
-            tsx: true,
-            decorators: true,
-            ..Default::default()
-        }),
-        Some("jsx") => Syntax::Es(EsSyntax {
-            jsx: true,
-            ..Default::default()
-        }),
-        _ => Syntax::Es(Default::default()),
-    };
+    let (syntax, _) = crate::parser::syntax_for_path(file_path);
 
     let sm: Lrc<SourceMap> = Default::default();
     let source_file = sm.new_source_file(

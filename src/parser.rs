@@ -7,44 +7,58 @@ use swc_ecma_transforms_base::resolver;
 use swc_ecma_visit::VisitMutWith;
 use tracing::warn;
 
+/// The parser configuration a file's extension calls for, and whether that
+/// configuration is TypeScript. The single definition for every parse in the
+/// scanner: a file read one way by one pass and another way by the next is a
+/// file two passes disagree about.
+///
+/// Two facts decide it, and nothing else:
+///
+/// - **TypeScript or ES**, from `.ts`/`.tsx` against everything else.
+///   Decorators are enabled on the TypeScript arms so a decorated class parses
+///   into `Decorator` nodes instead of failing outright.
+/// - **JSX**, which is enabled for every ES parse (carrick#803). Keying JSX on
+///   the extension read `.jsx` and refused `.js`, and a `.js` file holding JSX
+///   is the entry point every React Native app is scaffolded with — the file
+///   failed to parse and was excluded from the index. JSX is unambiguous in ES
+///   mode, where there is no type assertion for `<` to be read as, so enabling
+///   it costs a plain `.js` file nothing. The TypeScript arms cannot do the
+///   same: there `<T>x` is a type assertion, and `tsx` genuinely changes how a
+///   valid file parses, which is why the extension still decides it.
+pub(crate) fn syntax_for_path(file_path: &Path) -> (Syntax, bool) {
+    match file_path.extension().and_then(|ext| ext.to_str()) {
+        Some("ts") => (
+            Syntax::Typescript(TsSyntax {
+                decorators: true,
+                ..Default::default()
+            }),
+            true,
+        ),
+        Some("tsx") => (
+            Syntax::Typescript(TsSyntax {
+                tsx: true,
+                decorators: true,
+                ..Default::default()
+            }),
+            true,
+        ),
+        _ => (
+            Syntax::Es(EsSyntax {
+                jsx: true,
+                ..Default::default()
+            }),
+            false,
+        ),
+    }
+}
+
 /// Parse a JavaScript or TypeScript file into an AST
 pub fn parse_file(
     file_path: &Path,
     source_map: &Lrc<SourceMap>,
     handler: &Handler,
 ) -> Option<Module> {
-    // Determine syntax based on file extension. Enable decorators so NestJS
-    // `@Controller` / `@Get()` parse into Decorator AST nodes rather than
-    // being treated as a syntax error and silently dropped.
-    let (syntax, is_typescript) = if let Some(ext) = file_path.extension() {
-        match ext.to_string_lossy().as_ref() {
-            "ts" => (
-                Syntax::Typescript(TsSyntax {
-                    decorators: true,
-                    ..Default::default()
-                }),
-                true,
-            ),
-            "tsx" => (
-                Syntax::Typescript(TsSyntax {
-                    tsx: true,
-                    decorators: true,
-                    ..Default::default()
-                }),
-                true,
-            ),
-            "jsx" => (
-                Syntax::Es(EsSyntax {
-                    jsx: true,
-                    ..Default::default()
-                }),
-                false,
-            ),
-            _ => (Syntax::Es(Default::default()), false),
-        }
-    } else {
-        (Syntax::Es(Default::default()), false)
-    };
+    let (syntax, is_typescript) = syntax_for_path(file_path);
 
     // Read file content
     let file_content = match fs::read_to_string(file_path) {

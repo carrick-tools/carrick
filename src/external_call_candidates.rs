@@ -138,7 +138,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use swc_common::{FileName, GLOBALS, Globals, Mark, SourceMap, sync::Lrc};
 use swc_ecma_ast::*;
-use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
+use swc_ecma_parser::{Parser, StringInput, lexer::Lexer};
 use swc_ecma_transforms_base::resolver;
 use swc_ecma_visit::{Visit, VisitMutWith, VisitWith};
 use tracing::warn;
@@ -1385,34 +1385,6 @@ fn return_owner(file: usize, shape: &ReturnShape, state: &Ownership) -> Option<O
 // Parsing and fact collection
 // ---------------------------------------------------------------------------
 
-fn syntax_for(file_path: &Path) -> (Syntax, bool) {
-    match file_path.extension().and_then(|e| e.to_str()) {
-        Some("ts") => (
-            Syntax::Typescript(TsSyntax {
-                decorators: true,
-                ..Default::default()
-            }),
-            true,
-        ),
-        Some("tsx") => (
-            Syntax::Typescript(TsSyntax {
-                tsx: true,
-                decorators: true,
-                ..Default::default()
-            }),
-            true,
-        ),
-        Some("jsx") => (
-            Syntax::Es(EsSyntax {
-                jsx: true,
-                ..Default::default()
-            }),
-            false,
-        ),
-        _ => (Syntax::Es(Default::default()), false),
-    }
-}
-
 fn collect_facts(
     relative: &Path,
     absolute: &Path,
@@ -1422,7 +1394,7 @@ fn collect_facts(
     let Ok(content) = std::fs::read_to_string(absolute) else {
         return FileFacts::default();
     };
-    let (syntax, is_typescript) = syntax_for(absolute);
+    let (syntax, is_typescript) = crate::parser::syntax_for_path(absolute);
 
     // A fresh SourceMap per file keeps byte offsets — and therefore the line
     // lookups below — file-local.
