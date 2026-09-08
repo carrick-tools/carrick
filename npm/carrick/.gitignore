@@ -1,5 +1,5 @@
 node_modules/
 *.log
-vscode/out/
-vscode/server/
-vscode/*.vsix
+*.tgz
+# Built by scripts/bundle-sidecar.mjs from src/sidecar/dist.
+sidecar/

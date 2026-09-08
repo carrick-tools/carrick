@@ -11,30 +11,27 @@ into the agent that costs nobody a prompt.
 
 ## What it needs
 
-- Node 24 or newer on PATH (`carrick.nodePath` names another).
-- The `carrick` CLI (`carrick.binary` names another) and a workspace that has
-  been indexed with `carrick index`. Without an index the server publishes
-  nothing and says so in the Carrick output channel.
+- The `carrick` CLI on PATH — `npm install -g carrick`, or `carrick init` in
+  the folder that holds your repos. `carrick.binary` names another copy.
+- A workspace that has been indexed with `carrick index`. Without an index the
+  server publishes nothing and says so in the Carrick output channel.
 
 ## Settings
 
 | Setting | Default | What it does |
 |---|---|---|
-| `carrick.serverPath` | the copy shipped with the extension | Entry point of the language server |
-| `carrick.nodePath` | `node` | Node used to run the server |
-| `carrick.binary` | `carrick` on PATH | The CLI the server reads from |
+| `carrick.binary` | `carrick` on PATH | The CLI to start `lsp --stdio` on |
+
+The extension holds no server of its own: it starts `carrick lsp --stdio`, so
+the server and the scanner are always the same version.
 
 ## Building it
 
 ```
 npm install
-npm run build          # compiles src/extension.ts to out/
-node bundle-server.mjs # copies the shared server into server/
+npm run build   # compiles src/extension.ts to out/
 npx --yes @vscode/vsce package
 ```
 
-Packaging was run once on 2026-09-06 and produced a 479 KB `.vsix`; the file is
-gitignored. Not published to the Marketplace or Open VSX yet. The publisher account and the
-Open VSX namespace are owner actions in carrick#710, and the same ticket makes
-the server a subcommand of the `carrick` package, at which point this extension
-holds a manifest and nothing else.
+The `.vsix` is gitignored. Not published to the Marketplace or Open VSX yet: the
+publisher account and the Open VSX namespace are owner actions in carrick#710.

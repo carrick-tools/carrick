@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/src/hook/post-edit.ts\"",
+            "command": "carrick hook post-edit",
             "timeout": 15
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/src/hook/session-start.ts\"",
+            "command": "carrick hook session-start",
             "timeout": 30
           }
         ]

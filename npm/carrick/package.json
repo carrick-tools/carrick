@@ -1,19 +1,48 @@
 {
-  "name": "carrick-plugin",
-  "version": "0.0.1",
-  "private": true,
-  "description": "Claude Code plugin and stdio language server that push carrick check verdicts into an agent's context",
+  "name": "carrick",
+  "version": "0.3.48",
+  "description": "The API contract index for a TypeScript workspace: what the other services do with the routes and calls in the file you are editing, in your editor and in your agent's context",
+  "keywords": ["typescript", "monorepo", "api", "contracts", "lsp", "claude-code"],
+  "homepage": "https://carrick.tools",
+  "bugs": "https://github.com/carrick-tools/carrick/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/carrick-tools/carrick.git",
+    "directory": "npm/carrick"
+  },
+  "license": "SEE LICENSE IN LICENSE.md",
   "type": "module",
+  "bin": {
+    "carrick": "bin/carrick.mjs"
+  },
   "engines": {
     "node": ">=24"
   },
+  "files": ["bin", "src", "sidecar", "templates", "LICENSE.md"],
   "scripts": {
     "test": "tsc --noEmit && node --test 'test/**/*.test.ts'",
     "typecheck": "tsc --noEmit",
-    "selftest": "node test/selftest.ts"
+    "selftest": "node test/selftest.ts",
+    "bundle": "node scripts/bundle-sidecar.mjs",
+    "prepack": "node scripts/bundle-sidecar.mjs"
+  },
+  "dependencies": {
+    "ts-morph": "^25.0.1",
+    "zod": "^3.23.0"
+  },
+  "optionalDependencies": {
+    "@carrick-tools/cli-darwin-arm64": "0.3.48",
+    "@carrick-tools/cli-darwin-x64": "0.3.48",
+    "@carrick-tools/cli-linux-arm64": "0.3.48",
+    "@carrick-tools/cli-linux-x64": "0.3.48",
+    "@carrick-tools/cli-win32-x64": "0.3.48"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
     "typescript": "^5.9.2"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   }
 }

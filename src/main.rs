@@ -141,6 +141,11 @@ ENVIRONMENT VARIABLES:
                                     analyzer results is reported and fails,
                                     rather than overwriting the index with a
                                     thinner one
+    CARRICK_SIDECAR_DIR             Directory holding the type sidecar's
+                                    dist/src/index.js. Set by the npm package,
+                                    where the binary and the sidecar install
+                                    into different directories; a source
+                                    checkout finds it without this
     CARRICK_SIDECAR_READY_TIMEOUT_SECS
                                     How long to wait for the type sidecar to
                                     build its TypeScript program (default 180).
@@ -346,12 +351,25 @@ fn discover_sidecar_path() -> Option<PathBuf> {
     let sidecar_entry = "dist/src/index.js";
 
     // List of locations to check, in order of priority
-    let mut candidates: Vec<PathBuf> = vec![
+    let mut candidates: Vec<PathBuf> = vec![];
+
+    // 0. Told where it is. The npm package (carrick#710) is the case that
+    //    needs this: the binary ships in a per-platform package and the
+    //    sidecar ships in the main one, beside the `node_modules/` its
+    //    dependencies resolve through, so nothing relative to the executable
+    //    can reach it.
+    if let Ok(configured) = env::var("CARRICK_SIDECAR_DIR")
+        && !configured.trim().is_empty()
+    {
+        candidates.push(PathBuf::from(configured));
+    }
+
+    candidates.extend([
         // 1. Relative to executable (for packaged distribution)
         get_executable_relative_path("sidecar"),
         get_executable_relative_path("../sidecar"),
         get_executable_relative_path("../lib/sidecar"),
-    ];
+    ]);
 
     // 2. For development builds, use CARGO_MANIFEST_DIR (set at compile time)
     //    This ensures we find the sidecar regardless of the current working directory
