@@ -3753,6 +3753,24 @@ mod tests {
         scan_test_content_with_fetchers(content, &[])
     }
 
+    /// [`SWC_SPAN_BASE`] is a claim about SWC's numbering that every span sent
+    /// to the type sidecar subtracts (carrick#805). Nothing else asserts it:
+    /// the sidecar's span lookup allows two units of slack, so a base off by
+    /// one is absorbed there and only surfaces once that slack goes.
+    #[test]
+    fn a_candidate_span_is_the_files_byte_offset_plus_the_base() {
+        let content = "fetch('/a');";
+        let result = scan_test_content(content);
+        let candidate = result
+            .candidates
+            .first()
+            .expect("the call raises a candidate");
+
+        let call = content.find("fetch").expect("the call is in the source") as u32;
+        assert_eq!(candidate.span_start, call + SWC_SPAN_BASE);
+        assert_eq!(candidate.span_end, content.len() as u32 - 1 + SWC_SPAN_BASE);
+    }
+
     fn scan_test_content_with_fetchers(content: &str, data_fetchers: &[String]) -> ScanResult {
         let scanner = SwcScanner::new();
         let path = PathBuf::from("test.ts");
