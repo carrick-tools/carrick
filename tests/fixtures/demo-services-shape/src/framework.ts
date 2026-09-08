@@ -1,6 +1,6 @@
 // A stand-in for whatever decorator-routing library a service uses. The
 // scanner reads the SHAPE of the decorators, never this module's name.
-export function Controller(prefix: string): ClassDecorator {
+export function Controller(prefix?: string): ClassDecorator {
   return () => undefined;
 }
 
@@ -9,6 +9,18 @@ export function Get(path?: string): MethodDecorator {
 }
 
 export function Post(path?: string): MethodDecorator {
+  return () => undefined;
+}
+
+// A server-sent-events route: a stream served over an ordinary GET, spelled as
+// its own decorator rather than as a verb.
+export function Sse(path?: string): MethodDecorator {
+  return () => undefined;
+}
+
+// A decorator that takes no argument and routes nothing, from the same module
+// as the verbs: the tie-break the implicit-prefix rule has to survive.
+export function Scoped(): ClassDecorator {
   return () => undefined;
 }
 

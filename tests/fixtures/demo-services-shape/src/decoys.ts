@@ -1,5 +1,5 @@
 import axios from "axios";
-import { app, Get } from "./framework";
+import { app, Controller, Get, Scoped } from "./framework";
 import { ApiTags } from "./docs";
 
 // 1. A bare path literal with no base at all. Whether this registers a route
@@ -60,3 +60,16 @@ export class Tagged {
 const PREFIX = process.env.API_PREFIX || "/api";
 
 app.get(`${PREFIX}/users`, () => "registered, not requested");
+
+// 7. A class carrying two argument-less decorators from the verbs' own module.
+// One of them routes and the other does not, and nothing on the declaration
+// says which: two statements about the prefix disagree, so the class states
+// none.
+@Controller()
+@Scoped()
+export class Ambiguous {
+  @Get("ambiguous")
+  ambiguous(): string {
+    return "ambiguous";
+  }
+}

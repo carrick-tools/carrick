@@ -5588,18 +5588,74 @@ impl FileOrchestrator {
             // the stamp above survived the join, and a file route the model
             // also described reached the index as the model's own reading.
             let canonical = Self::canonicalize_route_path(&endpoint.path);
-            let twin = result.endpoints[..deterministic_rows]
+            let agreeing = result.endpoints[..deterministic_rows]
                 .iter()
                 .position(|existing| {
                     existing.resolution_source != Some(ResolutionSource::Model)
                         && existing.method.eq_ignore_ascii_case(&endpoint.method)
                         && Self::canonicalize_route_path(&existing.path) == canonical
                 });
+            // A model row that agrees with no deterministic row may still be
+            // describing one. A decorator route is stated by a DECLARATION, and
+            // a decorated method's span opens at its first decorator — so the
+            // model, answering at the decorator's own call, lands strictly
+            // inside it. That containment says the two rows are the same
+            // registration however far apart their paths are, and the source
+            // that read the path off the declaration is the one that wins
+            // (carrick#804: `@Get()` under `@Controller()` serves `/`, and the
+            // model named the route after its handler).
+            //
+            // Only a decorator route, because only there does the span mean
+            // "this registration and nothing else". A file-based route's span
+            // is its handler's BODY, which contains every call the handler
+            // makes, and a row the model states at one of those is not this
+            // route restated — it is the invented row carrick#703 discards.
+            //
+            // Strict containment only: a registration written as a CALL shares
+            // its span with the candidate the model answered at, so this can
+            // never re-key a row the path match already owns.
+            let twin = agreeing.or_else(|| {
+                let (start, end) = (
+                    endpoint.call_expression_span_start?,
+                    endpoint.call_expression_span_end?,
+                );
+                result.endpoints[..deterministic_rows]
+                    .iter()
+                    .position(|existing| {
+                        let (Some(outer_start), Some(outer_end)) = (
+                            existing.call_expression_span_start,
+                            existing.call_expression_span_end,
+                        ) else {
+                            return false;
+                        };
+                        existing.resolution_source == Some(ResolutionSource::DecoratorRoute)
+                            && outer_start <= start
+                            && end <= outer_end
+                            && (outer_start, outer_end) != (start, end)
+                    })
+            });
             match twin {
                 Some(index) => {
                     let stated_by = result.endpoints[index].resolution_source;
                     if stated_by.is_some() {
                         endpoint.resolution_source = stated_by;
+                    }
+                    if agreeing.is_none() {
+                        warn!(
+                            "[FileOrchestrator] Model endpoint {} {} in {} contradicts the \
+                             declaration it sits inside: kept as {} {}",
+                            endpoint.method,
+                            endpoint.path,
+                            file_path,
+                            result.endpoints[index].method,
+                            result.endpoints[index].path
+                        );
+                        endpoint.method = result.endpoints[index].method.clone();
+                        endpoint.path = result.endpoints[index].path.clone();
+                        endpoint
+                            .handler_name
+                            .clone_from(&result.endpoints[index].handler_name);
+                        stats.model_contradictions_discarded += 1;
                     }
                     // A fact the convention read off the module's structure,
                     // which the model has no way to state, travels onto the
