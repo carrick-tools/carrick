@@ -1,7 +1,8 @@
 #!/bin/sh
-# Stops the FIRST repo-wide search of a session and nothing after it.
+# Stops the FIRST repo-wide search of a session, and only while the session has
+# not called a Carrick tool yet. Nothing after that first block is stopped.
 # Fails OPEN on any internal error (no jq, malformed payload, unwritable
-# marker): a gate that cannot read its input must not become a block.
+# marker), because a gate that cannot read its input must not become a block.
 payload=$(cat 2>/dev/null) || exit 0
 tool=$(printf %s "$payload" | jq -r '.tool_name // ""' 2>/dev/null) || exit 0
 # The session's working directory, so a search of somewhere else can be told
@@ -46,6 +47,25 @@ case "$tool" in
     ;;
   *) exit 0 ;;
 esac
+# Silent once the session has asked the index. The PreToolUse payload carries
+# `transcript_path`, and a tool_use block naming an `mcp__carrick__` tool in
+# that file is the session's own record of having called Carrick already. The
+# gate exists to interrupt a vocabulary sweep that skipped the index; after the
+# index has answered, the search IS the next step, and blocking it has killed
+# the only route to a fact the index does not hold (cloud#552).
+#
+# The match is on the tool_use shape, `"name":"mcp__carrick__`, and not on the
+# bare namespace: session-start.sh and turn-reminder.sh both print that string
+# into the transcript as prose on turn 1, so a bare match would be true before
+# the agent had done anything. The quoted form also cannot match this script's
+# own block message or a tool name quoted inside a tool result.
+#
+# Direction of failure: no transcript_path, an unreadable file or a grep error
+# falls THROUGH to the block below, which is the behaviour without this check.
+tp=$(printf %s "$payload" | jq -r '.transcript_path // ""' 2>/dev/null)
+if [ -n "$tp" ] && [ -r "$tp" ] && grep -q '"name":"mcp__carrick__' "$tp" 2>/dev/null; then
+  exit 0
+fi
 # Session-scoped marker, outside the repo, so the nudge happens once per
 # session and no marker file is ever committed.
 sid=$(printf %s "$payload" | jq -r '.session_id // ""' 2>/dev/null) || exit 0
