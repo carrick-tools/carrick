@@ -163,6 +163,27 @@ fn a_this_field_receiver_records_an_edge_into_the_sibling_package() {
     );
 }
 
+/// A receiver whose ORIGIN is a workspace package, whose class the file never
+/// names (carrick#781). One class in the package's published surface declares
+/// the member, so the join answers; before the fix `resolve_member` had
+/// nothing left to try and returned nothing.
+#[test]
+fn an_origin_receiver_records_an_edge_when_one_class_declares_the_member() {
+    let edges = scan_edges();
+    assert_eq!(
+        edges.get("readRunByOrigin").map(Vec::as_slice),
+        Some(
+            [Edge {
+                callee: "RunClient.subscribeToRun".to_string(),
+                callee_file: "packages/core/src/v2/client/index.ts".to_string(),
+                call_site_line: 65,
+            }]
+            .as_slice()
+        ),
+        "all edges were {edges:?}"
+    );
+}
+
 #[test]
 fn a_receiver_the_file_does_not_declare_records_nothing() {
     let edges = scan_edges();
@@ -174,6 +195,14 @@ fn a_receiver_the_file_does_not_declare_records_nothing() {
         // The field is initialised with `new RunClient()` but never
         // annotated, so the class body declares nothing about it.
         "UntypedManager.readStreamUntyped",
+        // The origin is a workspace package, but two classes on its published
+        // surface declare `fetchStream`, so the join is ambiguous and drops
+        // rather than picking one (carrick#781).
+        "readStreamByOrigin",
+        // A nested parameter shadows the origin, so neither the enclosing
+        // function nor the arrow itself may answer for it.
+        "readContestedByOrigin",
+        "nested",
     ] {
         assert_eq!(
             edges.get(caller).map(Vec::as_slice),

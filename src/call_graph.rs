@@ -19,6 +19,14 @@
 //!   package function, and produces no edge.
 //! - `this.foo(...)` — the enclosing class's `Class.foo` key, in the same
 //!   file. A same-named method on another class cannot match.
+//! - `obj.foo(...)` where the file states no class for `obj` at all, only
+//!   where its value came FROM — a local whose initialiser traces back to an
+//!   imported binding whose specifier is a workspace package
+//!   ([`crate::receiver_origin`], carrick#781). The class is then the one the
+//!   package's published surface declares that member on, accepted only when
+//!   exactly ONE class in the surface declares it. This is the one receiver
+//!   form that is an inference rather than a statement the file makes, so it
+//!   is tried last and drops on any conflict.
 //! - `this.field.foo(...)` — the receiver is a field of the enclosing class,
 //!   and the class body declares which class the field is
 //!   ([`crate::receiver_type::class_field_types`], carrick#782). The field's
@@ -54,13 +62,14 @@
 use crate::agents::file_orchestrator::FileOrchestrator;
 use crate::import_bindings::{BindingResolver, ResolvedBinding};
 use crate::parser::parse_file;
+use crate::receiver_origin::ReceiverOrigins;
 use crate::receiver_type::ReceiverTypes;
 use crate::visitor::{
     CalleeRef, CalleeShape, FunctionCallRef, FunctionDefinition, FunctionDefinitionExtractor,
     ImportedSymbol, SymbolKind,
 };
 use crate::workspace_resolver::{Resolution, WorkspaceIndex};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swc_common::{
     SourceMap,
@@ -100,6 +109,36 @@ pub struct FileCallIndex {
     /// a `this.field.foo()` receiver (carrick#782). Keyed by class, not by
     /// definition: a field belongs to the class and every method sees it.
     pub field_types: HashMap<String, ReceiverTypes>,
+    /// Definition key → the specifiers that definition's own local bindings
+    /// trace their value back to (carrick#781). Read only when nothing states
+    /// a class for the receiver.
+    pub receiver_origins: HashMap<String, ReceiverOrigins>,
+}
+
+/// One class member a workspace package's surface publishes.
+struct SurfaceMember {
+    file: PathBuf,
+    key: String,
+    line: u32,
+}
+
+/// The class members one package's published surface declares (carrick#781),
+/// indexed by member name, with the names more than one class declares held
+/// separately: those are ambiguous and answer nothing.
+#[derive(Default)]
+struct PackageSurface {
+    members: HashMap<String, SurfaceMember>,
+    conflicting: HashSet<String>,
+}
+
+/// The class and member a definition key names, for the keys that are class
+/// members. `Class.static.member` and a bare `foo` both answer `None`.
+fn class_member(key: &str) -> Option<(&str, &str)> {
+    let (class, member) = key.split_once('.')?;
+    if class.is_empty() || member.is_empty() || member.contains('.') {
+        return None;
+    }
+    Some((class, member))
 }
 
 /// Where a resolved call lands.
@@ -314,6 +353,11 @@ pub fn resolve_call_edges(
             }
         }
     }
+
+    debug!(
+        "call_graph: package-surface origins resolved {} receiver(s), dropped {} on a member more than one class in the surface declares (carrick#781)",
+        resolver.origin_resolved, resolver.origin_conflicts
+    );
 }
 
 /// One entry per called function, reporting its FIRST call site, in a stable
@@ -345,6 +389,18 @@ struct CallResolver<'a> {
     /// resolution miss, not something to shout about mid-scan.
     source_map: Lrc<SourceMap>,
     handler: Handler,
+    /// Package specifier → the class members its published surface declares
+    /// (carrick#781). Built once per specifier; an external one indexes to an
+    /// empty surface and is paid for once.
+    surfaces: HashMap<String, PackageSurface>,
+    /// Module → the specifiers it re-exports, shared across surface walks.
+    reexport_cache: HashMap<PathBuf, Vec<String>>,
+    /// How many receivers the origin join answered, and how many it declined
+    /// because more than one class in the surface declares the member. Both
+    /// are reported at the end of the pass: the second is the known limit
+    /// carrick#781 records, not a silence.
+    origin_resolved: usize,
+    origin_conflicts: usize,
 }
 
 impl<'a> CallResolver<'a> {
@@ -365,6 +421,10 @@ impl<'a> CallResolver<'a> {
             external: HashMap::new(),
             source_map,
             handler,
+            surfaces: HashMap::new(),
+            reexport_cache: HashMap::new(),
+            origin_resolved: 0,
+            origin_conflicts: 0,
         }
     }
 
@@ -386,6 +446,19 @@ impl<'a> CallResolver<'a> {
                     line,
                 });
         }
+        let definitions = self.external_definitions(file)?;
+        keys.into_iter()
+            .find_map(|key| definitions.get(&key).map(|line| (key, *line)))
+            .map(|(key, line)| Target {
+                file: file.to_path_buf(),
+                key,
+                line,
+            })
+    }
+
+    /// The definition table for a file OUTSIDE the scanned service, parsed on
+    /// first use. `None` for a file that does not parse.
+    fn external_definitions(&mut self, file: &Path) -> Option<&HashMap<String, u32>> {
         if !self.external.contains_key(file) {
             let definitions = parse_file(file, &self.source_map, &self.handler).map(|module| {
                 let mut extractor =
@@ -400,14 +473,18 @@ impl<'a> CallResolver<'a> {
             });
             self.external.insert(file.to_path_buf(), definitions);
         }
-        let definitions = self.external.get(file)?.as_ref()?;
-        keys.into_iter()
-            .find_map(|key| definitions.get(&key).map(|line| (key, *line)))
-            .map(|(key, line)| Target {
-                file: file.to_path_buf(),
-                key,
-                line,
-            })
+        self.external.get(file)?.as_ref()
+    }
+
+    /// One file's definition table, wherever the file sits, plus the path an
+    /// edge into it must report — the walked path for a file in the scanned
+    /// service, so relativization at the cloud boundary still works.
+    fn file_definitions(&mut self, file: &Path) -> Option<(PathBuf, HashMap<String, u32>)> {
+        if let Some(index) = self.per_file.get(file) {
+            return Some((index.path.clone(), index.definitions.clone()));
+        }
+        let definitions = self.external_definitions(file)?.clone();
+        Some((file.to_path_buf(), definitions))
     }
 
     fn resolve(
@@ -485,11 +562,119 @@ impl<'a> CallResolver<'a> {
         // parameter, a `new X()` local. The class name is then resolved
         // exactly as a class named directly at the call site would be
         // (carrick#776).
-        let declared = index.declared_types.get(caller_key)?.get(object)?.clone();
-        if declared == object {
-            return None;
+        if let Some(declared) = index
+            .declared_types
+            .get(caller_key)
+            .and_then(|types| types.get(object))
+        {
+            if declared == object {
+                return None;
+            }
+            let declared = declared.clone();
+            // A DECLARED class is the file's own statement and settles the
+            // question either way: a type this repo has no source for resolves
+            // to nothing rather than falling through to the inference below.
+            return self.resolve_class_member(index, &declared, name);
         }
-        self.resolve_class_member(index, &declared, name)
+
+        // Nothing states a class, but the file does state where the value came
+        // FROM (carrick#781).
+        let specifier = index
+            .receiver_origins
+            .get(caller_key)
+            .and_then(|origins| origins.get(object))?
+            .clone();
+        self.resolve_surface_member(&specifier, name)
+    }
+
+    /// `obj.foo(...)` where `obj`'s value traces back to a workspace package:
+    /// the member that package's published surface declares (carrick#781).
+    ///
+    /// Accepted only when exactly ONE class across the surface declares the
+    /// member. `list`, `get` and `create` are what every client calls its
+    /// methods, and the origin is a reason to believe the receiver belongs to
+    /// the package rather than proof of which class it is — so a member two
+    /// classes declare is dropped outright rather than guessed at. The same
+    /// conflict rule `FileOrchestrator::resolve_package_surface_members` uses
+    /// for the HTTP-candidate join.
+    fn resolve_surface_member(&mut self, specifier: &str, name: &str) -> Option<Target> {
+        self.build_surface(specifier);
+        let (target, conflicted) = {
+            let surface = self.surfaces.get(specifier)?;
+            if surface.conflicting.contains(name) {
+                (None, true)
+            } else {
+                let target = surface.members.get(name).map(|member| Target {
+                    file: member.file.clone(),
+                    key: member.key.clone(),
+                    line: member.line,
+                });
+                (target, false)
+            }
+        };
+        if conflicted {
+            self.origin_conflicts += 1;
+        }
+        if target.is_some() {
+            self.origin_resolved += 1;
+        }
+        target
+    }
+
+    /// Index one package specifier's published surface by member name. An
+    /// external specifier reaches no modules and indexes to an empty surface,
+    /// which is cached like any other so it costs one lookup.
+    fn build_surface(&mut self, specifier: &str) {
+        if self.surfaces.contains_key(specifier) {
+            return;
+        }
+        let modules = FileOrchestrator::package_surface_modules(
+            specifier,
+            self.workspace,
+            &self.repo_root,
+            &mut self.reexport_cache,
+            &self.source_map,
+            &self.handler,
+        );
+
+        let mut members: HashMap<String, SurfaceMember> = HashMap::new();
+        // Counted per (file, class): two files declaring one class NAME are two
+        // different classes, and a member both declare is as ambiguous as a
+        // member two differently-named classes declare.
+        let mut declarers: HashMap<String, HashSet<(PathBuf, String)>> = HashMap::new();
+        for module in modules {
+            let Some((path, definitions)) = self.file_definitions(&module) else {
+                continue;
+            };
+            let mut keys: Vec<(String, u32)> = definitions.into_iter().collect();
+            keys.sort();
+            for (key, line) in keys {
+                let Some((class, member)) = class_member(&key) else {
+                    continue;
+                };
+                declarers
+                    .entry(member.to_string())
+                    .or_default()
+                    .insert((path.clone(), class.to_string()));
+                members.entry(member.to_string()).or_insert(SurfaceMember {
+                    file: path.clone(),
+                    key: key.clone(),
+                    line,
+                });
+            }
+        }
+        let conflicting = declarers
+            .into_iter()
+            .filter(|(_, declarers)| declarers.len() > 1)
+            .map(|(member, _)| member)
+            .collect();
+        self.surfaces.insert(
+            specifier.to_string(),
+            PackageSurface {
+                members,
+                conflicting,
+            },
+        );
     }
 
     /// `class.foo(...)` where `class` is a binding that NAMES a class or a
@@ -717,6 +902,7 @@ mod tests {
                 imports: imports.imported_symbols,
                 declared_types: functions.declared_types,
                 field_types: functions.field_types,
+                receiver_origins: functions.receiver_origins,
             };
             per_file.insert(path.clone(), index);
             per_file_definitions.push((path.clone(), functions.function_definitions));
@@ -1312,7 +1498,8 @@ mod tests {
     }
 
     /// An annotated property declares the field just as a parameter property
-    /// does, and a private one is reached under its `#` key.
+    /// does, a private one is reached under its `#` key, and a non-null
+    /// assertion on the receiver is unwrapped rather than dropped.
     #[test]
     fn an_annotated_property_and_a_private_one_both_resolve() {
         let (dir, defs) = scan(&[
@@ -1329,7 +1516,9 @@ mod tests {
                  read(id: string) {\n    \
                  return this.client.fetchStream(id);\n  }\n  \
                  readBackup(id: string) {\n    \
-                 return this.#backup.fetchStream(id);\n  }\n}\n",
+                 return this.#backup.fetchStream(id);\n  }\n  \
+                 readAsserted(id: string) {\n    \
+                 return this.client!.fetchStream(id);\n  }\n}\n",
             ),
         ]);
 
@@ -1339,6 +1528,10 @@ mod tests {
         );
         assert_eq!(
             callee_names(&defs, "Manager.readBackup"),
+            ["RunClient.fetchStream"]
+        );
+        assert_eq!(
+            callee_names(&defs, "Manager.readAsserted"),
             ["RunClient.fetchStream"]
         );
         drop(dir);
@@ -1370,6 +1563,188 @@ mod tests {
 
         assert!(callee_names(&defs, "Manager.readUnannotated").is_empty());
         assert!(callee_names(&defs, "Manager.readDeeper").is_empty());
+        drop(dir);
+    }
+
+    /// The workspace a package-surface origin test needs: a core package
+    /// publishing a client and the manager that hands one over, plus an app
+    /// that imports the manager BY NAME and never names the client's class.
+    fn origin_workspace(extra_core: &[(&str, &str)], reader: &str) -> Vec<(String, String)> {
+        let mut files: Vec<(String, String)> = vec![
+            (
+                "package.json".into(),
+                r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#.into(),
+            ),
+            (
+                "packages/core/package.json".into(),
+                r#"{"name":"@fixture/core","exports":{"./v2":"./src/v2/index.ts"}}"#.into(),
+            ),
+            (
+                "packages/core/src/v2/index.ts".into(),
+                "export * from \"./client.js\";\n\
+                 export * from \"./manager.js\";\n\
+                 export * from \"./batch.js\";\n\
+                 export * from \"./mirror.js\";\n"
+                    .into(),
+            ),
+            (
+                "packages/core/src/v2/client.ts".into(),
+                "export class RunClient {\n  subscribeToRun(id: string) {\n    return id;\n  }\n}\n"
+                    .into(),
+            ),
+            (
+                "packages/core/src/v2/manager.ts".into(),
+                "import { RunClient } from \"./client.js\";\n\
+                 export const runClientManager = {\n  \
+                 clientOrThrow(): RunClient {\n    return new RunClient();\n  },\n};\n"
+                    .into(),
+            ),
+            (
+                "packages/core/src/v2/batch.ts".into(),
+                "export class BatchClient {\n  runBatch(id: string) {\n    return id;\n  }\n}\n"
+                    .into(),
+            ),
+            (
+                "packages/app/package.json".into(),
+                r#"{"name":"@fixture/app","dependencies":{"@fixture/core":"workspace:*","vendor-runs":"^1.0.0"}}"#
+                    .into(),
+            ),
+            ("packages/app/src/reader.ts".into(), reader.into()),
+        ];
+        for (name, source) in extra_core {
+            files.push(((*name).into(), (*source).into()));
+        }
+        files
+    }
+
+    /// Run a scan over `origin_workspace`, scoped to the app service.
+    fn scan_origin(
+        extra_core: &[(&str, &str)],
+        reader: &str,
+    ) -> (TempDir, HashMap<String, FunctionDefinition>) {
+        let owned = origin_workspace(extra_core, reader);
+        let files: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(name, source)| (name.as_str(), source.as_str()))
+            .collect();
+        scan_service(&files, "packages/app")
+    }
+
+    /// The file states no class for the receiver — only that its value came out
+    /// of a binding imported from a workspace package. Exactly one class in
+    /// that package's surface declares the member, so the edge is answerable
+    /// (carrick#781).
+    #[test]
+    fn an_origin_receiver_resolves_a_member_one_class_declares() {
+        let (dir, defs) = scan_origin(
+            &[],
+            "import { runClientManager } from \"@fixture/core/v2\";\n\
+             export function readRun(id: string) {\n  \
+             const client = runClientManager.clientOrThrow();\n  \
+             return client.subscribeToRun(id);\n}\n",
+        );
+
+        assert_eq!(callee_names(&defs, "readRun"), ["RunClient.subscribeToRun"]);
+        assert!(
+            callee_files(&defs, "readRun")[0].ends_with("packages/core/src/v2/client.ts"),
+            "{:?}",
+            callee_files(&defs, "readRun")
+        );
+        drop(dir);
+    }
+
+    /// Two classes in one surface declaring the member make the join
+    /// ambiguous, and an ambiguous origin answers nothing rather than picking.
+    #[test]
+    fn an_origin_receiver_drops_a_member_two_classes_declare() {
+        let (dir, defs) = scan_origin(
+            &[(
+                "packages/core/src/v2/mirror.ts",
+                "export class MirrorClient {\n  subscribeToRun(id: string) {\n    return id;\n  }\n}\n",
+            )],
+            "import { runClientManager } from \"@fixture/core/v2\";\n\
+             export function readRun(id: string) {\n  \
+             const client = runClientManager.clientOrThrow();\n  \
+             return client.subscribeToRun(id);\n}\n",
+        );
+
+        assert!(callee_names(&defs, "readRun").is_empty());
+        drop(dir);
+    }
+
+    /// A DECLARED class settles the question either way: a type this repo has
+    /// no source for resolves to nothing rather than falling through to the
+    /// origin inference.
+    #[test]
+    fn a_declared_external_class_does_not_fall_through_to_the_origin() {
+        let (dir, defs) = scan_origin(
+            &[],
+            "import type { VendorClient } from \"vendor-runs\";\n\
+             import { runClientManager } from \"@fixture/core/v2\";\n\
+             export function readRun(id: string) {\n  \
+             const client: VendorClient = runClientManager.clientOrThrow();\n  \
+             return client.subscribeToRun(id);\n}\n",
+        );
+
+        assert!(callee_names(&defs, "readRun").is_empty());
+        drop(dir);
+    }
+
+    /// An origin in an EXTERNAL package reaches no modules, so its surface is
+    /// empty and answers nothing.
+    #[test]
+    fn an_origin_in_an_external_package_resolves_to_nothing() {
+        let (dir, defs) = scan_origin(
+            &[],
+            "import { vendorManager } from \"vendor-runs\";\n\
+             export function readRun(id: string) {\n  \
+             const client = vendorManager.clientOrThrow();\n  \
+             return client.subscribeToRun(id);\n}\n",
+        );
+
+        assert!(callee_names(&defs, "readRun").is_empty());
+        drop(dir);
+    }
+
+    /// Origins are scoped per FUNCTION: a file that binds `client` from a
+    /// workspace package in one helper and takes it as a parameter in another
+    /// states two different things, and a module-wide table would drop both.
+    #[test]
+    fn an_origin_in_one_function_does_not_contest_another() {
+        let (dir, defs) = scan_origin(
+            &[],
+            "import { runClientManager } from \"@fixture/core/v2\";\n\
+             export function readRun(id: string) {\n  \
+             const client = runClientManager.clientOrThrow();\n  \
+             return client.subscribeToRun(id);\n}\n\
+             export function readOther(id: string, client) {\n  \
+             return client.subscribeToRun(id);\n}\n",
+        );
+
+        assert_eq!(callee_names(&defs, "readRun"), ["RunClient.subscribeToRun"]);
+        // A parameter shadows the module scope and carries no origin of its own.
+        assert!(callee_names(&defs, "readOther").is_empty());
+        drop(dir);
+    }
+
+    /// A nested function's parameter shadows the enclosing scope's binding,
+    /// and the call sites inside it are folded into the enclosing function —
+    /// so an origin that does not notice the parameter would answer for a
+    /// receiver that is something else entirely.
+    #[test]
+    fn a_nested_parameter_shadows_an_origin() {
+        let (dir, defs) = scan_origin(
+            &[],
+            "import type { VendorClient } from \"vendor-runs\";\n\
+             import { runClientManager } from \"@fixture/core/v2\";\n\
+             export function readContested(id: string) {\n  \
+             const client = runClientManager.clientOrThrow();\n  \
+             const inner = (client: VendorClient) => client.subscribeToRun(id);\n  \
+             return inner;\n}\n",
+        );
+
+        assert!(callee_names(&defs, "readContested").is_empty());
+        assert!(callee_names(&defs, "inner").is_empty());
         drop(dir);
     }
 
