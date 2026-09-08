@@ -28,7 +28,7 @@ function serverEntry(context: vscode.ExtensionContext): string | null {
   if (configured) return configured;
   const candidates = [
     path.join(context.extensionPath, "server", "server.ts"),
-    path.join(context.extensionPath, "..", "src", "server.ts"),
+    path.join(context.extensionPath, "..", "..", "npm", "carrick", "src", "server.ts"),
   ];
   return candidates.find((candidate) => fs.existsSync(candidate)) ?? null;
 }

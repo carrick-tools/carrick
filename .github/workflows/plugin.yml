@@ -1,23 +1,26 @@
 name: Plugin
 
 # The hook, the language server and the VS Code wrapper. Separate from ci.yml so
-# the path filter can apply: this job is about `plugin/` and nothing in it
-# touches Rust, so a Rust-only pull request should not wait on it and a
-# plugin-only one should not wait on the Rust suite.
+# the path filter can apply: this job is about the npm package and the host
+# manifests that point at it, and nothing in them touches Rust, so a Rust-only
+# pull request should not wait on it and a package-only one should not wait on
+# the Rust suite.
 #
 # Everything here runs against fixture payloads and a fake `carrick`
-# (plugin/test/fake-carrick.mjs), so no binary, no index and no network beyond
+# (npm/carrick/test/fake-carrick.mjs), so no binary, no index and no network beyond
 # the installs. carrick#723.
 
 on:
   push:
     branches: [main, develop]
     paths:
+      - "npm/**"
       - "plugin/**"
       - ".github/workflows/plugin.yml"
   pull_request:
     branches: [main, develop]
     paths:
+      - "npm/**"
       - "plugin/**"
       - ".github/workflows/plugin.yml"
 
@@ -36,22 +39,22 @@ jobs:
           node-version: "24"
           cache: "npm"
           cache-dependency-path: |
-            plugin/package-lock.json
+            npm/carrick/package-lock.json
             plugin/vscode/package-lock.json
 
       - name: Install
-        working-directory: plugin
+        working-directory: npm/carrick
         run: npm ci
 
       - name: Typecheck and unit tests
-        working-directory: plugin
+        working-directory: npm/carrick
         run: npm test
 
       # Counts hook contexts and diagnostic attachments separately for every
       # install shape, and fails when a shape delivers on both channels or
       # neither.
       - name: One channel per install
-        working-directory: plugin
+        working-directory: npm/carrick
         run: npm run selftest
 
       - name: Build the VS Code extension

@@ -13,6 +13,5 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"],
-  "exclude": ["vscode"]
+  "include": ["src/**/*.ts", "test/**/*.ts"]
 }
