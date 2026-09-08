@@ -6125,7 +6125,10 @@ mod tests {
             consumer_location: Some("src/client.ts".to_string()),
             match_score: 1.0,
             type_compatible: Some(false),
-            type_verdict: None,
+            // The overlay sets both halves together, and persistence now keys
+            // on the verdict (carrick#811), so a match that is missing it
+            // stores nothing and this setup would not inflate anything.
+            type_verdict: Some(crate::operation::TypeVerdict::Incompatible),
             mismatch_reason: Some("y".repeat(400)),
             producer_provenance: Default::default(),
             relationship: carrick_match::MatchRelationship::ProducerConsumer,

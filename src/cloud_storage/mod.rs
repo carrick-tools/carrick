@@ -174,12 +174,13 @@ pub struct TypeHome {
 /// `check_compatibility` tool can surface the REAL type-compat verdict CI
 /// already computes instead of a structural-matching-only answer.
 ///
-/// Only edges the check actually EVALUATED are persisted (`type_compatible`
-/// `Some(_)`), so `compatible` is never a fabricated `true`: a pair with no
-/// stored verdict is "not compared", never "compatible". The four key fields are
-/// the exact `OperationKey::canonical()` / `service_name ?? repo_name` strings
-/// the cloud reconstructs from the same persisted blob it already reads, so the
-/// join is byte-identical and drift-free.
+/// Only edges the check actually REACHED are persisted, so no verdict here is
+/// ever a fabricated `compatible`: a pair with no stored row is "not compared",
+/// which is a different state from a pair the check reached and could not
+/// verify (carrick#811). The four key fields are the exact
+/// `OperationKey::canonical()` / `service_name ?? repo_name` strings the cloud
+/// reconstructs from the same persisted blob it already reads, so the join is
+/// byte-identical and drift-free.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CompatVerdict {
     /// Producer repo id (`service_name ?? repo_name`).
@@ -192,12 +193,31 @@ pub struct CompatVerdict {
     /// equal to the persisted `DataFetchingCall::canonical_path` for every edge
     /// that yields a match).
     pub consumer_key: String,
-    /// `true` = the type check found the request/response types compatible,
-    /// `false` = incompatible. Only evaluated edges reach here, so this is
-    /// never a fabricated `true`.
-    pub compatible: bool,
-    /// Populated iff `!compatible`: the human-readable mismatch reason the
-    /// check emitted.
+    /// The three-way verdict the check produced for this pair, uncollapsed
+    /// (carrick#811): `compatible`, `incompatible`, or `unverifiable` — the
+    /// check reached the pair and could not verify it, which is an answer and
+    /// not silence.
+    ///
+    /// Written on EVERY row this scanner persists. `Option` only so a blob
+    /// from a scanner that predates the field still deserializes; absent here
+    /// means an older scan, never "unverifiable".
+    ///
+    /// A pair the check never reached has no row at all, so absence from
+    /// `compat_verdicts` means one thing only: nothing was compared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<crate::operation::TypeVerdict>,
+    /// `Some(true)` = the check found the request/response types compatible,
+    /// `Some(false)` = incompatible.
+    ///
+    /// ABSENT on an `unverifiable` row, because there is no boolean that says
+    /// "the check could not tell": `false` there would read as a detected
+    /// mismatch to any reader that only knows this field. Read `verdict`
+    /// first; this stays for the readers keyed on the boolean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatible: Option<bool>,
+    /// Populated iff `compatible == Some(false)`: the human-readable mismatch
+    /// reason the check emitted. The reason an `unverifiable` row carries is
+    /// `unresolved_reason` below, not this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mismatch_reason: Option<String>,
     /// Scanner release that produced this verdict (`CARGO_PKG_VERSION`), so a
@@ -781,17 +801,25 @@ pub trait CloudStorage {
 /// `CrossRepoMatch` edges `get_results` produced (compat already overlaid), and
 /// keys each by the canonical pair identity the cloud reconstructs (#351/#324).
 ///
-/// Fail-closed by construction: only edges the check actually evaluated
-/// (`type_compatible.is_some()`) become a `CompatVerdict`; an unevaluated or
+/// Fail-closed by construction: only edges the check actually REACHED
+/// (`type_verdict.is_some()`) become a `CompatVerdict`; an unreached or
 /// unmatched pair simply has no stored verdict, which the cloud reads as "not
-/// compared", never "compatible". Multiple call sites collapsing onto one
-/// producer/consumer canonical pair are deduped with incompatible-wins, so a
-/// real mismatch is never masked by a sibling call site that happened to agree.
+/// compared", never "compatible". A pair the check reached and could not
+/// verify IS stored, as `verdict: unverifiable` with the reason that says why
+/// (carrick#811) — before that, the two states were the same absence, and 74
+/// of 82 judged edges on a real service pair reached the cloud as silence.
+/// Multiple call sites collapsing onto one producer/consumer canonical pair
+/// are deduped worst-wins via [`TypeVerdict::combine`] (incompatible >
+/// unverifiable > compatible), so a real mismatch is never masked by a sibling
+/// call site that happened to agree, and a pair that compared nothing is never
+/// upgraded by one that did.
 pub fn attach_compat_verdicts(
     payloads: &mut [CloudRepoData],
     matches: &[crate::analyzer::CrossRepoMatch],
     resolutions: &crate::analyzer::PairResolutions,
 ) {
+    use crate::operation::TypeVerdict;
+
     let scanner_version = env!("CARGO_PKG_VERSION");
     for payload in payloads.iter_mut() {
         let service_id = payload
@@ -809,9 +837,11 @@ pub fn attach_compat_verdicts(
             if m.consumer_repo != service_id {
                 continue;
             }
-            let Some(compatible) = m.type_compatible else {
-                // The check did not evaluate this edge — persist nothing so the
-                // cloud falls back to structural-matching-only (fail closed).
+            let Some(verdict) = m.type_verdict else {
+                // No pair outcome reached this edge — persist nothing, so an
+                // absent row means "not compared" and nothing else (fail
+                // closed). An edge the check REACHED always has a verdict
+                // here, including the unverifiable one.
                 continue;
             };
             let pair = (
@@ -825,16 +855,24 @@ pub fn attach_compat_verdicts(
             // them up itself. Absent when this run filed no outcome for the
             // edge — nothing was checked, which is not "unresolved".
             let resolution = resolutions.for_edge(m);
-            let verdict = CompatVerdict {
+            let row = CompatVerdict {
                 producer_repo: m.producer_repo.clone(),
                 producer_key: m.producer_key.clone(),
                 consumer_repo: m.consumer_repo.clone(),
                 consumer_key: m.consumer_key.clone(),
-                compatible,
-                mismatch_reason: if compatible {
-                    None
-                } else {
+                verdict: Some(verdict),
+                // No boolean says "could not tell", so an unverifiable row
+                // carries none rather than a `false` a reader would show as a
+                // detected mismatch.
+                compatible: match verdict {
+                    TypeVerdict::Compatible => Some(true),
+                    TypeVerdict::Incompatible => Some(false),
+                    TypeVerdict::Unverifiable => None,
+                },
+                mismatch_reason: if verdict == TypeVerdict::Incompatible {
                     m.mismatch_reason.clone()
+                } else {
+                    None
                 },
                 scanner_version: scanner_version.to_string(),
                 resolved: resolution.map(|r| r.resolved),
@@ -843,13 +881,17 @@ pub fn attach_compat_verdicts(
             by_pair
                 .entry(pair)
                 .and_modify(|existing| {
-                    // Incompatible-wins: a mismatch on any call site to this pair
-                    // is the verdict worth surfacing.
-                    if existing.compatible && !verdict.compatible {
-                        *existing = verdict.clone();
+                    // Worst-wins on the same canonical pair, by the one
+                    // precedence the scanner states (`TypeVerdict::combine`):
+                    // the row is replaced only when the new verdict is worse
+                    // than the stored one, so equal verdicts keep the first —
+                    // and `matches` is sorted, so that is deterministic.
+                    let stored = existing.verdict.unwrap_or(TypeVerdict::Unverifiable);
+                    if stored.combine(verdict) != stored {
+                        *existing = row.clone();
                     }
                 })
-                .or_insert(verdict);
+                .or_insert(row);
         }
 
         payload.compat_verdicts = if by_pair.is_empty() {
@@ -1226,7 +1268,17 @@ mod tests {
             consumer_location: Some("src/client.ts".to_string()),
             match_score: 1.0,
             type_compatible,
-            type_verdict: None,
+            // The overlay sets both halves together, so a test edge that
+            // states one states the other. An edge the check REACHED but could
+            // not verify is `(None, Some(Unverifiable))`, which no bool can
+            // express — `unverifiable_edge` below builds that one.
+            type_verdict: type_compatible.map(|c| {
+                if c {
+                    crate::operation::TypeVerdict::Compatible
+                } else {
+                    crate::operation::TypeVerdict::Incompatible
+                }
+            }),
             mismatch_reason: mismatch_reason.map(String::from),
             producer_provenance: Default::default(),
             relationship: carrick_match::MatchRelationship::ProducerConsumer,
@@ -1363,7 +1415,10 @@ mod tests {
         let verdict: CompatVerdict = serde_json::from_value(older).unwrap();
         assert_eq!(verdict.resolved, None);
         assert_eq!(verdict.unresolved_reason, None);
-        assert!(!verdict.compatible);
+        assert_eq!(verdict.compatible, Some(false));
+        // The tri-state is absent on a blob written before it existed, and
+        // absent reads as "this scan did not state it" — never "unverifiable".
+        assert_eq!(verdict.verdict, None);
     }
 
     /// An old blob that predates `compat_verdicts` deserializes with the field
@@ -1505,7 +1560,11 @@ mod tests {
             .iter()
             .find(|v| v.producer_key == "http|GET|/orders/:id")
             .unwrap();
-        assert!(!incompat.compatible);
+        assert_eq!(incompat.compatible, Some(false));
+        assert_eq!(
+            incompat.verdict,
+            Some(crate::operation::TypeVerdict::Incompatible)
+        );
         assert_eq!(
             incompat.mismatch_reason.as_deref(),
             Some("Order[] vs Order")
@@ -1517,7 +1576,11 @@ mod tests {
             .iter()
             .find(|v| v.producer_key == "http|GET|/health")
             .unwrap();
-        assert!(compat.compatible);
+        assert_eq!(compat.compatible, Some(true));
+        assert_eq!(
+            compat.verdict,
+            Some(crate::operation::TypeVerdict::Compatible)
+        );
         assert!(compat.mismatch_reason.is_none());
 
         // The unevaluated POST /orders pair is absent — the cloud reads its
@@ -1575,7 +1638,195 @@ mod tests {
         attach_compat_verdicts(&mut payloads, &matches, &Default::default());
         let verdicts = payloads[0].compat_verdicts.clone().unwrap();
         assert_eq!(verdicts.len(), 1);
-        assert!(!verdicts[0].compatible);
+        assert_eq!(verdicts[0].compatible, Some(false));
+        assert_eq!(verdicts[0].mismatch_reason.as_deref(), Some("mismatch"));
+    }
+
+    /// An edge the check REACHED but could not verify: no boolean can say it,
+    /// so the overlay leaves `type_compatible` unset and states the verdict.
+    fn unverifiable_edge(producer_key: &str, consumer_repo: &str) -> CrossRepoMatch {
+        let mut e = edge(
+            "producer",
+            producer_key,
+            consumer_repo,
+            producer_key,
+            None,
+            None,
+        );
+        e.type_verdict = Some(crate::operation::TypeVerdict::Unverifiable);
+        e
+    }
+
+    /// carrick#811: a pair the check reached and could not verify is PERSISTED,
+    /// as the third state — not dropped into the same silence as a pair nobody
+    /// checked. The row carries no `compatible` boolean, because there is no
+    /// boolean that means "could not tell" and `false` would read as a
+    /// detected mismatch.
+    #[test]
+    fn an_unverifiable_pair_is_persisted_as_the_third_state() {
+        use crate::analyzer::{PairCheckOutcome, PairResolutions};
+
+        let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
+        let matches = vec![unverifiable_edge("http|GET|/orders/:id", "consumer")];
+        // The judge's own flag and sentence, joined to the same pair.
+        let outcomes = vec![PairCheckOutcome {
+            pair_key: "p/orders~c/src/client.ts".to_string(),
+            pseudo_method: "GET".to_string(),
+            identity: "/orders/:id".to_string(),
+            consumer_file: "src/client.ts".to_string(),
+            consumer_line: 1,
+            type_kind: ManifestTypeKind::Response,
+            bucket: crate::services::type_sidecar::VerdictBucket::GateCaughtBakedAny,
+            gate: Some("capture:producer:any".to_string()),
+            diagnostic: None,
+            producer_alias: "P".to_string(),
+            consumer_alias: "C".to_string(),
+            producer_service: "producer".to_string(),
+            consumer_service: "consumer".to_string(),
+            resolved: false,
+            unresolved_reason: Some("the producer type carries 'any' at 'tenant'".to_string()),
+        }];
+        attach_compat_verdicts(
+            &mut payloads,
+            &matches,
+            &PairResolutions::from_outcomes(&outcomes),
+        );
+
+        let verdicts = payloads[0].compat_verdicts.clone().unwrap();
+        assert_eq!(verdicts.len(), 1, "the reached pair is stored");
+        assert_eq!(
+            verdicts[0].verdict,
+            Some(crate::operation::TypeVerdict::Unverifiable)
+        );
+        assert_eq!(verdicts[0].compatible, None);
+        assert_eq!(verdicts[0].mismatch_reason, None);
+        assert_eq!(verdicts[0].resolved, Some(false));
+        assert_eq!(
+            verdicts[0].unresolved_reason.as_deref(),
+            Some("the producer type carries 'any' at 'tenant'")
+        );
+    }
+
+    /// The wire, read as the cloud reads it: `verdict` serializes to the exact
+    /// three strings `CompatVerdict.verdict` in the mcp-server types declares,
+    /// and an unverifiable row omits `compatible` entirely rather than
+    /// carrying a `false` a boolean-only reader would show as a mismatch.
+    #[test]
+    fn verdict_rides_the_wire_as_the_three_declared_strings() {
+        let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
+        let matches = vec![
+            edge(
+                "producer",
+                "http|GET|/a",
+                "consumer",
+                "http|GET|/a",
+                Some(true),
+                None,
+            ),
+            edge(
+                "producer",
+                "http|GET|/b",
+                "consumer",
+                "http|GET|/b",
+                Some(false),
+                Some("A vs B"),
+            ),
+            unverifiable_edge("http|GET|/c", "consumer"),
+        ];
+        attach_compat_verdicts(&mut payloads, &matches, &Default::default());
+
+        let raw: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&payloads[0]).unwrap()).unwrap();
+        let row = |key: &str| -> serde_json::Value {
+            raw["compat_verdicts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["producer_key"] == key)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(row("http|GET|/a")["verdict"], "compatible");
+        assert_eq!(row("http|GET|/a")["compatible"], true);
+        assert_eq!(row("http|GET|/b")["verdict"], "incompatible");
+        assert_eq!(row("http|GET|/b")["compatible"], false);
+
+        let unverifiable = row("http|GET|/c");
+        assert_eq!(unverifiable["verdict"], "unverifiable");
+        assert!(
+            unverifiable.get("compatible").is_none(),
+            "no boolean means 'could not tell': {unverifiable}"
+        );
+        assert!(unverifiable.get("mismatch_reason").is_none());
+    }
+
+    /// An edge no pair outcome reached carries no verdict, and absence from
+    /// `compat_verdicts` therefore means exactly one thing: not compared.
+    #[test]
+    fn an_unreached_edge_is_still_absent() {
+        let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
+        let matches = vec![edge(
+            "producer",
+            "http|GET|/x",
+            "consumer",
+            "http|GET|/x",
+            None,
+            None,
+        )];
+        attach_compat_verdicts(&mut payloads, &matches, &Default::default());
+        assert!(payloads[0].compat_verdicts.is_none());
+    }
+
+    /// Worst-wins across call sites now spans all three states: a pair that
+    /// compared nothing is never upgraded by a sibling call site that agreed,
+    /// and a real mismatch still outranks both.
+    #[test]
+    fn attach_compat_verdicts_dedup_unverifiable_beats_compatible() {
+        let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
+        let matches = vec![
+            edge(
+                "producer",
+                "http|GET|/x",
+                "consumer",
+                "http|GET|/x",
+                Some(true),
+                None,
+            ),
+            unverifiable_edge("http|GET|/x", "consumer"),
+        ];
+        attach_compat_verdicts(&mut payloads, &matches, &Default::default());
+        let verdicts = payloads[0].compat_verdicts.clone().unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(
+            verdicts[0].verdict,
+            Some(crate::operation::TypeVerdict::Unverifiable)
+        );
+        assert_eq!(verdicts[0].compatible, None);
+    }
+
+    /// ...and an incompatible verdict still wins over an unverifiable one,
+    /// whichever order the call sites arrive in.
+    #[test]
+    fn attach_compat_verdicts_dedup_incompatible_beats_unverifiable() {
+        let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
+        let matches = vec![
+            unverifiable_edge("http|GET|/x", "consumer"),
+            edge(
+                "producer",
+                "http|GET|/x",
+                "consumer",
+                "http|GET|/x",
+                Some(false),
+                Some("mismatch"),
+            ),
+        ];
+        attach_compat_verdicts(&mut payloads, &matches, &Default::default());
+        let verdicts = payloads[0].compat_verdicts.clone().unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(
+            verdicts[0].verdict,
+            Some(crate::operation::TypeVerdict::Incompatible)
+        );
         assert_eq!(verdicts[0].mismatch_reason.as_deref(), Some("mismatch"));
     }
 }
