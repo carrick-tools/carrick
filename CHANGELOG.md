@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.58](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.57...carrick-v0.3.58) (2026-09-09)
+
+
+### Features
+
+* **plugin:** code lens on the rows the index knows something about ([#909](https://github.com/carrick-tools/carrick/issues/909)) ([f501955](https://github.com/carrick-tools/carrick/commit/f501955620e55a8c7a02895c617f239a722c1604))
+* **plugin:** cross-repo go to definition, on demand and never in the way ([#905](https://github.com/carrick-tools/carrick/issues/905)) ([f9f5720](https://github.com/carrick-tools/carrick/commit/f9f57204763088902f4fe6dc71c1f308a72fe79b))
+* **plugin:** put the delivery surface inside a noise budget ([#907](https://github.com/carrick-tools/carrick/issues/907)) ([880b7ee](https://github.com/carrick-tools/carrick/commit/880b7eece929fe91942dda466f512dfecdc63c43))
+
 ## [0.3.57](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.56...carrick-v0.3.57) (2026-09-09)
 
 
