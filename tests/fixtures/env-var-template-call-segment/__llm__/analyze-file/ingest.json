@@ -1,0 +1,32 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:10",
+      "line_number": 10,
+      "target": "${INGEST_BASE}/v1/ingest/${encodeURIComponent(DATASET)}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${INGEST_BASE}/v1/ingest/${encodeURIComponent(DATASET)}`, { method: \"POST\" })",
+      "call_expression_line": 10,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:24",
+      "line_number": 24,
+      "target": "${INGEST_BASE}/v1/status/${region}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${INGEST_BASE}/v1/status/${region}`, { method: \"GET\" })",
+      "call_expression_line": 24,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}
