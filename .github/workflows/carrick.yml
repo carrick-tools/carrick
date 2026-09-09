@@ -5,12 +5,14 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # Reserved for Carrick Cloud dispatches (currently dormant). Cross-repo
-  # results stay current without it: every scan reads the live index, and
-  # Carrick re-runs affected open PRs when a sibling repo changes.
+  # Carrick Cloud sends this when a sibling repo in the same project changes
+  # on its main branch, so this repo's cross-repo results catch up without
+  # anyone pushing. If you add deploy steps to this file, gate them on
+  # github.event_name so a sibling change never deploys this repo.
   repository_dispatch:
     types: [carrick-sibling-updated]
-  # Kept so a backfill scan can be forced without pushing to main.
+  # Rescan on demand (Actions tab, or: gh workflow run carrick.yml). After a
+  # Carrick release the index only refreshes on the next scan.
   workflow_dispatch:
     inputs:
       full-scan:
