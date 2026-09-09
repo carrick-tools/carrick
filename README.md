@@ -142,12 +142,10 @@ gh workflow run carrick.yml -f full-scan=true
 On every other trigger the expression is empty and the incremental scan runs
 exactly as before.
 
-One limit worth knowing before you spend a run on it: Carrick indexes a commit
-once per scanner version, so a full scan of a commit that is already indexed is
-re-analyzed and then discarded at upload — the run prints "Index already current
-for this commit and scanner version". Ask for it on a commit the index has not
-seen yet. [carrick#885](https://github.com/carrick-tools/carrick/issues/885)
-tracks making a full scan supersede the stored generation instead.
+An ordinary scan indexes a commit once per scanner version, so a second run on
+an unchanged commit stores nothing and says so. A full scan is the exception:
+its answers replace what the index holds for that commit, because re-analyzing
+everything is a statement that the stored answers were the stale part.
 
 ## MCP tools
 

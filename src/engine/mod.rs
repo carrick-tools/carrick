@@ -689,7 +689,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
                 // stays fresh, then propagate the failure.
                 logging::finish_spinner_warn(&sp, "Cross-repo analysis failed");
                 if let Some(payloads) = &upload_payloads {
-                    upload_service_payloads(storage, payloads).await?;
+                    upload_service_payloads(storage, payloads, no_cache).await?;
                 }
                 return Err(e);
             }
@@ -792,7 +792,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         for payload in &mut payloads {
             enforce_payload_size_limit(payload, staging_available);
         }
-        upload_service_payloads(storage, &payloads).await?;
+        upload_service_payloads(storage, &payloads, no_cache).await?;
     }
 
     let topology = crate::findings::Topology {
@@ -1002,6 +1002,7 @@ where
 async fn upload_service_payloads<T: CloudStorage>(
     storage: &T,
     payloads: &[CloudRepoData],
+    forced: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let sp = logging::spinner("Uploading results...");
     let mut outcomes: Vec<UploadOutcome> = Vec::with_capacity(payloads.len());
@@ -1028,7 +1029,16 @@ async fn upload_service_payloads<T: CloudStorage>(
             }
         }
     }
-    logging::finish_spinner(&sp, upload_finish_message(&outcomes));
+    if forced_reanalysis_was_discarded(&outcomes, forced) {
+        // A scan that finished having done less than it was asked to: the
+        // annotation puts it on the run summary, where someone who asked for
+        // a full scan will look for the result of it.
+        logging::finish_spinner_warn(&sp, FORCED_REANALYSIS_DISCARDED);
+        warn!("{}", FORCED_REANALYSIS_DISCARDED);
+        logging::annotate(logging::Annotation::Warning, FORCED_REANALYSIS_DISCARDED);
+    } else {
+        logging::finish_spinner(&sp, upload_finish_message(&outcomes));
+    }
     Ok(())
 }
 
@@ -1045,6 +1055,25 @@ fn upload_finish_message(outcomes: &[UploadOutcome]) -> &'static str {
     } else {
         "Uploaded results to Carrick Cloud"
     }
+}
+
+/// Said when a `--no-cache` run's answers were computed and then discarded by
+/// the ingest. Names the one cause it can have, because the run itself did
+/// nothing wrong.
+const FORCED_REANALYSIS_DISCARDED: &str = "Full re-analysis was discarded: the cloud kept the stored index for this commit. \
+     It is deployed without force_reindex support (carrick#885); the answers this run \
+     computed were not stored.";
+
+/// Did a forced run pay for a re-analysis the cloud then threw away?
+///
+/// A run that sent `force_reindex` and still got `already_current` back has
+/// exactly one explanation: the deployed cloud predates the reader for that
+/// field, since a cloud that has it never answers current to a forced write.
+/// That is a deploy-order mistake, and it must show as a warning rather than
+/// as the ordinary "already current" line — the whole point of `--no-cache` is
+/// that the run believed the stored answers were stale (carrick#885).
+fn forced_reanalysis_was_discarded(outcomes: &[UploadOutcome], forced: bool) -> bool {
+    forced && !outcomes.is_empty() && outcomes.iter().all(|o| o.already_current)
 }
 
 /// Remove AST nodes from CloudRepoData for serialization, then run the payload
@@ -4738,6 +4767,33 @@ mod tests {
             upload_finish_message(&[]),
             "Uploaded results to Carrick Cloud"
         );
+    }
+
+    /// carrick#885: a forced run that gets "already current" back paid for a
+    /// re-analysis the cloud discarded, and the only way that happens is a
+    /// cloud deployed without the `force_reindex` reader. Say so instead of
+    /// printing the ordinary line.
+    #[test]
+    fn a_forced_run_that_was_short_circuited_is_a_warning_not_a_status_line() {
+        let skipped = UploadOutcome {
+            already_current: true,
+        };
+        let indexed = UploadOutcome {
+            already_current: false,
+        };
+
+        assert!(forced_reanalysis_was_discarded(&[skipped, skipped], true));
+
+        // A cached run that finds the index current is the ordinary case the
+        // short-circuit exists for, and says nothing about a deploy.
+        assert!(!forced_reanalysis_was_discarded(&[skipped, skipped], false));
+
+        // Any service that was re-indexed means the cloud honoured the flag.
+        assert!(!forced_reanalysis_was_discarded(&[skipped, indexed], true));
+        assert!(!forced_reanalysis_was_discarded(&[indexed], true));
+
+        // Nothing was uploaded, so nothing was discarded.
+        assert!(!forced_reanalysis_was_discarded(&[], true));
     }
 
     /// A blank service payload, named, with nothing resolved.
