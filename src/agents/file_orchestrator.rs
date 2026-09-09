@@ -28,6 +28,7 @@ use crate::{
     call_base::resolve_call_base,
     cloud_storage::{ManifestRole, ManifestTypeKind},
     config::Config,
+    dispatch::Dispatch,
     engine::type_compat_v2::{ReceiverRole, classify_receiver},
     env_alias::{
         EnvAliasExtractor, EnvAliasMap, EnvFallbackMap, EnvSchemaIndex, LiteralBaseMap,
@@ -63,6 +64,7 @@ use crate::{
     url_normalizer::UrlNormalizer,
     visitor::{ImportSymbolExtractor, ImportedSymbol, SymbolKind, TypeSymbolExtractor},
     workspace_resolver::{Resolution, WorkspaceIndex},
+    wrapper_dispatch::{DispatchMemberIndex, collect_dispatch_members},
     wrapper_request_shape::{self, RequestShapeSignal, WrapperRequestShape},
 };
 use futures::stream::StreamExt;
@@ -301,6 +303,10 @@ struct FileSymbols {
     /// The file's own request members, read for the files that import it
     /// (carrick#588).
     request_members: RequestMemberIndex,
+    /// Which member of this file reaches which single request (carrick#872),
+    /// read for the files that import it AND for its own same-file wrapper
+    /// sites. Says only a line, never a target.
+    dispatch_members: DispatchMemberIndex,
     /// Which import each local binding's value traces back to (carrick#666).
     /// Constrains the package-surface member join below.
     receiver_origins: ReceiverOrigins,
@@ -314,6 +320,22 @@ struct FileSymbols {
 /// `file_results` key of its module, and the line the request sits on.
 struct MemberHome {
     path_str: String,
+    request_line: u32,
+}
+
+/// Where the wrapper one call site delegates to writes its single request
+/// (carrick#872).
+///
+/// The site's own file states no dispatch value — the literal is in the
+/// wrapper — so the row emitted here is joined, once every file's rows are in,
+/// to whatever the model stated at `request_line` of `module`.
+#[derive(Debug, Clone)]
+struct DispatchSite {
+    /// The member name the site called. Provenance, for the debug line.
+    name: String,
+    /// Canonical path of the module that declares the member.
+    module: PathBuf,
+    /// 1-based line of the member's sole request, inside that module.
     request_line: u32,
 }
 
@@ -1076,6 +1098,10 @@ impl FileOrchestrator {
             /// This file's OWN request members, keyed by name (carrick#588).
             /// Read for the files that import it, never for itself.
             request_members: RequestMemberIndex,
+            /// This file's OWN members that reach exactly one request, keyed
+            /// by name (carrick#872). Read for the files that import it, and
+            /// for its own same-file wrapper sites.
+            dispatch_members: DispatchMemberIndex,
             /// Which import each local binding's value traces back to
             /// (carrick#666), read at the package-surface member join.
             receiver_origins: ReceiverOrigins,
@@ -1091,6 +1117,12 @@ impl FileOrchestrator {
             /// stamped onto the rows that member DID produce, so a consumer
             /// listing can state what the join could not follow.
             unresolved_member_sites: Vec<(u32, String)>,
+            /// Call sites in this file that reach a wrapper whose body issues
+            /// one request, keyed by the site's call-expression start offset
+            /// (carrick#872). Read once every file's rows are in, to carry the
+            /// dispatch value the wrapper's own request states onto the row
+            /// emitted here.
+            dispatch_sites: HashMap<u32, DispatchSite>,
             /// What the deterministic layer states about this file, computed
             /// once every cross-file input it reads is in and before the model
             /// is called. These become the file's rows; the model's answer is
@@ -1139,6 +1171,7 @@ impl FileOrchestrator {
             stats: &mut ProcessingStats,
             member_deficits: &mut HashMap<String, u32>,
             resolved_member_rows: &mut HashMap<String, HashMap<u32, String>>,
+            dispatch_sites: &mut HashMap<String, HashMap<u32, DispatchSite>>,
         ) {
             // Carry the wrapper's own request shape onto the sites that
             // delegate to it (carrick-cloud#386). Runs first among the
@@ -1243,6 +1276,12 @@ impl FileOrchestrator {
                         .collect(),
                 );
             }
+            // carrick#872: which wrapper each site in this file delegates to.
+            // Read once every file's rows are in — the value is in the
+            // WRAPPER's file, whose rows may not exist yet.
+            if !pf.dispatch_sites.is_empty() {
+                dispatch_sites.insert(pf.path_str.clone(), std::mem::take(&mut pf.dispatch_sites));
+            }
         }
 
         // PHASE 1 (serial, CPU-bound): run the SWC gatekeeper on every file and build the
@@ -1261,6 +1300,10 @@ impl FileOrchestrator {
         // can be stamped on exactly those rows.
         let mut member_deficits: HashMap<String, u32> = HashMap::new();
         let mut resolved_member_rows: HashMap<String, HashMap<u32, String>> = HashMap::new();
+        // carrick#872, filled per file and read once every file is in: which
+        // spans in which file reach a wrapper whose body issues one request,
+        // and where that request is written.
+        let mut dispatch_sites: HashMap<String, HashMap<u32, DispatchSite>> = HashMap::new();
         // What the repo's validation schemas declare about the environment
         // (carrick#649), folded across every parseable file. Repo-wide because
         // an environment variable is process-global and the file declaring the
@@ -1610,9 +1653,11 @@ impl FileOrchestrator {
                 pubsub_anchor_ops: scan_result.pubsub_anchor_ops,
                 local_wrapper_calls: scan_result.local_wrapper_calls,
                 request_members: symbols.request_members,
+                dispatch_members: symbols.dispatch_members,
                 receiver_origins: symbols.receiver_origins,
                 resolved_members: HashMap::new(),
                 unresolved_member_sites: Vec::new(),
+                dispatch_sites: HashMap::new(),
                 resolved: Vec::new(),
             });
         }
@@ -1685,9 +1730,15 @@ impl FileOrchestrator {
         // it. Seeded from the files already parsed for their symbol tables, so
         // the on-demand parse only runs for a module no analyzed file was.
         let mut member_cache: HashMap<PathBuf, RequestMemberIndex> = HashMap::new();
+        // The same modules read for a different question (carrick#872): which
+        // member reaches which single request. Filled at exactly the same
+        // points as `member_cache`, off the same parse, so the two never
+        // disagree about which modules were read.
+        let mut dispatch_cache: HashMap<PathBuf, DispatchMemberIndex> = HashMap::new();
         for pf in &pending {
             if let Ok(canonical) = Path::new(&pf.path_str).canonicalize() {
-                member_cache.insert(canonical, pf.request_members.clone());
+                member_cache.insert(canonical.clone(), pf.request_members.clone());
+                dispatch_cache.insert(canonical, pf.dispatch_members.clone());
             }
         }
 
@@ -1789,20 +1840,35 @@ impl FileOrchestrator {
                         }
                     }
                     let mut rings: Vec<Vec<(PathBuf, RequestMemberIndex)>> = Vec::new();
+                    // The dispatch index of the same modules, in the same ring
+                    // order, so the two joins answer from the same evidence.
+                    let mut dispatch_rings: Vec<Vec<(PathBuf, DispatchMemberIndex)>> = Vec::new();
                     for ring in [&nearest, &further] {
                         let mut indexes: Vec<(PathBuf, RequestMemberIndex)> = Vec::new();
+                        let mut dispatch_indexes: Vec<(PathBuf, DispatchMemberIndex)> = Vec::new();
                         for path in ring {
                             if !member_cache.contains_key(path) {
-                                let index = parse_file(path, &cm, &handler)
-                                    .map(|module| collect_request_members(&module, &cm))
+                                let module = parse_file(path, &cm, &handler);
+                                let index = module
+                                    .as_ref()
+                                    .map(|module| collect_request_members(module, &cm))
+                                    .unwrap_or_default();
+                                let dispatch = module
+                                    .as_ref()
+                                    .map(|module| collect_dispatch_members(module, &cm))
                                     .unwrap_or_default();
                                 member_cache.insert(path.clone(), index);
+                                dispatch_cache.insert(path.clone(), dispatch);
                             }
                             if let Some(index) = member_cache.get(path) {
                                 indexes.push((path.clone(), index.clone()));
                             }
+                            if let Some(index) = dispatch_cache.get(path) {
+                                dispatch_indexes.push((path.clone(), index.clone()));
+                            }
                         }
                         rings.push(indexes);
+                        dispatch_rings.push(dispatch_indexes);
                     }
                     // The join's outcome, and the sites it declined
                     // (carrick#656) — both come back from the walk, because
@@ -1814,6 +1880,18 @@ impl FileOrchestrator {
                             &import_owners,
                             &receiver_imports,
                         );
+
+                    // Which wrapper each site delegates to, for the dispatch
+                    // carry (carrick#872). Same rings, same receiver rule, a
+                    // different index: a member the request-member join drops
+                    // for stating no route-shaped URL of its own still states
+                    // a line, and that line is where the model wrote the
+                    // dispatch value.
+                    pf.dispatch_sites = Self::resolve_dispatch_sites(
+                        &pf.candidate_map,
+                        dispatch_rings,
+                        &import_owners,
+                    );
 
                     // The same join across a workspace package boundary
                     // (carrick#666). Kept separate from the rings above rather
@@ -1977,11 +2055,37 @@ impl FileOrchestrator {
                 // A rescued file raised no candidate of its own, so it is not
                 // read as anybody's wrapper and nothing joins onto it either.
                 request_members: RequestMemberIndex::default(),
+                dispatch_members: DispatchMemberIndex::default(),
                 receiver_origins: ReceiverOrigins::default(),
                 resolved_members: HashMap::new(),
                 unresolved_member_sites: Vec::new(),
+                dispatch_sites: HashMap::new(),
                 resolved: Vec::new(),
             });
+        }
+
+        // The same-file half of the dispatch carry (carrick#872). A site that
+        // delegates to a wrapper declared in its OWN file raises no candidate
+        // at all — that is why `local_http_wrapper` exists — so the ring join
+        // above never sees it. Its wrapper is in this file's own index, and
+        // the value the wrapper writes is in this file's own extracted rows.
+        for pf in &mut pending {
+            let Ok(canonical) = Path::new(&pf.path_str).canonicalize() else {
+                continue;
+            };
+            for call in &pf.local_wrapper_calls {
+                let Some(member) = pf.dispatch_members.get(&call.wrapper_name) else {
+                    continue;
+                };
+                pf.dispatch_sites.insert(
+                    call.span_start,
+                    DispatchSite {
+                        name: call.wrapper_name.clone(),
+                        module: canonical.clone(),
+                        request_line: member.request_line,
+                    },
+                );
+            }
         }
 
         // Where every request member the scan read is declared (carrick#656).
@@ -1990,18 +2094,20 @@ impl FileOrchestrator {
         // only as a rescued file — and its members are in `member_cache`, read
         // on demand for the consumers that import it, never on its own
         // `PendingFile`.
-        let member_homes = {
-            let analysed: HashMap<PathBuf, String> = pending
-                .iter()
-                .filter_map(|pf| {
-                    Path::new(&pf.path_str)
-                        .canonicalize()
-                        .ok()
-                        .map(|canonical| (canonical, pf.path_str.clone()))
-                })
-                .collect();
-            Self::member_homes(&member_cache, &analysed)
-        };
+        // Every file this scan will have rows for, by canonical path. Read by
+        // the member homes below and by the dispatch carry (carrick#872),
+        // which both have to turn a module path into the `file_results` key
+        // its rows are stored under.
+        let analysed: HashMap<PathBuf, String> = pending
+            .iter()
+            .filter_map(|pf| {
+                Path::new(&pf.path_str)
+                    .canonicalize()
+                    .ok()
+                    .map(|canonical| (canonical, pf.path_str.clone()))
+            })
+            .collect();
+        let member_homes = Self::member_homes(&member_cache, &analysed);
 
         // PHASE 1c (#218 — cross-file env-alias resolution). A consumer that
         // builds its URLs from an imported config-object property
@@ -2221,6 +2327,7 @@ impl FileOrchestrator {
                         &mut stats,
                         &mut member_deficits,
                         &mut resolved_member_rows,
+                        &mut dispatch_sites,
                     );
 
                     stats.total_mounts += adjusted.mounts.len();
@@ -2270,6 +2377,7 @@ impl FileOrchestrator {
                         &mut stats,
                         &mut member_deficits,
                         &mut resolved_member_rows,
+                        &mut dispatch_sites,
                     );
                     Self::count_unemitted_literal_candidates(
                         &deterministic,
@@ -2386,6 +2494,16 @@ impl FileOrchestrator {
         );
         if stamped > 0 {
             debug!("  - Rows stating unfollowed member call sites: {stamped}");
+        }
+
+        // PHASE 5b (carrick#872): carry the value a wrapper writes for a
+        // dispatching route onto the rows emitted at the sites that call it.
+        // Cross-file for the same reason as the pass above: the literal is in
+        // the wrapper's file and the row is in the consumer's, so neither
+        // file's own pass can see both.
+        let carried = Self::carry_wrapper_dispatch(&mut file_results, &dispatch_sites, &analysed);
+        if carried > 0 {
+            debug!("  - Rows carrying a wrapper's dispatch value: {carried}");
         }
 
         // STEP 5: Build aggregated mount graph from all file results
@@ -4086,6 +4204,11 @@ impl FileOrchestrator {
         // requests go through a helper raises no HTTP candidate of its own, so
         // the wrapper map's candidate gate is the wrong filter for this.
         let request_members = collect_request_members(&module, cm);
+        // The same parse again (carrick#872): which member reaches which
+        // single request, for the dispatch carry. A separate index from the
+        // one above because it answers a different question and drops far
+        // less — see `crate::wrapper_dispatch`.
+        let dispatch_members = collect_dispatch_members(&module, cm);
         // Same parse again: the origins are read off the declarators the
         // extractors above already walked.
         let receiver_origins = collect_receiver_origins(&module);
@@ -4100,6 +4223,7 @@ impl FileOrchestrator {
             env_fallbacks: bindings.env_fallbacks,
             literal_bases: bindings.literal_bases,
             request_members,
+            dispatch_members,
             receiver_origins,
         }
     }
@@ -5952,6 +6076,12 @@ impl FileOrchestrator {
         deterministic.payload_expression_line = model.payload_expression_line;
         deterministic.primary_type_symbol = model.primary_type_symbol;
         deterministic.type_import_source = model.type_import_source;
+        // The value the call sends for the field its target dispatches on
+        // (carrick#831). Determinism states no dispatch anywhere — which field
+        // discriminates is the producer's fact, and the model is the only side
+        // that reads it — so a deterministic row that swallowed the model's
+        // answer here lost the only statement of it there was.
+        deterministic.dispatch = model.dispatch;
     }
 
     /// Apply a statement that is not a row of its own to the model row at its
@@ -6330,6 +6460,72 @@ impl FileOrchestrator {
         (resolved, declined)
     }
 
+    /// Join each candidate's callee name onto the wrapper whose body issues
+    /// the request it reaches (carrick#872).
+    ///
+    /// The same rings, the same nearest-ring-decides rule and the same
+    /// receiver constraint as [`Self::resolve_imported_members`], over
+    /// [`crate::wrapper_dispatch`]'s index instead of the request members. The
+    /// two indexes answer different questions, so a site can resolve here and
+    /// not there: a client whose URL is an opaque field states no route for the
+    /// request-member join to assert, and still states the line its request is
+    /// written on.
+    ///
+    /// Nothing is counted or reported for a site that does not resolve. This
+    /// join adds no row and changes no target: all it can do is carry a value
+    /// the model already stated one file away, so a miss leaves the site
+    /// exactly where it is.
+    fn resolve_dispatch_sites(
+        candidate_map: &HashMap<String, CandidateTarget>,
+        rings: Vec<Vec<(PathBuf, DispatchMemberIndex)>>,
+        import_owners: &HashMap<String, Option<PathBuf>>,
+    ) -> HashMap<u32, DispatchSite> {
+        let rings: Vec<_> = rings
+            .into_iter()
+            .map(fold_indexes_with_conflicts)
+            .filter(|(members, conflicting)| !members.is_empty() || !conflicting.is_empty())
+            .collect();
+        if rings.is_empty() {
+            return HashMap::new();
+        }
+        let mut resolved: HashMap<u32, DispatchSite> = HashMap::new();
+        for candidate in candidate_map.values() {
+            let name = Self::member_call_name(candidate);
+            let mut owned = None;
+            for (members, conflicting) in &rings {
+                if conflicting.contains(name) {
+                    break;
+                }
+                if let Some(member) = members.get(name) {
+                    owned = Some(member);
+                    break;
+                }
+            }
+            let Some(owned) = owned else {
+                continue;
+            };
+            // A receiver that is itself imported must have been imported from
+            // the member's own module; a parameter, a local or a `this` chain
+            // carries no such constraint. Identical to the request-member join,
+            // for the same reason: `list` and `get` are what every client calls
+            // its methods.
+            if let Some(receiver_source) = import_owners.get(&candidate.callee_object)
+                && receiver_source.as_ref() != Some(&owned.module)
+            {
+                continue;
+            }
+            resolved.insert(
+                candidate.span_start,
+                DispatchSite {
+                    name: name.to_string(),
+                    module: owned.module.clone(),
+                    request_line: owned.member.request_line,
+                },
+            );
+        }
+        resolved
+    }
+
     /// The member name a candidate call site names: its callee property
     /// (`client.createArtifactUrl`), or its callee object when the call is a
     /// bare identifier. The same name the join keys on, written once so the
@@ -6465,6 +6661,89 @@ impl FileOrchestrator {
             }
         }
         stamped
+    }
+
+    /// Carry the dispatch value a wrapper's own request states onto the rows
+    /// emitted at the sites that call it (carrick#872).
+    ///
+    /// The value is the MODEL's, read from the wrapper's own row at the line
+    /// [`crate::wrapper_dispatch`] said the wrapper's single request sits on.
+    /// Nothing is inferred from the wrapper's source here: a wrapper the model
+    /// stated no dispatch for carries nothing, which is the right answer for a
+    /// wrapper that takes its action as a parameter and for a plain route
+    /// alike.
+    ///
+    /// Read every value BEFORE writing any of them, so a row stamped by this
+    /// pass can never be read as another site's wrapper. Stamps `dispatch` and
+    /// nothing else: no target, no method, no key. A site row that already
+    /// states a value of its own keeps it — the site wrote a literal, and a
+    /// literal at the site is a stronger statement than one a delegation away.
+    fn carry_wrapper_dispatch(
+        file_results: &mut HashMap<String, FileAnalysisResult>,
+        sites: &HashMap<String, HashMap<u32, DispatchSite>>,
+        analysed: &HashMap<PathBuf, String>,
+    ) -> usize {
+        // (consumer file, site span, the wrapper's value, the member's name).
+        // Sorted, because the debug line this writes is read against a scan
+        // that must not reorder itself between runs.
+        let mut stamps: Vec<(&String, u32, Dispatch, &String)> = Vec::new();
+        let mut consumers: Vec<(&String, &HashMap<u32, DispatchSite>)> = sites.iter().collect();
+        consumers.sort_by_key(|(path, _)| *path);
+        for (path, spans) in consumers {
+            let mut ordered: Vec<(&u32, &DispatchSite)> = spans.iter().collect();
+            ordered.sort_by_key(|(span, _)| **span);
+            for (span, site) in ordered {
+                let Some(home_path) = analysed.get(&site.module) else {
+                    continue;
+                };
+                let Some(home) = file_results.get(home_path) else {
+                    continue;
+                };
+                let Ok(line) = i32::try_from(site.request_line) else {
+                    continue;
+                };
+                // The wrapper's own row for that request. A file whose model
+                // answer never came, or whose request line the model said
+                // nothing about, states no value and nothing is carried.
+                let Some(dispatch) = home
+                    .data_calls
+                    .iter()
+                    .find(|call| {
+                        (call.line_number == line || call.call_expression_line == Some(line))
+                            && call.dispatch.is_some()
+                    })
+                    .and_then(|call| call.dispatch.clone())
+                else {
+                    continue;
+                };
+                stamps.push((path, *span, dispatch, &site.name));
+            }
+        }
+
+        let stamps: Vec<(String, u32, Dispatch, String)> = stamps
+            .into_iter()
+            .map(|(path, span, dispatch, name)| (path.clone(), span, dispatch, name.clone()))
+            .collect();
+        let mut carried = 0;
+        for (path, span, dispatch, name) in stamps {
+            let Some(result) = file_results.get_mut(&path) else {
+                continue;
+            };
+            for data_call in &mut result.data_calls {
+                if data_call.call_expression_span_start != Some(span)
+                    || data_call.dispatch.is_some()
+                {
+                    continue;
+                }
+                debug!(
+                    "Carrying dispatch {}={} from {} onto {}:{}",
+                    dispatch.field, dispatch.value, name, path, data_call.line_number
+                );
+                data_call.dispatch = Some(dispatch.clone());
+                carried += 1;
+            }
+        }
+        carried
     }
 
     /// The path a data call is KEYED on — the one canonicalization every reader
@@ -7865,6 +8144,7 @@ impl FileOrchestrator {
 mod tests {
     use super::*;
     use crate::agents::file_analyzer_agent::{DataCallResult, EndpointResult, MountResult};
+    use crate::dispatch::DispatchLocation;
 
     /// #369: relative import specifiers resolve through the TS extension
     /// order to an existing file; package and alias specifiers resolve to
@@ -14079,6 +14359,144 @@ export { routes };
         assert_eq!(
             file_results["client.ts"].data_calls[0].consumers_not_resolved,
             expected
+        );
+    }
+
+    /// carrick#872: the value the wrapper's own request states reaches the row
+    /// at the site that calls the wrapper, and nothing else on that row moves.
+    #[test]
+    fn carry_wrapper_dispatch_stamps_the_site_row_from_the_wrapper_s_row() {
+        let mut client = FileAnalysisResult::default();
+        let mut wrapper_row = call_with_span(19, "${this.gatewayUrl}", Some(400));
+        wrapper_row.dispatch = Some(Dispatch {
+            location: DispatchLocation::Body,
+            field: "action".to_string(),
+            value: "search-by-intent".to_string(),
+        });
+        client.data_calls.push(wrapper_row);
+        let mut consumer = FileAnalysisResult::default();
+        consumer
+            .data_calls
+            .push(call_with_span(4, "/rpc/gateway", Some(100)));
+        let mut file_results = HashMap::from([
+            ("client.ts".to_string(), client),
+            ("consumer.ts".to_string(), consumer),
+        ]);
+
+        let carried = FileOrchestrator::carry_wrapper_dispatch(
+            &mut file_results,
+            &HashMap::from([(
+                "consumer.ts".to_string(),
+                HashMap::from([(
+                    100,
+                    DispatchSite {
+                        name: "searchByIntent".to_string(),
+                        module: PathBuf::from("/repo/client.ts"),
+                        request_line: 19,
+                    },
+                )]),
+            )]),
+            &HashMap::from([(PathBuf::from("/repo/client.ts"), "client.ts".to_string())]),
+        );
+
+        assert_eq!(carried, 1);
+        let row = &file_results["consumer.ts"].data_calls[0];
+        assert_eq!(
+            row.dispatch.as_ref().map(|d| d.value.as_str()),
+            Some("search-by-intent")
+        );
+        assert_eq!(
+            row.target, "/rpc/gateway",
+            "the carry states a value, never a target"
+        );
+    }
+
+    /// A wrapper whose own request states no value — a plain route, or one
+    /// whose action is a parameter — carries nothing, and the site is left
+    /// exactly where it was.
+    #[test]
+    fn carry_wrapper_dispatch_carries_nothing_from_a_wrapper_with_no_value() {
+        let mut client = FileAnalysisResult::default();
+        client
+            .data_calls
+            .push(call_with_span(19, "${this.gatewayUrl}", Some(400)));
+        let mut consumer = FileAnalysisResult::default();
+        consumer
+            .data_calls
+            .push(call_with_span(4, "/rpc/gateway", Some(100)));
+        let mut file_results = HashMap::from([
+            ("client.ts".to_string(), client),
+            ("consumer.ts".to_string(), consumer),
+        ]);
+
+        let carried = FileOrchestrator::carry_wrapper_dispatch(
+            &mut file_results,
+            &HashMap::from([(
+                "consumer.ts".to_string(),
+                HashMap::from([(
+                    100,
+                    DispatchSite {
+                        name: "searchByIntent".to_string(),
+                        module: PathBuf::from("/repo/client.ts"),
+                        request_line: 19,
+                    },
+                )]),
+            )]),
+            &HashMap::from([(PathBuf::from("/repo/client.ts"), "client.ts".to_string())]),
+        );
+
+        assert_eq!(carried, 0);
+        assert!(file_results["consumer.ts"].data_calls[0].dispatch.is_none());
+    }
+
+    /// A site that states a literal of its OWN keeps it: a value written at
+    /// the site is a stronger statement than one a delegation away.
+    #[test]
+    fn carry_wrapper_dispatch_leaves_a_site_that_states_its_own_value() {
+        let mut client = FileAnalysisResult::default();
+        let mut wrapper_row = call_with_span(19, "${this.gatewayUrl}", Some(400));
+        wrapper_row.dispatch = Some(Dispatch {
+            location: DispatchLocation::Body,
+            field: "action".to_string(),
+            value: "search-by-intent".to_string(),
+        });
+        client.data_calls.push(wrapper_row);
+        let mut consumer = FileAnalysisResult::default();
+        let mut site_row = call_with_span(4, "/rpc/gateway", Some(100));
+        site_row.dispatch = Some(Dispatch {
+            location: DispatchLocation::Body,
+            field: "action".to_string(),
+            value: "list-external-calls".to_string(),
+        });
+        consumer.data_calls.push(site_row);
+        let mut file_results = HashMap::from([
+            ("client.ts".to_string(), client),
+            ("consumer.ts".to_string(), consumer),
+        ]);
+
+        let carried = FileOrchestrator::carry_wrapper_dispatch(
+            &mut file_results,
+            &HashMap::from([(
+                "consumer.ts".to_string(),
+                HashMap::from([(
+                    100,
+                    DispatchSite {
+                        name: "searchByIntent".to_string(),
+                        module: PathBuf::from("/repo/client.ts"),
+                        request_line: 19,
+                    },
+                )]),
+            )]),
+            &HashMap::from([(PathBuf::from("/repo/client.ts"), "client.ts".to_string())]),
+        );
+
+        assert_eq!(carried, 0);
+        assert_eq!(
+            file_results["consumer.ts"].data_calls[0]
+                .dispatch
+                .as_ref()
+                .map(|d| d.value.as_str()),
+            Some("list-external-calls")
         );
     }
 

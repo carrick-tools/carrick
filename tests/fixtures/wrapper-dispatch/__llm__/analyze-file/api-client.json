@@ -1,0 +1,78 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:19",
+      "line_number": 19,
+      "target": "${this.gatewayUrl}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(this.gatewayUrl, { method: \"POST\", ... })",
+      "call_expression_line": 19,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "action",
+        "value": "search-by-intent"
+      }
+    },
+    {
+      "candidate_id": "@line:41",
+      "line_number": 41,
+      "target": "${this.gatewayUrl}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(this.gatewayUrl, { method: \"POST\", ... })",
+      "call_expression_line": 41,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "action",
+        "value": "invalidate-cache"
+      }
+    },
+    {
+      "candidate_id": "@line:45",
+      "line_number": 45,
+      "target": "${this.gatewayUrl}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(this.gatewayUrl, { method: \"POST\", ... })",
+      "call_expression_line": 45,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "action",
+        "value": "rebuild-index"
+      }
+    },
+    {
+      "candidate_id": "@line:52",
+      "line_number": 52,
+      "target": "${this.gatewayUrl}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(this.gatewayUrl, { method: \"POST\", ... })",
+      "call_expression_line": 52,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "dispatch": {
+        "location": "body",
+        "field": "action",
+        "value": "get-cross-repo-data"
+      }
+    }
+  ]
+}

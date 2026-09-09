@@ -212,9 +212,14 @@ pub struct ResolvedMember {
 pub type RequestMemberIndex = HashMap<String, RequestMember>;
 
 /// A member and the module that declared it, as an importing file sees it.
+///
+/// Generic over what a member IS, because two indexes are folded the same way:
+/// the request members here, and the dispatch members of
+/// [`crate::wrapper_dispatch`]. The default keeps `OwnedMember<PathBuf>`
+/// reading as it always has.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnedMember<Id> {
-    pub member: RequestMember,
+pub struct OwnedMember<Id, M = RequestMember> {
+    pub member: M,
     pub module: Id,
 }
 
@@ -243,10 +248,10 @@ pub fn collect_request_members(module: &Module, source_map: &Lrc<SourceMap>) -> 
 /// rings of modules needs to tell "not declared here" from "declared
 /// ambiguously here", because only the first is a reason to look one ring
 /// further out.
-pub fn fold_indexes_with_conflicts<Id: Clone + PartialEq>(
-    indexes: impl IntoIterator<Item = (Id, RequestMemberIndex)>,
-) -> (HashMap<String, OwnedMember<Id>>, HashSet<String>) {
-    let mut folded: HashMap<String, OwnedMember<Id>> = HashMap::new();
+pub fn fold_indexes_with_conflicts<Id: Clone + PartialEq, M: Clone + PartialEq>(
+    indexes: impl IntoIterator<Item = (Id, HashMap<String, M>)>,
+) -> (HashMap<String, OwnedMember<Id, M>>, HashSet<String>) {
+    let mut folded: HashMap<String, OwnedMember<Id, M>> = HashMap::new();
     let mut conflicting: HashSet<String> = HashSet::new();
     for (module, index) in indexes {
         for (name, member) in index {
