@@ -24,6 +24,20 @@ inputs:
       .npmrc references) in the job's `env:` and the install step inherits it.
     required: false
     default: "auto"
+  full-scan:
+    description: |
+      Re-analyze every file instead of reusing the cached answer for a file
+      whose content has not changed.
+
+      Leave this false. A scan reads the model once per changed file and reuses
+      what it already has for the rest, which is what makes a routine scan cheap
+      and fast. Set it to true for one run when the answers themselves need
+      redoing rather than the files — after Carrick starts extracting something
+      it did not extract before, where the cache holds answers from before it
+      could. Wire it to a `workflow_dispatch` input so it is asked for
+      deliberately, never a default a push carries.
+    required: false
+    default: "false"
 
 outputs:
   success:
@@ -243,11 +257,20 @@ runs:
         # The npm package carries the binary for this runner (an optional
         # dependency npm resolves by os and cpu) and the type sidecar with its
         # dependencies, so that path downloads, untars and installs nothing.
+        # A full scan is one argument, built here so both invocations below
+        # take exactly the same flags. Anything other than a literal "true"
+        # leaves the incremental path alone.
+        SCAN_ARGS=()
+        if [ "${{ inputs.full-scan }}" = "true" ]; then
+          echo "::notice::full-scan requested: re-analyzing every file, ignoring the cached answers."
+          SCAN_ARGS+=("--no-cache")
+        fi
+
         set +e
         if [ "${{ steps.resolve.outputs.mode }}" = "npx" ]; then
-          npx --yes "carrick@${{ steps.version.outputs.version }}" "${{ inputs.path }}" 2>&1 | tee "$LOG_FILE"
+          npx --yes "carrick@${{ steps.version.outputs.version }}" "${{ inputs.path }}" "${SCAN_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
         else
-          "${{ steps.download.outputs.dist-dir }}/carrick" "${{ inputs.path }}" 2>&1 | tee "$LOG_FILE"
+          "${{ steps.download.outputs.dist-dir }}/carrick" "${{ inputs.path }}" "${SCAN_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
         fi
         EXIT_CODE=${PIPESTATUS[0]}
         set -e

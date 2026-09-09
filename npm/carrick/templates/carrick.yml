@@ -14,6 +14,15 @@ on:
   # Rescan on demand (Actions tab, or: gh workflow run carrick.yml). After a
   # Carrick release the index only refreshes on the next scan.
   workflow_dispatch:
+    inputs:
+      full-scan:
+        description: >-
+          Re-analyze every file instead of reusing the cached answer for a file
+          that has not changed. Slower and costs a full analysis; ask for it
+          when Carrick has started extracting something it did not extract
+          before, so the cache holds answers from before it could.
+        type: boolean
+        default: false
 
 permissions:
   # Mint a short-lived OIDC token Carrick exchanges for keyless upload auth
@@ -30,3 +39,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: {{ACTION_REF}}
+        with:
+          # Empty on every trigger but workflow_dispatch, which is the point:
+          # a full re-analysis is asked for, never carried by a push.
+          full-scan: ${{ inputs.full-scan }}
