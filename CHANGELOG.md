@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.50](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.49...carrick-v0.3.50) (2026-09-09)
+
+
+### Bug Fixes
+
+* **init:** write a hook command this machine can resolve ([#849](https://github.com/carrick-tools/carrick/issues/849)) ([4b9a724](https://github.com/carrick-tools/carrick/commit/4b9a72448cc251eba46e3e31563cca9a2d59d656)), closes [#837](https://github.com/carrick-tools/carrick/issues/837) [#838](https://github.com/carrick-tools/carrick/issues/838)
+* **logging:** bound the debug log by bytes, not only by days ([#851](https://github.com/carrick-tools/carrick/issues/851)) ([6370750](https://github.com/carrick-tools/carrick/commit/6370750c0f583580494963e2c381f215a87d125a)), closes [#836](https://github.com/carrick-tools/carrick/issues/836)
+* **sidecar:** find the vendored pnpm and tsc from an npm install, not only a checkout ([#841](https://github.com/carrick-tools/carrick/issues/841)) ([bccfedb](https://github.com/carrick-tools/carrick/commit/bccfedb64e83688896f26bc3a6e41248cefda439)), closes [#833](https://github.com/carrick-tools/carrick/issues/833)
+
+
+### Documentation
+
+* **smoke:** grade the headless arms on the tool the model used ([#847](https://github.com/carrick-tools/carrick/issues/847)) ([8295c13](https://github.com/carrick-tools/carrick/commit/8295c131a473efde7b574becfb54edb32df0daa4)), closes [#709](https://github.com/carrick-tools/carrick/issues/709)
+
+
+### CI/CD
+
+* draft the release PR, and build the release tarball on the PR ([#850](https://github.com/carrick-tools/carrick/issues/850)) ([ace78d7](https://github.com/carrick-tools/carrick/commit/ace78d73f35e06fb7aeac74ac9dfa5736bb28d28)), closes [#840](https://github.com/carrick-tools/carrick/issues/840)
+
 ## [0.3.49](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.48...carrick-v0.3.49) (2026-09-08)
 
 
