@@ -96,11 +96,15 @@ jobs:
           mkdir -p "$RUNNER_TEMP/probe"
           cd "$RUNNER_TEMP/probe"
           echo '{"name":"probe","private":true}' > package.json
-          npm install --ignore-scripts "$RUNNER_TEMP"/carrick-*.tgz
+          # --omit=optional so this proves the same thing on every day of the
+          # week. Without it the platform package for this runner is installed
+          # whenever the version happens to be published already, the binary
+          # resolves, and the assertion below stops describing anything.
+          npm install --ignore-scripts --omit=optional "$RUNNER_TEMP"/carrick-*.tgz
           ./node_modules/.bin/carrick --version
-          # No platform package on this machine, so the resolver's message is
-          # what a user with an unpublished platform sees. It must be a
-          # message, not a stack trace — and a non-zero exit here is the
+          # No platform package here by construction, so this is the message a
+          # user whose platform did not publish sees. It must be a message,
+          # not a stack trace — and a non-zero exit here is the
           # expected one, so it is captured rather than run through a pipeline
           # that `pipefail` would then fail on.
           MISSING=$(./node_modules/.bin/carrick check nothing.ts 2>&1 || true)
