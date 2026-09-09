@@ -426,7 +426,7 @@ impl AgentSchemas {
                                 "description": "Import path where the `primary_type_symbol` type is defined (e.g., './types/user'), or null if it is declared in the same file. Read the import statements at the top of the file."
                             },
                             "dispatch": {
-                                "description": "Set only when this call writes a literal for a request field whose value selects what the receiver does, rather than data the receiver operates on. Null when the call sends no such field.",
+                                "description": "Decide this for EVERY data_call. Set it when the call writes a literal for a request field that names what the receiver should do, rather than data for the receiver to work on; judge that from this file alone, since the receiver is normally not in it. Null when the call sends no such field.",
                                 "nullable": true,
                                 "type": "OBJECT",
                                 "properties": {
