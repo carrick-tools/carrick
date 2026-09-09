@@ -206,7 +206,17 @@ GET and the producer serves POST at /api/v1/widgets/:widgetId
 The server is the same in every editor, so most of what the VS Code smoke shows
 can be seen without one, by driving `carrick lsp --stdio` the way a client does
 (`initialize` with the workspace folder, `initialized`, `didOpen`) and printing
-the `publishDiagnostics` notifications.
+the `publishDiagnostics` notifications. Since carrick#854 that is a script:
+
+```
+node npm/carrick/scripts/lsp-probe.mjs --workspace $WS \
+  --open $WS/user-service/src/routes/users.ts
+```
+
+One row per published URI, the server's log on stderr as it arrives, and a
+non-zero exit when the server never started, published nothing, or named a
+counterpart file that is not on disk. Add `--server <install>/node_modules/carrick/dist/server.js`
+to ask the same question of an installed package, and `--json` to diff two runs.
 
 **Run on 2026-09-08 against the three-repo workspace**, opening the producer and
 one consumer:
