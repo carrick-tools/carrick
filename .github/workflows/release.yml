@@ -90,14 +90,22 @@ jobs:
       - name: Build the platform package
         shell: bash
         run: |
+          set -euo pipefail
           BINARY="target/${{ matrix.target }}/release/carrick"
-          [ "${{ matrix.platform }}" = "win32" ] && BINARY="$BINARY.exe"
+          if [ "${{ matrix.platform }}" = "win32" ]; then
+            BINARY="$BINARY.exe"
+          fi
+          OUT="dist/platform/${{ matrix.platform }}-${{ matrix.arch }}"
           node npm/platform/build.mjs \
             --platform "${{ matrix.platform }}" \
             --arch "${{ matrix.arch }}" \
             --version "${{ steps.version.outputs.version }}" \
             --binary "$BINARY" \
             --out dist/platform
+          # Asserted rather than assumed: a script that writes nothing and
+          # exits 0 is how the win32 leg of 0.3.52 passed this step with no
+          # package to show for it.
+          test -f "$OUT/package.json"
 
       # Packed here, not in the publish job: upload-artifact does not carry a
       # file's mode, so a binary uploaded as a file arrives 0644 and every
@@ -105,8 +113,14 @@ jobs:
       - name: Pack the platform package
         shell: bash
         run: |
+          set -euo pipefail
+          # npm pack does not create its --pack-destination, and answers ENOENT
+          # when it is missing (release 0.3.52 failed here on all five legs).
+          TARBALLS="$GITHUB_WORKSPACE/dist/tarballs"
+          mkdir -p "$TARBALLS"
           cd "dist/platform/${{ matrix.platform }}-${{ matrix.arch }}"
-          npm pack --pack-destination "$GITHUB_WORKSPACE/dist/tarballs"
+          npm pack --pack-destination "$TARBALLS"
+          ls -l "$TARBALLS"
 
       - name: Upload the platform package
         uses: actions/upload-artifact@v4
@@ -233,7 +247,16 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          for tarball in dist/tarballs/*.tgz; do
+          shopt -s nullglob
+          tarballs=(dist/tarballs/*.tgz)
+          # Publishing the main package with no platform package behind it
+          # would ship a CLI that resolves no binary on any machine.
+          if [ ${#tarballs[@]} -eq 0 ]; then
+            echo "::error::No platform packages were built, so there is nothing to publish."
+            exit 1
+          fi
+          echo "publishing ${#tarballs[@]} platform package(s)"
+          for tarball in "${tarballs[@]}"; do
             echo "publishing $tarball"
             npm publish --access public "$tarball"
           done
