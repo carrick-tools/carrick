@@ -75,8 +75,34 @@ function sidecarRoot(): string {
   return path.resolve(here, '..', '..', '..');
 }
 
+/**
+ * Locate a vendored executable the way node locates a package: walk up from
+ * the bundle and take the first `node_modules/.bin/<name>` that exists.
+ *
+ * Where the bins sit depends on how the sidecar arrived. A checkout and the
+ * release tarball both keep them in the sidecar's own `node_modules`, so the
+ * first candidate hits and nothing changes. An npm install never can: npm
+ * strips nested `node_modules` from a published tarball, so the sidecar ships
+ * as a plain directory inside the package and its dependencies are installed
+ * by the package that carries it — hoisted to the install root, or nested one
+ * level up when a version conflict forces it. Assuming one shape is what made
+ * an installed `carrick` degrade every pair to unverifiable (carrick#833).
+ *
+ * `from` is injectable so the layouts can be pinned by test; production always
+ * starts at the bundle. Returns the sidecar-local path when nothing exists,
+ * which is the caller's "not found" signal and the most useful thing to name.
+ */
+export function resolveVendoredBin(name: string, from: string = sidecarRoot()): string {
+  const local = path.join(from, 'node_modules', '.bin', name);
+  for (let dir = from; ; dir = path.dirname(dir)) {
+    const candidate = path.join(dir, 'node_modules', '.bin', name);
+    if (fs.existsSync(candidate)) return candidate;
+    if (path.dirname(dir) === dir) return local;
+  }
+}
+
 function binPath(name: string): string {
-  return path.join(sidecarRoot(), 'node_modules', '.bin', name);
+  return resolveVendoredBin(name);
 }
 
 function unverifiableAll(
