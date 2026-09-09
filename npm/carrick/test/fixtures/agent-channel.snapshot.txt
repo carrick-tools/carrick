@@ -1,0 +1,62 @@
+### check-clean.json :: renderPostToolUse
+Carrick checked user-service/src/routes/users.ts against the workspace index (user-service, indexed at 6a1b2c3).
+Boundary: A local index holds what the deterministic passes state: 41 candidate(s) in this service need a model and were not classified here.
+user-service at 6a1b2c3: 128 file(s) sent to the analyzer
+
+### check-deleted.json :: renderPostToolUse
+Carrick checked user-service/src/routes/users.ts against the workspace index (user-service, indexed at 6a1b2c3).
+- user-service/src/routes/users.ts:42:3 route GET /api/users/:id [fact, file_based_route] producer_removed (no type verdict): the file is gone from disk and one consumer still calls this route. Read off loader export claimed by a file-route convention. Consumers: order-service src/clients/users.ts:18
+This file is gone from disk and the index still holds 1 row(s) for it, with 1 counterpart(s) still on the other side.
+This file has changed since the index, so these verdicts describe the indexed version. 2 file(s) in the workspace have changed since 6a1b2c3.
+Boundary: A local index holds what the deterministic passes state: 41 candidate(s) in this service need a model and were not classified here.
+user-service at 6a1b2c3: 128 file(s) sent to the analyzer
+
+### check-mismatch.json :: renderPostToolUse
+Carrick checked user-service/src/routes/users.ts against the workspace index (user-service, indexed at 6a1b2c3).
+- user-service/src/routes/users.ts:42:3 route GET /api/users/:id [fact, file_based_route] type_mismatch: the response no longer carries `email`, which both consumers read. Read off loader export claimed by a file-route convention. Consumers: order-service src/clients/users.ts:18, billing-service src/lookup.ts:7
+- user-service/src/routes/users.ts:61:9 call POST /api/orders [candidate, model] method_mismatch (no type verdict): order-service serves PUT at this path, and no type verdict bears on a routing mismatch. Producers: order-service src/server.ts:120
+- user-service/src/routes/users.ts:12:3 route GET /api/users [fact, imported_member] compatible: response satisfies the consumer's expected type. Consumers: order-service src/clients/users.ts:4
+- user-service/src/routes/users.ts:80:5 call GET /api/audit/:id [fact, imported_member] no usable type on one side, so nothing is claimed: the consumer's expected type resolved to `any`. Producers: audit-service src/routes/audit.ts:9
+- user-service/src/routes/users.ts:95:7 call POST https://api.example-payments.test/v1/charges [fact, imported_member] no type verdict: matched to a shared external contract, and nothing pairs with it to compare. Same contract in: billing-service src/charges.ts:31
+This file has changed since the index, so these verdicts describe the indexed version. 3 file(s) in the workspace have changed since 6a1b2c3.
+Boundary: A local index holds what the deterministic passes state: 41 candidate(s) in this service need a model and were not classified here.
+user-service at 6a1b2c3: 128 file(s) sent to the analyzer
+  2 file(s) the analyzer never answered for (e.g. src/legacy/huge.ts: analyzer timeout)
+  1 call site(s) that named a client member and did not resolve to it (usersClient.get)
+  3 indexed call(s) whose path no producer may claim (e.g. src/proxy.ts:22)
+  5 call(s) with no resolved expected type (e.g. src/routes/users.ts:80)
+  4 bare route-literal call site(s) left unclassified
+  6 row(s) the model alone states (11 joined a deterministic row)
+  1 model endpoint(s) dropped in modules a routing convention claims
+  types captured on a bare checkout: anything through a dependency is `any`
+
+### check-not-indexed.json :: renderPostToolUse
+(silent)
+
+### check-pre-rendered-boundary.json :: renderPostToolUse
+Carrick checked user-service/src/routes/users.ts against the workspace index (user-service, indexed at 6a1b2c3).
+- user-service/src/routes/users.ts:42:3 route GET /api/users/:id [fact, file_based_route] type_mismatch: the response no longer carries `email`, which both consumers read. Read off loader export claimed by a file-route convention. Consumers: order-service src/clients/users.ts:18, billing-service src/lookup.ts:7
+- user-service/src/routes/users.ts:61:9 call POST /api/orders [candidate, model] method_mismatch (no type verdict): order-service serves PUT at this path, and no type verdict bears on a routing mismatch. Producers: order-service src/server.ts:120
+- user-service/src/routes/users.ts:12:3 route GET /api/users [fact, imported_member] compatible: response satisfies the consumer's expected type. Consumers: order-service src/clients/users.ts:4
+- user-service/src/routes/users.ts:80:5 call GET /api/audit/:id [fact, imported_member] no usable type on one side, so nothing is claimed: the consumer's expected type resolved to `any`. Producers: audit-service src/routes/audit.ts:9
+- user-service/src/routes/users.ts:95:7 call POST https://api.example-payments.test/v1/charges [fact, imported_member] no type verdict: matched to a shared external contract, and nothing pairs with it to compare. Same contract in: billing-service src/charges.ts:31
+This file has changed since the index, so these verdicts describe the indexed version. 3 file(s) in the workspace have changed since 6a1b2c3.
+A local index holds what the deterministic passes state: 41 candidate(s) in this service need a model and were not classified here.
+boundary (user-service): 41 candidates not classified locally, 4 unemitted literal
+candidates. Candidates are not classified locally: no model runs on this machine.
+
+### check-silent.json :: renderPostToolUse
+(silent)
+
+### status-not-indexed.json :: renderSessionStart
+Carrick has no index for this workspace, so nothing in this session is checked against the other services. `carrick index --workspace <dir>` builds one.
+
+### status-workspace.json :: renderSessionStart
+Carrick indexed 3 service(s) in /workspace at 2026-09-06T21:14:03Z, scanner 0.3.41.
+- user-service at 6a1b2c3: 157 route(s), 12 call(s), changed since index: 7 (src/routes/users.ts, src/routes/orders.ts, src/lib/db.ts, src/lib/http.ts, src/util/format.ts, +2 more)
+- user-admin at 6a1b2c3: 12 route(s), 3 call(s). Same repo as user-service, so the same 7 changed file(s)
+- order-service at 9988776: 40 route(s), 61 call(s), changed since index: 120 (src/file1.ts, src/file2.ts, src/file3.ts, src/file4.ts, src/file5.ts, +115 more)
+A local index holds what the deterministic passes state: 41 candidate(s) in this service need a model and were not classified here.
+boundary (user-service): 4 unemitted literal candidates.
+A local index holds what the deterministic passes state: 2 candidate(s) in this service need a model and were not classified here.
+A local index holds what the deterministic passes state: 9 candidate(s) in this service need a model and were not classified here.

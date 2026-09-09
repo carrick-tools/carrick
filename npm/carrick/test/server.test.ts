@@ -188,3 +188,84 @@ test("a CLI that fails publishes nothing and keeps the server alive", async (t) 
   });
   await client.waitFor(() => client.responses.has(id), "the server still answering");
 });
+
+// ------------------------------------------------- the noise budget, live
+//
+// carrick#879's rules as the client sees them, over stdio.
+
+test("a client with its own boundary surface gets no per-file row, and the notification instead", async (t) => {
+  const workspace = makeWorkspace();
+  const client = new LspClient({ env: fakeEnv() });
+  t.after(() => {
+    client.stop();
+    workspace.cleanup();
+  });
+
+  await client.initialize(workspace.root, "Visual Studio Code", { boundarySurface: true });
+  client.open(workspace.file);
+  await client.waitFor(
+    () => client.notifications.some((one) => one.method === "carrick/boundary"),
+    "the boundary notification",
+  );
+  await client.settle(200);
+
+  const edited = client.publishes.find((publish) => publish.uri.endsWith("routes/users.ts"));
+  const codes = (edited?.diagnostics as Array<{ code?: string }>).map((row) => row.code);
+  assert.equal(codes.includes("boundary"), false, "off the Problems list");
+  assert.equal(codes.length, 2, "the two findings and nothing else");
+
+  // Moved, not dropped: the same lines, on the workspace surface.
+  const moved = client.notifications.find((one) => one.method === "carrick/boundary");
+  const params = moved?.params as { service: string; lines: string[] };
+  assert.equal(params.service, "user-service");
+  assert.match(params.lines[0] ?? "", /A local index holds what the deterministic passes state/);
+});
+
+test("a client that states no boundary surface keeps the file-level fallback", async (t) => {
+  const workspace = makeWorkspace();
+  const client = new LspClient({ env: fakeEnv() });
+  t.after(() => {
+    client.stop();
+    workspace.cleanup();
+  });
+
+  await client.initialize(workspace.root);
+  client.open(workspace.file);
+  await client.waitFor(() => client.publishes.length >= 3, "diagnostics");
+  const edited = client.publishes.find((publish) => publish.uri.endsWith("routes/users.ts"));
+  const codes = (edited?.diagnostics as Array<{ code?: string }>).map((row) => row.code);
+  assert.equal(codes.includes("boundary"), true);
+});
+
+test("turning a surface off takes its rows away on the next publish, not at the next restart", async (t) => {
+  const workspace = makeWorkspace();
+  const client = new LspClient({ env: fakeEnv() });
+  t.after(() => {
+    client.stop();
+    workspace.cleanup();
+  });
+
+  await client.initialize(workspace.root);
+  client.open(workspace.file);
+  await client.waitFor(() => client.publishes.length >= 3, "the first diagnostics");
+  const before = client.publishes.length;
+
+  // No further edit, no restart: the setting alone re-publishes.
+  client.configure({ diagnostics: false });
+  await client.waitFor(
+    () =>
+      client.publishes
+        .slice(before)
+        .some((publish) => publish.uri.endsWith("routes/users.ts")),
+    "a re-publish after the setting changed",
+  );
+  await client.settle(200);
+
+  const last = client.publishes.filter((publish) => publish.uri.endsWith("routes/users.ts")).at(-1);
+  const codes = (last?.diagnostics as Array<{ code?: string }>).map((row) => row.code);
+  assert.deepEqual(codes, ["boundary"], "the findings are gone and the boundary is not");
+  const consumer = client.publishes
+    .filter((publish) => publish.uri.endsWith("order-service/src/clients/users.ts"))
+    .at(-1);
+  assert.deepEqual(consumer?.diagnostics, [], "and the mirrored rows are cleared too");
+});

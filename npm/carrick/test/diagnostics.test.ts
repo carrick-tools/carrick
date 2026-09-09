@@ -211,3 +211,224 @@ test("a deleted file is surfaced as producer removed", () => {
 test("an error payload publishes nothing", () => {
   assert.equal(diagnosticsFor("check-not-indexed.json").size, 0);
 });
+
+// ---------------------------------------------------------------- the budget
+//
+// One test per rule in carrick#879's acceptance list. The payloads are written
+// here rather than as fixtures: a forty-row file is a shape, not an answer key,
+// and reading it beside its assertion is the point.
+
+import { capDiagnostics, MAX_PER_CHECK, MAX_PER_FILE } from "../src/diagnostics.ts";
+import { DEFAULT_SURFACES } from "../src/surfaces.ts";
+import type { CheckItem, CheckResult } from "../src/contract.ts";
+
+/** A client that has somewhere else to show the boundary, as VS Code does. */
+const WITH_SURFACE = { ...DEFAULT_SURFACES, boundarySurface: true };
+
+function mismatch(line: number, counterparts: CheckItem["counterparts"] = []): CheckItem {
+  return {
+    kind: "route",
+    method: "GET",
+    path: `/api/thing/${line}`,
+    line,
+    col: 3,
+    source: "fact",
+    counterparts,
+    verdict: { state: "resolved", result: "type_mismatch", detail: "the response lost a field" },
+  };
+}
+
+function payload(items: CheckItem[]): CheckResult {
+  return { schema: "carrick.check/0", file: CHECKED, service: "user-service", items };
+}
+
+test("a file the index holds no finding for publishes nothing at all", () => {
+  const byFile = toDiagnostics(fixture("check-clean.json"), ROOT, CHECKED, {
+    exists,
+    surfaces: WITH_SURFACE,
+  });
+  assert.equal(byFile.size, 0, "not one Information row, none");
+});
+
+test("the boundary falls back to a file-level row only for a client with nowhere else", () => {
+  const fallback = diagnosticsFor("check-clean.json").get(CHECKED_ABS);
+  assert.equal(fallback?.length, 1);
+  assert.equal(fallback?.[0]?.code, "boundary");
+
+  const off = toDiagnostics(fixture("check-clean.json"), ROOT, CHECKED, {
+    exists,
+    surfaces: { ...DEFAULT_SURFACES, boundary: false },
+  });
+  assert.equal(off.size, 0, "carrick.boundary off removes the fallback");
+});
+
+test("each switch turns off its own surface and leaves the other standing", () => {
+  const noFindings = toDiagnostics(fixture("check-mismatch.json"), ROOT, CHECKED, {
+    exists,
+    surfaces: { ...DEFAULT_SURFACES, diagnostics: false },
+  });
+  assert.deepEqual(
+    noFindings.get(CHECKED_ABS)?.map((diagnostic) => diagnostic.code),
+    ["boundary"],
+    "diagnostics off keeps the boundary",
+  );
+  assert.equal(noFindings.size, 1, "and mirrors nothing onto a counterpart");
+
+  const noBoundary = toDiagnostics(fixture("check-mismatch.json"), ROOT, CHECKED, {
+    exists,
+    surfaces: { ...DEFAULT_SURFACES, boundary: false },
+  });
+  assert.deepEqual(
+    noBoundary.get(CHECKED_ABS)?.map((diagnostic) => diagnostic.code),
+    ["type_mismatch", "method_mismatch"],
+    "boundary off keeps the findings",
+  );
+});
+
+test("forty findings publish eleven, and the eleventh names the rest and the command", () => {
+  const items = Array.from({ length: 40 }, (_, index) => mismatch(index + 1));
+  const rows = toDiagnostics(payload(items), ROOT, CHECKED, {
+    exists,
+    surfaces: WITH_SURFACE,
+  }).get(CHECKED_ABS);
+  assert.equal(rows?.length, MAX_PER_FILE + 1);
+  assert.equal(
+    rows?.at(-1)?.message,
+    "and 30 more finding(s) in this file, from `carrick check user-service/src/routes/users.ts`.",
+  );
+  assert.equal(rows?.at(-1)?.code, "capped");
+  // Problems first, then by line: the ten that survive are the first ten lines.
+  assert.deepEqual(
+    rows?.slice(0, MAX_PER_FILE).map((row) => row.range.start.line),
+    Array.from({ length: MAX_PER_FILE }, (_, index) => index),
+  );
+});
+
+test("a finding with four counterparts publishes one row per counterpart file", () => {
+  const counterparts = [
+    {
+      role: "consumer",
+      service: "order-service",
+      repo: `${ROOT}/order-service`,
+      file: "src/clients/users.ts",
+      line: 18,
+    },
+    {
+      role: "consumer",
+      service: "order-service",
+      repo: `${ROOT}/order-service`,
+      file: "src/clients/users.ts",
+      line: 44,
+    },
+    {
+      role: "consumer",
+      service: "order-service",
+      repo: `${ROOT}/order-service`,
+      file: "src/server.ts",
+      line: 120,
+    },
+    {
+      role: "consumer",
+      service: "billing-service",
+      repo: `${ROOT}/billing-service`,
+      file: "src/charges.ts",
+      line: 31,
+    },
+  ];
+  const byFile = toDiagnostics(payload([mismatch(42, counterparts)]), ROOT, CHECKED, {
+    exists,
+    surfaces: WITH_SURFACE,
+  });
+  const client = byFile.get(path.resolve(ROOT, "order-service/src/clients/users.ts"));
+  assert.equal(client?.length, 1, "two call sites in one file are one row");
+  assert.match(client?.[0]?.message ?? "", /Also at line 44 in this file\./);
+  assert.equal(client?.[0]?.range.start.line, 17, "and it lands on the first of them");
+  assert.equal(byFile.size, 4, "the checked file and three counterpart files");
+  // Every site is still clickable, whether or not it got a row of its own.
+  assert.equal(byFile.get(CHECKED_ABS)?.[0]?.relatedInformation?.length, 4);
+});
+
+test("a mirrored row counts against the receiving file's own cap", () => {
+  // Twelve findings, every one of them mirrored into the same consumer file.
+  const items = Array.from({ length: 12 }, (_, index) =>
+    mismatch(index + 1, [
+      {
+        role: "consumer",
+        service: "order-service",
+        repo: `${ROOT}/order-service`,
+        file: "src/server.ts",
+        line: index + 100,
+      },
+    ]),
+  );
+  const consumer = toDiagnostics(payload(items), ROOT, CHECKED, {
+    exists,
+    surfaces: WITH_SURFACE,
+  }).get(path.resolve(ROOT, "order-service/src/server.ts"));
+  assert.equal(consumer?.length, MAX_PER_FILE + 1);
+  assert.match(consumer?.at(-1)?.message ?? "", /^and 2 more finding\(s\) in this file/);
+});
+
+test("one check publishes thirty rows at most, and says what it did not show", () => {
+  const items = Array.from({ length: 25 }, (_, index) =>
+    mismatch(index + 1, [
+      {
+        role: "consumer",
+        service: "order-service",
+        repo: `${ROOT}/service-${index}`,
+        file: "src/client.ts",
+        line: 10,
+      },
+    ]),
+  );
+  const byFile = toDiagnostics(payload(items), ROOT, CHECKED, {
+    exists: () => true,
+    surfaces: WITH_SURFACE,
+  });
+  const total = [...byFile.values()].reduce((sum, rows) => sum + rows.length, 0);
+  assert.equal(total, MAX_PER_CHECK);
+  const checked = byFile.get(CHECKED_ABS);
+  assert.match(checked?.at(-1)?.message ?? "", /^and \d+ more finding\(s\) elsewhere in this check/);
+  // A file the budget dropped publishes an empty list, so its previous rows go.
+  assert.ok(
+    [...byFile.values()].some((rows) => rows.length === 0),
+    "dropped files are cleared rather than left standing",
+  );
+});
+
+test("no diagnostic Carrick publishes has severity Hint", () => {
+  const payloads: CheckResult[] = [
+    fixture("check-mismatch.json"),
+    fixture("check-clean.json"),
+    fixture("check-deleted.json"),
+    fixture("check-pre-rendered-boundary.json"),
+    payload(Array.from({ length: 40 }, (_, index) => mismatch(index + 1))),
+  ];
+  for (const one of payloads) {
+    for (const surfaces of [DEFAULT_SURFACES, WITH_SURFACE]) {
+      for (const rows of toDiagnostics(one, ROOT, CHECKED, { exists, surfaces }).values()) {
+        for (const row of rows) assert.notEqual(row.severity, SEVERITY.hint);
+      }
+    }
+  }
+});
+
+test("a routing finding is an error only where its other side is on this disk", () => {
+  const routing: CheckItem = {
+    kind: "call",
+    source: "fact",
+    verdict: { state: "not_checked", result: "method_mismatch" },
+  };
+  assert.equal(severityOf(routing, true), SEVERITY.error);
+  assert.equal(
+    severityOf(routing, false),
+    SEVERITY.warning,
+    "an error a reader cannot go and look at asserts more than the payload supports",
+  );
+  // A type verdict is a claim about this file, so it stands on its own.
+  assert.equal(severityOf(mismatch(1), false), SEVERITY.error);
+});
+
+test("capping an empty check publishes nothing", () => {
+  assert.equal(capDiagnostics(new Map(), CHECKED_ABS, CHECKED).size, 0);
+});
