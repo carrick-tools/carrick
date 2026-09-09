@@ -259,8 +259,20 @@ above the file, logs when the two differ, and handles `didOpen`, `didChange`
 without the editor, by driving `carrick lsp --stdio` the way a client does. Doing
 that first separates "the server has nothing to say about this workspace" from
 "this editor is not rendering it", which otherwise costs an hour per editor. Today
-that is the by-hand sequence in SMOKE.md section 3; carrick#854 turns it into one
-command, and until it exists every editor row starts with the manual version.
+that is one command (carrick#854):
+
+```
+node npm/carrick/scripts/lsp-probe.mjs --workspace $WS \
+  --open $WS/<producer>/src/routes/users.ts
+```
+
+It prints one row per published URI — the file, the diagnostic count, the
+severities, the codes, and whether the `relatedInformation` locations exist on
+disk — and exits non-zero when the server never started, published nothing, or
+pointed at a file that is not there. The server's own log lines arrive on stderr
+as it runs, so the root it chose is in the same output. `--server` points it at
+an installed `node_modules/carrick/dist/server.js` instead of this checkout, and
+`--json` prints the raw publishes so two runs can be diffed.
 
 **4.0 expected observation** (recorded on the demo workspace, 2026-09-08):
 
@@ -481,7 +493,7 @@ Open tickets this plan runs into, so a red row can be recognised as a known one.
 | carrick#845 | The package publishes no type declarations, so a TypeScript consumer of `carrick/templates` cannot type the import | not exercised here; it lands with the same release |
 | carrick#848 | An edit made through Bash reaches neither channel, because both are keyed to `Write\|Edit\|MultiEdit` and the server is started lazily by the Edit or Write tool | 3.6, and the validity rule in 3.10 |
 | carrick#853 | Shipped. The `install` matrix, `node-floor`, `global-install` and `upgrade` jobs in `plugin.yml` | 1.2, 1.4 to 1.7, 1.9, 1.11, 1.12 |
-| carrick#854 | No script drives the language server against a real index, so every editor row starts with a by-hand sequence | 4.0, and the first step of 4.1 to 4.7 |
+| carrick#854 | Shipped as `npm/carrick/scripts/lsp-probe.mjs`. Driving it against a real index is still by hand, because CI has no index to point it at | 4.0, and the first step of 4.1 to 4.7 |
 | carrick#857 | A file rewritten with identical bytes reads as stale, so every verdict in it gains a caveat that the same payload's `changed_since_index: 0` denies. Found by row 2.18's neighbourhood on 2026-09-09 | 2.17, 2.18, and every editor row, since a save with no change is ordinary there |
 | carrick#858 | The log-roll message prints `carrick.log.<date>.1` literally rather than the file it wrote. Cosmetic | the log-bound check at the end of section 2 |
 
