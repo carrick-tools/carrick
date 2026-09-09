@@ -9,12 +9,29 @@ There is no UI beyond the Problems panel. That is the point: an editor-hosted
 agent reads the Problems panel after its own edits, so a diagnostic is a channel
 into the agent that costs nobody a prompt.
 
-## What it needs
+Cursor, Windsurf and VSCodium install it the same way; they resolve extensions
+from Open VSX rather than the Marketplace.
 
-- The `carrick` CLI on PATH — `npm install -g carrick`, or `carrick init` in
-  the folder that holds your repos. `carrick.binary` names another copy.
-- A workspace that has been indexed with `carrick index`. Without an index the
-  server publishes nothing and says so in the Carrick output channel.
+## Install the CLI first
+
+This extension holds no server of its own. It starts `carrick lsp --stdio`, so
+without the `carrick` CLI on PATH it starts nothing and says so in the Carrick
+output channel.
+
+```
+npm install -g carrick     # needs Node 24 or newer
+```
+
+Then, in the folder that holds your repos:
+
+```
+carrick init      # finds the repos, writes the workspace file, runs the first index
+```
+
+`carrick index` refreshes it later. Without an index the server publishes no
+diagnostics and says so in the output channel.
+
+If the CLI lives somewhere that is not on PATH, point `carrick.binary` at it.
 
 ## Settings
 
@@ -22,8 +39,8 @@ into the agent that costs nobody a prompt.
 |---|---|---|
 | `carrick.binary` | `carrick` on PATH | The CLI to start `lsp --stdio` on |
 
-The extension holds no server of its own: it starts `carrick lsp --stdio`, so
-the server and the scanner are always the same version.
+The extension and the scanner are always the same version, because there is
+only one of them: the CLI.
 
 ## Building it
 
@@ -33,5 +50,6 @@ npm run build   # compiles src/extension.ts to out/
 npx --yes @vscode/vsce package
 ```
 
-The `.vsix` is gitignored. Not published to the Marketplace or Open VSX yet: the
-publisher account and the Open VSX namespace are owner actions in carrick#710.
+The `.vsix` is gitignored. `release.yml` runs the same `vsce package` at the
+release version, attaches the `.vsix` to the GitHub release and publishes it to
+Open VSX.

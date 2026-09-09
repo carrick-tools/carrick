@@ -81,8 +81,10 @@ either verdict channel and is printed whichever one is delivering.
 `vscode/` holds a thin extension: a `LanguageClient` on `carrick lsp --stdio`,
 activated on TypeScript files, with no UI of its own. Build and package it with
 `npm install && npm run build && npx --yes @vscode/vsce package` in that
-directory. It is not published to the Marketplace or Open VSX; the publisher
-account and the Open VSX namespace are owner actions in carrick#710.
+directory. `release.yml` packages it at the release version, attaches the
+`.vsix` to the GitHub release and publishes it to Open VSX, which is the gallery
+Cursor, Windsurf and VSCodium resolve from. The Marketplace publish waits on a
+token; until there is one the attached `.vsix` is uploaded by hand.
 
 An editor accepts any number of diagnostic providers per file, so this server
 sits beside TypeScript's rather than replacing it, and `relatedInformation`

@@ -279,7 +279,7 @@ in Claude Code it is the site in the text.
 
 | # | Editor | Status | Install path | Activation trigger |
 |---|---|---|---|---|
-| 4.1 | VS Code, from `.vsix` | **Manual** | `cd plugin/vscode && npm install && npm run build && npx --yes @vscode/vsce package`, then `code --install-extension carrick-0.0.1.vsix` | opening any `.ts` or `.tsx` file (`onLanguage:typescript`, `onLanguage:typescriptreact`) |
+| 4.1 | VS Code, from `.vsix` | **Manual** | `cd plugin/vscode && npm install && npm run build && npx --yes @vscode/vsce package`, then `code --install-extension carrick-<version>.vsix` | opening any `.ts` or `.tsx` file (`onLanguage:typescript`, `onLanguage:typescriptreact`) |
 | 4.2 | VS Code, from the Marketplace | **Blocked** (carrick#710) | `code --install-extension carrick-tools.carrick` | as 4.1. Waits on the publisher account |
 | 4.3 | Cursor | **Manual** for the `.vsix` (`cursor --install-extension <file>.vsix`), **Blocked** for the gallery | Cursor resolves extensions from Open VSX, not the Marketplace, so the gallery row waits on the Open VSX namespace, not on 4.2 | as 4.1 |
 | 4.4 | Windsurf | as 4.3, with `windsurf --install-extension` | same | as 4.1 |

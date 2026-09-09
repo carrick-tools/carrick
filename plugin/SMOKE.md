@@ -224,7 +224,7 @@ Then VS Code itself, which needs a machine with VS Code on it:
 
 1. `cd plugin/vscode && npm install && npm run build && npx --yes @vscode/vsce package`
    (2026-09-08: 320 files, 460 KB).
-2. Install the `.vsix`: `code --install-extension carrick-0.0.1.vsix`.
+2. Install the `.vsix`: `code --install-extension carrick-<version>.vsix`.
 3. Open `$WS` as the workspace folder. Set `carrick.binary` if `carrick` is not
    on PATH for GUI applications.
 4. Break a producer response type, run `carrick refresh --service <producer>`,
