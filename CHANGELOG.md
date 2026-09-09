@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.56](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.55...carrick-v0.3.56) (2026-09-09)
+
+
+### Bug Fixes
+
+* **release:** wait for the registry, and stop asking npm ci for a lockfile that cannot exist ([#892](https://github.com/carrick-tools/carrick/issues/892)) ([c99f55b](https://github.com/carrick-tools/carrick/commit/c99f55bdc87f671eabda95560429049d683cf712)), closes [#710](https://github.com/carrick-tools/carrick/issues/710)
+
 ## [0.3.55](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.54...carrick-v0.3.55) (2026-09-09)
 
 
