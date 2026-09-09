@@ -3,6 +3,14 @@ Carrick checked user-service/src/routes/users.ts against the workspace index (us
 Boundary: A local index holds what the deterministic passes state: 41 candidate(s) in this service need a model and were not classified here.
 user-service at 6a1b2c3: 128 file(s) sent to the analyzer
 
+### check-definition.json :: renderPostToolUse
+Carrick checked user-service/src/routes/users.ts against the workspace index (user-service, indexed at 6a1b2c3).
+- user-service/src/routes/users.ts:30:3 call POST /api/orders [candidate, model] no type verdict: the model read a call here and nothing contradicts it. Producers: order-service src/server.ts:120
+- user-service/src/routes/users.ts:30:3 route GET /api/users/:id [fact, file_based_route] compatible: response satisfies the consumer's expected type. Read off loader export claimed by a file-route convention. Consumers: order-service src/clients/users.ts:18
+Boundary: A local index holds what the deterministic passes state: 0 candidate(s) in this service need a model and were not classified here.
+user-service at 6a1b2c3: 12 file(s) sent to the analyzer
+  1 row(s) the model alone states (1 joined a deterministic row)
+
 ### check-deleted.json :: renderPostToolUse
 Carrick checked user-service/src/routes/users.ts against the workspace index (user-service, indexed at 6a1b2c3).
 - user-service/src/routes/users.ts:42:3 route GET /api/users/:id [fact, file_based_route] producer_removed (no type verdict): the file is gone from disk and one consumer still calls this route. Read off loader export claimed by a file-route convention. Consumers: order-service src/clients/users.ts:18
