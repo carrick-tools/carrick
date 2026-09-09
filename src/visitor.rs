@@ -1203,11 +1203,84 @@ impl FunctionDefinitionExtractor {
                         Expr::Object(nested) => {
                             self.collect_exported_object_members(&name, nested, depth + 1)
                         }
+                        // `{ list: listThings }` names a function the module
+                        // declared elsewhere. It has a definition already, at
+                        // its own key; what the table adds is that the module
+                        // OFFERS it. A second row for the same body would
+                        // double the function count and re-bill its intent.
+                        Expr::Ident(ident) => {
+                            self.exported_names.insert(ident.sym.to_string());
+                        }
                         _ => {}
                     }
                 }
+                // `{ list, create }`: the shorthand form of the line above.
+                Prop::Shorthand(ident) => {
+                    self.exported_names.insert(ident.sym.to_string());
+                }
                 _ => {}
             }
+        }
+    }
+
+    /// The export a CommonJS assignment writes to, if it writes to one.
+    ///
+    /// `exports.handler` and `module.exports.handler` are the named export
+    /// `handler`, keyed like any other named export. `module.exports` is the
+    /// default export, keyed `default` exactly as `export default` is, so a
+    /// member of it lands on `default.<member>` on either module system.
+    fn cjs_export_key(target: &AssignTarget) -> Option<String> {
+        let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = target else {
+            return None;
+        };
+        let MemberProp::Ident(prop) = &member.prop else {
+            return None;
+        };
+        match &*member.obj {
+            // `module.exports = …`
+            Expr::Ident(object) if &*object.sym == "module" && &*prop.sym == "exports" => {
+                Some("default".to_string())
+            }
+            // `exports.handler = …`
+            Expr::Ident(object) if &*object.sym == "exports" => Some(prop.sym.to_string()),
+            // `module.exports.handler = …`
+            Expr::Member(inner) => {
+                let Expr::Ident(root) = &*inner.obj else {
+                    return None;
+                };
+                let MemberProp::Ident(middle) = &inner.prop else {
+                    return None;
+                };
+                (&*root.sym == "module" && &*middle.sym == "exports").then(|| prop.sym.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// Record what a CommonJS export assignment puts on the module's surface.
+    ///
+    /// A function value is a definition under the exported name. An object is
+    /// a member bag, read exactly as the ESM one is. An identifier names a
+    /// function the module declared elsewhere: that already has a definition at
+    /// its own key, and what the assignment adds is that the module offers it.
+    fn record_cjs_export(&mut self, name: String, value: &Expr) {
+        match value {
+            Expr::Arrow(arrow) => {
+                self.insert_arrow_definition(name.clone(), arrow);
+                self.exported_names.insert(name);
+            }
+            Expr::Fn(fn_expr) => {
+                self.insert_method_definition(name.clone(), &fn_expr.function);
+                self.exported_names.insert(name);
+            }
+            Expr::Object(object) => {
+                self.exported_names.insert(name.clone());
+                self.collect_exported_object_members(&name, object, 0);
+            }
+            Expr::Ident(ident) => {
+                self.exported_names.insert(ident.sym.to_string());
+            }
+            _ => {}
         }
     }
 }
@@ -1318,6 +1391,24 @@ impl Visit for FunctionDefinitionExtractor {
             _ => {}
         }
         export.visit_children_with(self);
+    }
+
+    /// Track the CommonJS export surface: `exports.handler = …`,
+    /// `module.exports.other = …`, `module.exports = { … }` and
+    /// `module.exports = fn` (carrick#863). It is how every `.js` lambda states
+    /// its entry point, and none of those shapes is a declaration, a
+    /// function-initialised variable or a class member, so none of them
+    /// produced a definition.
+    ///
+    /// Not restricted to the top level. An export written inside a branch or a
+    /// setup function is still what the module offers, and the key comes from
+    /// the exports member rather than from a binding name, so it means the same
+    /// thing wherever it is written.
+    fn visit_assign_expr(&mut self, assign: &AssignExpr) {
+        if let Some(name) = Self::cjs_export_key(&assign.left) {
+            self.record_cjs_export(name, &assign.right);
+        }
+        assign.visit_children_with(self);
     }
 
     /// Track `export { foo, bar }` named exports

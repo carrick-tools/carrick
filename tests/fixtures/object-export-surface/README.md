@@ -16,5 +16,15 @@ arrow-valued property, and one level of nesting. `internals` in the same file is
 the bound — an object the module keeps to itself is a value it uses rather than
 a surface it offers, and its members stay out of the index.
 
+`src/lambda.js` and `src/queue.js` are the same surface on the other module
+system (carrick#863): `exports.handler = …`, `module.exports.health = …`, an
+object assigned to a named export, and `module.exports = { … }`, which is the
+default export and keys its members `default.<member>` exactly as
+`export default { … }` does. Each file also carries the bound that matters
+there: a function offered by name (`reset`, `consume`) has ONE definition, at
+its own key, because a second row for the same body would double the function
+count and re-bill its intent — and `sweep`, which no assignment reaches, stays
+unexported.
+
 The LLM is replayed from `__llm__/` and states nothing: what is under test is
 what the scanner derives from the AST on its own.
