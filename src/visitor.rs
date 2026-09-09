@@ -1159,6 +1159,57 @@ impl FunctionDefinitionExtractor {
             },
         );
     }
+    /// Index the function-valued members of an object literal the module
+    /// EXPORTS, keyed `owner.member` — the same key space class members use.
+    ///
+    /// A module whose surface is an object rather than a set of bindings is an
+    /// ordinary shape, not a framework's: `export default { async fetch(req)
+    /// {} }` is the whole of a request handler on more than one runtime, and
+    /// `export const handlers = { list, create }` is a route table. Neither is
+    /// a `FnDecl`, a `VarDeclarator` or a class member, so before carrick#830
+    /// a file whose only functions were written this way produced no function
+    /// definition at all: no signature, no intent, nothing in the index for
+    /// anything else to point at.
+    ///
+    /// Bounded to the export surface on purpose. An object literal passed as an
+    /// argument, or bound to a local the module keeps to itself, is a value the
+    /// module uses rather than one it offers, and collecting every callback in
+    /// every options object would flood the function index — and its intents —
+    /// with things nothing can call.
+    fn collect_exported_object_members(&mut self, owner: &str, object: &ObjectLit, depth: usize) {
+        // A route table nests (`{ v1: { list() {} } }`); a deep object is data.
+        const MAX_DEPTH: usize = 3;
+        if depth > MAX_DEPTH {
+            return;
+        }
+        for prop in &object.props {
+            let PropOrSpread::Prop(prop) = prop else {
+                continue;
+            };
+            match &**prop {
+                Prop::Method(method) => {
+                    if let Some(key) = Self::prop_name_to_string(&method.key) {
+                        self.insert_method_definition(format!("{owner}.{key}"), &method.function);
+                    }
+                }
+                Prop::KeyValue(kv) => {
+                    let Some(key) = Self::prop_name_to_string(&kv.key) else {
+                        continue;
+                    };
+                    let name = format!("{owner}.{key}");
+                    match &*kv.value {
+                        Expr::Arrow(arrow) => self.insert_arrow_definition(name, arrow),
+                        Expr::Fn(fn_expr) => self.insert_method_definition(name, &fn_expr.function),
+                        Expr::Object(nested) => {
+                            self.collect_exported_object_members(&name, nested, depth + 1)
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 impl Visit for FunctionDefinitionExtractor {
@@ -1171,7 +1222,16 @@ impl Visit for FunctionDefinitionExtractor {
             Decl::Var(var_decl) => {
                 for decl in &var_decl.decls {
                     if let Pat::Ident(ident) = &decl.name {
-                        self.exported_names.insert(ident.id.sym.to_string());
+                        let name = ident.id.sym.to_string();
+                        self.exported_names.insert(name.clone());
+                        // `export const handlers = { list, create() {} }`: an
+                        // exported object's function members are part of the
+                        // module's surface (carrick#830).
+                        if let Some(init) = &decl.init
+                            && let Expr::Object(object) = &**init
+                        {
+                            self.collect_exported_object_members(&name, object, 0);
+                        }
                     }
                 }
             }
@@ -1243,8 +1303,19 @@ impl Visit for FunctionDefinitionExtractor {
 
     /// Track `export default foo` (expression)
     fn visit_export_default_expr(&mut self, export: &ExportDefaultExpr) {
-        if let Expr::Ident(ident) = &*export.expr {
-            self.exported_names.insert(ident.sym.to_string());
+        match &*export.expr {
+            Expr::Ident(ident) => {
+                self.exported_names.insert(ident.sym.to_string());
+            }
+            // `export default { async fetch(request) { … } }`: the module's
+            // whole surface is one object, and its members are its functions
+            // (carrick#830). `default` is what the module exports them under,
+            // and naming them for it keeps the key the same on every host.
+            Expr::Object(object) => {
+                self.exported_names.insert("default".to_string());
+                self.collect_exported_object_members("default", object, 0);
+            }
+            _ => {}
         }
         export.visit_children_with(self);
     }
