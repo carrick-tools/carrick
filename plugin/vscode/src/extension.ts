@@ -158,10 +158,11 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push({ dispose: () => void client?.stop() });
 
   void client.start().then(() => {
-    client?.onNotification("carrick/boundary", (notice: BoundaryNotice) => {
+    const listener = client?.onNotification("carrick/boundary", (notice: BoundaryNotice) => {
       lastBoundary = notice;
       renderStatus();
     });
+    if (listener) context.subscriptions.push(listener);
   });
 
   // A setting changed is forwarded straight through, so a surface turned off

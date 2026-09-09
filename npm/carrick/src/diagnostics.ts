@@ -311,13 +311,19 @@ export function capDiagnostics(
         unstated += file.hidden;
       }
     }
-    rows.push(...file.boundary);
     capped.set(file.file, rows);
   }
   if (unstated > 0) {
     const rows = capped.get(checkedAbs) ?? [];
     rows.push(overflowRow(unstated, "elsewhere in this check", checkedFile));
     capped.set(checkedAbs, rows);
+  }
+  // The boundary is appended last, after every overflow row, because it is the
+  // line that makes a short answer readable and the hook renders it last for
+  // the same reason. Both channels read alike.
+  for (const file of staged) {
+    if (!file.boundary.length) continue;
+    capped.get(file.file)?.push(...file.boundary);
   }
   return capped;
 }
