@@ -101,6 +101,47 @@ Private registries use your own credentials. Carrick adds no auth of its own: pu
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 ```
 
+### Re-analyzing everything
+
+A scan reads the model once per changed file and reuses what it already has for
+the rest, which is what makes a routine scan cheap. Occasionally the answers
+themselves need redoing rather than the files: Carrick starts extracting
+something it did not extract before, and the cache holds answers from before it
+could. `full-scan` re-analyzes every file for one run.
+
+Ask for it, rather than leaving it on. Wire it to the workflow's
+`workflow_dispatch` input, which is what `carrick init` scaffolds:
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      full-scan:
+        type: boolean
+        default: false
+
+jobs:
+  carrick:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: carrick-tools/carrick@v1
+        with:
+          full-scan: ${{ inputs.full-scan }}
+```
+
+Then run it from the Actions tab, or:
+
+```bash
+gh workflow run carrick.yml -f full-scan=true
+```
+
+On every other trigger the expression is empty and the incremental scan runs
+exactly as before.
+
 ## MCP tools
 
 The MCP endpoint exposes the index as structured tools your agent can call directly.

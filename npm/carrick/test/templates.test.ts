@@ -31,6 +31,18 @@ test("the defaults are the ones a user would want without saying anything", () =
   assert.match(rendered, new RegExp(`- uses: ${DEFAULTS["ACTION_REF"]?.replace("/", "\\/")}`));
 });
 
+test("a full re-analysis is asked for on demand, never carried by a push", () => {
+  const rendered = renderTemplate("workflow");
+  // The input exists, and the step passes it through. A cache the model's own
+  // answers have outgrown is only redone when someone asks.
+  assert.match(rendered, /workflow_dispatch:\n\s+inputs:\n\s+full-scan:/);
+  assert.match(rendered, /type: boolean\n\s+default: false/);
+  assert.match(rendered, /full-scan: \$\{\{ inputs\.full-scan \}\}/);
+  // Not on push or pull_request: those triggers define no input, so the
+  // expression is empty and the Action's own default stands.
+  assert.doesNotMatch(rendered, /full-scan: true/);
+});
+
 test("the workflow asks for OIDC and no secret", () => {
   const rendered = renderTemplate("workflow");
   assert.match(rendered, /id-token: write/);
