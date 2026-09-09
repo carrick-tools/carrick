@@ -84,7 +84,27 @@ test("the templates are importable by the tool that has to render the same bytes
   // The hosted scaffold tool depends on this package at a pinned version and
   // renders from here. Without an export map it would have to reach into
   // dist/ by path, which is not a contract anyone should rely on.
-  assert.equal(pkg["exports"]["./templates"], "./dist/templates.js");
+  //
+  // And it is a TypeScript consumer, so the export has to carry its types: a
+  // subpath with no `types` condition is TS7016 under any strict config, and
+  // the consumer's only way out is to hand-write a declaration of this
+  // module's surface — a second copy of the thing the shared template exists
+  // to remove (#845).
+  const templates = pkg["exports"]["./templates"] as Record<string, string>;
+  assert.equal(templates["default"], "./dist/templates.js");
+  assert.equal(templates["types"], "./dist/templates.d.ts");
+  assert.equal(
+    Object.keys(templates)[0],
+    "types",
+    "conditions resolve in order, so `types` has to come first",
+  );
+  // Read as text: the build config carries comments, so it is JSONC.
+  const build = fs.readFileSync(path.join(packageRoot, "tsconfig.build.json"), "utf8");
+  assert.match(
+    build,
+    /"declaration":\s*true/,
+    "the file the types condition names has to be emitted",
+  );
   assert.ok(fs.existsSync(path.join(packageRoot, "src", "templates.ts")));
 });
 
