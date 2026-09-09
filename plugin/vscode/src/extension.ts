@@ -58,6 +58,7 @@ function surfaces(): Record<string, boolean> {
   const settings = vscode.workspace.getConfiguration("carrick");
   return {
     diagnostics: settings.get<boolean>("diagnostics") ?? true,
+    definition: settings.get<boolean>("definition") ?? true,
     boundary: settings.get<boolean>("boundary") ?? true,
     codeLens: settings.get<boolean>("codeLens") ?? true,
     boundarySurface: true,
