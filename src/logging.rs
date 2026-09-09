@@ -124,8 +124,16 @@ pub fn init(verbose: bool) {
 /// thing: the file's size depends on how much anyone scanned that day, so an
 /// ordinary day of local runs wrote 9.3 GB into one file and three days of
 /// them was 25 GB on a laptop. Two hundred megabytes is far more DEBUG than
-/// anyone reads and bounds the directory at roughly 1.2 GB — a capped file and
-/// one rolled generation of it, for each of [`RETAINED_LOG_DAYS`] days.
+/// anyone reads, and with it the directory holds at most
+/// [`RETAINED_LOG_DAYS`] files of the appender's plus the one generation this
+/// module rolls aside: about 800 MB, whatever anyone scans.
+///
+/// The appender's own pruning matches on the `carrick.log` prefix, so whether
+/// it counts a rolled `carrick.log.<date>.1` toward its cap depends on the
+/// platform (it sorts by creation time where the filesystem reports one, and
+/// falls back to parsing the date out of the name, which a rolled name defeats).
+/// Either way the count is bounded, which is what the file names cannot be
+/// relied on to say and what the test below asserts.
 const LOG_SIZE_CAP_BYTES: u64 = 200 * 1024 * 1024;
 
 /// Raise, lower or remove the byte cap for one run. `0` removes it, which is
@@ -658,6 +666,58 @@ mod tests {
         // process-global, so this checks the arithmetic it does with it.
         assert_eq!(LOG_SIZE_CAP_BYTES, 200 * 1024 * 1024);
         assert_eq!(budget(log_size_cap(), 0), LOG_SIZE_CAP_BYTES);
+    }
+
+    /// The two prunings together leave a bounded number of files, whichever
+    /// of them counts the rolled generation on this platform. The appender
+    /// sorts by creation time where the filesystem has one and by the date in
+    /// the name where it does not, and a rolled name has no parseable date —
+    /// so the count, not the naming, is the thing to assert.
+    #[test]
+    fn a_roll_never_lifts_the_file_count_above_the_cap_plus_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for day in ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04"] {
+            std::fs::write(dir.path().join(format!("carrick.log.{day}")), "old\n")
+                .expect("seed old log");
+        }
+        std::fs::write(dir.path().join("carrick.log.2026-09-01.1"), "older still\n")
+            .expect("seed rolled");
+        let day = today();
+        std::fs::write(
+            dir.path().join(format!("carrick.log.{day}")),
+            vec![b'x'; 512],
+        )
+        .expect("seed today");
+
+        assert_eq!(roll_over_cap(dir.path(), &day, 256), Some(512));
+
+        let mut appender = rolling::Builder::new()
+            .rotation(rolling::Rotation::DAILY)
+            .filename_prefix("carrick.log")
+            .max_log_files(RETAINED_LOG_DAYS)
+            .build(dir.path())
+            .expect("build appender");
+        writeln!(appender, "a line").expect("write");
+        appender.flush().expect("flush");
+
+        let kept = log_files(dir.path());
+        assert!(
+            kept.len() <= RETAINED_LOG_DAYS + 1,
+            "kept {} files, bound is {}: {kept:?}",
+            kept.len(),
+            RETAINED_LOG_DAYS + 1
+        );
+        assert!(
+            kept.contains(&format!("carrick.log.{day}")),
+            "today's file is not there: {kept:?}"
+        );
+        assert!(
+            kept.iter()
+                .filter(|name| name.ends_with(ROLLED_SUFFIX))
+                .count()
+                <= 1,
+            "more than one rolled generation: {kept:?}"
+        );
     }
 
     fn log_files(dir: &Path) -> Vec<String> {
