@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.55](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.54...carrick-v0.3.55) (2026-09-09)
+
+
+### Bug Fixes
+
+* **release:** regenerate the lockfile before npm ci, which cannot be correct at a release ([#891](https://github.com/carrick-tools/carrick/issues/891)) ([c86fe3d](https://github.com/carrick-tools/carrick/commit/c86fe3d095e95e202e10971c995a4640aed55e7f)), closes [#710](https://github.com/carrick-tools/carrick/issues/710)
+
+
+### Documentation
+
+* **action:** say that a full scan of an indexed commit is discarded ([#886](https://github.com/carrick-tools/carrick/issues/886)) ([cb207ce](https://github.com/carrick-tools/carrick/commit/cb207ce1d3ddb6175107295fe823cfc9fec5fb50))
+
 ## [0.3.54](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.53...carrick-v0.3.54) (2026-09-09)
 
 
