@@ -19,7 +19,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.join(here, "..", "..");
@@ -77,7 +77,12 @@ export function build({ platform, arch, version, binary, out }) {
   return target;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// `file://${argv[1]}` is not this module's URL on Windows, where argv[1] is
+// `D:\a\...` and the URL is `file:///D:/a/...`. That comparison was false on
+// the win32 leg of the release, so this script did nothing and exited 0 — the
+// step passed, the package was never written, and the failure only surfaced
+// two steps later as a missing directory (release 0.3.52).
+if (pathToFileURL(process.argv[1] ?? "").href === import.meta.url) {
   try {
     const parsed = options(process.argv.slice(2));
     const target = build(parsed);

@@ -164,3 +164,31 @@ test("no lifecycle script runs on install, so --ignore-scripts changes nothing",
     assert.ok(!(name in scripts), `${name} would not run under --ignore-scripts`);
   }
 });
+
+test("the platform builder writes a package when run as a command", async () => {
+  // Imported, `build()` is covered by the manifest test above. Run as a
+  // command it goes through the entry guard, and a guard that is false writes
+  // nothing and still exits 0 — which is how a release leg passed this step
+  // with no package to show for it.
+  const { execFileSync } = await import("node:child_process");
+  const os = await import("node:os");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-platform-"));
+  const binary = path.join(root, "carrick");
+  fs.writeFileSync(binary, "#!/bin/sh\n");
+  execFileSync(
+    process.execPath,
+    [
+      path.join(repoRoot, "npm", "platform", "build.mjs"),
+      "--platform", "linux",
+      "--arch", "x64",
+      "--version", "9.9.9",
+      "--binary", binary,
+      "--out", path.join(root, "out"),
+    ],
+    { encoding: "utf8" },
+  );
+  const built = path.join(root, "out", "linux-x64");
+  assert.ok(fs.existsSync(path.join(built, "package.json")), "no package.json was written");
+  assert.ok(fs.existsSync(path.join(built, "bin", "carrick")), "no binary was written");
+  assert.equal(readJson(path.join(built, "package.json"))["version"], "9.9.9");
+});
