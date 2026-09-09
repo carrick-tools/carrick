@@ -18,10 +18,113 @@ jobs:
       - uses: googleapis/release-please-action@v4
         id: release
 
-  publish:
+  # One binary per platform npm can install. The names are the npm platform and
+  # arch strings, because that is what `carrick`'s resolver asks for
+  # (npm/carrick/src/native.ts) — a rust target triple is a detail of this job.
+  binaries:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            arch: x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - platform: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: darwin
+            arch: arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+          # Both Mac targets on the same Apple-silicon runner: the x86_64
+          # target needs `rustup target add` and nothing else, and the
+          # Intel-runner labels are being retired.
+          - platform: darwin
+            arch: x64
+            runner: macos-latest
+            target: x86_64-apple-darwin
+          # Nothing in this repo has ever been built or run on Windows. It is
+          # allowed to fail rather than hold up a release: a platform package
+          # that does not publish leaves an optional dependency that resolves
+          # to nothing, which npm skips with a warning.
+          - platform: win32
+            arch: x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            optional: true
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.optional == true }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the version from the tag
+        id: version
+        shell: bash
+        run: |
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          echo "version=${TAG##*v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-cargo-release-
+
+      - name: Build binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build the platform package
+        shell: bash
+        run: |
+          BINARY="target/${{ matrix.target }}/release/carrick"
+          [ "${{ matrix.platform }}" = "win32" ] && BINARY="$BINARY.exe"
+          node npm/platform/build.mjs \
+            --platform "${{ matrix.platform }}" \
+            --arch "${{ matrix.arch }}" \
+            --version "${{ steps.version.outputs.version }}" \
+            --binary "$BINARY" \
+            --out dist/platform
+
+      # Packed here, not in the publish job: upload-artifact does not carry a
+      # file's mode, so a binary uploaded as a file arrives 0644 and every
+      # install of it fails with EACCES. A tarball keeps the executable bit.
+      - name: Pack the platform package
+        shell: bash
+        run: |
+          cd "dist/platform/${{ matrix.platform }}-${{ matrix.arch }}"
+          npm pack --pack-destination "$GITHUB_WORKSPACE/dist/tarballs"
+
+      - name: Upload the platform package
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/tarballs/*.tgz
+          retention-days: 1
+
+  # The release asset the Action has always downloaded. It stays until the npm
+  # path is proven on a mirror: a first publish that fails, or publishes four
+  # platforms out of five, must not take every customer's scan with it.
+  # Its own job, so a failed publish cannot stop the asset being attached.
+  action-tarball:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -73,6 +176,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # `v1` means "the Action works at this commit", so it moves with the
+      # asset rather than with the npm publish: the Action falls back to the
+      # asset, so a release that published nothing to npm is still a release
+      # a pinned workflow can run.
       - name: Update v1 moving tag
         run: |
           TAG="${{ needs.release-please.outputs.tag_name }}"
@@ -85,6 +192,61 @@ jobs:
           git push -f origin v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publishing uses NPM_TOKEN for this first release only: npm configures a
+  # trusted publisher on a package that exists, and none of these six do yet.
+  # The token is a granular, short-lived one; after the first publish the six
+  # packages move to trusted publishing and the token is deleted, which is
+  # carrick#874. `id-token: write` stays either way — provenance is
+  # generated from it, token or no token.
+  publish:
+    needs: [release-please, binaries]
+    if: ${{ needs.release-please.outputs.release_created }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Provenance is generated from this, with or without the token below.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing needs npm 11.5.1 or newer; the one bundled with Node
+      # 24 is older than that on some images.
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - name: Download the platform packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: platform-*
+          path: dist/tarballs
+          merge-multiple: true
+
+      - name: Publish the platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          for tarball in dist/tarballs/*.tgz; do
+            echo "publishing $tarball"
+            npm publish --access public "$tarball"
+          done
+
+      - name: Build the type sidecar
+        run: cd src/sidecar && npm ci && npm run build
+
+      # prepack builds the emit and bundles the sidecar, and fails when the
+      # sidecar imports something the package does not declare.
+      - name: Publish carrick
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: cd npm/carrick && npm ci && npm publish --access public
 
   # Builds the carrick-match wasm artifact, attaches it to the release, and
   # dispatches the pin-bump PR in carrick-cloud (#325). Lives in the same

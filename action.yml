@@ -71,8 +71,49 @@ runs:
       with:
         node-version: "24"
 
-    - name: Download Carrick
+    - name: Resolve the Carrick version
       if: steps.fork-check.outputs.skip != 'true'
+      id: version
+      shell: bash
+      run: |
+        # Pin to the release matching this action checkout: release-please
+        # bumps Cargo.toml and npm/carrick/package.json in the same commit it
+        # tags, so the version here identifies what this ref shipped with.
+        # Without the pin every run would float to the latest published
+        # package regardless of which action ref the workflow pinned.
+        VERSION=$(grep -m1 '^version' "$GITHUB_ACTION_PATH/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+        echo "Using carrick@$VERSION"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+    # Which copy of Carrick this run uses. The npm package is the one artefact
+    # from carrick#710; the release asset is what every run used before it, and
+    # it stays until the npm path has been proven on a real scan. A probe
+    # rather than a fallback around the scan itself: a scan that runs and exits
+    # non-zero has found issues, and must never be mistaken for a missing
+    # package.
+    - name: Resolve how to run Carrick
+      if: steps.fork-check.outputs.skip != 'true'
+      id: resolve
+      shell: bash
+      run: |
+        VERSION="${{ steps.version.outputs.version }}"
+        # Two halves to prove, and both fail quietly if only one is checked:
+        # the package resolves at all (npx exits non-zero when it does not),
+        # and the platform package for THIS runner came with it. `--help`
+        # exits 0 either way and says so in its output, so a release that
+        # published four platforms out of five falls back here rather than
+        # failing the scan. The download this warms is the one the scan reuses
+        # from npx's cache.
+        if OUT=$(npx --yes "carrick@$VERSION" --help 2>&1) && ! grep -q "is not installed" <<<"$OUT"; then
+          echo "carrick@$VERSION resolves on npm, with a binary for $(uname -s)/$(uname -m)"
+          echo "mode=npx" >> "$GITHUB_OUTPUT"
+        else
+          echo "::notice::carrick@$VERSION is not installable from npm on this runner; running from the release asset instead."
+          echo "mode=tarball" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Download Carrick from the release asset
+      if: steps.resolve.outputs.mode == 'tarball'
       id: download
       shell: bash
       env:
@@ -138,7 +179,7 @@ runs:
         echo "dist-dir=$DIST_DIR" >> "$GITHUB_OUTPUT"
 
     - name: Install sidecar dependencies
-      if: steps.fork-check.outputs.skip != 'true'
+      if: steps.resolve.outputs.mode == 'tarball'
       shell: bash
       run: cd "${{ steps.download.outputs.dist-dir }}/sidecar" && npm ci
 
@@ -199,8 +240,15 @@ runs:
         # RUNNER_TEMP so it never pollutes the user's workspace.
         LOG_FILE="$RUNNER_TEMP/carrick-analysis.log"
 
+        # The npm package carries the binary for this runner (an optional
+        # dependency npm resolves by os and cpu) and the type sidecar with its
+        # dependencies, so that path downloads, untars and installs nothing.
         set +e
-        "${{ steps.download.outputs.dist-dir }}/carrick" "${{ inputs.path }}" 2>&1 | tee "$LOG_FILE"
+        if [ "${{ steps.resolve.outputs.mode }}" = "npx" ]; then
+          npx --yes "carrick@${{ steps.version.outputs.version }}" "${{ inputs.path }}" 2>&1 | tee "$LOG_FILE"
+        else
+          "${{ steps.download.outputs.dist-dir }}/carrick" "${{ inputs.path }}" 2>&1 | tee "$LOG_FILE"
+        fi
         EXIT_CODE=${PIPESTATUS[0]}
         set -e
 
