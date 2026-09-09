@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.52](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.51...carrick-v0.3.52) (2026-09-09)
+
+
+### Features
+
+* **dispatch:** carry a wrapper's dispatch value onto the sites that call it ([#873](https://github.com/carrick-tools/carrick/issues/873)) ([6b95883](https://github.com/carrick-tools/carrick/commit/6b958837d44e0eb337ff39ce3f863df8cb8cc04f))
+* **release:** publish carrick to npm, keeping the release asset as the fallback ([#834](https://github.com/carrick-tools/carrick/issues/834)) ([753df62](https://github.com/carrick-tools/carrick/commit/753df6262ab636302213ac9c4a9de4aca80b74ef)), closes [#710](https://github.com/carrick-tools/carrick/issues/710) [#833](https://github.com/carrick-tools/carrick/issues/833)
+
+
+### Bug Fixes
+
+* **extract:** index function members of a module's exported object literal ([#862](https://github.com/carrick-tools/carrick/issues/862)) ([384cf24](https://github.com/carrick-tools/carrick/commit/384cf24783f42e8db526863ef9eef40ef437e66a))
+
 ## [0.3.51](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.50...carrick-v0.3.51) (2026-09-09)
 
 
