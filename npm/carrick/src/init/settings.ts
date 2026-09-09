@@ -17,7 +17,15 @@ import path from "node:path";
 
 import { packageRoot } from "../native.ts";
 
-/** The entry point in this package, for a settings file that must name a path. */
+/**
+ * The entry point in this package, for a settings file that must name a path.
+ *
+ * A hook command is a line handed to a shell, so this file has to be runnable
+ * on its own: it carries a `#!/usr/bin/env node` shebang, it is executable in
+ * the repository, and npm sets the mode on a `bin` target at install time
+ * (verified 2026-09-09 against a packed tarball installed with
+ * `--ignore-scripts`: 644 in the archive, 755 once installed).
+ */
 export function ownEntryPoint(root: string = packageRoot()): string {
   return path.join(root, "bin", "carrick.mjs");
 }
