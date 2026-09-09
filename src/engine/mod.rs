@@ -3714,11 +3714,14 @@ fn aliases_to_resolve(manifest: &[TypeManifestEntry]) -> Vec<String> {
 ///
 ///  - **is there anything to publish?** An answer that is itself a bare `any`
 ///    or `unknown` describes nothing, so it is not written: the entry keeps no
-///    definition, reads `Unknown`, and its `any_provenance` says why. Writing
-///    it would publish `any` — "this endpoint accepts anything" — where the
-///    truth is "no layer could see this type". A shape with a top type
-///    somewhere INSIDE it still describes a payload and is published, with its
-///    provenance (carrick#376).
+///    definition, and its `any_provenance` says why. Writing it would publish
+///    `any` — "this endpoint accepts anything" — where the truth is "no layer
+///    could see this type". A shape with a top type somewhere INSIDE it still
+///    describes a payload and is published, with its provenance (carrick#376).
+///    This question is asked of EVERY entry, not only the abstained ones: a
+///    non-answer is not worth publishing whoever asked for it, and the readers
+///    that count typed operations count `resolved_definition.is_some()`
+///    (carrick#852).
 ///  - **does it settle the state?** Only a shape with no disqualifying top type
 ///    anywhere in it, the same notion the check phase uses. That promotion is
 ///    scoped to entries the v1 side abstained on; `type_state` reflecting the
@@ -3740,8 +3743,21 @@ fn apply_resolved_definitions(
         };
         let v1_abstained = entry.v1_unresolved && entry.type_state == ManifestTypeState::Unknown;
 
-        if v1_abstained
-            && (r.expanded.trim().is_empty() || type_compat_v2::text_is_bare_top_type(&r.expanded))
+        // An answer that IS a bare top type describes nothing, and describes
+        // nothing whoever asked for it. The rule used to be scoped to entries
+        // v1 abstained on, so an entry v1 DID answer for published
+        // `export type … = unknown;` as its resolved definition — and every
+        // reader that asks "does this operation have a type" asks
+        // `resolved_definition.is_some()`, so a non-answer was counted as an
+        // answer (carrick#852). Publishing it also offers a producer side to a
+        // compatibility check with nothing in it.
+        //
+        // The empty answer stays scoped to the abstention: an entry v1 answered
+        // for has a shape behind it, and an empty expansion there is the
+        // capture failing to print one rather than the capture saying there is
+        // none.
+        if type_compat_v2::text_is_bare_top_type(&r.expanded)
+            || (v1_abstained && r.expanded.trim().is_empty())
         {
             continue;
         }
@@ -7346,6 +7362,33 @@ mod tests {
             "`any` is not a contract to publish; the row's provenance says why there is none"
         );
         assert_eq!(manifest[0].expanded_definition, None);
+    }
+
+    /// The same question, asked of an entry the v1 side DID answer for. Seven
+    /// rows of one indexed service published `export type … = unknown;` as
+    /// their resolved definition: a symbol was named, `type_state` read
+    /// `Implicit`, and the boundary counted them as typed because it counts
+    /// `resolved_definition.is_some()` (carrick#852).
+    #[test]
+    fn a_shapeless_capture_answer_publishes_nothing_for_an_answered_entry() {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        manifest[0].type_state = ManifestTypeState::Implicit;
+        manifest[0].is_explicit = false;
+        assert!(!manifest[0].v1_unresolved, "v1 answered for this one");
+
+        apply_resolved_definitions(&mut manifest, vec![captured("OrderView", "unknown")]);
+
+        assert_eq!(
+            manifest[0].resolved_definition, None,
+            "`unknown` is not a definition to publish"
+        );
+        assert_eq!(manifest[0].expanded_definition, None);
+        assert_eq!(
+            manifest[0].type_state,
+            ManifestTypeState::Implicit,
+            "what the SOURCE states about the type is untouched: this is about \
+             what the capture could resolve, not about how it was written"
+        );
     }
 
     /// A shape with a top type inside it still describes a payload: it is
