@@ -711,6 +711,7 @@ mod tests {
                 return_is_explicit: false,
                 signature: None,
                 intent_input_hash: None,
+                dispatch_table: None,
             },
         );
         strip_body_source(&mut defs);
@@ -785,6 +786,7 @@ mod tests {
             return_is_explicit: false,
             signature: None,
             intent_input_hash: None,
+            dispatch_table: None,
         };
 
         // Complete: both intent and hash present → kept.
@@ -859,6 +861,7 @@ mod tests {
             return_is_explicit: false,
             signature: None,
             intent_input_hash: None,
+            dispatch_table: None,
         }
     }
 

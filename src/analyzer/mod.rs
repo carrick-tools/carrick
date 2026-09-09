@@ -3241,6 +3241,7 @@ mod tests {
             return_is_explicit: false,
             signature: None,
             intent_input_hash: None,
+            dispatch_table: None,
         };
 
         let mut defs = HashMap::new();

@@ -319,6 +319,167 @@ fn declared_location(
     }
 }
 
+/// The advisory for every handler that switches on a request field and has no
+/// `operations` block declaring what it serves (carrick#831).
+///
+/// One finding per (service, location, field). It carries the material a
+/// reader needs to accept the model's reading rather than author it: the
+/// values, the route consumers name (when any do), and the call sites already
+/// stating a value. A table whose field IS declared produces nothing — the
+/// question it asks has been answered.
+///
+/// Never a failure and never a claim that anything is wrong: the handler
+/// works. What is missing is in the index, not in the code.
+pub fn dispatch_operation_findings(
+    repos: &[crate::cloud_storage::CloudRepoData],
+) -> Vec<crate::findings::Finding> {
+    let mut findings = Vec::new();
+    for repo in repos {
+        let Some(tables) = repo.dispatch_tables.as_ref() else {
+            continue;
+        };
+        let service = repo
+            .service_name
+            .clone()
+            .unwrap_or_else(|| repo.repo_name.clone());
+        let declared = declared_fields(repo);
+        for table in tables {
+            if declared.contains(&(table.location, table.field.clone())) {
+                continue;
+            }
+            // The route and the call sites come from the CONSUMERS, because
+            // the case this exists for is the handler whose route is not in
+            // the source at all. A call counts when it states a value for
+            // this field that this handler answers — that, and not the path,
+            // is what ties it to this table.
+            let mut routes: std::collections::BTreeMap<String, usize> = Default::default();
+            let mut call_sites: Vec<String> = Vec::new();
+            for other in repos {
+                let other_service = other
+                    .service_name
+                    .clone()
+                    .unwrap_or_else(|| other.repo_name.clone());
+                if other_service == service {
+                    continue;
+                }
+                for call in &other.calls {
+                    let Some(dispatch) = call.dispatch.as_ref() else {
+                        continue;
+                    };
+                    if dispatch.location != table.location || dispatch.field != table.field {
+                        continue;
+                    }
+                    if !table.values.contains(&dispatch.value) {
+                        continue;
+                    }
+                    if let Some((method, path)) = call.key.as_http() {
+                        *routes.entry(format!("{method} {path}")).or_default() += 1;
+                    }
+                    call_sites.push(call.file_path.to_string_lossy().into_owned());
+                }
+            }
+            // The route the most consumers name. A tie is broken by the route
+            // text so two scans of one tree suggest the same block.
+            let route = routes
+                .into_iter()
+                .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                .map(|(route, _)| route);
+            call_sites.sort();
+            call_sites.dedup();
+            findings.push(crate::findings::Finding::DispatchOperations {
+                service: service.clone(),
+                route,
+                dispatch_location: table.location.as_str().to_string(),
+                dispatch_field: table.field.clone(),
+                values: table.values.clone(),
+                call_sites,
+            });
+        }
+    }
+    findings
+}
+
+/// The `(location, field)` pairs this repo's `carrick.json` already declares
+/// operations for, read back off the config the blob carries.
+fn declared_fields(
+    repo: &crate::cloud_storage::CloudRepoData,
+) -> std::collections::HashSet<(DispatchLocation, String)> {
+    let Some(config_json) = repo.config_json.as_deref() else {
+        return Default::default();
+    };
+    let Ok(config) = serde_json::from_str::<crate::config::Config>(config_json) else {
+        return Default::default();
+    };
+    config
+        .declared_operations
+        .iter()
+        .map(|block| (block.dispatch.location, block.dispatch.field.clone()))
+        .collect()
+}
+
+/// Copy each table onto the function row that declares its handler
+/// (carrick#831), joined by `handler_name` + `line_number` in the same file.
+///
+/// Returns how many joined. The array stays the record either way: a table
+/// whose handler the function index never saw (an inline handler, a file the
+/// definition pass skipped) is carried there and simply has no row to sit on,
+/// which is why this reports its count instead of asserting one.
+pub fn stamp_dispatch_tables_on_functions(
+    function_definitions: &mut std::collections::HashMap<
+        String,
+        crate::visitor::FunctionDefinition,
+    >,
+    tables: &[DispatchTable],
+) -> usize {
+    let mut stamped = 0usize;
+    for table in tables {
+        let Some(handler_name) = table.handler_name.as_deref() else {
+            continue;
+        };
+        // Same name AND same file. One repo declares `handler` in a dozen
+        // files, so the name alone would stamp the fact onto every one of
+        // them.
+        let candidates: Vec<String> = function_definitions
+            .iter()
+            .filter(|(_, definition)| definition.name == handler_name)
+            .filter(|(_, definition)| {
+                definition
+                    .file_path
+                    .to_string_lossy()
+                    .ends_with(table.file_path.trim_start_matches("./"))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        // The line extraction stated for the declaration decides between
+        // several same-named functions in one file. When it matches none of
+        // them, a SOLE candidate still takes it: the line is the model's
+        // reading of where a declaration opens and is worth a few lines of
+        // slack, while the name and the file together already identify the
+        // function. Several candidates and no line agreement stamps nothing
+        // — the array is the record either way.
+        let by_line: Vec<&String> = candidates
+            .iter()
+            .filter(|key| Some(function_definitions[*key].line_number) == table.line_number)
+            .collect();
+        let chosen: Vec<String> = if !by_line.is_empty() {
+            by_line.into_iter().cloned().collect()
+        } else if candidates.len() == 1 {
+            candidates
+        } else {
+            Vec::new()
+        };
+
+        for key in chosen {
+            if let Some(definition) = function_definitions.get_mut(&key) {
+                definition.dispatch_table = Some(table.clone());
+                stamped += 1;
+            }
+        }
+    }
+    stamped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,6 +681,178 @@ mod tests {
                 .iter()
                 .all(|e| e.resolution_source == Some(ResolutionSource::DeclaredOperation)),
             "every surviving row is the repo's statement"
+        );
+    }
+
+    fn table(values: &[&str]) -> DispatchTable {
+        DispatchTable {
+            location: DispatchLocation::Body,
+            field: "action".to_string(),
+            values: values.iter().map(|v| v.to_string()).collect(),
+            handler_name: Some("handler".to_string()),
+            file_path: "lambdas/check-or-upload/index.ts".to_string(),
+            line_number: Some(419),
+            service_name: None,
+            repo_name: None,
+        }
+    }
+
+    fn blob(name: &str, tables: Option<Vec<DispatchTable>>) -> crate::cloud_storage::CloudRepoData {
+        let mut data = crate::cloud_storage::CloudRepoData {
+            repo_name: name.to_string(),
+            ..serde_json::from_value(serde_json::json!({
+                "repo_name": name,
+                "endpoints": [],
+                "calls": [],
+                "mounts": [],
+                "apps": {},
+                "imported_handlers": [],
+                "function_definitions": {},
+                "last_updated": "2026-01-01T00:00:00Z",
+                "commit_hash": "deadbeef"
+            }))
+            .expect("a minimal blob deserializes")
+        };
+        data.service_name = Some(name.to_string());
+        data.dispatch_tables = tables;
+        data
+    }
+
+    /// carrick#831: the advisory carries the material for the block, and the
+    /// route comes from the consumers, because the handler it is about may
+    /// have no route in its own source at all.
+    #[test]
+    fn the_advisory_names_the_route_its_consumers_call() {
+        let producer = blob(
+            "check-or-upload",
+            Some(vec![table(&["search-by-intent", "upload-logs"])]),
+        );
+        let mut consumer = blob("mcp-server", None);
+        consumer.calls.push(crate::analyzer::ApiEndpointDetails {
+            owner: None,
+            key: crate::operation::OperationKey::http("POST", "/types/check-or-upload"),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: std::path::PathBuf::from("lambdas/mcp-server/src/api-client.ts:115"),
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            resolution_source: None,
+            view_module: false,
+            dispatch: Some(Dispatch {
+                location: DispatchLocation::Body,
+                field: "action".to_string(),
+                value: "search-by-intent".to_string(),
+            }),
+        });
+
+        let findings = dispatch_operation_findings(&[producer, consumer]);
+        assert_eq!(findings.len(), 1);
+        let crate::findings::Finding::DispatchOperations {
+            service,
+            route,
+            dispatch_field,
+            values,
+            call_sites,
+            ..
+        } = &findings[0]
+        else {
+            panic!("expected a dispatch_operations finding: {:?}", findings[0]);
+        };
+        assert_eq!(service, "check-or-upload");
+        assert_eq!(route.as_deref(), Some("POST /types/check-or-upload"));
+        assert_eq!(dispatch_field, "action");
+        assert_eq!(values.len(), 2);
+        assert_eq!(call_sites, &["lambdas/mcp-server/src/api-client.ts:115"]);
+        assert_eq!(
+            findings[0].severity(),
+            crate::findings::Severity::Advisory,
+            "never a failure: the handler works, the index is what is short"
+        );
+    }
+
+    /// A table whose field the repo already declares asks nothing, so it says
+    /// nothing.
+    #[test]
+    fn a_declared_field_produces_no_advisory() {
+        let mut producer = blob("check-or-upload", Some(vec![table(&["upload-logs"])]));
+        producer.config_json = Some(
+            serde_json::to_string(&crate::config::Config {
+                service_name: Some("check-or-upload".to_string()),
+                declared_operations: vec![crate::config::DeclaredOperations {
+                    service: "check-or-upload".to_string(),
+                    route: Some("POST /types/check-or-upload".to_string()),
+                    dispatch: crate::config::DeclaredDispatch {
+                        location: DispatchLocation::Body,
+                        field: "action".to_string(),
+                    },
+                    operations: vec![crate::config::DeclaredOperation {
+                        value: "upload-logs".to_string(),
+                        handler: None,
+                    }],
+                }],
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        assert!(dispatch_operation_findings(&[producer]).is_empty());
+    }
+
+    /// The table lands on the handler's own function row, and a table whose
+    /// handler the function index never saw is not lost — it stays in the
+    /// array, which is the record.
+    #[test]
+    fn a_table_is_stamped_onto_its_handlers_function_row() {
+        use crate::visitor::{FunctionDefinition, FunctionNodeType};
+
+        let definition = |name: &str, file: &str, line: u32| FunctionDefinition {
+            name: name.to_string(),
+            file_path: std::path::PathBuf::from(file),
+            node_type: FunctionNodeType::Placeholder,
+            arguments: vec![],
+            body_source: None,
+            is_exported: true,
+            line_number: line,
+            end_line: line + 10,
+            intent: None,
+            calls: vec![],
+            return_type: None,
+            return_is_explicit: false,
+            signature: None,
+            tokens: vec![],
+            intent_input_hash: None,
+            dispatch_table: None,
+        };
+        let mut functions = std::collections::HashMap::from([
+            (
+                "handler".to_string(),
+                definition("handler", "lambdas/check-or-upload/index.ts", 419),
+            ),
+            (
+                "other".to_string(),
+                definition("handler", "lambdas/mcp-server/src/lambda.ts", 12),
+            ),
+        ]);
+
+        let stamped = stamp_dispatch_tables_on_functions(
+            &mut functions,
+            &[table(&["upload-logs"]), {
+                let mut orphan = table(&["x"]);
+                orphan.handler_name = Some("nobody".to_string());
+                orphan
+            }],
+        );
+
+        assert_eq!(stamped, 1, "the handler in the right file, and only it");
+        assert!(functions["handler"].dispatch_table.is_some());
+        assert!(
+            functions["other"].dispatch_table.is_none(),
+            "same name, different file: not this handler"
         );
     }
 

@@ -661,6 +661,20 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         })
         .collect();
 
+    // Handlers that switch on a request field with no `operations` block yet
+    // (carrick#831), taken here for the same reason as the two above: the
+    // blobs are about to move into the analyzer. Every blob in the run is
+    // read, because the consumers that name a value are in the peers and the
+    // handler that answers them is in the current services (or the reverse on
+    // a peer's own run).
+    let dispatch_advisories = crate::dispatch::dispatch_operation_findings(
+        &all_repo_data
+            .iter()
+            .chain(current_services_data.iter())
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+
     let sp = logging::spinner("Running cross-repo analysis...");
     let analyzer =
         match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar).await {
@@ -688,6 +702,10 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // whole run's type layer is untrustworthy, not just that service's.
     let has_types = type_degradations.is_empty();
     results.findings.extend(type_degradations);
+
+    // Advisory: the index has one operation where the source has several, and
+    // the block that fixes it is a paste away (carrick#831).
+    results.findings.extend(dispatch_advisories);
 
     // 6a. Resolve this run's SDK-mediated consumer edges: consumer candidate →
     //     the publishing repo's exported member → the producer endpoint that
@@ -1560,6 +1578,16 @@ async fn analyze_current_repo_incremental(
             // no operation row to carry it.
             cloud_data.dispatch_tables =
                 crate::dispatch::collect_dispatch_tables(&raw_model_results);
+            // ...and onto the handler's own function row, joined by name and
+            // declaration line, so a reader of a function row finds the fact
+            // without knowing the array exists.
+            if let Some(tables) = cloud_data.dispatch_tables.as_ref() {
+                let stamped = crate::dispatch::stamp_dispatch_tables_on_functions(
+                    &mut cloud_data.function_definitions,
+                    tables,
+                );
+                debug!("Dispatch tables stamped onto function rows: {stamped}");
+            }
             cloud_data.file_results = Some(raw_model_results);
             cloud_data.cached_detection = Some(detection.clone());
             cloud_data.cached_guidance = Some(guidance);
@@ -4541,6 +4569,13 @@ async fn analyze_current_repo(
         .file_results
         .as_ref()
         .and_then(crate::dispatch::collect_dispatch_tables);
+    if let Some(tables) = cloud_data.dispatch_tables.clone() {
+        let stamped = crate::dispatch::stamp_dispatch_tables_on_functions(
+            &mut cloud_data.function_definitions,
+            &tables,
+        );
+        debug!("Dispatch tables stamped onto function rows: {stamped}");
+    }
     cloud_data.cached_detection = Some(analysis_result.framework_detection.clone());
     cloud_data.cached_guidance = Some(analysis_result.framework_guidance.clone());
     cloud_data.cache_version = Some(CACHE_VERSION);
@@ -4811,6 +4846,7 @@ mod tests {
                         .to_string(),
                 ),
                 intent_input_hash: None,
+                dispatch_table: None,
             },
         );
         // A path outside the repo root is left as-is (matches the dashboard's
@@ -4833,6 +4869,7 @@ mod tests {
                 return_is_explicit: false,
                 signature: None,
                 intent_input_hash: None,
+                dispatch_table: None,
             },
         );
 
@@ -4969,6 +5006,7 @@ mod tests {
                     abs("src/types")
                 )),
                 intent_input_hash: None,
+                dispatch_table: None,
             },
         );
 
@@ -6630,6 +6668,7 @@ mod tests {
                 return_is_explicit: false,
                 signature: None,
                 intent_input_hash: Some("deadbeef".to_string()),
+                dispatch_table: None,
             },
         );
 
