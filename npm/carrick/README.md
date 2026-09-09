@@ -57,6 +57,29 @@ for the machine-readable shape, pinned in
 - **Anything else**: `carrick check <file>` on demand, and the pull request
   check in CI.
 
+## In your editor
+
+Go to definition on a call to another service jumps to the handler that serves
+it, in the other repo. On a route it lists the call sites that reach it, and
+the editor shows the picker. Carrick answers only inside a row the index holds,
+and only when the file on the other side is on this disk, so every other jump
+falls through to TypeScript exactly as it did before.
+
+## Settings
+
+One switch per surface. In VS Code they are settings; any other LSP client
+sends the same keys, with the `carrick.` prefix stripped, as
+`initializationOptions`.
+
+| Setting | Default | What it turns off |
+|---|---|---|
+| `carrick.binary` | the `carrick` on PATH | — the path to the CLI, not a surface |
+| `carrick.diagnostics` | on | The verdicts in the Problems panel |
+| `carrick.definition` | on | Cross-repo go to definition. Off means Carrick answers nothing and your other definition providers are untouched |
+| `carrick.boundary` | on | The boundary: the status bar item, or the file-level row in a client without one |
+
+`CARRICK_CHANNEL=off` in the environment turns off delivery altogether.
+
 ## What a local index holds
 
 Deterministic rows: file-based and descriptor routes, class-controller routes,

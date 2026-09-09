@@ -128,6 +128,7 @@ turned off loses its rows on the next publish, not at the next restart.
 | Setting | Default | What it turns off |
 |---|---|---|
 | `carrick.diagnostics` | on | The verdicts in the Problems panel, at their own site and at each counterpart |
+| `carrick.definition` | on | Cross-repo go to definition: a call site jumps to the handler that serves it, a route lists the call sites that reach it. Off means an empty answer, so every jump falls through to the other providers |
 | `carrick.boundary` | on | The boundary: the status bar item in VS Code, the file-level row in a client without one |
 | `carrick.codeLens` | on | The lens above a route or call the index holds a counterpart or a mismatch for |
 | `carrick.binary` | the `carrick` on PATH | Not a surface: which CLI to run |

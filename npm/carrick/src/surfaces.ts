@@ -21,6 +21,12 @@
 export type Surfaces = {
   /** Publish verdict diagnostics at all. */
   diagnostics: boolean;
+  /**
+   * Answer `textDocument/definition` (carrick#881). Off means an empty answer
+   * rather than a withdrawn capability, so a client that cached the capability
+   * at initialize still behaves.
+   */
+  definition: boolean;
   /** State the boundary. Where it lands depends on `boundarySurface`. */
   boundary: boolean;
   /** Render code lenses on the rows the index knows something about. */
@@ -35,6 +41,7 @@ export type Surfaces = {
 
 export const DEFAULT_SURFACES: Surfaces = {
   diagnostics: true,
+  definition: true,
   boundary: true,
   codeLens: true,
   boundarySurface: false,
@@ -77,6 +84,7 @@ export function readSurfaces(params: unknown, current: Surfaces = DEFAULT_SURFAC
   };
   return {
     diagnostics: read("diagnostics"),
+    definition: read("definition"),
     boundary: read("boundary"),
     codeLens: read("codeLens"),
     boundarySurface: read("boundarySurface"),

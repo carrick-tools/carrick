@@ -102,6 +102,9 @@ export class LspClient {
     return id;
   }
 
+  /** The initialize response, for a test that asserts on the capabilities. */
+  initializeResult: { capabilities?: Record<string, unknown> } | null = null;
+
   async initialize(
     rootDir: string,
     clientName = "Claude Code",
@@ -119,7 +122,16 @@ export class LspClient {
       ...(initializationOptions ? { initializationOptions } : {}),
     });
     await this.waitFor(() => this.responses.has(id), "initialize response");
+    this.initializeResult = this.responses.get(id) as { capabilities?: Record<string, unknown> };
     this.notify("initialized", {});
+  }
+
+  /** A `textDocument/definition` request at a 0-based position. */
+  definition(file: string, line: number, character: number): number {
+    return this.request("textDocument/definition", {
+      textDocument: { uri: pathToFileURL(file).toString() },
+      position: { line, character },
+    });
   }
 
   open(file: string): void {

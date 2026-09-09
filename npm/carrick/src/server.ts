@@ -27,8 +27,9 @@
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { check } from "./cli.ts";
-import type { CheckResult } from "./contract.ts";
 import { resolveChannel, type ChannelChoice } from "./channel.ts";
+import type { CheckResult } from "./contract.ts";
+import { definitionsAt, positionOf } from "./definition.ts";
 import { toDiagnostics, type Diagnostic } from "./diagnostics.ts";
 import { toCodeLenses } from "./lens.ts";
 import { createLogger } from "./log.ts";
@@ -40,6 +41,8 @@ const NAME = "carrick";
 const VERSION = "0.0.1";
 /** Editors fire `didChange` on every keystroke; one check per pause is enough. */
 const DEBOUNCE_MS = 400;
+/** How many files' check answers are kept. Enough for the ones in front of you. */
+const CACHE_FILES = 64;
 
 const log = createLogger("carrick-lsp");
 
@@ -72,6 +75,12 @@ const publishedBy = new Map<string, Set<string>>();
 const debounces = new Map<string, NodeJS.Timeout>();
 /** Ids for the requests this server makes of the client. */
 let nextServerId = 1;
+/**
+ * The last check answer per absolute file, so a pull surface answers from what
+ * the push path already ran rather than running the CLI again. Dropped on every
+ * edit, because the payload's line numbers are about the text that was checked.
+ */
+const lastCheck = new Map<string, CheckResult>();
 /** One check at a time: a burst of edits must not interleave two runs. */
 let queue: Promise<void> = Promise.resolve();
 
@@ -91,20 +100,50 @@ function publish(uriPath: string, diagnostics: Diagnostic[]): void {
   });
 }
 
+/**
+ * The check answer for a file: the cached one, or one run now and cached.
+ *
+ * Every surface reads the file's answer through here, so a hover, a jump and a
+ * diagnostic on the same unchanged file cost one CLI call between them. A
+ * `check` reads `.carrick/` and never scans, but it does spawn a process, and
+ * an on-demand request is expected back in a fraction of a second.
+ */
+async function resultFor(absFile: string): Promise<CheckResult | null> {
+  const key = path.resolve(absFile);
+  const cached = lastCheck.get(key);
+  if (cached) return cached;
+  const outcome = await check(relative(absFile), { cwd: root });
+  if (!outcome.result) {
+    log("no answer for", relative(absFile), outcome.failure ?? "");
+    return null;
+  }
+  // A "no" is never cached. `not_indexed` is the answer that changes under the
+  // user's feet: they run `carrick index` in a terminal and the next request
+  // has to ask again rather than repeat what was true before they did.
+  if (outcome.result.error) return outcome.result;
+  // An editor session opens files all day and this server runs as long as it
+  // does, so the oldest entry goes when the cache is full. A Map iterates in
+  // insertion order, which makes the first key the oldest.
+  if (lastCheck.size >= CACHE_FILES) {
+    const oldest = lastCheck.keys().next();
+    if (!oldest.done) lastCheck.delete(oldest.value);
+  }
+  lastCheck.set(key, outcome.result);
+  return outcome.result;
+}
+
 async function checkAndPublish(absFile: string): Promise<void> {
   const relFile = relative(absFile);
-  const outcome = await check(relFile, { cwd: root });
-  if (!outcome.result) {
-    log("no answer for", relFile, outcome.failure ?? "");
+  const started = Date.now();
+  const result = await resultFor(absFile);
+  if (!result) return;
+  if (result.error) {
+    log("check", relFile, "->", result.error);
     return;
   }
-  if (outcome.result.error) {
-    log("check", relFile, "->", outcome.result.error);
-    return;
-  }
-  const byFile = toDiagnostics(outcome.result, root, relFile, { surfaces });
+  const byFile = toDiagnostics(result, root, relFile, { surfaces });
   log(
-    `check ${relFile} -> ${[...byFile.values()].reduce((n, list) => n + list.length, 0)} diagnostic(s) across ${byFile.size} file(s) in ${outcome.ms}ms`,
+    `check ${relFile} -> ${[...byFile.values()].reduce((n, list) => n + list.length, 0)} diagnostic(s) across ${byFile.size} file(s) in ${Date.now() - started}ms`,
   );
 
   // Clear only what THIS file's previous check flagged and no longer does: a
@@ -116,7 +155,7 @@ async function checkAndPublish(absFile: string): Promise<void> {
     new Set([...byFile.keys()].filter((file) => (byFile.get(file) ?? []).length > 0)),
   );
   for (const [file, diagnostics] of byFile) publish(file, diagnostics);
-  publishBoundary(outcome.result);
+  publishBoundary(result);
 }
 
 /**
@@ -229,6 +268,10 @@ function onInitialize(id: number | string | undefined, params: Record<string, un
         // the capability still gets an answer when the switch is flipped: the
         // answer is an empty list.
         codeLensProvider: { resolveProvider: true },
+        // Declared whatever `carrick.definition` says, for the same reason:
+        // off means an empty answer, which is the fall-through every position
+        // outside a row already gets, and never a method the server refuses.
+        definitionProvider: true,
       },
       serverInfo: { name: NAME, version: VERSION },
     },
@@ -253,9 +296,14 @@ function handle(message: Message): void {
     case "textDocument/didOpen":
     case "textDocument/didSave":
     case "textDocument/didChange": {
-      if (channel.channel !== "lsp") return;
       const file = pathOf(params);
       if (!file) return;
+      // The text moved, so the lines in the cached answer are about text that
+      // is gone. Dropped on every channel: in the hook channel nothing
+      // re-checks the file, and a jump off a stale line is the worst answer
+      // this surface can give.
+      lastCheck.delete(path.resolve(file));
+      if (channel.channel !== "lsp") return;
       scheduleCheck(file, method === "textDocument/didChange" ? DEBOUNCE_MS : 0);
       return;
     }
@@ -280,8 +328,10 @@ function handle(message: Message): void {
         return;
       }
       void enqueue(async () => {
-        const outcome = await check(relative(file), { cwd: root });
-        send({ id, result: outcome.result ? toCodeLenses(outcome.result, { surfaces }) : [] });
+        // The same cached answer every other surface reads (carrick#910): a
+        // lens and a jump on one unchanged file cost one CLI call between them.
+        const result = await resultFor(file);
+        send({ id, result: result ? toCodeLenses(result, { surfaces }) : [] });
       });
       return;
     }
@@ -290,6 +340,23 @@ function handle(message: Message): void {
       // from, so there is nothing left to fill in.
       send({ id, result: params ?? null });
       return;
+    case "textDocument/definition": {
+      // Not gated on which channel owns delivery: an install where the hook
+      // owns it publishes nothing, and a person in that editor still asks for
+      // a jump. `off` is the exception, because it is the blunt instrument
+      // that means Carrick says nothing at all.
+      const file = pathOf(params);
+      const position = positionOf(params);
+      if (!file || !position || !surfaces.definition || channel.channel === "off") {
+        send({ id, result: [] });
+        return;
+      }
+      void enqueue(async () => {
+        const result = await resultFor(file);
+        send({ id, result: result ? definitionsAt(result, position) : [] });
+      });
+      return;
+    }
     case "textDocument/diagnostic": {
       // A pull-only client still gets an answer, and the same one.
       const file = pathOf(params);
@@ -298,11 +365,10 @@ function handle(message: Message): void {
         return;
       }
       void enqueue(async () => {
-        const outcome = await check(relative(file), { cwd: root });
-        const items = outcome.result
-          ? (toDiagnostics(outcome.result, root, relative(file), { surfaces }).get(
-              path.resolve(file),
-            ) ?? [])
+        const result = await resultFor(file);
+        const items = result
+          ? (toDiagnostics(result, root, relative(file), { surfaces }).get(path.resolve(file)) ??
+            [])
           : [];
         send({ id, result: { kind: "full", items } });
       });

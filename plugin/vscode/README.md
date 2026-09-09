@@ -49,6 +49,7 @@ If the CLI lives somewhere that is not on PATH, point `carrick.binary` at it.
 |---|---|---|
 | `carrick.binary` | `carrick` on PATH | The CLI to start `lsp --stdio` on |
 | `carrick.diagnostics` | on | The verdicts in the Problems panel |
+| `carrick.definition` | on | Go to definition on a call to another service, which jumps to the handler that serves it in the other repo, and on a route lists the call sites that reach it |
 | `carrick.boundary` | on | The status bar item and its tooltip |
 | `carrick.codeLens` | on | The lens above a route or call with a counterpart or a mismatch |
 
