@@ -23,6 +23,8 @@ export type Surfaces = {
   diagnostics: boolean;
   /** State the boundary. Where it lands depends on `boundarySurface`. */
   boundary: boolean;
+  /** Render code lenses on the rows the index knows something about. */
+  codeLens: boolean;
   /**
    * The client shows the boundary somewhere that is not the Problems list, so
    * the per-file Information diagnostic is not published to it. False for a
@@ -34,6 +36,7 @@ export type Surfaces = {
 export const DEFAULT_SURFACES: Surfaces = {
   diagnostics: true,
   boundary: true,
+  codeLens: true,
   boundarySurface: false,
 };
 
@@ -75,6 +78,7 @@ export function readSurfaces(params: unknown, current: Surfaces = DEFAULT_SURFAC
   return {
     diagnostics: read("diagnostics"),
     boundary: read("boundary"),
+    codeLens: read("codeLens"),
     boundarySurface: read("boundarySurface"),
   };
 }

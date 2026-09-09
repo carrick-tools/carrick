@@ -5,7 +5,13 @@ diagnostics: the routes and calls in it, who is on the other side of them, and
 any contract that no longer holds. Consumer sites arrive as related locations,
 so a finding on a producer is one click from the code that reads it.
 
-The Problems panel is nearly all of it. That is the point: an editor-hosted
+Above a route or a call the index holds something about, one small lens says
+how many are on the other side and whether the contract still holds. Clicking it
+lists them and opens one, across repos. A row the index knows nothing about gets
+no lens: on a laptop index a missing consumer means "not indexed here" and not
+"nobody calls this", so nothing here ever says zero.
+
+The Problems panel is the rest of it. That is the point: an editor-hosted
 agent reads the Problems panel after its own edits, so a diagnostic is a channel
 into the agent that costs nobody a prompt. The one other thing on screen is a
 status bar item naming the indexed service and the commit it was taken at, whose
@@ -44,6 +50,7 @@ If the CLI lives somewhere that is not on PATH, point `carrick.binary` at it.
 | `carrick.binary` | `carrick` on PATH | The CLI to start `lsp --stdio` on |
 | `carrick.diagnostics` | on | The verdicts in the Problems panel |
 | `carrick.boundary` | on | The status bar item and its tooltip |
+| `carrick.codeLens` | on | The lens above a route or call with a counterpart or a mismatch |
 
 Each turns off its own surface and leaves the others standing, and takes effect
 on the next publish rather than at the next reload. The full table, including

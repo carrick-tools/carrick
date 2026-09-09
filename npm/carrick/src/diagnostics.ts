@@ -89,7 +89,8 @@ export type Diagnostic = {
   }>;
 };
 
-function rangeAt(line: number | undefined, col: number | undefined): Range {
+/** A one-character range at a 1-based line and column, or at 1:1 without them. */
+export function rangeAt(line: number | undefined, col: number | undefined): Range {
   const zeroLine = Math.max(0, (line ?? 1) - 1);
   const zeroCol = Math.max(0, (col ?? 1) - 1);
   return {
@@ -184,8 +185,9 @@ function defaultExists(target: string): boolean {
  */
 export function resolveCounterpart(
   counterpart: Counterpart,
-  exists: (target: string) => boolean = defaultExists,
+  exists: ((target: string) => boolean) | undefined = defaultExists,
 ): string | null {
+  if (!exists) exists = defaultExists;
   if (!counterpart.file) return null;
   if (path.isAbsolute(counterpart.file)) return exists(counterpart.file) ? counterpart.file : null;
   if (!counterpart.repo) return null;
