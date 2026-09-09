@@ -290,11 +290,13 @@ test("CARRICK_CHANNEL=off silences the jump too", async (t) => {
   assert.deepEqual(await definitionAt(client, workspace.file, ROUTE), []);
 });
 
-test("a file the index does not hold answers nothing", async (t) => {
+test("a file the index does not hold answers nothing, and is asked again once it does", async (t) => {
   const workspace = makeWorkspace();
-  const client = new LspClient({
-    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("check-not-indexed.json") }),
-  });
+  // The CLI reads its fixture on every call, so rewriting the file is a user
+  // running `carrick index` in a terminal between two jumps.
+  const answer = path.join(workspace.root, "answer.json");
+  fs.copyFileSync(fixturePath("check-not-indexed.json"), answer);
+  const client = new LspClient({ env: fakeEnv({ CARRICK_FAKE_FIXTURE: answer }) });
   t.after(() => {
     client.stop();
     workspace.cleanup();
@@ -302,4 +304,7 @@ test("a file the index does not hold answers nothing", async (t) => {
 
   await client.initialize(workspace.root);
   assert.deepEqual(await definitionAt(client, workspace.file, ROUTE), []);
+
+  fs.copyFileSync(fixturePath("check-mismatch.json"), answer);
+  assert.equal((await definitionAt(client, workspace.file, ROUTE)).length, 1);
 });

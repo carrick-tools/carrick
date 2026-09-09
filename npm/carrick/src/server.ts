@@ -117,6 +117,10 @@ async function resultFor(absFile: string): Promise<CheckResult | null> {
     log("no answer for", relative(absFile), outcome.failure ?? "");
     return null;
   }
+  // A "no" is never cached. `not_indexed` is the answer that changes under the
+  // user's feet: they run `carrick index` in a terminal and the next request
+  // has to ask again rather than repeat what was true before they did.
+  if (outcome.result.error) return outcome.result;
   // An editor session opens files all day and this server runs as long as it
   // does, so the oldest entry goes when the cache is full. A Map iterates in
   // insertion order, which makes the first key the oldest.
