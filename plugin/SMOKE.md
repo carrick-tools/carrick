@@ -4,6 +4,11 @@ The plugin's own suite runs against fixture payloads and a fake binary, so none
 of it proves anything against a real index. These are the runs that do. Section
 0 and section 3 are free; sections 1 and 2 spend a little on model calls.
 
+This file is the record of what has been run. [TEST-PLAN.md](./TEST-PLAN.md) is
+the wider list of what must be run for the whole delivery surface: the npm
+package on every platform and package manager it claims, the CLI's error paths,
+both Claude Code channels, and each editor over the same language server.
+
 Set once for every command below:
 
 ```
