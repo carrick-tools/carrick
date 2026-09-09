@@ -633,11 +633,14 @@ impl AgentSchemas {
                     }
                 }
             },
-            // `dispatch_tables` is NOT required, following the two optional
-            // top-level arrays already on this schema. It is not a locator
-            // field: a handler that switches on a request field is a shape the
-            // model either sees or does not, and an empty array forced out of
-            // a file with no such handler buys nothing.
+            // `dispatch_tables` is required for the same reason
+            // `pubsub_operations` is: an OPTIONAL top-level array is one
+            // flash-lite drops wholesale (the GraphQL section, ~4/20 runs,
+            // #403), and for a ROUTELESS producer this array is the only
+            // record its operations exist at all — a dropped section loses
+            // the whole finding rather than one field of it. An empty array
+            // is always groundable, so requiring it cannot force
+            // hallucination.
             // `pubsub_operations` is required so the model must always emit the
             // array (empty when a file has none). As an optional property the
             // lite model omitted it in 9/12 harness runs on the corpus-2 Kafka
@@ -648,7 +651,7 @@ impl AgentSchemas {
             // `graphql_consumer_locates` stays optional deliberately: its
             // instruction is "omit the entry rather than guess" — judgment,
             // not location.
-            "required": ["mounts", "endpoints", "data_calls", "pubsub_operations"]
+            "required": ["mounts", "endpoints", "data_calls", "pubsub_operations", "dispatch_tables"]
         })
     }
 
@@ -888,11 +891,11 @@ mod tests {
             "the locator fields are required so the lite model states them rather than omitting them (#300)"
         );
         assert!(
-            !schema["required"]
+            schema["required"]
                 .as_array()
                 .unwrap()
                 .contains(&serde_json::json!("dispatch_tables")),
-            "an optional top-level array, like the two GraphQL ones"
+            "required, like pubsub_operations: an optional top-level array is one flash-lite drops wholesale (#403)"
         );
 
         // A response written to this schema round-trips into the scanner's
