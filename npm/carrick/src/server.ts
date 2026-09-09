@@ -6,14 +6,19 @@
 // anything on the other side of them disagree. The answer comes from
 // `carrick check <file> --json`; nothing is computed here.
 //
-// Client differences it is built for (verified on the 2026-09-05 spike):
+// Client differences it is built for (verified on the 2026-09-05 spike, and on
+// Claude Code 2.1.265 on 2026-09-09; see plugin/SMOKE.md section 1):
 //
 // * Claude Code sends `didOpen` only, with the post-edit text, and delivers
 //   diagnostics into the model one turn later. Editors send `didChange` too, so
 //   both are handled and `didChange` is debounced.
-// * Claude Code runs one server per file extension: with a TypeScript server
-//   enabled, this one is not started at all and the PostToolUse hook is the
-//   channel. Editors accept any number of diagnostic providers per file.
+// * Claude Code starts this server lazily, and only when the Edit or Write tool
+//   touches a file whose extension the manifest claims. An edit the model makes
+//   through Bash starts nothing, on either channel, because the PostToolUse
+//   hook matches the same three tools. Editors open every file they show.
+// * Claude Code runs one server per file extension: with another plugin's
+//   server already claiming `.ts`, this one is not used for it. Editors accept
+//   any number of diagnostic providers per file.
 // * Claude Code drops `relatedInformation`; editors render it. Counterpart
 //   sites go in both places (see diagnostics.ts).
 //
