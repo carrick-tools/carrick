@@ -49,6 +49,12 @@ pub struct VerifiedEndpointEntry {
     pub path: String,
     pub provenance: crate::operation::EndpointProvenance,
     pub type_verdict: Option<crate::operation::TypeVerdict>,
+    /// The dispatch case this operation is, when it is one of several behind
+    /// its route (carrick#831). Part of the row's IDENTITY, not decoration:
+    /// without it the nine operations behind one route collapse to one
+    /// verified row, and eight operations nothing calls read as consumed
+    /// because a ninth was.
+    pub dispatch: Option<crate::dispatch::Dispatch>,
 }
 
 impl VerifiedEndpointEntry {
@@ -59,7 +65,14 @@ impl VerifiedEndpointEntry {
             path,
             provenance,
             type_verdict: None,
+            dispatch: None,
         }
+    }
+
+    /// The same, for one case of a body-dispatching route.
+    fn with_dispatch(mut self, dispatch: Option<crate::dispatch::Dispatch>) -> Self {
+        self.dispatch = dispatch;
+        self
     }
 }
 /// Result of `analyze_matches_with_mount_graph` and
@@ -256,6 +269,19 @@ pub struct ApiEndpointDetails {
     /// minority of rows, not a field every row carries.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub view_module: bool,
+    /// The dispatch case this operation is (carrick#831). On an ENDPOINT
+    /// entry: the request field the handler switches on and the literal this
+    /// case answers. On a CALL entry: the literal that call sends for it.
+    /// `None` on both sides is a plain route, which is nearly every row.
+    ///
+    /// This is the one field on this struct that is part of the operation's
+    /// IDENTITY: `POST /types/check-or-upload {action=upload-logs}` and
+    /// `{action=search-by-intent}` are two operations with two request
+    /// contracts, and a bookkeeping map keyed on method and path alone folds
+    /// them into one. Carried from the mount-graph row, projected to the
+    /// index, and read by matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<crate::dispatch::Dispatch>,
 }
 
 pub struct ApiAnalysisResult {
@@ -798,10 +824,19 @@ fn sort_dedup_cross_repo_matches(matches: &mut Vec<CrossRepoMatch>) {
 /// (the matchers build entries verdict-free; the join runs later), so it plays
 /// no part in the ordering or the dedup key.
 fn sort_dedup_verified(verified: &mut Vec<VerifiedEndpointEntry>) {
+    // The dispatch case is part of the key on both sides (carrick#831):
+    // collapsing on `(method, path)` alone would fold the cases of one route
+    // into whichever sorted first, and report eight unconsumed operations as
+    // verified.
     verified.sort_by(|a, b| {
-        (&a.method, &a.path, a.provenance).cmp(&(&b.method, &b.path, b.provenance))
+        (&a.method, &a.path, &a.dispatch, a.provenance).cmp(&(
+            &b.method,
+            &b.path,
+            &b.dispatch,
+            b.provenance,
+        ))
     });
-    verified.dedup_by(|a, b| a.method == b.method && a.path == b.path);
+    verified.dedup_by(|a, b| a.method == b.method && a.path == b.path && a.dispatch == b.dispatch);
 }
 
 /// Aggregate the per-consumer type verdicts on the cross-repo edges onto each
@@ -2056,6 +2091,20 @@ impl Analyzer {
                             .insert(call_site);
                         continue;
                     }
+                    // The case this call states for a dispatching producer's
+                    // field (carrick#831), computed once for the whole
+                    // producer loop. `None` is a call that states nothing —
+                    // against a plain route that is every call there has ever
+                    // been, and against a dispatching one it is the reason the
+                    // pair cannot be drawn.
+                    let call_dispatch = crate::dispatch::Dispatch::key_of(call.dispatch.as_ref());
+                    // Whether every producer this call routed to refused it on
+                    // its dispatch case, and the last verdict that said so. A
+                    // call the router would deliver but no case answers is
+                    // UNMATCHED, not silently dropped: the producers exist, so
+                    // the code below would otherwise record nothing at all.
+                    let mut dispatch_rejection: Option<carrick_match::MatchVerdict> = None;
+                    let mut any_producer_matched = false;
                     for endpoint in matching_endpoints {
                         // #381: a pairing with zero literal agreement — a
                         // wildcard-only producer (`GET /*`) absorbing an
@@ -2067,15 +2116,47 @@ impl Analyzer {
                         // agreement). `reportable_agreement` is the shared
                         // definition of that rule (#537) — the cloud and the
                         // MCP server run the same one over wasm.
-                        if carrick_match::reportable_agreement(
+                        //
+                        // The dispatch form of it (carrick#831) adds the one
+                        // question the path cannot answer: when this producer
+                        // is one case of a body-dispatching handler, does the
+                        // call send its value? Ranking is unaffected — the
+                        // cases of one route share a path, so they scored
+                        // identically above and the maximal-agreement filter
+                        // has already kept all of them or none.
+                        let verdict = carrick_match::match_verdict_with_dispatch(
                             &endpoint.full_path,
                             &normalized_path,
-                        )
-                        .is_none()
-                        {
+                            crate::dispatch::Dispatch::key_of(endpoint.dispatch.as_ref()),
+                            call_dispatch.clone(),
+                        );
+                        if matches!(
+                            verdict,
+                            carrick_match::MatchVerdict::DispatchValueUnknown
+                                | carrick_match::MatchVerdict::DispatchValueMismatch
+                        ) {
+                            debug!(
+                                "Dispatch case declined {} {} for {}: {:?}",
+                                endpoint.method, endpoint.full_path, call_site, verdict
+                            );
+                            dispatch_rejection.get_or_insert(verdict);
                             continue;
                         }
-                        let key = format!("{}:{}", endpoint.method, endpoint.full_path);
+                        if verdict != carrick_match::MatchVerdict::Matched {
+                            continue;
+                        }
+                        any_producer_matched = true;
+                        // The dispatch case is part of the operation's
+                        // identity, so it is part of this key: without it the
+                        // nine operations behind one route are one verified
+                        // endpoint, and eight of them read as consumed
+                        // because a ninth was.
+                        let key = format!(
+                            "{}:{}{}",
+                            endpoint.method,
+                            endpoint.full_path,
+                            crate::dispatch::Dispatch::key_suffix(endpoint.dispatch.as_ref())
+                        );
                         matched_endpoints.insert(key);
                         let Some(edge) = Self::build_cross_repo_match(
                             call,
@@ -2132,6 +2213,21 @@ impl Analyzer {
                                 }
                             }
                         }
+                    }
+                    // Every producer the router would have delivered this
+                    // call to declined it on its dispatch case (carrick#831).
+                    // The route exists and the call reaches it, but no
+                    // operation behind it answers what the call sends — or,
+                    // for `dispatch_value_unknown`, the call says nothing the
+                    // cases can be told apart by. Record it UNMATCHED for the
+                    // same reason #537 records a path-less call: the
+                    // alternative is a call that matched nothing and is
+                    // reported nowhere.
+                    if !any_producer_matched && dispatch_rejection.is_some() {
+                        missing
+                            .entry((method.to_string(), miss_path))
+                            .or_default()
+                            .insert(call_site);
                     }
                 }
                 Some(_) => {
@@ -2257,13 +2353,24 @@ impl Analyzer {
             if endpoint.evidence == carrick_match::MatchEvidence::CallSite {
                 continue;
             }
-            let key = format!("{}:{}", endpoint.method, endpoint.full_path);
+            // Same key the match loop inserted, dispatch case and all
+            // (carrick#831): eight unconsumed operations behind a route whose
+            // ninth is consumed are eight orphans, not silence.
+            let key = format!(
+                "{}:{}{}",
+                endpoint.method,
+                endpoint.full_path,
+                crate::dispatch::Dispatch::key_suffix(endpoint.dispatch.as_ref())
+            );
             if matched_endpoints.contains(&key) {
-                verified.push(VerifiedEndpointEntry::new(
-                    endpoint.method.clone(),
-                    endpoint.full_path.clone(),
-                    endpoint.provenance,
-                ));
+                verified.push(
+                    VerifiedEndpointEntry::new(
+                        endpoint.method.clone(),
+                        endpoint.full_path.clone(),
+                        endpoint.provenance,
+                    )
+                    .with_dispatch(endpoint.dispatch.clone()),
+                );
             } else if !method_mismatched_producers.contains(&key)
                 && !carrick_match::is_catch_all_path(&endpoint.full_path)
                 && carrick_match::path_literal_specificity(&endpoint.full_path) > 0
@@ -3709,6 +3816,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         }
     }
 
@@ -4069,6 +4177,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         });
 
         // 2. Unclassified env var (not in internal/external list)
@@ -4087,6 +4196,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         });
 
         // 3. Process.env pattern (should be detected as env var)
@@ -4105,6 +4215,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         });
 
         // 4. Raw code pattern with UPPERCASE var (common in legacy code)
@@ -4124,6 +4235,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         });
 
         let mount_graph = MountGraph::new(); // Empty graph
@@ -4198,6 +4310,7 @@ mod tests {
                 service_name: None,
                 provenance: Default::default(),
                 resolution_source: None,
+                dispatch: None,
             });
         }
 
@@ -4266,6 +4379,7 @@ mod tests {
                 service_name: None,
                 provenance: Default::default(),
                 resolution_source: None,
+                dispatch: None,
             });
         }
 
@@ -4313,6 +4427,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -4330,6 +4445,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
+            dispatch: None,
         });
 
         let (findings, verified, _edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -4397,6 +4513,7 @@ mod tests {
                 service_name: None,
                 provenance: Default::default(),
                 resolution_source: consumer_source,
+                dispatch: None,
             });
 
             let mut mount_graph = MountGraph::new();
@@ -4414,6 +4531,7 @@ mod tests {
                 provenance: Default::default(),
                 evidence: carrick_match::MatchEvidence::RouteDefinition,
                 resolution_source: producer_source,
+                dispatch: None,
             });
             mount_graph.data_calls.push(DataFetchingCall {
                 method: "GET".to_string(),
@@ -4429,6 +4547,7 @@ mod tests {
                 base: None,
                 consumers_not_resolved: None,
                 resolution_source: consumer_source,
+                dispatch: None,
             });
 
             let (findings, _verified, _edges) =
@@ -4472,6 +4591,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: Some(ResolutionSource::ImportedMember),
+            dispatch: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -4499,6 +4619,7 @@ mod tests {
                 provenance: Default::default(),
                 evidence,
                 resolution_source: source,
+                dispatch: None,
             });
         }
         mount_graph.data_calls.push(DataFetchingCall {
@@ -4515,6 +4636,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: Some(ResolutionSource::ImportedMember),
+            dispatch: None,
         });
 
         let (findings, _verified, _edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -4552,6 +4674,7 @@ mod tests {
                 provenance: Default::default(),
                 evidence: carrick_match::MatchEvidence::RouteDefinition,
                 resolution_source: None,
+                dispatch: None,
             });
         }
 
@@ -4566,6 +4689,165 @@ mod tests {
             })
             .collect();
         assert_eq!(marked, vec![("/dashboard", true), ("/api/orders", false)]);
+    }
+
+    /// carrick#831: nine operations behind one route are nine operations.
+    ///
+    /// Three consumers, each naming a different case, produce three verified
+    /// operations and leave the other six orphaned — the shape our own
+    /// `POST /types/check-or-upload` has. Before the discriminator existed the
+    /// same graph was ONE endpoint, so one consumer verified all nine.
+    #[test]
+    fn nine_dispatch_cases_behind_one_route_verify_one_at_a_time() {
+        use crate::dispatch::{Dispatch, DispatchLocation};
+        use crate::mount_graph::ResolvedEndpoint;
+
+        const ROUTE: &str = "/types/check-or-upload";
+        const CASES: [&str; 9] = [
+            "check-or-upload",
+            "store-metadata",
+            "complete-upload",
+            "get-cross-repo-data",
+            "download-file",
+            "upload-logs",
+            "search-by-intent",
+            "list-external-calls",
+            "post-pr-result",
+        ];
+        let case = |value: &str| Dispatch {
+            location: DispatchLocation::Body,
+            field: "action".to_string(),
+            value: value.to_string(),
+        };
+
+        let mut analyzer = Analyzer::new(Config::default());
+        let mut call = |value: Option<&str>, line: u32| {
+            analyzer.calls.push(ApiEndpointDetails {
+                view_module: false,
+                owner: None,
+                key: OperationKey::http("POST", ROUTE),
+                params: vec![],
+                request_body: None,
+                response_body: None,
+                handler_name: None,
+                request_type: None,
+                response_type: None,
+                file_path: PathBuf::from(format!("api-client.ts:{line}")),
+                repo_name: Some("mcp".to_string()),
+                service_name: None,
+                provenance: Default::default(),
+                resolution_source: None,
+                dispatch: value.map(&case),
+            });
+        };
+        call(Some("search-by-intent"), 115);
+        call(Some("list-external-calls"), 162);
+        call(Some("get-cross-repo-data"), 194);
+
+        let mut mount_graph = MountGraph::new();
+        for value in CASES {
+            mount_graph.endpoints.push(ResolvedEndpoint {
+                view_module: false,
+                method: "POST".to_string(),
+                path: ROUTE.to_string(),
+                full_path: ROUTE.to_string(),
+                handler: Some(format!("handle-{value}")),
+                owner: "app".to_string(),
+                file_location: "index.ts:400".to_string(),
+                middleware_chain: vec![],
+                repo_name: Some("cloud".to_string()),
+                service_name: None,
+                provenance: Default::default(),
+                evidence: carrick_match::MatchEvidence::RouteDefinition,
+                resolution_source: None,
+                dispatch: Some(case(value)),
+            });
+        }
+
+        let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        // Cross-repo EDGES need the repo tagging the merge does, which this
+        // unit harness does not run; the verified/orphaned split is the same
+        // decision read off the same matcher call.
+        let _ = edges;
+        assert_eq!(verified.len(), 3, "one verified operation per case named");
+        let orphaned: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| matches!(f, Finding::OrphanedEndpoint { .. }))
+            .collect();
+        assert_eq!(
+            orphaned.len(),
+            6,
+            "the six cases nothing in this project calls stay orphaned: {findings:?}"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| matches!(f, Finding::MissingEndpoint { .. })),
+            "every call named a case that exists: {findings:?}"
+        );
+    }
+
+    /// carrick#831: a call that states no value for the field a producer
+    /// switches on stays UNMATCHED — the route is there, but which of its
+    /// operations the call means is unknown, and picking one would fabricate
+    /// the contract the discriminator exists to keep apart.
+    #[test]
+    fn a_call_with_no_dispatch_value_does_not_match_a_dispatching_producer() {
+        use crate::dispatch::{Dispatch, DispatchLocation};
+        use crate::mount_graph::ResolvedEndpoint;
+
+        let mut analyzer = Analyzer::new(Config::default());
+        analyzer.calls.push(ApiEndpointDetails {
+            view_module: false,
+            owner: None,
+            key: OperationKey::http("POST", "/types/check-or-upload"),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::from("api-client.ts:115"),
+            repo_name: Some("mcp".to_string()),
+            service_name: None,
+            provenance: Default::default(),
+            resolution_source: None,
+            dispatch: None,
+        });
+
+        let mut mount_graph = MountGraph::new();
+        mount_graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
+            method: "POST".to_string(),
+            path: "/types/check-or-upload".to_string(),
+            full_path: "/types/check-or-upload".to_string(),
+            handler: Some("handleSearchByIntent".to_string()),
+            owner: "app".to_string(),
+            file_location: "index.ts:400".to_string(),
+            middleware_chain: vec![],
+            repo_name: Some("cloud".to_string()),
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
+            dispatch: Some(Dispatch {
+                location: DispatchLocation::Body,
+                field: "action".to_string(),
+                value: "search-by-intent".to_string(),
+            }),
+        });
+
+        let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
+
+        assert!(edges.is_empty(), "no edge may be drawn: {edges:?}");
+        assert!(verified.is_empty(), "and nothing is verified");
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f, Finding::MissingEndpoint { .. })),
+            "the call is reported unmatched rather than dropped: {findings:?}"
+        );
     }
 
     /// A call whose path matches nothing at all (under any verb) is still a
@@ -4591,6 +4873,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -4608,6 +4891,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
+            dispatch: None,
         });
 
         let (findings, _, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -4649,6 +4933,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -4666,6 +4951,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
+            dispatch: None,
         });
 
         let (findings, _, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -4707,6 +4993,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -4725,6 +5012,7 @@ mod tests {
             provenance: EndpointProvenance::Mock,
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
+            dispatch: None,
         });
         // An unmatched mock producer: must orphan WITH the mock tag.
         mount_graph.endpoints.push(ResolvedEndpoint {
@@ -4741,6 +5029,7 @@ mod tests {
             provenance: EndpointProvenance::Mock,
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
+            dispatch: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
             method: "GET".to_string(),
@@ -4756,6 +5045,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         });
 
         let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -4850,6 +5140,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::CallSite,
             resolution_source: None,
+            dispatch: None,
         });
         // repo-beta: the identical call to the same external endpoint.
         mount_graph.data_calls.push(DataFetchingCall {
@@ -4866,6 +5157,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         });
         analyzer
             .calls
@@ -4930,6 +5222,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
+            dispatch: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
             method: "POST".to_string(),
@@ -4945,6 +5238,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         });
         analyzer
             .calls
@@ -4992,6 +5286,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::CallSite,
             resolution_source: None,
+            dispatch: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
             method: "POST".to_string(),
@@ -5007,6 +5302,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         });
         analyzer.calls.push(http_call(
             "POST",
@@ -5045,6 +5341,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
+            dispatch: None,
         }
     }
 
@@ -6232,6 +6529,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         }
     }
 

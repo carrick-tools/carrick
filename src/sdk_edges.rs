@@ -728,6 +728,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         }
     }
 
@@ -776,6 +777,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         }];
         data.mount_graph = Some(graph);
         data
@@ -916,6 +918,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         }];
         sdk.mount_graph = Some(graph);
 
@@ -974,6 +977,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         }];
         data.mount_graph = Some(graph);
         data

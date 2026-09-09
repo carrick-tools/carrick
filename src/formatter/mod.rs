@@ -630,7 +630,16 @@ fn format_verified_row(entry: &crate::analyzer::VerifiedEndpointEntry) -> String
     } else {
         ""
     };
-    format!("| `{}` | `{}`{} |\n", entry.method, entry.path, marker)
+    // One case of a body-dispatching route is its own operation, and reads as
+    // one: `POST /types/check-or-upload {action=search-by-intent}`.
+    let case = match &entry.dispatch {
+        Some(dispatch) => format!(" {{{}={}}}", dispatch.field, dispatch.value),
+        None => String::new(),
+    };
+    format!(
+        "| `{}` | `{}{}`{} |\n",
+        entry.method, entry.path, case, marker
+    )
 }
 
 /// Render a verdict subsection (heading + honest caption + table) when it has
@@ -1766,12 +1775,14 @@ mod tests {
                 path: "/api/users".to_string(),
                 provenance: EndpointProvenance::Route,
                 type_verdict: None,
+                dispatch: None,
             },
             crate::analyzer::VerifiedEndpointEntry {
                 method: "POST".to_string(),
                 path: "/api/orders".to_string(),
                 provenance: EndpointProvenance::Route,
                 type_verdict: None,
+                dispatch: None,
             },
         ];
 
@@ -1791,12 +1802,14 @@ mod tests {
                 path: "/api/users".to_string(),
                 provenance: EndpointProvenance::Route,
                 type_verdict: None,
+                dispatch: None,
             },
             crate::analyzer::VerifiedEndpointEntry {
                 method: "GET".to_string(),
                 path: "/api/widgets".to_string(),
                 provenance: EndpointProvenance::Mock,
                 type_verdict: None,
+                dispatch: None,
             },
         ];
 
@@ -1848,6 +1861,7 @@ mod tests {
             path: "/api/users".to_string(),
             provenance: EndpointProvenance::Route,
             type_verdict: None,
+            dispatch: None,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
         assert!(output.contains("Verified (1)"));
@@ -1864,6 +1878,7 @@ mod tests {
             path: "/api/users".to_string(),
             provenance: EndpointProvenance::Route,
             type_verdict: None,
+            dispatch: None,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
 
@@ -1882,6 +1897,7 @@ mod tests {
             path: "/api/users".to_string(),
             provenance: EndpointProvenance::Route,
             type_verdict: None,
+            dispatch: None,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
 
@@ -1911,6 +1927,7 @@ mod tests {
                 path: path.to_string(),
                 provenance: EndpointProvenance::Route,
                 type_verdict: verdict,
+                dispatch: None,
             }
         };
         let mut result = result_with(vec![]);
@@ -2324,6 +2341,7 @@ mod tests {
             path: "/api/users".to_string(),
             provenance: EndpointProvenance::Route,
             type_verdict: None,
+            dispatch: None,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
 

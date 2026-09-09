@@ -223,6 +223,7 @@ fn analyzer_result(
         primary_type_symbol: None,
         type_import_source: None,
         resolution_source: None,
+        dispatch: None,
     };
 
     let mut file_results = HashMap::new();
@@ -235,6 +236,7 @@ fn analyzer_result(
             data_calls: vec![],
             graphql_operations: vec![],
             pubsub_operations: vec![],
+            dispatch_tables: Vec::new(),
         },
     );
     file_results

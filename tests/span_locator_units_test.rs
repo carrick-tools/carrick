@@ -141,6 +141,7 @@ fn analyzer_result(client_file: &str, site: &Site) -> HashMap<String, FileAnalys
         base: None,
         consumers_not_resolved: None,
         resolution_source: None,
+        dispatch: None,
     };
 
     let mut file_results = HashMap::new();
@@ -153,6 +154,7 @@ fn analyzer_result(client_file: &str, site: &Site) -> HashMap<String, FileAnalys
             data_calls: vec![call],
             graphql_operations: vec![],
             pubsub_operations: vec![],
+            dispatch_tables: Vec::new(),
         },
     );
     file_results

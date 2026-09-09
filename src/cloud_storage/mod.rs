@@ -514,6 +514,23 @@ pub struct CloudRepoData {
     /// one thing it must never read as is "this scan had no boundary".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boundary: Option<crate::boundary::ServiceBoundary>,
+    /// Handlers in this service that switch on a request field, with the
+    /// values each answers (carrick#831).
+    ///
+    /// A fact about the HANDLER, kept beside the operations rather than inside
+    /// them, because a handler states it whether or not it declares a route.
+    /// For a routed handler the same fact is also on each operation row as its
+    /// own `dispatch` case; for a ROUTELESS one — an API-gateway lambda, where
+    /// the route lives in infrastructure and not in the source — this array is
+    /// the only place the nine operations behind it are stated at all, and no
+    /// operation row is invented for them. Promotion to rows is the
+    /// `operations` block in `carrick.json`.
+    ///
+    /// Nothing in matching reads it. Additive and optional: a blob written
+    /// before the field existed carries `None`, which reads as "this scanner
+    /// does not state dispatch tables", never as "this service has none".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_tables: Option<Vec<crate::dispatch::DispatchTable>>,
 }
 
 /// Version of the v2 capture stub artifact schema. Bumped on incompatible
@@ -682,6 +699,7 @@ impl CloudRepoData {
             // Collected once the blob is complete and its paths are relative;
             // see `crate::boundary::ServiceBoundary::collect`.
             boundary: None,
+            dispatch_tables: None,
         }
     }
 }
@@ -716,6 +734,10 @@ pub fn mount_graph_to_api_details(
             provenance: endpoint.provenance,
             resolution_source: endpoint.resolution_source,
             view_module: endpoint.view_module,
+            // The case this operation answers (carrick#831). Part of the
+            // operation's identity, so it travels onto the index row: without
+            // it, nine operations behind one route are one row on the wire.
+            dispatch: endpoint.dispatch.clone(),
         })
         .collect();
 
@@ -739,6 +761,9 @@ pub fn mount_graph_to_api_details(
             resolution_source: call.resolution_source,
             // Likewise: a view module is a property of a route's module.
             view_module: false,
+            // The value this call sends for the field its target dispatches
+            // on (carrick#831): the consumer half of the same identity.
+            dispatch: call.dispatch.clone(),
         })
         .collect();
 
@@ -1103,6 +1128,7 @@ mod tests {
             provenance: EndpointProvenance::Mock,
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
+            dispatch: None,
         });
 
         let (endpoints, _calls) = mount_graph_to_api_details(&graph);
@@ -1137,6 +1163,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: Some(ResolutionSource::FileBasedRoute),
             view_module: false,
+            dispatch: None,
         });
         // A route whose module also renders a view (carrick#704).
         graph.endpoints.push(ResolvedEndpoint {
@@ -1153,6 +1180,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: Some(ResolutionSource::FileBasedRoute),
             view_module: true,
+            dispatch: None,
         });
         graph.data_calls.push(DataFetchingCall {
             method: "POST".to_string(),
@@ -1168,6 +1196,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: Some(ResolutionSource::WholeUrlEnv),
+            dispatch: None,
         });
 
         let (endpoints, calls) = mount_graph_to_api_details(&graph);
@@ -1189,6 +1218,130 @@ mod tests {
             serde_json::to_value(&calls[0]).unwrap()["resolution_source"],
             "whole_url_env"
         );
+    }
+
+    /// carrick#831: the dispatch case survives the one projection both cloud
+    /// paths go through, on the producer side and the consumer side, and
+    /// reaches the wire only where a row has one.
+    #[test]
+    fn mount_graph_projection_carries_the_dispatch_case() {
+        use crate::dispatch::{Dispatch, DispatchLocation};
+        use crate::mount_graph::{DataFetchingCall, ResolvedEndpoint};
+
+        let case = |value: &str| Dispatch {
+            location: DispatchLocation::Body,
+            field: "action".to_string(),
+            value: value.to_string(),
+        };
+        let mut graph = MountGraph::new();
+        let route = |dispatch: Option<Dispatch>| ResolvedEndpoint {
+            method: "POST".to_string(),
+            path: "/types/check-or-upload".to_string(),
+            full_path: "/types/check-or-upload".to_string(),
+            handler: Some("handler".to_string()),
+            owner: "http".to_string(),
+            file_location: "lambdas/check-or-upload/index.ts:0".to_string(),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
+            view_module: false,
+            dispatch,
+        };
+        graph.endpoints.push(route(Some(case("search-by-intent"))));
+        graph.endpoints.push(route(None));
+        graph.data_calls.push(DataFetchingCall {
+            method: "POST".to_string(),
+            target_url: "${API}/types/check-or-upload".to_string(),
+            canonical_path: "/types/check-or-upload".to_string(),
+            client: "fetch".to_string(),
+            file_location: "lambdas/mcp-server/src/api-client.ts:115".to_string(),
+            call_kind: None,
+            repo_name: None,
+            service_name: None,
+            host: None,
+            line: Some(115),
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: None,
+            dispatch: Some(case("search-by-intent")),
+        });
+
+        let (endpoints, calls) = mount_graph_to_api_details(&graph);
+        assert_eq!(endpoints[0].dispatch, Some(case("search-by-intent")));
+        assert_eq!(endpoints[1].dispatch, None, "a plain route states none");
+        assert_eq!(calls[0].dispatch, Some(case("search-by-intent")));
+
+        // On the wire: the three fields verbatim, and no key at all on a row
+        // without a case — the majority of rows pay nothing for this field.
+        let producer = serde_json::to_value(&endpoints[0]).unwrap();
+        assert_eq!(producer["dispatch"]["location"], "body");
+        assert_eq!(producer["dispatch"]["field"], "action");
+        assert_eq!(producer["dispatch"]["value"], "search-by-intent");
+        assert!(
+            serde_json::to_value(&endpoints[1]).unwrap()["dispatch"].is_null(),
+            "a plain route writes no dispatch key"
+        );
+        assert_eq!(
+            serde_json::to_value(&calls[0]).unwrap()["dispatch"]["value"],
+            "search-by-intent"
+        );
+    }
+
+    /// carrick#831: a blob written before the field existed reads exactly as
+    /// it did — every dispatch-shaped field absent, and absence meaning a
+    /// plain route rather than an unknown one.
+    #[test]
+    fn a_blob_without_dispatch_reads_as_it_always_did() {
+        let old_blob = serde_json::json!({
+            "repo_name": "old",
+            "endpoints": [{
+                "owner": null,
+                "key": { "protocol": "http", "method": "GET", "path": "/things" },
+                "params": [],
+                "request_body": null,
+                "response_body": null,
+                "handler_name": "list",
+                "request_type": null,
+                "response_type": null,
+                "file_path": "src/routes.ts:4"
+            }],
+            "calls": [],
+            "mounts": [],
+            "apps": {},
+            "imported_handlers": [],
+            "function_definitions": {},
+            "last_updated": "2026-01-01T00:00:00Z",
+            "commit_hash": "abc123"
+        });
+
+        let data: CloudRepoData =
+            serde_json::from_value(old_blob).expect("an old blob still deserializes");
+        assert_eq!(data.endpoints[0].dispatch, None);
+        assert_eq!(
+            data.dispatch_tables, None,
+            "absence says this scanner stated no tables, never that there are none"
+        );
+
+        // And the same blob with an explicit null, which is what a hand-rolled
+        // or partially-migrated writer produces.
+        let with_nulls = serde_json::json!({
+            "repo_name": "old",
+            "endpoints": [],
+            "calls": [],
+            "mounts": [],
+            "apps": {},
+            "imported_handlers": [],
+            "function_definitions": {},
+            "last_updated": "2026-01-01T00:00:00Z",
+            "commit_hash": "abc123",
+            "dispatch_tables": null
+        });
+        let data: CloudRepoData =
+            serde_json::from_value(with_nulls).expect("an explicit null deserializes too");
+        assert_eq!(data.dispatch_tables, None);
     }
 
     /// carrick#704: `view_module` survives the one projection both cloud paths
@@ -1215,6 +1368,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: Some(ResolutionSource::FileBasedRoute),
             view_module,
+            dispatch: None,
         };
         graph
             .endpoints
@@ -1238,6 +1392,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         });
 
         let (endpoints, calls) = mount_graph_to_api_details(&graph);
@@ -1301,6 +1456,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         }
     }
 

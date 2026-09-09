@@ -42,6 +42,91 @@ pub struct Config {
     #[serde(default)]
     #[serde(rename = "externalDomains")]
     pub external_domains: HashSet<String>,
+    /// Operations this service declares behind a body-dispatching handler
+    /// (carrick#831), resolved from the file's top-level `operations` array by
+    /// [`Config::load_services`]. Never written in a service entry directly:
+    /// the blocks are declared once for the file and carry the service they
+    /// belong to, exactly like the `includes` map.
+    ///
+    /// Skipped when empty so a config without one serializes byte-identically
+    /// into the blob's `config_json`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_operations: Vec<DeclaredOperations>,
+}
+
+/// One handler's operations, declared rather than inferred (carrick#831).
+///
+/// The promotion half of body dispatch. Inference can see that a handler
+/// switches on `action` and can name the cases, but it is reading code: those
+/// rows are candidates. A block here is the repo stating them, so the rows it
+/// produces are facts — and it is the ONLY way a routeless handler (a lambda
+/// whose route lives in infrastructure) gets operation rows at all, because
+/// the scanner may not invent a route the source does not contain.
+///
+/// Declared operations REPLACE the inferred ones for the handler they name:
+/// two sources for one set would leave a reader guessing which is current, and
+/// the repo's own statement is the one that wins.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct DeclaredOperations {
+    /// The service (`serviceName`) whose handler this is.
+    pub service: String,
+    /// The route the handler is served at, as `"POST /types/check-or-upload"`.
+    ///
+    /// Required for a ROUTELESS handler, which is the case this block mainly
+    /// exists for: nothing in the source states the route, so the declaration
+    /// has to. Omit it when the route IS in the source, and the block then
+    /// promotes whichever of the service's inferred dispatching operations
+    /// share its field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    /// Where the dispatch value is read and which field it is.
+    pub dispatch: DeclaredDispatch,
+    /// The values the handler answers, one operation each.
+    pub operations: Vec<DeclaredOperation>,
+}
+
+/// The `{ location, field }` half of a declaration: the same two fields a
+/// [`crate::dispatch::Dispatch`] carries, without the value (each entry in
+/// `operations` supplies its own).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct DeclaredDispatch {
+    pub location: crate::dispatch::DispatchLocation,
+    pub field: String,
+}
+
+/// One declared operation: the value it answers, and optionally the symbol
+/// that answers it.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct DeclaredOperation {
+    pub value: String,
+    /// `"file:symbol"` — where the case is handled. Recorded as the row's
+    /// location so a reader lands on the handler rather than on `carrick.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler: Option<String>,
+}
+
+impl DeclaredOperations {
+    /// `(METHOD, path)` when the block declares a route, parsed from
+    /// `"POST /types/check-or-upload"`. `None` when it declares none, and an
+    /// error when what it declares is not a verb and a path.
+    pub fn parsed_route(&self) -> Result<Option<(String, String)>, String> {
+        let Some(route) = self.route.as_deref() else {
+            return Ok(None);
+        };
+        let (method, path) = route
+            .trim()
+            .split_once(char::is_whitespace)
+            .ok_or_else(|| {
+                format!("`route` must be a method and a path, e.g. \"POST /things\"; got '{route}'")
+            })?;
+        let path = path.trim();
+        if method.trim().is_empty() || !path.starts_with('/') {
+            return Err(format!(
+                "`route` must be a method and an absolute path, e.g. \"POST /things\"; got '{route}'"
+            ));
+        }
+        Ok(Some((method.trim().to_uppercase(), path.to_string())))
+    }
 }
 
 /// Call-classification declarations attached to a shared source root.
@@ -77,6 +162,12 @@ struct RootConfig {
     /// the repo, not once per service that reaches through it.
     #[serde(default)]
     includes: BTreeMap<String, IncludeDeclarations>,
+    /// Declared operations behind body-dispatching handlers (carrick#831),
+    /// one block per handler, each naming the service it belongs to. On the
+    /// file rather than on a service for the same reason `includes` is: a
+    /// declaration is written once for the repo.
+    #[serde(default)]
+    operations: Vec<DeclaredOperations>,
     #[serde(default)]
     services: Vec<Config>,
     #[serde(flatten)]
@@ -170,6 +261,56 @@ impl Config {
                         service.inherit(decls);
                         inherited.insert(key);
                     }
+                }
+            }
+
+            // Distribute the declared operations to the services they name.
+            // Same rule as `includes` below: a block naming a service this
+            // file does not declare is dead config that reads as if it
+            // applies, so it is an error rather than a silent no-op. The
+            // route, when one is declared, is validated here too — a block
+            // whose route cannot be parsed would otherwise fail at graph
+            // build time, far from the file that is wrong.
+            for block in &root.operations {
+                if block.operations.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "{}: `operations` block for service '{}' declares no operations. \
+                             List the values the handler answers, or remove the block.",
+                            path.display(),
+                            block.service
+                        ),
+                    ));
+                }
+                if let Err(reason) = block.parsed_route() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "{}: `operations` block for service '{}': {reason}",
+                            path.display(),
+                            block.service
+                        ),
+                    ));
+                }
+                let mut matched = false;
+                for service in file_services.iter_mut() {
+                    if service.service_name.as_deref() == Some(block.service.as_str()) {
+                        service.declared_operations.push(block.clone());
+                        matched = true;
+                    }
+                }
+                if !matched {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "{}: `operations` declares a block for service '{}', which this \
+                             file does not declare. Name a service from `services`, or remove \
+                             the block.",
+                            path.display(),
+                            block.service
+                        ),
+                    ));
                 }
             }
 
@@ -555,6 +696,101 @@ mod tests {
         assert!(message.contains("lambdas/_shard"), "{message}");
         assert!(message.contains("include"), "{message}");
         assert!(message.contains("carrick.json"), "{message}");
+    }
+
+    /// carrick#831: an `operations` block reaches the service it names, route
+    /// and all, and a value list becomes one declared operation each.
+    #[test]
+    fn operations_block_reaches_the_service_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carrick.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "operations": [{
+                    "service": "check-or-upload",
+                    "route": "post /types/check-or-upload",
+                    "dispatch": { "location": "body", "field": "action" },
+                    "operations": [
+                        { "value": "search-by-intent", "handler": "lambdas/check-or-upload/index.ts:handleSearchByIntent" },
+                        { "value": "upload-logs" }
+                    ]
+                }],
+                "services": [
+                    { "name": "check-or-upload", "directory": "lambdas/check-or-upload" },
+                    { "name": "mcp-server", "directory": "lambdas/mcp-server" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let services = Config::load_services(vec![path]).unwrap();
+        let named = |name: &str| {
+            services
+                .iter()
+                .find(|s| s.service_name.as_deref() == Some(name))
+                .unwrap()
+        };
+        let block = &named("check-or-upload").declared_operations[0];
+        assert_eq!(block.operations.len(), 2);
+        assert_eq!(
+            block.parsed_route().unwrap(),
+            Some(("POST".to_string(), "/types/check-or-upload".to_string())),
+            "the verb is canonicalised, the path is kept verbatim"
+        );
+        assert!(
+            named("mcp-server").declared_operations.is_empty(),
+            "a block reaches only the service it names"
+        );
+    }
+
+    /// A block naming a service the file does not declare is dead config that
+    /// reads as if it applies — the same failure the unused `includes` key is.
+    #[test]
+    fn operations_block_for_an_unknown_service_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carrick.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "operations": [{
+                    "service": "check-or-uplaod",
+                    "dispatch": { "location": "body", "field": "action" },
+                    "operations": [{ "value": "upload-logs" }]
+                }],
+                "services": [{ "name": "check-or-upload", "directory": "lambdas/check-or-upload" }]
+            }"#,
+        )
+        .unwrap();
+
+        let err = Config::load_services(vec![path]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("check-or-uplaod"), "{err}");
+    }
+
+    /// A route that is not a verb and an absolute path fails at LOAD, beside
+    /// the file that is wrong, rather than at graph-build time.
+    #[test]
+    fn operations_block_with_an_unreadable_route_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carrick.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "operations": [{
+                    "service": "a",
+                    "route": "/types/check-or-upload",
+                    "dispatch": { "location": "body", "field": "action" },
+                    "operations": [{ "value": "upload-logs" }]
+                }],
+                "services": [{ "name": "a", "directory": "a" }]
+            }"#,
+        )
+        .unwrap();
+
+        let err = Config::load_services(vec![path]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("method and a"), "{err}");
     }
 
     #[test]

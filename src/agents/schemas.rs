@@ -330,6 +330,34 @@ impl AgentSchemas {
                                 "type": "STRING",
                                 "nullable": true,
                                 "description": "Import path where the `primary_type_symbol` type is defined (e.g., './types/user'), or null if it is declared in the same file. Null whenever `primary_type_symbol` is null. Read the import statements at the top of the file."
+                            },
+                            "dispatch": {
+                                "description": "Set only when this handler answers ONE literal value of a single request field, and other values of that same field are answered elsewhere by the same handler. Null when the handler serves its route regardless of any field's value.",
+                                "nullable": true,
+                                "type": "OBJECT",
+                                "properties": {
+                                    "location": {
+                                        "description": "Where the field travels: 'body' for a property of the request body, 'header' for a request header.",
+                                        "enum": [
+                                            "body",
+                                            "header"
+                                        ],
+                                        "type": "STRING"
+                                    },
+                                    "field": {
+                                        "description": "The field's name exactly as the source spells it; dotted for a nested body property (e.g. 'meta.op'). Never renamed, abbreviated or normalised.",
+                                        "type": "STRING"
+                                    },
+                                    "value": {
+                                        "description": "The literal value of that field, exactly as the source spells it, with no quotes around it.",
+                                        "type": "STRING"
+                                    }
+                                },
+                                "required": [
+                                    "location",
+                                    "field",
+                                    "value"
+                                ]
                             }
                         },
                         "required": ["candidate_id", "line_number", "owner_node", "method", "path", "handler_name", "pattern_matched", "emission_style", "payload_expression_text", "payload_expression_line", "response_expression_text", "response_expression_line"]
@@ -396,6 +424,34 @@ impl AgentSchemas {
                                 "type": "STRING",
                                 "nullable": true,
                                 "description": "Import path where the `primary_type_symbol` type is defined (e.g., './types/user'), or null if it is declared in the same file. Read the import statements at the top of the file."
+                            },
+                            "dispatch": {
+                                "description": "Set only when this call writes a literal for a request field whose value selects what the receiver does, rather than data the receiver operates on. Null when the call sends no such field.",
+                                "nullable": true,
+                                "type": "OBJECT",
+                                "properties": {
+                                    "location": {
+                                        "description": "Where the field travels: 'body' for a property of the request body, 'header' for a request header.",
+                                        "enum": [
+                                            "body",
+                                            "header"
+                                        ],
+                                        "type": "STRING"
+                                    },
+                                    "field": {
+                                        "description": "The field's name exactly as the source spells it; dotted for a nested body property (e.g. 'meta.op'). Never renamed, abbreviated or normalised.",
+                                        "type": "STRING"
+                                    },
+                                    "value": {
+                                        "description": "The literal value of that field, exactly as the source spells it, with no quotes around it.",
+                                        "type": "STRING"
+                                    }
+                                },
+                                "required": [
+                                    "location",
+                                    "field",
+                                    "value"
+                                ]
                             }
                         },
                         // The four locator fields are required-but-nullable: the
@@ -532,8 +588,56 @@ impl AgentSchemas {
                         },
                         "required": ["kind", "field", "result_type_symbol"]
                     }
+                },
+                "dispatch_tables": {
+                    "description": "One item per handler function in this file that reads a single request field and answers differently for each literal value of it, whether or not this file binds a route to that handler. Empty when no handler does that.",
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "handler_name": {
+                                "description": "Name of the handler function that reads the field, or 'anonymous' for an inline handler.",
+                                "type": "STRING"
+                            },
+                            "line_number": {
+                                "description": "Line number where that handler function is declared (read from the line-number prefix in the source code).",
+                                "type": "INTEGER"
+                            },
+                            "location": {
+                                "description": "Where the field travels: 'body' for a property of the request body, 'header' for a request header.",
+                                "enum": [
+                                    "body",
+                                    "header"
+                                ],
+                                "type": "STRING"
+                            },
+                            "field": {
+                                "description": "The field's name exactly as the source spells it; dotted for a nested body property (e.g. 'meta.op'). Never renamed, abbreviated or normalised.",
+                                "type": "STRING"
+                            },
+                            "values": {
+                                "description": "Every literal value of that field the handler answers, in source order, each exactly as the source spells it and with no quotes around it.",
+                                "type": "ARRAY",
+                                "items": {
+                                    "type": "STRING"
+                                }
+                            }
+                        },
+                        "required": [
+                            "handler_name",
+                            "line_number",
+                            "location",
+                            "field",
+                            "values"
+                        ]
+                    }
                 }
             },
+            // `dispatch_tables` is NOT required, following the two optional
+            // top-level arrays already on this schema. It is not a locator
+            // field: a handler that switches on a request field is a shape the
+            // model either sees or does not, and an empty array forced out of
+            // a file with no such handler buys nothing.
             // `pubsub_operations` is required so the model must always emit the
             // array (empty when a file has none). As an optional property the
             // lite model omitted it in 9/12 harness runs on the corpus-2 Kafka
@@ -743,6 +847,81 @@ mod tests {
             .collect();
         required_keys.sort_unstable();
         assert_eq!(required_keys, serde_keys);
+    }
+
+    /// carrick#831: the dispatch blocks the file-analyzer schema asks for are
+    /// the shape this scanner parses, field name for field name.
+    ///
+    /// The TEXT of these blocks is the cloud's (it authors the wording and
+    /// sweeps it on flash-lite, and `prompt-harness/verify-schema-sync.ts`
+    /// diffs it field by field against this file). What this test owns is the
+    /// half the cloud cannot see: that a response written to this schema
+    /// deserializes into `Dispatch` and `DispatchTable` with nothing dropped.
+    #[test]
+    fn dispatch_schema_matches_the_shape_the_scanner_parses() {
+        let schema = AgentSchemas::file_analysis_schema();
+
+        for side in ["endpoints", "data_calls"] {
+            let dispatch = &schema["properties"][side]["items"]["properties"]["dispatch"];
+            assert_eq!(dispatch["type"], "OBJECT", "{side}");
+            assert_eq!(
+                dispatch["nullable"], true,
+                "{side}: nullable, so an ordinary route answers null rather than omitting the key"
+            );
+            assert_eq!(
+                dispatch["required"],
+                serde_json::json!(["location", "field", "value"]),
+                "{side}: all three or nothing — a case with no value names no operation"
+            );
+            assert_eq!(
+                dispatch["properties"]["location"]["enum"],
+                serde_json::json!(["body", "header"]),
+                "{side}: the two locations `DispatchLocation` spells"
+            );
+        }
+
+        let tables = &schema["properties"]["dispatch_tables"];
+        assert_eq!(tables["type"], "ARRAY");
+        assert_eq!(
+            tables["items"]["required"],
+            serde_json::json!(["handler_name", "line_number", "location", "field", "values"]),
+            "the locator fields are required so the lite model states them rather than omitting them (#300)"
+        );
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("dispatch_tables")),
+            "an optional top-level array, like the two GraphQL ones"
+        );
+
+        // A response written to this schema round-trips into the scanner's
+        // own types with every field landing where it belongs.
+        let parsed: crate::agents::file_analyzer_agent::FileAnalysisResult =
+            serde_json::from_value(serde_json::json!({
+                "mounts": [],
+                "endpoints": [],
+                "data_calls": [],
+                "pubsub_operations": [],
+                "dispatch_tables": [{
+                    "handler_name": "handler",
+                    "line_number": 419,
+                    "location": "body",
+                    "field": "action",
+                    "values": ["upload-logs", "search-by-intent"]
+                }]
+            }))
+            .expect("a schema-shaped response parses");
+        let table = &parsed.dispatch_tables[0];
+        assert_eq!(
+            table.location,
+            crate::dispatch::DispatchLocation::Body,
+            "the enum spelling is the wire spelling"
+        );
+        assert_eq!(table.field, "action");
+        assert_eq!(table.values, vec!["upload-logs", "search-by-intent"]);
+        assert_eq!(table.handler_name.as_deref(), Some("handler"));
+        assert_eq!(table.line_number, Some(419));
     }
 
     #[test]

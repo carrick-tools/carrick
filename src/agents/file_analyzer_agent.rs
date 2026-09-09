@@ -99,6 +99,94 @@ where
         .and_then(crate::operation::CallKind::parse_lenient))
 }
 
+/// Absorb an off-shape `dispatch` object to `None` instead of failing the
+/// whole file's parse (mirrors `call_kind` and `emission_style`).
+///
+/// A dispatch is three strings and it is worth nothing without all three: a
+/// case with no value names no operation, and a case with no field names
+/// nothing to compare it against. Junk is silence, never a partial fact.
+fn deserialize_dispatch<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::dispatch::Dispatch>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| parse_dispatch(&value)))
+}
+
+/// One dispatch object, or `None` when it is not three usable strings.
+fn parse_dispatch(value: &serde_json::Value) -> Option<crate::dispatch::Dispatch> {
+    let location = match value.get("location")?.as_str()?.trim() {
+        "body" => crate::dispatch::DispatchLocation::Body,
+        "header" => crate::dispatch::DispatchLocation::Header,
+        _ => return None,
+    };
+    let field = value.get("field")?.as_str()?.trim().to_string();
+    let dispatch_value = value.get("value")?.as_str()?.to_string();
+    if field.is_empty() || dispatch_value.trim().is_empty() {
+        return None;
+    }
+    Some(crate::dispatch::Dispatch {
+        location,
+        field,
+        value: dispatch_value,
+    })
+}
+
+/// Absorb off-shape `dispatch_tables` entries item by item.
+///
+/// A table the model got wrong drops itself, not the file: this array sits
+/// beside the endpoints and the calls, and one malformed object must not cost
+/// a file its whole analysis.
+fn deserialize_dispatch_tables<'de, D>(
+    deserializer: D,
+) -> Result<Vec<crate::dispatch::DispatchTable>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<Vec<serde_json::Value>> = Option::deserialize(deserializer)?;
+    Ok(raw
+        .unwrap_or_default()
+        .iter()
+        .filter_map(parse_dispatch_table)
+        .collect())
+}
+
+/// One dispatch table, or `None` when it states no field or no value.
+fn parse_dispatch_table(value: &serde_json::Value) -> Option<crate::dispatch::DispatchTable> {
+    let location = match value.get("location")?.as_str()?.trim() {
+        "body" => crate::dispatch::DispatchLocation::Body,
+        "header" => crate::dispatch::DispatchLocation::Header,
+        _ => return None,
+    };
+    let field = value.get("field")?.as_str()?.to_string();
+    let values = value
+        .get("values")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    crate::dispatch::DispatchTable {
+        location,
+        field,
+        values,
+        handler_name: value
+            .get("handler_name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|h| !h.trim().is_empty()),
+        file_path: String::new(),
+        line_number: value
+            .get("line_number")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok()),
+        service_name: None,
+        repo_name: None,
+    }
+    .normalized()
+}
+
 fn deserialize_pubsub_role<'de, D>(
     deserializer: D,
 ) -> Result<Option<crate::operation::PubsubRole>, D::Error>
@@ -168,6 +256,16 @@ pub enum ResolutionSource {
     InlineLiteral,
     /// The row is the model's, with no deterministic twin at its span.
     Model,
+    /// An operation the REPO declares, in the `operations` block of
+    /// `carrick.json` (carrick#831): a case of a body-dispatching handler,
+    /// stated rather than read.
+    ///
+    /// The only source on this list that no pass over the source produces. It
+    /// is what a routeless handler — a lambda whose route lives in
+    /// infrastructure — can have, since the scanner may not invent a route the
+    /// source does not contain, and it is a fact for the same reason a
+    /// declared internal domain is: the repo said so.
+    DeclaredOperation,
 }
 
 /// Result of analyzing a single endpoint definition
@@ -208,6 +306,17 @@ pub struct EndpointResult {
     pub primary_type_symbol: Option<String>,
     /// Import path where the type is defined (e.g., "./types/user"), null if inline or same file
     pub type_import_source: Option<String>,
+    /// The request field this operation switches on and the literal this case
+    /// answers, when the handler behind the route dispatches on one
+    /// (carrick#831). `None` is a plain route, which is nearly every row.
+    ///
+    /// FROM THE MODEL, unlike `view_module` and `handler_declaration_line`
+    /// beside it: which field a handler reads off the body and which literal a
+    /// branch answers is a reading of the handler, the same kind of reading
+    /// the route itself is. Lenient on the way in — an off-shape object is
+    /// silence, not a partial case.
+    #[serde(default, deserialize_with = "deserialize_dispatch")]
+    pub dispatch: Option<crate::dispatch::Dispatch>,
     /// Which layer stated this row. Never from the model — set by the
     /// emit/join pass. See [`ResolutionSource`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -330,6 +439,14 @@ pub struct DataCallResult {
     /// counted — until those files change or `CACHE_VERSION` moves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumers_not_resolved: Option<crate::imported_request_member::UnfollowedMemberSites>,
+    /// The literal this call sends for the field the target dispatches on
+    /// (carrick#831), read off the call site's own request body. `None` says
+    /// the call states nothing — which, against a dispatching producer, keeps
+    /// the pair unmatched rather than guessing which of its cases was meant.
+    ///
+    /// FROM THE MODEL, like the target itself.
+    #[serde(default, deserialize_with = "deserialize_dispatch")]
+    pub dispatch: Option<crate::dispatch::Dispatch>,
     /// Which layer stated this row. Never from the model — set by the
     /// emit/join pass. See [`ResolutionSource`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -469,6 +586,16 @@ pub struct FileAnalysisResult {
     /// to empty rather than failing the whole file's parse.
     #[serde(default)]
     pub graphql_consumer_locates: Vec<GraphqlConsumerLocate>,
+    /// Handlers in this file that switch on a request field, with the values
+    /// each answers (carrick#831).
+    ///
+    /// Stated whether or not the handler declares a route, and it is the ONLY
+    /// thing a routeless handler can state: the route of an API-gateway lambda
+    /// is not in the source, so no operation row may be invented for it. A
+    /// reader gets the fact that nine operations live behind this handler; the
+    /// `operations` block in `carrick.json` is what turns them into rows.
+    #[serde(default, deserialize_with = "deserialize_dispatch_tables")]
+    pub dispatch_tables: Vec<crate::dispatch::DispatchTable>,
 }
 
 /// Agent that performs file-centric analysis using framework-agnostic patterns.
@@ -1478,6 +1605,7 @@ mod tests {
             data_calls: vec![],
             graphql_operations: vec![],
             pubsub_operations: vec![],
+            dispatch_tables: Vec::new(),
         };
 
         FileAnalyzerAgent::sanitize_result(&mut result);
@@ -1498,6 +1626,7 @@ mod tests {
             data_calls: vec![],
             graphql_operations: vec![],
             pubsub_operations: vec![],
+            dispatch_tables: Vec::new(),
         };
         FileAnalyzerAgent::sanitize_result(&mut result);
         assert_eq!(
@@ -1605,6 +1734,7 @@ mod tests {
             primary_type_symbol: Some("User".to_string()),
             type_import_source: Some("./types/user".to_string()),
             resolution_source: None,
+            dispatch: None,
         };
 
         let json = serde_json::to_string(&endpoint).unwrap();
@@ -1638,6 +1768,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         };
 
         let json = serde_json::to_string(&data_call).unwrap();
@@ -1674,6 +1805,7 @@ mod tests {
                 primary_type_symbol: Some("-".to_string()),
                 type_import_source: Some(".repo-a_types.ts".to_string()),
                 resolution_source: None,
+                dispatch: None,
             }],
             data_calls: vec![DataCallResult {
                 call_kind: None,
@@ -1695,9 +1827,11 @@ mod tests {
                 base: None,
                 consumers_not_resolved: None,
                 resolution_source: None,
+                dispatch: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
+            dispatch_tables: Vec::new(),
         };
 
         let needs_retry = FileAnalyzerAgent::sanitize_result(&mut result);
@@ -1830,10 +1964,12 @@ mod tests {
                 primary_type_symbol: None,
                 type_import_source: None,
                 resolution_source: None,
+                dispatch: None,
             }],
             data_calls: vec![],
             graphql_operations: vec![],
             pubsub_operations: vec![],
+            dispatch_tables: Vec::new(),
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -2040,6 +2176,7 @@ mod tests {
                 primary_type_symbol: None,
                 type_import_source: None,
                 resolution_source: None,
+                dispatch: None,
             }],
             data_calls: vec![DataCallResult {
                 call_kind: None,
@@ -2061,9 +2198,11 @@ mod tests {
                 base: None,
                 consumers_not_resolved: None,
                 resolution_source: None,
+                dispatch: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
+            dispatch_tables: Vec::new(),
         };
 
         let retry = FileAnalysisResult {
@@ -2073,6 +2212,7 @@ mod tests {
             data_calls: vec![],
             graphql_operations: vec![],
             pubsub_operations: vec![],
+            dispatch_tables: Vec::new(),
         };
 
         let chosen = FileAnalyzerAgent::choose_best_result(initial.clone(), retry);
@@ -2116,6 +2256,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         }
     }
 

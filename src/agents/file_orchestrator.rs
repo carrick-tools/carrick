@@ -852,6 +852,13 @@ impl ResolutionSource {
             // only what the receiver is.
             Self::ReceiverType => 1,
             Self::InlineLiteral | Self::Model => 0,
+            // Never arbitrated here: a declared operation (carrick#831) is
+            // not a statement about a call SITE, so it never competes for one.
+            // The rows it produces are materialised into the graph after every
+            // pass has run, and the config is the only thing that states them.
+            // Ranked at the top so this arm reads as "nothing outranks the
+            // repo's own declaration" rather than as an unexamined default.
+            Self::DeclaredOperation => u8::MAX,
         }
     }
 
@@ -4592,6 +4599,7 @@ impl FileOrchestrator {
                             emission_style: None,
                             primary_type_symbol: None,
                             type_import_source: None,
+                            dispatch: None,
                             resolution_source: None,
                             view_module,
                         })
@@ -4651,6 +4659,7 @@ impl FileOrchestrator {
                     emission_style: None,
                     primary_type_symbol: None,
                     type_import_source: None,
+                    dispatch: None,
                     resolution_source: None,
                 }
             })
@@ -4701,6 +4710,7 @@ impl FileOrchestrator {
                 emission_style: route.returns_no_payload.then_some(EmissionStyle::NoPayload),
                 primary_type_symbol: None,
                 type_import_source: None,
+                dispatch: None,
                 resolution_source: None,
             })
             .collect()
@@ -4793,6 +4803,7 @@ impl FileOrchestrator {
                         emission_style: returns_no_payload.then_some(EmissionStyle::NoPayload),
                         primary_type_symbol: None,
                         type_import_source: None,
+                        dispatch: None,
                         resolution_source: None,
                     },
                 ));
@@ -5245,6 +5256,7 @@ impl FileOrchestrator {
                     loopback_default_url: None,
                     base: None,
                     consumers_not_resolved: None,
+                    dispatch: None,
                     resolution_source: Some(ResolutionSource::SameFileWrapper),
                 })),
             });
@@ -5324,6 +5336,7 @@ impl FileOrchestrator {
             loopback_default_url,
             base: None,
             consumers_not_resolved: None,
+            dispatch: None,
             resolution_source: Some(source),
         }
     }
@@ -5365,6 +5378,7 @@ impl FileOrchestrator {
             emission_style: None,
             primary_type_symbol: None,
             type_import_source: None,
+            dispatch: None,
             resolution_source: Some(ResolutionSource::ReceiverType),
             // A registration call, not a file-router module.
             view_module: false,
@@ -5606,6 +5620,7 @@ impl FileOrchestrator {
             graphql_operations,
             pubsub_operations,
             graphql_consumer_locates,
+            dispatch_tables,
         } = model;
         // Everything the deterministic layer states nothing about travels
         // through unchanged.
@@ -5613,6 +5628,10 @@ impl FileOrchestrator {
         result.graphql_operations = graphql_operations;
         result.pubsub_operations = pubsub_operations;
         result.graphql_consumer_locates = graphql_consumer_locates;
+        // A dispatch table is a fact about a HANDLER, not about a candidate:
+        // there is no deterministic row for it to be joined onto and no
+        // candidate id to drop it for. It travels through with the mounts.
+        result.dispatch_tables = dispatch_tables;
 
         // --- the producer side -------------------------------------------
         //
@@ -7235,6 +7254,10 @@ impl FileOrchestrator {
                     // (carrick#660). Retention only, like `provenance`.
                     resolution_source: endpoint.resolution_source,
                     view_module: endpoint.view_module,
+                    // The case this operation answers, when its handler
+                    // switches on a request field (carrick#831). Unlike the
+                    // fields above it, matching reads this one.
+                    dispatch: endpoint.dispatch.clone(),
                 });
             }
         }
@@ -7305,6 +7328,10 @@ impl FileOrchestrator {
                         // Which layer stated the row (carrick#660): the pass
                         // that resolved it, or the model. Retention only.
                         resolution_source: data_call.resolution_source,
+                        // The value this call sends for the field its target
+                        // dispatches on (carrick#831). Read by matching, and
+                        // only against a producer that dispatches.
+                        dispatch: data_call.dispatch.clone(),
                     },
                     data_call.call_expression_span_start.is_some(),
                 ));
@@ -8808,10 +8835,12 @@ export * from "./aFetch.js";"#,
                     primary_type_symbol: None,
                     type_import_source: None,
                     resolution_source: None,
+                    dispatch: None,
                 }],
                 data_calls: vec![],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -8860,6 +8889,7 @@ export * from "./aFetch.js";"#,
             primary_type_symbol: None,
             type_import_source: None,
             resolution_source: None,
+            dispatch: None,
         };
 
         let mut file_results = HashMap::new();
@@ -9214,6 +9244,7 @@ export * from "./aFetch.js";"#,
                     primary_type_symbol: None,
                     type_import_source: None,
                     resolution_source: None,
+                    dispatch: None,
                 }],
                 ..Default::default()
             },
@@ -9266,6 +9297,7 @@ export * from "./aFetch.js";"#,
             primary_type_symbol: None,
             type_import_source: None,
             resolution_source: None,
+            dispatch: None,
         };
         let file_result = |path: &str| FileAnalysisResult {
             endpoints: vec![endpoint(path)],
@@ -9339,6 +9371,7 @@ export * from "./aFetch.js";"#,
                     primary_type_symbol: None,
                     type_import_source: None,
                     resolution_source: None,
+                    dispatch: None,
                 }],
                 ..Default::default()
             },
@@ -9401,9 +9434,11 @@ export * from "./aFetch.js";"#,
                     base: None,
                     consumers_not_resolved: None,
                     resolution_source: None,
+                    dispatch: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -9455,6 +9490,7 @@ export * from "./aFetch.js";"#,
                 ],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -9511,6 +9547,7 @@ export * from "./aFetch.js";"#,
                 ],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -9560,6 +9597,7 @@ export * from "./aFetch.js";"#,
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         }
     }
 
@@ -9913,6 +9951,7 @@ export * from "./aFetch.js";"#,
                 base: None,
                 consumers_not_resolved: None,
                 resolution_source: None,
+                dispatch: None,
             }],
             ..Default::default()
         };
@@ -10003,6 +10042,7 @@ export * from "./aFetch.js";"#,
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         };
 
         let mut file_results = HashMap::new();
@@ -10031,6 +10071,7 @@ export * from "./aFetch.js";"#,
                     primary_type_symbol: None,
                     type_import_source: None,
                     resolution_source: None,
+                    dispatch: None,
                 }],
                 data_calls: vec![
                     // Self-call to the service's own endpoint over localhost.
@@ -10043,6 +10084,7 @@ export * from "./aFetch.js";"#,
                 ],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -10099,6 +10141,7 @@ export * from "./aFetch.js";"#,
             primary_type_symbol: None,
             type_import_source: None,
             resolution_source: None,
+            dispatch: None,
         };
         let mk_call = |line: u32, method: &str, target: &str| DataCallResult {
             call_kind: None,
@@ -10120,6 +10163,7 @@ export * from "./aFetch.js";"#,
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         };
 
         let mut file_results = HashMap::new();
@@ -10142,6 +10186,7 @@ export * from "./aFetch.js";"#,
                 ],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -10214,6 +10259,7 @@ export * from "./aFetch.js";"#,
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -10229,6 +10275,7 @@ export * from "./aFetch.js";"#,
                 ],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -10302,6 +10349,7 @@ export * from "./aFetch.js";"#,
                         base: None,
                         consumers_not_resolved: None,
                         resolution_source: None,
+                        dispatch: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -10323,10 +10371,12 @@ export * from "./aFetch.js";"#,
                         base: None,
                         consumers_not_resolved: None,
                         resolution_source: None,
+                        dispatch: None,
                     },
                 ],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -10379,9 +10429,11 @@ export * from "./aFetch.js";"#,
                     base: None,
                     consumers_not_resolved: None,
                     resolution_source: None,
+                    dispatch: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -10434,6 +10486,7 @@ export * from "./aFetch.js";"#,
                         base: None,
                         consumers_not_resolved: None,
                         resolution_source: None,
+                        dispatch: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -10455,10 +10508,12 @@ export * from "./aFetch.js";"#,
                         base: None,
                         consumers_not_resolved: None,
                         resolution_source: None,
+                        dispatch: None,
                     },
                 ],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -10522,10 +10577,12 @@ export * from "./aFetch.js";"#,
                     primary_type_symbol: None,
                     type_import_source: None,
                     resolution_source: None,
+                    dispatch: None,
                 }],
                 data_calls: vec![],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -10581,6 +10638,7 @@ export * from "./aFetch.js";"#,
             primary_type_symbol: None,
             type_import_source: None,
             resolution_source: Some(ResolutionSource::DecoratorRoute),
+            dispatch: None,
         }
     }
 
@@ -10660,6 +10718,7 @@ export * from "./aFetch.js";"#,
             primary_type_symbol: None,
             type_import_source: None,
             resolution_source: None,
+            dispatch: None,
         }
     }
 
@@ -10681,6 +10740,7 @@ export * from "./aFetch.js";"#,
                 data_calls: vec![],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
         let graph = orchestrator.build_mount_graph(
@@ -10850,6 +10910,7 @@ export * from "./aFetch.js";"#,
                     primary_type_symbol: Some("User".to_string()),
                     type_import_source: Some("react".to_string()),
                     resolution_source: None,
+                    dispatch: None,
                 },
                 EndpointResult {
                     handler_declaration_line: None,
@@ -10871,6 +10932,7 @@ export * from "./aFetch.js";"#,
                     primary_type_symbol: Some("Models.User".to_string()),
                     type_import_source: Some("./models".to_string()),
                     resolution_source: None,
+                    dispatch: None,
                 },
             ],
             data_calls: vec![DataCallResult {
@@ -10893,9 +10955,11 @@ export * from "./aFetch.js";"#,
                 base: None,
                 consumers_not_resolved: None,
                 resolution_source: None,
+                dispatch: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
+            dispatch_tables: Vec::new(),
         };
 
         let mut imported_symbols = HashMap::new();
@@ -10973,6 +11037,7 @@ export * from "./aFetch.js";"#,
                 primary_type_symbol: Some("OrderPlacedEvent".to_string()),
                 type_import_source: Some("../types/events.ts".to_string()),
                 resolution_source: None,
+                dispatch: None,
             }],
             data_calls: vec![DataCallResult {
                 call_kind: None,
@@ -10994,6 +11059,7 @@ export * from "./aFetch.js";"#,
                 base: None,
                 consumers_not_resolved: None,
                 resolution_source: None,
+                dispatch: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![
@@ -11034,6 +11100,7 @@ export * from "./aFetch.js";"#,
                     payload_expression_line: None,
                 },
             ],
+            dispatch_tables: Vec::new(),
         };
 
         let mut imported_symbols = HashMap::new();
@@ -11125,6 +11192,7 @@ export * from "./aFetch.js";"#,
             data_calls: vec![],
             graphql_operations: vec![],
             pubsub_operations: ops,
+            dispatch_tables: Vec::new(),
         }
     }
 
@@ -11327,6 +11395,7 @@ export * from "./aFetch.js";"#,
                 primary_type_symbol: Some("User".to_string()),
                 type_import_source: Some("./wrong".to_string()),
                 resolution_source: None,
+                dispatch: None,
             }],
             data_calls: vec![DataCallResult {
                 call_kind: None,
@@ -11349,9 +11418,11 @@ export * from "./aFetch.js";"#,
                 base: None,
                 consumers_not_resolved: None,
                 resolution_source: None,
+                dispatch: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
+            dispatch_tables: Vec::new(),
         };
 
         let mut imported_symbols = HashMap::new();
@@ -11407,6 +11478,7 @@ export * from "./aFetch.js";"#,
                 data_calls: vec![],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -11437,6 +11509,7 @@ export * from "./aFetch.js";"#,
                         primary_type_symbol: None,
                         type_import_source: None,
                         resolution_source: None,
+                        dispatch: None,
                     },
                     EndpointResult {
                         handler_declaration_line: None,
@@ -11458,11 +11531,13 @@ export * from "./aFetch.js";"#,
                         primary_type_symbol: None,
                         type_import_source: None,
                         resolution_source: None,
+                        dispatch: None,
                     },
                 ],
                 data_calls: vec![],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -11682,6 +11757,7 @@ export default [
             primary_type_symbol: None,
             type_import_source: None,
             resolution_source: None,
+            dispatch: None,
         }
     }
 
@@ -12627,6 +12703,7 @@ export { routes };
             primary_type_symbol: None,
             type_import_source: None,
             resolution_source: None,
+            dispatch: None,
         }
     }
 
@@ -13279,6 +13356,7 @@ export { routes };
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         }
     }
 
@@ -15026,6 +15104,7 @@ export function publishWrapped(order: OrderPlaced): void {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         }
     }
 
@@ -15037,6 +15116,7 @@ export function publishWrapped(order: OrderPlaced): void {
             data_calls,
             graphql_operations: vec![],
             pubsub_operations: vec![],
+            dispatch_tables: Vec::new(),
         }
     }
 
