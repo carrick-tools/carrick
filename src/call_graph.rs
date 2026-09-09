@@ -1644,7 +1644,14 @@ mod tests {
              return client.subscribeToRun(id);\n}\n",
         );
 
-        assert_eq!(callee_names(&defs, "readRun"), ["RunClient.subscribeToRun"]);
+        // `runClientManager.clientOrThrow` is itself an indexed definition
+        // since carrick#830 — the manager is an exported object literal — so it
+        // is a resolved callee here. What this test is about is the member
+        // called on the RECEIVER it returns.
+        assert_eq!(
+            callee_names(&defs, "readRun"),
+            ["RunClient.subscribeToRun", "runClientManager.clientOrThrow"]
+        );
         assert!(
             callee_files(&defs, "readRun")[0].ends_with("packages/core/src/v2/client.ts"),
             "{:?}",
@@ -1668,7 +1675,15 @@ mod tests {
              return client.subscribeToRun(id);\n}\n",
         );
 
-        assert!(callee_names(&defs, "readRun").is_empty());
+        // `runClientManager.clientOrThrow` is itself an indexed definition
+        // since carrick#830 — the manager is an exported object literal — so it
+        // is a resolved callee here. What this test is about is the member
+        // called on the RECEIVER it returns.
+        assert_eq!(
+            callee_names(&defs, "readRun"),
+            ["runClientManager.clientOrThrow"],
+            "the ambiguous member on the receiver answers nothing"
+        );
         drop(dir);
     }
 
@@ -1686,7 +1701,15 @@ mod tests {
              return client.subscribeToRun(id);\n}\n",
         );
 
-        assert!(callee_names(&defs, "readRun").is_empty());
+        // `runClientManager.clientOrThrow` is itself an indexed definition
+        // since carrick#830 — the manager is an exported object literal — so it
+        // is a resolved callee here. What this test is about is the member
+        // called on the RECEIVER it returns.
+        assert_eq!(
+            callee_names(&defs, "readRun"),
+            ["runClientManager.clientOrThrow"],
+            "a type this repo has no source for answers nothing"
+        );
         drop(dir);
     }
 
@@ -1721,7 +1744,14 @@ mod tests {
              return client.subscribeToRun(id);\n}\n",
         );
 
-        assert_eq!(callee_names(&defs, "readRun"), ["RunClient.subscribeToRun"]);
+        // `runClientManager.clientOrThrow` is itself an indexed definition
+        // since carrick#830 — the manager is an exported object literal — so it
+        // is a resolved callee here. What this test is about is the member
+        // called on the RECEIVER it returns.
+        assert_eq!(
+            callee_names(&defs, "readRun"),
+            ["RunClient.subscribeToRun", "runClientManager.clientOrThrow"]
+        );
         // A parameter shadows the module scope and carries no origin of its own.
         assert!(callee_names(&defs, "readOther").is_empty());
         drop(dir);
@@ -1743,7 +1773,15 @@ mod tests {
              return inner;\n}\n",
         );
 
-        assert!(callee_names(&defs, "readContested").is_empty());
+        // `runClientManager.clientOrThrow` is itself an indexed definition
+        // since carrick#830 — the manager is an exported object literal — so it
+        // is a resolved callee here. What this test is about is the member
+        // called on the RECEIVER it returns.
+        assert_eq!(
+            callee_names(&defs, "readContested"),
+            ["runClientManager.clientOrThrow"],
+            "the shadowed receiver answers nothing"
+        );
         assert!(callee_names(&defs, "inner").is_empty());
         drop(dir);
     }
