@@ -155,7 +155,8 @@ CI runs these commands against a real index.
 | # | Command | Expected observation | Exit |
 |---|---|---|---|
 | 2.1 | `carrick init` | asks nothing until it has an identity, then lists the repos it found, writes `carrick-workspace.json` and `.claude/settings.json`, runs the first index, and prints the two lines it cannot run (the MCP line and the workflow line). Re-running says `unchanged` for both files and adds no second hook entry | 0 |
-| 2.2 | `carrick index` | `indexed N repo(s) in X.Xs at <time>`, one line per service with route and call counts and a short commit, the counterpart link count, then each service's boundary lines. On the demo workspace this took 7.1 s for three repos | 0 |
+| 2.1b | `carrick init` with `carrick` off PATH (run the entry point by absolute path, with a PATH holding node, git and gh only) | the hook command it writes is this install's own entry point, and it says so, with `npm install -g carrick` as the way back to the short command. It also says the plugin's language server is started as a bare `carrick`, which that machine cannot resolve, so the hooks are the channel there (carrick#837, #849) | 0 |
+| 2.2 | `carrick index` | `indexed N repo(s) in X.Xs at <time>`, one line per service with route and call counts and a short commit, the counterpart link count, then each service's boundary lines. On the demo workspace this takes about 7 s for three repos (7.1 s on 0.3.48, 6.6 s on 0.3.50) | 0 |
 | 2.3 | `carrick status` | one block per service: what the index holds, the commit, how far the repo has moved since, and the boundary lines | 0 |
 | 2.4 | `carrick status --json` | validates against `docs/schemas/carrick-status-0.json`; `scanner_version` is the build under test | 0 |
 | 2.5 | `carrick check <a file with a route>` | the routes and calls in that file, who is on the other side, and any verdict. On the demo workspace, checking `user-service`'s users controller names the `GET /api/users` mismatch and `notification-service server.ts:25` | 0 |
@@ -179,8 +180,8 @@ user sees when the thing they did was wrong.
 | 2.15 | No index, JSON | the same with `--json` | the same stderr line, plus a JSON object on stdout carrying `"error": "not_indexed"` and the schema id. A hook must never fail an edit, which is why this exits 0 | 0 |
 | 2.16 | File outside the workspace | `carrick check /etc/hosts` | `not_in_workspace` in the same two forms | 0 |
 | 2.17 | Wrong cwd | `cd <workspace>/user-service && carrick check src/users/users.controller.ts` | it still answers. The walk starts at the **file**, not the working directory, and takes the nearest ancestor holding `carrick-workspace.json` or `.carrick/index.json`. A language server is the case this does not cover, because a client sends it a folder rather than a file, which is what the root guard in 3.5 is for | 0 |
-| 2.18 | Stale index | edit a producer file, then `carrick check <that file> --json` without re-indexing | `changed_since_index` is non-zero and `stale` is true; a verdict that can no longer be claimed comes back `unresolved` with `result: null` and a `detail` reading `unresolved since your edit: <repo> has changed since it was indexed`. It must not report `compatible` from the pre-edit index | 0 |
-| 2.19 | Deleted file | delete an indexed file, then check it | `deleted` is set; the index still holds its rows. Deletions fire no channel of their own (E17): the next session start or the next explicit check is where this surfaces | 0 |
+| 2.18 | Stale index | edit a producer file, then `carrick check <that file> --json` without re-indexing | `changed_since_index` is non-zero and `stale` is true. The verdict **state does not move**: freshness left the verdict deliberately, so a `resolved` row stays `resolved` and its `detail` gains `(unresolved since your edit: <repo> has changed since it was indexed, so this describes the tree the index was built on)`. Read the state for what the index found and the envelope for whether the tree still matches | 0 |
+| 2.19 | Deleted file | delete an indexed file, then check it | `deleted` and `stale` are both true, the index still holds the file's rows, and each verdict becomes `not_checked` / `producer_removed` with `this file is gone and the index still serves <op> here: producer removed, N consumer(s)`. The human render leads with `this file is no longer on disk`. Deletions fire no channel of their own (E17): the next session start or the next explicit check is where this surfaces | 0 |
 | 2.20 | No file argument | `carrick check` | `carrick: \`carrick check\` needs a file path` | **2** |
 | 2.21 | Unknown option | `carrick check foo.ts --deep` | `carrick: unknown option for \`carrick check\`: --deep` | 2 |
 | 2.22 | No workspace file | `carrick index` in an empty directory | `no carrick-workspace.json found here or above`, with an example of one | 1 |
@@ -365,13 +366,19 @@ Nothing in this section is run from here, and no eval is run as part of this pla
 Copy this table, one row per machine or host, and fill it in. Record the build
 under test once at the top: scanner version, package version, and the commit.
 
-**Build under test:** version ______, commit ______, packed on ______.
+**Build under test:** version 0.3.50, tag `v0.3.50` (`46428cc`; the tree it was
+packed from differs from that tag in this file and two other markdown files
+only), packed 2026-09-09 on macOS 15.5 arm64, Node 24.12.0.
+
+**Fixture:** the three-service demo workspace, re-indexed by the build under
+test before section 2 (6.6 s, `user-service` 3 routes 1 call, `order-service`
+0 routes 4 calls, `notification-service` 0 routes 3 calls, 6 counterpart links).
 
 ### Install matrix
 
 | Row | Platform / manager | Ran on | `--version` | `index` | verdict probe | Notes |
 |---|---|---|---|---|---|---|
-| 1.2 | macOS arm64, npm | | | | | |
+| 1.2 | macOS arm64, npm | 2026-09-09, macOS 15.5, Node 24.12.0 | **pass** `0.3.50` | **pass** 3 repos in 6.6 s | **pass** `isolation: pnpm`, `install_ok: true`, TS 5.9.3, `compatible` / `incompatible` | packed tarball plus the darwin-arm64 platform tarball, installed with `--ignore-scripts` into a bare directory. The full 1.A sequence, no step skipped |
 | 1.3 | macOS x64, npm | | | | | |
 | 1.4 | Linux arm64, npm | | | | | |
 | 1.5 | Windows x64, npm | | | | | |
@@ -379,8 +386,52 @@ under test once at the top: scanner version, package version, and the commit.
 | 1.7 | Linux, yarn classic | | | | | |
 | 1.8 | yarn Berry PnP | | | | | |
 | 1.9 | global install | | | | | |
-| 1.11 | upgrade | | | | | |
+| 1.11 | upgrade | 2026-09-09 (half) | n/a | n/a | n/a | the read half passed on the way in: a 0.3.50 CLI read an index written by 0.3.48 and reported `scanner_version: 0.3.48`, the version that wrote it. The install-over-install half is unrun |
 | 1.12 | Node 22 floor | | | n/a | n/a | |
+
+### CLI
+
+Run 2026-09-09 on macOS arm64, from the installed package of the build above,
+against the demo workspace unless the row names another. Every row's output was
+captured; the notes quote it where the wording is the observation.
+
+| Row | What | Result | What it said |
+|---|---|---|---|
+| 2.1 | `init` | **pass** | identity `daveymoores (from the GitHub CLI)`, repo list, `wrote carrick-workspace.json`, `wrote .claude/settings.json`, first index, then the MCP line and the workflow line. Second run: `unchanged` for both files, still two hook entries. Run on a scratch two-repo workspace so the fixture keeps no `.claude/` of its own |
+| 2.1b | `init` with `carrick` off PATH | **pass** | writes the absolute entry point into the hook command and says so: "`carrick` is not on PATH here, so those hooks name this install", plus how to get the short command back. This is carrick#837 / #849 proven from an install rather than a checkout |
+| 2.2 | `index` | **pass** | `indexed 3 repo(s) in 6.6s`, a line per service, `6 counterpart link(s)`, then each service's boundary lines |
+| 2.3 | `status` | **pass** | workspace line, three service lines with `changed since index: 0`, then the boundary blocks |
+| 2.4 | `status --json` | **pass** | `schema: carrick.status/0`; every required field present at both levels; no key outside the schema; `scanner_version` is the build that wrote the index |
+| 2.5 | `check <producer>` | **pass** | the three routes, and on `GET /api/users` the `type_mismatch` with `notification-service server.ts:25` as the consumer. The other two routes are `unresolved`, which is a claim about nothing rather than a claim of agreement |
+| 2.6 | `check --json` | **pass** | `schema: carrick.check/0`; `repo` + `file` opens the queried file; all three `counterparts[].repo` + `.file` open a file that exists; four `boundary_lines` and a `boundary_note` |
+| 2.7 | `touch` | **pass** | the same surface with `verdict: null` on every item, by contract. The human render simply omits the verdict line |
+| 2.8 | `refresh --service` | **pass** | one repo re-scanned in 2.8 s against 6.6 s for all three; the other two commits unchanged; counterpart links preserved |
+| 2.9 | `hook post-edit` | **pass** | one `hookSpecificOutput.additionalContext` object, **27 ms** for the check (74 ms wall including Node start), carrying the real mismatch and the consumer. A file with no rows still gets the boundary; a file outside the workspace gets nothing at all |
+| 2.10 | `hook session-start` | **pass** | one line per service, boundary lines after, trailing newline present (carrick#838). The 13 boundary lines are **byte-identical** to `carrick status` |
+| 2.11 | `lsp --stdio` | **pass** | `start pid <n> node v24.12.0` on stderr, nothing on stdout. `CARRICK_LOG` writes the same line to the file **as well**; `CARRICK_LOG_QUIET=1` is what empties stderr |
+| 2.12 | `templates workflow` | **pass** | the workflow on stdout with no `{{` placeholder left |
+| 2.13 | no identity | **pass** | `carrick init needs your GitHub identity, and this machine has none it can use.` plus the two ways to give it. Exit 1, nothing written |
+| 2.14 | no index | **pass** | `no local index for this file. Run carrick index --workspace <dir> ...`, exit 0 |
+| 2.15 | no index, `--json` | **pass** | the same line on stderr, `{"schema":"carrick.check/0","error":"not_indexed"}` on stdout, exit 0 |
+| 2.16 | file outside the workspace | **pass** | `this file is not under any repo the workspace lists ...` and `"error":"not_in_workspace"`, exit 0 |
+| 2.17 | wrong cwd | **pass** | answers from inside a service directory: the walk starts at the file. Exit 0 |
+| 2.18 | stale index | **pass** | `stale: true`, `changed_since_index: 1`, and every verdict's detail gains the "since your edit" sentence while its state stands. The row's original expectation was wrong and is corrected above |
+| 2.19 | deleted file | **pass** | `deleted: true`, rows still served, each verdict `not_checked` / `producer_removed` with the consumer count, and the render leads with `this file is no longer on disk` |
+| 2.20 | no file argument | **pass** | ``carrick: `carrick check` needs a file path``, exit 2 |
+| 2.21 | unknown option | **pass** | ``carrick: unknown option for `carrick check`: --deep``, exit 2 |
+| 2.22 | no workspace file | **pass** | `no carrick-workspace.json found here or above`, with an example, exit 1 |
+| 2.23 | workspace names a missing repo | **pass** | names `./nope`, says it is not indexed, indexes the other two anyway |
+| 2.24 | unknown hook | **pass** | `carrick hook needs one of: post-edit, session-start`, exit 2 |
+| 2.25 | unknown template | **pass** | `carrick templates: no carrick template named nonsense`, exit 2 |
+| 2.26 | platform package missing | **pass** | names the platform package, offers `CARRICK_NATIVE_BINARY`, exit 1, no stack trace |
+| 2.27 | corrupt settings file | **pass** | `skipped .claude/settings.json: it is not valid JSON (...)`, and the file was left exactly as it was |
+| extra | read commands write nothing | **pass** | twenty `check` and twenty `status` calls left the debug log at 275,646 bytes, unchanged |
+| extra | log is bounded | **pass** | with `CARRICK_LOG_MAX_MB=1` and a file past the cap, the run rolled it to one generation and started a new file. The message names the rolled file with a literal `<date>`, which is carrick#858 |
+
+**Found by this run, both filed:** carrick#857, a file rewritten with identical
+bytes reads as stale, so every verdict in it carries a caveat the same payload
+denies; and carrick#858, the log-roll message prints a placeholder instead of
+the file it wrote. Nothing else in section 2 failed.
 
 ### Claude Code
 
@@ -428,6 +479,8 @@ Open tickets this plan runs into, so a red row can be recognised as a known one.
 | carrick#848 | An edit made through Bash reaches neither channel, because both are keyed to `Write\|Edit\|MultiEdit` and the server is started lazily by the Edit or Write tool | 3.6, and the validity rule in 3.10 |
 | carrick#853 | No install matrix in CI: every job runs on `ubuntu-latest` | 1.2 to 1.8, 1.12 |
 | carrick#854 | No script drives the language server against a real index, so every editor row starts with a by-hand sequence | 4.0, and the first step of 4.1 to 4.7 |
+| carrick#857 | A file rewritten with identical bytes reads as stale, so every verdict in it gains a caveat that the same payload's `changed_since_index: 0` denies. Found by row 2.18's neighbourhood on 2026-09-09 | 2.17, 2.18, and every editor row, since a save with no change is ordinary there |
+| carrick#858 | The log-roll message prints `carrick.log.<date>.1` literally rather than the file it wrote. Cosmetic | the log-bound check at the end of section 2 |
 
 And the design facts that are not tickets, because they are how it works. A row
 that hits one of these is behaving correctly:
