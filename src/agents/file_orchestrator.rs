@@ -6475,6 +6475,13 @@ impl FileOrchestrator {
     /// join adds no row and changes no target: all it can do is carry a value
     /// the model already stated one file away, so a miss leaves the site
     /// exactly where it is.
+    ///
+    /// The rings stop where the request-member rings stop: at the repo's
+    /// relative import graph. A client another WORKSPACE PACKAGE publishes is
+    /// imported by package name, which names no module here, so a site that
+    /// reaches its wrapper through a published surface carries nothing yet —
+    /// the half `resolve_package_surface_members` answers for targets has no
+    /// counterpart here.
     fn resolve_dispatch_sites(
         candidate_map: &HashMap<String, CandidateTarget>,
         rings: Vec<Vec<(PathBuf, DispatchMemberIndex)>>,
