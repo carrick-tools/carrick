@@ -1,6 +1,6 @@
 {
   "name": "carrick",
-  "version": "0.3.53",
+  "version": "0.3.54",
   "description": "The API contract index for a TypeScript workspace: what the other services do with the routes and calls in the file you are editing, in your editor and in your agent's context",
   "keywords": [
     "typescript",
@@ -55,11 +55,11 @@
     "zod": "^3.23.0"
   },
   "optionalDependencies": {
-    "@carrick-tools/cli-darwin-arm64": "0.3.53",
-    "@carrick-tools/cli-darwin-x64": "0.3.53",
-    "@carrick-tools/cli-linux-arm64": "0.3.53",
-    "@carrick-tools/cli-linux-x64": "0.3.53",
-    "@carrick-tools/cli-win32-x64": "0.3.53"
+    "@carrick-tools/cli-darwin-arm64": "0.3.54",
+    "@carrick-tools/cli-darwin-x64": "0.3.54",
+    "@carrick-tools/cli-linux-arm64": "0.3.54",
+    "@carrick-tools/cli-linux-x64": "0.3.54",
+    "@carrick-tools/cli-win32-x64": "0.3.54"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",

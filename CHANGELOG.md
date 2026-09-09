@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.54](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.53...carrick-v0.3.54) (2026-09-09)
+
+
+### CI/CD
+
+* **release:** package and publish the VS Code extension ([#883](https://github.com/carrick-tools/carrick/issues/883)) ([d1af332](https://github.com/carrick-tools/carrick/commit/d1af332a3c8fe85a57b340bb9daa92e707c971a7))
+
 ## [0.3.53](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.52...carrick-v0.3.53) (2026-09-09)
 
 
