@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.3.51](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.50...carrick-v0.3.51) (2026-09-09)
+
+
+### Features
+
+* **dispatch:** key an operation by the request field its handler switches on ([#867](https://github.com/carrick-tools/carrick/issues/867)) ([daed5d6](https://github.com/carrick-tools/carrick/commit/daed5d628760d48954fe5760bc18548893d4859d))
+
+
+### Bug Fixes
+
+* **calls:** a call expression in a path segment is a parameter, not leftover source ([#861](https://github.com/carrick-tools/carrick/issues/861)) ([5bc3624](https://github.com/carrick-tools/carrick/commit/5bc362439d14c28a19ffef0a2852c7af369bc9fe)), closes [#829](https://github.com/carrick-tools/carrick/issues/829) [#632](https://github.com/carrick-tools/carrick/issues/632) [#647](https://github.com/carrick-tools/carrick/issues/647)
+* **dispatch:** take the data_calls dispatch description from the swept snapshot ([#869](https://github.com/carrick-tools/carrick/issues/869)) ([e083e54](https://github.com/carrick-tools/carrick/commit/e083e54117f0079047d2c505f2d7381874e00d19)), closes [#831](https://github.com/carrick-tools/carrick/issues/831)
+* **local:** a rewrite that changes no bytes is not a change ([#860](https://github.com/carrick-tools/carrick/issues/860)) ([c6ff15c](https://github.com/carrick-tools/carrick/commit/c6ff15c60701e8c82b2e6685d6820262fdc19c14)), closes [#857](https://github.com/carrick-tools/carrick/issues/857) [#709](https://github.com/carrick-tools/carrick/issues/709)
+* **npm:** publish type declarations for the templates export ([#868](https://github.com/carrick-tools/carrick/issues/868)) ([fd281d6](https://github.com/carrick-tools/carrick/commit/fd281d6a6d0f349924a66bb21d404a5abce31d20)), closes [#845](https://github.com/carrick-tools/carrick/issues/845) [#710](https://github.com/carrick-tools/carrick/issues/710) [#832](https://github.com/carrick-tools/carrick/issues/832)
+* **types:** a bare `unknown` is not a definition to publish ([#864](https://github.com/carrick-tools/carrick/issues/864)) ([26cd546](https://github.com/carrick-tools/carrick/commit/26cd54674cff7a2390d4b253aaca6a2cb096ae0c)), closes [#852](https://github.com/carrick-tools/carrick/issues/852) [#780](https://github.com/carrick-tools/carrick/issues/780) [#846](https://github.com/carrick-tools/carrick/issues/846)
+
+
+### Documentation
+
+* **plugin:** a test plan for the delivery surface ([#855](https://github.com/carrick-tools/carrick/issues/855)) ([7d92ec6](https://github.com/carrick-tools/carrick/commit/7d92ec68907310addd6258903fcc62f2bde8f7e1))
+* **plugin:** fill in the install and CLI results for 0.3.50 on macOS arm64 ([#859](https://github.com/carrick-tools/carrick/issues/859)) ([472f0e6](https://github.com/carrick-tools/carrick/commit/472f0e67aecbafa9edd34562fdc3099f8ffbead3)), closes [#709](https://github.com/carrick-tools/carrick/issues/709)
+
 ## [0.3.50](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.49...carrick-v0.3.50) (2026-09-09)
 
 
