@@ -256,10 +256,44 @@ jobs:
             exit 1
           fi
           echo "publishing ${#tarballs[@]} platform package(s)"
+          : > "$RUNNER_TEMP/published.txt"
           for tarball in "${tarballs[@]}"; do
             echo "publishing $tarball"
             npm publish --access public "$tarball"
+            # The name from the tarball itself rather than from its filename,
+            # so the wait below asks about exactly what was published — and
+            # only about that, since win32 is allowed to fail.
+            tar -xzOf "$tarball" package/package.json \
+              | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).name" \
+              >> "$RUNNER_TEMP/published.txt"
           done
+
+      # npm does not serve a freshly published version immediately, and the
+      # last of the five above was published seconds ago. An install that runs
+      # while one of them is still invisible resolves it to nothing, and the
+      # main package's install then fails on a lockfile that has lost an entry
+      # — which is how 0.3.55 published five platform packages and no
+      # `carrick`. Lag of about twenty minutes has been seen on this scope.
+      - name: Wait until the platform packages are readable
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          VERSION="${TAG##*v}"
+          DEADLINE=$(( $(date +%s) + 900 ))
+          while read -r pkg; do
+            [ -n "$pkg" ] || continue
+            delay=5
+            until npm view "$pkg@$VERSION" version >/dev/null 2>&1; do
+              if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+                echo "::error::$pkg@$VERSION was published but is still not readable after 15 minutes. The platform packages are on npm; re-run this job when the registry serves them."
+                exit 1
+              fi
+              echo "waiting for $pkg@$VERSION (${delay}s)"
+              sleep "$delay"
+              if [ "$delay" -lt 60 ]; then delay=$(( delay * 2 )); else delay=60; fi
+            done
+            echo "$pkg@$VERSION is readable"
+          done < "$RUNNER_TEMP/published.txt"
 
       - name: Build the type sidecar
         run: cd src/sidecar && npm ci && npm run build
@@ -271,18 +305,17 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd npm/carrick
-          # The lockfile cannot be correct for the version being released, so it is
-          # regenerated rather than trusted. `optionalDependencies` pins the five
-          # platform packages to this exact version, and when release-please writes
-          # the release commit those tarballs do not exist yet — no committed
-          # lockfile can hold an integrity hash for a package that has not been
-          # published. npm records `{"optional": true}` stubs instead, and `npm ci`
-          # rejects them the moment the version does exist ("lock file's ...@ does
-          # not satisfy ...@0.3.54", release 0.3.54). Regenerating first is right in
-          # both states: real entries when the pins resolve, stubs when they do not,
-          # and `npm ci` accepts either.
-          npm install --package-lock-only --ignore-scripts
-          npm ci
+          # `npm install`, not `npm ci`: nothing here needs a lockfile that
+          # agrees with the manifest, and at a release no lockfile can. The
+          # pins name the exact version being released, so a committed
+          # lockfile's entries are always a release behind, and a regenerate is
+          # only as good as what the registry served that second — 0.3.54 and
+          # 0.3.55 both died here, one on stale entries and one on an entry
+          # that vanished while the registry caught up. `npm install` resolves
+          # fresh, tolerates an optional dependency it cannot reach, and gives
+          # prepack the toolchain it needs. `npm publish` reads the manifest,
+          # never the lock, and the lock is not published.
+          npm install --ignore-scripts --no-audit --no-fund
           npm publish --access public
 
   # Builds the carrick-match wasm artifact, attaches it to the release, and
