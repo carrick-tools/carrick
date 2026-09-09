@@ -90,3 +90,20 @@ jobs:
           MISSING=$(./node_modules/.bin/carrick check nothing.ts 2>&1 || true)
           echo "$MISSING"
           echo "$MISSING" | grep -q "is not installed"
+
+      # The verdict is the whole point of the local tier, and it is the one
+      # thing the steps above cannot see: the check phase spawns a vendored
+      # pnpm and tsc, they live somewhere else in an install than in a
+      # checkout, and a miss degrades every pair to `unverifiable` rather than
+      # failing (carrick#833). So run the same probe against both shapes and
+      # require the same verdicts from each. No binary and no network: the
+      # stubs are hand-authored and dependency-free, so the check's install is
+      # local-only.
+      - name: A checkout produces type verdicts
+        run: node npm/carrick/scripts/verdict-probe.mjs --sidecar src/sidecar
+
+      - name: The installed package produces the same type verdicts
+        run: |
+          set -euo pipefail
+          node npm/carrick/scripts/verdict-probe.mjs \
+            --sidecar "$RUNNER_TEMP/probe/node_modules/carrick/sidecar"

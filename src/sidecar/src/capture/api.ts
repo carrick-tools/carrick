@@ -409,12 +409,13 @@ export interface CheckOptions {
   pairs: CheckPairSpec[];
   /** Parent dir for the scratch workspace (default: os.tmpdir()). */
   workspaceRoot?: string;
-  /** Absolute path to the vendored pnpm binary. Defaults to the sidecar's
-   * own node_modules/.bin/pnpm resolved from this bundle's location. */
+  /** Absolute path to the vendored pnpm binary. Defaults to the first
+   * `node_modules/.bin/pnpm` at or above this bundle — the sidecar's own in a
+   * checkout, the install root's in an npm install. */
   pnpmPath?: string;
-  /** Absolute path to the tsc CLI. Defaults to the sidecar's own
-   * node_modules/.bin/tsc. Tests inject a stand-in to pin the
-   * abnormal-termination path. */
+  /** Absolute path to the tsc CLI. Defaults to the nearest
+   * `node_modules/.bin/tsc` at or above this bundle. Tests inject a stand-in
+   * to pin the abnormal-termination path. */
   tscPath?: string;
   /** Delete the scratch workspace before returning (default true). Tests that
    * inspect the assembled tree pass false. */
