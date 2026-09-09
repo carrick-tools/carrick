@@ -175,3 +175,277 @@ jobs:
               exit 1
             }
           done
+
+  # ---------------------------------------------------------------------------
+  # The install matrix (carrick#853).
+  #
+  # The `plugin` job above proves one of the combinations this package claims:
+  # an npm install of the packed tarball, project-local, on Linux x64, on
+  # Node 24. The package claims five platforms, three package managers and a
+  # Node floor. The two packaging failures that actually shipped (carrick#833,
+  # and a `.ts` Node refuses to strip under node_modules) were invisible to
+  # every test in the repo and visible the moment a tarball was installed, and
+  # each shape below differs from the proven one in the same way: a lookup, a
+  # spawn, a resolver. None of them can be reasoned about.
+  #
+  # One tarball, packed once and downloaded by every leg. The question is
+  # whether THIS artefact installs and answers everywhere; packing per leg would
+  # ask a different question on each runner.
+  pack:
+    name: Pack the tarball
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      # `npm pack` runs prepack, which builds the emit and bundles the sidecar,
+      # so the sidecar has to exist first. The same two commands the `plugin`
+      # job runs, deliberately duplicated rather than shared: this job must not
+      # wait on the unit tests, or the whole matrix waits on them too.
+      - name: Build the type sidecar
+        working-directory: src/sidecar
+        run: npm ci && npm run build
+
+      - name: Install
+        working-directory: npm/carrick
+        run: npm install --package-lock-only --ignore-scripts && npm ci
+
+      - name: Pack
+        run: |
+          set -euo pipefail
+          mkdir -p pack
+          (cd npm/carrick && npm pack --pack-destination "$GITHUB_WORKSPACE/pack")
+          ls -l pack
+
+      - name: Upload the tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: carrick-tarball
+          path: pack/*.tgz
+          retention-days: 1
+
+  install:
+    name: Install (${{ matrix.name }})
+    needs: pack
+    runs-on: ${{ matrix.runner }}
+    # Windows is known red (carrick#842: the check phase spawns a vendored
+    # `tsc` that is a `.CMD` there, with no shell), and the pnpm and yarn bin
+    # walks have never been measured (carrick#843). A required leg for any of
+    # the three would redden every pull request until those are fixed, so each
+    # records its answer without blocking. Read the leg, not the tick.
+    continue-on-error: ${{ matrix.optional == true }}
+    strategy:
+      # Without this the known-red Windows leg cancels every other leg, which
+      # is the opposite of what this matrix is for.
+      fail-fast: false
+      matrix:
+        include:
+          - name: npm, Linux x64
+            runner: ubuntu-latest
+            manager: npm
+          - name: npm, Linux arm64
+            runner: ubuntu-24.04-arm
+            manager: npm
+          - name: npm, macOS arm64
+            runner: macos-latest
+            manager: npm
+          # There is no macOS x64 leg. The darwin-x64 platform package is
+          # cross-built on the Apple-silicon runner (release.yml), the Intel
+          # runner labels are being retired, and an install probe resolves no
+          # platform binary at all (`--omit=optional`, below), so an Intel leg
+          # would answer the same question as the arm64 one.
+          - name: npm, Windows x64
+            runner: windows-latest
+            manager: npm
+            optional: true
+          - name: pnpm, Linux x64
+            runner: ubuntu-latest
+            manager: pnpm
+            optional: true
+          - name: yarn, Linux x64
+            runner: ubuntu-latest
+            manager: yarn
+            optional: true
+    defaults:
+      run:
+        # Windows runs pwsh by default, and every step below is a shell script.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: carrick-tarball
+          path: pack
+
+      # Not through corepack: it is opt-in on the runner images and its state
+      # differs between them, which is a variable this matrix does not want.
+      - name: Install the package manager
+        if: matrix.manager != 'npm'
+        run: npm install -g ${{ matrix.manager }}
+
+      # The tarball, installed the way a user installs it, with its path kept
+      # relative: a Windows runner's `RUNNER_TEMP` is a `D:\a\...` path that
+      # neither bash nor a Node CLI reads the same way.
+      #
+      # `--ignore-scripts` because no lifecycle script exists anywhere in the
+      # package, and this is what holds that true. Optional dependencies are
+      # omitted so this proves the same thing on every day of the week: without
+      # it the platform package for this runner installs whenever the version
+      # happens to be published already, the binary resolves, and the assertion
+      # in the next step stops describing anything.
+      - name: Install the packed package as a user would
+        run: |
+          set -euo pipefail
+          TARBALL="../$(ls pack/carrick-*.tgz)"
+          mkdir -p probe
+          cd probe
+          echo '{"name":"probe","private":true}' > package.json
+          case "${{ matrix.manager }}" in
+            npm)  npm install --ignore-scripts --omit=optional "$TARBALL" ;;
+            pnpm) pnpm add --ignore-scripts --no-optional "$TARBALL" ;;
+            yarn) yarn add --ignore-scripts --ignore-optional "file:$TARBALL" ;;
+          esac
+          ./node_modules/.bin/carrick --version
+
+      # No platform package here by construction, so this is the message a user
+      # whose platform did not publish sees. It must be a message and not a
+      # stack trace, and its non-zero exit is the expected one.
+      - name: A missing platform package is a message
+        working-directory: probe
+        run: |
+          set -euo pipefail
+          MISSING=$(./node_modules/.bin/carrick check nothing.ts 2>&1 || true)
+          echo "$MISSING"
+          echo "$MISSING" | grep -q "is not installed"
+
+      # The verdict is the whole point of the local tier and the one thing the
+      # steps above cannot see: the check phase spawns a vendored pnpm and tsc,
+      # they live somewhere else in an install than in a checkout, and a miss
+      # degrades every pair to `unverifiable` rather than failing
+      # (carrick#833). On Windows this is the reproduction carrick#842 is
+      # missing, so its output is what that leg exists to record.
+      - name: The installed package produces type verdicts
+        run: node npm/carrick/scripts/verdict-probe.mjs --sidecar probe/node_modules/carrick/sidecar
+
+  # The floor is checked in `bin/carrick.mjs` before any `.ts` is imported,
+  # because on an older Node the import itself is a syntax error and a syntax
+  # error is not an answer to "which Node do I need". Nothing else runs this
+  # package on an older Node.
+  node-floor:
+    name: Node floor
+    needs: pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: carrick-tarball
+          path: pack
+
+      # Installed on 24, because `npm install` on 22 refuses the engines field
+      # and the question here is what the CLI says, not what npm says.
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install
+        run: |
+          set -euo pipefail
+          TARBALL="../$(ls pack/carrick-*.tgz)"
+          mkdir -p probe
+          cd probe
+          echo '{"name":"probe","private":true}' > package.json
+          npm install --ignore-scripts --omit=optional "$TARBALL"
+
+      - name: Downgrade Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: An older Node gets an answer, not a syntax error
+        run: |
+          set -euo pipefail
+          node --version
+          ENTRY=probe/node_modules/carrick/bin/carrick.mjs
+          OUT=$(node "$ENTRY" --version 2>&1 || true)
+          echo "$OUT"
+          CODE=0
+          node "$ENTRY" --version >/dev/null 2>&1 || CODE=$?
+          echo "$OUT" | grep -q "carrick needs Node 24 or newer"
+          [ "$CODE" = "1" ] || { echo "::error::expected exit 1, got $CODE"; exit 1; }
+
+  # The install the README tells people to do, and the one `carrick init` writes
+  # a bare hook command for. It differs from a project-local install in the one
+  # way that matters: `carrick` is found by a PATH lookup rather than by a path.
+  global-install:
+    name: Global install
+    needs: pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: carrick-tarball
+          path: pack
+
+      - name: Install globally and run it off PATH
+        run: |
+          set -euo pipefail
+          npm install -g --ignore-scripts --omit=optional "$(ls pack/carrick-*.tgz)"
+          which carrick
+          carrick --version
+
+  # An install over an install. What this catches is a file the previous version
+  # left behind, or a `dist/` that half-updated: both install cleanly and answer
+  # wrongly.
+  upgrade:
+    name: Upgrade over a published install
+    needs: pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: carrick-tarball
+          path: pack
+
+      # The published `latest` is the version people upgrade FROM. Between
+      # releases it is the version this tarball also carries, and the step is
+      # still the one that matters: the same files, written twice.
+      - name: Install the published package, then this tarball over it
+        run: |
+          set -euo pipefail
+          TARBALL="../$(ls pack/carrick-*.tgz)"
+          EXPECTED=$(node -p "require('./npm/carrick/package.json').version")
+          mkdir -p probe
+          cd probe
+          echo '{"name":"probe","private":true}' > package.json
+          npm install --ignore-scripts --omit=optional carrick
+          echo "from: $(./node_modules/.bin/carrick --version)"
+          npm install --ignore-scripts --omit=optional "$TARBALL"
+          GOT=$(./node_modules/.bin/carrick --version)
+          echo "to: $GOT"
+          [ "$GOT" = "$EXPECTED" ] || {
+            echo "::error::after the upgrade carrick reports $GOT, not $EXPECTED"
+            exit 1
+          }
+          MISSING=$(./node_modules/.bin/carrick check nothing.ts 2>&1 || true)
+          echo "$MISSING" | grep -q "is not installed"
