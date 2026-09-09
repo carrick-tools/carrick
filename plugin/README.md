@@ -79,7 +79,9 @@ either verdict channel and is printed whichever one is delivering.
 ## VS Code
 
 `vscode/` holds a thin extension: a `LanguageClient` on `carrick lsp --stdio`,
-activated on TypeScript files, with no UI of its own. Build and package it with
+activated on TypeScript files, with two pieces of UI and no logic. A status bar
+item carrying the boundary, and the command a code lens runs, which lists the
+other side of a row and opens it across repos. Build and package it with
 `npm install && npm run build && npx --yes @vscode/vsce package` in that
 directory. `release.yml` packages it at the release version, attaches the
 `.vsix` to the GitHub release and publishes it to Open VSX, which is the gallery
@@ -103,7 +105,10 @@ support all take a command and arguments; that is the whole configuration. The
 server reads the workspace folder the client sends, falls back to the nearest
 `.carrick/` above the file, logs when the two differ, and handles `didOpen`,
 `didChange` (debounced) and `didSave`. A pull-only client gets the same answer
-from `textDocument/diagnostic`.
+from `textDocument/diagnostic`, and any client gets `textDocument/codeLens`. A
+client with no status bar keeps the boundary as a file-level diagnostic; one
+that has somewhere else for it says `boundarySurface` in its
+`initializationOptions`.
 
 ## Terminal agents with neither
 
@@ -124,6 +129,7 @@ turned off loses its rows on the next publish, not at the next restart.
 |---|---|---|
 | `carrick.diagnostics` | on | The verdicts in the Problems panel, at their own site and at each counterpart |
 | `carrick.boundary` | on | The boundary: the status bar item in VS Code, the file-level row in a client without one |
+| `carrick.codeLens` | on | The lens above a route or call the index holds a counterpart or a mismatch for |
 | `carrick.binary` | the `carrick` on PATH | Not a surface: which CLI to run |
 
 `CARRICK_CHANNEL=off` stays the blunt instrument and silences delivery
@@ -138,6 +144,26 @@ that says it has somewhere workspace-shaped to put it — VS Code does, with
 item with the lines as its tooltip — gets it there instead of on every
 TypeScript file it opens. A client that says nothing keeps the file-level
 Information row, and `carrick.boundary` turns that off.
+
+## The code lens
+
+`textDocument/codeLens`, answered from the same `carrick check <file> --json`
+the diagnostics come from, and answered whichever channel owns delivery: the
+channel decides who speaks unasked, and a lens is only ever rendered because a
+client asked for it.
+
+A lens is rendered on a row the index holds at least one counterpart or one
+non-compatible verdict for, and on no other row. **Nothing says zero.** A local
+index holds facts only, so a route with no indexed consumer is the ordinary
+state, and a lens reading "0 consumers" would say "nobody calls this" where it
+means "not indexed here". The boundary answers the question of why the other
+rows are bare.
+
+Clicking a lens runs `carrick.showCounterparts` with the sites the payload
+named, which VS Code renders as a list and opens across repos. A candidate row
+produces no lens at all: it is the model's reading, and a lens is not asked for
+before it appears. When candidates can reach a laptop they are counted in a
+clause of their own and never inside the mismatch count.
 
 ## The noise budget
 

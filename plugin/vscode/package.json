@@ -40,6 +40,11 @@
           "type": "boolean",
           "default": true,
           "description": "Show what the scan could not classify, in the status bar. Your agent's own channel states it whatever this is set to."
+        },
+        "carrick.codeLens": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a lens above a route or call the index holds a counterpart or a mismatch for. Rows it knows nothing about get no lens."
         }
       }
     }

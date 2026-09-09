@@ -16,8 +16,15 @@
 // there: a status bar item whose tooltip is the boundary. The server keeps
 // stating the boundary in the agent's own channel either way.
 //
-// The extension holds no code of its own beyond that: the server, the hook and
-// the scanner are all the `carrick` npm package (carrick#710). That is the
+// The other surface is the code lens (carrick#880), on the rows the index holds
+// a counterpart or a mismatch for and on no others. Clicking one lists the
+// other side and opens it, which is the one jump nothing else in the editor can
+// make. The lens carries the boundary in its arguments rather than in a
+// tooltip, because `vscode-languageclient` copies a command's title, name and
+// arguments and drops the rest.
+//
+// Beyond those two the extension holds no code of its own: the server, the hook
+// and the scanner are all the `carrick` npm package (carrick#710). That is the
 // whole reason the extension has no version of the server to fall out of date
 // with.
 
@@ -52,8 +59,52 @@ function surfaces(): Record<string, boolean> {
   return {
     diagnostics: settings.get<boolean>("diagnostics") ?? true,
     boundary: settings.get<boolean>("boundary") ?? true,
+    codeLens: settings.get<boolean>("codeLens") ?? true,
     boundarySurface: true,
   };
+}
+
+/** One site on the other side of a row, as the lens command hands it over. */
+type CounterpartSite = {
+  role: string;
+  service: string | null;
+  /** Absolute, and already checked to exist; null when it is not on this disk. */
+  path: string | null;
+  line: number | null;
+};
+
+type CounterpartList = {
+  operation: string;
+  sites: CounterpartSite[];
+  boundary: string[];
+};
+
+/**
+ * What a lens does when it is clicked: list the other side, and open one.
+ *
+ * A site the server could not point at on this disk is shown and not opened:
+ * saying "order-service, not on this machine" is the true answer, and a guessed
+ * path would be a worse one. The boundary rides along as the placeholder,
+ * because `vscode-languageclient` drops a command tooltip and this is the only
+ * place a lens can carry it.
+ */
+async function showCounterparts(list: CounterpartList): Promise<void> {
+  const items = list.sites.map((site) => ({
+    label: site.service ? `${site.role} in ${site.service}` : site.role,
+    description: site.path ? `${site.path}${site.line ? `:${site.line}` : ""}` : "not on this machine",
+    site,
+  }));
+  const picked = await vscode.window.showQuickPick(items, {
+    title: list.operation,
+    placeHolder: list.boundary[0] ?? "The other side of this operation",
+  });
+  const site = picked?.site;
+  if (!site?.path) return;
+  const document = await vscode.workspace.openTextDocument(site.path);
+  const line = Math.max(0, (site.line ?? 1) - 1);
+  await vscode.window.showTextDocument(document, {
+    selection: new vscode.Range(line, 0, line, 0),
+  });
 }
 
 function renderStatus(): void {
@@ -79,6 +130,10 @@ export function activate(context: vscode.ExtensionContext): void {
   status.name = "Carrick";
   context.subscriptions.push(status);
 
+  context.subscriptions.push(
+    vscode.commands.registerCommand("carrick.showCounterparts", showCounterparts),
+  );
+
   const settings = vscode.workspace.getConfiguration("carrick");
   const command = settings.get<string>("binary") || "carrick";
   const run = {
@@ -103,10 +158,11 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push({ dispose: () => void client?.stop() });
 
   void client.start().then(() => {
-    client?.onNotification("carrick/boundary", (notice: BoundaryNotice) => {
+    const listener = client?.onNotification("carrick/boundary", (notice: BoundaryNotice) => {
       lastBoundary = notice;
       renderStatus();
     });
+    if (listener) context.subscriptions.push(listener);
   });
 
   // A setting changed is forwarded straight through, so a surface turned off

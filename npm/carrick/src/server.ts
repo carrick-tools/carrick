@@ -30,6 +30,7 @@ import { check } from "./cli.ts";
 import type { CheckResult } from "./contract.ts";
 import { resolveChannel, type ChannelChoice } from "./channel.ts";
 import { toDiagnostics, type Diagnostic } from "./diagnostics.ts";
+import { toCodeLenses } from "./lens.ts";
 import { createLogger } from "./log.ts";
 import { resolveRoot, rootNote, type RootChoice } from "./root.ts";
 import { boundaryFor } from "./render.ts";
@@ -61,12 +62,16 @@ let root = process.cwd();
 let rootChoice: RootChoice | null = null;
 let channel: ChannelChoice = resolveChannel({ hooksInstalled: false });
 let clientName = "an unnamed client";
+/** Whether the client will re-request lenses when asked to (LSP 3.16). */
+let clientRefreshesLenses = false;
 /** One off switch per surface (carrick#879), as the client stated them. */
 let surfaces: Surfaces = DEFAULT_SURFACES;
 
 /** What each checked file last published to, so a clear is scoped to it. */
 const publishedBy = new Map<string, Set<string>>();
 const debounces = new Map<string, NodeJS.Timeout>();
+/** Ids for the requests this server makes of the client. */
+let nextServerId = 1;
 /** One check at a time: a burst of edits must not interleave two runs. */
 let queue: Promise<void> = Promise.resolve();
 
@@ -182,6 +187,10 @@ function onInitialize(id: number | string | undefined, params: Record<string, un
   }
   const info = params["clientInfo"] as { name?: string } | undefined;
   if (info?.name) clientName = info.name;
+  const capabilities = params["capabilities"] as
+    | { workspace?: { codeLens?: { refreshSupport?: boolean } } }
+    | undefined;
+  clientRefreshesLenses = capabilities?.workspace?.codeLens?.refreshSupport === true;
   surfaces = readSurfaces(params["initializationOptions"]);
 
   rootChoice = resolveRoot({
@@ -216,6 +225,10 @@ function onInitialize(id: number | string | undefined, params: Record<string, un
           interFileDependencies: true,
           workspaceDiagnostics: false,
         },
+        // Declared whatever `carrick.codeLens` says, so a client that cached
+        // the capability still gets an answer when the switch is flipped: the
+        // answer is an empty list.
+        codeLensProvider: { resolveProvider: true },
       },
       serverInfo: { name: NAME, version: VERSION },
     },
@@ -252,8 +265,31 @@ function handle(message: Message): void {
       surfaces = readSurfaces(params, surfaces);
       log(`surfaces: ${JSON.stringify(surfaces)}`);
       for (const relFile of publishedBy.keys()) scheduleCheck(path.resolve(root, relFile), 0);
+      // A lens is pulled, not pushed, so `carrick.codeLens` off only clears the
+      // screen once the client asks again. It is asked to.
+      if (clientRefreshesLenses) send({ id: `carrick-refresh-${nextServerId++}`, method: "workspace/codeLens/refresh", params: {} });
       return;
     }
+    case "textDocument/codeLens": {
+      // A REQUEST, not a push: it is answered in an install where the hook owns
+      // delivery, because the channel decides who speaks unasked and a lens is
+      // only ever rendered because a client asked for it.
+      const file = pathOf(params);
+      if (!file) {
+        send({ id, result: [] });
+        return;
+      }
+      void enqueue(async () => {
+        const outcome = await check(relative(file), { cwd: root });
+        send({ id, result: outcome.result ? toCodeLenses(outcome.result, { surfaces }) : [] });
+      });
+      return;
+    }
+    case "codeLens/resolve":
+      // Everything a lens carries comes from the one check the list was built
+      // from, so there is nothing left to fill in.
+      send({ id, result: params ?? null });
+      return;
     case "textDocument/diagnostic": {
       // A pull-only client still gets an answer, and the same one.
       const file = pathOf(params);

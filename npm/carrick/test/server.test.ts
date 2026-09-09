@@ -269,3 +269,64 @@ test("turning a surface off takes its rows away on the next publish, not at the 
     .at(-1);
   assert.deepEqual(consumer?.diagnostics, [], "and the mirrored rows are cleared too");
 });
+
+// ------------------------------------------------------------ code lenses
+//
+// A lens is a request, not a push, which is the whole reason it is answered in
+// an install where the hook owns delivery (carrick#880).
+
+test("the lens answers in an install where the hook owns delivery", async (t) => {
+  const workspace = makeWorkspace();
+  const client = new LspClient({ args: ["--hooks-installed"], env: fakeEnv() });
+  t.after(() => {
+    client.stop();
+    workspace.cleanup();
+  });
+
+  await client.initialize(workspace.root);
+  client.open(workspace.file);
+  await client.settle(300);
+  assert.equal(client.publishes.length, 0, "the hook is still the one that pushes");
+
+  const id = client.request("textDocument/codeLens", {
+    textDocument: { uri: `file://${workspace.file}` },
+  });
+  await client.waitFor(() => client.responses.has(id), "a lens response");
+  const lenses = client.responses.get(id) as Array<{ command?: { title: string } }>;
+  assert.ok(lenses.length > 0, "the channel gate is about pushing, and this was asked for");
+  for (const lens of lenses) assert.equal(/\b0\b/.test(lens.command?.title ?? ""), false);
+});
+
+test("carrick.codeLens off answers the request with an empty list", async (t) => {
+  const workspace = makeWorkspace();
+  const client = new LspClient({ env: fakeEnv() });
+  t.after(() => {
+    client.stop();
+    workspace.cleanup();
+  });
+
+  await client.initialize(workspace.root, "Visual Studio Code", { codeLens: false });
+  const id = client.request("textDocument/codeLens", {
+    textDocument: { uri: `file://${workspace.file}` },
+  });
+  await client.waitFor(() => client.responses.has(id), "a lens response");
+  assert.deepEqual(client.responses.get(id), []);
+});
+
+test("a client that refreshes lenses is asked to when a setting changes", async (t) => {
+  const workspace = makeWorkspace();
+  const client = new LspClient({ env: fakeEnv() });
+  t.after(() => {
+    client.stop();
+    workspace.cleanup();
+  });
+
+  await client.initialize(workspace.root, "Visual Studio Code", undefined, {
+    workspace: { codeLens: { refreshSupport: true } },
+  });
+  client.configure({ codeLens: false });
+  await client.waitFor(
+    () => client.notifications.some((one) => one.method === "workspace/codeLens/refresh"),
+    "the refresh request",
+  );
+});

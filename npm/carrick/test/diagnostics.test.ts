@@ -432,3 +432,25 @@ test("a routing finding is an error only where its other side is on this disk", 
 test("capping an empty check publishes nothing", () => {
   assert.equal(capDiagnostics(new Map(), CHECKED_ABS, CHECKED).size, 0);
 });
+
+test("the boundary is the last row on a file, even when the cap trips", () => {
+  const items = Array.from({ length: 25 }, (_, index) =>
+    mismatch(index + 1, [
+      {
+        role: "consumer",
+        service: "order-service",
+        repo: `${ROOT}/service-${index}`,
+        file: "src/client.ts",
+        line: 10,
+      },
+    ]),
+  );
+  const rows = toDiagnostics(
+    { ...payload(items), boundary_note: "41 candidate(s) were not classified here." },
+    ROOT,
+    CHECKED,
+    { exists: () => true },
+  ).get(CHECKED_ABS);
+  assert.equal(rows?.at(-1)?.code, "boundary", "after every overflow row, as the hook renders it");
+  assert.match(rows?.at(-2)?.message ?? "", /more finding\(s\) elsewhere in this check/);
+});

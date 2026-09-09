@@ -106,6 +106,7 @@ export class LspClient {
     rootDir: string,
     clientName = "Claude Code",
     initializationOptions?: Record<string, unknown>,
+    capabilities: Record<string, unknown> = {},
   ): Promise<void> {
     const uri = pathToFileURL(rootDir).toString();
     const id = this.request("initialize", {
@@ -114,7 +115,7 @@ export class LspClient {
       workspaceFolders: [{ uri, name: path.basename(rootDir) }],
       rootUri: uri,
       rootPath: rootDir,
-      capabilities: {},
+      capabilities,
       ...(initializationOptions ? { initializationOptions } : {}),
     });
     await this.waitFor(() => this.responses.has(id), "initialize response");
