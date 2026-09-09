@@ -96,25 +96,28 @@ tarball still builds, holds `carrick`, `sidecar/package.json`,
 `sidecar/package-lock.json` and `sidecar/dist/src/index.js`, and that the binary
 inside it runs.
 
-Every one of those jobs runs on `ubuntu-latest`, and there is no other runner in
-any workflow in this repository. That is the whole shape of the gap below.
+Since carrick#853 the `install` matrix in `plugin.yml` packs that tarball once and
+installs it again on macOS arm64, on Linux arm64, on Windows, and with pnpm and
+yarn, with the Node floor, a global install and an upgrade as their own jobs. What
+is still by hand is everything that needs the BINARY, because CI installs with
+`--omit=optional` and so has no platform package to run.
 
 ### The matrix
 
 | # | Row | Status | Command | Expected observation |
 |---|---|---|---|---|
 | 1.1 | npm, Linux x64, project-local, `--ignore-scripts` | **CI** | `plugin.yml`, steps "Install the packed package as a user would" and the two verdict-probe steps | `carrick --version` prints the version; both probes print `isolation: pnpm` and `compatible` / `incompatible` |
-| 1.2 | npm, macOS arm64 | **Manual** (carrick#853) | see 1.A below | `carrick --version`, then a full `carrick index` of the demo workspace, then `verdict-probe.mjs` against the installed sidecar |
-| 1.3 | npm, macOS x64 | **Manual** (carrick#853) | 1.A on an Intel machine, or under Rosetta with an x64 Node | same as 1.2. Record which of the two platform packages resolved |
-| 1.4 | npm, Linux arm64 | **Manual** (carrick#853) | 1.A inside `docker run --platform linux/arm64 -it node:24 bash` with the tarballs mounted | same as 1.2. This runner (`ubuntu-24.04-arm`) is in the release matrix of carrick#834 and has never run |
-| 1.5 | npm, Windows x64 | **Manual, known red** (carrick#842) | 1.A in PowerShell | `carrick --version` and `carrick index` are expected to work; `verdict-probe.mjs` is expected to **fail** with `install_ok:false`, because `node_modules/.bin/tsc` is a `.CMD` and the spawn has no shell. Record the exact failure text; that is the reproduction #842 is missing |
-| 1.6 | pnpm install | **Manual** (carrick#843) | `pnpm add /tmp/pack/carrick-<v>.tgz` then `node <checkout>/npm/carrick/scripts/verdict-probe.mjs --sidecar node_modules/carrick/sidecar` | `isolation: pnpm`. The walk is expected to reach `node_modules/.pnpm/carrick@<v>/node_modules/.bin`; that is reasoning, not a measurement |
-| 1.7 | yarn (classic) install | **Manual** (carrick#843) | `yarn add file:/tmp/pack/carrick-<v>.tgz` then the same probe | as 1.6 |
+| 1.2 | npm, macOS arm64 | **CI** (install half) | `plugin.yml`, the `install` matrix leg `npm, macOS arm64` | the tarball installs, `carrick --version` prints the version, a missing platform package is a message, and `verdict-probe.mjs` answers against the installed sidecar. The full `carrick index` of the demo workspace stays manual: CI installs with `--omit=optional`, so no platform binary resolves there |
+| 1.3 | npm, macOS x64 | **Retired as a row** | n/a | there is no Intel leg and there will not be one: the darwin-x64 platform package is cross-built on the Apple-silicon runner (`release.yml`), the Intel runner labels are being retired, and an install probe resolves no platform binary at all, so the leg would answer 1.2's question again. What is untested is the x64 BINARY, which needs an Intel machine and belongs to whoever has one |
+| 1.4 | npm, Linux arm64 | **CI** (install half) | `plugin.yml`, the `install` matrix leg `npm, Linux arm64` on `ubuntu-24.04-arm` | as 1.2. This is the runner the release matrix builds on, and until carrick#853 it had never run |
+| 1.5 | npm, Windows x64 | **CI, expected red** (carrick#842) | `plugin.yml`, the `install` matrix leg `npm, Windows x64` | the install, `carrick --version` and the missing-platform message all work; `verdict-probe.mjs` fails with `spawn ...\\node_modules\\.bin\\pnpm ENOENT`, which is the reproduction #842 was missing. The step expects that failure and goes red only if the probe starts passing, which is the day the leg should run the same step as every other one |
+| 1.6 | pnpm install | **CI** | `plugin.yml`, the `install` matrix leg `pnpm, Linux x64` | measured 2026-09-09, first run: `isolation: pnpm`, `install_ok: true`, `ts_version: 5.9.3`, and both verdict buckets. The walk does reach the bin directory under pnpm's layout — that was reasoning before this leg and is a measurement now |
+| 1.7 | yarn (classic) install | **CI** | `plugin.yml`, the `install` matrix leg `yarn, Linux x64` | as 1.6, measured in the same run |
 | 1.8 | yarn Berry with PnP | **Manual** (carrick#843) | the same, in a PnP project | there is no `node_modules` at all, so the walk cannot work by construction. What it should do instead is undecided; record what it actually does, which is the input that ticket needs |
-| 1.9 | Global install | **Manual** | `npm install -g /tmp/pack/carrick-tools-cli-*.tgz /tmp/pack/carrick-<v>.tgz`, then `which carrick && carrick --version` in a new shell | `carrick` resolves on PATH. This is the install the README tells people to do, and the one that makes `carrick init` write the short hook command rather than an absolute path |
+| 1.9 | Global install | **CI** | `plugin.yml`, the `global-install` job | `which carrick` resolves and `carrick --version` answers off PATH. This is the install the README tells people to do, and the one that makes `carrick init` write the short hook command rather than an absolute path |
 | 1.10 | npx one-shot | **Blocked on publish** (carrick#834) | `npx --yes carrick@<version> init` | Nothing offline stands in for this: npx of a local tarball cannot resolve the optional platform dependency, so the row is untestable until the package publishes. When it does, the observation is that `init` runs to the end and says it wrote an absolute hook command (carrick#837, fixed in #849) |
-| 1.11 | Upgrade from a previous version | **Manual** | pack at the previous release tag into `/tmp/pack-old`, `npm install /tmp/pack-old/carrick-*.tgz`, then `npm install /tmp/pack/carrick-*.tgz` over it | `carrick --version` reports the new version; `carrick status --json` on a workspace indexed by the old build still answers, and its `scanner_version` is the version that wrote the index, not the one reading it. The registry form of this row is blocked on publish |
-| 1.12 | Node floor | **Manual** (carrick#853) | `npx -p node@22 -- node <install>/node_modules/carrick/bin/carrick.mjs --version` | `carrick needs Node 24 or newer; this is Node 22.x` and exit 1. It must be that message and not a syntax error: the floor is checked before any TypeScript is imported, and the whole point is that an old Node gets an answer to "which Node do I need" |
+| 1.11 | Upgrade from a previous version | **CI** (version half) | `plugin.yml`, the `upgrade` job: install the published `carrick`, then the packed tarball over it | `carrick --version` reports the version at HEAD and a missing platform package is still a message, so no file of the previous install is left answering. The `carrick status --json` half stays manual: it runs the binary, which an `--omit=optional` install does not have |
+| 1.12 | Node floor | **CI** | `plugin.yml`, the `node-floor` job: install on 24, then run `bin/carrick.mjs` on 22 | `carrick needs Node 24 or newer; this is Node 22.x` and exit 1. It must be that message and not a syntax error: the floor is checked before any TypeScript is imported, and the whole point is that an old Node gets an answer to "which Node do I need" |
 | 1.13 | `--ignore-scripts` | **CI** | as 1.1 | no lifecycle script exists anywhere in the package or the platform packages, so the install works with scripts disabled. If this ever needs one, this row is the reason it cannot have one |
 | 1.14 | Marketplace and Open VSX publish | **Blocked on publish** (carrick#834, carrick#710) | n/a | the publisher account and the namespace are owner actions. Until they exist, section 4 installs the `.vsix` by file |
 
@@ -378,16 +381,16 @@ test before section 2 (6.6 s, `user-service` 3 routes 1 call, `order-service`
 
 | Row | Platform / manager | Ran on | `--version` | `index` | verdict probe | Notes |
 |---|---|---|---|---|---|---|
-| 1.2 | macOS arm64, npm | 2026-09-09, macOS 15.5, Node 24.12.0 | **pass** `0.3.50` | **pass** 3 repos in 6.6 s | **pass** `isolation: pnpm`, `install_ok: true`, TS 5.9.3, `compatible` / `incompatible` | packed tarball plus the darwin-arm64 platform tarball, installed with `--ignore-scripts` into a bare directory. The full 1.A sequence, no step skipped |
-| 1.3 | macOS x64, npm | | | | | |
-| 1.4 | Linux arm64, npm | | | | | |
-| 1.5 | Windows x64, npm | | | | | |
-| 1.6 | Linux, pnpm | | | | | |
-| 1.7 | Linux, yarn classic | | | | | |
+| 1.2 | npm, macOS arm64 | **CI** (install half) | `plugin.yml`, the `install` matrix leg `npm, macOS arm64` | the tarball installs, `carrick --version` prints the version, a missing platform package is a message, and `verdict-probe.mjs` answers against the installed sidecar. The full `carrick index` of the demo workspace stays manual: CI installs with `--omit=optional`, so no platform binary resolves there |
+| 1.3 | npm, macOS x64 | **Retired as a row** | n/a | there is no Intel leg and there will not be one: the darwin-x64 platform package is cross-built on the Apple-silicon runner (`release.yml`), the Intel runner labels are being retired, and an install probe resolves no platform binary at all, so the leg would answer 1.2's question again. What is untested is the x64 BINARY, which needs an Intel machine and belongs to whoever has one |
+| 1.4 | npm, Linux arm64 | **CI** (install half) | `plugin.yml`, the `install` matrix leg `npm, Linux arm64` on `ubuntu-24.04-arm` | as 1.2. This is the runner the release matrix builds on, and until carrick#853 it had never run |
+| 1.5 | npm, Windows x64 | **CI, expected red** (carrick#842) | `plugin.yml`, the `install` matrix leg `npm, Windows x64` | the install, `carrick --version` and the missing-platform message all work; `verdict-probe.mjs` fails with `spawn ...\\node_modules\\.bin\\pnpm ENOENT`, which is the reproduction #842 was missing. The step expects that failure and goes red only if the probe starts passing, which is the day the leg should run the same step as every other one |
+| 1.6 | pnpm install | **CI** | `plugin.yml`, the `install` matrix leg `pnpm, Linux x64` | measured 2026-09-09, first run: `isolation: pnpm`, `install_ok: true`, `ts_version: 5.9.3`, and both verdict buckets. The walk does reach the bin directory under pnpm's layout — that was reasoning before this leg and is a measurement now |
+| 1.7 | yarn (classic) install | **CI** | `plugin.yml`, the `install` matrix leg `yarn, Linux x64` | as 1.6, measured in the same run |
 | 1.8 | yarn Berry PnP | | | | | |
-| 1.9 | global install | | | | | |
-| 1.11 | upgrade | 2026-09-09 (half) | n/a | n/a | n/a | the read half passed on the way in: a 0.3.50 CLI read an index written by 0.3.48 and reported `scanner_version: 0.3.48`, the version that wrote it. The install-over-install half is unrun |
-| 1.12 | Node 22 floor | | | n/a | n/a | |
+| 1.9 | Global install | **CI** | `plugin.yml`, the `global-install` job | `which carrick` resolves and `carrick --version` answers off PATH. This is the install the README tells people to do, and the one that makes `carrick init` write the short hook command rather than an absolute path |
+| 1.11 | Upgrade from a previous version | **CI** (version half) | `plugin.yml`, the `upgrade` job: install the published `carrick`, then the packed tarball over it | `carrick --version` reports the version at HEAD and a missing platform package is still a message, so no file of the previous install is left answering. The `carrick status --json` half stays manual: it runs the binary, which an `--omit=optional` install does not have |
+| 1.12 | Node floor | **CI** | `plugin.yml`, the `node-floor` job: install on 24, then run `bin/carrick.mjs` on 22 | `carrick needs Node 24 or newer; this is Node 22.x` and exit 1. It must be that message and not a syntax error: the floor is checked before any TypeScript is imported, and the whole point is that an old Node gets an answer to "which Node do I need" |
 
 ### CLI
 
@@ -474,10 +477,10 @@ Open tickets this plan runs into, so a red row can be recognised as a known one.
 | carrick#710 | The packaging ticket itself: the npm organisation, the Marketplace publisher and the Open VSX namespace are the owner actions it lists | 1.14, 3 (marketplace path), 4.2 to 4.4 |
 | carrick#833 | The vendored `pnpm` and `tsc` lookup. Fixed in #841 and proven against a packed tarball; deliberately open until a registry install proves it, because the close criterion is the published package | 1.1 to 1.9 |
 | carrick#842 | Windows cannot spawn the vendored bins (`.bin/tsc` is a `.CMD` and the spawn has no shell). Expected red | 1.5 |
-| carrick#843 | The bin walk is unmeasured for pnpm and yarn, and cannot work at all under yarn PnP | 1.6 to 1.8 |
+| carrick#843 | Half answered: pnpm and yarn classic are measured in CI and work (1.6, 1.7). Yarn PnP has no `node_modules` at all, so the walk cannot work there by construction | 1.8 |
 | carrick#845 | The package publishes no type declarations, so a TypeScript consumer of `carrick/templates` cannot type the import | not exercised here; it lands with the same release |
 | carrick#848 | An edit made through Bash reaches neither channel, because both are keyed to `Write\|Edit\|MultiEdit` and the server is started lazily by the Edit or Write tool | 3.6, and the validity rule in 3.10 |
-| carrick#853 | No install matrix in CI: every job runs on `ubuntu-latest` | 1.2 to 1.8, 1.12 |
+| carrick#853 | Shipped. The `install` matrix, `node-floor`, `global-install` and `upgrade` jobs in `plugin.yml` | 1.2, 1.4 to 1.7, 1.9, 1.11, 1.12 |
 | carrick#854 | No script drives the language server against a real index, so every editor row starts with a by-hand sequence | 4.0, and the first step of 4.1 to 4.7 |
 | carrick#857 | A file rewritten with identical bytes reads as stale, so every verdict in it gains a caveat that the same payload's `changed_since_index: 0` denies. Found by row 2.18's neighbourhood on 2026-09-09 | 2.17, 2.18, and every editor row, since a save with no change is ordinary there |
 | carrick#858 | The log-roll message prints `carrick.log.<date>.1` literally rather than the file it wrote. Cosmetic | the log-bound check at the end of section 2 |
