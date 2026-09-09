@@ -115,7 +115,7 @@ Install hooks once per clone: `./scripts/install-hooks.sh`.
 - PRs should include a short summary, rationale, test commands run, and links to relevant issues. Include sample Action output when it changes.
 
 ## Ownership Boundary (who does what)
-Agents own the delivery loop end to end: branch, PR, review of the full diff, reading the real CI check conclusions, squash-merge, and cutting the release by merging the release-please PR. Nothing in that loop waits on the owner. Exactly two actions are the owner's and must be requested, never performed by an agent:
+Agents own the delivery loop end to end: branch, PR, review of the full diff, reading the real CI check conclusions, squash-merge, and cutting the release by merging the release-please PR. The release PR opens as a draft (`draft-pull-request` in `release-please-config.json`), so cutting a release is `gh pr ready <n>` and then the merge — the draft is the pause in which the deploy-order check happens, since a blob shape the deployed reader drops must not ship before the cloud side of it is live (carrick#840). Nothing in that loop waits on the owner. Exactly two actions are the owner's and must be requested, never performed by an agent:
 - **Cloud deploys**: `terraform apply` and the lambda/app zips it ships, in `carrick-cloud`. Merged is not deployed; say so explicitly when a change needs a deploy before it can be measured.
 - **Paid eval spend**: any run that makes real LLM calls (Tier-A, cross-repo, OSS evals, corpus sweeps, fleet re-scans). State the estimated cost and get an explicit yes on that number before launching.
 

@@ -1,0 +1,100 @@
+name: Release build
+
+# The tarball the Action runs, built on the pull request rather than on the tag.
+#
+# `release.yml` runs only when a tag is cut, so until carrick#840 nothing proved
+# that the archive `carrick-tools/carrick@v1` downloads still builds. A pull
+# request that repackaged the sidecar or moved a file the archive copies was
+# checked by reading it, after the merge, and a tag that fails here fails after
+# the version is already public.
+#
+# So: the same steps as the `publish` job in `release.yml`, up to and including
+# the `tar`, with nothing uploaded and no tag moved, plus a check that the
+# archive holds what the Action unpacks and that its binary runs. Keep the two
+# step lists the same; a change to one belongs in the other, and this workflow
+# is in its own path filter so that editing `release.yml` runs it.
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/release-build.yml"
+      - "src/sidecar/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "npm/**"
+
+concurrency:
+  group: release-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tarball:
+    name: Release tarball
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-build-
+            ${{ runner.os }}-cargo-release-
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: src/sidecar/package-lock.json
+
+      - name: Build binary
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Build sidecar
+        run: cd src/sidecar && npm ci && npm run build
+
+      - name: Create release archive
+        run: |
+          mkdir -p release/sidecar
+          cp target/x86_64-unknown-linux-gnu/release/carrick release/
+          cp -r src/sidecar/dist release/sidecar/dist
+          cp src/sidecar/package.json release/sidecar/
+          cp src/sidecar/package-lock.json release/sidecar/
+          cd release
+          tar -czf carrick-action-linux.tar.gz carrick sidecar
+
+      # What the Action unpacks and then runs. A tarball that builds but is
+      # missing the sidecar entry point produces a scan with no type layer at
+      # all, which is a silent loss rather than a failure (carrick#748).
+      - name: The archive holds what the Action needs
+        run: |
+          set -euo pipefail
+          tar -tzf release/carrick-action-linux.tar.gz > members.txt
+          cat members.txt
+          for member in carrick sidecar/package.json sidecar/package-lock.json \
+            sidecar/dist/src/index.js; do
+            grep -qx "$member" members.txt || {
+              echo "::error::the release archive is missing $member"
+              exit 1
+            }
+          done
+
+      - name: The binary in the archive runs
+        run: |
+          set -euo pipefail
+          mkdir -p unpacked
+          tar -xzf release/carrick-action-linux.tar.gz -C unpacked
+          ./unpacked/carrick --help > /dev/null

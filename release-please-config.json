@@ -1,4 +1,5 @@
 {
+  "draft-pull-request": true,
   "packages": {
     ".": {
       "release-type": "rust",
