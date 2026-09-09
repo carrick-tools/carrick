@@ -232,15 +232,9 @@ jobs:
     name: Install (${{ matrix.name }})
     needs: pack
     runs-on: ${{ matrix.runner }}
-    # Windows is known red (carrick#842: the check phase spawns a vendored
-    # `tsc` that is a `.CMD` there, with no shell), and the pnpm and yarn bin
-    # walks have never been measured (carrick#843). A required leg for any of
-    # the three would redden every pull request until those are fixed, so each
-    # records its answer without blocking. Read the leg, not the tick.
-    continue-on-error: ${{ matrix.optional == true }}
     strategy:
-      # Without this the known-red Windows leg cancels every other leg, which
-      # is the opposite of what this matrix is for.
+      # Without this one failing leg cancels the rest, which is the opposite of
+      # what this matrix is for: each leg is a separate question.
       fail-fast: false
       matrix:
         include:
@@ -261,15 +255,12 @@ jobs:
           - name: npm, Windows x64
             runner: windows-latest
             manager: npm
-            optional: true
           - name: pnpm, Linux x64
             runner: ubuntu-latest
             manager: pnpm
-            optional: true
           - name: yarn, Linux x64
             runner: ubuntu-latest
             manager: yarn
-            optional: true
     defaults:
       run:
         # Windows runs pwsh by default, and every step below is a shell script.
@@ -332,10 +323,25 @@ jobs:
       # steps above cannot see: the check phase spawns a vendored pnpm and tsc,
       # they live somewhere else in an install than in a checkout, and a miss
       # degrades every pair to `unverifiable` rather than failing
-      # (carrick#833). On Windows this is the reproduction carrick#842 is
-      # missing, so its output is what that leg exists to record.
+      # (carrick#833).
       - name: The installed package produces type verdicts
+        if: runner.os != 'Windows'
         run: node npm/carrick/scripts/verdict-probe.mjs --sidecar probe/node_modules/carrick/sidecar
+
+      # Windows is the one shape that cannot answer yet: the check phase spawns
+      # the vendored pnpm by path, and on Windows that path is an sh script npm
+      # wrote beside a `.CMD`, which `spawn` without a shell cannot run
+      # (carrick#842). Its failure is the reproduction that ticket was missing,
+      # so the leg records it and stays green — and goes red the day it starts
+      # passing, because that is the day this step should become the one above.
+      - name: The installed package produces type verdicts (expected red, carrick#842)
+        if: runner.os == 'Windows'
+        run: |
+          if node npm/carrick/scripts/verdict-probe.mjs --sidecar probe/node_modules/carrick/sidecar; then
+            echo "::error::the verdict probe now passes on Windows: carrick#842 is fixed, and this leg should run the same step as every other one"
+            exit 1
+          fi
+          echo "::warning::the verdict probe failed on Windows, as carrick#842 says it does. The output above is the reproduction"
 
   # The floor is checked in `bin/carrick.mjs` before any `.ts` is imported,
   # because on an older Node the import itself is a syntax error and a syntax
@@ -404,7 +410,9 @@ jobs:
       - name: Install globally and run it off PATH
         run: |
           set -euo pipefail
-          npm install -g --ignore-scripts --omit=optional "$(ls pack/carrick-*.tgz)"
+          # `./`, because npm reads a bare `pack/carrick-0.3.56.tgz` as a git
+          # spec and tries to ssh to github.com/pack/carrick-0.3.56.tgz.git.
+          npm install -g --ignore-scripts --omit=optional "./$(ls pack/carrick-*.tgz)"
           which carrick
           carrick --version
 
