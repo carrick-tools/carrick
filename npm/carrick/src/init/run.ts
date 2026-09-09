@@ -15,7 +15,7 @@ import readline from "node:readline/promises";
 import { spawnSync } from "node:child_process";
 import { describeIdentity, githubIdentity } from "./identity.ts";
 import { findRepos, mergeWorkspace } from "./repos.ts";
-import { mergeCarrickHooks } from "./settings.ts";
+import { hookCommand, mergeCarrickHooks } from "./settings.ts";
 import { renderTemplate } from "../templates.ts";
 import { resolveNativeBinary, nativeEnv, packageRoot } from "../native.ts";
 
@@ -159,10 +159,23 @@ export async function init(argv: string[]): Promise<number> {
   //    own hooks, or the hook pack the hosted index installs.
   const settingsFile = path.join(workspace, SETTINGS_FILE);
   const settings = fs.existsSync(settingsFile) ? fs.readFileSync(settingsFile, "utf8") : null;
+  const command = hookCommand({ onPath });
   try {
-    const hooks = mergeCarrickHooks(settings);
+    const hooks = mergeCarrickHooks(settings, command.command);
     const wroteHooks = writeIfChanged(settingsFile, hooks.body);
     say(`${wroteHooks === "written" ? "wrote" : "unchanged"}  ${SETTINGS_FILE}`);
+    if (!command.bare) {
+      say(
+        `         \`carrick\` is not on PATH here, so those hooks name this install: ${command.command}.`,
+      );
+      say(
+        "         An npx run leaves nothing on PATH afterwards, and a hook that cannot find carrick",
+      );
+      say(
+        "         says nothing rather than failing your edit. `npm install -g carrick` and run init",
+      );
+      say("         again to write the short command instead.");
+    }
   } catch (error) {
     say(
       `skipped  ${SETTINGS_FILE}: it is not valid JSON (${(error as Error).message}). Fix it and run carrick init again; nothing was overwritten.`,
@@ -211,6 +224,12 @@ export async function init(argv: string[]): Promise<number> {
   say("the index covers every repo in it. The hooks need no plugin; the language server does:");
   const plugin = path.join(packageRoot(), "plugin");
   say(`    claude --plugin-dir ${fs.existsSync(plugin) ? plugin : "<carrick checkout>/plugin"}`);
+  if (!command.bare) {
+    say(
+      "    That plugin's language server is started as `carrick`, which this machine cannot resolve;",
+    );
+    say("    install it globally first, or the hooks above are the channel.");
+  }
   say();
   say("Then: edit a file with a route or a call in it, and Carrick answers on the edit.");
   return 0;

@@ -58,6 +58,14 @@ test("what ships: the entry point, the emit, the sidecar and the templates", () 
   }
 });
 
+test("the entry point can be run as a command, because a hook may name it", () => {
+  // `carrick init` writes this path into a settings file when `carrick` does
+  // not resolve on PATH (#837), and a settings hook is a line a shell runs.
+  const entry = path.join(packageRoot, "bin", "carrick.mjs");
+  assert.match(fs.readFileSync(entry, "utf8"), /^#!\/usr\/bin\/env node\n/);
+  assert.ok(fs.statSync(entry).mode & 0o111, "bin/carrick.mjs is not executable");
+});
+
 test("the entry point imports the emit, never the TypeScript", () => {
   // Node refuses to strip types for any file under node_modules, so a `.ts`
   // import here works in this checkout and throws on every installed copy.

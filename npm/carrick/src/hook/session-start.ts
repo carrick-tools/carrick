@@ -38,7 +38,9 @@ async function main(): Promise<void> {
     log("no answer", outcome.failure ?? "");
     return;
   }
-  process.stdout.write(renderSessionStart(outcome.result));
+  // Ends with a newline: this is a line a developer also runs by hand and
+  // compares against `carrick status`, and that one ends its output properly.
+  process.stdout.write(`${renderSessionStart(outcome.result)}\n`);
 }
 
 await main();
