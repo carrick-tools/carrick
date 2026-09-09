@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.53](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.52...carrick-v0.3.53) (2026-09-09)
+
+
+### Features
+
+* **action:** a full-scan input, for when the cached answers are what is stale ([#877](https://github.com/carrick-tools/carrick/issues/877)) ([02e7016](https://github.com/carrick-tools/carrick/commit/02e701630c53ce4404c4850d3f10bd8f002f147a))
+
+
+### Bug Fixes
+
+* **release:** create the pack destination, and fail loudly when a leg builds nothing ([#876](https://github.com/carrick-tools/carrick/issues/876)) ([98b5fec](https://github.com/carrick-tools/carrick/commit/98b5fec2952ad30dfe726c64441b3f207c88b83a)), closes [#710](https://github.com/carrick-tools/carrick/issues/710)
+
 ## [0.3.52](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.51...carrick-v0.3.52) (2026-09-09)
 
 
