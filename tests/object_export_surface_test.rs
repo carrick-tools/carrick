@@ -122,3 +122,67 @@ fn a_module_that_exports_one_object_states_its_functions() {
         names(&definitions)
     );
 }
+
+/// carrick#863: the same surface, stated the CommonJS way. Every `.js` lambda
+/// writes its entry point as an assignment, and an assignment is none of the
+/// shapes the extractor knew.
+#[test]
+fn a_module_that_exports_by_assignment_states_its_functions() {
+    let definitions = function_definitions();
+
+    // `exports.handler = async (event) => { … }`: the lambda entry point, and
+    // the whole surface of most files written this way.
+    let handler = definition(&definitions, "handler");
+    assert_eq!(handler["file_path"], "src/lambda.js");
+    assert_eq!(handler["line_number"], 6, "at the arrow, not the statement");
+    assert_eq!(handler["is_exported"], true);
+    assert_eq!(handler["signature"], "(event) => unknown");
+
+    // `module.exports.health = function health(deep) { … }`.
+    let health = definition(&definitions, "health");
+    assert_eq!(health["file_path"], "src/lambda.js");
+    assert_eq!(health["line_number"], 13);
+    assert_eq!(health["is_exported"], true);
+    assert_eq!(health["signature"], "(deep) => unknown");
+
+    // An object assigned to a named export is a member bag, read exactly as
+    // the ESM one is.
+    let drop = definition(&definitions, "table.drop");
+    assert_eq!(drop["signature"], "(id) => unknown");
+    assert_eq!(drop["is_exported"], true);
+
+    // `module.exports = { … }` is the default export, so its members key the
+    // same way `export default { … }` does.
+    let drain = definition(&definitions, "default.drain");
+    assert_eq!(drain["file_path"], "src/queue.js");
+    assert_eq!(drain["is_exported"], true);
+    assert_eq!(drain["signature"], "(queue) => unknown");
+
+    // A function offered by name has ONE definition, at its own key, and the
+    // assignment says the module offers it. A second row for the same body
+    // would double the count and re-bill the intent.
+    for (offered, shorthand) in [("reset", false), ("consume", true)] {
+        let def = definition(&definitions, offered);
+        assert_eq!(
+            def["is_exported"], true,
+            "{offered} is offered by an export assignment: {def:#?}"
+        );
+        let alias = if shorthand {
+            "default.consume"
+        } else {
+            "table.reset"
+        };
+        assert!(
+            !definitions.contains_key(alias),
+            "{offered} already has a definition; {alias} would be a second row for one body: {:?}",
+            names(&definitions)
+        );
+    }
+
+    // The bound: a module-local function no assignment reaches stays local.
+    let sweep = definition(&definitions, "sweep");
+    assert_eq!(
+        sweep["is_exported"], false,
+        "nothing exports sweep: {sweep:#?}"
+    );
+}
