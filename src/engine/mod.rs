@@ -92,7 +92,14 @@ pub(crate) mod type_compat_v2;
 /// was asked about. A v20 cache holds rows the deterministic layer stated,
 /// which this version states again — replaying one would duplicate them and
 /// pin the file to the resolver of the scan that wrote it.
-const CACHE_VERSION: u32 = 21;
+///
+/// 22: the extraction schema gained the body-dispatch discriminator
+/// (carrick#831) — `dispatch` on an operation row and on a call row, and
+/// `dispatch_tables` beside them. A v21 cache holds the model's answers from
+/// before the field was asked for, so replaying one states a plain route for
+/// every dispatching handler in the repo and the change is invisible on every
+/// incremental scan until the files happen to move.
+const CACHE_VERSION: u32 = 22;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
@@ -654,6 +661,20 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         })
         .collect();
 
+    // Handlers that switch on a request field with no `operations` block yet
+    // (carrick#831), taken here for the same reason as the two above: the
+    // blobs are about to move into the analyzer. Every blob in the run is
+    // read, because the consumers that name a value are in the peers and the
+    // handler that answers them is in the current services (or the reverse on
+    // a peer's own run).
+    let dispatch_advisories = crate::dispatch::dispatch_operation_findings(
+        &all_repo_data
+            .iter()
+            .chain(current_services_data.iter())
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+
     let sp = logging::spinner("Running cross-repo analysis...");
     let analyzer =
         match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar).await {
@@ -681,6 +702,10 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     // whole run's type layer is untrustworthy, not just that service's.
     let has_types = type_degradations.is_empty();
     results.findings.extend(type_degradations);
+
+    // Advisory: the index has one operation where the source has several, and
+    // the block that fixes it is a paste away (carrick#831).
+    results.findings.extend(dispatch_advisories);
 
     // 6a. Resolve this run's SDK-mediated consumer edges: consumer candidate →
     //     the publishing repo's exported member → the producer endpoint that
@@ -1472,6 +1497,15 @@ async fn analyze_current_repo_incremental(
             );
             crate::phase_timing::mark(crate::phase_timing::Phase::Graph);
 
+            // Declared operations (carrick#831), applied on the incremental
+            // path exactly as on the full one. The blocks live in the config,
+            // not in the analysis cache, so an edited `carrick.json` takes
+            // effect on the next scan without a cache bump.
+            let declared = crate::dispatch::apply_declared_operations(&mut mount_graph, service);
+            if declared > 0 {
+                debug!("Declared operations materialised from carrick.json: {declared}");
+            }
+
             // Deterministic protocol scans run BEFORE the graph is projected:
             // the GraphQL consumer file set folds transport data calls out of
             // the graph (#307) so every downstream surface (cloud projection,
@@ -1538,6 +1572,22 @@ async fn analyze_current_repo_incremental(
             // SourceMap, so it is stable while the file is), and the client
             // name and payload locators are the model's contribution to the
             // row, which a replay has to carry as a cold scan would.
+            // Handlers that switch on a request field (carrick#831), read
+            // off the same model answers the cache holds. A fact about the
+            // handler, kept beside the operations because a routeless one has
+            // no operation row to carry it.
+            cloud_data.dispatch_tables =
+                crate::dispatch::collect_dispatch_tables(&raw_model_results);
+            // ...and onto the handler's own function row, joined by name and
+            // declaration line, so a reader of a function row finds the fact
+            // without knowing the array exists.
+            if let Some(tables) = cloud_data.dispatch_tables.as_ref() {
+                let stamped = crate::dispatch::stamp_dispatch_tables_on_functions(
+                    &mut cloud_data.function_definitions,
+                    tables,
+                );
+                debug!("Dispatch tables stamped onto function rows: {stamped}");
+            }
             cloud_data.file_results = Some(raw_model_results);
             cloud_data.cached_detection = Some(detection.clone());
             cloud_data.cached_guidance = Some(guidance);
@@ -1889,6 +1939,10 @@ fn append_deterministic_protocol_operations(
         // A file-router module is an HTTP concept; non-HTTP ops carry the
         // default.
         view_module: false,
+        // So is body dispatch (carrick#831): a GraphQL field and a socket
+        // event are already identified by their own name, and nothing
+        // switches on a request field to reach them.
+        dispatch: None,
     };
 
     let graphql = &extractions.graphql;
@@ -3064,6 +3118,7 @@ fn build_cloud_data_from_mount_graph(
         // scanner" (re-index).
         scanner_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         boundary: None,
+        dispatch_tables: None,
     }
 }
 
@@ -4390,6 +4445,15 @@ async fn analyze_current_repo(
         &mut analysis_result.mount_graph,
         &protocol_extractions.graphql,
     );
+    // The repo's own statement of what a body-dispatching handler serves
+    // (carrick#831), applied after every pass that reads the source: a
+    // declaration replaces what inference produced for the same handler, so
+    // it has to run once inference is finished with the graph.
+    let declared =
+        crate::dispatch::apply_declared_operations(&mut analysis_result.mount_graph, service);
+    if declared > 0 {
+        debug!("Declared operations materialised from carrick.json: {declared}");
+    }
     let analysis_result = analysis_result;
     crate::phase_timing::mark(crate::phase_timing::Phase::Protocols);
 
@@ -4514,6 +4578,20 @@ async fn analyze_current_repo(
         &analysis_result.raw_model_results,
         repo_path,
     ));
+    // Handlers that switch on a request field (carrick#831). Read from the
+    // NORMALIZED copy so the file path on a table is repo-relative like every
+    // other path in the payload.
+    cloud_data.dispatch_tables = cloud_data
+        .file_results
+        .as_ref()
+        .and_then(crate::dispatch::collect_dispatch_tables);
+    if let Some(tables) = cloud_data.dispatch_tables.clone() {
+        let stamped = crate::dispatch::stamp_dispatch_tables_on_functions(
+            &mut cloud_data.function_definitions,
+            &tables,
+        );
+        debug!("Dispatch tables stamped onto function rows: {stamped}");
+    }
     cloud_data.cached_detection = Some(analysis_result.framework_detection.clone());
     cloud_data.cached_guidance = Some(analysis_result.framework_guidance.clone());
     cloud_data.cache_version = Some(CACHE_VERSION);
@@ -4697,6 +4775,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         }
     }
 
@@ -4783,6 +4862,7 @@ mod tests {
                         .to_string(),
                 ),
                 intent_input_hash: None,
+                dispatch_table: None,
             },
         );
         // A path outside the repo root is left as-is (matches the dashboard's
@@ -4805,6 +4885,7 @@ mod tests {
                 return_is_explicit: false,
                 signature: None,
                 intent_input_hash: None,
+                dispatch_table: None,
             },
         );
 
@@ -4873,6 +4954,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         };
 
         let mut graph = MountGraph::new();
@@ -4899,6 +4981,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
+            dispatch: None,
         });
         graph.data_calls.push(DataFetchingCall {
             method: "GET".to_string(),
@@ -4914,6 +4997,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         });
 
         let mut function_definitions = HashMap::new();
@@ -4938,6 +5022,7 @@ mod tests {
                     abs("src/types")
                 )),
                 intent_input_hash: None,
+                dispatch_table: None,
             },
         );
 
@@ -5044,6 +5129,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         };
 
         relativize_cloud_paths(&mut data, repo_path);
@@ -5144,6 +5230,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         };
 
         let test_data = CloudRepoData {
@@ -5179,6 +5266,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         };
 
         // Verify strip_ast_nodes removes AST nodes
@@ -5228,6 +5316,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         }];
 
         // Test Config merging
@@ -5281,6 +5370,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         };
 
         let test_data = vec![CloudRepoData {
@@ -5316,6 +5406,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         }];
 
         // Test that cross-repo builder doesn't fail with SourceMap issues
@@ -5362,6 +5453,7 @@ mod tests {
                     primary_type_symbol: None,
                     type_import_source: None,
                     resolution_source: None,
+                    dispatch: None,
                 })
                 .collect(),
             data_calls: data_calls
@@ -5386,10 +5478,12 @@ mod tests {
                     base: None,
                     consumers_not_resolved: None,
                     resolution_source: None,
+                    dispatch: None,
                 })
                 .collect(),
             graphql_operations: vec![],
             pubsub_operations: vec![],
+            dispatch_tables: Vec::new(),
         }
     }
 
@@ -5430,6 +5524,7 @@ mod tests {
                 base: None,
                 consumers_not_resolved: None,
                 resolution_source: None,
+                dispatch: None,
             }
         };
         let mut mount_graph = MountGraph::new();
@@ -5506,6 +5601,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
+            dispatch: None,
         };
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints = vec![
@@ -5582,6 +5678,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::CallSite,
             resolution_source: None,
+            dispatch: None,
         }];
         mount_graph.data_calls = vec![crate::mount_graph::DataFetchingCall {
             method: "POST".to_string(),
@@ -5597,6 +5694,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         }];
 
         let entries = build_type_manifest_entries(&mount_graph, &config, ".");
@@ -5864,10 +5962,12 @@ mod tests {
                         primary_type_symbol: None,
                         type_import_source: None,
                         resolution_source: None,
+                        dispatch: None,
                     }],
                     data_calls: vec![],
                     graphql_operations: vec![],
                     pubsub_operations: vec![],
+                    dispatch_tables: Vec::new(),
                 },
             );
         }
@@ -5905,6 +6005,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         };
 
         // Staging unavailable: the request body has to carry the payload, so
@@ -5959,6 +6060,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         };
 
         let stripped = strip_ast_nodes(data, true);
@@ -6024,6 +6126,7 @@ mod tests {
                 sdk_unresolved: None,
                 scanner_version: None,
                 boundary: None,
+                dispatch_tables: None,
             }
         }
 
@@ -6100,6 +6203,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         };
 
         // Size the file_results filler so the payload lands just UNDER the 5MB
@@ -6311,6 +6415,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -6384,6 +6489,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         };
 
         attach_external_call_candidates(
@@ -6445,6 +6551,7 @@ mod tests {
                 base: None,
                 consumers_not_resolved: None,
                 resolution_source: None,
+                dispatch: None,
             },
             crate::mount_graph::DataFetchingCall {
                 method: "GET".to_string(),
@@ -6460,6 +6567,7 @@ mod tests {
                 base: None,
                 consumers_not_resolved: None,
                 resolution_source: None,
+                dispatch: None,
             },
         ];
 
@@ -6496,6 +6604,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         };
 
         attach_external_call_candidates(
@@ -6575,6 +6684,7 @@ mod tests {
                 return_is_explicit: false,
                 signature: None,
                 intent_input_hash: Some("deadbeef".to_string()),
+                dispatch_table: None,
             },
         );
 
@@ -6611,6 +6721,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         };
 
         let json = serde_json::to_string(&data).expect("should serialize");
@@ -7509,6 +7620,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         }
     }
 
@@ -7565,6 +7677,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         }];
         let graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],
@@ -7737,6 +7850,7 @@ mod tests {
                     },
                 ],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -7824,6 +7938,7 @@ mod tests {
                     backing_type_source: None,
                 }],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -7886,6 +8001,7 @@ mod tests {
                     backing_type_source: None,
                 }],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -7956,6 +8072,7 @@ mod tests {
                     },
                 ],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -8023,6 +8140,7 @@ mod tests {
             primary_type_symbol: None,
             type_import_source: None,
             resolution_source: None,
+            dispatch: None,
         }
     }
 
@@ -8075,6 +8193,7 @@ mod tests {
                 data_calls: vec![],
                 graphql_operations: vec![claim("findOne", 8)],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
         file_results.insert(
@@ -8086,6 +8205,7 @@ mod tests {
                 data_calls: vec![],
                 graphql_operations: vec![claim("resolveTicket", 4)],
                 pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
             },
         );
 
@@ -8140,6 +8260,7 @@ mod tests {
             data_calls: vec![],
             graphql_operations: ops,
             pubsub_operations: vec![],
+            dispatch_tables: Vec::new(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -8873,6 +8994,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         };
         append_pubsub_operations(
             &mut cloud_data,
@@ -9478,6 +9600,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         }
     }
 }

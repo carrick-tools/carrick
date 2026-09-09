@@ -161,6 +161,20 @@ pub struct FunctionDefinition {
     /// callee's intent shifts. `None` until an intent is generated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent_input_hash: Option<String>,
+    /// What this function switches on, when it reads one request field and
+    /// answers differently for each literal value of it (carrick#831).
+    ///
+    /// A projection of the service-level `dispatch_tables` array, joined onto
+    /// this row by `handler_name` + `line_number` — the array is the record
+    /// (a table whose handler the function index never saw is still carried
+    /// there), and this is the copy a reader of a function row finds without
+    /// having to know the array exists.
+    ///
+    /// From the model, and `None` on every function that does not do this,
+    /// which is nearly all of them. Skipped on the wire when absent: a
+    /// function row is the bulk of the blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_table: Option<crate::dispatch::DispatchTable>,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -1106,6 +1120,7 @@ impl FunctionDefinitionExtractor {
                 return_type,
                 signature: None,
                 intent_input_hash: None,
+                dispatch_table: None,
             },
         );
     }
@@ -1140,6 +1155,7 @@ impl FunctionDefinitionExtractor {
                 return_type,
                 signature: None,
                 intent_input_hash: None,
+                dispatch_table: None,
             },
         );
     }
@@ -1210,6 +1226,7 @@ impl Visit for FunctionDefinitionExtractor {
                             return_type,
                             signature: None,
                             intent_input_hash: None,
+                            dispatch_table: None,
                         },
                     );
                 }
@@ -1283,6 +1300,7 @@ impl Visit for FunctionDefinitionExtractor {
                 return_type,
                 signature: None,
                 intent_input_hash: None,
+                dispatch_table: None,
             },
         );
 
@@ -1326,6 +1344,7 @@ impl Visit for FunctionDefinitionExtractor {
                                 return_type,
                                 signature: None,
                                 intent_input_hash: None,
+                                dispatch_table: None,
                             },
                         );
                     }
@@ -1364,6 +1383,7 @@ impl Visit for FunctionDefinitionExtractor {
                                 return_type,
                                 signature: None,
                                 intent_input_hash: None,
+                                dispatch_table: None,
                             },
                         );
                     }
@@ -1504,6 +1524,7 @@ impl Visit for FunctionDefinitionExtractor {
                                     return_type,
                                     signature: None,
                                     intent_input_hash: None,
+                                    dispatch_table: None,
                                 },
                             );
                         }
@@ -1546,6 +1567,7 @@ impl Visit for FunctionDefinitionExtractor {
                                     return_type,
                                     signature: None,
                                     intent_input_hash: None,
+                                    dispatch_table: None,
                                 },
                             );
                         }

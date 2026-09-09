@@ -1350,6 +1350,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         }
     }
 

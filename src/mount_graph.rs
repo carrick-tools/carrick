@@ -84,6 +84,20 @@ pub struct ResolvedEndpoint {
     /// `false`, and skipped on the wire when false, like `resolution_source`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub view_module: bool,
+    /// The request field this route's handler switches on and the literal this
+    /// operation answers (carrick#831). `None` is a plain route: its identity
+    /// is method and path, exactly as before this field existed.
+    ///
+    /// UNLIKE every other field on this struct, matching READS it: two
+    /// operations on one `(METHOD, path)` that answer different values are two
+    /// operations, and a call that states no value for the field matches
+    /// neither. See [`carrick_match::match_verdict_with_dispatch`].
+    ///
+    /// `default` so a graph serialized before the field existed reads as a
+    /// plain route, and skipped on the wire when absent, like the two fields
+    /// above: it is a marker on a minority of rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<crate::dispatch::Dispatch>,
 }
 
 /// Represents a data-fetching call with its target
@@ -170,6 +184,16 @@ pub struct DataFetchingCall {
     /// Retention only: nothing in matching reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
+    /// The literal this call sends for the field its target dispatches on
+    /// (carrick#831), read off the call site's own request body.
+    ///
+    /// Matching reads it, and only against a producer that states a dispatch
+    /// of its own: against a plain route this is an ordinary body field and
+    /// changes nothing. `None` against a DISPATCHING producer leaves the pair
+    /// unmatched — the call names one of that route's operations and the scan
+    /// cannot say which.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<crate::dispatch::Dispatch>,
 }
 
 /// The complete mount and endpoint graph
@@ -471,17 +495,23 @@ impl MountGraph {
                 }
 
                 // Merge endpoints, deduplicating by repo + service + method +
-                // full_path. Keying on BOTH repo and service means neither two
-                // monorepo services that share a route (e.g. a common `/health`),
-                // nor two repos that happen to declare the same `serviceName`,
-                // collapse into one endpoint and lose an orphan finding.
+                // full_path + dispatch case. Keying on BOTH repo and service
+                // means neither two monorepo services that share a route (e.g.
+                // a common `/health`), nor two repos that happen to declare
+                // the same `serviceName`, collapse into one endpoint and lose
+                // an orphan finding. The dispatch case is on the key for the
+                // same reason and it is load-bearing (carrick#831): the nine
+                // operations behind one body-dispatching route share a
+                // `(method, full_path)`, so without it eight of them are
+                // dropped here and one stands in for all of them.
                 for endpoint in &mount_graph.endpoints {
                     let key = format!(
-                        "{}:{}:{}:{}",
+                        "{}:{}:{}:{}{}",
                         repo_data.repo_name,
                         repo_data.service_name.as_deref().unwrap_or(""),
                         endpoint.method,
-                        endpoint.full_path
+                        endpoint.full_path,
+                        crate::dispatch::Dispatch::key_suffix(endpoint.dispatch.as_ref())
                     );
                     if seen_endpoints.insert(key) {
                         let mut tagged_endpoint = endpoint.clone();
@@ -499,7 +529,16 @@ impl MountGraph {
                 // resolves to the same `service_name ?? repo_name` id producers
                 // carry when cross-repo edges are captured (#368).
                 for call in &mount_graph.data_calls {
-                    let key = format!("{}:{}:{}", call.method, call.target_url, call.file_location);
+                    // The dispatch value is on the key too (carrick#831): two
+                    // calls at one site sending different values are two
+                    // consumers, and `file_location` alone folds them.
+                    let key = format!(
+                        "{}:{}:{}{}",
+                        call.method,
+                        call.target_url,
+                        call.file_location,
+                        crate::dispatch::Dispatch::key_suffix(call.dispatch.as_ref())
+                    );
                     if seen_data_calls.insert(key) {
                         let mut tagged_call = call.clone();
                         tagged_call.repo_name = Some(repo_data.repo_name.clone());
@@ -554,6 +593,7 @@ mod tests {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         };
         assert_eq!(
             serde_json::to_value(&call).unwrap(),
@@ -614,6 +654,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
+            dispatch: None,
         });
 
         // Create config with internal domain
@@ -892,6 +933,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
+            dispatch: None,
         });
 
         let config = Config {
@@ -941,6 +983,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
+            dispatch: None,
         });
 
         // No env vars declared: the injected base cannot be classified through
@@ -976,6 +1019,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
+            dispatch: None,
         });
 
         let config = Config {
@@ -1012,6 +1056,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
+            dispatch: None,
         });
 
         let config = Config::default();
@@ -1048,6 +1093,7 @@ mod tests {
                 provenance: Default::default(),
                 evidence: carrick_match::MatchEvidence::RouteDefinition,
                 resolution_source: None,
+                dispatch: None,
             });
         }
         let normalizer = UrlNormalizer::default_permissive();
@@ -1101,6 +1147,7 @@ mod tests {
             provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
+            dispatch: None,
         });
         crate::cloud_storage::CloudRepoData {
             repo_name: repo.to_string(),
@@ -1135,6 +1182,7 @@ mod tests {
             sdk_unresolved: None,
             scanner_version: None,
             boundary: None,
+            dispatch_tables: None,
         }
     }
 
@@ -1204,6 +1252,7 @@ mod tests {
                 base: None,
                 consumers_not_resolved: None,
                 resolution_source: None,
+                dispatch: None,
             });
         let merged = MountGraph::merge_from_repos(&[repo]);
         assert_eq!(merged.data_calls.len(), 1);

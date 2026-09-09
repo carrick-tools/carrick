@@ -703,6 +703,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         }
     }
 
@@ -722,6 +723,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         }
     }
 
@@ -1100,6 +1102,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         };
 
         let result = ApiAnalysisResult {
@@ -1182,6 +1185,7 @@ mod tests {
                 service_name: None,
                 provenance: Default::default(),
                 resolution_source: None,
+                dispatch: None,
             }],
             findings: vec![],
             dependency_conflicts: vec![],
@@ -1338,6 +1342,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         };
         let result = ApiAnalysisResult {
             endpoints: vec![],
@@ -1408,6 +1413,7 @@ mod tests {
             service_name: None,
             provenance: Default::default(),
             resolution_source: None,
+            dispatch: None,
         };
         let result = ApiAnalysisResult {
             endpoints: vec![],

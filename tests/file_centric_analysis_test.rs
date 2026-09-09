@@ -128,6 +128,7 @@ fn test_file_analysis_result_structures() {
         primary_type_symbol: None,
         type_import_source: None,
         resolution_source: None,
+        dispatch: None,
     };
     assert_eq!(endpoint.method, "GET");
     assert_eq!(endpoint.path, "/:id");
@@ -153,6 +154,7 @@ fn test_file_analysis_result_structures() {
         base: None,
         consumers_not_resolved: None,
         resolution_source: None,
+        dispatch: None,
     };
     assert_eq!(data_call.target, "https://api.example.com/users");
     assert_eq!(data_call.method, Some("POST".to_string()));
@@ -201,6 +203,7 @@ fn test_file_analysis_result_serialization() {
                 primary_type_symbol: None,
                 type_import_source: None,
                 resolution_source: None,
+                dispatch: None,
             },
             EndpointResult {
                 handler_declaration_line: None,
@@ -222,6 +225,7 @@ fn test_file_analysis_result_serialization() {
                 primary_type_symbol: None,
                 type_import_source: None,
                 resolution_source: None,
+                dispatch: None,
             },
         ],
         data_calls: vec![DataCallResult {
@@ -244,7 +248,9 @@ fn test_file_analysis_result_serialization() {
             base: None,
             consumers_not_resolved: None,
             resolution_source: None,
+            dispatch: None,
         }],
+        dispatch_tables: Vec::new(),
     };
 
     // Serialize to JSON
@@ -391,6 +397,7 @@ fn test_cross_file_import_resolution() {
             ],
             endpoints: vec![],
             data_calls: vec![],
+            dispatch_tables: Vec::new(),
         },
     );
 
@@ -423,6 +430,7 @@ fn test_cross_file_import_resolution() {
                     primary_type_symbol: None,
                     type_import_source: None,
                     resolution_source: None,
+                    dispatch: None,
                 },
                 EndpointResult {
                     handler_declaration_line: None,
@@ -444,6 +452,7 @@ fn test_cross_file_import_resolution() {
                     primary_type_symbol: None,
                     type_import_source: None,
                     resolution_source: None,
+                    dispatch: None,
                 },
                 EndpointResult {
                     handler_declaration_line: None,
@@ -465,9 +474,11 @@ fn test_cross_file_import_resolution() {
                     primary_type_symbol: None,
                     type_import_source: None,
                     resolution_source: None,
+                    dispatch: None,
                 },
             ],
             data_calls: vec![],
+            dispatch_tables: Vec::new(),
         },
     );
 
@@ -500,6 +511,7 @@ fn test_cross_file_import_resolution() {
                     primary_type_symbol: None,
                     type_import_source: None,
                     resolution_source: None,
+                    dispatch: None,
                 },
                 EndpointResult {
                     handler_declaration_line: None,
@@ -521,9 +533,11 @@ fn test_cross_file_import_resolution() {
                     primary_type_symbol: None,
                     type_import_source: None,
                     resolution_source: None,
+                    dispatch: None,
                 },
             ],
             data_calls: vec![],
+            dispatch_tables: Vec::new(),
         },
     );
 
@@ -576,6 +590,7 @@ fn test_data_call_extraction() {
                 base: None,
                 consumers_not_resolved: None,
                 resolution_source: None,
+                dispatch: None,
             },
             DataCallResult {
                 call_kind: None,
@@ -597,6 +612,7 @@ fn test_data_call_extraction() {
                 base: None,
                 consumers_not_resolved: None,
                 resolution_source: None,
+                dispatch: None,
             },
             DataCallResult {
                 call_kind: None,
@@ -618,8 +634,10 @@ fn test_data_call_extraction() {
                 base: None,
                 consumers_not_resolved: None,
                 resolution_source: None,
+                dispatch: None,
             },
         ],
+        dispatch_tables: Vec::new(),
     };
 
     assert_eq!(result.data_calls.len(), 3);
@@ -660,6 +678,7 @@ fn test_nested_router_mounts() {
             }],
             endpoints: vec![],
             data_calls: vec![],
+            dispatch_tables: Vec::new(),
         },
     );
 
@@ -679,6 +698,7 @@ fn test_nested_router_mounts() {
             }],
             endpoints: vec![],
             data_calls: vec![],
+            dispatch_tables: Vec::new(),
         },
     );
 
@@ -698,6 +718,7 @@ fn test_nested_router_mounts() {
             }],
             endpoints: vec![],
             data_calls: vec![],
+            dispatch_tables: Vec::new(),
         },
     );
 
@@ -728,8 +749,10 @@ fn test_nested_router_mounts() {
                 primary_type_symbol: None,
                 type_import_source: None,
                 resolution_source: None,
+                dispatch: None,
             }],
             data_calls: vec![],
+            dispatch_tables: Vec::new(),
         },
     );
 
@@ -771,6 +794,7 @@ fn test_multiple_http_methods_on_same_path() {
                 primary_type_symbol: None,
                 type_import_source: None,
                 resolution_source: None,
+                dispatch: None,
             },
             EndpointResult {
                 handler_declaration_line: None,
@@ -792,6 +816,7 @@ fn test_multiple_http_methods_on_same_path() {
                 primary_type_symbol: None,
                 type_import_source: None,
                 resolution_source: None,
+                dispatch: None,
             },
             EndpointResult {
                 handler_declaration_line: None,
@@ -813,6 +838,7 @@ fn test_multiple_http_methods_on_same_path() {
                 primary_type_symbol: None,
                 type_import_source: None,
                 resolution_source: None,
+                dispatch: None,
             },
             EndpointResult {
                 handler_declaration_line: None,
@@ -834,9 +860,11 @@ fn test_multiple_http_methods_on_same_path() {
                 primary_type_symbol: None,
                 type_import_source: None,
                 resolution_source: None,
+                dispatch: None,
             },
         ],
         data_calls: vec![],
+        dispatch_tables: Vec::new(),
     };
 
     // Verify all methods are captured

@@ -735,6 +735,7 @@ impl CloudStorage for AwsStorage {
                     sdk_unresolved: None,
                     scanner_version: None,
                     boundary: None,
+                    dispatch_tables: None,
                 };
                 repo_s3_urls.insert(adjacent.repo.clone(), adjacent.s3_url);
                 all_repo_data.push(repo_data);

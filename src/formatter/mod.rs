@@ -157,6 +157,12 @@ pub fn format_analysis_results(
         ));
         output.push_str("\n\n");
     }
+    if !categorized.dispatch_operations.is_empty() {
+        output.push_str(&format_dispatch_operations_section(
+            &categorized.dispatch_operations,
+        ));
+        output.push_str("\n\n");
+    }
     if !categorized.configuration.is_empty() {
         output.push_str(&format_configuration_section(&categorized.configuration));
         output.push_str("\n\n");
@@ -630,7 +636,16 @@ fn format_verified_row(entry: &crate::analyzer::VerifiedEndpointEntry) -> String
     } else {
         ""
     };
-    format!("| `{}` | `{}`{} |\n", entry.method, entry.path, marker)
+    // One case of a body-dispatching route is its own operation, and reads as
+    // one: `POST /types/check-or-upload {action=search-by-intent}`.
+    let case = match &entry.dispatch {
+        Some(dispatch) => format!(" {{{}={}}}", dispatch.field, dispatch.value),
+        None => String::new(),
+    };
+    format!(
+        "| `{}` | `{}{}`{} |\n",
+        entry.method, entry.path, case, marker
+    )
 }
 
 /// Render a verdict subsection (heading + honest caption + table) when it has
@@ -776,6 +791,11 @@ struct CategorizedFindings<'a> {
     /// Services whose type extraction failed (carrick#535). Counts toward the
     /// headline: it is the reason the type verdicts below are missing.
     degraded_types: Vec<&'a Finding>,
+    /// Handlers that switch on a request field with no `operations` block
+    /// declaring what they serve (carrick#831). Advisory, and rendered beside
+    /// the env-var suggestions: both are a line of `carrick.json` away from
+    /// being a fact.
+    dispatch_operations: Vec<&'a Finding>,
 }
 
 impl CategorizedFindings<'_> {
@@ -816,6 +836,7 @@ fn categorize_findings(findings: &[Finding]) -> CategorizedFindings<'_> {
     let mut unparseable_dependencies = Vec::new();
     let mut shared_contracts = Vec::new();
     let mut degraded_types = Vec::new();
+    let mut dispatch_operations = Vec::new();
 
     for finding in findings {
         match finding {
@@ -832,6 +853,7 @@ fn categorize_findings(findings: &[Finding]) -> CategorizedFindings<'_> {
             }
             Finding::SharedExternalContract { .. } => shared_contracts.push(finding),
             Finding::DegradedTypes { .. } => degraded_types.push(finding),
+            Finding::DispatchOperations { .. } => dispatch_operations.push(finding),
         }
     }
 
@@ -844,6 +866,7 @@ fn categorize_findings(findings: &[Finding]) -> CategorizedFindings<'_> {
         unparseable_dependencies,
         shared_contracts,
         degraded_types,
+        dispatch_operations,
     }
 }
 
@@ -1135,6 +1158,100 @@ fn format_configuration_section(issues: &[EnvVarSuggestionGroup]) -> String {
 
     output.push_str("\n</details>");
     output
+}
+
+/// Render the handlers that switch on a request field and the operations
+/// behind them (carrick#831).
+///
+/// Advisory and worded as one: nothing here is wrong. The handler serves
+/// several operations and the index has one, and the block that fixes it is
+/// the repo's to paste. The values come from the model's reading, so the
+/// section says so rather than presenting them as read facts.
+fn format_dispatch_operations_section(findings: &[&Finding]) -> String {
+    let mut output = format!(
+        "<details>\n<summary><strong>Operations behind one route ({})</strong></summary>\n\n",
+        findings.len()
+    );
+    output.push_str(
+        "> These handlers read one request field and answer differently for each value, so \
+         one route serves several operations. Carrick indexes what it can see: declare them in \
+         `carrick.json` and each becomes an operation of its own, with its own consumers.\n\n",
+    );
+    for finding in findings {
+        let Finding::DispatchOperations {
+            service,
+            route,
+            dispatch_location,
+            dispatch_field,
+            values,
+            call_sites,
+        } = finding
+        else {
+            continue;
+        };
+        let where_ = match route {
+            Some(route) => format!("`{route}`"),
+            None => "no route in the source (declare one)".to_string(),
+        };
+        output.push_str(&format!(
+            "  - **{}** switches on the `{}` {} at {} — {} value{}, {} call site{} already naming one\n",
+            service,
+            dispatch_field,
+            dispatch_location,
+            where_,
+            values.len(),
+            plural(values.len()),
+            call_sites.len(),
+            plural(call_sites.len()),
+        ));
+        output.push_str("\n```json\n");
+        output.push_str(&declared_operations_block(
+            service,
+            route.as_deref(),
+            dispatch_location,
+            dispatch_field,
+            values,
+        ));
+        output.push_str("\n```\n\n");
+    }
+    output.push_str("</details>");
+    output
+}
+
+/// The `operations` block for a `carrick.json`, ready to paste.
+///
+/// Written by hand rather than through `serde_json`, whose maps sort their
+/// keys: a block a person is meant to read starts with the service and the
+/// route, not with `dispatch` because `d` sorts first.
+fn declared_operations_block(
+    service: &str,
+    route: Option<&str>,
+    location: &str,
+    field: &str,
+    values: &[String],
+) -> String {
+    let quoted = |value: &str| serde_json::Value::String(value.to_string()).to_string();
+    let mut out = String::from("{\n  \"operations\": [\n    {\n");
+    out.push_str(&format!("      \"service\": {},\n", quoted(service)));
+    if let Some(route) = route {
+        out.push_str(&format!("      \"route\": {},\n", quoted(route)));
+    }
+    out.push_str(&format!(
+        "      \"dispatch\": {{ \"location\": {}, \"field\": {} }},\n",
+        quoted(location),
+        quoted(field)
+    ));
+    out.push_str("      \"operations\": [\n");
+    for (index, value) in values.iter().enumerate() {
+        let comma = if index + 1 == values.len() { "" } else { "," };
+        out.push_str(&format!(
+            "        {{ \"value\": {} }}{}\n",
+            quoted(value),
+            comma
+        ));
+    }
+    out.push_str("      ]\n    }\n  ]\n}");
+    out
 }
 
 /// Render the shared-external-contract groups (#379): repos whose call sites
@@ -1766,12 +1883,14 @@ mod tests {
                 path: "/api/users".to_string(),
                 provenance: EndpointProvenance::Route,
                 type_verdict: None,
+                dispatch: None,
             },
             crate::analyzer::VerifiedEndpointEntry {
                 method: "POST".to_string(),
                 path: "/api/orders".to_string(),
                 provenance: EndpointProvenance::Route,
                 type_verdict: None,
+                dispatch: None,
             },
         ];
 
@@ -1791,12 +1910,14 @@ mod tests {
                 path: "/api/users".to_string(),
                 provenance: EndpointProvenance::Route,
                 type_verdict: None,
+                dispatch: None,
             },
             crate::analyzer::VerifiedEndpointEntry {
                 method: "GET".to_string(),
                 path: "/api/widgets".to_string(),
                 provenance: EndpointProvenance::Mock,
                 type_verdict: None,
+                dispatch: None,
             },
         ];
 
@@ -1848,6 +1969,7 @@ mod tests {
             path: "/api/users".to_string(),
             provenance: EndpointProvenance::Route,
             type_verdict: None,
+            dispatch: None,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
         assert!(output.contains("Verified (1)"));
@@ -1864,6 +1986,7 @@ mod tests {
             path: "/api/users".to_string(),
             provenance: EndpointProvenance::Route,
             type_verdict: None,
+            dispatch: None,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
 
@@ -1882,6 +2005,7 @@ mod tests {
             path: "/api/users".to_string(),
             provenance: EndpointProvenance::Route,
             type_verdict: None,
+            dispatch: None,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
 
@@ -1911,6 +2035,7 @@ mod tests {
                 path: path.to_string(),
                 provenance: EndpointProvenance::Route,
                 type_verdict: verdict,
+                dispatch: None,
             }
         };
         let mut result = result_with(vec![]);
@@ -2324,6 +2449,7 @@ mod tests {
             path: "/api/users".to_string(),
             provenance: EndpointProvenance::Route,
             type_verdict: None,
+            dispatch: None,
         }];
         let output = format_analysis_results(result, &topology_baseline(), None);
 

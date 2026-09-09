@@ -35,8 +35,10 @@
 //! The `wasm` feature (default off) adds wasm-bindgen exports for
 //! [`paths_match`], [`is_param_segment`], [`match_agreement`],
 //! [`path_literal_specificity`], [`is_catch_all_path`],
-//! [`is_unknown_call_path`], [`match_verdict`], [`reportable_agreement`], and
-//! [`classify_relationship`]:
+//! [`is_unknown_call_path`], [`match_verdict`], [`reportable_agreement`],
+//! [`classify_relationship`], and the body-dispatch trio [`dispatch_key`],
+//! [`dispatch_verdict`], [`match_verdict_with_dispatch`] /
+//! [`reportable_agreement_with_dispatch`]:
 //!
 //! ```text
 //! cargo build --target wasm32-unknown-unknown -p carrick-match --features wasm
@@ -211,6 +213,141 @@ pub enum MatchVerdict {
     /// The pair routes but shares no literal segment — a prefixed catch-all or
     /// a param-only route covering the call without vouching for it.
     NoLiteralAgreement,
+    /// The producer is one case of a body-dispatching handler and the call
+    /// states no value for the field it switches on (carrick#831). The paths
+    /// route, but the route is not the whole operation identity here: without
+    /// the call's own value, the pair is a guess between the producer's
+    /// siblings, so no edge may be drawn.
+    DispatchValueUnknown,
+    /// The producer is one case of a body-dispatching handler and the call
+    /// states a DIFFERENT value for that field. This is a clean negative, not
+    /// a gap: the call names a sibling operation on the same route, and the
+    /// sibling is where its edge belongs.
+    DispatchValueMismatch,
+}
+
+/// What the CALL states for the field a dispatching producer switches on.
+///
+/// Returned by [`dispatch_verdict`]; folded into [`MatchVerdict`] by
+/// [`match_verdict_with_dispatch`]. Keep the two in step: every non-`Matched`
+/// variant here has to name a rejection there, or a surface that reads the
+/// folded verdict loses a distinction this one draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum DispatchVerdict {
+    /// The producer states no dispatch: an ordinary route, whose identity is
+    /// method and path alone. A call carrying a dispatch value still matches
+    /// it — the value is then a body field like any other, not part of the
+    /// operation's identity, and only the PRODUCER can make it one.
+    NotDispatching,
+    /// Both sides name the same (location, field) and the same value.
+    Matched,
+    /// The producer dispatches and the call states nothing the producer's
+    /// field can be read from: no dispatch at all, or one on a different
+    /// field.
+    ValueUnknown,
+    /// Both sides name the same (location, field) and DIFFERENT values.
+    ValueMismatch,
+}
+
+/// The canonical key text for one dispatch case: `"body:action=upload-logs"`.
+///
+/// This is the string that makes nine operations behind one route nine keys
+/// (carrick#831). Every surface that keys, dedupes or counts a dispatching
+/// operation appends it to the `METHOD:path` key it already builds, so a
+/// bookkeeping map cannot fold the nine back into one.
+///
+/// Inputs are taken verbatim: the value is the literal the source states, and
+/// no case folding or trimming is applied, because a dispatch value is a
+/// string compared for equality by the handler itself.
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn dispatch_key(location: &str, field: &str, value: &str) -> String {
+    format!("{location}:{field}={value}")
+}
+
+/// Whether a call satisfies the dispatch case a producer answers.
+///
+/// Both sides are passed as [`dispatch_key`] strings, or `None` where the row
+/// carries no dispatch. `None` on the producer is the ordinary route and ends
+/// the question ([`DispatchVerdict::NotDispatching`]).
+///
+/// The comparison is by (location, field) first and value second, so a call
+/// that states a value for a DIFFERENT field is `ValueUnknown` rather than a
+/// mismatch: it says nothing at all about the field this producer switches
+/// on, and "unknown" is the honest reading of silence.
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn dispatch_verdict(
+    producer_dispatch: Option<String>,
+    call_dispatch: Option<String>,
+) -> DispatchVerdict {
+    let Some(producer) = producer_dispatch else {
+        return DispatchVerdict::NotDispatching;
+    };
+    let Some(call) = call_dispatch else {
+        return DispatchVerdict::ValueUnknown;
+    };
+    let (Some((producer_field, producer_value)), Some((call_field, call_value))) =
+        (producer.split_once('='), call.split_once('='))
+    else {
+        // A key without a value separator states no value. Treat it as
+        // silence rather than as a value that happens to be the whole string.
+        return DispatchVerdict::ValueUnknown;
+    };
+    if producer_field != call_field {
+        return DispatchVerdict::ValueUnknown;
+    }
+    if producer_value == call_value {
+        DispatchVerdict::Matched
+    } else {
+        DispatchVerdict::ValueMismatch
+    }
+}
+
+/// [`match_verdict`] with the producer's dispatch case folded in: the one
+/// decision a surface asks about a pair when the producer may be one case of a
+/// body-dispatching handler (carrick#831).
+///
+/// The path question is asked FIRST and unchanged. A dispatch case is a
+/// narrowing of an operation that already has to route: a call that does not
+/// reach the path is not a dispatch failure, and naming it one would hide the
+/// real reason behind a newer one.
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn match_verdict_with_dispatch(
+    endpoint_path: &str,
+    call_path: &str,
+    producer_dispatch: Option<String>,
+    call_dispatch: Option<String>,
+) -> MatchVerdict {
+    match match_verdict(endpoint_path, call_path) {
+        MatchVerdict::Matched => match dispatch_verdict(producer_dispatch, call_dispatch) {
+            DispatchVerdict::NotDispatching | DispatchVerdict::Matched => MatchVerdict::Matched,
+            DispatchVerdict::ValueUnknown => MatchVerdict::DispatchValueUnknown,
+            DispatchVerdict::ValueMismatch => MatchVerdict::DispatchValueMismatch,
+        },
+        rejected => rejected,
+    }
+}
+
+/// [`reportable_agreement`] with the producer's dispatch case folded in.
+///
+/// The agreement number is the PATH's, unchanged: a dispatch case narrows
+/// which operation a call names, it does not add a segment the two sides
+/// agree on. Ranking several producers against one call therefore still
+/// ranks on path specificity, and among the cases of one dispatching route
+/// at most one survives this function at all.
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn reportable_agreement_with_dispatch(
+    endpoint_path: &str,
+    call_path: &str,
+    producer_dispatch: Option<String>,
+    call_dispatch: Option<String>,
+) -> Option<u32> {
+    match match_verdict_with_dispatch(endpoint_path, call_path, producer_dispatch, call_dispatch) {
+        MatchVerdict::Matched => match_agreement(endpoint_path, call_path),
+        _ => None,
+    }
 }
 
 /// The single decision every surface asks of the matcher: is this
@@ -406,6 +543,142 @@ fn agreement_with_wildcards(endpoint_path: &str, call_path: &str) -> Option<u32>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- body dispatch (carrick#831) ---------------------------------------
+
+    #[test]
+    fn dispatch_key_is_the_case_written_verbatim() {
+        assert_eq!(
+            dispatch_key("body", "action", "search-by-intent"),
+            "body:action=search-by-intent"
+        );
+        // A header case and a body case on the same field are different keys:
+        // the location is part of what the handler switches on.
+        assert_ne!(
+            dispatch_key("body", "action", "x"),
+            dispatch_key("header", "action", "x")
+        );
+    }
+
+    #[test]
+    fn a_plain_route_is_never_narrowed_by_the_call() {
+        // Only the producer can make a field part of the operation's identity.
+        assert_eq!(
+            dispatch_verdict(None, Some(dispatch_key("body", "action", "x"))),
+            DispatchVerdict::NotDispatching
+        );
+        assert_eq!(
+            dispatch_verdict(None, None),
+            DispatchVerdict::NotDispatching
+        );
+        assert_eq!(
+            match_verdict_with_dispatch(
+                "/types/check-or-upload",
+                "/types/check-or-upload",
+                None,
+                Some(dispatch_key("body", "action", "upload-logs")),
+            ),
+            MatchVerdict::Matched
+        );
+    }
+
+    #[test]
+    fn a_dispatching_producer_matches_only_its_own_case() {
+        let producer = Some(dispatch_key("body", "action", "search-by-intent"));
+        assert_eq!(
+            dispatch_verdict(producer.clone(), producer.clone()),
+            DispatchVerdict::Matched
+        );
+        assert_eq!(
+            dispatch_verdict(
+                producer.clone(),
+                Some(dispatch_key("body", "action", "upload-logs"))
+            ),
+            DispatchVerdict::ValueMismatch
+        );
+        // A value for a different field says nothing about this one.
+        assert_eq!(
+            dispatch_verdict(
+                producer.clone(),
+                Some(dispatch_key("body", "kind", "search-by-intent"))
+            ),
+            DispatchVerdict::ValueUnknown
+        );
+        // Location is part of the field identity.
+        assert_eq!(
+            dispatch_verdict(
+                producer.clone(),
+                Some(dispatch_key("header", "action", "search-by-intent"))
+            ),
+            DispatchVerdict::ValueUnknown
+        );
+    }
+
+    #[test]
+    fn a_call_stating_no_value_stays_unmatched() {
+        let producer = Some(dispatch_key("body", "action", "search-by-intent"));
+        assert_eq!(
+            dispatch_verdict(producer.clone(), None),
+            DispatchVerdict::ValueUnknown
+        );
+        assert_eq!(
+            match_verdict_with_dispatch(
+                "/types/check-or-upload",
+                "/types/check-or-upload",
+                producer.clone(),
+                None,
+            ),
+            MatchVerdict::DispatchValueUnknown
+        );
+        assert_eq!(
+            reportable_agreement_with_dispatch(
+                "/types/check-or-upload",
+                "/types/check-or-upload",
+                producer,
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_path_question_is_answered_first() {
+        // A call that never reaches the route is a route failure, not a
+        // dispatch one: naming it a dispatch failure would hide the real
+        // reason behind a newer one.
+        assert_eq!(
+            match_verdict_with_dispatch(
+                "/types/check-or-upload",
+                "/types/other",
+                Some(dispatch_key("body", "action", "x")),
+                None,
+            ),
+            MatchVerdict::NoRouteMatch
+        );
+        assert_eq!(
+            match_verdict_with_dispatch(
+                "/*",
+                "/types/check-or-upload",
+                Some(dispatch_key("body", "action", "x")),
+                None,
+            ),
+            MatchVerdict::CatchAllRoute
+        );
+    }
+
+    #[test]
+    fn a_matching_case_keeps_the_paths_own_agreement() {
+        let case = Some(dispatch_key("body", "action", "search-by-intent"));
+        assert_eq!(
+            reportable_agreement_with_dispatch(
+                "/types/check-or-upload",
+                "/types/check-or-upload",
+                case.clone(),
+                case,
+            ),
+            reportable_agreement("/types/check-or-upload", "/types/check-or-upload")
+        );
+    }
 
     #[test]
     fn test_paths_match_dispatch() {

@@ -263,6 +263,7 @@ mod tests {
             return_is_explicit: return_type.is_some(),
             signature: None,
             intent_input_hash: None,
+            dispatch_table: None,
         }
     }
 

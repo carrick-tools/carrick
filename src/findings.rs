@@ -202,6 +202,30 @@ pub enum Finding {
         env_var: String,
         call_sites: Vec<String>,
     },
+    /// A handler that switches on a request field, and the operations behind
+    /// it that nothing in `carrick.json` declares yet (carrick#831).
+    ///
+    /// Advisory, never a failure, and never a claim that anything is wrong:
+    /// the handler works, the index simply has one operation where the source
+    /// has several. What it carries is the material for the `operations`
+    /// block a reader can paste — the field, every value, and the call sites
+    /// that already name one — so accepting the model's reading is a copy
+    /// rather than an authoring job (#357).
+    ///
+    /// `route` is nullable because the case this exists for is the ROUTELESS
+    /// handler, whose route lives in infrastructure rather than in the source;
+    /// when consumer calls name one, that is where it comes from.
+    DispatchOperations {
+        service: String,
+        route: Option<String>,
+        dispatch_location: String,
+        dispatch_field: String,
+        /// Every value the handler answers, in the order extraction stated
+        /// them.
+        values: Vec<String>,
+        /// Call sites that already state a value for this field.
+        call_sites: Vec<String>,
+    },
     /// One package pinned to conflicting versions across repos. No
     /// method/path — this finding is not endpoint-scoped.
     DependencyConflict {
@@ -417,6 +441,7 @@ impl Finding {
             Finding::MissingEndpoint { .. } => "missing_endpoint",
             Finding::OrphanedEndpoint { .. } => "orphaned_endpoint",
             Finding::EnvVarCall { .. } => "env_var_call",
+            Finding::DispatchOperations { .. } => "dispatch_operations",
             Finding::DependencyConflict { .. } => "dependency_conflict",
             Finding::SharedExternalContract { .. } => "shared_external_contract",
             Finding::DegradedTypes { .. } => "degraded_types",
@@ -432,9 +457,9 @@ impl Finding {
             | Finding::MethodMismatch { .. }
             | Finding::DegradedTypes { .. } => Severity::Risk,
             Finding::MissingEndpoint { .. } | Finding::OrphanedEndpoint { .. } => Severity::Gap,
-            Finding::EnvVarCall { .. } | Finding::SharedExternalContract { .. } => {
-                Severity::Advisory
-            }
+            Finding::EnvVarCall { .. }
+            | Finding::SharedExternalContract { .. }
+            | Finding::DispatchOperations { .. } => Severity::Advisory,
             Finding::DependencyConflict { tier, .. } => {
                 if tier == tier::MAJOR {
                     Severity::Gap
@@ -541,6 +566,23 @@ impl Serialize for Finding {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
                 map.serialize_entry("env_var", env_var)?;
+                map.serialize_entry("call_sites", wire_call_sites(call_sites))?;
+            }
+            Finding::DispatchOperations {
+                service,
+                route,
+                dispatch_location,
+                dispatch_field,
+                values,
+                call_sites,
+            } => {
+                map.serialize_entry("service", service)?;
+                // Always written, null included: a reader has to tell "no
+                // route in the source" from "a field the writer forgot".
+                map.serialize_entry("route", route)?;
+                map.serialize_entry("dispatch_location", dispatch_location)?;
+                map.serialize_entry("dispatch_field", dispatch_field)?;
+                map.serialize_entry("values", values)?;
                 map.serialize_entry("call_sites", wire_call_sites(call_sites))?;
             }
             Finding::DependencyConflict {

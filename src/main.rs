@@ -8,6 +8,7 @@ mod call_graph;
 mod call_site_extractor;
 mod cloud_storage;
 mod config;
+mod dispatch;
 mod engine;
 mod env_alias;
 mod eval_output;
