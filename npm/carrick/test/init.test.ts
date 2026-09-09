@@ -8,7 +8,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { describeIdentity, githubIdentity, loginFromGhStatus } from "../src/init/identity.ts";
 import { findRepos, mergeWorkspace } from "../src/init/repos.ts";
-import { carrickHooks, mergeCarrickHooks } from "../src/init/settings.ts";
+import {
+  carrickHooks,
+  hookCommand,
+  mergeCarrickHooks,
+  ownEntryPoint,
+} from "../src/init/settings.ts";
 import { parseArgs } from "../src/init/run.ts";
 
 function entries(names: Array<[string, boolean]>) {
@@ -124,6 +129,60 @@ test("the hooks it claims are the only commands it will remove", () => {
       }
     }
   }
+});
+
+test("the hook command is the bare name only when the bare name resolves", () => {
+  const global = hookCommand({ onPath: () => true });
+  assert.deepEqual(global, { command: "carrick", bare: true });
+
+  const npxOnly = hookCommand({ onPath: () => false, root: "/opt/carrick" });
+  assert.equal(npxOnly.bare, false);
+  assert.equal(npxOnly.command, ownEntryPoint("/opt/carrick"));
+  assert.match(npxOnly.command, /bin\/carrick\.mjs$/);
+
+  // A path with a space in it is a path a shell must be handed quoted.
+  const spaced = hookCommand({ onPath: () => false, root: "/opt/my tools/carrick" });
+  assert.equal(spaced.command, `"${ownEntryPoint("/opt/my tools/carrick")}"`);
+});
+
+test("an absolute hook command is written, and is still recognised as ours", () => {
+  const entry = ownEntryPoint("/opt/carrick");
+  const written = JSON.parse(mergeCarrickHooks(null, entry).body);
+  assert.equal(written.hooks.PostToolUse[0].hooks[0].command, `${entry} hook post-edit`);
+  assert.equal(written.hooks.SessionStart[0].hooks[0].command, `${entry} hook session-start`);
+
+  // The same workspace, now with carrick installed globally: one entry, not two.
+  const rewritten = JSON.parse(mergeCarrickHooks(JSON.stringify(written, null, 2)).body);
+  assert.equal(rewritten.hooks.PostToolUse.length, 1);
+  assert.equal(rewritten.hooks.PostToolUse[0].hooks.length, 1);
+  assert.equal(rewritten.hooks.PostToolUse[0].hooks[0].command, "carrick hook post-edit");
+  assert.equal(rewritten.hooks.SessionStart.length, 1);
+});
+
+test("a quoted absolute hook command is ours too, and a lookalike is not", () => {
+  const quoted = `"/opt/my tools/carrick/bin/carrick.mjs" hook post-edit`;
+  const stale = JSON.stringify(
+    {
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: "Write|Edit",
+            hooks: [
+              { type: "command", command: quoted },
+              { type: "command", command: "carrickctl hook post-edit" },
+            ],
+          },
+        ],
+      },
+    },
+    null,
+    2,
+  );
+  const written = JSON.parse(mergeCarrickHooks(stale).body);
+  const commands = written.hooks.PostToolUse.flatMap(
+    (group: { hooks: Array<{ command: string }> }) => group.hooks.map((entry) => entry.command),
+  );
+  assert.deepEqual(commands, ["carrickctl hook post-edit", "carrick hook post-edit"]);
 });
 
 test("the identity comes from the GitHub CLI, or a token, or init stops", () => {

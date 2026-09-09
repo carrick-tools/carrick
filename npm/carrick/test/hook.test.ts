@@ -164,6 +164,9 @@ test("the session line asks status about the workspace, and states what it holds
   });
   assert.equal(run.code, 0);
   assert.match(run.stdout, /^Carrick indexed 3 service\(s\) in \S+ at 2026-09-06T21:14:03Z/);
+  // A line a developer runs by hand, so it ends like one (#838).
+  assert.ok(run.stdout.endsWith("\n"), "the session line ends with a newline");
+  assert.ok(!run.stdout.endsWith("\n\n"), "and with exactly one");
   assert.match(run.stdout, /\n- user-service at 6a1b2c3: 157 route\(s\), 12 call\(s\), changed since index: 7 \(/);
   assert.match(run.stdout, /\n- user-admin .*Same repo as user-service, so the same 7 changed file\(s\)/);
   const call = firstCall(argvLog);
