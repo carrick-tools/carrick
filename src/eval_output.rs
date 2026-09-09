@@ -65,6 +65,11 @@ pub struct EvalOp {
     /// carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumers_not_resolved: Option<crate::imported_request_member::UnfollowedMemberSites>,
+    /// The dispatch case this op is (carrick#831): on a producer the case it
+    /// answers, on a call the value it sends for the field its target
+    /// dispatches on. `None` for a plain route, which is nearly all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<crate::dispatch::Dispatch>,
     /// Which layer stated this row, and for a deterministic row which pass
     /// (carrick#660), exactly as the persisted operation carries it. `None`
     /// for an op that does not come from the HTTP emit/join phase.
@@ -501,8 +506,11 @@ impl EvalOp {
             // neither.
             base: None,
             consumers_not_resolved: None,
-            // Carried by the details type itself (carrick#660), on both sides.
+            // Both carried by the details type itself, on both sides: which
+            // layer stated the row (carrick#660), and the dispatch case it is
+            // (carrick#831).
             resolution_source: d.resolution_source,
+            dispatch: d.dispatch.clone(),
             handler: d.handler_name.clone(),
             request_type: d
                 .request_type

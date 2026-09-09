@@ -138,6 +138,7 @@ jobs:
           --test span_locator_units_test
           --test workspace_member_callers_test
           --test workspace_package_client_test
+          --test wrapper_dispatch_test
 
       # Every tests/*.rs must be run by a step above or be listed here with a
       # reason. Nine of twenty were silently local-only before this step.
