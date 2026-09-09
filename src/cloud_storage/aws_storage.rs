@@ -92,6 +92,11 @@ pub struct AwsStorage {
     /// discriminator this stays false, which gates multi-service uploads so
     /// they can't clobber each other.
     multi_service: std::sync::atomic::AtomicBool,
+    /// This run re-analyzed every file (`--no-cache`, which the Action sets
+    /// from `full-scan`), so its answers supersede whatever the index holds
+    /// for this commit. Set once from the CLI flag and sent on every write
+    /// action; see `force_reindex` on [`LambdaRequest`].
+    force_reindex: bool,
 }
 
 #[derive(Serialize)]
@@ -139,6 +144,23 @@ struct LambdaRequest {
     #[serde(rename = "payloadSize")]
     #[serde(skip_serializing_if = "Option::is_none")]
     payload_size: Option<u64>,
+    /// This run re-analyzed the tree from scratch and supersedes the stored
+    /// generation for this (repo, service), even at the same commit and the
+    /// same scanner version (carrick#885).
+    ///
+    /// The cloud's freshness guard reasons about the SOURCE: same hash, same
+    /// release, therefore nothing to do. `--no-cache` is a statement about
+    /// the ANSWERS, and on an unchanged tree the two agree that nothing needs
+    /// doing — which is exactly the case the flag exists for, so the whole
+    /// re-analysis was computed at model cost and discarded. Only this side
+    /// knows it superseded its own generation, so only this side can say so.
+    ///
+    /// Sent on the two write actions only, never on the bare existence check
+    /// (which indexes nothing). Omitted entirely when the run reused its
+    /// cache, so an ordinary upload's body is byte-for-byte what it was, and
+    /// a cloud deployed before the field existed ignores it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    force_reindex: Option<bool>,
 }
 
 /// Integrity fields for a payload that was staged to S3 rather than inlined.
@@ -266,7 +288,13 @@ fn http_client_builder() -> reqwest::ClientBuilder {
 }
 
 impl AwsStorage {
-    pub fn new() -> Result<Self, StorageError> {
+    /// `force_reindex` is the run's `--no-cache`: this scan re-analyzed every
+    /// file, so its write actions tell the cloud to replace the stored
+    /// generation instead of short-circuiting on the commit hash
+    /// (carrick#885). A property of the RUN, not of any one blob, which is
+    /// why it lives here and not on `CloudRepoData` — a flag inside the blob
+    /// would be stored in the index and read back as next scan's cache.
+    pub fn new(force_reindex: bool) -> Result<Self, StorageError> {
         let api_endpoint = env!("CARRICK_API_ENDPOINT");
         let lambda_url = format!("{}/types/check-or-upload", api_endpoint);
 
@@ -282,6 +310,7 @@ impl AwsStorage {
             lambda_url,
             http_client,
             multi_service: std::sync::atomic::AtomicBool::new(false),
+            force_reindex,
         })
     }
 
@@ -496,6 +525,7 @@ impl AwsStorage {
             payload_in_s3: staged.is_some().then_some(true),
             payload_sha256: staged.map(|s| s.sha256.clone()),
             payload_size: staged.map(|s| s.size),
+            force_reindex: self.force_reindex.then_some(true),
         };
 
         let response: WriteActionResponse = self.call_lambda(&request).await?;
@@ -567,6 +597,9 @@ impl CloudStorage for AwsStorage {
             payload_in_s3: None,
             payload_sha256: None,
             payload_size: None,
+            // The existence check indexes nothing, so there is nothing for it
+            // to supersede; the flag rides the write actions below.
+            force_reindex: None,
         };
 
         let lambda_response: LambdaResponse = self.call_lambda(&check_request).await?;
@@ -599,6 +632,7 @@ impl CloudStorage for AwsStorage {
                     payload_in_s3: stage_payload.then_some(true),
                     payload_sha256: staged.as_ref().map(|s| s.sha256.clone()),
                     payload_size: staged.as_ref().map(|s| s.size),
+                    force_reindex: self.force_reindex.then_some(true),
                 };
 
                 let complete_response: WriteActionResponse =
@@ -644,6 +678,7 @@ impl CloudStorage for AwsStorage {
             payload_in_s3: None,
             payload_sha256: None,
             payload_size: None,
+            force_reindex: None,
         };
 
         let lambda_response: LambdaResponse = self.call_lambda(&request).await?;
@@ -811,6 +846,7 @@ impl CloudStorage for AwsStorage {
             payload_in_s3: None,
             payload_sha256: None,
             payload_size: None,
+            force_reindex: None,
         };
 
         match self.call_lambda::<LambdaResponse>(&request).await {
@@ -896,6 +932,7 @@ mod tests {
             payload_in_s3: None,
             payload_sha256: None,
             payload_size: None,
+            force_reindex: None,
         };
         let json = serde_json::to_string(&bare).unwrap();
         assert!(!json.contains("wantsPayloadUrl"));
@@ -989,6 +1026,7 @@ mod tests {
             payload_in_s3: None,
             payload_sha256: None,
             payload_size: None,
+            force_reindex: None,
         };
         let json = serde_json::to_string(&inline).unwrap();
         assert!(!json.contains("payloadSha256"));
@@ -1004,6 +1042,42 @@ mod tests {
         let v = serde_json::to_value(&staged).unwrap();
         assert_eq!(v["payloadSha256"], digest.sha256);
         assert_eq!(v["payloadSize"], 2);
+    }
+
+    /// carrick#885: `force_reindex` is the run's statement that it superseded
+    /// its own generation, and the cloud's freshness guard reads it by that
+    /// exact snake_case key (matching `service_name` / `scanner_version`, not
+    /// the camelCase staging fields). Absent on an ordinary scan, so a cached
+    /// run's body is byte-for-byte what it was before the field existed and a
+    /// cloud deployed without the reader ignores it.
+    #[test]
+    fn force_reindex_rides_the_write_action_and_is_omitted_when_unset() {
+        let cached = LambdaRequest {
+            action: "store-metadata".to_string(),
+            repo: "r".to_string(),
+            service_name: None,
+            hash: "h".to_string(),
+            filename: "types.d.ts".to_string(),
+            cloud_repo_data: None,
+            s3_url: None,
+            wants_payload_url: None,
+            payload_in_s3: None,
+            payload_sha256: None,
+            payload_size: None,
+            force_reindex: None,
+        };
+        let json = serde_json::to_string(&cached).unwrap();
+        assert!(
+            !json.contains("force_reindex"),
+            "an unforced run must omit the field, not send false: {json}"
+        );
+
+        let forced = LambdaRequest {
+            force_reindex: Some(true),
+            ..cached
+        };
+        let v = serde_json::to_value(&forced).unwrap();
+        assert_eq!(v["force_reindex"], true);
     }
 
     /// carrick#536: `complete-upload` and `store-metadata` write the index, so

@@ -340,7 +340,10 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         let storage = MockStorage::new();
         run_analysis_engine_with_sidecar(storage, &args.repo_path, sidecar_ref, args.no_cache).await
     } else {
-        let storage = AwsStorage::new()?;
+        // `--no-cache` is carried into the upload as well as the analysis: a
+        // run that re-analyzed every file supersedes the stored generation
+        // even when the commit has not moved (carrick#885).
+        let storage = AwsStorage::new(args.no_cache)?;
         run_analysis_engine_with_sidecar(storage, &args.repo_path, sidecar_ref, args.no_cache).await
     }
 
