@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.57](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.56...carrick-v0.3.57) (2026-09-09)
+
+
+### Features
+
+* **npm:** a generic LSP client probe, so an editor row starts with a command ([#898](https://github.com/carrick-tools/carrick/issues/898)) ([deca57c](https://github.com/carrick-tools/carrick/commit/deca57c2c73d5cf8096c21b94db67e4d590bb111)), closes [#854](https://github.com/carrick-tools/carrick/issues/854)
+* **upload:** tell the cloud when a full scan supersedes the stored generation ([#896](https://github.com/carrick-tools/carrick/issues/896)) ([d7ecea2](https://github.com/carrick-tools/carrick/commit/d7ecea276f7b155fc8db238dd19596b6fa9a0c18))
+
+
+### Bug Fixes
+
+* **extract:** index the functions a CommonJS module assigns to its exports ([#902](https://github.com/carrick-tools/carrick/issues/902)) ([6cddefe](https://github.com/carrick-tools/carrick/commit/6cddefed9e010cf39fb6f1300a643219e864068f))
+
+
+### Documentation
+
+* **ci:** this repo's own workflow says what the sibling dispatch does now ([#903](https://github.com/carrick-tools/carrick/issues/903)) ([74e22f8](https://github.com/carrick-tools/carrick/commit/74e22f8acd5374318e32959cd0643108c886bcca)), closes [#888](https://github.com/carrick-tools/carrick/issues/888)
+
+
+### CI/CD
+
+* **plugin:** install the packed package on every platform and manager it claims ([#895](https://github.com/carrick-tools/carrick/issues/895)) ([eab387d](https://github.com/carrick-tools/carrick/commit/eab387dfc2af031c44256a1b40e06c5373188bbf)), closes [#853](https://github.com/carrick-tools/carrick/issues/853)
+
 ## [0.3.56](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.55...carrick-v0.3.56) (2026-09-09)
 
 
