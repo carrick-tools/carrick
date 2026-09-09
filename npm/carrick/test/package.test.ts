@@ -42,6 +42,27 @@ test("every platform this package can resolve is an optional dependency at this 
   }
 });
 
+test("the lockfile agrees with the manifest about the version and the five pins", () => {
+  // release-please bumps both, through `extra-files`. When it stops doing so
+  // — a renamed field, a jsonpath that no longer matches, a pin added without
+  // a config entry — the release publishes a package whose lockfile describes
+  // a different version, and the first thing anyone sees is a failed publish.
+  //
+  // Only the manifest-level fields are compared. The `node_modules/...`
+  // entries hold whatever the registry held when the lock was last written,
+  // which for a version that is not published yet is a stub with no version
+  // at all; the workflows regenerate the lock before `npm ci` for exactly
+  // that reason.
+  const lock = readJson(path.join(packageRoot, "package-lock.json"));
+  assert.equal(lock["version"], pkg["version"], "package-lock.json version");
+  assert.equal(lock["packages"][""]["version"], pkg["version"], "lock root package version");
+  assert.deepEqual(
+    lock["packages"][""]["optionalDependencies"],
+    pkg["optionalDependencies"],
+    "the lockfile's root optionalDependencies must be the manifest's, pin for pin",
+  );
+});
+
 test("the version tracks the scanner's, because the Action installs it by that number", () => {
   const cargo = fs.readFileSync(path.join(repoRoot, "Cargo.toml"), "utf8");
   const version = /^version\s*=\s*"([^"]+)"/m.exec(cargo)?.[1];

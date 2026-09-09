@@ -54,7 +54,19 @@ jobs:
 
       - name: Install
         working-directory: npm/carrick
-        run: npm ci
+        run: |
+          # The lockfile cannot be correct for the version being released, so it is
+          # regenerated rather than trusted. `optionalDependencies` pins the five
+          # platform packages to this exact version, and when release-please writes
+          # the release commit those tarballs do not exist yet — no committed
+          # lockfile can hold an integrity hash for a package that has not been
+          # published. npm records `{"optional": true}` stubs instead, and `npm ci`
+          # rejects them the moment the version does exist ("lock file's ...@ does
+          # not satisfy ...@0.3.54", release 0.3.54). Regenerating first is right in
+          # both states: real entries when the pins resolve, stubs when they do not,
+          # and `npm ci` accepts either.
+          npm install --package-lock-only --ignore-scripts
+          npm ci
 
       - name: Typecheck and unit tests
         working-directory: npm/carrick
@@ -84,11 +96,15 @@ jobs:
           mkdir -p "$RUNNER_TEMP/probe"
           cd "$RUNNER_TEMP/probe"
           echo '{"name":"probe","private":true}' > package.json
-          npm install --ignore-scripts "$RUNNER_TEMP"/carrick-*.tgz
+          # --omit=optional so this proves the same thing on every day of the
+          # week. Without it the platform package for this runner is installed
+          # whenever the version happens to be published already, the binary
+          # resolves, and the assertion below stops describing anything.
+          npm install --ignore-scripts --omit=optional "$RUNNER_TEMP"/carrick-*.tgz
           ./node_modules/.bin/carrick --version
-          # No platform package on this machine, so the resolver's message is
-          # what a user with an unpublished platform sees. It must be a
-          # message, not a stack trace — and a non-zero exit here is the
+          # No platform package here by construction, so this is the message a
+          # user whose platform did not publish sees. It must be a message,
+          # not a stack trace — and a non-zero exit here is the
           # expected one, so it is captured rather than run through a pipeline
           # that `pipefail` would then fail on.
           MISSING=$(./node_modules/.bin/carrick check nothing.ts 2>&1 || true)
