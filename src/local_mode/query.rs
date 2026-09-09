@@ -57,8 +57,19 @@ pub fn answer(workspace_root: &Path, file: &Path, mode: Mode) -> Result<CheckOut
         .unwrap_or_else(|| index.indexed_at.clone());
 
     let repo_root = PathBuf::from(&repo.path);
-    let changed = changed_since(&repo_root, &commit);
-    let stale = changed.contains(&relative) || newer_than_index(&repo_root, &relative, &indexed_at);
+    // Git is the whole answer where git can give one: it compares CONTENT, and
+    // a rewrite that lands the same bytes is not a change. The mtime signal is
+    // the fallback for the tree git cannot speak for, and it is built into the
+    // same set rather than OR-ed on top of it, so `stale` and
+    // `changed_since_index` can never contradict each other (carrick#857).
+    let changed = changed_since(&repo_root, &commit).unwrap_or_else(|| {
+        let mut changed = HashSet::new();
+        if newer_than_index(&repo_root, &relative, &indexed_at) {
+            changed.insert(relative.clone());
+        }
+        changed
+    });
+    let stale = changed.contains(&relative);
     let deleted = !repo_root.join(&relative).exists();
 
     let boundary = service_row.and_then(|service| service.boundary.clone());
@@ -121,7 +132,13 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadError> {
             .first()
             .map(|service| service.commit.clone())
             .unwrap_or_default();
-        let mut changed: Vec<String> = changed_since(&repo_root, &commit).into_iter().collect();
+        // No mtime fallback here: `status` answers for a whole repo, and the
+        // fallback is a stat of ONE file. Where git cannot answer, the repo
+        // reports nothing known to have changed rather than a walk of the tree.
+        let mut changed: Vec<String> = changed_since(&repo_root, &commit)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         changed.sort();
         let total = changed.len();
         let truncated = total > MAX_STALE_FILES;
@@ -287,27 +304,33 @@ fn read_index(workspace_root: &Path) -> Result<LocalIndex, ReadError> {
 /// everything committed since, plus everything uncommitted, plus what git does
 /// not track at all.
 ///
-/// Two cheap git calls and no walk of the tree. A repo git cannot answer for (a
-/// tarball, a commit that no longer exists after a rebase) yields an empty set,
-/// which reads as "nothing known to have changed" — the same thing the absence
-/// of a git repo has always meant here.
-fn changed_since(repo: &Path, commit: &str) -> HashSet<String> {
-    let mut changed = HashSet::new();
+/// Two cheap git calls and no walk of the tree. `None` is "git could not
+/// answer" — no commit recorded, a tarball with no repository, a commit a
+/// rebase has since dropped, or no `git` on the machine — and is deliberately
+/// distinct from `Some(empty)`, "git answered, and nothing has changed". The
+/// two used to collapse into one empty set, so a caller could not tell a clean
+/// tree from an unanswerable one and had to OR in a signal that is wrong
+/// whenever git can speak (carrick#857).
+fn changed_since(repo: &Path, commit: &str) -> Option<HashSet<String>> {
     if commit.is_empty() {
-        return changed;
+        return None;
     }
-    if let Some(text) = git(repo, &["diff", "--name-only", commit]) {
+    let diff = git(repo, &["diff", "--name-only", commit])?;
+    let untracked = git(repo, &["ls-files", "--others", "--exclude-standard"])?;
+    let mut changed = HashSet::new();
+    for text in [diff, untracked] {
         changed.extend(text.lines().map(str::to_string).filter(|l| !l.is_empty()));
     }
-    if let Some(text) = git(repo, &["ls-files", "--others", "--exclude-standard"]) {
-        changed.extend(text.lines().map(str::to_string).filter(|l| !l.is_empty()));
-    }
-    changed
+    Some(changed)
 }
 
-/// Whether the file itself has been written since the index was built. Covers
-/// the edit git cannot see: a file in `.gitignore`, or a tree that is not a
-/// git repo at all.
+/// Whether the file itself has been written since the index was built.
+///
+/// The fallback for a tree git cannot answer for, and only that: an mtime says
+/// a write happened, never that the bytes differ, so an editor autosave, a
+/// formatter that changed nothing, or a `git checkout --` that restored the
+/// same content all read as changed. Where git can compare content, its answer
+/// is used instead (carrick#857).
 fn newer_than_index(repo: &Path, relative: &str, indexed_at: &str) -> bool {
     let Ok(indexed_at) = chrono::DateTime::parse_from_rfc3339(indexed_at) else {
         return false;

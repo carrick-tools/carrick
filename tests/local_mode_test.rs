@@ -564,3 +564,97 @@ fn a_thin_index_says_what_it_could_not_classify() {
         "with the count beside it, in the answer a hook reads:\n{routes}"
     );
 }
+
+/// Rewrite a file with the bytes it already has, and push its mtime forward so
+/// the write is visible whatever the filesystem's timestamp granularity is.
+///
+/// This is what an editor with autosave on does to a buffer nobody edited, what
+/// a formatter does when it has nothing to fix, and what `git checkout --` and
+/// `git stash pop` do when they restore identical content.
+fn rewrite_identically(file: &Path) {
+    let text = std::fs::read_to_string(file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+    std::fs::write(file, &text).expect("write the same bytes back");
+    let handle = std::fs::File::options()
+        .write(true)
+        .open(file)
+        .expect("reopen to set the mtime");
+    handle
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(2))
+        .expect("set the mtime forward");
+}
+
+/// A write that changes no bytes is not a change: git compares content, and
+/// where git can answer, its answer is the whole answer (carrick#857).
+///
+/// Every other test here edits a file to make it stale. This one rewrites one
+/// without changing it, which is the ordinary case on the editor surface: the
+/// LSP checks a file on every save, so an autosave of an untouched buffer used
+/// to caveat every verdict in that file until the next index.
+#[test]
+#[serial]
+fn an_identical_rewrite_is_not_a_change() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let route = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+    let route_file = root.join(route);
+
+    index(root);
+    let fresh = check_json(root, route);
+    assert_eq!(
+        fresh["stale"],
+        serde_json::json!(false),
+        "a just-indexed file is not stale:\n{fresh:#}"
+    );
+
+    rewrite_identically(&route_file);
+
+    let after = check_json(root, route);
+    assert_eq!(
+        after["changed_since_index"],
+        serde_json::json!(0),
+        "git sees no change, because there is none:\n{after:#}"
+    );
+    assert_eq!(
+        after["stale"],
+        serde_json::json!(false),
+        "and `stale` says the same thing the count does:\n{after:#}"
+    );
+    for item in after["items"].as_array().expect("items") {
+        let detail = item["verdict"]["detail"].as_str().unwrap_or_default();
+        assert!(
+            !detail.contains("has changed since it was indexed"),
+            "no verdict carries a caveat this same response denies:\n{after:#}"
+        );
+    }
+}
+
+/// Where git cannot answer at all, the file's mtime is the only signal there
+/// is, and it still says the tree has moved. The fallback is not removed by
+/// carrick#857, only demoted to the case it was written for.
+#[test]
+#[serial]
+fn without_git_the_mtime_is_the_only_signal() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let route = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+    let route_file = root.join(route);
+
+    index(root);
+    // The tarball case: the index holds a commit, and nothing on disk can
+    // resolve it any more.
+    std::fs::remove_dir_all(root.join("catalog-web").join(".git")).expect("remove the repository");
+
+    rewrite_identically(&route_file);
+
+    let after = check_json(root, route);
+    assert_eq!(
+        after["stale"],
+        serde_json::json!(true),
+        "an unanswerable tree falls back to the write:\n{after:#}"
+    );
+    assert_eq!(
+        after["changed_since_index"],
+        serde_json::json!(1),
+        "and the count is the same signal, never a contradicting one:\n{after:#}"
+    );
+}

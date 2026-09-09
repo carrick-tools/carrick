@@ -109,7 +109,7 @@ is 0 on every local index, because a local index asks the model nothing.
 | `index_commit` | string | the commit that service was indexed at |
 | `indexed_at` | string (RFC 3339) | when `index` (or the last `refresh` of this service) ran |
 | `scanner_version` | string | the scanner release that wrote the index |
-| `changed_since_index` | int | files changed since `index_commit`: `git diff --name-only <commit>` plus files whose mtime is newer than the index |
+| `changed_since_index` | int | files changed since `index_commit`: `git diff --name-only <commit>` plus what git does not track. Where git cannot answer at all (no repository, a commit a rebase dropped, no `git`), it falls back to whether the queried file's own mtime is newer than the index, and counts only that file. A rewrite that changes no bytes is not a change |
 | `stale` | bool | this file is one of them, so its rows may not describe what is on disk now |
 | `deleted` | bool | the file is in the index and no longer on disk |
 | `items` | array | routes and calls the index holds for this file, in line order |
