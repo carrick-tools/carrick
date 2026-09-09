@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.49](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.48...carrick-v0.3.49) (2026-09-08)
+
+
+### Features
+
+* **npm:** one carrick package — lsp, hook and init as subcommands ([#832](https://github.com/carrick-tools/carrick/issues/832)) ([d0f2dd1](https://github.com/carrick-tools/carrick/commit/d0f2dd13ca0a4ff6493951882fb8fab0137afcc2))
+* **verdicts:** carry the request and response type verdicts separately on the blob ([#835](https://github.com/carrick-tools/carrick/issues/835)) ([f1bdd71](https://github.com/carrick-tools/carrick/commit/f1bdd711e20ffff24a7285823577358d3c24b476))
+
+
+### Bug Fixes
+
+* **types:** send the sidecar ts-morph positions for span-located type requests ([#825](https://github.com/carrick-tools/carrick/issues/825)) ([3aaea1d](https://github.com/carrick-tools/carrick/commit/3aaea1d61ccdba5828762c5fd8657934959117d5))
+
 ## [0.3.48](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.47...carrick-v0.3.48) (2026-09-08)
 
 
