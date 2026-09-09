@@ -115,15 +115,97 @@ jobs:
           path: dist/tarballs/*.tgz
           retention-days: 1
 
-  # Publishing is keyless: npm trusted publishing exchanges the job's OIDC
-  # token for the right to publish these names, so there is no npm token in
-  # this repository and every tarball carries provenance.
+  # The release asset the Action has always downloaded. It stays until the npm
+  # path is proven on a mirror: a first publish that fails, or publishes four
+  # platforms out of five, must not take every customer's scan with it.
+  # Its own job, so a failed publish cannot stop the asset being attached.
+  action-tarball:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: src/sidecar/package-lock.json
+
+      - name: Build binary
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Build sidecar
+        run: cd src/sidecar && npm ci && npm run build
+
+      - name: Create release archive
+        run: |
+          mkdir -p release/sidecar
+          cp target/x86_64-unknown-linux-gnu/release/carrick release/
+          cp -r src/sidecar/dist release/sidecar/dist
+          cp src/sidecar/package.json release/sidecar/
+          cp src/sidecar/package-lock.json release/sidecar/
+          cd release
+          tar -czf carrick-action-linux.tar.gz carrick sidecar
+
+      - name: Upload release artifact
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release-please.outputs.tag_name }}
+          files: release/carrick-action-linux.tar.gz
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # `v1` means "the Action works at this commit", so it moves with the
+      # asset rather than with the npm publish: the Action falls back to the
+      # asset, so a release that published nothing to npm is still a release
+      # a pinned workflow can run.
+      - name: Update v1 moving tag
+        run: |
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          VERSION="${TAG##*v}"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "Pre-release version ($VERSION) — skipping v1 update"
+            exit 0
+          fi
+          git tag -f v1 ${{ github.sha }}
+          git push -f origin v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publishing uses NPM_TOKEN for this first release only: npm configures a
+  # trusted publisher on a package that exists, and none of these six do yet.
+  # The token is a granular, short-lived one; after the first publish the six
+  # packages move to trusted publishing and the token is deleted, which is
+  # carrick#874. `id-token: write` stays either way — provenance is
+  # generated from it, token or no token.
   publish:
     needs: [release-please, binaries]
     if: ${{ needs.release-please.outputs.release_created }}
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+      # Provenance is generated from this, with or without the token below.
       id-token: write
     steps:
       - uses: actions/checkout@v4
@@ -147,6 +229,8 @@ jobs:
           merge-multiple: true
 
       - name: Publish the platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           for tarball in dist/tarballs/*.tgz; do
@@ -160,20 +244,9 @@ jobs:
       # prepack builds the emit and bundles the sidecar, and fails when the
       # sidecar imports something the package does not declare.
       - name: Publish carrick
-        run: cd npm/carrick && npm ci && npm publish --access public
-
-      - name: Update v1 moving tag
-        run: |
-          TAG="${{ needs.release-please.outputs.tag_name }}"
-          VERSION="${TAG##*v}"
-          if [[ "$VERSION" == *-* ]]; then
-            echo "Pre-release version ($VERSION) — skipping v1 update"
-            exit 0
-          fi
-          git tag -f v1 ${{ github.sha }}
-          git push -f origin v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: cd npm/carrick && npm ci && npm publish --access public
 
   # Builds the carrick-match wasm artifact, attaches it to the release, and
   # dispatches the pin-bump PR in carrick-cloud (#325). Lives in the same
