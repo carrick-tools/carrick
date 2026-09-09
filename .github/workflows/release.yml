@@ -269,7 +269,21 @@ jobs:
       - name: Publish carrick
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: cd npm/carrick && npm ci && npm publish --access public
+        run: |
+          cd npm/carrick
+          # The lockfile cannot be correct for the version being released, so it is
+          # regenerated rather than trusted. `optionalDependencies` pins the five
+          # platform packages to this exact version, and when release-please writes
+          # the release commit those tarballs do not exist yet — no committed
+          # lockfile can hold an integrity hash for a package that has not been
+          # published. npm records `{"optional": true}` stubs instead, and `npm ci`
+          # rejects them the moment the version does exist ("lock file's ...@ does
+          # not satisfy ...@0.3.54", release 0.3.54). Regenerating first is right in
+          # both states: real entries when the pins resolve, stubs when they do not,
+          # and `npm ci` accepts either.
+          npm install --package-lock-only --ignore-scripts
+          npm ci
+          npm publish --access public
 
   # Builds the carrick-match wasm artifact, attaches it to the release, and
   # dispatches the pin-bump PR in carrick-cloud (#325). Lives in the same
