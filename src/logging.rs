@@ -163,6 +163,10 @@ fn budget(cap: u64, existing: u64) -> u64 {
     cap.saturating_sub(existing)
 }
 
+/// The day this run's file is named for, in local time — the same clock
+/// `get_log_file_path` uses, so the roll looks at the file the upload path
+/// reads. The appender names its own files in UTC, which is carrick#789 and is
+/// neither fixed nor made worse here.
 fn today() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
