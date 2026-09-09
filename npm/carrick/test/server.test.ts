@@ -330,3 +330,26 @@ test("a client that refreshes lenses is asked to when a setting changes", async 
     "the refresh request",
   );
 });
+
+test("a lens request after a check runs no second CLI call (carrick#910)", async (t) => {
+  const workspace = makeWorkspace();
+  const argvLog = path.join(workspace.root, "argv.log");
+  const client = new LspClient({ env: fakeEnv({ CARRICK_FAKE_ARGV_LOG: argvLog }) });
+  t.after(() => {
+    client.stop();
+    workspace.cleanup();
+  });
+
+  await client.initialize(workspace.root);
+  client.open(workspace.file);
+  await client.waitFor(() => client.publishes.length >= 1, "the check the open ran");
+
+  const id = client.request("textDocument/codeLens", {
+    textDocument: { uri: `file://${workspace.file}` },
+  });
+  await client.waitFor(() => client.responses.has(id), "a lens response");
+  assert.ok((client.responses.get(id) as unknown[]).length > 0, "the lens still answers");
+  // Every surface reads one cached answer per file, and a lens arrives on every
+  // open and every save, so a second CLI call here would be a per-save cost.
+  assert.equal(fs.readFileSync(argvLog, "utf8").trim().split("\n").length, 1);
+});
