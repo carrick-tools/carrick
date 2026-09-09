@@ -1045,6 +1045,72 @@ fn query_string_start(route: &str) -> Option<usize> {
     None
 }
 
+/// A route with its plain-value `${…}` interpolations removed, so what remains
+/// is the literal text the source states about the path itself.
+///
+/// Only a placeholder that is a plain value expression is elided: no
+/// whitespace, no fallback operator, no string literal inside it. A call around
+/// a value (`${encodeURIComponent(dataset)}`) qualifies — it is a path
+/// parameter, and the normalizer reduces it to one. An un-collapsed inline
+/// fallback (`${WEBHOOK_URL ?? "http://localhost:3099"}/events`) does not, and
+/// stays judged whole: that rendering has to reach the collapse pass
+/// (carrick#399) and be canonicalized before it is a route, or one call site
+/// yields two keys.
+///
+/// Brace nesting is tracked, so a placeholder holding an object literal is
+/// consumed whole rather than ending at its first inner `}`. An unterminated
+/// `${` is left in place: the shape checks that call this reject it on their
+/// own grounds.
+fn route_skeleton(route: &str) -> String {
+    let mut skeleton = String::new();
+    let mut chars = route.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' || chars.peek() != Some(&'{') {
+            skeleton.push(c);
+            continue;
+        }
+        chars.next();
+        let mut inner = String::new();
+        let mut depth = 1usize;
+        let mut closed = false;
+        for c in chars.by_ref() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        closed = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            inner.push(c);
+        }
+        if closed && is_plain_interpolation(&inner) {
+            continue;
+        }
+        skeleton.push_str("${");
+        skeleton.push_str(&inner);
+        if closed {
+            skeleton.push('}');
+        }
+    }
+    skeleton
+}
+
+/// Whether the text inside a `${…}` is a plain value expression, and so stands
+/// for one path parameter rather than for source the scanner has yet to
+/// resolve.
+fn is_plain_interpolation(inner: &str) -> bool {
+    !inner.is_empty()
+        && !inner.chars().any(|c| c.is_whitespace())
+        && !inner.contains("||")
+        && !inner.contains("??")
+        && !inner.contains('"')
+        && !inner.contains('\'')
+}
+
 pub fn is_valid_route_shape(route: &str) -> bool {
     let route = route.trim();
     if route.is_empty() {
@@ -1066,11 +1132,22 @@ pub fn is_valid_route_shape(route: &str) -> bool {
     }
     // No leftover JavaScript-source markers that prove the value is an
     // unresolved expression (`a || b`, a call/group) rather than a route.
+    //
+    // Judged on the route's SKELETON, with every `${…}` placeholder removed. A
+    // placeholder is an interpolated value — a path parameter — and what stands
+    // inside it is the source of that value, not of the route:
+    // `/v1/ingest/${encodeURIComponent(dataset)}` is one parameter segment for
+    // exactly the reason `/v1/ingest/${dataset}` is, and the normalizer already
+    // reduces both to `:dataset` (`convert_interpolations_to_params`). Applying
+    // the check to the whole target instead dropped the call outright, so an
+    // ordinary encoder around a path value cost the row rather than the
+    // parameter's name (carrick#829).
     let is_clean = |s: &str| {
-        !s.contains("||")
-            && !s.contains('(')
-            && !s.contains(')')
-            && !s.chars().any(|c| c.is_whitespace())
+        let skeleton = route_skeleton(s);
+        !skeleton.contains("||")
+            && !skeleton.contains('(')
+            && !skeleton.contains(')')
+            && !skeleton.chars().any(|c| c.is_whitespace())
     };
 
     // Explicit `ENV_VAR:NAME:/path` form (the analyzer's canonical env-var
@@ -3319,6 +3396,12 @@ mod tests {
             "/api/v1/widgets?${params.toString()}",
             "${base}/api/v1/widgets?${params.toString()}",
             "${base}/api/v1/widgets/${id}/history?since=${encodeURIComponent(at)}",
+            // carrick#829: a call around a path VALUE is a parameter segment,
+            // exactly as `${id}` is, and the normalizer reduces both to the
+            // same `:param`. Judging it as leftover source cost the whole call
+            // — no edge, no unmatched call, no egress row — for the sake of the
+            // parameter's name.
+            "${base}/api/v1/widgets/${lookup(id)}/history",
             "https://api.example.com/v1/widgets?limit=10&cursor=${cursor}",
             "ENV_VAR:WIDGETS_API:/v1/widgets?${params.toString()}",
         ];
@@ -3330,10 +3413,9 @@ mod tests {
         }
 
         let dropped = [
-            // The call is in the PATH, so the matched path itself is
-            // unresolved. Left rejected: resolving it needs the argument, not
-            // a shape rule.
-            "${base}/api/v1/widgets/${lookup(id)}/history",
+            // A call OUTSIDE a placeholder is still leftover source: nothing
+            // says the value it returns is one segment, or a path at all.
+            "${base}/api/v1/widgets/lookup(id)/history",
             // `?` inside an interpolation separates nothing, so these are
             // judged whole and stay rejected on their whitespace.
             "${cfg?.url ?? 'x'}/p",
