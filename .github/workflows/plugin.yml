@@ -18,6 +18,10 @@ on:
       - "plugin/**"
       - "src/sidecar/**"
       - ".github/workflows/plugin.yml"
+      # release.yml packages and publishes the extension with the same command
+      # the `vsix` job below runs, and nothing else proves that command still
+      # works before a tag is cut.
+      - ".github/workflows/release.yml"
   pull_request:
     branches: [main, develop]
     paths:
@@ -25,6 +29,10 @@ on:
       - "plugin/**"
       - "src/sidecar/**"
       - ".github/workflows/plugin.yml"
+      # release.yml packages and publishes the extension with the same command
+      # the `vsix` job below runs, and nothing else proves that command still
+      # works before a tag is cut.
+      - ".github/workflows/release.yml"
 
 jobs:
   plugin:
@@ -58,10 +66,6 @@ jobs:
       - name: One channel per install
         working-directory: npm/carrick
         run: npm run selftest
-
-      - name: Build the VS Code extension
-        working-directory: plugin/vscode
-        run: npm ci && npm run build
 
       # The tarball, installed the way a user installs it. Two failures live
       # only here and in nothing above: a `.ts` the package imports, which Node
@@ -107,3 +111,51 @@ jobs:
           set -euo pipefail
           node npm/carrick/scripts/verdict-probe.mjs \
             --sidecar "$RUNNER_TEMP/probe/node_modules/carrick/sidecar"
+
+  # What `release.yml` attaches to the release and publishes to Open VSX, built
+  # on the pull request. Nothing else runs `vsce package` before a tag is cut,
+  # and the version there comes from release-please, so a packaging failure
+  # would otherwise surface after the version is already public.
+  #
+  # Keep the `vsce package` command the same as the one in release.yml.
+  vsix:
+    name: Extension package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: plugin/vscode/package-lock.json
+
+      - name: Install
+        working-directory: plugin/vscode
+        run: npm ci
+
+      # Runs vscode:prepublish, so this is also the typecheck of extension.ts.
+      # `--out dist/` does not create the directory: with none there, vsce
+      # writes a FILE called `dist`.
+      - name: Package the extension
+        working-directory: plugin/vscode
+        run: mkdir -p dist && npx --yes @vscode/vsce package --out dist/
+
+      # What an editor unpacks. The .vscodeignore lives next door to the manifest
+      # and an entry that swallowed `node_modules` or `out` would still package
+      # cleanly and install as an extension that does nothing.
+      - name: The .vsix holds what an editor needs
+        working-directory: plugin/vscode
+        run: |
+          set -euo pipefail
+          VSIX=$(ls dist/*.vsix)
+          unzip -l "$VSIX" | awk '{ print $4 }' > members.txt
+          for member in extension/package.json extension/out/extension.js \
+            extension/LICENSE.md \
+            extension/node_modules/vscode-languageclient/package.json; do
+            grep -qx "$member" members.txt || {
+              echo "::error::the .vsix is missing $member"
+              exit 1
+            }
+          done

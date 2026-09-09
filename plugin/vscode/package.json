@@ -4,7 +4,7 @@
   "description": "Shows what the other services in your workspace do with the routes and calls in the file you are editing",
   "version": "0.0.1",
   "publisher": "carrick-tools",
-  "license": "SEE LICENSE IN ../../LICENSE.md",
+  "license": "SEE LICENSE IN LICENSE.md",
   "repository": {
     "type": "git",
     "url": "https://github.com/carrick-tools/carrick.git",
@@ -36,7 +36,7 @@
   },
   "scripts": {
     "build": "tsc -p .",
-    "vscode:prepublish": "npm run build"
+    "vscode:prepublish": "node -e \"require('fs').copyFileSync('../../LICENSE.md', 'LICENSE.md')\" && npm run build"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",

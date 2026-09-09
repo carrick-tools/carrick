@@ -282,3 +282,104 @@ jobs:
     with:
       tag: ${{ needs.release-please.outputs.tag_name }}
     secrets: inherit
+
+  # The VS Code extension, packaged at the release version and published to the
+  # galleries. Its own job on purpose: the extension is a manifest that starts
+  # `carrick lsp --stdio`, so a gallery that is down, a token that expired or a
+  # namespace that was renamed has nothing to do with the CLI, and must not stop
+  # npm publishing or the Action's asset being attached.
+  #
+  # The version comes from release-please's extra-files entries for
+  # plugin/vscode/package.json, so the checked-in manifest at the release commit
+  # already carries it and `vsce package` names the file from it.
+  extension:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the version from the tag
+        id: version
+        run: |
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          echo "version=${TAG##*v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: plugin/vscode/package-lock.json
+
+      - name: Install
+        working-directory: plugin/vscode
+        run: npm ci
+
+      # The same command the pull-request job in plugin.yml runs. A change to
+      # one belongs in the other.
+      # `vsce package --out dist/` does not create the directory: it writes a
+      # FILE called `dist` when there is none, and the next run then fails on
+      # ENOTDIR.
+      - name: Package the extension
+        working-directory: plugin/vscode
+        run: mkdir -p dist && npx --yes @vscode/vsce package --out dist/
+
+      # vsce names the file from the manifest, so this is the assertion that the
+      # manifest was bumped with the tag rather than left behind.
+      - name: The .vsix carries the release version
+        id: vsix
+        run: |
+          set -euo pipefail
+          VSIX="plugin/vscode/dist/carrick-${{ steps.version.outputs.version }}.vsix"
+          if [ ! -f "$VSIX" ]; then
+            echo "::error::$VSIX was not built. plugin/vscode/package.json is at $(node -p "require('./plugin/vscode/package.json').version"), not ${{ steps.version.outputs.version }}. Check the extra-files entries in release-please-config.json."
+            ls -l plugin/vscode/dist
+            exit 1
+          fi
+          echo "vsix=$VSIX" >> "$GITHUB_OUTPUT"
+
+      # Attached first, so that a gallery rejection still leaves a .vsix that a
+      # user can install by file and the owner can upload to the Marketplace.
+      - name: Attach the .vsix to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release-please.outputs.tag_name }}
+          files: ${{ steps.vsix.outputs.vsix }}
+          # Matches action-tarball: this release is the latest one, and `false`
+          # here would take that flag off whichever job wrote it first.
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Open VSX is the gallery Cursor, Windsurf and VSCodium resolve from, so
+      # it reaches the editor-hosted agents this extension exists for.
+      # --skip-duplicate so that re-running a release job is not an error.
+      - name: Publish to Open VSX
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OVSX_PAT:-}" ]; then
+            echo "::error::OVSX_PAT is not set, so the extension cannot be published to Open VSX."
+            exit 1
+          fi
+          npx --yes ovsx publish --skip-duplicate "${{ steps.vsix.outputs.vsix }}"
+
+      # The Marketplace needs an Azure DevOps token, which needs a subscription
+      # on the publisher's account, so there is no VSCE_PAT yet. Until there is,
+      # the .vsix attached to the release above is uploaded by hand on the
+      # publisher page. Skipped rather than failed: no token is the expected
+      # state, not a broken release.
+      - name: Publish to the VS Code Marketplace
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VSCE_PAT:-}" ]; then
+            echo "::notice::VSCE_PAT is not set, so the Marketplace publish was skipped. Upload ${{ steps.vsix.outputs.vsix }} from the release page on the publisher's manage page."
+            exit 0
+          fi
+          npx --yes @vscode/vsce publish --skip-duplicate --packagePath "${{ steps.vsix.outputs.vsix }}"

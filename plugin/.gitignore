@@ -2,3 +2,6 @@ node_modules/
 *.log
 vscode/out/
 vscode/*.vsix
+vscode/dist/
+# copied in by vscode:prepublish so the packaged extension carries the licence
+vscode/LICENSE.md
