@@ -144,4 +144,6 @@ Tests run against fixture payloads under `npm/carrick/test/fixtures/` and a fake
 CLI (`npm/carrick/test/fake-carrick.mjs`), so they need no binary and no index.
 `.github/workflows/plugin.yml` runs all three commands plus the VS Code build on
 every pull request that touches either directory. The manual smokes, which need
-a real binary, are in [SMOKE.md](./SMOKE.md).
+a real binary, are in [SMOKE.md](./SMOKE.md), and the full list of what the
+delivery surface has to be proven on, platform by platform and editor by editor,
+is in [TEST-PLAN.md](./TEST-PLAN.md).
