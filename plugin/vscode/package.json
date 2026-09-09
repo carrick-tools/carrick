@@ -2,7 +2,7 @@
   "name": "carrick",
   "displayName": "Carrick",
   "description": "Shows what the other services in your workspace do with the routes and calls in the file you are editing",
-  "version": "0.3.57",
+  "version": "0.3.58",
   "publisher": "carrick-tools",
   "license": "SEE LICENSE IN LICENSE.md",
   "repository": {
