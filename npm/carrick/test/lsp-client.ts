@@ -24,6 +24,8 @@ export class LspClient {
   /** Milliseconds since the last publish arrived, for settling. */
   private lastPublishAt = 0;
   readonly publishes: Publish[] = [];
+  /** Every notification that is not a diagnostic publish, e.g. carrick/boundary. */
+  readonly notifications: Array<{ method: string; params: unknown }> = [];
   readonly responses = new Map<number, unknown>();
   stderr = "";
   exited: { code: number | null; signal: NodeJS.Signals | null } | null = null;
@@ -76,6 +78,8 @@ export class LspClient {
       if (message.method === "textDocument/publishDiagnostics" && message.params) {
         this.publishes.push(message.params);
         this.lastPublishAt = Date.now();
+      } else if (message.method) {
+        this.notifications.push({ method: message.method, params: message.params });
       } else if (typeof message.id === "number") {
         this.responses.set(message.id, message.result);
       }
@@ -98,7 +102,11 @@ export class LspClient {
     return id;
   }
 
-  async initialize(rootDir: string, clientName = "Claude Code"): Promise<void> {
+  async initialize(
+    rootDir: string,
+    clientName = "Claude Code",
+    initializationOptions?: Record<string, unknown>,
+  ): Promise<void> {
     const uri = pathToFileURL(rootDir).toString();
     const id = this.request("initialize", {
       processId: process.pid,
@@ -107,6 +115,7 @@ export class LspClient {
       rootUri: uri,
       rootPath: rootDir,
       capabilities: {},
+      ...(initializationOptions ? { initializationOptions } : {}),
     });
     await this.waitFor(() => this.responses.has(id), "initialize response");
     this.notify("initialized", {});
@@ -121,6 +130,11 @@ export class LspClient {
         text: "",
       },
     });
+  }
+
+  /** A setting changed mid-session, the way VS Code forwards one. */
+  configure(carrick: Record<string, unknown>): void {
+    this.notify("workspace/didChangeConfiguration", { settings: { carrick } });
   }
 
   change(file: string, version: number): void {

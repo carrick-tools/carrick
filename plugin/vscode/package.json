@@ -30,6 +30,16 @@
           "type": "string",
           "default": "",
           "description": "Path to the carrick CLI. Empty means the carrick on PATH (npm install -g carrick)."
+        },
+        "carrick.diagnostics": {
+          "type": "boolean",
+          "default": true,
+          "description": "Publish Carrick's verdicts in the Problems panel."
+        },
+        "carrick.boundary": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show what the scan could not classify, in the status bar. Your agent's own channel states it whatever this is set to."
         }
       }
     }

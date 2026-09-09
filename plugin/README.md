@@ -111,6 +111,52 @@ Codex CLI, aider and anything else without hooks or an LSP client get the CLI
 (`carrick check <file>`) and the pull request check. They read the same facts on
 demand; nothing pushes into their context.
 
+## Settings, one per surface
+
+Every surface can be turned off on its own, and turning one off leaves the
+others exactly as they were. In VS Code they are settings; in any other client
+they are `initializationOptions`, under the same names without the `carrick.`
+prefix, and a `workspace/didChangeConfiguration` carrying
+`{ "settings": { "carrick": { ... } } }` changes one mid-session. A surface
+turned off loses its rows on the next publish, not at the next restart.
+
+| Setting | Default | What it turns off |
+|---|---|---|
+| `carrick.diagnostics` | on | The verdicts in the Problems panel, at their own site and at each counterpart |
+| `carrick.boundary` | on | The boundary: the status bar item in VS Code, the file-level row in a client without one |
+| `carrick.binary` | the `carrick` on PATH | Not a surface: which CLI to run |
+
+`CARRICK_CHANNEL=off` stays the blunt instrument and silences delivery
+entirely.
+
+**The boundary is never dropped, and after carrick#879 it is not always in the
+Problems panel.** It says what a scan could not classify, which is what makes an
+empty answer readable, so the agent's channel always carries it. For a person it
+is one sentence about a service rather than a finding about a file, so a client
+that says it has somewhere workspace-shaped to put it — VS Code does, with
+`boundarySurface` in its `initializationOptions`, and renders it as a status bar
+item with the lines as its tooltip — gets it there instead of on every
+TypeScript file it opens. A client that says nothing keeps the file-level
+Information row, and `carrick.boundary` turns that off.
+
+## The noise budget
+
+What the Problems panel is allowed to hold, per check:
+
+- Ten findings per file, problems first and then by line, with an eleventh row
+  naming the remainder and the `carrick check` that prints it. Rows mirrored
+  from another file's finding count against the receiving file's ten.
+- Thirty rows across the whole check, with one more row naming what it did not
+  show.
+- One row per counterpart file for one finding, whatever the number of sites in
+  it; the other lines are named in that row and every site is still a clickable
+  location.
+- Error only where a fact row's verdict claims something, is not compatible, and
+  the other side is on this disk. Warning for candidates, for rows that claim
+  nothing, and for a routing finding whose counterpart this machine cannot open.
+  Hint is never used, because it renders as a faint underline to a human and as
+  nothing at all to an agent.
+
 ## Environment
 
 | Variable | Default | What it does |

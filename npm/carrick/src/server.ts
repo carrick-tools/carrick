@@ -27,10 +27,13 @@
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { check } from "./cli.ts";
+import type { CheckResult } from "./contract.ts";
 import { resolveChannel, type ChannelChoice } from "./channel.ts";
 import { toDiagnostics, type Diagnostic } from "./diagnostics.ts";
 import { createLogger } from "./log.ts";
 import { resolveRoot, rootNote, type RootChoice } from "./root.ts";
+import { boundaryFor } from "./render.ts";
+import { DEFAULT_SURFACES, readSurfaces, type Surfaces } from "./surfaces.ts";
 
 const NAME = "carrick";
 const VERSION = "0.0.1";
@@ -58,6 +61,8 @@ let root = process.cwd();
 let rootChoice: RootChoice | null = null;
 let channel: ChannelChoice = resolveChannel({ hooksInstalled: false });
 let clientName = "an unnamed client";
+/** One off switch per surface (carrick#879), as the client stated them. */
+let surfaces: Surfaces = DEFAULT_SURFACES;
 
 /** What each checked file last published to, so a clear is scoped to it. */
 const publishedBy = new Map<string, Set<string>>();
@@ -92,7 +97,7 @@ async function checkAndPublish(absFile: string): Promise<void> {
     log("check", relFile, "->", outcome.result.error);
     return;
   }
-  const byFile = toDiagnostics(outcome.result, root, relFile);
+  const byFile = toDiagnostics(outcome.result, root, relFile, { surfaces });
   log(
     `check ${relFile} -> ${[...byFile.values()].reduce((n, list) => n + list.length, 0)} diagnostic(s) across ${byFile.size} file(s) in ${outcome.ms}ms`,
   );
@@ -106,6 +111,31 @@ async function checkAndPublish(absFile: string): Promise<void> {
     new Set([...byFile.keys()].filter((file) => (byFile.get(file) ?? []).length > 0)),
   );
   for (const [file, diagnostics] of byFile) publish(file, diagnostics);
+  publishBoundary(outcome.result);
+}
+
+/**
+ * The boundary, for a client that has somewhere workspace-shaped to put it.
+ *
+ * carrick#879 moved it off the per-file Problems list for those clients, and
+ * this is where it moved TO: one notification per check carrying the same lines
+ * the diagnostic used to, which the VS Code extension renders as a status bar
+ * item and its tooltip. A client that declared no such surface gets the
+ * Information diagnostic instead and this notification as well, which costs it
+ * nothing: an unknown notification is ignored by definition.
+ */
+function publishBoundary(result: CheckResult): void {
+  if (!surfaces.boundary) return;
+  const lines = boundaryFor(result);
+  if (!lines.length) return;
+  send({
+    method: "carrick/boundary",
+    params: {
+      service: result.service ?? null,
+      indexCommit: result.index_commit ?? null,
+      lines,
+    },
+  });
 }
 
 function scheduleCheck(absFile: string, debounceMs: number): void {
@@ -152,6 +182,7 @@ function onInitialize(id: number | string | undefined, params: Record<string, un
   }
   const info = params["clientInfo"] as { name?: string } | undefined;
   if (info?.name) clientName = info.name;
+  surfaces = readSurfaces(params["initializationOptions"]);
 
   rootChoice = resolveRoot({
     clientRoot,
@@ -215,6 +246,14 @@ function handle(message: Message): void {
       scheduleCheck(file, method === "textDocument/didChange" ? DEBOUNCE_MS : 0);
       return;
     }
+    case "workspace/didChangeConfiguration": {
+      // A switch turned off takes its rows away on the next publish, not at the
+      // next restart, so every file this server has flagged is re-checked here.
+      surfaces = readSurfaces(params, surfaces);
+      log(`surfaces: ${JSON.stringify(surfaces)}`);
+      for (const relFile of publishedBy.keys()) scheduleCheck(path.resolve(root, relFile), 0);
+      return;
+    }
     case "textDocument/diagnostic": {
       // A pull-only client still gets an answer, and the same one.
       const file = pathOf(params);
@@ -225,7 +264,9 @@ function handle(message: Message): void {
       void enqueue(async () => {
         const outcome = await check(relative(file), { cwd: root });
         const items = outcome.result
-          ? (toDiagnostics(outcome.result, root, relative(file)).get(path.resolve(file)) ?? [])
+          ? (toDiagnostics(outcome.result, root, relative(file), { surfaces }).get(
+              path.resolve(file),
+            ) ?? [])
           : [];
         send({ id, result: { kind: "full", items } });
       });
