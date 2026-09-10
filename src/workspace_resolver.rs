@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-use crate::packages::MANIFEST_SKIP_DIRS;
+use crate::packages::{MANIFEST_SKIP_DIRS, deno_workspace_manifest_paths, read_manifest};
 
 /// Source extensions a specifier may resolve to, in the order they are tried.
 /// TypeScript first: in a repo that has both, the `.ts` file is the source and
@@ -100,18 +100,13 @@ impl WorkspaceIndex {
         let mut internal_packages: BTreeMap<String, InternalPackage> = BTreeMap::new();
 
         for manifest in manifest_paths(repo_root) {
-            let Ok(text) = std::fs::read_to_string(&manifest) else {
+            let Ok(facts) = read_manifest(&manifest) else {
                 continue;
             };
-            let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
-                continue;
-            };
-            for field in ["dependencies", "peerDependencies", "optionalDependencies"] {
-                if let Some(map) = json.get(field).and_then(|v| v.as_object()) {
-                    declared.extend(map.keys().cloned());
-                }
-            }
-            let Some(name) = json.get("name").and_then(|n| n.as_str()) else {
+            declared.extend(facts.package.dependencies.keys().cloned());
+            declared.extend(facts.package.peer_dependencies.keys().cloned());
+            declared.extend(facts.package.optional_dependencies.keys().cloned());
+            let Some(name) = facts.package.name.as_deref() else {
                 continue;
             };
             internal_names.insert(name.to_string());
@@ -122,11 +117,8 @@ impl WorkspaceIndex {
             else {
                 continue;
             };
-            let main = json
-                .get("main")
-                .and_then(|m| m.as_str())
-                .map(str::to_string);
-            let exports = json.get("exports").cloned();
+            let main = facts.main;
+            let exports = facts.exports;
             // Two directories can declare the same package name — a vendored
             // copy, a fork kept alongside the original. Keeping the
             // lexicographically smallest directory makes the choice a property
@@ -377,7 +369,7 @@ fn is_declaration_file(path: &str) -> bool {
         .any(|suffix| path.ends_with(suffix))
 }
 
-/// Every `package.json` under `repo_root`, sorted, skipping dependency installs
+/// Every package or Deno manifest under `repo_root`, sorted, skipping dependency installs
 /// and build output. Sorted so the duplicate-name tiebreak in
 /// [`WorkspaceIndex::build`] sees a stable sequence whatever the filesystem
 /// hands back.
@@ -398,7 +390,12 @@ fn manifest_paths(repo_root: &Path) -> Vec<PathBuf> {
         .filter(|e| e.file_type().is_file() && e.file_name() == "package.json")
         .map(|e| e.path().to_path_buf())
         .collect();
+    match deno_workspace_manifest_paths(repo_root) {
+        Ok(deno_manifests) => manifests.extend(deno_manifests),
+        Err(error) => tracing::warn!("Ignoring Deno workspace manifests: {}", error),
+    }
     manifests.sort();
+    manifests.dedup();
     manifests
 }
 
@@ -713,5 +710,56 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(repo.path().join("package.json"), r#"{"name":"bare"}"#).unwrap();
         assert!(!WorkspaceIndex::build(repo.path()).has_external_packages());
+    }
+
+    #[test]
+    fn deno_manifests_supply_internal_exports_and_registry_identities() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("packages/core")).unwrap();
+        std::fs::create_dir_all(root.join("packages/unlisted")).unwrap();
+        std::fs::write(
+            root.join("deno.jsonc"),
+            r#"{
+            "name":"root", "workspace":["./packages/core"],
+            "imports":{"client":"npm:@vendor/client@^2.0.0/http"}
+        }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("packages/core/deno.json"),
+            r#"{
+            "name":"@local/core", "exports":{".":"./mod.ts"}
+        }"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("packages/core/mod.ts"), "export const value = 1;").unwrap();
+        std::fs::write(
+            root.join("packages/unlisted/deno.json"),
+            r#"{"name":"@local/unlisted","exports":"./mod.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("packages/unlisted/mod.ts"),
+            "export const hidden = 1;",
+        )
+        .unwrap();
+
+        let index = WorkspaceIndex::build(root);
+        assert_eq!(
+            index.resolve(Path::new("app.ts"), "@local/core"),
+            Resolution::Internal(PathBuf::from("packages/core/mod.ts"))
+        );
+        assert_eq!(
+            index.resolve(Path::new("app.ts"), "@vendor/client/http"),
+            Resolution::External {
+                package: "@vendor/client".into(),
+                subpath: Some("http".into())
+            }
+        );
+        assert_eq!(
+            index.resolve(Path::new("app.ts"), "@local/unlisted"),
+            Resolution::Unresolved
+        );
     }
 }

@@ -240,7 +240,7 @@ fn service_root(repo_root: &Path, service: &crate::config::Config) -> PathBuf {
     }
 }
 
-/// A service's own `package.json`, if it has one.
+/// A service's own package or Deno manifest, if it has one.
 ///
 /// The file at the service root and nowhere else: a scan must pick the same
 /// manifest on every host, and the root is the only one that is unambiguously
@@ -248,8 +248,11 @@ fn service_root(repo_root: &Path, service: &crate::config::Config) -> PathBuf {
 /// walking the whole service tree to reach a path it already knew, once per
 /// service (carrick#748).
 pub fn find_service_manifest(repo_path: &Path, service: &crate::config::Config) -> Option<PathBuf> {
-    let manifest = service_root(repo_path, service).join("package.json");
-    manifest.is_file().then_some(manifest)
+    let root = service_root(repo_path, service);
+    ["package.json", "deno.json", "deno.jsonc"]
+        .into_iter()
+        .map(|name| root.join(name))
+        .find(|manifest| manifest.is_file())
 }
 
 /// Find JS/TS files for a single service, scoped to its `directory` plus any
@@ -295,6 +298,29 @@ mod tests {
     use super::*;
     use std::fs::{self, File};
     use tempfile::tempdir;
+
+    #[test]
+    fn service_manifest_accepts_deno_and_prefers_package_json() {
+        let repo = tempdir().unwrap();
+        let root = repo.path();
+        File::create(root.join("deno.jsonc")).unwrap();
+        assert_eq!(
+            find_service_manifest(root, &crate::config::Config::default()),
+            Some(root.join("deno.jsonc"))
+        );
+
+        File::create(root.join("deno.json")).unwrap();
+        assert_eq!(
+            find_service_manifest(root, &crate::config::Config::default()),
+            Some(root.join("deno.json"))
+        );
+
+        File::create(root.join("package.json")).unwrap();
+        assert_eq!(
+            find_service_manifest(root, &crate::config::Config::default()),
+            Some(root.join("package.json"))
+        );
+    }
 
     #[test]
     fn find_files_skips_test_sources() {
