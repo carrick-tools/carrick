@@ -212,9 +212,10 @@ test("the identity comes from the GitHub CLI, or a token, or init stops", () => 
   assert.match(none.problem ?? "", /GITHUB_TOKEN/);
 });
 
-// The gallery an id resolves against is the whole of this: the extension is on
-// Open VSX, which Cursor and Windsurf read, and not on the VS Code Marketplace,
-// which is the only place `code --install-extension` looks (carrick#915).
+// The gallery an id resolves against is that editor's own, and the three
+// editors named below read three different ones. The extension is published to
+// each of those three, so an id is only ever printed for an editor whose
+// gallery carries it (carrick#915).
 test("no editor is handed an id for a gallery it does not read", () => {
   const everyEditor = editorLines(() => true);
   for (const line of everyEditor) {
@@ -222,20 +223,25 @@ test("no editor is handed an id for a gallery it does not read", () => {
     if (!install) continue;
     const [, editor, target] = install;
     assert.ok(
-      ["cursor", "windsurf"].includes(editor!) || target!.endsWith(".vsix"),
-      `${editor} resolves an id against a gallery this extension does not publish to: ${line}`,
+      ["code", "cursor", "windsurf"].includes(editor!),
+      `${editor} resolves an id against a gallery this extension is not published to: ${line}`,
     );
+    assert.equal(target, "carrick-tools.carrick");
   }
-  assert.doesNotMatch(everyEditor.join("\n"), /install (it )?from the Marketplace/i);
+  // Every editor answers in a heading and a command a user can copy, so a block
+  // that has grown prose is a block that is explaining something away.
+  assert.equal(everyEditor.length, 6);
 });
 
-test("VS Code is pointed at the .vsix, never at a command that finds nothing", () => {
+test("VS Code gets the gallery command like the others", () => {
   const code = editorLines((command) => command === "code");
-  // The prose names `code --install-extension` to say it will not work, so what
-  // must not exist is a line a user can copy, which is an indented command.
-  for (const line of code) assert.doesNotMatch(line, /^\s*\S+ --install-extension/);
-  assert.match(code.join("\n"), /not on the VS Code Marketplace/);
-  assert.match(code.join("\n"), /https:\/\/docs\.carrick\.tools\/editor/);
+  assert.deepEqual(code, [
+    "  VS Code, for diagnostics in the Problems panel:",
+    "    code --install-extension carrick-tools.carrick",
+  ]);
+  // A pointer somewhere else is what a missing publish reads like, and there is
+  // no missing publish.
+  assert.doesNotMatch(code.join("\n"), /\.vsix|docs\.carrick\.tools|Marketplace/);
 });
 
 test("Cursor and Windsurf get the gallery command, which is one they can run", () => {
@@ -249,11 +255,11 @@ test("Cursor and Windsurf get the gallery command, which is one they can run", (
     /windsurf --install-extension carrick-tools\.carrick/,
   );
 
-  // Both editors on one machine is two blocks, and the VS Code text stays out
-  // of the two that can install from a gallery.
+  // Both editors on one machine is two blocks, and an editor that is not on the
+  // machine is not named.
   const forks = editorLines((command) => command === "cursor" || command === "windsurf");
   assert.equal(forks.length, 4);
-  assert.doesNotMatch(forks.join("\n"), /Marketplace/);
+  assert.doesNotMatch(forks.join("\n"), /VS Code|code --install-extension/);
 });
 
 test("an editor we have not tested gets the server's command and no claim", () => {

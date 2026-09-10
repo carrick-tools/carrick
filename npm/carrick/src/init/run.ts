@@ -23,7 +23,6 @@ const WORKSPACE_FILE = "carrick-workspace.json";
 const SETTINGS_FILE = path.join(".claude", "settings.json");
 const MCP_LINE = "claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp";
 const EXTENSION_ID = "carrick-tools.carrick";
-const EDITOR_DOCS = "https://docs.carrick.tools/editor";
 
 export type InitOptions = {
   workspace: string;
@@ -108,34 +107,28 @@ function onPath(command: string): boolean {
 }
 
 /**
- * The editor lines, which differ per editor because the galleries do.
+ * The editor lines, one line per editor that is on the machine.
  *
- * `release.yml` publishes the extension to Open VSX, which is the gallery
- * Cursor and Windsurf resolve an id against, so on those two a gallery install
- * is a working command. `code --install-extension` resolves against the VS Code
- * Marketplace instead, and the Marketplace publish waits on a token nobody
- * holds, so that command finds nothing and is never printed (carrick#915). Any
- * other editor gets the server's command and no claim about the editor: the
- * per-editor results table in `plugin/TEST-PLAN.md` section 6 is still empty.
+ * `--install-extension <id>` resolves the id against that editor's own gallery,
+ * and the three editors below read three different ones: VS Code the VS Code
+ * Marketplace, Cursor and Windsurf each their own. The extension is published
+ * to all three, so the id is a command every one of them can run
+ * (carrick#915). Any other editor gets the server's command and no claim about
+ * the editor: the per-editor results table in `plugin/TEST-PLAN.md` section 6
+ * is still empty.
  *
  * `onPath` is injected so a test can state each machine.
  */
 export function editorLines(onPath: (command: string) => boolean): string[] {
   const lines: string[] = [];
   for (const [command, editor] of [
+    ["code", "VS Code"],
     ["cursor", "Cursor"],
     ["windsurf", "Windsurf"],
   ] as const) {
     if (!onPath(command)) continue;
     lines.push(`  ${editor}, for diagnostics in the Problems panel:`);
     lines.push(`    ${command} --install-extension ${EXTENSION_ID}`);
-  }
-  if (onPath("code")) {
-    lines.push("  VS Code, for diagnostics in the Problems panel:");
-    lines.push(
-      "    The extension is not on the VS Code Marketplace, so `code --install-extension`",
-    );
-    lines.push(`    cannot find it. Install the .vsix from ${EDITOR_DOCS}`);
   }
   if (lines.length === 0) {
     lines.push("  Any editor with an LSP client starts the server itself as `carrick lsp --stdio`.");
