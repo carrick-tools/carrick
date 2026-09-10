@@ -40,6 +40,7 @@ pub mod receiver_type;
 pub mod scan_health;
 pub mod sdk_edges;
 pub mod sdk_surface;
+pub mod service_derivation;
 pub mod services;
 pub mod signature_pass;
 pub mod socket_io;

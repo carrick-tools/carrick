@@ -131,6 +131,7 @@ jobs:
           --test object_export_surface_test
           --test receiver_type_classification_test
           --test route_request_anchor_test
+          --test service_derivation_test
           --test socket_class_field_test
           --test socket_extraction_test
           --test socket_namespace_test
