@@ -165,6 +165,11 @@ jobs:
       - name: Run pub/sub wrapper type-capture test
         run: cargo test --test pubsub_wrapper_type_capture_test --verbose
 
+      - name: Run Deno scan-root guard tests
+        env:
+          CARRICK_MOCK_ALL: "1"
+        run: cargo test --bin carrick deno --verbose
+
       - name: Run library tests
         run: cargo test --lib --verbose
 

@@ -207,18 +207,19 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    // A Deno-native project (deno.json/deno.jsonc, no package.json anywhere)
+    // A Deno-native scan root (deno.json/deno.jsonc, no root package.json)
     // would otherwise produce a silently thin scan: dependency discovery,
     // framework detection, and type resolution all start from a package.json
     // manifest.
     if is_deno_native_project(Path::new(&args.repo_path)) {
         return Err(format!(
             "'{}' looks like a Deno-native project (deno.json/deno.jsonc present, no package.json \
-             anywhere in the tree). Carrick can't scan Deno-native projects yet — \
+             at the scan root). Carrick can't scan Deno-native projects yet: \
              dependency discovery, framework detection, and type resolution all start \
-             from a package.json. A project that also maintains a package.json \
-             (npm-compatibility mode) may scan partially. If Deno support matters to \
-             you, please open an issue: https://github.com/carrick-tools/carrick/issues",
+             from a package.json. Nested Node packages do not configure the Deno root. \
+             A project that also maintains a package.json at the scan root \
+             (npm-compatibility mode) may scan partially. Deno support is tracked at \
+             https://github.com/carrick-tools/carrick/issues/934",
             args.repo_path
         )
         .into());
@@ -400,32 +401,13 @@ fn discover_sidecar_path() -> Option<PathBuf> {
     None
 }
 
-/// True when the scan target is a Deno-native project: a `deno.json` /
-/// `deno.jsonc` at the root and no `package.json` anywhere in the tree
-/// (dependency/build directories excluded). A repo that keeps both manifests
-/// (Deno's npm-compatibility mode) is not flagged — it may scan partially.
+/// A root Deno manifest needs a co-located Node manifest for the existing
+/// npm-compatibility path. Descendant manifests describe separate packages,
+/// including vendored workspaces, and cannot configure the Deno scan root.
 fn is_deno_native_project(repo_root: &Path) -> bool {
     let has_deno_config =
         repo_root.join("deno.json").is_file() || repo_root.join("deno.jsonc").is_file();
-    if !has_deno_config {
-        return false;
-    }
-
-    // depth() == 0 keeps the scan root traversable even when its own basename
-    // matches a skip dir (a service directory named `build` is still a repo).
-    let walker = walkdir::WalkDir::new(repo_root)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|e| {
-            e.depth() == 0
-                || !(e.file_type().is_dir()
-                    && e.file_name()
-                        .to_str()
-                        .is_some_and(|n| packages::MANIFEST_SKIP_DIRS.contains(&n)))
-        });
-    !walker
-        .flatten()
-        .any(|entry| entry.file_type().is_file() && entry.file_name() == "package.json")
+    has_deno_config && !repo_root.join("package.json").is_file()
 }
 
 /// Get a path relative to the executable location
@@ -558,17 +540,70 @@ mod tests {
     }
 
     #[test]
-    fn deno_with_nested_package_json_is_not_flagged() {
-        // A workspace member's manifest anywhere in the tree is enough.
+    fn deno_with_nested_package_json_is_flagged() {
+        // A nested Node package does not describe the Deno scan root.
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(repo.path().join("deno.json"), "{}").unwrap();
         std::fs::create_dir_all(repo.path().join("packages/api")).unwrap();
         std::fs::write(repo.path().join("packages/api/package.json"), "{}").unwrap();
-        assert!(!is_deno_native_project(repo.path()));
+        assert!(is_deno_native_project(repo.path()));
     }
 
     #[test]
-    fn package_json_inside_node_modules_does_not_count() {
+    fn deno_workspace_with_vendored_node_subworkspace_is_flagged() {
+        for config_name in ["deno.json", "deno.jsonc"] {
+            let repo = tempfile::tempdir().unwrap();
+            std::fs::write(
+                repo.path().join(config_name),
+                r#"{"workspace": ["./services/api", "./services/worker"]}"#,
+            )
+            .unwrap();
+            for member in ["services/api", "services/worker"] {
+                std::fs::create_dir_all(repo.path().join(member)).unwrap();
+                std::fs::write(repo.path().join(member).join(config_name), "{}").unwrap();
+            }
+            for package in [
+                "vendor/frontend",
+                "vendor/frontend/packages/client",
+                "tools",
+            ] {
+                std::fs::create_dir_all(repo.path().join(package)).unwrap();
+                std::fs::write(repo.path().join(package).join("package.json"), "{}").unwrap();
+            }
+            std::fs::write(
+                repo.path().join("vendor/frontend/pnpm-workspace.yaml"),
+                "packages:\n  - packages/*\n",
+            )
+            .unwrap();
+            assert!(is_deno_native_project(repo.path()), "{config_name}");
+            // Scanning the Node subtree itself remains supported.
+            assert!(!is_deno_native_project(
+                &repo.path().join("vendor/frontend")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn deno_with_generated_config_is_refused_before_analysis() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("deno.jsonc"), "{ // Deno config\n}").unwrap();
+        std::fs::write(repo.path().join("carrick.json"), "{}").unwrap();
+        std::fs::write(repo.path().join("tsconfig.json"), "{}").unwrap();
+        std::fs::create_dir_all(repo.path().join("tools")).unwrap();
+        std::fs::write(repo.path().join("tools/package.json"), "{}").unwrap();
+        let error = run_analysis(CliArgs::parse_from(&args(&[repo.path().to_str().unwrap()])))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("no package.json at the scan root"),
+            "{error}"
+        );
+        assert!(error.contains("Nested Node packages"), "{error}");
+    }
+
+    #[test]
+    fn deno_package_json_inside_node_modules_does_not_count() {
         // A vendored dependency's manifest is not the project's manifest.
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(repo.path().join("deno.json"), "{}").unwrap();
@@ -578,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn package_json_inside_build_output_does_not_count() {
+    fn deno_package_json_inside_build_output_does_not_count() {
         // Build output isn't the project's own manifest — every skip dir
         // beyond node_modules behaves the same way.
         let repo = tempfile::tempdir().unwrap();
@@ -591,19 +626,18 @@ mod tests {
     }
 
     #[test]
-    fn scan_root_named_like_skip_dir_is_still_walked() {
-        // A repo directory legitimately named `build` must not be skipped as
-        // its own walk root: its nested package.json still counts.
+    fn deno_scan_root_named_like_skip_dir_is_flagged() {
+        // The root manifest determines the guard even for a directory named build.
         let parent = tempfile::tempdir().unwrap();
         let repo = parent.path().join("build");
         std::fs::create_dir_all(repo.join("packages/api")).unwrap();
         std::fs::write(repo.join("deno.json"), "{}").unwrap();
         std::fs::write(repo.join("packages/api/package.json"), "{}").unwrap();
-        assert!(!is_deno_native_project(&repo));
+        assert!(is_deno_native_project(&repo));
     }
 
     #[test]
-    fn plain_node_project_is_not_flagged() {
+    fn deno_guard_allows_plain_node_project() {
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(repo.path().join("package.json"), "{}").unwrap();
         assert!(!is_deno_native_project(repo.path()));
