@@ -1289,6 +1289,7 @@ impl TypeSidecar {
         service_name: &str,
         anchors: &[CaptureAnchor],
         out_dir: &str,
+        tsconfig_path: Option<&str>,
     ) -> Result<CaptureV2Result, SidecarError> {
         self.ensure_ready()?;
 
@@ -1305,7 +1306,7 @@ impl TypeSidecar {
             service_name: service_name.to_string(),
             anchors: anchors.to_vec(),
             out_dir: out_dir.to_string(),
-            tsconfig_path: None,
+            tsconfig_path: tsconfig_path.map(str::to_owned),
         };
 
         self.send_request(&request)?;

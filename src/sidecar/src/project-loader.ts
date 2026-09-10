@@ -14,6 +14,7 @@ import { Project, type CompilerOptions } from 'ts-morph';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type { TsconfigSnapshot, PinnedDependencySnapshot } from './types.js';
+import { DenoProject, findDenoConfig } from './capture/index.js';
 
 /**
  * Options for ProjectLoader construction
@@ -207,8 +208,28 @@ export class ProjectLoader {
       // Priority 2: Use tsconfig.json file
       else {
         const tsconfigPath = this.findTsConfig();
+        const denoConfig = findDenoConfig(this.repoRoot, this.tsconfigPath);
 
-        if (tsconfigPath) {
+        if (denoConfig) {
+          this.log(`Project will load with Deno config: ${denoConfig.configPath}`);
+          this.buildProject = () => {
+            const deno = new DenoProject(denoConfig, this.repoRoot);
+            const project = new Project({
+              compilerOptions: deno.parsed.options as CompilerOptions,
+              skipAddingFilesFromTsConfig: true,
+              resolutionHost: (host, getOptions) => ({
+                resolveModuleNames: (names, from) => names.map(name =>
+                  deno.resolve(name, from, getOptions() as import('typescript').CompilerOptions, host)),
+                resolveTypeReferenceDirectives: (names, from) => names.map(name =>
+                  deno.resolveTypeReference(typeof name === 'string' ? name : name.fileName, from,
+                    getOptions() as import('typescript').CompilerOptions, host)),
+              }),
+            });
+            for (const file of deno.parsed.fileNames) project.addSourceFileAtPath(file);
+            for (const diagnostic of deno.diagnostics) this.logError(diagnostic);
+            return project;
+          };
+        } else if (tsconfigPath) {
           this.log(`Project will load with tsconfig: ${tsconfigPath}`);
           this.buildProject = () =>
             new Project({

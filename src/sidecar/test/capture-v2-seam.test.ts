@@ -91,11 +91,11 @@ describe('capture bundle seam (pinned decision 11a)', () => {
       const base = path.basename(file);
       for (const spec of importsOf(file)) {
         if (!spec.includes('capture/')) continue;
-        if (base === 'index.ts') {
+        if (base === 'index.ts' || base === 'project-loader.ts') {
           assert.strictEqual(
             spec,
             './capture/index.js',
-            `index.ts must use only the captureStub door, saw '${spec}'`
+            `${base} must use only the capture entry point (shared Deno resolution), saw '${spec}'`
           );
         } else if (base === 'types.ts') {
           assert.strictEqual(

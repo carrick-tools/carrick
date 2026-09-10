@@ -3442,7 +3442,14 @@ fn run_capture_for_service(
         &type_resolution.explicit_manifest,
         &type_resolution.inferred_types,
     );
-    match type_compat_v2::run_capture(sidecar, repo_path, &service_id, &anchors, &backfill_texts) {
+    match type_compat_v2::run_capture(
+        sidecar,
+        repo_path,
+        &service_id,
+        &anchors,
+        &backfill_texts,
+        config.tsconfig.as_deref(),
+    ) {
         Some((stub_dir, artifact)) => {
             cloud_data.capture_stub = Some(artifact);
             Some(stub_dir)
