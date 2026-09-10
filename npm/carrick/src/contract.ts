@@ -35,6 +35,8 @@ export type Boundary = {
 };
 
 export type Counterpart = {
+  /** Hosted-only GitHub owner/repo; it never names a local navigation target. */
+  remote?: string | null;
   /**
    * `peer` is a shared external contract: both sides call the same third
    * party and neither serves the other, so it gets no producer/consumer word.

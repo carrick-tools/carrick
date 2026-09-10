@@ -5,15 +5,15 @@
 //!
 //! 1. **Per repo, isolated.** Each repo is scanned on its own with the
 //!    cross-repo download forced empty, so no sibling's data reaches a repo's
-//!    own scan, and its index blob is written to `.carrick/repos/`. This is
+//!    own scan. Hosted answers are handed in only as previous_data. This is
 //!    the slow phase, and it is where `refresh` does its work for one service.
 //! 2. **Join.** One more run reads every blob back, builds the analyzer over
 //!    all of them, runs the type check, and writes what it found to
-//!    `.carrick/join.json`.
+//!    a temporary join file inside the current build directory.
 //!
 //! The indexer then folds the blobs (boundaries, commits) and the join
-//! (operations, edges, verdicts) into `.carrick/index.json`, which is the only
-//! file the read-only commands open.
+//! (operations, edges, verdicts) into `.carrick/index.json`. Read-only commands
+//! consume it after checking the local credential identity.
 //!
 //! Subprocesses rather than in-process calls for the same reason the harness
 //! uses them: a scan keeps process-global state (the health counters, the
@@ -44,42 +44,193 @@ pub struct IndexOutcome {
 /// Index every repo in the workspace, or re-index the one holding `only`.
 pub fn run(workspace: &Workspace, only: Option<&str>) -> Result<IndexOutcome, String> {
     let started = Instant::now();
-    let blobs = workspace.blobs_dir();
-
-    let targets: Vec<PathBuf> = match only {
-        None => {
-            // A full index starts from nothing, so a repo that has left the
-            // workspace leaves the answers with it.
-            let _ = std::fs::remove_dir_all(&blobs);
-            workspace.repos.clone()
-        }
-        Some(name) => vec![repo_for_service(workspace, &blobs, name)?],
+    // Build into a fresh generation. A failed scan leaves the last complete
+    // read model intact; account changes never inherit previous local rows.
+    let requested = only
+        .map(|name| repo_for_service(workspace, &workspace.blobs_dir(), name))
+        .transpose()?;
+    let hosted = super::hosted::refresh(workspace);
+    let previous = LocalIndex::read(&workspace.index_file()).ok();
+    let same_sources = previous.as_ref().is_some_and(|index| {
+        index.hosted_source_key == hosted.source_key()
+            && std::fs::read(workspace.index_dir().join("blobs-source.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Option<String>>(&bytes).ok())
+                == Some(index.hosted_source_key.clone())
+            && index
+                .repos
+                .iter()
+                .map(|r| PathBuf::from(&r.path))
+                .collect::<Vec<_>>()
+                == workspace.repos
+    });
+    let targets = if same_sources {
+        requested
+            .map(|path| vec![path])
+            .unwrap_or_else(|| workspace.repos.clone())
+    } else {
+        workspace.repos.clone()
     };
+    let generation = workspace
+        .index_dir()
+        .join(format!("build-{}", uuid::Uuid::new_v4()));
+    let blobs = generation.join("repos");
     std::fs::create_dir_all(&blobs).map_err(|e| format!("{}: {e}", blobs.display()))?;
     super::workspace::write_self_ignore(&workspace.index_dir())
         .map_err(|e| format!("could not write the .carrick/.gitignore: {e}"))?;
+    let result = run_generation(workspace, &hosted, &generation, &blobs, &targets, started);
+    let _ = std::fs::remove_dir_all(&generation);
+    result
+}
 
+fn run_generation(
+    workspace: &Workspace,
+    hosted: &super::hosted::HostedInput,
+    generation: &Path,
+    blobs: &Path,
+    targets: &[PathBuf],
+    started: Instant,
+) -> Result<IndexOutcome, String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("could not find the carrick binary to run a scan with: {e}"))?;
 
+    // A scoped refresh can retain unrequested local scans only when the
+    // workspace paths and authenticated hosted sources are unchanged.
+    let retained = if targets.len() < workspace.repos.len() {
+        read_blobs(&workspace.blobs_dir())?
+    } else {
+        Vec::new()
+    };
+    for (position, blob) in retained
+        .into_iter()
+        .filter(|b| {
+            workspace
+                .repos
+                .iter()
+                .any(|p| repo_label(p) == b.repo_name && !targets.contains(p))
+        })
+        .enumerate()
+    {
+        std::fs::write(
+            blobs.join(format!("retained-{position}.json")),
+            serde_json::to_vec(&blob).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let mut scanned = Vec::new();
-    for repo in &targets {
+    for (position, repo) in targets.iter().enumerate() {
         let name = repo_label(repo);
         eprintln!("indexing {name}...");
-        scan_repo(&exe, repo, &blobs)?;
+        let previous = generation.join("previous.json");
+        std::fs::write(
+            &previous,
+            serde_json::to_vec(&hosted.local_blobs(repo)).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        // Scanner cache filenames derive from repo/service labels. Keep each
+        // scanner in its own directory so user labels cannot overwrite a
+        // retained or hosted blob in the join input.
+        let scan_dir = generation.join(format!("scan-{position}"));
+        scan_repo(&exe, repo, &scan_dir, &previous)?;
+        for (service, blob) in read_blobs(&scan_dir)?.into_iter().enumerate() {
+            std::fs::write(
+                blobs.join(format!("local-{position}-{service}.json")),
+                serde_json::to_vec(&blob).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        }
         scanned.push(name);
     }
 
+    // Hosted-only repositories enter the existing matcher/type judge, but
+    // have no local repo in build() and therefore cannot create local items.
+    let mut remote_services = BTreeMap::new();
+    let mut service_names = std::collections::HashSet::new();
+    for blob in read_blobs(blobs)? {
+        let service = service_id(&blob);
+        if !service_names.insert(service.clone()) {
+            return Err(format!(
+                "local service identity '{service}' is ambiguous in this workspace"
+            ));
+        }
+    }
+    for (position, (remote, blob)) in hosted.remote_blobs().into_iter().enumerate() {
+        let service = service_id(&blob);
+        if !service_names.insert(service.clone()) {
+            return Err(format!(
+                "hosted service identity '{service}' is ambiguous in this workspace"
+            ));
+        }
+        remote_services.insert(service, remote);
+        std::fs::write(
+            blobs.join(format!("hosted-{position}.json")),
+            serde_json::to_vec(&blob).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let join_target = workspace
         .repos
         .first()
         .ok_or_else(|| "the workspace resolved to no repos".to_string())?;
-    let join = join(&exe, join_target, &blobs, &workspace.join_file())?;
+    let join = join(&exe, join_target, blobs, &generation.join("join.json"))?;
 
-    let index = build(workspace, &blobs, &join)?;
+    let mut index = build(workspace, blobs, &join, &remote_services)?;
+    index.hosted_checked_at = hosted.checked_at();
+    index.hosted_source_key = hosted.source_key();
+    (index.hosted_identity, index.hosted_workspace) = hosted.identity();
+    let scanned_blobs = read_blobs(blobs)?;
+    for repo in &mut index.repos {
+        for service in &mut repo.services {
+            if let Some(blob) = scanned_blobs
+                .iter()
+                .find(|b| b.repo_name == repo.name && service_id(b) == service.name)
+            {
+                service.enrichment = hosted.service(Path::new(&repo.path), blob);
+            }
+        }
+        for item in repo.files.values_mut().flatten() {
+            for counterpart in &mut item.counterparts {
+                counterpart.remote = remote_services.get(&counterpart.service).cloned();
+            }
+        }
+    }
+    // Keep only local blobs in the persistent repo directory. Hosted inputs
+    // remain in their credential-bound snapshot, never an implicit join seed.
+    let persistent = workspace.blobs_dir();
+    let source_marker = workspace.index_dir().join("blobs-source.json");
+    match std::fs::remove_file(&source_marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    if persistent.exists() {
+        std::fs::remove_dir_all(&persistent).map_err(|e| e.to_string())?;
+    }
+    std::fs::create_dir_all(&persistent).map_err(|e| e.to_string())?;
+    for (position, blob) in scanned_blobs
+        .iter()
+        .filter(|b| {
+            !remote_services.contains_key(&service_id(b))
+                && index.repos.iter().any(|r| r.name == b.repo_name)
+        })
+        .enumerate()
+    {
+        std::fs::write(
+            persistent.join(format!("{position}.json")),
+            serde_json::to_vec(blob).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     index
         .write(&workspace.index_file())
         .map_err(|e| format!("could not write {}: {e}", workspace.index_file().display()))?;
+    // The marker is written last. An interrupted replacement cannot combine a
+    // new account's read model with the preceding account's retained blobs.
+    std::fs::write(
+        source_marker,
+        serde_json::to_vec(&index.hosted_source_key).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     // The hand-off has been folded in; leaving it would invite a reader to
     // treat a stale copy of the join as the index.
     let _ = std::fs::remove_file(workspace.join_file());
@@ -122,12 +273,13 @@ fn repo_for_service(workspace: &Workspace, blobs: &Path, service: &str) -> Resul
 }
 
 /// Phase 1 for one repo.
-fn scan_repo(exe: &Path, repo: &Path, blobs: &Path) -> Result<(), String> {
+fn scan_repo(exe: &Path, repo: &Path, blobs: &Path, previous: &Path) -> Result<(), String> {
     let mut command = Command::new(exe);
     command
         .arg(repo)
         .env(crate::cloud_storage::CACHE_DIR_ENV, blobs)
         .env(crate::cloud_storage::ISOLATE_ENV, "1")
+        .env(super::hosted::PREVIOUS_ENV, previous)
         .env(super::NO_MODEL_ENV, "1")
         .env("CARRICK_SKIP_INTENTS", "1")
         .env_remove("CARRICK_OUTPUT_JSON")
@@ -146,6 +298,7 @@ fn join(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Result<LocalJoin, 
         .env("CARRICK_SKIP_INTENTS", "1")
         .env(super::JOIN_OUT_ENV, out)
         .env_remove(crate::cloud_storage::ISOLATE_ENV)
+        .env_remove(super::hosted::PREVIOUS_ENV)
         .env_remove("CARRICK_OUTPUT_JSON");
     strip_ci_env(&mut command);
     run_scan(command, "workspace join")?;
@@ -194,7 +347,7 @@ fn strip_ci_env(command: &mut Command) {
 }
 
 /// The directory name a scan of this path records as the repo name.
-fn repo_label(repo: &Path) -> String {
+pub(super) fn repo_label(repo: &Path) -> String {
     repo.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| repo.to_string_lossy().into_owned())
@@ -242,7 +395,12 @@ fn read_blobs(blobs: &Path) -> Result<Vec<CloudRepoData>, String> {
 }
 
 /// Fold the blobs and the join into the read model.
-fn build(workspace: &Workspace, blobs_dir: &Path, join: &LocalJoin) -> Result<LocalIndex, String> {
+fn build(
+    workspace: &Workspace,
+    blobs_dir: &Path,
+    join: &LocalJoin,
+    remotes: &BTreeMap<String, String>,
+) -> Result<LocalIndex, String> {
     let blobs = read_blobs(blobs_dir)?;
     let now = timestamp();
 
@@ -254,12 +412,13 @@ fn build(workspace: &Workspace, blobs_dir: &Path, join: &LocalJoin) -> Result<Lo
         let name = repo_label(repo_path);
         let services: Vec<IndexedService> = blobs
             .iter()
-            .filter(|blob| blob.repo_name == name)
+            .filter(|blob| blob.repo_name == name && !remotes.contains_key(&service_id(blob)))
             .map(|blob| IndexedService {
+                enrichment: Default::default(),
                 name: service_id(blob),
                 directory: service_directory(blob),
                 commit: blob.commit_hash.clone(),
-                indexed_at: now.clone(),
+                indexed_at: blob.last_updated.to_rfc3339(),
                 boundary: blob.boundary.clone(),
                 routes: blob.endpoints.len(),
                 calls: blob.calls.len(),
@@ -340,6 +499,22 @@ fn build(workspace: &Workspace, blobs_dir: &Path, join: &LocalJoin) -> Result<Lo
     }
 
     Ok(LocalIndex {
+        hosted_identity: None,
+        hosted_workspace: None,
+        repos_detected_by: Some(
+            match workspace.repos_detected_by.as_str() {
+                "carrick.json" => "carrick_json",
+                "sibling repositories" => "siblings",
+                "single repository" => "single_repo",
+                "workspace manifest" => "workspace_manifest",
+                _ => "workspace_overrides",
+            }
+            .to_string(),
+        ),
+        repos_added: workspace.repos_added.clone(),
+        repos_excluded: workspace.repos_excluded.clone(),
+        hosted_checked_at: None,
+        hosted_source_key: None,
         version: READ_MODEL_VERSION,
         scanner_version: join.scanner_version.clone(),
         indexed_at: now,
@@ -367,6 +542,7 @@ fn counterparts_for(
                     continue;
                 }
                 found.push(Counterpart {
+                    remote: None,
                     role: consumer_role(&edge.relationship).to_string(),
                     service: edge.consumer_service.clone(),
                     file: edge.consumer_file.clone().unwrap_or_default(),
@@ -391,6 +567,7 @@ fn counterparts_for(
                     .unwrap_or_default();
                 if sites.is_empty() {
                     found.push(Counterpart {
+                        remote: None,
                         role: producer_role(&edge.relationship).to_string(),
                         service: edge.producer_service.clone(),
                         file: String::new(),
@@ -399,6 +576,7 @@ fn counterparts_for(
                 }
                 for site in sites {
                     found.push(Counterpart {
+                        remote: None,
                         role: producer_role(&edge.relationship).to_string(),
                         service: site.service.clone(),
                         file: site.file.clone(),

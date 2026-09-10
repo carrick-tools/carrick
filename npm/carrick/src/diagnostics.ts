@@ -238,6 +238,7 @@ export function resolveCounterpart(
   exists: ((target: string) => boolean) | undefined = defaultExists,
 ): string | null {
   if (!exists) exists = defaultExists;
+  if (counterpart.remote) return null;
   if (!counterpart.file) return null;
   if (path.isAbsolute(counterpart.file)) return exists(counterpart.file) ? counterpart.file : null;
   if (!counterpart.repo) return null;

@@ -73,7 +73,10 @@ pub fn answer(workspace_root: &Path, file: &Path, mode: Mode) -> Result<CheckOut
     let deleted = !repo_root.join(&relative).exists();
 
     let boundary = service_row.and_then(|service| service.boundary.clone());
-    let boundary_note = boundary_note(boundary.as_ref());
+    let enrichment = service_row
+        .map(|s| s.enrichment.clone())
+        .unwrap_or_default();
+    let boundary_note = enrichment_note(&enrichment, boundary.as_ref());
     let boundary_lines = boundary_lines(&service, &boundary_note, boundary.as_ref());
 
     // Where every other repo in the workspace lives, so a counterpart's
@@ -91,6 +94,9 @@ pub fn answer(workspace_root: &Path, file: &Path, mode: Mode) -> Result<CheckOut
         .collect();
 
     Ok(CheckOutput {
+        hosted: enrichment.hosted,
+        hosted_state: enrichment.hosted_state,
+        hosted_checked_at: index.hosted_checked_at.clone(),
         schema: SCHEMA.to_string(),
         file: relative,
         repo: repo.path.clone(),
@@ -145,8 +151,10 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadError> {
         changed.truncate(MAX_STALE_FILES);
 
         for service in &repo.services {
-            let note = boundary_note(service.boundary.as_ref());
+            let note = enrichment_note(&service.enrichment, service.boundary.as_ref());
             services.push(StatusService {
+                hosted: service.enrichment.hosted.clone(),
+                hosted_state: service.enrichment.hosted_state.clone(),
                 service: service.name.clone(),
                 repo: repo.path.clone(),
                 index_commit: service.commit.clone(),
@@ -165,6 +173,10 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadError> {
     }
 
     Ok(StatusOutput {
+        repos_detected_by: index.repos_detected_by.clone(),
+        repos_added: index.repos_added.clone(),
+        repos_excluded: index.repos_excluded.clone(),
+        hosted_checked_at: index.hosted_checked_at.clone(),
         schema: STATUS_SCHEMA.to_string(),
         workspace: workspace_root.to_string_lossy().into_owned(),
         indexed_at: index.indexed_at.clone(),
@@ -190,7 +202,12 @@ fn project(
             service: counterpart.service.clone(),
             file: counterpart.file.clone(),
             line: counterpart.line,
-            repo: repo_of_service.get(&counterpart.service).cloned(),
+            remote: counterpart.remote.clone(),
+            repo: if counterpart.remote.is_some() {
+                None
+            } else {
+                repo_of_service.get(&counterpart.service).cloned()
+            },
         })
         .collect();
 
@@ -294,10 +311,17 @@ fn read_index(workspace_root: &Path) -> Result<LocalIndex, ReadError> {
     if !index_file.is_file() {
         return Err(ReadError::NotIndexed);
     }
-    LocalIndex::read(&index_file).map_err(|e| {
+    let index = LocalIndex::read(&index_file).map_err(|e| {
         eprintln!("carrick: {e}");
         ReadError::IndexUnreadable
-    })
+    })?;
+    if !super::hosted::can_read_index(&index) {
+        eprintln!(
+            "carrick: the hosted index belongs to a different or unavailable credential. Run carrick login and carrick index."
+        );
+        return Err(ReadError::IndexUnreadable);
+    }
+    Ok(index)
 }
 
 /// The repo-relative paths that differ from the commit the index was built at:
@@ -311,15 +335,22 @@ fn read_index(workspace_root: &Path) -> Result<LocalIndex, ReadError> {
 /// two used to collapse into one empty set, so a caller could not tell a clean
 /// tree from an unanswerable one and had to OR in a signal that is wrong
 /// whenever git can speak (carrick#857).
-fn changed_since(repo: &Path, commit: &str) -> Option<HashSet<String>> {
-    if commit.is_empty() {
+pub(crate) fn changed_since(repo: &Path, commit: &str) -> Option<HashSet<String>> {
+    if commit.is_empty() || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let diff = git(repo, &["diff", "--name-only", commit])?;
-    let untracked = git(repo, &["ls-files", "--others", "--exclude-standard"])?;
+    let diff = git(
+        repo,
+        &["diff", "--name-only", "--no-renames", "-z", commit, "--"],
+    )?;
+    let untracked = git(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
     let mut changed = HashSet::new();
     for text in [diff, untracked] {
-        changed.extend(text.lines().map(str::to_string).filter(|l| !l.is_empty()));
+        changed.extend(
+            text.split('\0')
+                .map(str::to_string)
+                .filter(|l| !l.is_empty()),
+        );
     }
     Some(changed)
 }
@@ -349,6 +380,9 @@ fn git(repo: &Path, args: &[&str]) -> Option<String> {
         .arg("-C")
         .arg(repo)
         .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .output()
         .ok()?;
     if !output.status.success() {
@@ -395,6 +429,76 @@ pub fn boundary_lines(
     lines
 }
 
+/// Hosted provenance feeds the same boundary renderer used by every local
+/// surface. Read commands never probe the network to compose this sentence.
+pub fn enrichment_note(
+    enrichment: &super::hosted::ServiceEnrichment,
+    boundary: Option<&crate::boundary::ServiceBoundary>,
+) -> String {
+    use super::hosted::HostedState;
+    let remote = enrichment.remote.as_deref().unwrap_or("this repo");
+    let mut note = match (&enrichment.hosted_state, &enrichment.hosted) {
+        (HostedState::Enriched, Some(hosted)) => format!(
+            "candidates: from the hosted index at {} (indexed {}); {} file(s) changed since then hold facts only.",
+            hosted.commit.chars().take(7).collect::<String>(),
+            hosted.indexed_at,
+            boundary
+                .and_then(|b| b.candidates_withheld_changed_files)
+                .unwrap_or(0)
+        ),
+        (HostedState::VersionMismatch, Some(hosted)) => format!(
+            "hosted index written by carrick {} (cache {:?}), this binary is {} (cache {}); candidates not replayed.",
+            hosted.scanner_version.as_deref().unwrap_or("unknown"),
+            enrichment.hosted_cache_version,
+            env!("CARGO_PKG_VERSION"),
+            crate::engine::CACHE_VERSION
+        ),
+        (HostedState::CommitMissing, Some(hosted)) => format!(
+            "hosted index at {}, which this clone does not have; candidates not replayed. Run git fetch.",
+            hosted.commit.chars().take(7).collect::<String>()
+        ),
+        (HostedState::NoIndexYet, _) => format!(
+            "{}; {remote} is connected and has no hosted index yet. The first CI run on main writes it, and the next carrick index reads it.",
+            super::NOT_CLASSIFIED_LOCALLY
+        ),
+        (HostedState::NotConnected, _) => format!(
+            "{}; {remote} is not connected to a Carrick project.",
+            super::NOT_CLASSIFIED_LOCALLY
+        ),
+        (HostedState::NotSignedIn, _) => format!(
+            "{}; not signed in, so the hosted index was not read.",
+            boundary_note(boundary)
+        ),
+        _ => boundary_note(boundary),
+    };
+    if enrichment.hosted_state == HostedState::VersionMismatch
+        && let Some(version) = enrichment
+            .hosted
+            .as_ref()
+            .and_then(|h| h.scanner_version.as_ref())
+        && semver::Version::parse(version).is_ok()
+    {
+        note.push_str(&format!(
+            " Run npm i -g carrick@{version}, or re-index main with the current Action."
+        ));
+    }
+    if let Some(failure) = &enrichment.failure {
+        if let Some(hosted) = &enrichment.hosted {
+            note.push_str(&format!(
+                " Hosted copy from {} retained; could not refresh: {failure}.",
+                hosted.indexed_at
+            ));
+        } else {
+            note.push_str(&format!(" Could not refresh the hosted index: {failure}."));
+        }
+    }
+    if let Some(allowance) = &enrichment.allowance_sentence {
+        note.push(' ');
+        note.push_str(allowance);
+    }
+    note
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +522,44 @@ mod tests {
         let note = boundary_note(None);
         assert!(note.contains("not classified locally"), "{note}");
         assert!(note.contains("0 route-literal call site(s)"), "{note}");
+    }
+}
+
+#[cfg(test)]
+mod hosted_change_tests {
+    use super::*;
+
+    #[test]
+    fn hosted_diff_includes_staged_untracked_deleted_and_unusual_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "fixture@carrick.test"],
+            vec!["config", "user.name", "fixture"],
+        ] {
+            assert!(git(repo, &args).is_some());
+        }
+        for file in ["staged.ts", "deleted.ts", "odd\nname.ts"] {
+            std::fs::write(repo.join(file), "export const value = 1;").unwrap();
+        }
+        git(repo, &["add", "."]).unwrap();
+        git(repo, &["commit", "-qm", "base"]).unwrap();
+        let commit = git(repo, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(repo.join("staged.ts"), "export const value = 2;").unwrap();
+        git(repo, &["add", "staged.ts"]).unwrap();
+        std::fs::remove_file(repo.join("deleted.ts")).unwrap();
+        std::fs::write(repo.join("odd\nname.ts"), "changed").unwrap();
+        std::fs::write(repo.join("new.ts"), "new").unwrap();
+        assert_eq!(
+            changed_since(repo, commit.trim()).unwrap(),
+            HashSet::from([
+                "staged.ts".into(),
+                "deleted.ts".into(),
+                "odd\nname.ts".into(),
+                "new.ts".into()
+            ])
+        );
+        assert!(changed_since(repo, "--output=elsewhere").is_none());
     }
 }

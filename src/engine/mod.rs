@@ -99,7 +99,7 @@ pub(crate) mod type_compat_v2;
 /// before the field was asked for, so replaying one states a plain route for
 /// every dispatching handler in the repo and the change is invisible on every
 /// incremental scan until the files happen to move.
-const CACHE_VERSION: u32 = 22;
+pub(crate) const CACHE_VERSION: u32 = 22;
 
 // Type aliases to reduce complexity
 type FileDiscoveryResult = Result<
@@ -284,6 +284,8 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         &format!("Downloaded data from {} repos", all_repo_data.len()),
     );
 
+    let local_previous = crate::local_mode::hosted::previous_data()?;
+
     // 4. Analyze each service (incremental per service where possible).
     let sp = logging::spinner("Analyzing repository...");
     let mut current_services_data = Vec::with_capacity(services.len());
@@ -320,7 +322,9 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         let previous_data = if no_cache {
             None
         } else {
-            all_repo_data
+            local_previous
+                .as_ref()
+                .unwrap_or(&all_repo_data)
                 .iter()
                 .find(|r| r.repo_name == repo_name && r.service_name == service.service_name)
                 .cloned()
@@ -1167,6 +1171,10 @@ fn enforce_payload_size_limit(data: &mut CloudRepoData, staging_available: bool)
 /// Get files changed between a base commit and HEAD.
 /// Returns relative paths matching the file discovery format.
 fn get_changed_files(repo_path: &str, base_commit: &str) -> Option<Vec<String>> {
+    if crate::local_mode::no_model() {
+        return crate::local_mode::query::changed_since(Path::new(repo_path), base_commit)
+            .map(|set| set.into_iter().collect());
+    }
     let output = std::process::Command::new("git")
         .args(["diff", "--name-only", base_commit, "HEAD"])
         .current_dir(repo_path)
@@ -1426,16 +1434,21 @@ async fn analyze_current_repo_incremental(
             // Get framework detection, guidance, and extraction config
             // (cached or fresh — all three share the package_json_hash gate)
             let (detection, guidance, extraction_config) = if crate::local_mode::no_model() {
-                // Local mode (carrick#708): all three are model calls, and
-                // there is no model here. Stated empty rather than cached,
-                // so a later cloud scan of the same tree does not replay a
-                // laptop's silence as a detection result.
-                debug!("Local mode: skipping framework detection and guidance (no model)");
-                (
-                    DetectionResult::default(),
-                    crate::local_mode::offline_guidance(),
-                    None,
-                )
+                if !pkg_changed {
+                    (
+                        prev.cached_detection.clone().unwrap_or_default(),
+                        prev.cached_guidance
+                            .clone()
+                            .unwrap_or_else(crate::local_mode::offline_guidance),
+                        prev.cached_extraction_config.clone(),
+                    )
+                } else {
+                    (
+                        DetectionResult::default(),
+                        crate::local_mode::offline_guidance(),
+                        None,
+                    )
+                }
             } else if !pkg_changed {
                 if let (Some(det), Some(guid)) = (&prev.cached_detection, &prev.cached_guidance) {
                     debug!("Reusing cached framework detection and guidance");
@@ -1711,6 +1724,18 @@ async fn analyze_current_repo_incremental(
                 &analysis.stats,
                 repo_path,
             ));
+            if crate::local_mode::no_model() {
+                cloud_data
+                    .boundary
+                    .as_mut()
+                    .unwrap()
+                    .candidates_withheld_changed_files = Some(
+                    prev_file_results
+                        .keys()
+                        .filter(|file| changed_set.contains(*file))
+                        .count(),
+                );
+            }
             // Everything between the marks above: manifest assembly, the
             // deterministic attachments, relativisation. Named so the printed
             // phases add up to `analysis` rather than falling short of it.

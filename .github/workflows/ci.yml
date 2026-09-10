@@ -127,6 +127,7 @@ jobs:
           --test literal_base_url_test
           --test llm_mock_pipeline_test
           --test local_mode_test
+          --test hosted_enrichment_test
           --test new_url_target_test
           --test object_export_surface_test
           --test receiver_type_classification_test

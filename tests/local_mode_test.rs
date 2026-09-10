@@ -106,6 +106,8 @@ fn run(workspace: &Path, args: &[&str]) -> String {
     let output = Command::new(carrick())
         .args(args)
         .current_dir(workspace)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
         .output()
         .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
     assert!(
@@ -155,6 +157,7 @@ fn local_mode_answers_and_follows_an_edit() {
     let caller = "inventory-svc/src/inventory.ts";
 
     let map = index(root);
+    let retained_indexed_at = check_json(root, caller)["indexed_at"].clone();
     assert!(
         map.contains("catalog-web") && map.contains("inventory-svc"),
         "the map names every service:\n{map}"
@@ -219,6 +222,11 @@ fn local_mode_answers_and_follows_an_edit() {
     run(
         root,
         &["refresh", "--service", "catalog-web", "--workspace", "."],
+    );
+    assert_eq!(
+        check_json(root, caller)["indexed_at"],
+        retained_indexed_at,
+        "a scoped refresh must preserve the unscanned service timestamp"
     );
     let broken = check(root, caller);
     assert!(
