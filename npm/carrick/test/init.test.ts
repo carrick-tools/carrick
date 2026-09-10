@@ -14,7 +14,7 @@ import {
   mergeCarrickHooks,
   ownEntryPoint,
 } from "../src/init/settings.ts";
-import { parseArgs } from "../src/init/run.ts";
+import { editorLines, parseArgs } from "../src/init/run.ts";
 
 function entries(names: Array<[string, boolean]>) {
   return names.map(([name, isDirectory]) => ({ name, isDirectory: () => isDirectory }));
@@ -210,6 +210,57 @@ test("the identity comes from the GitHub CLI, or a token, or init stops", () => 
   assert.equal(none.identity, null);
   assert.match(none.problem ?? "", /gh auth login/);
   assert.match(none.problem ?? "", /GITHUB_TOKEN/);
+});
+
+// The gallery an id resolves against is the whole of this: the extension is on
+// Open VSX, which Cursor and Windsurf read, and not on the VS Code Marketplace,
+// which is the only place `code --install-extension` looks (carrick#915).
+test("no editor is handed an id for a gallery it does not read", () => {
+  const everyEditor = editorLines(() => true);
+  for (const line of everyEditor) {
+    const install = /^\s*(\S+) --install-extension (\S+)/.exec(line);
+    if (!install) continue;
+    const [, editor, target] = install;
+    assert.ok(
+      ["cursor", "windsurf"].includes(editor!) || target!.endsWith(".vsix"),
+      `${editor} resolves an id against a gallery this extension does not publish to: ${line}`,
+    );
+  }
+  assert.doesNotMatch(everyEditor.join("\n"), /install (it )?from the Marketplace/i);
+});
+
+test("VS Code is pointed at the .vsix, never at a command that finds nothing", () => {
+  const code = editorLines((command) => command === "code");
+  // The prose names `code --install-extension` to say it will not work, so what
+  // must not exist is a line a user can copy, which is an indented command.
+  for (const line of code) assert.doesNotMatch(line, /^\s*\S+ --install-extension/);
+  assert.match(code.join("\n"), /not on the VS Code Marketplace/);
+  assert.match(code.join("\n"), /https:\/\/docs\.carrick\.tools\/editor/);
+});
+
+test("Cursor and Windsurf get the gallery command, which is one they can run", () => {
+  const cursor = editorLines((command) => command === "cursor");
+  assert.deepEqual(cursor, [
+    "  Cursor, for diagnostics in the Problems panel:",
+    "    cursor --install-extension carrick-tools.carrick",
+  ]);
+  assert.match(
+    editorLines((command) => command === "windsurf").join("\n"),
+    /windsurf --install-extension carrick-tools\.carrick/,
+  );
+
+  // Both editors on one machine is two blocks, and the VS Code text stays out
+  // of the two that can install from a gallery.
+  const forks = editorLines((command) => command === "cursor" || command === "windsurf");
+  assert.equal(forks.length, 4);
+  assert.doesNotMatch(forks.join("\n"), /Marketplace/);
+});
+
+test("an editor we have not tested gets the server's command and no claim", () => {
+  const unknown = editorLines(() => false);
+  assert.equal(unknown.length, 1);
+  assert.match(unknown[0]!, /carrick lsp --stdio/);
+  assert.doesNotMatch(unknown[0]!, /--install-extension/);
 });
 
 test("init reads its arguments", () => {
