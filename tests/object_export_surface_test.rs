@@ -88,6 +88,18 @@ fn definition<'a>(
 fn a_module_that_exports_one_object_states_its_functions() {
     let definitions = function_definitions();
 
+    let collect = definition(&definitions, "collect");
+    assert_eq!(
+        collect["signature"],
+        "(ordinal: (number) | undefined, label: string, note?: string, ...values: number[]) => void"
+    );
+    assert_eq!(collect["arguments"][0]["has_default"], true);
+    assert_eq!(collect["arguments"][0]["default_value"], "0");
+    assert!(collect["arguments"][0].get("is_optional").is_none());
+    assert!(collect["arguments"][1].get("has_default").is_none());
+    assert_eq!(collect["arguments"][2]["is_optional"], true);
+    assert_eq!(collect["arguments"][3]["is_rest"], true);
+
     // The ticket's shape: the whole module is `export default { async fetch }`.
     let fetch = definition(&definitions, "default.fetch");
     assert_eq!(fetch["file_path"], "src/edge.js");

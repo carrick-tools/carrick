@@ -25,3 +25,8 @@ const internals = {
 export function normalize(input: string): string {
   return internals.tidy(input);
 }
+
+// Top-level parameter facts must survive the stored index (carrick#920).
+export function collect(ordinal: number = 0, label: string, note?: string, ...values: number[]): void {
+  void [ordinal, label, note, values];
+}
