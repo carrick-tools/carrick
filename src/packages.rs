@@ -1,6 +1,10 @@
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, io, path::PathBuf};
+use std::{
+    collections::HashMap,
+    io,
+    path::{Path, PathBuf},
+};
 
 /// Cap on the dependency names sent to cloud tasks. The cloud caps at 500
 /// server-side; staying under it keeps requests deterministic.
@@ -35,6 +39,245 @@ pub struct PackageJson {
     /// these aliases or the invented name 404s.
     #[serde(default)]
     pub resolutions: HashMap<String, String>,
+}
+
+/// The manifest facts shared by package loading and workspace resolution.
+/// Deno spells dependencies as import-map targets; normalizing them here keeps
+/// every scanner pass on the same identity rules.
+#[derive(Debug, Clone)]
+pub struct ManifestFacts {
+    pub package: PackageJson,
+    pub main: Option<String>,
+    pub exports: Option<serde_json::Value>,
+    /// Deno workspace member directories, exactly as declared by this config.
+    pub workspace: Vec<String>,
+}
+
+pub fn read_manifest(path: &Path) -> Result<ManifestFacts, io::Error> {
+    let content = std::fs::read_to_string(path)?;
+    let json_text = if path.file_name().is_some_and(|name| name == "deno.jsonc") {
+        strip_jsonc_syntax(&content).map_err(|message| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse {}: {}", path.display(), message),
+            )
+        })?
+    } else {
+        content
+    };
+    let json: serde_json::Value = serde_json::from_str(&json_text).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to parse {}: {}", path.display(), e),
+        )
+    })?;
+
+    if path.file_name().is_some_and(|name| name == "package.json") {
+        let package = serde_json::from_value(json.clone()).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse {}: {}", path.display(), e),
+            )
+        })?;
+        return Ok(ManifestFacts {
+            package,
+            main: json
+                .get("main")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            exports: json.get("exports").cloned(),
+            workspace: Vec::new(),
+        });
+    }
+
+    let mut dependencies = HashMap::new();
+    if let Some(imports) = json.get("imports").and_then(serde_json::Value::as_object) {
+        for target in imports.values().filter_map(serde_json::Value::as_str) {
+            if let Some((name, spec)) = deno_registry_identity(target) {
+                dependencies.entry(name).or_insert(spec);
+            }
+        }
+    }
+    let package = PackageJson {
+        name: json
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        version: json
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        dependencies,
+        dev_dependencies: HashMap::new(),
+        peer_dependencies: HashMap::new(),
+        optional_dependencies: HashMap::new(),
+        resolutions: HashMap::new(),
+    };
+    let workspace = match json.get("workspace") {
+        None => Vec::new(),
+        Some(serde_json::Value::Array(members)) => members
+            .iter()
+            .enumerate()
+            .map(|(index, member)| {
+                member.as_str().map(str::to_owned).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Failed to parse {}: workspace member {} must be a string",
+                            path.display(),
+                            index
+                        ),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Failed to parse {}: workspace must be an array of strings",
+                    path.display()
+                ),
+            ));
+        }
+    };
+    Ok(ManifestFacts {
+        package,
+        main: None,
+        exports: json.get("exports").cloned(),
+        workspace,
+    })
+}
+
+fn deno_registry_identity(target: &str) -> Option<(String, String)> {
+    let specifier = target
+        .strip_prefix("npm:")
+        .or_else(|| target.strip_prefix("jsr:"))?;
+    let package_end = if specifier.starts_with('@') {
+        specifier
+            .find('/')
+            .and_then(|slash| {
+                specifier[slash + 1..]
+                    .find('/')
+                    .map(|tail| slash + 1 + tail)
+            })
+            .unwrap_or(specifier.len())
+    } else {
+        specifier.find('/').unwrap_or(specifier.len())
+    };
+    let package_and_version = &specifier[..package_end];
+    let version_at = package_and_version
+        .char_indices()
+        .filter_map(|(index, ch)| (index > 0 && ch == '@').then_some(index))
+        .next_back();
+    let (name, spec) = version_at.map_or((package_and_version, "*"), |at| {
+        (&package_and_version[..at], &package_and_version[at + 1..])
+    });
+    let valid_name = !name.is_empty()
+        && name.is_ascii()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'@' | b'/' | b'-' | b'_' | b'.')
+        })
+        && (!name.starts_with('@')
+            || name
+                .strip_prefix('@')
+                .and_then(|scoped| scoped.split_once('/'))
+                .is_some_and(|(scope, package)| !scope.is_empty() && !package.is_empty()));
+    valid_name.then(|| {
+        (
+            name.to_string(),
+            if spec.is_empty() {
+                "*".to_string()
+            } else {
+                spec.to_string()
+            },
+        )
+    })
+}
+
+/// Remove JSONC comments without touching comment markers inside strings.
+fn strip_jsonc_syntax(input: &str) -> Result<String, &'static str> {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if ch == '"' {
+            in_string = true;
+            out.push(ch);
+        } else if ch == '/' && chars.peek() == Some(&'/') {
+            out.push(' ');
+            chars.next();
+            for comment in chars.by_ref() {
+                if comment == '\n' {
+                    out.push('\n');
+                    break;
+                }
+            }
+        } else if ch == '/' && chars.peek() == Some(&'*') {
+            out.push(' ');
+            chars.next();
+            let mut previous = '\0';
+            let mut closed = false;
+            for comment in chars.by_ref() {
+                if comment == '\n' {
+                    out.push('\n');
+                }
+                if previous == '*' && comment == '/' {
+                    closed = true;
+                    break;
+                }
+                previous = comment;
+            }
+            if !closed {
+                return Err("unterminated block comment");
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    let mut normalized = String::with_capacity(out.len());
+    let mut chars = out.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if in_string {
+            normalized.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            normalized.push(ch);
+            continue;
+        }
+        if ch == ',' {
+            let mut lookahead = chars.clone();
+            if lookahead
+                .find(|next| !next.is_whitespace())
+                .is_some_and(|next| matches!(next, '}' | ']'))
+            {
+                continue;
+            }
+        }
+        normalized.push(ch);
+    }
+    Ok(normalized)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +319,70 @@ pub struct Packages {
 /// legitimately named `build` is still a repo).
 pub const MANIFEST_SKIP_DIRS: [&str; 5] = ["node_modules", "dist", "build", ".next", ".vite"];
 
+/// Deno configs that belong to the declared workspace, starting at the root.
+/// Nested configs outside a `workspace` list are intentionally absent.
+pub fn deno_workspace_manifest_paths(repo_root: &Path) -> Result<Vec<PathBuf>, io::Error> {
+    let canonical_root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut pending = deno_manifest_at(repo_root).into_iter().collect::<Vec<_>>();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut manifests = Vec::new();
+    while let Some(manifest) = pending.pop() {
+        let identity = manifest.canonicalize().unwrap_or_else(|_| manifest.clone());
+        if !seen.insert(identity) {
+            continue;
+        }
+        manifests.push(manifest.clone());
+        let facts = read_manifest(&manifest)?;
+        let declaring_dir = manifest.parent().unwrap_or(repo_root);
+        for member in facts.workspace {
+            let member_dir = declaring_dir.join(&member);
+            let canonical_member = member_dir.canonicalize().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Deno workspace member '{}' declared by {} cannot be read: {}",
+                        member,
+                        manifest.display(),
+                        e
+                    ),
+                )
+            })?;
+            if canonical_member.strip_prefix(&canonical_root).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Deno workspace member '{}' declared by {} is outside the repository",
+                        member,
+                        manifest.display()
+                    ),
+                ));
+            }
+            let member_manifest = deno_manifest_at(&member_dir).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Deno workspace member '{}' declared by {} has no deno.json or deno.jsonc",
+                        member,
+                        manifest.display()
+                    ),
+                )
+            })?;
+            pending.push(member_manifest);
+        }
+    }
+    manifests.sort();
+    Ok(manifests)
+}
+
+fn deno_manifest_at(dir: &Path) -> Option<PathBuf> {
+    ["deno.json", "deno.jsonc"]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
+}
+
 /// Names declared by every package.json under `repo_root` (workspace members
 /// included), skipping dependency/build directories. Used to recognize
 /// workspace-internal packages that must not be treated as registry deps.
@@ -93,12 +400,18 @@ pub fn collect_internal_package_names(
                         .to_str()
                         .is_some_and(|n| MANIFEST_SKIP_DIRS.contains(&n)))
         });
-    for entry in walker.flatten() {
-        if entry.file_type().is_file()
-            && entry.file_name() == "package.json"
-            && let Ok(text) = std::fs::read_to_string(entry.path())
-            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
-            && let Some(name) = json.get("name").and_then(|n| n.as_str())
+    let mut manifests: Vec<PathBuf> = walker
+        .flatten()
+        .filter(|entry| entry.file_type().is_file() && entry.file_name() == "package.json")
+        .map(|entry| entry.path().to_path_buf())
+        .collect();
+    match deno_workspace_manifest_paths(repo_root) {
+        Ok(deno_manifests) => manifests.extend(deno_manifests),
+        Err(error) => tracing::warn!("Ignoring Deno workspace manifests: {}", error),
+    }
+    for manifest in manifests {
+        if let Ok(facts) = read_manifest(&manifest)
+            && let Some(name) = facts.package.name
         {
             names.insert(name.to_string());
         }
@@ -136,13 +449,7 @@ impl Packages {
         let mut packages = Packages::default();
 
         for path in package_json_paths {
-            let content = std::fs::read_to_string(&path)?;
-            let package_json: PackageJson = serde_json::from_str(&content).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Failed to parse {}: {}", path.display(), e),
-                )
-            })?;
+            let package_json = read_manifest(&path)?.package;
 
             packages.package_jsons.push(package_json);
             packages.source_paths.push(path);
@@ -271,6 +578,145 @@ impl Packages {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deno_jsonc_normalizes_registry_imports_and_keeps_workspace_facts() {
+        let repo = tempfile::tempdir().unwrap();
+        let manifest = repo.path().join("deno.jsonc");
+        std::fs::write(
+            &manifest,
+            r#"{
+            // aliases are not package identities
+            "name": "@local/api",
+            "workspace": ["./packages/core"],
+            "exports": "./mod.ts",
+            "imports": {
+                "client": "npm:@vendor/client@^2.1.0/http",
+                "utils": "jsr:@scope/utils@1.4.0/path",
+                "local": "./src/local.ts",
+                "url": "https://example.invalid/mod.ts",
+            },
+        }"#,
+        )
+        .unwrap();
+
+        let facts = read_manifest(&manifest).unwrap();
+        assert_eq!(facts.package.name.as_deref(), Some("@local/api"));
+        assert_eq!(facts.workspace, vec!["./packages/core"]);
+        assert_eq!(facts.exports, Some(serde_json::json!("./mod.ts")));
+        assert_eq!(
+            facts
+                .package
+                .dependencies
+                .get("@vendor/client")
+                .map(String::as_str),
+            Some("^2.1.0")
+        );
+        assert_eq!(
+            facts
+                .package
+                .dependencies
+                .get("@scope/utils")
+                .map(String::as_str),
+            Some("1.4.0")
+        );
+        assert_eq!(facts.package.dependencies.len(), 2);
+    }
+
+    #[test]
+    fn deno_registry_identity_is_total_for_scoped_unscoped_and_malformed_targets() {
+        assert_eq!(
+            deno_registry_identity("npm:client@2.0.0/http"),
+            Some(("client".into(), "2.0.0".into()))
+        );
+        assert_eq!(
+            deno_registry_identity("jsr:@scope/client@^2/http"),
+            Some(("@scope/client".into(), "^2".into()))
+        );
+        assert_eq!(
+            deno_registry_identity("npm:client"),
+            Some(("client".into(), "*".into()))
+        );
+        for target in ["npm:", "jsr:", "npm:/subpath", "npm:🦕", "npm:@scope"] {
+            let _ = deno_registry_identity(target);
+        }
+        assert_eq!(deno_registry_identity("npm:"), None);
+        assert_eq!(deno_registry_identity("jsr:"), None);
+        assert_eq!(deno_registry_identity("npm:🦕"), None);
+        assert_eq!(deno_registry_identity("npm:@scope"), None);
+    }
+
+    #[test]
+    fn jsonc_comments_preserve_token_boundaries_and_must_close() {
+        assert!(
+            serde_json::from_str::<serde_json::Value>(
+                &strip_jsonc_syntax("[1/* x */,2,]").unwrap()
+            )
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&strip_jsonc_syntax("[1/* x */2]").unwrap())
+                .is_err()
+        );
+        assert_eq!(
+            strip_jsonc_syntax("{/* never closes"),
+            Err("unterminated block comment")
+        );
+    }
+
+    #[test]
+    fn deno_workspace_members_are_declared_and_missing_members_are_errors() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("listed")).unwrap();
+        std::fs::create_dir_all(repo.path().join("unlisted")).unwrap();
+        std::fs::write(repo.path().join("deno.json"), r#"{"workspace":["listed"]}"#).unwrap();
+        std::fs::write(repo.path().join("listed/deno.json"), r#"{"name":"listed"}"#).unwrap();
+        std::fs::write(
+            repo.path().join("unlisted/deno.json"),
+            r#"{"name":"unlisted"}"#,
+        )
+        .unwrap();
+
+        let paths = deno_workspace_manifest_paths(repo.path()).unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                repo.path().join("deno.json"),
+                repo.path().join("listed/deno.json")
+            ]
+        );
+
+        std::fs::write(
+            repo.path().join("deno.json"),
+            r#"{"workspace":["missing"]}"#,
+        )
+        .unwrap();
+        let error = deno_workspace_manifest_paths(repo.path()).unwrap_err();
+        assert!(error.to_string().contains("cannot be read"));
+    }
+
+    #[test]
+    fn deno_workspace_rejects_wrong_member_shapes_and_terminates_cycles() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("child")).unwrap();
+        std::fs::write(repo.path().join("deno.json"), r#"{"workspace":["child"]}"#).unwrap();
+        std::fs::write(
+            repo.path().join("child/deno.json"),
+            r#"{"workspace":[".."]}"#,
+        )
+        .unwrap();
+        assert_eq!(deno_workspace_manifest_paths(repo.path()).unwrap().len(), 2);
+
+        for malformed in [r#"{"workspace":"child"}"#, r#"{"workspace":["child",7]}"#] {
+            std::fs::write(repo.path().join("deno.json"), malformed).unwrap();
+            assert!(
+                deno_workspace_manifest_paths(repo.path())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("workspace")
+            );
+        }
+    }
 
     #[test]
     fn collect_internal_package_names_walks_tree_and_skips_dep_dirs() {
