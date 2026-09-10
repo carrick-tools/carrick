@@ -3588,81 +3588,16 @@ fn discover_files_and_symbols(
 
 /// Resolve a repo's `carrick.json` into one service config per service.
 ///
-/// No config, or a flat config, yields a single service rooted at the repo
-/// root (zero-config single-service mode). A `services` array yields one entry
-/// per declared service. Always returns at least one service.
+/// An explicit config wins. Without one, the shared resolver derives services
+/// from workspace manifests, or returns one service for a plain repository.
 ///
 /// A config that exists but cannot be parsed, or that declares paths that
 /// don't exist, is a hard error: silently falling back to defaults would
 /// ignore the user's declared service layout and upload a wrong index.
 fn resolve_services(repo_path: &str) -> Result<Vec<Config>, Box<dyn std::error::Error>> {
-    // carrick.json belongs at the scan root. Read it there directly rather than
-    // walking the tree (a tree walk would pick up nested example/fixture
-    // configs in a repo that contains them).
-    let config_path = std::path::Path::new(repo_path).join("carrick.json");
-
-    let services = if config_path.is_file() {
-        debug!("Found carrick.json: {}", config_path.display());
-        Config::load_services(vec![config_path.clone()]).map_err(|e| {
-            // A config that parsed but declares something inconsistent already
-            // names the file and the offending declaration; wrapping it in the
-            // parse-failure advice would tell the user to delete a file whose
-            // only problem is one line.
-            if e.kind() == std::io::ErrorKind::InvalidInput {
-                e.to_string()
-            } else {
-                format!(
-                    "Failed to parse {}: {}. Fix the config or delete it to scan \
-                     the repo as a single zero-config service.",
-                    config_path.display(),
-                    e
-                )
-            }
-        })?
-    } else {
-        Vec::new()
-    };
-
-    // A typo'd directory would otherwise walk nothing and upload an empty
-    // service, silently erasing its coverage from the index.
-    let root = std::path::Path::new(repo_path);
-    for service in &services {
-        let label = service
-            .service_name
-            .as_deref()
-            .or(service.directory.as_deref())
-            .unwrap_or("<unnamed>");
-        if let Some(dir) = &service.directory
-            && !root.join(dir).is_dir()
-        {
-            return Err(format!(
-                "Service '{}' in {} declares directory '{}', which does not exist under '{}'",
-                label,
-                config_path.display(),
-                dir,
-                repo_path
-            )
-            .into());
-        }
-        for inc in &service.include {
-            if !root.join(inc).exists() {
-                return Err(format!(
-                    "Service '{}' in {} declares include path '{}', which does not exist under '{}'",
-                    label,
-                    config_path.display(),
-                    inc,
-                    repo_path
-                )
-                .into());
-            }
-        }
-    }
-
-    if services.is_empty() {
-        Ok(vec![Config::default()])
-    } else {
-        Ok(services)
-    }
+    crate::service_derivation::resolve(std::path::Path::new(repo_path))
+        .map(|derived| derived.services)
+        .map_err(Into::into)
 }
 
 /// Build-artifact directories to skip everywhere.

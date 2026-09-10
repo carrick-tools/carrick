@@ -6,55 +6,55 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { describeIdentity, githubIdentity, loginFromGhStatus } from "../src/init/identity.ts";
-import { findRepos, mergeWorkspace } from "../src/init/repos.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { writeConfigs, type WorkspaceProposal } from "../src/init/repos.ts";
 import {
   carrickHooks,
   hookCommand,
   mergeCarrickHooks,
   ownEntryPoint,
 } from "../src/init/settings.ts";
-import { editorLines, parseArgs } from "../src/init/run.ts";
+import { editorLines, parseArgs, init } from "../src/init/run.ts";
 
-function entries(names: Array<[string, boolean]>) {
-  return names.map(([name, isDirectory]) => ({ name, isDirectory: () => isDirectory }));
-}
-
-test("a repo is a directory here with a package.json in it", () => {
-  const found = findRepos("/ws", {
-    readdir: () =>
-      entries([
-        ["api", true],
-        ["web", true],
-        ["node_modules", true],
-        [".git", true],
-        ["dist", true],
-        ["notes", true],
-        ["README.md", false],
-      ]),
-    exists: (target) => !target.includes("notes"),
-  });
-  assert.deepEqual(found, ["./api", "./web"]);
+test("init writes a missing native proposal once and preserves racing or malformed files", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-init-"));
+  try {
+    const plan: WorkspaceProposal = { schema: "carrick.derive/0", workspace: dir, repos_detected_by: "single repository", repos_added: [], repos_excluded: [], missing: [], parent_proposal: null, repos: [{ path: dir, reason: "single repository", services: [{ serviceName: "api" }], config: { services: [{ name: "api", include: ["shared"] }] }, warnings: [] }] };
+    const target = path.join(dir, "carrick.json");
+    assert.equal(writeConfigs(plan)[0]?.created, true);
+    const bytes = fs.readFileSync(target);
+    assert.equal(writeConfigs(plan)[0]?.created, false);
+    assert.deepEqual(fs.readFileSync(target), bytes);
+    for (const body of ["{broken", '{"services":[{"name":"hand-added","include":["../shared"]}]}']) {
+      fs.writeFileSync(target, body);
+      assert.equal(writeConfigs(plan)[0]?.created, false);
+      assert.equal(fs.readFileSync(target, "utf8"), body);
+    }
+    fs.unlinkSync(target);
+    fs.mkdirSync(target);
+    assert.equal(writeConfigs(plan)[0]?.created, false);
+    assert.ok(fs.statSync(target).isDirectory());
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("the repo list keeps what a user put there, in the order they put it", () => {
-  const existing = JSON.stringify({ repos: ["./web", "../shared-client"] }, null, 2);
-  const merged = mergeWorkspace(existing, ["./api", "./web"]);
-  assert.deepEqual(merged.repos, ["./web", "../shared-client", "./api"]);
-  assert.deepEqual(merged.added, ["./api"]);
-});
-
-test("running init twice writes the same repo list", () => {
-  const first = mergeWorkspace(null, ["./api", "./web"]);
-  const second = mergeWorkspace(first.body, ["./api", "./web"]);
-  assert.equal(second.body, first.body);
-  assert.deepEqual(second.added, []);
-});
-
-test("a trailing slash or a missing ./ is the same repo, not a second one", () => {
-  const existing = JSON.stringify({ repos: ["api/", "./web"] }, null, 2);
-  const merged = mergeWorkspace(existing, ["./api", "./web"]);
-  assert.deepEqual(merged.added, []);
+test("unsigned init refuses GH_TOKEN before deriving, writing or requesting the network", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-init-"));
+  const previous = { ...process.env };
+  const fetchBefore = globalThis.fetch;
+  try {
+    process.env["XDG_CONFIG_HOME"] = dir;
+    process.env["GH_TOKEN"] = "github-is-not-carrick";
+    delete process.env["CARRICK_TOKEN"];
+    globalThis.fetch = async () => { throw new Error("must not request network"); };
+    assert.equal(await init(["--yes", "--skip-index", dir]), 1);
+    assert.deepEqual(fs.readdirSync(dir), []);
+  } finally {
+    process.env = previous;
+    globalThis.fetch = fetchBefore;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("the hook entries land beside everything else the settings file holds", () => {
@@ -90,6 +90,15 @@ test("merging twice changes nothing the second time", () => {
   assert.equal(twice.body, once.body);
   assert.equal(twice.changed, false);
   assert.equal(once.changed, true);
+});
+
+test("moving hooks between shared and local settings removes only Carrick entries", () => {
+  const before = JSON.stringify({ permissions: { allow: ["Bash(ls:*)"] }, hooks: { PostToolUse: [{ hooks: [{ type: "command", command: "eslint --fix" }] }] } });
+  const local = mergeCarrickHooks(before, '"/opt/my tools/carrick/bin/carrick.mjs"').body;
+  const cleaned = JSON.parse(mergeCarrickHooks(local, null).body);
+  assert.deepEqual(cleaned, JSON.parse(before));
+  const shared = mergeCarrickHooks(null).body;
+  assert.deepEqual(JSON.parse(mergeCarrickHooks(shared, null).body), { hooks: {} });
 });
 
 test("an entry of ours that has moved on is replaced, not duplicated", () => {
@@ -183,33 +192,6 @@ test("a quoted absolute hook command is ours too, and a lookalike is not", () =>
     (group: { hooks: Array<{ command: string }> }) => group.hooks.map((entry) => entry.command),
   );
   assert.deepEqual(commands, ["carrickctl hook post-edit", "carrick hook post-edit"]);
-});
-
-test("the identity comes from the GitHub CLI, or a token, or init stops", () => {
-  const gh = githubIdentity({ ghStatus: () => "  ✓ Logged in to github.com account octocat (keyring)" });
-  assert.deepEqual(gh.identity, { login: "octocat", source: "gh" });
-  assert.match(describeIdentity(gh.identity!), /octocat/);
-
-  const older = loginFromGhStatus("✓ Logged in to github.com as octocat (oauth_token)");
-  assert.equal(older, "octocat");
-
-  const token = githubIdentity({
-    env: { GITHUB_TOKEN: "x" },
-    ghStatus: () => {
-      throw new Error("gh: not found");
-    },
-  });
-  assert.equal(token.identity?.source, "token");
-
-  const none = githubIdentity({
-    env: {},
-    ghStatus: () => {
-      throw new Error("gh: not found");
-    },
-  });
-  assert.equal(none.identity, null);
-  assert.match(none.problem ?? "", /gh auth login/);
-  assert.match(none.problem ?? "", /GITHUB_TOKEN/);
 });
 
 // The gallery an id resolves against is that editor's own, and the three

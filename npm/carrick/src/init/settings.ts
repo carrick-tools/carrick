@@ -131,7 +131,7 @@ export type MergeResult = {
  * Throws when the existing file is not JSON: a settings file a user has hand
  * edited into invalid JSON is a thing to report, never a thing to overwrite.
  */
-export function mergeCarrickHooks(existing: string | null, command = "carrick"): MergeResult {
+export function mergeCarrickHooks(existing: string | null, command: string | null = "carrick"): MergeResult {
   const base: Record<string, unknown> =
     existing == null || existing.trim() === ""
       ? {}
@@ -142,7 +142,7 @@ export function mergeCarrickHooks(existing: string | null, command = "carrick"):
   for (const [event, groups] of Object.entries(hooksBefore)) {
     hooks[event] = withoutOurs(groups);
   }
-  for (const [event, groups] of Object.entries(carrickHooks(command))) {
+  for (const [event, groups] of Object.entries(command === null ? {} : carrickHooks(command))) {
     hooks[event] = [...((hooks[event] as HookGroup[]) ?? []), ...groups];
   }
   // An event that only ever held our entry, and no longer does, leaves no

@@ -40,6 +40,7 @@ mod receiver_type;
 mod scan_health;
 mod sdk_edges;
 mod sdk_surface;
+mod service_derivation;
 mod services;
 mod signature_pass;
 mod socket_io;

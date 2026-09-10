@@ -8,12 +8,33 @@ and in your coding agent's context, without either of them asking.
 
 ```
 npm install -g carrick
-cd ~/code            # the folder that holds your repos
+carrick login
+cd ~/code            # a repo, or the folder that holds your repos
 carrick init
 ```
 
-`carrick init` needs a GitHub identity — `gh auth login`, or a `GITHUB_TOKEN` in
-the environment — and tells you so before it writes anything.
+`carrick login` opens the browser to authorise a Carrick workspace. `init`
+requires that credential or a `CARRICK_TOKEN` environment override and verifies
+it before writing files. GitHub CLI credentials do not grant Carrick access.
+
+Credentials live in `$XDG_CONFIG_HOME/carrick/credentials.json`, falling back
+to `~/.config/carrick/` on macOS and Linux or `%APPDATA%\carrick\` on Windows.
+The file is written with mode 0600. `carrick logout` removes it; unset
+`CARRICK_TOKEN` separately if you set that override. Revoke issued keys at
+[your account](https://app.carrick.tools/account).
+
+Rust derives the same services for CI, local indexing and `init`. An existing
+`carrick.json` is authoritative. When it is missing, `init` presents workspace
+packages and their nearest `tsconfig.json`, then creates the config once.
+Review service boundaries and shared source includes before committing it.
+Repeated init preserves existing config bytes, including hand edits.
+
+Workspace detection handles a repo root or immediate sibling repositories.
+An optional `carrick-workspace.json` adds paths through `repos` and removes
+directory names through `exclude`; init preserves this file and does not
+create one. `carrick derive --workspace . --json` previews the Rust proposal
+without writing files or scanning. Deno manifest discovery does not provide
+import-map type configuration or Deno globals; the Deno support guard remains.
 
 ## What it installs
 
@@ -30,8 +51,10 @@ types runs on it.
 
 | Command | What it does |
 |---|---|
+| `carrick login` | Authorise a Carrick workspace in the browser, or verify `CARRICK_TOKEN` |
+| `carrick logout` | Remove the saved local credential |
 | `carrick init` | The repo list, the first index, the agent hooks, and the lines it cannot run for you |
-| `carrick index` | Scan every repo in `carrick-workspace.json` and write `.carrick/` |
+| `carrick index` | Derive the workspace, apply optional repo overrides and write `.carrick/` |
 | `carrick refresh [--service X]` | Re-scan one repo, or all of them, and re-join |
 | `carrick check <file>` | What the index knows about that file, verdicts included |
 | `carrick touch <file>` | The same, without the verdicts |

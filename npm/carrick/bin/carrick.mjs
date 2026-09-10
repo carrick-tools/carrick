@@ -99,6 +99,8 @@ function extraHelp() {
     "",
     "This package also carries the commands that put those answers where you work:",
     "",
+    "    carrick login                sign in to a Carrick workspace",
+    "    carrick logout               remove the saved local credential",
     "    carrick init                 set up this folder: the repos to index, the first",
     "                                 index, and the editor and agent wiring",
     "    carrick lsp --stdio          the language server, for an editor or an agent",
@@ -112,6 +114,14 @@ function extraHelp() {
 }
 
 switch (command) {
+  case "login": {
+    const { login } = await import("../dist/auth/run.js");
+    process.exit(await login(rest));
+  }
+  case "logout": {
+    const { logout } = await import("../dist/auth/run.js");
+    process.exit(logout(rest));
+  }
   case "lsp": {
     await pointAtNativeBinary();
     await import("../dist/server.js");

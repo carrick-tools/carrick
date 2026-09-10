@@ -14,6 +14,8 @@ use super::workspace::Workspace;
 /// A local command, once its arguments have been read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalCommand {
+    /// Read the shared workspace/service proposal without scanning or writing.
+    Derive { workspace: Option<PathBuf> },
     /// Scan every repo the workspace lists, and build the index.
     Index { workspace: Option<PathBuf> },
     /// What is on the other side of this file.
@@ -56,7 +58,10 @@ impl LocalCommand {
 /// argument is not one of the four names.
 pub fn parse(args: &[String]) -> Option<Result<LocalCommand, String>> {
     let name = args.first()?.as_str();
-    if !matches!(name, "index" | "touch" | "check" | "refresh" | "status") {
+    if !matches!(
+        name,
+        "derive" | "index" | "touch" | "check" | "refresh" | "status"
+    ) {
         return None;
     }
     Some(parse_command(name, &args[1..]))
@@ -99,6 +104,12 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     }
 
     match name {
+        "derive" => {
+            if workspace.is_none() {
+                workspace = positional.first().map(PathBuf::from);
+            }
+            Ok(LocalCommand::Derive { workspace })
+        }
         "index" => {
             // `carrick index <dir>` reads the same as `--workspace <dir>`;
             // both name the folder holding the repos.
@@ -146,6 +157,16 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
 /// cannot fail an edit.
 pub fn run(command: LocalCommand) -> i32 {
     match command {
+        LocalCommand::Derive { workspace } => match derive(workspace.as_deref()) {
+            Ok(proposal) => {
+                println!("{proposal}");
+                0
+            }
+            Err(error) => {
+                eprintln!("carrick derive: {error}");
+                1
+            }
+        },
         LocalCommand::Index { workspace } => match build(workspace.as_deref(), None) {
             Ok(()) => 0,
             Err(message) => {
@@ -174,6 +195,22 @@ pub fn run(command: LocalCommand) -> i32 {
         } => read(&file, workspace.as_deref(), json, Mode::Check),
         LocalCommand::Status { workspace, json } => status(workspace.as_deref(), json),
     }
+}
+
+fn derive(root: Option<&Path>) -> Result<serde_json::Value, String> {
+    let root = root
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or("Could not locate the working directory")?;
+    let workspace = Workspace::load(&root)?;
+    let mut repos = Vec::new();
+    for repo in &workspace.repos {
+        let derived = crate::service_derivation::resolve(repo)?;
+        repos.push(serde_json::json!({ "path": repo, "reason": derived.reason, "services": derived.services, "config": derived.config, "warnings": derived.warnings }));
+    }
+    Ok(
+        serde_json::json!({ "schema": "carrick.derive/0", "workspace": workspace.root, "repos_detected_by": workspace.repos_detected_by, "repos_added": workspace.repos_added, "repos_excluded": workspace.repos_excluded, "missing": workspace.missing, "parent_proposal": workspace.parent_proposal, "repos": repos }),
+    )
 }
 
 /// `status`: the workspace, with no file in the question.
@@ -206,14 +243,33 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
 
 /// `index` and `refresh`: scan, join, write, and print the map.
 fn build(root: Option<&Path>, service: Option<&str>) -> Result<(), String> {
-    let root = super::workspace::locate(root, None).ok_or_else(|| {
-        format!(
-            "no {} found here or above. Create one listing your repos, for example \
-             {{\"repos\": [\"./api\", \"./web\"]}}",
-            super::workspace::WORKSPACE_FILE
-        )
-    })?;
+    // Build detection starts where the user asked. A parent's existing index
+    // is useful to read commands, but must not widen this build's repo list.
+    let root = root
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            std::env::var(super::workspace::WORKSPACE_ENV)
+                .ok()
+                .filter(|root| !root.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or("Could not locate the working directory")?;
     let workspace = Workspace::load(&root)?;
+    if let Some(proposal) = &workspace.parent_proposal {
+        eprintln!("carrick: {}", proposal.description());
+    }
+    eprintln!(
+        "carrick: indexing {} repos ({}): {}",
+        workspace.repos.len(),
+        workspace.repos_detected_by,
+        workspace
+            .repos
+            .iter()
+            .map(|repo| repo.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     for missing in &workspace.missing {
         eprintln!(
             "carrick: {} lists '{missing}', which is not a directory on this machine — it is \
@@ -314,14 +370,16 @@ fn print_help() {
         r#"Carrick — read-only facts from your disk
 
 USAGE:
+    carrick derive  [--workspace <dir>] --json
     carrick index   [--workspace <dir>]
     carrick status  [--workspace <dir>] [--json]
     carrick touch   <file> [--workspace <dir>] [--json]
     carrick check   <file> [--workspace <dir>] [--json]
     carrick refresh [--service <name>] [--workspace <dir>]
 
-    index      Scan every repo listed in <dir>/carrick-workspace.json into
-               <dir>/.carrick/. Deterministic facts only: no model runs here.
+    derive     Print the workspace and service proposal without writing files.
+    index      Detect repositories, apply optional workspace overrides and
+               write <dir>/.carrick/. No model runs on this machine.
     status     What the workspace holds: every service, the commit it was
                indexed at, how far its repo has moved since, and its boundary.
     touch      The routes and calls in one file, and their counterparts in
@@ -329,9 +387,10 @@ USAGE:
     check      The same, plus the contract verdicts the index already holds.
     refresh    Re-scan one service (or every repo) and re-join.
 
-The workspace is the folder holding your repos and a carrick-workspace.json
-listing them: {{"repos": ["./api", "./web"]}}. `touch` and `check` find it
-above the file, or take it from --workspace or CARRICK_WORKSPACE.
+The workspace is a repository or the folder holding its sibling repositories.
+Optional carrick-workspace.json overrides add paths with `repos` and remove
+names with `exclude`. `touch` and `check` find an index above the file, or
+take its workspace from --workspace or CARRICK_WORKSPACE.
 
 Output shape: docs/local-mode-output.md (`--json` prints carrick.check/0, or
 carrick.status/0 from `status`)."#

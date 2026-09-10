@@ -1,57 +1,58 @@
-// Which directories in this folder are repos to index.
-//
-// A proposal, not a decision: the list goes into `carrick-workspace.json`,
-// which the scanner reads literally and a user can edit. There is no walk
-// deeper than one level and no search order to reason about (E20) — a repo is
-// a directory here with a `package.json` in it.
-
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { z } from "zod";
+import { nativeEnv, resolveNativeBinary } from "../native.ts";
 
-/** Directories that are never a repo, whatever they hold. */
-const NEVER = new Set(["node_modules", "dist", "build", "out", "coverage", "target"]);
+const service = z.object({ serviceName: z.string().nullable(), directory: z.string().optional(), tsconfig: z.string().optional() }).passthrough();
+const proposal = z.object({
+  schema: z.literal("carrick.derive/0"), workspace: z.string(), repos_detected_by: z.string(),
+  repos_added: z.array(z.string()), repos_excluded: z.array(z.string()), missing: z.array(z.string()),
+  parent_proposal: z.object({ directory: z.string(), repos: z.array(z.string()) }).nullable(),
+  repos: z.array(z.object({ path: z.string(), reason: z.string(), services: z.array(service), config: z.record(z.unknown()).nullable(), warnings: z.array(z.string()) })),
+});
+export type WorkspaceProposal = z.infer<typeof proposal>;
 
-export type FindOptions = {
-  readdir?: (dir: string) => Array<{ name: string; isDirectory: () => boolean }>;
-  exists?: (target: string) => boolean;
-};
-
-export function findRepos(workspace: string, options: FindOptions = {}): string[] {
-  const readdir =
-    options.readdir ?? ((dir: string) => fs.readdirSync(dir, { withFileTypes: true }));
-  const exists = options.exists ?? ((target: string) => fs.existsSync(target));
-
-  const found: string[] = [];
-  for (const entry of readdir(workspace)) {
-    if (!entry.isDirectory()) continue;
-    if (entry.name.startsWith(".") || NEVER.has(entry.name)) continue;
-    if (!exists(path.join(workspace, entry.name, "package.json"))) continue;
-    found.push(`./${entry.name}`);
-  }
-  return found.sort();
+/** Rust owns service selection, tsconfig precedence and configuration validation. */
+export function deriveWorkspace(workspace: string): WorkspaceProposal {
+  const native = resolveNativeBinary();
+  if (!native.binary) throw new Error(native.problem ?? "The Carrick scanner is not installed.");
+  const result = spawnSync(native.binary, ["derive", "--workspace", workspace, "--json"], {
+    encoding: "utf8", env: nativeEnv(), timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
+  });
+  if (result.error) throw new Error(`Could not derive the workspace: ${result.error.message}`);
+  if (result.status !== 0) throw new Error(result.stderr.trim() || "The scanner could not derive the workspace.");
+  const parsed = proposal.safeParse(JSON.parse(result.stdout));
+  if (!parsed.success) throw new Error("The scanner returned an unsupported workspace proposal. Install matching Carrick CLI and scanner versions.");
+  return parsed.data;
 }
 
-/**
- * The workspace file to write: the repos already listed, in the order they were
- * listed, plus the ones found since. Re-running init updates rather than
- * duplicates, and never reorders or drops a path a user put there by hand —
- * including one pointing outside this folder.
- */
-export function mergeWorkspace(existing: string | null, found: string[]): {
-  body: string;
-  repos: string[];
-  added: string[];
-} {
-  let listed: string[] = [];
-  if (existing) {
-    const parsed = JSON.parse(existing) as { repos?: unknown };
-    if (Array.isArray(parsed.repos)) {
-      listed = parsed.repos.filter((entry): entry is string => typeof entry === "string");
+/** An explicit init may create a missing file once, including under a race. */
+export function writeConfigs(plan: WorkspaceProposal): Array<{ path: string; created: boolean }> {
+  return plan.repos.map((repo) => {
+    const target = path.join(repo.path, "carrick.json");
+    if (repo.config === null) return { path: target, created: false };
+    try {
+      fs.writeFileSync(target, `${JSON.stringify(repo.config, null, 2)}\n`, { flag: "wx" });
+      return { path: target, created: true };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return { path: target, created: false };
+      throw error;
     }
-  }
-  const normal = (entry: string) => entry.replace(/^\.\//, "").replace(/\/$/, "");
-  const known = new Set(listed.map(normal));
-  const added = found.filter((entry) => !known.has(normal(entry)));
-  const repos = [...listed, ...added];
-  return { body: `${JSON.stringify({ repos }, null, 2)}\n`, repos, added };
+  });
+}
+
+/** Only GitHub origin identities are sent to the workspace metadata read. */
+export function githubRemote(repo: string): string | null {
+  const result = spawnSync("git", ["-C", repo, "remote", "get-url", "origin"], { encoding: "utf8", timeout: 5000 });
+  if (result.status !== 0) return null;
+  const remote = result.stdout.trim();
+  const scp = /^git@github\.com:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/.exec(remote);
+  if (scp) return scp[1]!;
+  try {
+    const url = new URL(remote);
+    if (url.hostname.toLowerCase() !== "github.com" || !["https:", "ssh:"].includes(url.protocol)) return null;
+    const name = url.pathname.replace(/^\//, "").replace(/\.git$/, "");
+    return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(name) ? name : null;
+  } catch { return null; }
 }

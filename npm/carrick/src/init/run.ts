@@ -1,26 +1,17 @@
-// `carrick init`: the one command, run in the folder that holds the repos.
-//
-// It does the four things that are otherwise four installs — the repo list,
-// the first index, the agent hooks, and the editor line — and prints the two
-// it cannot do for you. Everything it writes is a file you can read and edit
-// afterwards; nothing here is state only Carrick understands.
-//
-// Re-running it updates rather than duplicates: the repo list keeps the order
-// and the hand-written entries it already had, and the hook entries are merged
-// by command rather than replacing the settings file's `hooks` key.
+// Authenticated setup; Rust owns the workspace and service proposal.
 
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { spawnSync } from "node:child_process";
-import { describeIdentity, githubIdentity } from "./identity.ts";
-import { findRepos, mergeWorkspace } from "./repos.ts";
+import { readCredential } from "../auth/credentials.ts";
+import { resolveRepos } from "../auth/read.ts";
+import { deriveWorkspace, writeConfigs, githubRemote } from "./repos.ts";
+import { connectRepos } from "./connect.ts";
 import { hookCommand, mergeCarrickHooks } from "./settings.ts";
 import { renderTemplate } from "../templates.ts";
 import { resolveNativeBinary, nativeEnv, packageRoot } from "../native.ts";
 
-const WORKSPACE_FILE = "carrick-workspace.json";
-const SETTINGS_FILE = path.join(".claude", "settings.json");
 const MCP_LINE = "claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp";
 const EXTENSION_ID = "carrick-tools.carrick";
 
@@ -67,8 +58,8 @@ function help(): string {
   return [
     "carrick init [DIRECTORY]",
     "",
-    "Set up the folder that holds your repos: the list to index, the first index,",
-    "and the wiring that puts its answers where you work.",
+    "Sign in with carrick login, then configure services, hooks and the first",
+    "index in a repository or a folder of repos.",
     "",
     "    -w, --workspace DIR  The folder holding the repos (default: this one)",
     "    -y, --yes            Take the repo list as proposed",
@@ -149,52 +140,73 @@ export async function init(argv: string[]): Promise<number> {
     return 1;
   }
 
-  // 1. Who is asking. There is no anonymous tier: the local index draws on the
-  //    identified free tier's allowance, so this is the first question and not
-  //    a thing to discover halfway through a scan.
-  const lookup = githubIdentity();
-  if (!lookup.identity) {
-    process.stderr.write(`${lookup.problem}\n`);
-    return 1;
-  }
-  say(describeIdentity(lookup.identity));
-  say();
-
-  // 2. The repos, proposed and confirmed.
-  const workspaceFile = path.join(workspace, WORKSPACE_FILE);
-  const existing = fs.existsSync(workspaceFile) ? fs.readFileSync(workspaceFile, "utf8") : null;
-  const found = findRepos(workspace);
-  const merged = mergeWorkspace(existing, found);
-  if (merged.repos.length === 0) {
-    process.stderr.write(
-      `carrick init: no repos in ${workspace}. Carrick indexes the directories beside each other, so run it in the folder that holds them, or pass one: carrick init ~/code\n`,
-    );
-    return 1;
-  }
-  say(`Repos to index, in ${workspace}:`);
-  for (const repo of merged.repos) {
-    say(`  ${repo}${merged.added.includes(repo) ? "  (new)" : ""}`);
-  }
-  say();
-  if (!parsed.assumeYes && merged.added.length > 0) {
-    const ok = await confirm("Index these?");
-    if (!ok) {
-      say(`Nothing written. Edit ${WORKSPACE_FILE} yourself and run carrick index.`);
-      return 0;
+  // Authentication and all derivation validation precede local writes.
+  let plan: ReturnType<typeof deriveWorkspace>;
+  try {
+    const credential = readCredential();
+    if (!credential) throw new Error("carrick init requires a Carrick login. Run carrick login, or set CARRICK_TOKEN.");
+    plan = deriveWorkspace(workspace);
+    const names = [...new Set(plan.repos.map((repo) => githubRemote(repo.path)).filter((name): name is string => name !== null))];
+    if (names.length > 200) throw new Error("This workspace has more than 200 GitHub repos. Initialise smaller workspace groups.");
+    const identity = await connectRepos(credential.token, names, await resolveRepos(credential.token, names), { interactive: process.stdin.isTTY === true, say });
+    say(`Carrick workspace: ${identity.workspace.slug}`);
+    if (identity.allowance_sentence) say(identity.allowance_sentence);
+    for (const repo of identity.repos) {
+      if (!repo.connected) say(`${repo.full_name} is not connected to this Carrick workspace.`);
+      else if (repo.services.length === 0) {
+        say(`${repo.full_name} is connected and has no hosted index yet.`);
+        say("  Add the workflow in that repo: carrick templates workflow > .github/workflows/carrick.yml");
+      }
     }
+  } catch (error) {
+    process.stderr.write(`carrick init: ${(error as Error).message}\n`);
+    return 1;
   }
-  const wrote = writeIfChanged(workspaceFile, merged.body);
-  say(`${wrote === "written" ? "wrote" : "unchanged"}  ${WORKSPACE_FILE}`);
+  say(`Repos to index, in ${plan.workspace} (${plan.repos_detected_by}):`);
+  if (plan.parent_proposal) {
+    const parent = plan.parent_proposal;
+    say(`The parent folder ${parent.directory} holds ${parent.repos.length} repo(s): ${parent.repos.join(", ")}. Run carrick init .. to initialise that workspace.`);
+  }
+  for (const repo of plan.repos) {
+    say(`  ${repo.path} (${repo.reason})`);
+    for (const service of repo.services) {
+      say(`    ${service.serviceName ?? "<repository>"}: directory ${service.directory ?? "."}, tsconfig ${service.tsconfig ?? "scanner default"}`);
+    }
+    for (const warning of repo.warnings) say(`    ${warning}`);
+  }
+  for (const missing of plan.missing) say(`Missing workspace override: ${missing}`);
+  if (!parsed.assumeYes) {
+    if (!process.stdin.isTTY) {
+      process.stderr.write("carrick init: use --yes to accept this proposal without a terminal.\n");
+      return 1;
+    }
+    if (!await confirm("Create missing configs and configure hooks?")) return 0;
+  }
+  try {
+    for (const result of writeConfigs(plan)) say(`${result.created ? "wrote" : "unchanged"}  ${result.path}`);
+    // Revalidate any file that appeared between preview and exclusive create.
+    deriveWorkspace(workspace);
+  } catch (error) {
+    process.stderr.write(`carrick init: ${(error as Error).message}\n`);
+    return 1;
+  }
+  say("Review carrick.json service boundaries and shared includes before committing it.");
 
   // 3. The agent hooks. Merged by command: this file may already hold a user's
   //    own hooks, or the hook pack the hosted index installs.
-  const settingsFile = path.join(workspace, SETTINGS_FILE);
-  const settings = fs.existsSync(settingsFile) ? fs.readFileSync(settingsFile, "utf8") : null;
   const command = hookCommand({ onPath });
+  const settingsName = path.join(".claude", command.bare ? "settings.json" : "settings.local.json");
+  const settingsFile = path.join(workspace, settingsName);
   try {
+    const settings = fs.existsSync(settingsFile) ? fs.readFileSync(settingsFile, "utf8") : null;
+    const otherFile = path.join(workspace, ".claude", command.bare ? "settings.local.json" : "settings.json");
+    const other = fs.existsSync(otherFile) ? fs.readFileSync(otherFile, "utf8") : null;
+    const cleaned = other === null ? null : mergeCarrickHooks(other, null);
     const hooks = mergeCarrickHooks(settings, command.command);
+    // Validate both documents before migrating our entries between them.
+    if (cleaned?.changed) writeIfChanged(otherFile, cleaned.body);
     const wroteHooks = writeIfChanged(settingsFile, hooks.body);
-    say(`${wroteHooks === "written" ? "wrote" : "unchanged"}  ${SETTINGS_FILE}`);
+    say(`${wroteHooks === "written" ? "wrote" : "unchanged"}  ${settingsName}`);
     if (!command.bare) {
       say(
         `         \`carrick\` is not on PATH here, so those hooks name this install: ${command.command}.`,
@@ -209,7 +221,7 @@ export async function init(argv: string[]): Promise<number> {
     }
   } catch (error) {
     say(
-      `skipped  ${SETTINGS_FILE}: it is not valid JSON (${(error as Error).message}). Fix it and run carrick init again; nothing was overwritten.`,
+      `Could not configure Carrick hooks: ${(error as Error).message}. Fix the settings files and run carrick init again.`,
     );
   }
 
@@ -248,7 +260,7 @@ export async function init(argv: string[]): Promise<number> {
   say();
   for (const line of editorLines(onPath)) say(line);
   say();
-  say(`Start Claude Code in this folder — the hooks above are ${SETTINGS_FILE} here, and`);
+  say(`Start Claude Code in this folder — the hooks above are ${settingsName} here, and`);
   say("the index covers every repo in it. The hooks need no plugin; the language server does:");
   const plugin = path.join(packageRoot(), "plugin");
   say(`    claude --plugin-dir ${fs.existsSync(plugin) ? plugin : "<carrick checkout>/plugin"}`);

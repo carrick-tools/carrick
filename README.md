@@ -194,7 +194,7 @@ When Carrick sees a call like `fetch(process.env.ORDER_SERVICE_URL + '/orders')`
 
 ### Monorepos
 
-`carrick.json` is optional — with no config (or a flat config like above) Carrick scans the repo as a single service. To index several services from one repository (e.g. a set of lambdas plus a dashboard), declare them with a `services` array instead. Each entry is scanned independently and indexed as its own service:
+`carrick.json` is optional. Without it, Carrick derives services from npm or pnpm workspace manifests; a plain repo is one service. An explicit config takes precedence over derivation. To set service boundaries and shared source includes, declare a `services` array. Each entry is scanned independently and indexed as its own service:
 
 ```json
 {
