@@ -11,11 +11,21 @@
 // what the server said and when.
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { pluginDir } from "./helpers.ts";
 
 export type Publish = { uri: string; diagnostics: unknown[] };
+
+/** What an editor would have in the buffer for a file it just opened. */
+function readText(file: string): string {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return "";
+  }
+}
 
 export class LspClient {
   private readonly child: ChildProcessWithoutNullStreams;
@@ -134,14 +144,28 @@ export class LspClient {
     });
   }
 
-  open(file: string): void {
+  /**
+   * `didOpen`, carrying the document's text the way a real client does.
+   *
+   * The text is what the server widens a diagnostic's range to (carrick#922),
+   * so a client that sent nothing would leave every row on its fallback range
+   * and a probe would report a fix that is not there. `text` states a buffer
+   * that differs from the file on disk, which is what an unsaved edit is.
+   */
+  open(file: string, text?: string): void {
     this.notify("textDocument/didOpen", {
       textDocument: {
         uri: pathToFileURL(file).toString(),
         languageId: "typescript",
         version: 1,
-        text: "",
+        text: text ?? readText(file),
       },
+    });
+  }
+
+  close(file: string): void {
+    this.notify("textDocument/didClose", {
+      textDocument: { uri: pathToFileURL(file).toString() },
     });
   }
 
@@ -150,10 +174,11 @@ export class LspClient {
     this.notify("workspace/didChangeConfiguration", { settings: { carrick } });
   }
 
-  change(file: string, version: number): void {
+  /** `didChange` at the sync kind this server declares: the whole document. */
+  change(file: string, version: number, text?: string): void {
     this.notify("textDocument/didChange", {
       textDocument: { uri: pathToFileURL(file).toString(), version },
-      contentChanges: [{ text: "" }],
+      contentChanges: [{ text: text ?? readText(file) }],
     });
   }
 
