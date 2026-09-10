@@ -4753,8 +4753,10 @@ mod tests {
           }});
         "#, serde_json::to_string(&log).unwrap())).unwrap();
         let sidecar = TypeSidecar::spawn(&fake).unwrap();
+        std::fs::write(root.join("api/tsconfig.json"), "{}").unwrap();
         let member = Config {
             directory: Some("api".into()),
+            tsconfig: Some("tsconfig.json".into()),
             ..Config::default()
         };
         scope_sidecar_to_service(Some(&sidecar), root.to_str().unwrap(), &member);
@@ -4825,6 +4827,11 @@ mod tests {
             Path::new(capture["repo_root"].as_str().unwrap()),
             root.join("api")
         );
+        assert_eq!(
+            capture["tsconfig_path"], "tsconfig.json",
+            "capture must preserve the explicit compiler configuration used by init"
+        );
+        assert_eq!(inits[0]["tsconfig_path"], capture["tsconfig_path"]);
         for anchor in capture["anchors"].as_array().unwrap() {
             let source = root
                 .join("api")
@@ -4848,6 +4855,10 @@ mod tests {
             .find(|r| r["action"] == "capture_v2")
             .unwrap();
         assert_eq!(Path::new(root_capture["repo_root"].as_str().unwrap()), root);
+        assert!(
+            root_capture.get("tsconfig_path").is_none(),
+            "root capture must not retain the previous service's config"
+        );
         assert!(
             root_capture["anchors"]
                 .as_array()

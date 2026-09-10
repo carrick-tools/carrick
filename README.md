@@ -2,7 +2,7 @@
 
 Carrick is a live, type-aware, intent-aware cross-repo index of every TypeScript service in your GitHub org, exposed to AI coding agents over the Model Context Protocol.
 
-> Carrick is TypeScript only. Any `package.json`-based project works, whichever package manager you use — npm, pnpm, Yarn, or Bun. When a lockfile sits at the path being scanned, the action installs your dependencies with lifecycle scripts disabled, so a type that resolves through a package is a real type rather than `any`; with no lockfile it scans the checkout as it stands, and one input turns the install off entirely ([details](#dependencies)). Deno-native projects (no `package.json`) aren't supported yet. Cross-repo features need at least two services indexed in the same GitHub org; a single-service install still gets same-repo validation.
+> Carrick scans TypeScript projects using npm, pnpm, Yarn, Bun, or Deno. Deno projects require Deno 2.9.4 or newer; the Action supplies the runtime and reads existing `deno.json` or `deno.jsonc` manifests. Dependency preparation disables lifecycle scripts ([details](#dependencies)). Cross-repo features need at least two services indexed in the same Carrick project; a single-service install still gets same-repo validation.
 
 **Get started:** sign up at [app.carrick.tools](https://app.carrick.tools) · full documentation at [docs.carrick.tools](https://docs.carrick.tools)
 
@@ -77,13 +77,28 @@ Pull requests opened from forks are skipped gracefully: GitHub withholds OIDC cr
 
 ### Dependencies
 
-Types that resolve through a package need that package on disk. On a checkout with no `node_modules`, every import from a dependency resolves to the compiler's error type and the endpoint types Carrick indexes collapse to `any`. So the action installs the scanned repo's dependencies before it scans:
+Package types need their dependencies on disk. Node projects use installed `node_modules`, and Deno projects use the Deno dependency cache. The Action prepares those dependencies before analysis:
 
-- It runs only when a lockfile sits at the path being analyzed. The lockfile picks the manager: `package-lock.json` runs `npm ci`, `pnpm-lock.yaml` runs `pnpm install --frozen-lockfile`, `yarn.lock` runs `yarn install`, `bun.lock`/`bun.lockb` runs `bun install`.
+- For Node projects, installation runs when a lockfile sits at the path being analyzed. The lockfile picks the manager: `package-lock.json` runs `npm ci`, `pnpm-lock.yaml` runs `pnpm install --frozen-lockfile`, `yarn.lock` runs `yarn install`, `bun.lock`/`bun.lockb` runs `bun install`.
 - Lifecycle scripts are disabled in every case, so nothing in your repo executes during a scan.
-- The install is time-boxed to five minutes and is never fatal. If it fails or runs long, the action prints a warning and scans the checkout as it stands, exactly as it did before.
-- Nothing is installed if `node_modules` is already there, so a workflow that installs its own dependencies first is left alone. In a monorepo the install happens once at the path being scanned, not per service.
+- Each install command has a five-minute timeout. A failed or timed-out install prints a warning, and analysis continues with the available dependencies; missing type prerequisites are reported by the scanner.
+- Existing `node_modules` skips the Node install. A Deno manifest at the scan root still triggers Deno cache preparation. In a monorepo preparation happens at the path being scanned.
 - The package manager's download cache is restored between runs, keyed on the lockfile's hash.
+
+For Deno roots the Action runs `deno install --frozen --node-modules-dir=none`.
+This prepares the Deno dependency cache and prevents npm lifecycle scripts from
+running even when the project authorizes them through `allowScripts`. A root
+with both Node and Deno configuration prepares both dependency stores. Before
+local indexing, install Deno 2.9.4 or newer and run the same preparation command
+from the Deno workspace root. Projects that import generated declarations must
+generate those declarations through their normal build before indexing.
+
+Deno services normally omit `tsconfig` and use their nearest Deno manifest.
+An explicit ordinary TypeScript config selects the TypeScript path. An explicit
+Deno config must name that nearest manifest; `deno.json` takes precedence over
+`deno.jsonc` when both exist. Import maps must be local files. Nested Deno roots
+without a Deno manifest at the Action's scan root need dependency preparation
+in their own workspace before the Carrick step.
 
 Turn it off with:
 
@@ -225,7 +240,7 @@ When Carrick sees a call like `fetch(process.env.ORDER_SERVICE_URL + '/orders')`
 | `name` | Service name (alias for `serviceName` inside a `services` entry) |
 | `directory` | Service root, relative to `carrick.json`. Files outside every declared directory are ignored |
 | `include` | Extra source roots to pull in for type/function resolution (e.g. shared libraries copied in at build time), relative to `carrick.json` |
-| `tsconfig` | Path to this service's `tsconfig.json`, relative to `directory`. Scopes type extraction to the service |
+| `tsconfig` | Optional TypeScript config path, relative to `directory`. Deno services normally omit this field and use their nearest Deno manifest |
 
 Alongside `services`, the optional top-level `includes` map declares classification for a shared source root once. See [Declaring a shared root once](#declaring-a-shared-root-once).
 

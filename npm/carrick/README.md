@@ -1,10 +1,9 @@
 # carrick
 
-Carrick indexes the TypeScript repos sitting beside each other on your disk and
-answers, about the file you are editing right now: which routes and calls are in
-it, who is on the other side of them in the other repos, and whether the
-contract between them still holds. It answers in your editor's Problems panel
-and in your coding agent's context, without either of them asking.
+Carrick indexes local TypeScript repositories and identifies the routes and
+calls in the file you are editing, their counterparts in indexed repositories,
+and whether their contracts agree. Configured editors show diagnostics, and
+coding agents can receive context through supported hooks or explicit checks.
 
 ```
 npm install -g carrick
@@ -42,7 +41,7 @@ The file is written with mode 0600. `carrick logout` removes it; unset
 
 Rust derives the same services for CI, local indexing and `init`. An existing
 `carrick.json` is authoritative. When it is missing, `init` presents workspace
-packages and their nearest `tsconfig.json`, then creates the config once.
+packages and their compiler configuration, then creates the config once.
 Review service boundaries and shared source includes before committing it.
 Repeated init preserves existing config bytes, including hand edits.
 
@@ -50,19 +49,32 @@ Workspace detection handles a repo root or immediate sibling repositories.
 An optional `carrick-workspace.json` adds paths through `repos` and removes
 directory names through `exclude`; init preserves this file and does not
 create one. `carrick derive --workspace . --json` previews the Rust proposal
-without writing files or scanning. Deno manifest discovery does not provide
-import-map type configuration or Deno globals; the Deno support guard remains.
+without writing files or scanning.
+
+Deno projects use their existing `deno.json` or `deno.jsonc` and require Deno
+2.9.4 or newer on PATH. Before local indexing, prepare their dependencies with
+`deno install --frozen --node-modules-dir=none` from the Deno workspace root;
+this prevents npm lifecycle scripts from running even when `allowScripts`
+authorizes them. Generate any application-owned declarations through the
+project's normal build before indexing.
+
+Deno services normally omit `tsconfig`. An explicit ordinary TypeScript config
+selects the TypeScript path; an explicit Deno config must be the nearest Deno
+manifest, with `deno.json` taking precedence over `deno.jsonc`. Import maps must
+be local files.
 
 ## What it installs
 
-One package. The scanner is a Rust binary that arrives as
+The scanner is a Rust binary that arrives as
 `@carrick-tools/cli-<platform>-<arch>`, an optional dependency npm resolves by
 `os` and `cpu`; the type sidecar, the language server and the hook scripts come
-with this package. There is no postinstall step and nothing is downloaded after
-the install, so `--ignore-scripts` works.
+with this package. Installing Carrick requires no postinstall script, so
+`--ignore-scripts` works. Dependency preparation and type checking during indexing
+can download registry packages; `index` and `refresh` can also download
+authenticated hosted indexes.
 
-Node 24 or newer, because the sidecar that resolves your request and response
-types runs on it.
+Node 24 or newer is required because the sidecar resolves request and response
+types in a Node process.
 
 ## The commands
 
@@ -91,8 +103,9 @@ for the machine-readable shape, pinned in
 - **Claude Code**: the hooks `carrick init` writes deliver on the edit itself.
   `claude --plugin-dir <carrick checkout>/plugin` adds the language server too.
 - **VS Code, Cursor, Windsurf**: the `carrick-tools.carrick` extension is a
-  client on `carrick lsp --stdio`. Editor-hosted agents read the Problems panel
-  after their own edits.
+  client on `carrick lsp --stdio` and publishes diagnostics in the Problems
+  panel. Whether an editor-hosted agent reads those diagnostics depends on its
+  integration and configuration.
 - **Neovim, Helix, Zed, JetBrains**: any LSP client, on the same command.
 - **Anything else**: `carrick check <file>` on demand, and the pull request
   check in CI.
@@ -122,15 +135,17 @@ sends the same keys, with the `carrick.` prefix stripped, as
 
 ## What a local index holds
 
-Deterministic rows: file-based and descriptor routes, class-controller routes,
-imported-member calls, GraphQL schema and document rows, socket and pub/sub
-operations, and the types on both sides of them. A route registered on a typed
-receiver, and a call whose URL is assembled at the call site, are classified in
-the hosted index and are absent here — every answer says how many of those it
-counted and did not classify, so a thin answer never reads as an empty one.
+A local index holds deterministic routes, calls, protocol operations and their
+types, together with eligible hosted model answers. `index` and `refresh` read
+authenticated hosted indexes and replay answers for unchanged files when the
+hosted commit is available locally and cache versions match. Changed files
+keep their local facts while their hosted model answers are withheld. Boundary
+rows report enrichment status and remaining unclassified candidates; no model
+runs on the local machine.
 
-The hosted index covers every repo in your organisation on its main branch,
-including the ones you do not have checked out, and answers over MCP:
+Hosted queries cover connected, indexed repositories in the selected Carrick
+project, including repositories absent from this disk, using their most recent
+default-branch indexes. They are available over MCP:
 
 ```
 claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp
