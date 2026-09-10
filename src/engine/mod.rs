@@ -7021,6 +7021,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn discovery_keeps_imported_class_private_members_inaccessible() {
+        let repo = format!(
+            "{}/tests/fixtures/member-accessibility",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let cm: Lrc<SourceMap> = Default::default();
+        let (_, _, definitions, _) =
+            discover_files_and_symbols(&repo, &Config::default(), cm).unwrap();
+        for name in ["Surface.run", "Surface.create", "consume"] {
+            assert!(definitions[name].is_exported, "{name} is public");
+        }
+        for name in [
+            "Surface.hidden",
+            "Surface.inherited",
+            "Surface.#secret",
+            "Surface.reset",
+            "Surface.state",
+            "Surface.action",
+            "Surface.#privateAction",
+        ] {
+            assert!(
+                !definitions[name].is_exported,
+                "importing Surface must not promote {name}"
+            );
+        }
+        assert!(
+            definitions["Surface.run"]
+                .calls
+                .iter()
+                .any(|call| call.name == "Surface.hidden"),
+            "private members remain indexed and callable within the class"
+        );
+    }
+
     /// Discovery resolves call edges on a real checkout, not just in the
     /// resolver's own unit tests. `Ledger.scrape` (src/index.ts:27) calls
     /// `auditLog`, imported from `./util/audit.js` — so this covers the whole

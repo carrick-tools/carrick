@@ -733,6 +733,8 @@ pub struct FunctionDefinitionExtractor {
     /// instance member — the one case where `Class.member` would collide on a
     /// single key. The static side is keyed `Class.static.member` instead.
     current_class_collisions: HashSet<String>,
+    /// Members whose AST accessibility prevents callers outside the class hierarchy.
+    inaccessible_members: HashSet<String>,
 }
 
 impl FunctionDefinitionExtractor {
@@ -752,6 +754,7 @@ impl FunctionDefinitionExtractor {
             exported_names: HashSet::new(),
             current_class: None,
             current_class_collisions: HashSet::new(),
+            inaccessible_members: HashSet::new(),
         }
     }
 
@@ -1016,14 +1019,17 @@ impl FunctionDefinitionExtractor {
 
     /// Mark functions as exported based on collected export names.
     /// Call this after `module.visit_with()` completes.
-    /// A class member (`Class.member`) is exported iff its class is.
+    /// A class member (`Class.member`) is exported only when its class is
+    /// exported and the member is accessible outside the class hierarchy.
     pub fn finalize_exports(&mut self) {
         for (name, def) in self.function_definitions.iter_mut() {
             let exported = self.exported_names.contains(name)
                 || name
                     .split_once('.')
                     .is_some_and(|(class_name, _)| self.exported_names.contains(class_name));
-            if exported {
+            if self.inaccessible_members.contains(name) {
+                def.is_exported = false;
+            } else if exported {
                 def.is_exported = true;
             }
         }
@@ -1053,6 +1059,7 @@ impl FunctionDefinitionExtractor {
                 ClassMember::Method(m) => (Self::prop_name_to_string(&m.key), m.is_static),
                 ClassMember::ClassProp(p) => (Self::prop_name_to_string(&p.key), p.is_static),
                 ClassMember::PrivateMethod(m) => (Some(format!("#{}", m.key.name)), m.is_static),
+                ClassMember::PrivateProp(p) => (Some(format!("#{}", p.key.name)), p.is_static),
                 _ => continue,
             };
             if let Some(name) = name {
@@ -1609,6 +1616,12 @@ impl Visit for FunctionDefinitionExtractor {
             && let Some(member_name) = Self::prop_name_to_string(&method.key)
         {
             let name = self.member_key(&class_name, &member_name, method.is_static);
+            if matches!(
+                method.accessibility,
+                Some(Accessibility::Private | Accessibility::Protected)
+            ) {
+                self.inaccessible_members.insert(name.clone());
+            }
             self.insert_method_definition(name, &method.function);
         }
         method.visit_children_with(self);
@@ -1621,6 +1634,7 @@ impl Visit for FunctionDefinitionExtractor {
         {
             let member_name = format!("#{}", method.key.name);
             let name = self.member_key(&class_name, &member_name, method.is_static);
+            self.inaccessible_members.insert(name.clone());
             self.insert_method_definition(name, &method.function);
         }
         method.visit_children_with(self);
@@ -1635,6 +1649,30 @@ impl Visit for FunctionDefinitionExtractor {
             && let Some(init) = &prop.value
         {
             let name = self.member_key(&class_name, &member_name, prop.is_static);
+            if matches!(
+                prop.accessibility,
+                Some(Accessibility::Private | Accessibility::Protected)
+            ) {
+                self.inaccessible_members.insert(name.clone());
+            }
+            match &**init {
+                Expr::Arrow(arrow) => self.insert_arrow_definition(name, arrow),
+                Expr::Fn(fn_expr) => self.insert_method_definition(name, &fn_expr.function),
+                _ => {}
+            }
+        }
+        prop.visit_children_with(self);
+    }
+
+    /// ECMAScript private fields use a distinct AST node from TypeScript's
+    /// accessibility-modified class properties, but retain the same callable facts.
+    fn visit_private_prop(&mut self, prop: &PrivateProp) {
+        if let Some(class_name) = self.current_class.clone()
+            && let Some(init) = &prop.value
+        {
+            let member_name = format!("#{}", prop.key.name);
+            let name = self.member_key(&class_name, &member_name, prop.is_static);
+            self.inaccessible_members.insert(name.clone());
             match &**init {
                 Expr::Arrow(arrow) => self.insert_arrow_definition(name, arrow),
                 Expr::Fn(fn_expr) => self.insert_method_definition(name, &fn_expr.function),
@@ -2399,6 +2437,92 @@ mod tests {
             .get("Local.run")
             .expect("instance method should be indexed");
         assert!(!def.is_exported);
+    }
+
+    #[test]
+    fn class_member_accessibility_controls_exports() {
+        for export in [
+            "export class Surface",
+            "export default class Surface",
+            "class Surface",
+        ] {
+            let source = format!(
+                r#"{export} {{
+                constructor() {{}}
+                public run() {{}}
+                implicit() {{}}
+                private hidden() {{}}
+                protected inherited() {{}}
+                #secret() {{}}
+                public static create() {{}}
+                private static hiddenStatic() {{}}
+                protected static inheritedStatic() {{}}
+                static #secretStatic() {{}}
+                public get readable() {{ return 1; }}
+                private get hiddenValue() {{ return 1; }}
+                protected get inheritedValue() {{ return 1; }}
+                get #secretValue() {{ return 1; }}
+                set readable(value: number) {{}}
+                private set writeOnly(value: number) {{}}
+                public arrow = () => 1;
+                private hiddenArrow = () => 1;
+                protected inheritedArrow = () => 1;
+                private static hiddenFn = function() {{ return 1; }};
+                #secretArrow = () => 1;
+                static #secretFn = function() {{ return 1; }};
+                public static shared() {{}}
+                private shared() {{}}
+            }}"#
+            );
+            let defs = extract(&source);
+            for member in [
+                "run",
+                "implicit",
+                "create",
+                "readable",
+                "arrow",
+                "static.shared",
+            ] {
+                let def = &defs[&format!("Surface.{member}")];
+                assert_eq!(
+                    def.is_exported,
+                    export.starts_with("export"),
+                    "{export}: {member}"
+                );
+            }
+            for member in [
+                "hidden",
+                "inherited",
+                "#secret",
+                "hiddenStatic",
+                "inheritedStatic",
+                "#secretStatic",
+                "hiddenValue",
+                "inheritedValue",
+                "#secretValue",
+                "hiddenArrow",
+                "inheritedArrow",
+                "hiddenFn",
+                "#secretArrow",
+                "#secretFn",
+                "shared",
+            ] {
+                let def = &defs[&format!("Surface.{member}")];
+                assert!(
+                    !def.is_exported,
+                    "{export}: {member} must remain inaccessible"
+                );
+                assert_eq!(serde_json::to_value(def).unwrap()["is_exported"], false);
+            }
+            // Constructors and setters have no standalone row in the current index.
+            assert!(!defs.contains_key("Surface.constructor"));
+            assert!(!defs.contains_key("Surface.writeOnly"));
+            assert_eq!(defs.len(), 21);
+        }
+        let defs =
+            extract("class Surface { private hidden() {} public run() {} } export { Surface };");
+        assert!(!defs["Surface.hidden"].is_exported);
+        assert!(defs["Surface.run"].is_exported);
     }
 
     #[test]
