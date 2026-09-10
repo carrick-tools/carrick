@@ -100,6 +100,56 @@ export function rangeAt(line: number | undefined, col: number | undefined): Rang
 }
 
 /**
+ * The text of one 1-based line of a file, or null when it cannot be read.
+ *
+ * The server backs this with the document the client has open, and with the
+ * file on disk for a counterpart file nobody opened (server.ts). Injectable so
+ * a test can state a line without a file.
+ */
+export type LineText = (absFile: string, line: number) => string | null;
+
+/**
+ * What a diagnostic underlines on its line: first non-whitespace to last
+ * (carrick#922).
+ *
+ * The index stores line-only locators, so there is no column span to publish
+ * and a one-character range marks the indent rather than the code. The line's
+ * own text is the span: an editor underlines the statement, and a reader who
+ * cannot see the Problems list still knows which line is meant.
+ *
+ * `col` is deliberately not used to start the span. The locators the index
+ * holds are line-only and the column, when a payload carries one, is where a
+ * pass happened to anchor rather than where the statement begins. Without the
+ * line's text there is nothing to widen to and the one-character range stands.
+ *
+ * Characters are UTF-16 code units, which is what LSP means by `character` at
+ * the default position encoding and what a JavaScript string index already is.
+ * A line with a multi-byte character before the code is therefore right by
+ * construction here, which is not true of the byte offsets the scanner sends
+ * the sidecar (carrick#805).
+ */
+export function lineSpan(
+  file: string,
+  line: number | undefined,
+  col: number | undefined,
+  lineText: LineText | undefined,
+): Range {
+  const fallback = rangeAt(line, col);
+  if (!lineText) return fallback;
+  const text = lineText(file, line ?? 1);
+  if (text == null) return fallback;
+  const end = text.trimEnd().length;
+  // A blank line has nothing to underline, and a zero-width range renders as
+  // nothing at all, so the one-character range stands there too.
+  if (end === 0) return fallback;
+  const start = text.length - text.trimStart().length;
+  return {
+    start: { line: fallback.start.line, character: start },
+    end: { line: fallback.start.line, character: end },
+  };
+}
+
+/**
  * A routing finding: a result with no type verdict behind it.
  *
  * `method_mismatch` and `producer_removed` are read off two deterministic rows
@@ -200,6 +250,11 @@ export type DiagnosticOptions = {
   exists?: (target: string) => boolean;
   /** The switches the client stated. Every surface is on when it stated none. */
   surfaces?: Surfaces;
+  /**
+   * The text of a line, for the span each row underlines (carrick#922). Without
+   * it every row keeps the one-character range the locator alone can state.
+   */
+  lineText?: LineText;
 };
 
 /** Every resolvable counterpart of one item, one entry per file it lands in. */
@@ -239,9 +294,9 @@ function groupCounterparts(
 }
 
 /** The eleventh row: what was not shown, and the command that shows it. */
-function overflowRow(hidden: number, where: string, checkedFile: string): Diagnostic {
+function overflowRow(hidden: number, where: string, checkedFile: string, range: Range): Diagnostic {
   return {
-    range: rangeAt(1, 1),
+    range,
     severity: SEVERITY.warning,
     code: "capped",
     source: SOURCE,
@@ -274,6 +329,7 @@ export function capDiagnostics(
   byFile: Map<string, Diagnostic[]>,
   checkedAbs: string,
   checkedFile: string,
+  lineText?: LineText,
 ): Map<string, Diagnostic[]> {
   const order = [
     ...(byFile.has(checkedAbs) ? [checkedAbs] : []),
@@ -305,7 +361,9 @@ export function capDiagnostics(
     unstated += file.shown.length - take;
     if (file.hidden > 0) {
       if (budget > 0 && take === file.shown.length) {
-        rows.push(overflowRow(file.hidden, "in this file", checkedFile));
+        rows.push(
+          overflowRow(file.hidden, "in this file", checkedFile, lineSpan(file.file, 1, 1, lineText)),
+        );
         budget -= 1;
       } else {
         unstated += file.hidden;
@@ -315,7 +373,14 @@ export function capDiagnostics(
   }
   if (unstated > 0) {
     const rows = capped.get(checkedAbs) ?? [];
-    rows.push(overflowRow(unstated, "elsewhere in this check", checkedFile));
+    rows.push(
+      overflowRow(
+        unstated,
+        "elsewhere in this check",
+        checkedFile,
+        lineSpan(checkedAbs, 1, 1, lineText),
+      ),
+    );
     capped.set(checkedAbs, rows);
   }
   // The boundary is appended last, after every overflow row, because it is the
@@ -344,6 +409,7 @@ export function toDiagnostics(
 ): Map<string, Diagnostic[]> {
   const exists = options.exists ?? defaultExists;
   const surfaces = options.surfaces ?? DEFAULT_SURFACES;
+  const lineText = options.lineText;
   const byFile = new Map<string, Diagnostic[]>();
   if (result.error) return byFile;
 
@@ -368,13 +434,13 @@ export function toDiagnostics(
         group.sites.map((counterpart) => ({
           location: {
             uri: pathToFileURL(group.target).toString(),
-            range: rangeAt(counterpart.line, 1),
+            range: lineSpan(group.target, counterpart.line, 1, lineText),
           },
           message: counterpartPhrase(counterpart),
         })),
       );
       const diagnostic: Diagnostic = {
-        range: rangeAt(item.line, item.col),
+        range: lineSpan(checkedAbs, item.line, item.col, lineText),
         severity,
         source: SOURCE,
         message: messageOf(item),
@@ -395,7 +461,7 @@ export function toDiagnostics(
           .filter((line): line is number => typeof line === "number");
         const also = alsoAt.length ? ` Also at line ${alsoAt.join(", ")} in this file.` : "";
         const mirrored: Diagnostic = {
-          range: rangeAt(first.line, 1),
+          range: lineSpan(group.target, first.line, 1, lineText),
           severity,
           source: SOURCE,
           message: `${counterpartPhrase(first)} of ${result.file ?? checkedFile}.${also} ${messageOf(item)}`,
@@ -411,7 +477,7 @@ export function toDiagnostics(
         0,
       );
       put(checkedAbs, {
-        range: rangeAt(1, 1),
+        range: lineSpan(checkedAbs, 1, 1, lineText),
         severity: SEVERITY.warning,
         code: "producer_removed",
         source: SOURCE,
@@ -428,12 +494,12 @@ export function toDiagnostics(
   const boundary = boundaryFor(result);
   if (boundary.length && surfaces.boundary && !surfaces.boundarySurface) {
     put(checkedAbs, {
-      range: rangeAt(1, 1),
+      range: lineSpan(checkedAbs, 1, 1, lineText),
       severity: SEVERITY.information,
       code: "boundary",
       source: SOURCE,
       message: `What this service's scan could not classify:\n${boundary.join("\n")}`,
     });
   }
-  return capDiagnostics(byFile, checkedAbs, checkedFile);
+  return capDiagnostics(byFile, checkedAbs, checkedFile, lineText);
 }

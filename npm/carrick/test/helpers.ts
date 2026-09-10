@@ -43,6 +43,22 @@ export type Workspace = {
 };
 
 /**
+ * A file with real, indented lines at the line numbers the fixtures name.
+ *
+ * The span a diagnostic underlines is the text of its line (carrick#922), so a
+ * one-line stand-in would leave every row on the fallback range and prove
+ * nothing. Every line is indented and every line is a different length, which
+ * is what makes a widened span readable in an assertion.
+ */
+export function sourceText(lines: number): string {
+  const body = [`import { thing } from "./thing";`];
+  for (let line = 2; line <= lines; line += 1) {
+    body.push(`  const value${line} = thing(${"x".repeat(line % 7)});`);
+  }
+  return `${body.join("\n")}\n`;
+}
+
+/**
  * A workspace laid out the way the local mode expects: `.carrick/` at the top,
  * service directories under it, and no marker inside a service.
  *
@@ -50,12 +66,17 @@ export type Workspace = {
  * path is relative to its own repo and only resolves when that repo is on disk.
  */
 export function makeWorkspace(): Workspace {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-plugin-"));
+  // Resolved, because on macOS `os.tmpdir()` is a symlink and a workspace under
+  // it has two spellings: the client opens `/var/...` and a counterpart path
+  // the CLI answers with resolves to `/private/var/...`. Two spellings of one
+  // file are two files to everything that keys on a path, which is a real
+  // hazard in a symlinked workspace and not the one under test here.
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-plugin-")));
   fs.mkdirSync(path.join(root, ".carrick"), { recursive: true });
   const service = path.join(root, "user-service");
   fs.mkdirSync(path.join(service, "src", "routes"), { recursive: true });
   const file = path.join(service, "src", "routes", "users.ts");
-  fs.writeFileSync(file, "export const handler = () => null;\n");
+  fs.writeFileSync(file, sourceText(130));
   for (const counterpart of [
     "order-service/src/clients/users.ts",
     "order-service/src/server.ts",
@@ -64,7 +85,7 @@ export function makeWorkspace(): Workspace {
   ]) {
     const target = path.join(root, counterpart);
     fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, "export {};\n");
+    fs.writeFileSync(target, sourceText(130));
   }
   return {
     root,

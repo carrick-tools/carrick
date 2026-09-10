@@ -5,7 +5,21 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { LspClient } from "./lsp-client.ts";
-import { fakeEnv, firstCall, fixturePath, makeWorkspace } from "./helpers.ts";
+import { fakeEnv, firstCall, fixturePath, makeWorkspace, sourceText } from "./helpers.ts";
+
+type Row = { code?: string; severity: number; range: { start: { line: number; character: number } } };
+
+/** What the client is left holding per file: `publishDiagnostics` replaces. */
+function finalState(client: LspClient): Map<string, Row[]> {
+  const state = new Map<string, Row[]>();
+  for (const publish of client.publishes) state.set(publish.uri, publish.diagnostics as Row[]);
+  return state;
+}
+
+function rowsFor(client: LspClient, suffix: string): Row[] {
+  for (const [uri, rows] of finalState(client)) if (uri.endsWith(suffix)) return rows;
+  return [];
+}
 
 test("didOpen publishes the check verdicts, on the file and on its counterparts", async (t) => {
   const workspace = makeWorkspace();
@@ -352,4 +366,166 @@ test("a lens request after a check runs no second CLI call (carrick#910)", async
   // Every surface reads one cached answer per file, and a lens arrives on every
   // open and every save, so a second CLI call here would be a per-save cost.
   assert.equal(fs.readFileSync(argvLog, "utf8").trim().split("\n").length, 1);
+});
+
+// --------------------------------------------------- the span, over the wire
+//
+// carrick#922. The unit tests state the rule; this states where the text comes
+// from, which is the part only the server knows.
+
+test("a row underlines the open document's line, not the one on disk (carrick#922)", async (t) => {
+  const workspace = makeWorkspace();
+  const client = new LspClient({ env: fakeEnv() });
+  t.after(() => {
+    client.stop();
+    workspace.cleanup();
+  });
+
+  // An unsaved buffer: the file on disk indents line 42 by two, and the text
+  // the client holds indents it by six. What the user sees is the latter.
+  const buffer = sourceText(130).split("\n");
+  buffer[41] = "      const unsaved = edit();";
+  await client.initialize(workspace.root);
+  client.open(workspace.file, buffer.join("\n"));
+  await client.waitFor(() => client.publishes.length >= 3, "diagnostics");
+
+  const finding = rowsFor(client, "user-service/src/routes/users.ts")[0];
+  assert.equal(finding?.code, "type_mismatch");
+  assert.deepEqual(finding?.range, {
+    start: { line: 41, character: 6 },
+    end: { line: 41, character: 29 },
+  });
+});
+
+test("a counterpart file nobody opened is underlined from the file on disk", async (t) => {
+  const workspace = makeWorkspace();
+  const client = new LspClient({ env: fakeEnv() });
+  t.after(() => {
+    client.stop();
+    workspace.cleanup();
+  });
+
+  await client.initialize(workspace.root);
+  client.open(workspace.file);
+  await client.waitFor(() => client.publishes.length >= 3, "diagnostics");
+
+  const mirrored = rowsFor(client, "order-service/src/clients/users.ts")[0];
+  const line18 = sourceText(130).split("\n")[17] ?? "";
+  assert.deepEqual(mirrored?.range, {
+    start: { line: 17, character: line18.length - line18.trimStart().length },
+    end: { line: 17, character: line18.trimEnd().length },
+  });
+  assert.ok(line18.trimEnd().length > 1, "a stand-in file would prove nothing here");
+});
+
+// ------------------------------------------- two passes, one published state
+//
+// carrick#923. Opening the other side of a contract is a second check pass with
+// an opinion about the first file, and it knows less about that file than the
+// file's own pass does.
+
+test("opening a counterpart does not take the first file's boundary away (carrick#923)", async (t) => {
+  const workspace = makeWorkspace();
+  const counterpart = path.join(workspace.root, "order-service/src/clients/users.ts");
+  const fixtures = path.join(workspace.root, "fixtures.json");
+  fs.writeFileSync(
+    fixtures,
+    JSON.stringify({
+      "user-service/src/routes/users.ts": fixturePath("check-mismatch.json"),
+      "order-service/src/clients/users.ts": fixturePath("check-counterpart.json"),
+    }),
+  );
+  const client = new LspClient({ env: fakeEnv({ CARRICK_FAKE_FIXTURE_MAP: fixtures }) });
+  t.after(() => {
+    client.stop();
+    workspace.cleanup();
+  });
+
+  await client.initialize(workspace.root);
+  client.open(workspace.file);
+  await client.waitFor(() => client.publishes.length >= 3, "the first file's diagnostics");
+  const first = rowsFor(client, "user-service/src/routes/users.ts").map((row) => row.code);
+  assert.deepEqual(first, ["type_mismatch", "method_mismatch", "boundary"]);
+
+  client.open(counterpart);
+  await client.waitFor(
+    () => rowsFor(client, "order-service/src/clients/users.ts").some((row) => row.code === "boundary"),
+    "the counterpart's own diagnostics",
+  );
+  await client.settle(300);
+
+  // The whole ticket: the first file's rows are what its own check said, still,
+  // and the boundary is the sentence that makes a short answer readable.
+  assert.deepEqual(
+    rowsFor(client, "user-service/src/routes/users.ts").map((row) => row.code),
+    first,
+  );
+  // And its finding is stated once, not twice: the counterpart's pass mirrors
+  // the same finding onto the same line, and that is the same row.
+  const republished = client.publishes.filter((publish) =>
+    publish.uri.endsWith("user-service/src/routes/users.ts"),
+  );
+  assert.equal(republished.length, 1, "a merge that says nothing new is not sent again");
+
+  // The counterpart holds its own pass's rows, with the first pass's mirrored
+  // row of the same finding folded into them rather than sitting beside it.
+  const other = rowsFor(client, "order-service/src/clients/users.ts");
+  assert.deepEqual(
+    other.map((row) => row.code),
+    ["type_mismatch", "boundary"],
+  );
+  assert.equal(other[0]?.range.start.line, 17);
+});
+
+test("a pass that stops finding something clears only its own rows", async (t) => {
+  const workspace = makeWorkspace();
+  const counterpart = path.join(workspace.root, "order-service/src/clients/users.ts");
+  const fixtures = path.join(workspace.root, "fixtures.json");
+  fs.writeFileSync(
+    fixtures,
+    JSON.stringify({
+      "user-service/src/routes/users.ts": fixturePath("check-mismatch.json"),
+      "order-service/src/clients/users.ts": fixturePath("check-counterpart.json"),
+    }),
+  );
+  const client = new LspClient({ env: fakeEnv({ CARRICK_FAKE_FIXTURE_MAP: fixtures }) });
+  t.after(() => {
+    client.stop();
+    workspace.cleanup();
+  });
+
+  await client.initialize(workspace.root);
+  client.open(workspace.file);
+  await client.waitFor(() => client.publishes.length >= 3, "the first file's diagnostics");
+  client.open(counterpart);
+  await client.waitFor(
+    () => rowsFor(client, "order-service/src/clients/users.ts").some((row) => row.code === "boundary"),
+    "the counterpart's own diagnostics",
+  );
+
+  // The counterpart's next check finds nothing at all. Its rows go; the rows
+  // the OTHER pass put on it are still what that pass found.
+  fs.writeFileSync(
+    fixtures,
+    JSON.stringify({
+      "user-service/src/routes/users.ts": fixturePath("check-mismatch.json"),
+      "order-service/src/clients/users.ts": fixturePath("check-silent.json"),
+    }),
+  );
+  client.change(counterpart, 2);
+  await client.waitFor(
+    () => !rowsFor(client, "order-service/src/clients/users.ts").some((row) => row.code === "boundary"),
+    "the counterpart's rows clearing",
+  );
+  await client.settle(300);
+
+  assert.deepEqual(
+    rowsFor(client, "order-service/src/clients/users.ts").map((row) => row.code),
+    ["type_mismatch"],
+    "the mirrored row from the other side stands, because that check still says so",
+  );
+  assert.deepEqual(
+    rowsFor(client, "user-service/src/routes/users.ts").map((row) => row.code),
+    ["type_mismatch", "method_mismatch", "boundary"],
+  );
 });

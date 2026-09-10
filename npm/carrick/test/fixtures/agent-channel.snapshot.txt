@@ -3,6 +3,11 @@ Carrick checked user-service/src/routes/users.ts against the workspace index (us
 Boundary: A local index holds what the deterministic passes state: 41 candidate(s) in this service need a model and were not classified here.
 user-service at 6a1b2c3: 128 file(s) sent to the analyzer
 
+### check-counterpart.json :: renderPostToolUse
+Carrick checked user-service/src/routes/users.ts against the workspace index (order-service, indexed at 6a1b2c3).
+- user-service/src/routes/users.ts:18:3 call GET /api/users/:id [fact, imported_member] type_mismatch: the response no longer carries `email`, which this call reads. Read off the client member this call goes through. Producers: user-service src/routes/users.ts:42
+Boundary: A local index holds what the deterministic passes state: 7 candidate(s) in this service need a model and were not classified here.
+
 ### check-definition.json :: renderPostToolUse
 Carrick checked user-service/src/routes/users.ts against the workspace index (user-service, indexed at 6a1b2c3).
 - user-service/src/routes/users.ts:30:3 call POST /api/orders [candidate, model] no type verdict: the model read a call here and nothing contradicts it. Producers: order-service src/server.ts:120

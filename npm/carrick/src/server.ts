@@ -24,13 +24,14 @@
 //
 // stdout is protocol only. Every log line goes to stderr.
 
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { check } from "./cli.ts";
 import { resolveChannel, type ChannelChoice } from "./channel.ts";
 import type { CheckResult } from "./contract.ts";
 import { definitionsAt, positionOf } from "./definition.ts";
-import { toDiagnostics, type Diagnostic } from "./diagnostics.ts";
+import { toDiagnostics, type Diagnostic, type LineText } from "./diagnostics.ts";
 import { toCodeLenses } from "./lens.ts";
 import { createLogger } from "./log.ts";
 import { resolveRoot, rootNote, type RootChoice } from "./root.ts";
@@ -70,8 +71,27 @@ let clientRefreshesLenses = false;
 /** One off switch per surface (carrick#879), as the client stated them. */
 let surfaces: Surfaces = DEFAULT_SURFACES;
 
-/** What each checked file last published to, so a clear is scoped to it. */
-const publishedBy = new Map<string, Set<string>>();
+/**
+ * What each check pass contributed, per pass, per file it landed rows in
+ * (carrick#923).
+ *
+ * A check of one file publishes rows on that file AND on its counterparts, so
+ * two open files on either side of one contract are two passes with an opinion
+ * about the same URI, and neither is the whole answer: the producer's pass
+ * knows every route in the producer, the consumer's pass knows only the one
+ * route it calls. `publishDiagnostics` replaces per URI, so whichever pass ran
+ * last used to erase the other's rows. What is published for a URI is the merge
+ * of every pass that has an opinion about it, computed here, and a pass is
+ * replaced whole when it re-runs.
+ *
+ * Uncapped on purpose. Evicting a pass would clear rows on a file that is still
+ * open and still wrong, and an entry is a handful of diagnostics.
+ */
+const contributions = new Map<string, Map<string, Diagnostic[]>>();
+/** The last diagnostics sent per URI, so an unchanged merge is not re-sent. */
+const published = new Map<string, string>();
+/** The text of every document the client has open, by absolute path. */
+const openDocuments = new Map<string, string>();
 const debounces = new Map<string, NodeJS.Timeout>();
 /** Ids for the requests this server makes of the client. */
 let nextServerId = 1;
@@ -98,6 +118,104 @@ function publish(uriPath: string, diagnostics: Diagnostic[]): void {
     method: "textDocument/publishDiagnostics",
     params: { uri: pathToFileURL(uriPath).toString(), diagnostics },
   });
+}
+
+/**
+ * One row's identity within a file: what it says and the line it says it on.
+ *
+ * Used only to drop a row a second pass would repeat. A finding that is a
+ * file's own is also mirrored onto that file by the counterpart's pass, at the
+ * same line and under the same code, and the two sentences differ only in the
+ * "producer in X of Y." the mirrored one leads with. The code and the line are
+ * what a reader would call the same row.
+ */
+function rowKey(diagnostic: Diagnostic): string {
+  return `${diagnostic.code ?? ""}|${diagnostic.range.start.line}`;
+}
+
+/**
+ * Every pass's rows for one file, the file's own pass first.
+ *
+ * Own-pass rows go in unconditionally: two findings on one line are two rows
+ * and only the passes DISAGREE about a file, never a pass with itself. Another
+ * pass's mirrored row is added only when nothing already said the same thing
+ * there, which is what stops the same finding rendering twice.
+ */
+function mergedFor(uriPath: string): Diagnostic[] {
+  const rows: Diagnostic[] = [];
+  const seen = new Set<string>();
+  const own = contributions.get(uriPath)?.get(uriPath);
+  if (own) {
+    rows.push(...own);
+    for (const row of own) seen.add(rowKey(row));
+  }
+  for (const [checked, byFile] of contributions) {
+    if (checked === uriPath) continue;
+    for (const row of byFile.get(uriPath) ?? []) {
+      const key = rowKey(row);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push(row);
+    }
+  }
+  return rows;
+}
+
+/**
+ * Replace one pass's rows and re-publish every file the change can reach.
+ *
+ * That is the files this pass touched now plus the ones it touched before: a
+ * file it has dropped needs the merge without it, which is often empty and
+ * clears the file. A URI whose merged set is what the client already has is not
+ * sent again, so opening the second file of a pair is silent where its rows
+ * agree with the first pass's.
+ */
+function republish(checkedAbs: string, byFile: Map<string, Diagnostic[]>): void {
+  const touched = new Set<string>([
+    ...(contributions.get(checkedAbs)?.keys() ?? []),
+    ...byFile.keys(),
+  ]);
+  contributions.set(checkedAbs, byFile);
+  for (const file of touched) {
+    const rows = mergedFor(file);
+    const body = JSON.stringify(rows);
+    if (published.get(file) === body) continue;
+    published.set(file, body);
+    publish(file, rows);
+  }
+}
+
+/**
+ * The text of one 1-based line, for the span a diagnostic underlines (#922).
+ *
+ * The open document first, because that is the text in front of the user and
+ * an editor with unsaved changes has no other source for it, and the file on
+ * disk second, because a finding is mirrored onto counterpart files nobody has
+ * opened. A client that sends an empty `text` on `didOpen` has told us nothing,
+ * so that reads as "not open" rather than as an empty file.
+ *
+ * Fresh per check: within one check the same file is read once, and between two
+ * checks the text may have moved.
+ */
+function lineTextReader(): LineText {
+  const cache = new Map<string, string[] | null>();
+  return (file: string, line: number): string | null => {
+    const key = path.resolve(file);
+    if (!cache.has(key)) {
+      let text = openDocuments.get(key);
+      if (!text) {
+        try {
+          text = fs.readFileSync(key, "utf8");
+        } catch {
+          text = undefined;
+        }
+      }
+      cache.set(key, text === undefined ? null : text.split(/\r?\n/));
+    }
+    const lines = cache.get(key);
+    if (!lines) return null;
+    return lines[line - 1] ?? null;
+  };
 }
 
 /**
@@ -141,20 +259,15 @@ async function checkAndPublish(absFile: string): Promise<void> {
     log("check", relFile, "->", result.error);
     return;
   }
-  const byFile = toDiagnostics(result, root, relFile, { surfaces });
+  const byFile = toDiagnostics(result, root, relFile, { surfaces, lineText: lineTextReader() });
   log(
     `check ${relFile} -> ${[...byFile.values()].reduce((n, list) => n + list.length, 0)} diagnostic(s) across ${byFile.size} file(s) in ${Date.now() - started}ms`,
   );
 
-  // Clear only what THIS file's previous check flagged and no longer does: a
-  // check of another file legitimately returns nothing while its findings stand.
-  const previous = publishedBy.get(relFile) ?? new Set<string>();
-  for (const stale of previous) if (!byFile.has(stale)) byFile.set(stale, []);
-  publishedBy.set(
-    relFile,
-    new Set([...byFile.keys()].filter((file) => (byFile.get(file) ?? []).length > 0)),
-  );
-  for (const [file, diagnostics] of byFile) publish(file, diagnostics);
+  // This pass's whole opinion, replacing the one it had before. What a file
+  // ends up with is the merge of every pass that has an opinion about it, so a
+  // check that returns nothing for a file clears only its own rows there.
+  republish(path.resolve(absFile), byFile);
   publishBoundary(result);
 }
 
@@ -206,6 +319,27 @@ function pathOf(params: Record<string, unknown> | undefined): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * The document's text as this notification states it, or null when it does not.
+ *
+ * `didOpen` carries the whole document. `didChange` carries whole documents too
+ * here, because the sync kind this server declares is Full, and an incremental
+ * change (one carrying a `range`) is ignored rather than applied to the wrong
+ * text. `didSave` carries none: `includeText` is false, and what is on disk is
+ * then the same text anyway.
+ */
+function textOf(params: Record<string, unknown> | undefined): string | null {
+  const document = params?.["textDocument"] as { text?: unknown } | undefined;
+  if (typeof document?.text === "string") return document.text;
+  const changes = params?.["contentChanges"];
+  if (!Array.isArray(changes)) return null;
+  for (const change of [...changes].reverse()) {
+    const entry = change as { text?: unknown; range?: unknown };
+    if (entry.range === undefined && typeof entry.text === "string") return entry.text;
+  }
+  return null;
 }
 
 // ------------------------------------------------------------------ protocol
@@ -298,6 +432,10 @@ function handle(message: Message): void {
     case "textDocument/didChange": {
       const file = pathOf(params);
       if (!file) return;
+      // The text the client has, kept for the span every row underlines: the
+      // buffer is what the user is looking at, and an unsaved one is on no disk.
+      const text = textOf(params);
+      if (text !== null) openDocuments.set(path.resolve(file), text);
       // The text moved, so the lines in the cached answer are about text that
       // is gone. Dropped on every channel: in the hook channel nothing
       // re-checks the file, and a jump off a stale line is the worst answer
@@ -307,12 +445,20 @@ function handle(message: Message): void {
       scheduleCheck(file, method === "textDocument/didChange" ? DEBOUNCE_MS : 0);
       return;
     }
+    case "textDocument/didClose": {
+      // The buffer is gone, so the file on disk is the text from here on. The
+      // rows stay: an editor keeps a closed file's diagnostics in the Problems
+      // list, and this server has not stopped believing them.
+      const file = pathOf(params);
+      if (file) openDocuments.delete(path.resolve(file));
+      return;
+    }
     case "workspace/didChangeConfiguration": {
       // A switch turned off takes its rows away on the next publish, not at the
       // next restart, so every file this server has flagged is re-checked here.
       surfaces = readSurfaces(params, surfaces);
       log(`surfaces: ${JSON.stringify(surfaces)}`);
-      for (const relFile of publishedBy.keys()) scheduleCheck(path.resolve(root, relFile), 0);
+      for (const checked of contributions.keys()) scheduleCheck(checked, 0);
       // A lens is pulled, not pushed, so `carrick.codeLens` off only clears the
       // screen once the client asks again. It is asked to.
       if (clientRefreshesLenses) send({ id: `carrick-refresh-${nextServerId++}`, method: "workspace/codeLens/refresh", params: {} });
@@ -366,9 +512,14 @@ function handle(message: Message): void {
       }
       void enqueue(async () => {
         const result = await resultFor(file);
+        // This file's own pass and no other: a request answers what a check of
+        // this file says, and a pull must not rewrite what the push path has
+        // published to other files.
         const items = result
-          ? (toDiagnostics(result, root, relative(file), { surfaces }).get(path.resolve(file)) ??
-            [])
+          ? (toDiagnostics(result, root, relative(file), {
+              surfaces,
+              lineText: lineTextReader(),
+            }).get(path.resolve(file)) ?? [])
           : [];
         send({ id, result: { kind: "full", items } });
       });

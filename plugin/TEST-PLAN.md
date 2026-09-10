@@ -312,12 +312,14 @@ answer for each in the section 6 table.
    PATH ...`. Other editors: their LSP log. If it did not start, go to 5 below
    before anything else.
 2. **Producer diagnostic.** Open the producer file. An error appears in Problems
-   on the route line with the mismatch text.
+   on the route line with the mismatch text, and the mark spans the statement on
+   that line rather than one character of the indent (carrick#922).
 3. **Consumer diagnostic.** Open the consumer file. It carries its own
    diagnostic naming the producer. The stronger version of this observation is
    that it appears **without** the consumer being opened at all, since the server
    publishes for counterpart files too; check the Problems panel after opening
-   only the producer.
+   only the producer. With both files open, each keeps every row of its own
+   check and the same finding is listed once, not twice (carrick#923).
 4. **Related information renders.** The consumer site under the producer's
    diagnostic is a clickable location that opens the right file at the right
    line. This is the field Claude Code drops and the one an editor exists to
@@ -326,7 +328,8 @@ answer for each in the section 6 table.
 5. **The boundary line.** An information diagnostic at line 1 of each checked
    file, carrying the boundary as the CLI prints it. It is never dropped, and on
    a service written the ordinary way it may be the only thing shown, because a
-   local index holds deterministic rows only.
+   local index holds deterministic rows only. It is still there after opening
+   the file on the other side of the row, which is what carrick#923 was.
 
 ### Workspace root, multi-root and monorepos
 

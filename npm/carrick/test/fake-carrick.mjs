@@ -7,6 +7,12 @@
 //
 // Env it honours:
 //   CARRICK_FAKE_FIXTURE  path to the JSON to print (default check-mismatch.json)
+//   CARRICK_FAKE_FIXTURE_MAP
+//                         path to a JSON object mapping a checked file, as the
+//                         caller passed it, to the fixture to answer it with.
+//                         A file it does not name falls back to the above, so a
+//                         test that needs the two sides of one contract to
+//                         answer differently says only what differs
 //   CARRICK_FAKE_DELAY_MS milliseconds to wait before printing
 //   CARRICK_FAKE_EXIT     exit code to use, with nothing on stdout
 //   CARRICK_FAKE_ARGV_LOG file to append the argv and cwd of every call to
@@ -33,9 +39,17 @@ if (exitCode !== 0) {
   process.exit(exitCode);
 }
 
-const fixture = process.env.CARRICK_FAKE_FIXTURE
+const fallbackFixture = process.env.CARRICK_FAKE_FIXTURE
   ? path.resolve(process.env.CARRICK_FAKE_FIXTURE)
   : path.join(here, "fixtures", "check-mismatch.json");
+
+/** The file this call is about: `check <file> --json`, so the first non-flag. */
+const asked = argv.slice(1).find((value) => !value.startsWith("--"));
+let fixture = fallbackFixture;
+if (process.env.CARRICK_FAKE_FIXTURE_MAP && asked) {
+  const map = JSON.parse(fs.readFileSync(process.env.CARRICK_FAKE_FIXTURE_MAP, "utf8"));
+  if (map[asked]) fixture = path.resolve(map[asked]);
+}
 
 const delay = process.env.CARRICK_FAKE_DELAY_MS ? Number(process.env.CARRICK_FAKE_DELAY_MS) : 0;
 const print = () => {

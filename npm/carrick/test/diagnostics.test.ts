@@ -454,3 +454,100 @@ test("the boundary is the last row on a file, even when the cap trips", () => {
   assert.equal(rows?.at(-1)?.code, "boundary", "after every overflow row, as the hook renders it");
   assert.match(rows?.at(-2)?.message ?? "", /more finding\(s\) elsewhere in this check/);
 });
+
+// ------------------------------------------------------ the span a row marks
+//
+// carrick#922: the index holds line-only locators, so every row used to carry a
+// one-character range and an editor underlined the indent rather than the code.
+// The line's own text is the span, and the text of the file the row lands IN.
+
+import { lineSpan, type LineText } from "../src/diagnostics.ts";
+
+const CONSUMER_ABS = path.resolve(ROOT, "order-service/src/clients/users.ts");
+/** 14 characters, of which the first two are the indent. */
+const CHECKED_LINE_42 = "  send(users);";
+/** 24 characters, and a different width from the checked file's line. */
+const CONSUMER_LINE_18 = "    await client.get(id);";
+
+/** The lines of named files, 1-based, as the reader `toDiagnostics` takes. */
+function linesOf(files: Record<string, Record<number, string>>): LineText {
+  return (file, line) => files[file]?.[line] ?? null;
+}
+
+const withText = linesOf({
+  [CHECKED_ABS]: { 1: "import { send } from './send';", 42: CHECKED_LINE_42, 61: "  post(order);" },
+  [CONSUMER_ABS]: { 18: CONSUMER_LINE_18 },
+});
+
+test("a finding underlines its line, first non-whitespace to last (carrick#922)", () => {
+  const rows = toDiagnostics(fixture("check-mismatch.json"), ROOT, CHECKED, {
+    exists,
+    lineText: withText,
+  }).get(CHECKED_ABS);
+  const finding = rows?.[0];
+  assert.equal(finding?.code, "type_mismatch");
+  assert.deepEqual(finding?.range, {
+    start: { line: 41, character: 2 },
+    end: { line: 41, character: 14 },
+  });
+});
+
+test("a mirrored row and its counterpart location read the OTHER file's line", () => {
+  const byFile = toDiagnostics(fixture("check-mismatch.json"), ROOT, CHECKED, {
+    exists,
+    lineText: withText,
+  });
+  const mirrored = byFile.get(CONSUMER_ABS)?.[0];
+  // The counterpart is at line 18 of the consumer, and the span is that line's
+  // text: a row that took its width from the file it was found in would mark
+  // the wrong columns in every file it is mirrored onto.
+  assert.deepEqual(mirrored?.range, {
+    start: { line: 17, character: 4 },
+    end: { line: 17, character: 25 },
+  });
+  const related = byFile.get(CHECKED_ABS)?.[0]?.relatedInformation?.[0];
+  assert.ok(related?.location.uri.endsWith("order-service/src/clients/users.ts"));
+  assert.deepEqual(related?.location.range, mirrored?.range);
+});
+
+test("the boundary row underlines the first line of the file it lands on", () => {
+  const rows = toDiagnostics(fixture("check-mismatch.json"), ROOT, CHECKED, {
+    exists,
+    lineText: withText,
+  }).get(CHECKED_ABS);
+  const boundary = rows?.at(-1);
+  assert.equal(boundary?.code, "boundary");
+  assert.deepEqual(boundary?.range, {
+    start: { line: 0, character: 0 },
+    end: { line: 0, character: 30 },
+  });
+});
+
+test("no text, a blank line, or a line the file does not have keeps the fallback", () => {
+  const oneCharacter = { start: { line: 41, character: 2 }, end: { line: 41, character: 3 } };
+  // A payload's `col` still decides the fallback: it is the only thing left to
+  // place the mark with.
+  assert.deepEqual(lineSpan(CHECKED_ABS, 42, 3, undefined), oneCharacter);
+  assert.deepEqual(lineSpan(CHECKED_ABS, 42, 3, () => null), oneCharacter);
+  assert.deepEqual(lineSpan(CHECKED_ABS, 42, 3, () => "      "), oneCharacter);
+  // And with text there is no column to honour: the locator is line-only, so
+  // the whole statement is the span.
+  assert.deepEqual(lineSpan(CHECKED_ABS, 42, 3, () => CHECKED_LINE_42), {
+    start: { line: 41, character: 2 },
+    end: { line: 41, character: 14 },
+  });
+});
+
+test("a span is in UTF-16 code units, so a multi-byte line is not off by its bytes", () => {
+  // 16 code units and 19 UTF-8 bytes: `character` in LSP is the former at the
+  // default position encoding, and a JavaScript string index already is one.
+  // The scanner's own spans are byte offsets, which is the trap carrick#805
+  // was, and every ASCII-only fixture is blind to the difference.
+  const line = `  ok("café 🎉");`;
+  assert.equal(line.length, 16);
+  assert.equal(Buffer.byteLength(line, "utf8"), 19);
+  assert.deepEqual(lineSpan(CHECKED_ABS, 7, 1, () => line), {
+    start: { line: 6, character: 2 },
+    end: { line: 6, character: 16 },
+  });
+});
