@@ -409,6 +409,7 @@ pub(crate) fn run_capture(
     service_id: &str,
     anchors: &[CaptureAnchor],
     backfill_texts: &HashMap<String, String>,
+    tsconfig_path: Option<&str>,
 ) -> Option<(PathBuf, CaptureStubArtifact)> {
     if anchors.is_empty() {
         return None;
@@ -417,7 +418,8 @@ pub(crate) fn run_capture(
         .canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(repo_path));
 
-    let (stub_dir, artifact, records) = capture_once(sidecar, &repo_root, service_id, anchors)?;
+    let (stub_dir, artifact, records) =
+        capture_once(sidecar, &repo_root, service_id, anchors, tsconfig_path)?;
 
     let Some((rerun_anchors, backfilled)) = backfill_anchors(anchors, &records, backfill_texts)
     else {
@@ -428,7 +430,13 @@ pub(crate) fn run_capture(
         service_id,
         backfilled.len()
     );
-    match capture_once(sidecar, &repo_root, service_id, &rerun_anchors) {
+    match capture_once(
+        sidecar,
+        &repo_root,
+        service_id,
+        &rerun_anchors,
+        tsconfig_path,
+    ) {
         Some((rerun_dir, rerun_artifact, rerun_records))
             if backfill_accepted(&backfilled, &records, &rerun_records) =>
         {
@@ -463,6 +471,7 @@ fn capture_once(
     repo_root: &Path,
     service_id: &str,
     anchors: &[CaptureAnchor],
+    tsconfig_path: Option<&str>,
 ) -> Option<(PathBuf, CaptureStubArtifact, Vec<CaptureAliasRecord>)> {
     let unique = format!(
         "carrick-capture-{}-{}",
@@ -479,6 +488,7 @@ fn capture_once(
         service_id,
         anchors,
         &out_dir.to_string_lossy(),
+        tsconfig_path,
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -2437,6 +2447,7 @@ mod tests {
                 array_depth: None,
             }],
             &HashMap::new(),
+            None,
         )
         .expect("orders-engine capture");
         let (billing_stub, billing_artifact) = run_capture(
@@ -2451,6 +2462,7 @@ mod tests {
                 array_depth: None,
             }],
             &HashMap::new(),
+            None,
         )
         .expect("billing-svc capture");
         let _ = std::fs::remove_dir_all(&orders_stub);
@@ -2548,6 +2560,61 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial(v2_capture_sidecar)]
+    fn explicit_config_survives_initial_capture_and_backfill() {
+        let sidecar_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
+        if !sidecar_path.exists() {
+            eprintln!("Skipping test: sidecar not built");
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        // Selecting this Deno config would fail; the explicit TS selection
+        // must reach both stateless capture requests.
+        std::fs::write(
+            repo.path().join("deno.json"),
+            r#"{"compilerOptions":{"lib":["deno.worker"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("selected.json"),
+            r#"{"compilerOptions":{"strict":true,"target":"ESNext","module":"ESNext","moduleResolution":"Bundler"},"include":["main.ts"]}"#).unwrap();
+        std::fs::write(
+            repo.path().join("main.ts"),
+            "export interface Selected { id: string }",
+        )
+        .unwrap();
+        let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");
+        sidecar.start_init(repo.path(), Some("selected.json"));
+        sidecar
+            .wait_ready(crate::services::type_sidecar::ready_budget())
+            .expect("sidecar init");
+        let anchors = ["Selected", "Missing"].map(|name| CaptureAnchor::Symbol {
+            alias: name.to_string(),
+            symbol_name: name.to_string(),
+            source_file: "main.ts".to_string(),
+            anchor_origin: AnchorOrigin::LlmSymbol,
+            array_depth: None,
+        });
+        let backfill = HashMap::from([("Missing".to_string(), "{ count: number }".to_string())]);
+        let (dir, artifact) = run_capture(
+            &sidecar,
+            repo.path().to_str().unwrap(),
+            "mixed",
+            &anchors,
+            &backfill,
+            Some("selected.json"),
+        )
+        .expect("explicit config must survive both capture attempts");
+        let surface = artifact.files.get("types/surface.d.ts").unwrap();
+        assert!(
+            surface.contains("count: number"),
+            "backfill was not adopted: {surface}"
+        );
+        assert!(!surface.contains("unknown"), "capture degraded: {surface}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The corpus-2 notifications-svc 4th-edge shape, end-to-end against the
     /// real sidecar ($0, no LLM):
     ///
@@ -2631,6 +2698,7 @@ mod tests {
             "notifications-svc",
             &producer_anchors,
             &backfill_texts,
+            None,
         )
         .expect("notifications-svc capture");
         let surface = notif_artifact
@@ -2658,6 +2726,7 @@ mod tests {
             "notifications-svc",
             &producer_anchors,
             &HashMap::new(),
+            None,
         )
         .expect("control capture");
         let control_surface = control_artifact
@@ -2682,6 +2751,7 @@ mod tests {
                 array_depth: None,
             }],
             &HashMap::new(),
+            None,
         )
         .expect("web-dashboard capture");
         let _ = std::fs::remove_dir_all(&notif_stub);
@@ -2828,6 +2898,7 @@ mod tests {
                 param_name: None,
             }],
             &HashMap::new(),
+            None,
         )
         .expect("notifications-svc capture");
         let surface = notif_artifact
@@ -2856,6 +2927,7 @@ mod tests {
                 anchor_origin: AnchorOrigin::LlmSymbol,
             }],
             &HashMap::new(),
+            None,
         )
         .expect("web-dashboard capture");
         let _ = std::fs::remove_dir_all(&notif_stub);

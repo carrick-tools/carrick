@@ -19,13 +19,21 @@ interface Module {
   local?: string;
   mediaType?: string;
   kind?: string;
+  npmPackage?: string;
   error?: string;
   dependencies?: Dependency[];
   typesDependency?: { dependency: Resolution };
 }
+interface NpmPackage {
+  name: string;
+  version: string;
+  dependencies: string[];
+  localPath?: string;
+}
 interface Graph {
   version: number;
   modules: Module[];
+  npmPackages?: Record<string, NpmPackage>;
   redirects?: Record<string, string>;
 }
 export interface DenoConfig {
@@ -54,6 +62,9 @@ export function findDenoConfig(repoRoot: string, explicit?: string): DenoConfig 
   }
   if (!configs.length) return undefined;
   const nearest = configs[0];
+  if (explicit && path.resolve(repoRoot, explicit) !== nearest.file) {
+    throw new Error('Explicit Deno config must be the nearest deno.json or deno.jsonc for the service directory.');
+  }
   const declaredWorkspace = configs.find(c => c.config.workspace?.some(member => {
     const memberRoot = path.resolve(path.dirname(c.file), member);
     const relative = path.relative(memberRoot, path.resolve(repoRoot));
@@ -100,6 +111,7 @@ export class DenoProject {
   private readonly localPaths = new Map<string, string>();
   private readonly edges = new Map<string, Map<string, Resolution>>();
   private readonly redirects: Record<string, string>;
+  private readonly npmPackages: Record<string, NpmPackage>;
   private readonly externalNames = new Map<string, string>();
 
   constructor(readonly config: DenoConfig, readonly repoRoot: string) {
@@ -154,10 +166,16 @@ export class DenoProject {
     fs.writeFileSync(entry, roots.map(s => `import ${JSON.stringify(s)};`).join('\n'));
     let graph: Graph;
     try {
-      graph = JSON.parse(runDeno(['info', '--json', '--frozen', '--node-modules-dir=manual', '--config', config.configPath, entry], repoRoot)) as Graph;
+      graph = JSON.parse(runDeno(['info', '--json', '--frozen', '--node-modules-dir=none', '--config', config.configPath, entry], repoRoot)) as Graph;
     } finally { fs.rmSync(entry, { force: true }); }
     if (!Array.isArray(graph.modules)) throw new Error('Unsupported deno info JSON: missing modules array');
     this.redirects = graph.redirects ?? {};
+    this.npmPackages = graph.npmPackages ?? {};
+    for (const [id, pkg] of Object.entries(this.npmPackages)) {
+      if (!pkg.localPath) {
+        throw new Error(`Deno npm graph lacks localPath for ${id}. Use Deno 2.9.4 and run deno install --frozen --node-modules-dir=none before scanning.`);
+      }
+    }
     for (const module of graph.modules) {
       this.modules.set(module.specifier, module);
       if (module.error) this.diagnostics.push(`${module.specifier}: ${module.error}`);
@@ -196,7 +214,7 @@ export class DenoProject {
     this.parsed.fileNames.push(...this.globals);
   }
 
-  private targetPath(resolution?: Resolution): string | undefined {
+  private targetPath(resolution?: Resolution, from = this.repoRoot): string | undefined {
     if (!resolution?.specifier || resolution.error) return undefined;
     let spec = resolution.specifier;
     const seen = new Set<string>();
@@ -206,20 +224,88 @@ export class DenoProject {
       if (!next) break;
       spec = next;
     }
+    const npm = this.modules.get(spec)?.npmPackage;
+    if (npm) {
+      const pkg = this.npmPackages[npm];
+      const suffix = /^npm:\/?(?:@[^/]+\/[^/@]+|[^/@]+)@[^/]+(.*)$/.exec(spec)?.[1] ?? '';
+      if (pkg?.localPath && !fs.existsSync(path.join(pkg.localPath, 'package.json'))) {
+        const diagnostic = `Deno npm dependency ${npm} is not cached; run deno install --frozen --node-modules-dir=none.`;
+        if (!this.diagnostics.includes(diagnostic)) this.diagnostics.push(diagnostic);
+        return undefined;
+      }
+      return pkg && this.resolveNpm(pkg.name + suffix, from, this.parsed.options, pkg)?.resolvedFileName;
+    }
     return this.localPaths.get(spec) ?? (spec.startsWith('file:') ? fileURLToPath(spec) : undefined);
   }
 
   resolve(spec: string, from: string, options: ts.CompilerOptions, host: ts.ModuleResolutionHost = ts.sys): ts.ResolvedModule | undefined {
     const edge = this.edges.get(path.resolve(from))?.get(spec);
     if (edge) {
-      const target = this.targetPath(edge);
+      const target = this.targetPath(edge, from);
       if (!target || !fs.existsSync(target)) return undefined;
       if (!/\.(?:[cm]?tsx?|jsx?|json)$/i.test(target)) return undefined;
-      return { resolvedFileName: target, isExternalLibraryImport: target.split(path.sep).includes('node_modules') };
+      return { resolvedFileName: target, isExternalLibraryImport: this.isNpmFile(target) };
     }
     // Generated capture imports and the internals of installed npm packages
     // use TypeScript resolution. Recorded failed Deno edges never fall back.
-    return ts.resolveModuleName(spec, from, options, host).resolvedModule;
+    return this.resolveNpm(spec, from, options) ?? ts.resolveModuleName(spec, from, options, host).resolvedModule;
+  }
+
+  private npmOwner(file: string): NpmPackage | undefined {
+    return Object.values(this.npmPackages).find(pkg => pkg.localPath &&
+      (file === pkg.localPath || file.startsWith(pkg.localPath + path.sep)));
+  }
+
+  private isNpmFile(file: string): boolean {
+    return !!this.npmOwner(file) || file.split(path.sep).includes('node_modules');
+  }
+
+  /** Let TypeScript interpret real package exports/types using Deno's exact
+   * dependency graph. Only the resolution host sees virtual node_modules;
+   * every returned source path points at the existing Deno cache. */
+  private resolveNpm(spec: string, from: string, options: ts.CompilerOptions, exact?: NpmPackage): ts.ResolvedModuleFull | undefined {
+    if (spec.startsWith('.') || path.isAbsolute(spec)) return undefined;
+    const name = spec.startsWith('@') ? spec.split('/').slice(0, 2).join('/') : spec.split('/')[0];
+    const owner = this.npmOwner(from);
+    const candidates = exact ? [exact] : owner
+      ? [owner, ...owner.dependencies.map(id => this.npmPackages[id]).filter((pkg): pkg is NpmPackage => !!pkg)]
+      : Object.values(this.npmPackages);
+    const matches = candidates.filter(pkg => pkg.name === name);
+    // Never select an arbitrary version outside a recorded graph edge.
+    const pkg = matches.length === 1 ? matches[0] : matches.find(p => p.version === this.pinned[name]);
+    if (!pkg?.localPath) return undefined;
+    const virtualRoot = path.join(this.cacheDir, 'npm-resolution');
+    const scopedTypes = [...(this.edges.get(path.resolve(from))?.values() ?? [])].flatMap(edge => {
+      let specifier = edge.specifier;
+      const seen = new Set<string>();
+      while (specifier && this.redirects[specifier] && !seen.has(specifier)) {
+        seen.add(specifier);
+        specifier = this.redirects[specifier];
+      }
+      const id = specifier && this.modules.get(specifier)?.npmPackage;
+      return id && this.npmPackages[id] ? [this.npmPackages[id]] : [];
+    });
+    const virtualModules = path.join(virtualRoot, 'node_modules');
+    const actual = (file: string): string => {
+      if (!file.startsWith(virtualModules + path.sep)) return file;
+      const relative = file.slice(virtualModules.length + 1).split(path.sep);
+      const packageName = relative.slice(0, relative[0].startsWith('@') ? 2 : 1).join('/');
+      const alternatives = Object.values(this.npmPackages).filter(p => p.name === packageName);
+      const selected = packageName === name ? pkg : scopedTypes.find(p => p.name === packageName)
+        ?? (owner ? candidates.find(p => p.name === packageName) : undefined)
+        ?? alternatives.find(p => p.version === this.pinned[packageName])
+        ?? (alternatives.length === 1 ? alternatives[0] : undefined);
+      return selected?.localPath ? path.join(selected.localPath, ...relative.slice(packageName.startsWith('@') ? 2 : 1)) : file;
+    };
+    const host: ts.ModuleResolutionHost = {
+      fileExists: file => ts.sys.fileExists(actual(file)),
+      readFile: file => ts.sys.readFile(actual(file)),
+      directoryExists: dir => dir === virtualRoot || dir === virtualModules || dir === path.join(virtualModules, '@types') || ts.sys.directoryExists(actual(dir)),
+      realpath: file => actual(file),
+      getCurrentDirectory: () => virtualRoot,
+    };
+    const result = ts.resolveModuleName(spec, path.join(virtualRoot, 'entry.ts'), options, host).resolvedModule;
+    return result && { ...result, resolvedFileName: actual(result.resolvedFileName), isExternalLibraryImport: true };
   }
 
   host(options: ts.CompilerOptions): ts.CompilerHost {
@@ -239,11 +325,11 @@ export class DenoProject {
   }
 
   /** Turn a Deno npm alias into its real package export, with the exact pin. */
-  private externalName(spec: string, target: string): string | undefined {
+  private externalName(spec: string, target: string, from: string): string | undefined {
     const key = `${spec}\0${target}`;
     if (this.externalNames.has(key)) return this.externalNames.get(key);
     let dir = path.dirname(target);
-    while (dir.split(path.sep).includes('node_modules')) {
+    while (this.isNpmFile(dir)) {
       const file = path.join(dir, 'package.json');
       if (fs.existsSync(file)) {
         const pkg = JSON.parse(fs.readFileSync(file, 'utf8')) as { name?: string; version?: string; exports?: unknown };
@@ -252,6 +338,28 @@ export class DenoProject {
             throw new Error(`Deno capture references multiple versions of ${pkg.name}; a single stub dependency cannot preserve both ${this.pinned[pkg.name]} and ${pkg.version}.`);
           }
           this.pinned[pkg.name] = pkg.version;
+          // DefinitelyTyped declarations keep their public runtime specifier;
+          // importing @types/foo directly is rejected by TypeScript (TS6137).
+          if (pkg.name.startsWith('@types/')) {
+            const publicName = pkg.name.slice('@types/'.length).replace(/^([^_]+)__/, '@$1/');
+            let code = this.edges.get(path.resolve(from))?.get(spec)?.specifier;
+            const seen = new Set<string>();
+            while (code && this.redirects[code] && !seen.has(code)) {
+              seen.add(code);
+              code = this.redirects[code];
+            }
+            const id = code && this.modules.get(code)?.npmPackage;
+            const runtimePackage = id && this.npmPackages[id];
+            if (runtimePackage && runtimePackage.name === publicName) {
+              if (this.pinned[publicName] && this.pinned[publicName] !== runtimePackage.version) {
+                throw new Error(`Deno capture references multiple versions of ${publicName}.`);
+              }
+              this.pinned[publicName] = runtimePackage.version;
+            }
+            const suffix = (code && /^npm:\/?(?:@[^/]+\/[^/@]+|[^/@]+)@[^/]+(.*)$/.exec(code)?.[1])
+              || (spec.startsWith(publicName + '/') ? spec.slice(publicName.length) : '');
+            return publicName + suffix;
+          }
           const plain = spec.replace(/^npm:/, '').replace(/(@[^/]+\/[^/@]+|^[^/@]+)@[^/]+/, '$1');
           let result: string | undefined;
           if (plain === pkg.name || plain.startsWith(`${pkg.name}/`)) result = plain;
@@ -285,7 +393,7 @@ export class DenoProject {
       const result = rewriteSpecifiers(fs.readFileSync(file, 'utf8'), spec => {
         const target = this.resolve(spec, from, this.parsed.options)?.resolvedFileName;
         if (!target) return undefined;
-        if (target.split(path.sep).includes('node_modules')) return this.externalName(spec, target);
+        if (this.isNpmFile(target)) return this.externalName(spec, target, from);
         const dest = emittedBySource.get(path.resolve(target));
         if (!dest) return undefined;
         let relative = path.posix.relative(path.posix.dirname(rel), dest).replace(/\.d\.(ts|mts|cts)$/, '');
@@ -352,6 +460,7 @@ function isolateRuntime(typesDir: string, files: string[], runtimeRel: string): 
         const symbol = checker.getSymbolAtLocation(node);
         const declarations = symbol?.declarations;
         if (declarations?.some(d => d.getSourceFile() === runtime) &&
+            !declarations.some(d => program.isSourceFileDefaultLibrary(d.getSourceFile())) &&
             // Only a type's root identifier, never a property or a declaration.
             ((ts.isTypeReferenceNode(node.parent) && node.parent.typeName === node) ||
              (ts.isQualifiedName(node.parent) && node.parent.left === node) ||

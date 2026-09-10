@@ -45,6 +45,7 @@ export interface SelfCheckArgs {
   bareCheckout: boolean;
   /** Producer repo root; its node_modules (if any) backs resolution. */
   repoRoot: string;
+  compilerHost?: (options: ts.CompilerOptions) => ts.CompilerHost;
 }
 
 interface FileFailures {
@@ -83,7 +84,7 @@ export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[] {
 }
 
 function runSelfCheck(args: SelfCheckArgs, treeFiles: string[]): CaptureAliasRecord[] {
-  const program = ts.createProgram(treeFiles, {
+  const options: ts.CompilerOptions = {
     noEmit: true,
     strict: true,
     // MUST be false: the whole stub tree is .d.ts (see module header).
@@ -91,7 +92,8 @@ function runSelfCheck(args: SelfCheckArgs, treeFiles: string[]): CaptureAliasRec
     module: ts.ModuleKind.ESNext,
     moduleResolution: ts.ModuleResolutionKind.Bundler,
     types: [],
-  });
+  };
+  const program = ts.createProgram(treeFiles, options, args.compilerHost?.(options));
   const checker = program.getTypeChecker();
   const diagnostics = ts.getPreEmitDiagnostics(program);
 

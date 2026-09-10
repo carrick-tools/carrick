@@ -119,7 +119,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   let parsed: ts.ParsedCommandLine | undefined;
   let deno: DenoProject | undefined;
   try {
-    const config = findDenoConfig(repoRoot, opts.tsconfigPath ?? (fs.existsSync(configPath) ? configPath : undefined));
+    const config = findDenoConfig(repoRoot, opts.tsconfigPath);
     if (config) deno = new DenoProject(config, repoRoot);
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
@@ -364,6 +364,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   // only transitives resolve").
   const installed = installedVersions(repoRoot, externalSpecs);
   const lockVersions = lockfileVersions(repoRoot);
+  for (const name of Object.keys(deno?.pinned ?? {})) externalSpecs.add(name);
   const pinned: Record<string, string> = {};
   const unpinned: string[] = [];
   for (const name of [...externalSpecs].sort()) {
@@ -373,7 +374,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   }
 
   const dependencyRoot = deno?.config.workspaceRoot ?? repoRoot;
-  const bareCheckout = !fs.existsSync(path.join(dependencyRoot, 'node_modules'));
+  const bareCheckout = !deno && !fs.existsSync(path.join(dependencyRoot, 'node_modules'));
 
   fs.writeFileSync(
     path.join(stubDir, 'package.json'),
@@ -415,6 +416,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     pinned,
     bareCheckout,
     repoRoot: dependencyRoot,
+    compilerHost: deno ? options => deno.host(options) : undefined,
   });
   const fidelity = computeFidelity(aliases);
 

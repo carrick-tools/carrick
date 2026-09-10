@@ -208,7 +208,7 @@ export class ProjectLoader {
       // Priority 2: Use tsconfig.json file
       else {
         const tsconfigPath = this.findTsConfig();
-        const denoConfig = findDenoConfig(this.repoRoot, tsconfigPath);
+        const denoConfig = findDenoConfig(this.repoRoot, this.tsconfigPath);
 
         if (denoConfig) {
           this.log(`Project will load with Deno config: ${denoConfig.configPath}`);
