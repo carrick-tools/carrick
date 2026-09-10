@@ -9,6 +9,8 @@ import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { writeConfigs, type WorkspaceProposal } from "../src/init/repos.ts";
 import {
   carrickHooks,
@@ -17,6 +19,63 @@ import {
   ownEntryPoint,
 } from "../src/init/settings.ts";
 import { editorLines, parseArgs, init } from "../src/init/run.ts";
+
+const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
+function executableInitFixture(projectSlug: string): {
+  root: string;
+  repo: string;
+  env: NodeJS.ProcessEnv;
+  cleanup: () => void;
+} {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-init-cli-"));
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "remote", "add", "origin", "git@github.com:acme/api.git"]);
+
+  const native = path.join(root, "native.mjs");
+  fs.writeFileSync(native, `#!/usr/bin/env node
+const argv = process.argv.slice(2);
+if (argv[0] !== "derive") process.exit(2);
+const workspace = argv[argv.indexOf("--workspace") + 1];
+process.stdout.write(JSON.stringify({
+  schema: "carrick.derive/0", workspace, repos_detected_by: "single repository",
+  repos_added: [], repos_excluded: [], missing: [], parent_proposal: null,
+  repos: [{ path: workspace, reason: "single repository", services: [{ serviceName: null }], config: null, warnings: [] }],
+}));
+`);
+  fs.chmodSync(native, 0o755);
+
+  const mockHttp = path.join(root, "mock-http.mjs");
+  fs.writeFileSync(mockHttp, `
+globalThis.fetch = async (input, init) => {
+  if (String(input) !== "https://api.carrick.tools/types/check-or-upload") throw new Error("unexpected URL");
+  const body = JSON.parse(String(init.body));
+  if (body.action !== "resolve-repos" || JSON.stringify(body.repos) !== JSON.stringify(["acme/api"])) throw new Error("unexpected request");
+  return Response.json({
+    schema: "carrick.resolve-repos/0",
+    workspace: { slug: "acme", billing_tier: "free", installed: true },
+    allowance_sentence: null,
+    repos: [{ full_name: "acme/api", connected: true, project_id: "p1", project_slug: ${JSON.stringify(projectSlug)}, services: [] }],
+    project_repos: [{ project_slug: ${JSON.stringify(projectSlug)}, repos: ["acme/api"] }],
+  });
+};
+`);
+
+  return {
+    root,
+    repo,
+    env: {
+      ...process.env,
+      CARRICK_NATIVE_BINARY: native,
+      CARRICK_TOKEN: "test-token",
+      XDG_CONFIG_HOME: path.join(root, "config"),
+      NODE_OPTIONS: `--import=${mockHttp}`,
+    },
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
 
 test("init writes a missing native proposal once and preserves racing or malformed files", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-init-"));
@@ -252,8 +311,73 @@ test("an editor we have not tested gets the server's command and no claim", () =
 });
 
 test("init reads its arguments", () => {
-  const parsed = parseArgs(["-y", "--workspace", "/code"], "/tmp");
-  assert.deepEqual(parsed, { workspace: "/code", assumeYes: true, skipIndex: false });
+  const parsed = parseArgs(["-y", "--project", "payments", "--workspace", "/code"], "/tmp");
+  assert.deepEqual(parsed, { workspace: "/code", assumeYes: true, skipIndex: false, project: "payments" });
   assert.equal((parseArgs(["/code"], "/tmp") as { workspace: string }).workspace, "/code");
+  assert.equal((parseArgs(["--project", "payments"]) as { project: string }).project, "payments");
+  assert.match(parseArgs(["--project"]) as string, /needs a slug/);
+  assert.equal((parseArgs(["--project", "default"]) as { project: string }).project, "default");
+  for (const slug of ["UPPER", "ab", "double--hyphen", "trailing-"]) {
+    assert.match(parseArgs(["--project", slug]) as string, /invalid project slug/);
+  }
   assert.match(parseArgs(["--nope"]) as string, /unknown option/);
+  assert.match(parseArgs(["--help"]) as string, /--project SLUG/);
+});
+
+// The native override is an executable shebang fixture, which Windows cannot launch.
+const posixNativeFixture = { skip: process.platform === "win32" ? "native shebang fixture requires POSIX" : false };
+
+test("the executable CLI rejects a different project and makes no local setup claim", posixNativeFixture, () => {
+  const fixture = executableInitFixture("default-project");
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", "--skip-index", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /acme\/api is currently in project "default-project"/);
+    assert.match(result.stdout, /Create project "payments" if needed/);
+    assert.match(result.stdout, /Assign the requested repos/);
+    assert.match(result.stderr, /Project "payments" was not verified/);
+    assert.equal(fs.existsSync(path.join(fixture.repo, "carrick.json")), false);
+    assert.equal(fs.existsSync(path.join(fixture.repo, ".claude")), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("the executable CLI accepts the named assignment on repeated init", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    for (let run = 0; run < 2; run += 1) {
+      const result = spawnSync(
+        process.execPath,
+        [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", "--skip-index", fixture.repo],
+        { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+      );
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stdout, /Verified 1 repo in project "payments"/);
+      assert.doesNotMatch(result.stdout, /Create project "payments" if needed/);
+    }
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("the executable CLI cannot verify a project without a GitHub repo identity", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments");
+  try {
+    execFileSync("git", ["-C", fixture.repo, "remote", "remove", "origin"]);
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", "--skip-index", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /cannot verify .* because it has no GitHub origin/);
+    assert.doesNotMatch(result.stdout, /Verified/);
+  } finally {
+    fixture.cleanup();
+  }
 });
