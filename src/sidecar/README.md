@@ -103,6 +103,48 @@ Re-initialising re-scopes the sidecar to another root, and drops the previous pr
 
 `tsconfig_path` is optional and relative to `repo_root`. `tsconfig_snapshot` and `pinned_dependencies` are optional and carry another repo's compiler options / exact versions when the sidecar has to stand in for a tree it cannot see.
 
+#### Deno projects
+
+When a service has no TypeScript config, `init` and `capture_v2` discover
+`deno.json` or `deno.jsonc`, including the containing Deno workspace. Pass the
+service directory as `repo_root` and omit `tsconfig_path`. An explicit Deno
+config selects the same path. An ordinary TypeScript config or snapshot keeps
+the existing TypeScript loader.
+
+Deno must be installed on `PATH`. This implementation is tested with Deno
+2.7.12. npm dependencies must already be available in the project's
+`node_modules` tree. Carrick reads [Deno's module graph](https://docs.deno.com/runtime/reference/cli/info/)
+with `deno info --json --frozen
+--node-modules-dir=manual` to obtain per-file resolution, so root import maps,
+member overrides, workspace exports, npm aliases, JSR redirects and type
+overrides come from Deno. Remote dependencies use Deno's cache and normal
+import permissions. Missing dependencies remain unresolved, with details in
+the capture errors, sidecar log and generated `resolution-diagnostics.json`.
+Carrick does not run install scripts or application code during preparation.
+
+The installed CLI's [`deno types`](https://docs.deno.com/runtime/reference/cli/types/)
+supplies runtime declarations. The supported
+runtime scopes are `deno.window` and `deno.ns`; `deno.unstable` uses declarations
+present in that CLI's output. Worker scopes and arbitrary runtime library
+combinations are unsupported. The sidecar uses its bundled TypeScript compiler,
+so this is not a replacement for `deno check` or a promise to support every
+Deno runtime API.
+
+Preparation writes only generated files under `.carrick/deno`. No source
+`package.json` or user-maintained TypeScript config is required. Capture
+rewrites resolved imports into the declaration tree, pins referenced npm
+packages and scopes reachable runtime declarations to the producer. The
+compatibility checker can then read the stubs without installing Deno.
+If one captured tree references multiple versions of the same npm package,
+capture fails explicitly because a single dependency pin cannot preserve both.
+
+The Deno integration tests in `test/deno-project.test.ts` require Deno on
+`PATH`; they report a skip when it is unavailable. Run them after building:
+
+```bash
+node --test dist/test/deno-project.test.js
+```
+
 Response:
 ```json
 { "request_id": "1", "status": "ready", "init_time_ms": 523 }
