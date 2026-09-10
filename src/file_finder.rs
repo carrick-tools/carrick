@@ -400,7 +400,7 @@ mod tests {
         assert_eq!(config, Some(config_path));
     }
 
-    const ARTIFACT_IGNORES: &[&str] = &["node_modules", "dist", "build", ".next"];
+    const ARTIFACT_IGNORES: &[&str] = &crate::packages::MANIFEST_SKIP_DIRS;
 
     /// Build a pnpm workspace as installed: every package's `node_modules`
     /// holds a symlink to each workspace package it depends on, and those
@@ -520,6 +520,7 @@ mod tests {
         fs::create_dir_all(root.join("dist")).expect("dist dir");
         fs::create_dir_all(root.join("build")).expect("build dir");
         fs::create_dir_all(root.join(".next").join("server")).expect(".next dir");
+        fs::create_dir_all(root.join(".vite/deps")).unwrap();
 
         let kept = root.join("src").join("app.ts");
         File::create(&kept).expect("kept file");
@@ -528,6 +529,7 @@ mod tests {
         File::create(root.join("dist/app.js")).expect("dist file");
         File::create(root.join("build/app.js")).expect("build file");
         File::create(root.join(".next/server/page.js")).expect(".next file");
+        File::create(root.join(".vite/deps/chunk.js")).unwrap();
 
         let (files, _) = find_files(root.to_str().unwrap(), ARTIFACT_IGNORES);
 

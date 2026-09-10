@@ -264,12 +264,10 @@ impl GraphqlConsumerHints {
     }
 }
 
-/// Directories never scanned for GraphQL sources.
+/// Additional directories excluded from GraphQL discovery, alongside the shared
+/// dependency and build-artifact exclusions.
 const SKIP_DIRS: &[&str] = &[
-    "node_modules",
     ".git",
-    "dist",
-    "build",
     "out",
     "coverage",
     "__generated__", // Relay artifacts — out of scope
@@ -296,7 +294,10 @@ pub fn scan_repo(scan_roots: &[PathBuf], service_files: &[PathBuf]) -> GraphqlEx
             .filter_entry(|e| {
                 !e.file_name()
                     .to_str()
-                    .map(|name| SKIP_DIRS.contains(&name))
+                    .map(|name| {
+                        SKIP_DIRS.contains(&name)
+                            || crate::packages::MANIFEST_SKIP_DIRS.contains(&name)
+                    })
                     .unwrap_or(false)
             })
             .filter_map(Result::ok)
@@ -893,6 +894,22 @@ mod tests {
         let mut keys: Vec<String> = ops.iter().map(|op| op.key.canonical()).collect();
         keys.sort();
         keys
+    }
+
+    #[test]
+    fn vite_artifacts_are_excluded_from_schema_discovery() {
+        let repo = tempfile::tempdir().unwrap();
+        for directory in ["src", ".vite/deps", "src/.vite/deps"] {
+            let dir = repo.path().join(directory);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("schema.graphql"), "type Query { item: String }").unwrap();
+        }
+        let extraction = scan_repo(&[repo.path().to_path_buf()], &[]);
+        assert_eq!(extraction.producers.len(), 1);
+        assert_eq!(
+            extraction.producers[0].file_path,
+            repo.path().join("src/schema.graphql")
+        );
     }
 
     /// `(canonical_key, primary_type_symbol)` pairs, sorted, for asserting the

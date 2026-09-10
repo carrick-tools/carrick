@@ -2345,7 +2345,24 @@ mod tests {
     use crate::config::Config;
     use crate::file_finder::find_service_files;
 
-    const IGNORE_PATTERNS: &[&str] = &["node_modules", "dist", "build", ".next"];
+    const IGNORE_PATTERNS: &[&str] = &crate::packages::MANIFEST_SKIP_DIRS;
+
+    #[test]
+    fn vite_artifacts_are_excluded_from_workspace_candidates() {
+        let repo = tempfile::tempdir().unwrap();
+        for directory in ["src", "packages/api/.vite/deps"] {
+            let dir = repo.path().join(directory);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("client.js"),
+                "fetch('https://vendor.example/api');",
+            )
+            .unwrap();
+        }
+        let index = WorkspaceIndex::build(repo.path());
+        let workspace = Workspace::parse(repo.path(), &index, &[]);
+        assert_eq!(workspace.files, vec![PathBuf::from("src/client.js")]);
+    }
 
     fn fixture_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/external-call-candidates")

@@ -681,6 +681,34 @@ mod tests {
     }
 
     #[test]
+    fn vite_artifacts_do_not_declare_workspace_packages() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"root-app","dependencies":{"cached-vendor":"^1.0.0"}}"#,
+        )
+        .unwrap();
+        let cache = root.join("packages/api/.vite/deps");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("package.json"),
+            r#"{"name":"cached-vendor","main":"./index.ts","dependencies":{"cache-only":"^1.0.0"}}"#).unwrap();
+        std::fs::write(cache.join("index.ts"), "export const cached = true;").unwrap();
+        let index = WorkspaceIndex::build(root);
+        assert_eq!(
+            index.resolve(Path::new("app.ts"), "cached-vendor"),
+            Resolution::External {
+                package: "cached-vendor".to_string(),
+                subpath: None
+            }
+        );
+        assert_eq!(
+            index.resolve(Path::new("app.ts"), "cache-only"),
+            Resolution::Unresolved
+        );
+    }
+
+    #[test]
     fn a_repo_declaring_nothing_has_no_external_packages() {
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(repo.path().join("package.json"), r#"{"name":"bare"}"#).unwrap();
