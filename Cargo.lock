@@ -231,6 +231,7 @@ dependencies = [
  "glob",
  "graphql-parser",
  "indicatif",
+ "libc",
  "matchit",
  "regex",
  "reqwest",

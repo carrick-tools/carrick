@@ -1,18 +1,10 @@
 //! Local read-only mode: `carrick index | touch | check | refresh` (carrick#708).
 //!
-//! The same pipeline the Action runs, pointed at a folder of repos on a
-//! developer's machine, with two differences that define the mode:
-//!
-//! * **No model.** There is no model on a laptop and no credential to reach
-//!   one, so the scan runs its deterministic passes and stops. Every row the
-//!   local index holds is a fact some pass states outright; a candidate the
-//!   model would have classified is counted by the boundary and not guessed
-//!   at. [`no_model`] is that switch, read in exactly three places (framework
-//!   detection, guidance, and the file-analyzer dispatch).
-//! * **No cloud.** The scanner authenticates with GitHub OIDC, which a laptop
-//!   does not have, so the index is written to and read from `<workspace>/
-//!   .carrick/` through the existing [`crate::cloud_storage::LocalDirStorage`]
-//!   backend. Nothing is uploaded and nothing is downloaded.
+//! Local scans recompute deterministic facts without model calls or uploads.
+//! Explicit index/refresh commands may read authenticated hosted indexes and
+//! replay unchanged files' model answers through the incremental pipeline.
+//! Hosted-only repositories participate in matching and type checks; local
+//! navigation remains restricted to files in the selected workspace.
 //!
 //! `index` and `refresh` write; `touch` and `check` only read, in well under
 //! the 300 ms an editor hook can afford, because everything they answer was
@@ -26,9 +18,10 @@ use std::path::Path;
 
 pub mod cli;
 mod contract;
-mod index;
+pub(crate) mod hosted;
+pub(crate) mod index;
 mod join;
-mod query;
+pub(crate) mod query;
 mod read_model;
 mod workspace;
 

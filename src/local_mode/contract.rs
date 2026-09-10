@@ -78,6 +78,8 @@ impl ErrorOutput {
 /// The other side of a contract, with where to find it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Counterpart {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
     pub role: String,
     pub service: String,
     /// Relative to the counterpart's own repo, which is a different repo from
@@ -124,6 +126,12 @@ pub struct Item {
 /// The whole answer.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CheckOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_checked_at: Option<String>,
+    #[serde(default)]
+    pub hosted: Option<super::hosted::HostedProvenance>,
+    #[serde(default)]
+    pub hosted_state: super::hosted::HostedState,
     pub schema: String,
     /// Relative to the repo that owns it.
     pub file: String,
@@ -241,6 +249,10 @@ pub const MAX_STALE_FILES: usize = 50;
 /// One service of the workspace, as `carrick status` reports it.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StatusService {
+    #[serde(default)]
+    pub hosted: Option<super::hosted::HostedProvenance>,
+    #[serde(default)]
+    pub hosted_state: super::hosted::HostedState,
     pub service: String,
     /// Absolute path of the repo this service belongs to. Services of one repo
     /// share a commit and a changed-file count, and this is what says so.
@@ -266,6 +278,14 @@ pub struct StatusService {
 /// What `carrick status` answers: the workspace, not a file.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StatusOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repos_detected_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos_added: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos_excluded: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_checked_at: Option<String>,
     pub schema: String,
     /// The workspace root: the folder holding `carrick-workspace.json` and
     /// `.carrick/`.
@@ -324,8 +344,11 @@ fn short_commit(commit: &str) -> &str {
 mod tests {
     use super::*;
 
-    fn output() -> CheckOutput {
+    pub(super) fn output() -> CheckOutput {
         CheckOutput {
+            hosted: None,
+            hosted_state: Default::default(),
+            hosted_checked_at: None,
             schema: SCHEMA.to_string(),
             file: "app/routes/orders.ts".to_string(),
             repo: "/repos/webapp".to_string(),
@@ -346,6 +369,7 @@ mod tests {
                 resolution_source: Some("file_based_route".to_string()),
                 evidence: None,
                 counterparts: vec![Counterpart {
+                    remote: None,
                     role: "consumer".to_string(),
                     service: "admin-ui".to_string(),
                     file: "src/api.ts".to_string(),
@@ -379,5 +403,55 @@ mod tests {
     #[test]
     fn a_short_commit_is_safe_on_a_short_string() {
         assert_eq!(short_commit("abc"), "abc");
+    }
+}
+
+#[cfg(test)]
+mod hosted_wire_tests {
+    use super::*;
+
+    #[test]
+    fn hosted_projection_additions_are_sparse_and_older_payloads_still_parse() {
+        let mut value = serde_json::to_value(super::tests::output()).unwrap();
+        value["hosted"] = serde_json::json!({"commit":"abc123","indexed_at":"2026-09-10T10:00:00Z","scanner_version":"0.3.58","project":"fixture"});
+        value["hosted_state"] = serde_json::json!("enriched");
+        value["hosted_checked_at"] = serde_json::json!("2026-09-10T11:00:00Z");
+        value["items"][0]["counterparts"][0]["remote"] = serde_json::json!("example/api");
+        value["items"][0]["counterparts"][0]["repo"] = serde_json::Value::Null;
+        let current: CheckOutput = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(current).unwrap(), value);
+        for field in ["hosted", "hosted_state", "hosted_checked_at"] {
+            value.as_object_mut().unwrap().remove(field);
+        }
+        value["items"][0]["counterparts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("remote");
+        let old: CheckOutput = serde_json::from_value(value).unwrap();
+        assert!(old.hosted.is_none());
+        assert!(old.hosted_checked_at.is_none());
+        assert!(old.items[0].counterparts[0].remote.is_none());
+        assert!(
+            !serde_json::to_value(old).unwrap()["items"][0]["counterparts"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("remote")
+        );
+    }
+
+    #[test]
+    fn older_status_and_boundary_payloads_default_only_the_new_fields() {
+        let value = serde_json::json!({"schema":"carrick.status/0","workspace":"/fixture","indexed_at":"now","scanner_version":"test","services":[{
+            "service":"api","repo":"/fixture/api","index_commit":"abc","indexed_at":"now","routes":0,"calls":0,"changed_since_index":0,"stale_files":[],"stale_files_total":0,"stale_files_truncated":false,"boundary":null,"boundary_note":"test","boundary_lines":[]}]});
+        let status: StatusOutput = serde_json::from_value(value).unwrap();
+        assert!(status.hosted_checked_at.is_none());
+        assert!(status.services[0].hosted.is_none());
+        let boundary = ServiceBoundary::default();
+        let mut value = serde_json::to_value(boundary).unwrap();
+        assert!(value.get("candidates_withheld_changed_files").is_none());
+        value["candidates_withheld_changed_files"] = serde_json::json!(3);
+        let parsed: ServiceBoundary = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.candidates_withheld_changed_files, Some(3));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), value);
     }
 }

@@ -308,3 +308,15 @@ test("a file the index does not hold answers nothing, and is asked again once it
   fs.copyFileSync(fixturePath("check-mismatch.json"), answer);
   assert.equal((await definitionAt(client, workspace.file, ROUTE)).length, 1);
 });
+
+test("a hosted-only counterpart never becomes a local absolute-file jump", () => {
+  const result = structuredClone(mismatch);
+  const item = result.items?.[0];
+  assert.ok(item);
+  item.counterparts = [{
+    role: "producer", service: "hosted-api", repo: null,
+    file: "/workspace/local-existing.ts", line: 4,
+    ...{ remote: "example/hosted-api" },
+  }];
+  assert.deepEqual(definitionsAt(result, ROUTE, { exists: onDisk }), []);
+});

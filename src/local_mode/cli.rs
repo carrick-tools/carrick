@@ -318,7 +318,8 @@ fn print_map(outcome: &super::index::IndexOutcome) {
         for service in &repo.services {
             // The same renderer the read-only commands print from, so the
             // map, the terminal and a hook all say one sentence.
-            let note = super::query::boundary_note(service.boundary.as_ref());
+            let note =
+                super::query::enrichment_note(&service.enrichment, service.boundary.as_ref());
             for line in
                 super::query::boundary_lines(&service.name, &note, service.boundary.as_ref())
             {

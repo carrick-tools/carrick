@@ -22,11 +22,11 @@ change bumps it to `carrick.check/1` and both are emitted for one release.
 
 | command | reads | writes | budget |
 |---|---|---|---|
-| `carrick index --workspace <dir>` | the repos listed in `<dir>/carrick-workspace.json` | `<dir>/.carrick/` | minutes, cold |
-| `carrick status [--json]` | `.carrick/` only | nothing | < 300 ms |
-| `carrick touch <file> [--json]` | `.carrick/` only | nothing | < 300 ms |
-| `carrick check <file> [--json]` | `.carrick/` only | nothing | < 300 ms |
-| `carrick refresh [--service <name>]` | one service's source | `<dir>/.carrick/` | seconds |
+| `carrick index --workspace <dir>` | detected local repos, optional workspace overrides, authenticated hosted indexes | `<dir>/.carrick/` | minutes, cold |
+| `carrick status [--json]` | local index, credential identity | nothing | < 300 ms |
+| `carrick touch <file> [--json]` | local index, credential identity | nothing | < 300 ms |
+| `carrick check <file> [--json]` | local index, credential identity | nothing | < 300 ms |
+| `carrick refresh [--service <name>]` | local source and authenticated hosted indexes | `<dir>/.carrick/` | seconds |
 
 `status` answers about the workspace and takes no file; it is what a surface
 opening a session asks. `touch` and `check` never parse the file, never call a model, never call the
@@ -35,8 +35,29 @@ answers "what is on the other side of what I am editing"; `check` adds the
 contract verdicts computed at index time. Both exit 0 whatever they find:
 local mode is advisory, nothing blocks.
 
-`index` computes deterministic facts only. There is no model on the laptop, so
-no candidate is classified locally and the boundary block says so.
+`index` recomputes deterministic facts from the working tree and reads hosted
+indexes using the credential stored by `carrick login` or `CARRICK_TOKEN`.
+Unchanged files can replay the hosted model answers through the scanner's
+incremental path. A changed file keeps its local facts and withholds hosted
+model answers, including staged, uncommitted, untracked and deleted changes.
+The hosted commit must exist locally and the analysis cache versions must
+match. Cached framework detection, guidance and extraction config additionally
+require the package manifest hash to match.
+
+Hosted-only repositories participate in the existing matching and compiler
+checks. They contribute counterparts with `repo: null` and `remote: owner/repo`,
+and never contribute local file items or navigation paths.
+
+Only `index` and `refresh` make hosted network requests. On a failed read, a cached
+hosted snapshot can be used for the same credential and authenticated workspace;
+the boundary states its date and the failure. A credential or account change
+cannot reuse another workspace's snapshot. Read-only commands check the current
+local credential identity before serving hosted answers; a different or missing
+credential returns `index_unreadable` until the local index is rebuilt. A scoped
+refresh retains other local
+scans only when workspace paths and authenticated hosted inputs are unchanged;
+otherwise it rebuilds the local services before joining them. Nothing uploads
+local source or runs a model on this machine.
 
 ## JSON
 
@@ -97,6 +118,9 @@ no candidate is classified locally and the boundary block says so.
 `boundary` is the `ServiceBoundary` block from `src/boundary.rs`, verbatim and
 whole; the fields above are a sample of it, not its definition. `files_attempted`
 is 0 on every local index, because a local index asks the model nothing.
+`candidates_withheld_changed_files`, when present, counts files whose hosted
+model answers were withheld because their working-tree bytes changed. An absent
+counter means this scan did not record it.
 
 ### Top level
 
@@ -109,12 +133,15 @@ is 0 on every local index, because a local index asks the model nothing.
 | `index_commit` | string | the commit that service was indexed at |
 | `indexed_at` | string (RFC 3339) | when `index` (or the last `refresh` of this service) ran |
 | `scanner_version` | string | the scanner release that wrote the index |
+| `hosted` | object \| null | `{commit, indexed_at, scanner_version, project}` describing the hosted copy; its commit is separate from `index_commit` |
+| `hosted_state` | string | `enriched`, `no_index_yet`, `not_connected`, `not_signed_in`, `version_mismatch`, `commit_missing`, or `read_failed`; the boundary explains any failed refresh alongside a retained copy |
+| `hosted_checked_at` | string \| null | when repository metadata last answered for this workspace; absent when no authenticated copy exists |
 | `changed_since_index` | int | files changed since `index_commit`: `git diff --name-only <commit>` plus what git does not track. Where git cannot answer at all (no repository, a commit a rebase dropped, no `git`), it falls back to whether the queried file's own mtime is newer than the index, and counts only that file. A rewrite that changes no bytes is not a change |
 | `stale` | bool | this file is one of them, so its rows may not describe what is on disk now |
 | `deleted` | bool | the file is in the index and no longer on disk |
 | `items` | array | routes and calls the index holds for this file, in line order |
 | `boundary` | object \| null | what this service's scan could not classify (`ServiceBoundary`, `src/boundary.rs`), verbatim |
-| `boundary_note` | string | one sentence naming what a LOCAL index cannot hold at all, with the count the scan kept. Always present, whatever the numbers: a thin index must never read as "there is no API here". |
+| `boundary_note` | string | hosted provenance, replay limits or the reason enrichment is unavailable, with the counts the scan kept. Always present. |
 | `boundary_lines` | string[] | the boundary as the CLI prints it, line by line: `boundary_note` first, then the counts. A reader rendering the boundary prints these bytes rather than re-wording the struct, so a hook and a terminal say the same sentence about the same number. |
 
 Locations come first and the boundary comes last: a reader that stops early has
@@ -137,7 +164,7 @@ than silently overwritten.
 | `path` | string | route path, GraphQL field, socket event, or pub/sub topic |
 | `line` | int \| null | 1-based line, when the index recorded one |
 | `col` | int \| null | 1-based column, when the index recorded one |
-| `source` | `"fact"` \| `"candidate"` | `fact` = a deterministic pass stated it; `candidate` = the model's reading alone. Local mode indexes no model rows, so a locally-produced row is always `fact`. |
+| `source` | `"fact"` \| `"candidate"` | `fact` = a deterministic pass stated it; `candidate` = a replayed hosted model answer. Local facts remain authoritative when a model answer contradicts them. |
 | `resolution_source` | string \| null | the wire value from the index blob: `file_based_route`, `imported_member`, `model`, … `null` = this row does not state it |
 | `evidence` | string \| null | one line naming what the row was read off |
 | `counterparts` | array | the other side of the contract, across every repo in the workspace |
@@ -149,6 +176,7 @@ than silently overwritten.
 |---|---|---|
 | `role` | `"producer"` \| `"consumer"` \| `"peer"` | what the counterpart is. `peer` is a shared external contract: both sides call the same third party, and neither serves the other. |
 | `service` | string | the counterpart's service |
+| `remote` | string \| null | GitHub `owner/repo` when the counterpart is hosted-only; `repo` is null in that case |
 | `repo` | string \| null | the absolute path of the counterpart's repo on this machine. `repo` + `file` opens it; null when the index no longer holds that repo |
 | `file` | string | the counterpart's file, relative to ITS OWN repo, which is a different repo from the queried file's |
 | `line` | int \| null | 1-based line, when the index recorded one |
@@ -238,22 +266,24 @@ unclassified in this service.
 | path | what |
 |---|---|
 | `.carrick/.gitignore` | `*` — the directory ignores itself, so no user file has to change |
-| `.carrick/repos/<repo>__<service>.json` | the per-service index blob (`CloudRepoData`), written by `LocalDirStorage` — the same bytes the cloud path would upload, minus everything a model would have added |
+| `.carrick/repos/*.json` | local per-service blobs, including eligible replayed hosted model answers |
+| `.carrick/hosted/snapshot.json` | authenticated hosted data, metadata and credential fingerprint; no bearer token |
 | `.carrick/index.json` | the joined read model `touch` and `check` answer from: every repo's absolute path, its services with their commits and boundaries, and per file the rows with their counterparts and verdicts |
-| `.carrick/join.json` | transient. The join phase writes it, the indexer folds it into `index.json` and deletes it; a copy left behind means an index that did not finish |
+| `.carrick/build-*/` | transient per-run blobs and join result, removed when the build finishes |
 
 `index.json` is derived: deleting it and re-running `carrick index` reproduces
 it. Nothing outside `src/local_mode/` reads it, and its internal shape is not
 this contract — only the command output above is.
 
-`<dir>/carrick-workspace.json` is the input, written by hand or by `carrick
-init`:
+`<dir>/carrick-workspace.json` is an optional overrides file. Shared Rust
+workspace detection selects a configured repo, a workspace manifest, immediate
+sibling repos, or the current repo. The CLI can propose the immediate parent
+without selecting it. Overrides add or exclude repo paths, relative to this
+file or absolute:
 
 ```json
-{ "repos": ["./webapp", "./orders-service", "../shared-client"] }
+{ "repos": ["../shared-client"], "exclude": ["./archived-service"] }
 ```
-
-Explicit paths, relative to the workspace file. No directory walk.
 
 ## What `touch` and `check` require
 
@@ -270,7 +300,8 @@ The workspace question has its own command and its own schema, below.
 
 What a surface opening a session asks: what is indexed, at which commit, how
 far each repo has moved since, and what each service could not classify. Same
-rules as the other reads — index only, exit 0 whatever it finds, under 300 ms.
+rules as the other reads: local index and credential identity, exit 0 whatever
+it finds, under 300 ms.
 
 `--json` prints **`carrick.status/0`**
 ([`schemas/carrick-status-0.json`](./schemas/carrick-status-0.json)):
@@ -308,23 +339,16 @@ rules as the other reads — index only, exit 0 whatever it finds, under 300 ms.
 | `services[].changed_since_index` | the exact number of changed and untracked files in that repo |
 | `services[].stale_files` | up to 50 of them, repo-relative; `stale_files_total` is always exact and `stale_files_truncated` says which you are looking at |
 | `services[].boundary_lines` | the same pre-rendered lines `check` and `touch` carry |
+| `services[].hosted`, `services[].hosted_state` | the same provenance and replay state as `check` |
+| `hosted_checked_at` | when repository metadata last answered for this workspace |
+| `repos_detected_by` | `carrick_json`, `workspace_manifest`, `siblings`, `single_repo`, or `workspace_overrides` |
+| `repos_added`, `repos_excluded` | explicit workspace override paths; absent when empty |
 
 Errors are the same three, under this schema:
 `{ "schema": "carrick.status/0", "error": "not_indexed" }`.
 
 ## Out of scope in this version
 
-- **Pulling candidates from the cloud index.** The scanner authenticates with
-  GitHub OIDC, which a laptop does not have, so local mode reads disk only. The
-  model rows the cloud index holds for these repos are not merged in. That
-  needs a user-auth path and is not built.
+- Local model calls and uploads.
 - Per-file incremental extraction and a persistent process.
-- **Rows only a model can state.** A local index holds what the deterministic
-  passes state: file-based and descriptor routes, class-controller routes,
-  imported-member calls, GraphQL schema and document rows, socket and pub/sub
-  operations, SDK surfaces. A route registered on a typed receiver
-  (`app.get("/x", handler)`) is NOT among them — its route-ness is decided by
-  matching the receiver's declaring package against a framework inventory only
-  the model produces — and neither is a call whose URL is assembled at the call
-  site. On a service written that way the local index is close to empty, which
-  is why `boundary_note` is on every answer.
+- Background hosted refresh timers or changes to the MCP tool surface.

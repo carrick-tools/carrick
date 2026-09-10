@@ -21,7 +21,7 @@ use crate::boundary::ServiceBoundary;
 /// Bumped whenever this file's shape changes. A mismatch makes every read-only
 /// command answer `index_unreadable`, which tells the user to re-index instead
 /// of showing them rows in a shape the reader half-understands.
-pub const READ_MODEL_VERSION: u32 = 2;
+pub const READ_MODEL_VERSION: u32 = 3;
 
 /// A route the service serves, or a call it makes.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,10 +40,8 @@ impl ItemKind {
     }
 }
 
-/// Which layer is answerable for a row. A local index holds only facts —
-/// the model stage does not run here — but the field is stated on every row
-/// rather than implied, because the same reader will one day see rows that
-/// came from an index the cloud built (R1).
+/// Which layer states a row: a local deterministic pass or a hosted model
+/// answer replayed for an unchanged file.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
@@ -74,6 +72,8 @@ impl Source {
 /// The other side of one contract.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Counterpart {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
     /// `producer`, `consumer`, or `peer` when neither side serves the other.
     pub role: String,
     pub service: String,
@@ -123,6 +123,8 @@ pub struct IndexedItem {
 /// One service of one repo, as the index recorded it.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct IndexedService {
+    #[serde(default)]
+    pub enrichment: super::hosted::ServiceEnrichment,
     /// `service_name ?? repo_name` — what every counterpart names it by.
     pub name: String,
     /// The service's root inside its repo, as `carrick.json` declares it
@@ -189,6 +191,20 @@ impl IndexedRepo {
 /// The whole read model.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct LocalIndex {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repos_detected_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos_added: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos_excluded: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_source_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_checked_at: Option<String>,
     pub version: u32,
     pub scanner_version: String,
     /// RFC 3339, when the last `index` or `refresh` finished.
@@ -219,7 +235,10 @@ impl LocalIndex {
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::other(format!("failed to serialize the index: {e}")))?;
-        std::fs::write(path, json)
+        let pending = path.with_file_name(format!("index-{}.tmp", uuid::Uuid::new_v4()));
+        let result = std::fs::write(&pending, json).and_then(|()| std::fs::rename(&pending, path));
+        let _ = std::fs::remove_file(pending);
+        result
     }
 
     /// The repo a file belongs to, and the file's path relative to it.
@@ -290,6 +309,13 @@ mod tests {
         // A workspace can list a monorepo and one of its packages; the file
         // belongs to the package, not to the tree that contains it.
         let index = LocalIndex {
+            hosted_identity: None,
+            hosted_workspace: None,
+            repos_detected_by: None,
+            repos_added: Vec::new(),
+            repos_excluded: Vec::new(),
+            hosted_checked_at: None,
+            hosted_source_key: None,
             version: READ_MODEL_VERSION,
             scanner_version: "test".to_string(),
             indexed_at: "2026-09-06T00:00:00Z".to_string(),
@@ -305,6 +331,13 @@ mod tests {
     #[test]
     fn a_file_outside_every_repo_resolves_to_nothing() {
         let index = LocalIndex {
+            hosted_identity: None,
+            hosted_workspace: None,
+            repos_detected_by: None,
+            repos_added: Vec::new(),
+            repos_excluded: Vec::new(),
+            hosted_checked_at: None,
+            hosted_source_key: None,
             version: READ_MODEL_VERSION,
             scanner_version: "test".to_string(),
             indexed_at: "2026-09-06T00:00:00Z".to_string(),

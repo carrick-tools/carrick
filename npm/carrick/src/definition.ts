@@ -35,8 +35,8 @@
 // Known deviation from the design record, which says the peek title labels a
 // candidate: LSP's `Location` and `LocationLink` carry no title, and the peek
 // renders the target file and line only. There is nowhere to put the label, so
-// ordering is what is enforced. (Local mode indexes no candidate rows at all
-// today, so this governs future rows rather than current behaviour.)
+// ordering is what is enforced. Hosted model answers can supply candidate
+// rows on local files unchanged since the hosted commit.
 
 import { isCandidate, type CheckItem, type CheckResult } from "./contract.ts";
 import { resolveCounterpart, type Range } from "./diagnostics.ts";

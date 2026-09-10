@@ -9,6 +9,10 @@
       "type": "object",
       "required": ["schema", "workspace", "indexed_at", "services"],
       "properties": {
+        "repos_detected_by": { "enum": ["carrick_json", "workspace_manifest", "siblings", "single_repo", "workspace_overrides"] },
+        "repos_added": { "type": "array", "items": { "type": "string" } },
+        "repos_excluded": { "type": "array", "items": { "type": "string" } },
+        "hosted_checked_at": { "type": ["string", "null"] },
         "schema": { "const": "carrick.status/0" },
         "workspace": {
           "type": "string",
@@ -40,6 +44,20 @@
         "changed_since_index"
       ],
       "properties": {
+        "hosted": {
+          "type": ["object", "null"],
+          "required": ["commit", "indexed_at", "scanner_version", "project"],
+          "properties": {
+            "commit": { "type": "string" },
+            "indexed_at": { "type": "string" },
+            "scanner_version": { "type": ["string", "null"] },
+            "project": { "type": "string" }
+          },
+          "additionalProperties": true
+        },
+        "hosted_state": {
+          "enum": ["enriched", "no_index_yet", "not_connected", "not_signed_in", "version_mismatch", "commit_missing", "read_failed"]
+        },
         "service": {
           "type": "string",
           "description": "serviceName from carrick.json, else the repo name."
@@ -74,6 +92,7 @@
         "boundary": {
           "type": ["object", "null"],
           "description": "ServiceBoundary for this service (src/boundary.rs), verbatim.",
+          "properties": { "candidates_withheld_changed_files": { "type": "integer", "minimum": 0 } },
           "additionalProperties": true
         },
         "boundary_note": { "type": "string" },

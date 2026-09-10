@@ -19,6 +19,21 @@
         "items"
       ],
       "properties": {
+        "hosted_checked_at": { "type": ["string", "null"] },
+        "hosted": {
+          "type": ["object", "null"],
+          "required": ["commit", "indexed_at", "scanner_version", "project"],
+          "properties": {
+            "commit": { "type": "string" },
+            "indexed_at": { "type": "string" },
+            "scanner_version": { "type": ["string", "null"] },
+            "project": { "type": "string" }
+          },
+          "additionalProperties": true
+        },
+        "hosted_state": {
+          "enum": ["enriched", "no_index_yet", "not_connected", "not_signed_in", "version_mismatch", "commit_missing", "read_failed"]
+        },
         "schema": { "const": "carrick.check/0" },
         "file": {
           "type": "string",
@@ -65,11 +80,12 @@
         "boundary": {
           "type": ["object", "null"],
           "description": "ServiceBoundary for this file's service (src/boundary.rs), verbatim. Null when the index states none.",
+          "properties": { "candidates_withheld_changed_files": { "type": "integer", "minimum": 0 } },
           "additionalProperties": true
         },
         "boundary_note": {
           "type": "string",
-          "description": "One sentence naming what a local index cannot hold at all, with the count the scan kept. Always present: a thin index must never read as 'there is no API here'."
+          "description": "Hosted provenance, replay limits or the reason enrichment is unavailable, with the count the scan kept. Always present: a thin index must never read as 'there is no API here'."
         },
         "boundary_lines": {
           "type": "array",
@@ -99,7 +115,7 @@
         "col": { "type": ["integer", "null"], "minimum": 1 },
         "source": {
           "enum": ["fact", "candidate"],
-          "description": "fact = a deterministic pass stated it; candidate = the model's reading alone. Local mode indexes no model rows."
+          "description": "fact = a deterministic pass stated it; candidate = the model's reading alone. Candidate rows are replayed hosted model answers on unchanged files."
         },
         "resolution_source": {
           "type": ["string", "null"],
@@ -124,6 +140,7 @@
       "type": "object",
       "required": ["role", "service", "file"],
       "properties": {
+        "remote": { "type": ["string", "null"], "description": "GitHub owner/repo for a hosted-only counterpart; repo is null." },
         "role": {
           "enum": ["producer", "consumer", "peer"],
           "description": "peer = shared external contract: both sides call the same third party and neither serves the other."
