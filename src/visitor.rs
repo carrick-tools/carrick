@@ -1,8 +1,10 @@
 extern crate swc_common;
 extern crate swc_ecma_parser;
 
-use crate::receiver_origin::{ReceiverOriginCollector, ReceiverOrigins};
-use crate::receiver_type::{ReceiverTypeCollector, ReceiverTypes, class_field_types};
+use crate::receiver_origin::origin_root;
+use crate::receiver_type::{
+    ReceiverTypes, annotated_type_ident, class_field_types, constructed_type_ident,
+};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -71,6 +73,17 @@ pub enum FunctionNodeType {
     // Used for deserialization when AST data is not available
     #[default]
     Placeholder,
+}
+
+impl Spanned for FunctionNodeType {
+    fn span(&self) -> swc_common::Span {
+        match self {
+            Self::ArrowFunction(arrow) => arrow.span,
+            Self::FunctionDeclaration(function) => function.function.span,
+            Self::FunctionExpression(function) => function.function.span,
+            Self::Placeholder => swc_common::DUMMY_SP,
+        }
+    }
 }
 
 impl serde::Serialize for FunctionNodeType {
@@ -240,6 +253,205 @@ pub struct CalleeRef {
     pub shape: CalleeShape,
     /// Line the call is written on, in the caller's file.
     pub line: u32,
+    /// Exact AST call span, used only during discovery to assign ownership.
+    /// A line can contain separate calls in separate nested functions.
+    pub span: swc_common::Span,
+    /// Lexically resolved receiver facts; never serialized.
+    pub receiver: ReceiverBinding,
+}
+
+/// The binding visible at one member call, independently of its indexed owner.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReceiverBinding {
+    /// An import can be resolved through this file's import table.
+    pub imported_name: Option<String>,
+    /// An indexed member declared within this receiver's lexical binding.
+    pub local_member: Option<String>,
+    /// A declared class settles resolution even when that class is unavailable.
+    pub declared: bool,
+    pub origin: Option<String>,
+}
+
+/// SWC gives each lexical binding a distinct Id, including unknown and
+/// destructured shadows. Keep those identities until receiver facts have
+/// been attached to exact call spans, then discard the resolved AST.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LexicalBinding {
+    receiver: ReceiverBinding,
+    declared_id: Option<Id>,
+    origin_root: Option<Id>,
+    direct_span: Option<swc_common::Span>,
+}
+
+#[derive(Default)]
+struct LexicalReceivers {
+    bindings: HashMap<Id, LexicalBinding>,
+    calls: HashMap<swc_common::Span, Id>,
+}
+
+impl LexicalReceivers {
+    fn record(&mut self, id: Id, binding: LexicalBinding) {
+        self.bindings
+            .entry(id)
+            .and_modify(|previous| {
+                // Agreement is per fact: conflicting initializer origins
+                // cannot erase an explicit class annotation that agrees.
+                if previous.receiver.imported_name != binding.receiver.imported_name {
+                    previous.receiver.imported_name = None;
+                }
+                if previous.declared_id != binding.declared_id {
+                    previous.declared_id = None;
+                }
+                if previous.receiver.origin != binding.receiver.origin {
+                    previous.receiver.origin = None;
+                }
+                if previous.origin_root != binding.origin_root {
+                    previous.origin_root = None;
+                }
+                if previous.direct_span != binding.direct_span {
+                    previous.direct_span = None;
+                }
+            })
+            .or_insert(binding);
+    }
+
+    fn record_call(&mut self, expr: &Expr, span: swc_common::Span) {
+        if let Expr::Member(member) = expr
+            && let Expr::Ident(object) = &*member.obj
+        {
+            self.calls.insert(span, object.to_id());
+        }
+    }
+
+    fn receiver(&self, id: &Id) -> ReceiverBinding {
+        let Some(binding) = self.bindings.get(id) else {
+            return ReceiverBinding::default();
+        };
+        let mut receiver = binding.receiver.clone();
+        receiver.declared = binding.declared_id.is_some();
+        let mut current = binding;
+        let mut seen = HashSet::new();
+        while receiver.origin.is_none() {
+            let Some(root) = &current.origin_root else {
+                break;
+            };
+            if !seen.insert(root) {
+                break;
+            }
+            let Some(parent) = self.bindings.get(root) else {
+                break;
+            };
+            receiver.origin = parent.receiver.origin.clone();
+            current = parent;
+        }
+        receiver
+    }
+}
+
+impl Visit for LexicalReceivers {
+    fn visit_import_decl(&mut self, import: &ImportDecl) {
+        for specifier in &import.specifiers {
+            let (ident, type_only) = match specifier {
+                ImportSpecifier::Named(named) => (&named.local, named.is_type_only),
+                ImportSpecifier::Default(default) => (&default.local, false),
+                ImportSpecifier::Namespace(namespace) => (&namespace.local, false),
+            };
+            self.record(
+                ident.to_id(),
+                LexicalBinding {
+                    receiver: ReceiverBinding {
+                        imported_name: Some(ident.sym.to_string()),
+                        declared: false,
+                        local_member: None,
+                        origin: (!import.type_only && !type_only)
+                            .then(|| import.src.value.to_string()),
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    fn visit_class_decl(&mut self, class: &ClassDecl) {
+        self.record(
+            class.ident.to_id(),
+            LexicalBinding {
+                direct_span: Some(class.class.span),
+                ..Default::default()
+            },
+        );
+        class.visit_children_with(self);
+    }
+
+    fn visit_class_expr(&mut self, class: &ClassExpr) {
+        if let Some(ident) = &class.ident {
+            self.record(
+                ident.to_id(),
+                LexicalBinding {
+                    direct_span: Some(class.class.span),
+                    ..Default::default()
+                },
+            );
+        }
+        class.visit_children_with(self);
+    }
+
+    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
+        if let Pat::Ident(ident) = &declarator.name {
+            self.record(
+                ident.id.to_id(),
+                LexicalBinding {
+                    declared_id: ident
+                        .type_ann
+                        .as_deref()
+                        .and_then(annotated_type_ident)
+                        .or_else(|| declarator.init.as_deref().and_then(constructed_type_ident))
+                        .map(Ident::to_id),
+                    origin_root: declarator
+                        .init
+                        .as_deref()
+                        .and_then(origin_root)
+                        .map(Ident::to_id),
+                    direct_span: match declarator.init.as_deref() {
+                        Some(Expr::Object(object)) => Some(object.span),
+                        _ => None,
+                    },
+                    ..Default::default()
+                },
+            );
+            // The declarator's binding was recorded above. Its initializer
+            // may contain more declarations and calls, which still need a walk.
+            declarator.init.visit_with(self);
+        } else {
+            declarator.visit_children_with(self);
+        }
+    }
+
+    fn visit_binding_ident(&mut self, ident: &BindingIdent) {
+        self.record(
+            ident.id.to_id(),
+            LexicalBinding {
+                declared_id: ident
+                    .type_ann
+                    .as_deref()
+                    .and_then(annotated_type_ident)
+                    .map(Ident::to_id),
+                ..Default::default()
+            },
+        );
+    }
+
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if let Callee::Expr(expr) = &call.callee {
+            self.record_call(expr, call.span);
+        }
+        call.visit_children_with(self);
+    }
+
+    fn visit_opt_call(&mut self, call: &OptCall) {
+        self.record_call(&call.callee, call.span);
+        call.visit_children_with(self);
+    }
 }
 
 /// Most retrieval tokens one function may contribute (see
@@ -399,9 +611,10 @@ fn build_tokens(params: &[String], identifiers: &[String], literals: &[String]) 
 /// raw material for `FunctionDefinition::tokens` — every identifier and
 /// property name read, and every string or numeric literal written.
 ///
-/// Nested functions and arrows are walked too: their calls sit inside the
-/// enclosing function's body and count as its dependencies. Entering a nested
-/// class clears the `this` context, so a `this.x()` written inside a class
+/// Nested functions and arrows are walked too, preserving retrieval tokens
+/// and calls in anonymous callbacks. Once all definitions are known, module
+/// finalization keeps each call under its innermost indexed owner. Entering a
+/// nested class clears the `this` context, so a `this.x()` written inside a class
 /// declared in the body resolves to nothing rather than to the outer class.
 struct CalleeCollector<'a> {
     source_map: &'a swc_common::SourceMap,
@@ -451,6 +664,8 @@ impl CalleeCollector<'_> {
                 name: ident.sym.to_string(),
                 shape: CalleeShape::Bare,
                 line,
+                span,
+                receiver: ReceiverBinding::default(),
             }),
             Expr::Member(member) => {
                 let name = match &member.prop {
@@ -465,6 +680,8 @@ impl CalleeCollector<'_> {
                                 name,
                                 shape: CalleeShape::ThisMember(class),
                                 line,
+                                span,
+                                receiver: ReceiverBinding::default(),
                             });
                         }
                     }
@@ -472,6 +689,8 @@ impl CalleeCollector<'_> {
                         name,
                         shape: CalleeShape::Member(obj.sym.to_string()),
                         line,
+                        span,
+                        receiver: ReceiverBinding::default(),
                     }),
                     // `this.field.foo()`. Nothing wider: `a.b.c()` needs the
                     // VALUE of `a.b`, which no statement in the file gives.
@@ -491,6 +710,8 @@ impl CalleeCollector<'_> {
                             name,
                             shape: CalleeShape::ThisFieldMember { class, field },
                             line,
+                            span,
+                            receiver: ReceiverBinding::default(),
                         });
                     }
                     _ => {}
@@ -713,21 +934,6 @@ pub struct FunctionDefinitionExtractor {
     /// consumes it immediately after discovery to populate
     /// `FunctionDefinition::calls`, and nothing downstream sees it.
     pub callee_refs: HashMap<String, Vec<CalleeRef>>,
-    /// Definition key → the classes that definition declares its own local
-    /// bindings to be ([`crate::receiver_type`], carrick#776). Keyed like
-    /// `callee_refs` because it exists to resolve those call sites' receivers,
-    /// and because a name means different things in different scopes.
-    pub declared_types: HashMap<String, ReceiverTypes>,
-    /// Definition key → the module specifiers this definition's own local
-    /// bindings trace their value back to ([`crate::receiver_origin`],
-    /// carrick#781). Keyed like `declared_types`, and read only after it
-    /// declines: an origin says the receiver belongs to a package, never which
-    /// class it is.
-    pub receiver_origins: HashMap<String, ReceiverOrigins>,
-    /// The module scope every body in this file starts from — its value
-    /// imports and its top-level declarators — cloned per function, so a
-    /// parameter shadows it wherever one appears.
-    module_origins: ReceiverOriginCollector,
     /// Class name → the classes that class declares its own FIELDS to be
     /// ([`crate::receiver_type::class_field_types`], carrick#782). Keyed by
     /// class rather than by definition because a field belongs to the class,
@@ -757,9 +963,6 @@ impl FunctionDefinitionExtractor {
         Self {
             function_definitions: HashMap::new(),
             callee_refs: HashMap::new(),
-            declared_types: HashMap::new(),
-            receiver_origins: HashMap::new(),
-            module_origins: ReceiverOriginCollector::per_function(),
             field_types: HashMap::new(),
             current_file_path: file_path,
             source_map,
@@ -767,6 +970,104 @@ impl FunctionDefinitionExtractor {
             current_class: None,
             current_class_collisions: HashSet::new(),
             inaccessible_members: HashSet::new(),
+        }
+    }
+
+    /// Each exact call site belongs to its smallest enclosing indexed
+    /// function (carrick#931). Callbacks without a definition row keep their
+    /// calls under the nearest indexed enclosing function.
+    /// Retrieval tokens still include nested bodies.
+    fn finalize_call_owners(&mut self) {
+        let mut owners: HashMap<swc_common::Span, (u32, String)> = HashMap::new();
+        for (key, calls) in &self.callee_refs {
+            let Some(definition) = self.function_definitions.get(key) else {
+                continue;
+            };
+            let span = definition.node_type.span();
+            if span.is_dummy() {
+                continue;
+            }
+            let candidate = (span.hi.0 - span.lo.0, key.clone());
+            for call in calls {
+                if call.span.is_dummy() {
+                    continue;
+                }
+                owners
+                    .entry(call.span)
+                    .and_modify(|owner| {
+                        // The key breaks ties deterministically if aliases
+                        // index the same function body more than once.
+                        if candidate < *owner {
+                            *owner = candidate.clone();
+                        }
+                    })
+                    .or_insert_with(|| candidate.clone());
+            }
+        }
+        for (key, calls) in &mut self.callee_refs {
+            calls.retain(|call| owners.get(&call.span).is_none_or(|(_, owner)| owner == key));
+        }
+    }
+
+    /// Resolve lexical identities on a private clone so scope marks cannot
+    /// affect the AST retained for signatures or other extraction passes.
+    fn finalize_receiver_bindings(&mut self, module: &Module) {
+        use swc_common::{GLOBALS, Globals, Mark};
+        use swc_ecma_transforms_base::resolver;
+        use swc_ecma_visit::VisitMutWith;
+
+        // parse_file already resolves its AST; standalone parsing does not.
+        // Marks belong to the Globals that created them, so neither those
+        // marks nor their numeric indexes can be reused in a fresh resolver.
+        struct ClearContexts;
+        impl swc_ecma_visit::VisitMut for ClearContexts {
+            fn visit_mut_syntax_context(&mut self, context: &mut swc_common::SyntaxContext) {
+                *context = swc_common::SyntaxContext::empty();
+            }
+        }
+        let mut resolved = module.clone();
+        resolved.visit_mut_with(&mut ClearContexts);
+        let mut lexical = LexicalReceivers::default();
+        GLOBALS.set(&Globals::new(), || {
+            resolved.visit_mut_with(&mut resolver(Mark::new(), Mark::new(), true));
+            resolved.visit_with(&mut lexical);
+        });
+        for call in self.callee_refs.values_mut().flatten() {
+            if let Some(id) = lexical.calls.get(&call.span) {
+                call.receiver = lexical.receiver(id);
+                let target_id = lexical
+                    .bindings
+                    .get(id)
+                    .and_then(|binding| binding.declared_id.as_ref())
+                    .unwrap_or(id);
+                if call.receiver.declared {
+                    call.receiver.imported_name = lexical
+                        .bindings
+                        .get(target_id)
+                        .and_then(|binding| binding.receiver.imported_name.clone());
+                }
+                if let Some(span) = lexical
+                    .bindings
+                    .get(target_id)
+                    .and_then(|binding| binding.direct_span)
+                {
+                    // A same-named class or object in another scope cannot
+                    // supply this member. Require the indexed body to lie
+                    // within the actual receiver declaration.
+                    for key in [
+                        format!("{}.{}", target_id.0, call.name),
+                        format!("{}.static.{}", target_id.0, call.name),
+                    ] {
+                        if let Some(definition) = self.function_definitions.get(&key) {
+                            let member_span = definition.node_type.span();
+                            if span.lo <= member_span.lo && member_span.hi <= span.hi {
+                                call.receiver.local_member = Some(key);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -825,25 +1126,6 @@ impl FunctionDefinitionExtractor {
         };
         self.callee_refs.insert(key.to_string(), refs);
 
-        let mut types = ReceiverTypeCollector::default();
-        for param in &function.params {
-            types.record_pat(&param.pat);
-        }
-        if let Some(body) = &function.body {
-            body.visit_with(&mut types);
-        }
-        self.declared_types.insert(key.to_string(), types.finish());
-
-        let mut origins = self.module_origins.clone();
-        for param in &function.params {
-            origins.record_shadow(&param.pat);
-        }
-        if let Some(body) = &function.body {
-            body.visit_with(&mut origins);
-        }
-        self.receiver_origins
-            .insert(key.to_string(), origins.finish());
-
         tokens
     }
 
@@ -857,21 +1139,6 @@ impl FunctionDefinitionExtractor {
         let collector = self.walk_body(&*arrow.body);
         let tokens = build_tokens(&params, &collector.identifiers, &collector.literals);
         self.callee_refs.insert(key.to_string(), collector.out);
-
-        let mut types = ReceiverTypeCollector::default();
-        for pat in &arrow.params {
-            types.record_pat(pat);
-        }
-        arrow.body.visit_with(&mut types);
-        self.declared_types.insert(key.to_string(), types.finish());
-
-        let mut origins = self.module_origins.clone();
-        for pat in &arrow.params {
-            origins.record_shadow(pat);
-        }
-        arrow.body.visit_with(&mut origins);
-        self.receiver_origins
-            .insert(key.to_string(), origins.finish());
 
         tokens
     }
@@ -1581,11 +1848,11 @@ impl Visit for FunctionDefinitionExtractor {
         var_decl.visit_children_with(self);
     }
 
-    /// Seed the module scope before any body is walked: a function's own
-    /// statements are recorded on top of it (carrick#781).
+    /// Finalize ownership and lexical receivers after discovering every body.
     fn visit_module(&mut self, module: &Module) {
-        self.module_origins.record_module_scope(module);
         module.visit_children_with(self);
+        self.finalize_call_owners();
+        self.finalize_receiver_bindings(module);
     }
 
     /// Track the enclosing class name so members can be indexed as `Class.member`.
@@ -2039,6 +2306,40 @@ second`): void {}
                 && !arg.is_rest
                 && arg.default_value.is_none()));
         }
+    }
+
+    #[test]
+    fn call_ownership_preserves_distinct_spans_and_nested_tokens() {
+        let (cm, module) = parse_ts(
+            "function target() {}\n\
+             function outer() { const label = 'café'; function nested() { target(); target?.(); } target(); }",
+        );
+        let mut extractor = FunctionDefinitionExtractor::new(PathBuf::from("test.ts"), cm);
+        module.visit_with(&mut extractor);
+
+        assert_eq!(extractor.callee_refs["outer"].len(), 1);
+        assert_eq!(extractor.callee_refs["nested"].len(), 2);
+        let spans: HashSet<_> = extractor
+            .callee_refs
+            .values()
+            .flatten()
+            .map(|call| {
+                assert_eq!(call.name, "target");
+                assert_eq!(call.line, 2);
+                call.span
+            })
+            .collect();
+        assert_eq!(spans.len(), 3);
+        assert!(
+            extractor.function_definitions["outer"]
+                .tokens
+                .contains(&"target".to_string())
+        );
+        assert!(
+            extractor.function_definitions["outer"]
+                .tokens
+                .contains(&"café".to_string())
+        );
     }
 
     #[test]

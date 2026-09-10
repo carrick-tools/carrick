@@ -43,21 +43,11 @@
 //!   decides what the value is; the two-ring member join already reaches that
 //!   shape by module (carrick#655) and does not need this one.
 //!
-//! Two scopes are read, for two callers. [`collect_receiver_origins`] folds a
-//! whole module into one table, which is what the HTTP-candidate join has
-//! always consumed (carrick#666). [`ReceiverOriginCollector`] answers the same
-//! question per FUNCTION for the call graph (carrick#781): seeded with the
-//! module scope every body can see — its value imports and its top-level
-//! declarators — then walked over one body. `client` is what half the
-//! functions in a file call their local, so a module-wide fold drops the name
-//! in exactly the files that use it most. On that per-function path a
-//! PARAMETER of the name shadows the import and is recorded as no origin at
-//! all, wherever the parameter sits: a nested function's call sites are folded
-//! into the enclosing function's, so a parameter the enclosing scope cannot
-//! see would otherwise have the join answer for a receiver that is something
-//! else. The module-wide fold keeps the reading it has always had — parameters
-//! do not shadow there — because its rows are the HTTP-candidate join's and
-//! moving them is not this ticket's business.
+//! [`collect_receiver_origins`] folds a whole module into one table for the
+//! HTTP-candidate join (carrick#666). The call graph instead records origins
+//! by SWC lexical binding identity in `visitor`, using [`origin_root`] to
+//! follow initializers. Its captured receivers and shadows remain distinct
+//! even when their call sites belong to the same indexed function.
 
 use std::collections::HashMap;
 
@@ -77,7 +67,7 @@ pub fn collect_receiver_origins(module: &Module) -> ReceiverOrigins {
 
 /// The identifier an expression's value traces back to, following the forms
 /// that pass a value along rather than replacing it.
-fn origin_root(expr: &Expr) -> Option<&Ident> {
+pub(crate) fn origin_root(expr: &Expr) -> Option<&Ident> {
     match expr {
         Expr::Ident(ident) => Some(ident),
         Expr::Await(await_expr) => origin_root(&await_expr.arg),
@@ -95,38 +85,18 @@ fn origin_root(expr: &Expr) -> Option<&Ident> {
     }
 }
 
-/// Reads one scope's receiver origins. Seed it with the module scope through
-/// [`record_module_scope`](Self::record_module_scope), clone it per function,
-/// walk that function's body with `visit_with`, then take the table with
-/// [`finish`](Self::finish).
+/// Reads the HTTP-candidate join's module-wide receiver origins.
 ///
 /// `None` against a name marks its origin contested: bound from two different
 /// specifiers, or bound from something that is not an import at all.
 #[derive(Clone, Default)]
 pub struct ReceiverOriginCollector {
     origins: HashMap<String, Option<String>>,
-    /// Whether a parameter encountered while walking shadows what the scope
-    /// binds. On for the per-function reading (carrick#781), where a nested
-    /// function's parameter has to be seen because its call sites are folded
-    /// into the enclosing function's. Off for the module-wide fold, which has
-    /// answered for a file as a whole since carrick#666 and whose rows a
-    /// stricter rule would silently move.
-    shadow_params: bool,
 }
 
 impl ReceiverOriginCollector {
-    /// A collector for ONE function: parameters shadow, wherever they sit.
-    pub fn per_function() -> Self {
-        Self {
-            origins: HashMap::new(),
-            shadow_params: true,
-        }
-    }
-
-    /// Everything a function body can see before its own statements: the
-    /// module's value imports, then its top-level declarators. Nested bodies
-    /// are deliberately not walked — that is the caller's one body, recorded
-    /// after this seed.
+    /// Seed the module's value imports and top-level declarators before
+    /// walking all nested bodies with the module-wide collector.
     pub fn record_module_scope(&mut self, module: &Module) {
         for item in &module.body {
             match item {
@@ -139,14 +109,6 @@ impl ReceiverOriginCollector {
                 }
                 _ => {}
             }
-        }
-    }
-
-    /// Record a binding this scope introduces that is NOT an import — a
-    /// parameter, most of all. A shadowed import is not the import.
-    pub fn record_shadow(&mut self, pat: &Pat) {
-        if let Pat::Ident(ident) = pat {
-            self.record(ident.id.sym.to_string(), None);
         }
     }
 
@@ -212,28 +174,6 @@ impl Visit for ReceiverOriginCollector {
     fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
         self.record_declarator(declarator);
         declarator.visit_children_with(self);
-    }
-
-    /// A parameter is a binding that is not the import, wherever it sits. Call
-    /// sites inside a nested function are folded into the enclosing one, so a
-    /// parameter that shadows an origin has to be seen from out here or the
-    /// join answers for a receiver that is something else entirely. Only on
-    /// the per-function path — see `shadow_params`.
-    fn visit_param(&mut self, param: &Param) {
-        if self.shadow_params {
-            self.record_shadow(&param.pat);
-        }
-        param.visit_children_with(self);
-    }
-
-    /// Arrow parameters are `Pat`s with no `Param` wrapper around them.
-    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
-        if self.shadow_params {
-            for pat in &arrow.params {
-                self.record_shadow(pat);
-            }
-        }
-        arrow.visit_children_with(self);
     }
 }
 
@@ -350,104 +290,25 @@ mod tests {
         assert!(!origins.contains_key("client"));
     }
 
-    /// The per-function reading (carrick#781): the module scope seeds the
-    /// table, then one function's own body is recorded on top of it.
-    fn scope_origins(source: &str, function: &str) -> ReceiverOrigins {
-        let (_, module) = parse_standalone_module(Path::new("origins.ts"), source).expect("parses");
-        let mut collector = ReceiverOriginCollector::default();
-        collector.record_module_scope(&module);
-        let declaration = module
-            .body
-            .iter()
-            .find_map(|item| match item {
-                ModuleItem::Stmt(Stmt::Decl(Decl::Fn(decl))) if decl.ident.sym == *function => {
-                    Some(decl)
-                }
-                ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => match &export.decl {
-                    Decl::Fn(decl) if decl.ident.sym == *function => Some(decl),
-                    _ => None,
-                },
-                _ => None,
-            })
-            .expect("the function");
-        for param in &declaration.function.params {
-            collector.record_shadow(&param.pat);
-        }
-        if let Some(body) = &declaration.function.body {
-            body.visit_with(&mut collector);
-        }
-        collector.finish()
-    }
-
-    /// A nested parameter is invisible to the module-wide fold and shadowing
-    /// on the per-function path: the two readings, stated.
+    /// The HTTP-candidate module fold deliberately does not treat nested
+    /// parameters as module-wide shadows. Call-graph lexical shadows have
+    /// their own regression tests in call_graph.
     #[test]
-    fn a_nested_parameter_shadows_only_on_the_per_function_path() {
-        let source = r#"
-            import { manager } from "@scope/core/v3";
-            export function run(id: string) {
-              const client = manager.clientOrThrow();
-              const inner = (client: Other) => client.list(id);
-              return inner;
+    fn nested_parameters_do_not_change_the_http_module_fold() {
+        let origins = origins(
+            r#"
+            import { manager } from "@scope/core";
+            function run() {
+                const client = manager.make();
+                const nested = (client) => client.list();
+                return nested;
             }
-        "#;
-        let (_, module) = parse_standalone_module(Path::new("origins.ts"), source).expect("parses");
-
-        // Module-wide (carrick#666): unchanged, the parameter is not a binding
-        // this reading records at all.
-        assert_eq!(
-            collect_receiver_origins(&module)
-                .get("client")
-                .map(String::as_str),
-            Some("@scope/core/v3")
+        "#,
         );
-
-        // Per function (carrick#781): the nested parameter shadows it, because
-        // the nested call site is folded into this function's.
-        let mut collector = ReceiverOriginCollector::per_function();
-        collector.record_module_scope(&module);
-        module.visit_with(&mut collector);
-        assert!(!collector.finish().contains_key("client"));
-    }
-
-    #[test]
-    fn one_body_is_read_on_top_of_the_module_scope() {
-        let source = r#"
-            import { manager } from "@scope/core/v3";
-            const shared = manager.clientOrThrow();
-            export function first() {
-              const client = manager.clientOrThrow();
-              return client;
-            }
-            export function second(client) {
-              return client;
-            }
-            export function third() {
-              const client = makeSomethingElse();
-              return shared;
-            }
-        "#;
-        // The module-scope const is visible to every body.
-        for function in ["first", "second", "third"] {
-            assert_eq!(
-                scope_origins(source, function)
-                    .get("shared")
-                    .map(String::as_str),
-                Some("@scope/core/v3"),
-                "{function} must see the module-scope binding"
-            );
-        }
-        // A local in one function says nothing about the same name in another.
         assert_eq!(
-            scope_origins(source, "first")
-                .get("client")
-                .map(String::as_str),
-            Some("@scope/core/v3")
+            origins.get("client").map(String::as_str),
+            Some("@scope/core")
         );
-        // A parameter shadows whatever the module scope binds.
-        assert!(!scope_origins(source, "second").contains_key("client"));
-        // A local bound from something that is not an import has no origin.
-        assert!(!scope_origins(source, "third").contains_key("client"));
     }
 
     #[test]

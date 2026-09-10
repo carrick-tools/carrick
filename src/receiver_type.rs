@@ -19,12 +19,10 @@
 //! uses the same import walk it already uses for a class named directly, so a
 //! type that names nothing in this repo simply resolves to nothing.
 //!
-//! Collection is per FUNCTION, keyed like the call sites it exists to resolve,
-//! because a name means different things in different scopes: a file that
-//! takes `client: ApiClient` in one helper and writes `const client =
-//! useClient()` in another states two different things, and a module-wide
-//! table would have to drop both. Nested functions are folded into the
-//! enclosing one, exactly as their call sites already are.
+//! The call graph reads these type expressions per lexical binding in
+//! `visitor`, so captured receivers survive ownership attribution and
+//! same-named declarations in nested scopes remain distinct. The collector
+//! below also supports folding declarations and class fields into one table.
 //!
 //! What is read, and nothing else:
 //!
@@ -79,11 +77,19 @@ pub fn class_field_types(class: &Class) -> ReceiverTypes {
                 let PropName::Ident(key) = &prop.key else {
                     continue;
                 };
-                let declared = prop.type_ann.as_deref().and_then(annotated_type_name);
+                let declared = prop
+                    .type_ann
+                    .as_deref()
+                    .and_then(annotated_type_ident)
+                    .map(|ident| ident.sym.to_string());
                 collector.record(key.sym.to_string(), declared);
             }
             ClassMember::PrivateProp(prop) if !prop.is_static => {
-                let declared = prop.type_ann.as_deref().and_then(annotated_type_name);
+                let declared = prop
+                    .type_ann
+                    .as_deref()
+                    .and_then(annotated_type_ident)
+                    .map(|ident| ident.sym.to_string());
                 collector.record(format!("#{}", prop.key.name), declared);
             }
             // `constructor(private readonly client: ApiClient)` declares a
@@ -104,7 +110,11 @@ pub fn class_field_types(class: &Class) -> ReceiverTypes {
                     let Some(binding) = binding else {
                         continue;
                     };
-                    let declared = binding.type_ann.as_deref().and_then(annotated_type_name);
+                    let declared = binding
+                        .type_ann
+                        .as_deref()
+                        .and_then(annotated_type_ident)
+                        .map(|ident| ident.sym.to_string());
                     collector.record(binding.id.sym.to_string(), declared);
                 }
             }
@@ -116,10 +126,10 @@ pub fn class_field_types(class: &Class) -> ReceiverTypes {
 
 /// The class identifier a type annotation names, or `None` when the
 /// annotation is anything but an unqualified type reference.
-fn annotated_type_name(type_ann: &TsTypeAnn) -> Option<String> {
+pub(crate) fn annotated_type_ident(type_ann: &TsTypeAnn) -> Option<&Ident> {
     match &*type_ann.type_ann {
         TsType::TsTypeRef(reference) => match &reference.type_name {
-            TsEntityName::Ident(ident) => Some(ident.sym.to_string()),
+            TsEntityName::Ident(ident) => Some(ident),
             TsEntityName::TsQualifiedName(_) => None,
         },
         _ => None,
@@ -128,17 +138,17 @@ fn annotated_type_name(type_ann: &TsTypeAnn) -> Option<String> {
 
 /// The class identifier a `new X()` initialiser names, through the wrappers
 /// that pass a value along without replacing it.
-fn constructed_type_name(expr: &Expr) -> Option<String> {
+pub(crate) fn constructed_type_ident(expr: &Expr) -> Option<&Ident> {
     match expr {
         Expr::New(new_expr) => match &*new_expr.callee {
-            Expr::Ident(ident) => Some(ident.sym.to_string()),
+            Expr::Ident(ident) => Some(ident),
             _ => None,
         },
-        Expr::Await(await_expr) => constructed_type_name(&await_expr.arg),
-        Expr::Paren(paren) => constructed_type_name(&paren.expr),
-        Expr::TsAs(as_expr) => constructed_type_name(&as_expr.expr),
-        Expr::TsNonNull(non_null) => constructed_type_name(&non_null.expr),
-        Expr::TsSatisfies(satisfies) => constructed_type_name(&satisfies.expr),
+        Expr::Await(await_expr) => constructed_type_ident(&await_expr.arg),
+        Expr::Paren(paren) => constructed_type_ident(&paren.expr),
+        Expr::TsAs(as_expr) => constructed_type_ident(&as_expr.expr),
+        Expr::TsNonNull(non_null) => constructed_type_ident(&non_null.expr),
+        Expr::TsSatisfies(satisfies) => constructed_type_ident(&satisfies.expr),
         _ => None,
     }
 }
@@ -160,7 +170,11 @@ impl ReceiverTypeCollector {
     /// destructured parameter binds names this pass has no statement about.
     pub fn record_pat(&mut self, pat: &Pat) {
         if let Pat::Ident(ident) = pat {
-            let declared = ident.type_ann.as_deref().and_then(annotated_type_name);
+            let declared = ident
+                .type_ann
+                .as_deref()
+                .and_then(annotated_type_ident)
+                .map(|ident| ident.sym.to_string());
             self.record(ident.id.sym.to_string(), declared);
         }
     }
@@ -205,8 +219,9 @@ impl Visit for ReceiverTypeCollector {
             let declared = ident
                 .type_ann
                 .as_deref()
-                .and_then(annotated_type_name)
-                .or_else(|| declarator.init.as_deref().and_then(constructed_type_name));
+                .and_then(annotated_type_ident)
+                .or_else(|| declarator.init.as_deref().and_then(constructed_type_ident))
+                .map(|ident| ident.sym.to_string());
             self.record(ident.id.sym.to_string(), declared);
         }
         declarator.visit_children_with(self);

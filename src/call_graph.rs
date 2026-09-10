@@ -62,7 +62,6 @@
 use crate::agents::file_orchestrator::FileOrchestrator;
 use crate::import_bindings::{BindingResolver, ResolvedBinding};
 use crate::parser::parse_file;
-use crate::receiver_origin::ReceiverOrigins;
 use crate::receiver_type::ReceiverTypes;
 use crate::visitor::{
     CalleeRef, CalleeShape, FunctionCallRef, FunctionDefinition, FunctionDefinitionExtractor,
@@ -100,19 +99,10 @@ pub struct FileCallIndex {
     pub callees: HashMap<String, Vec<CalleeRef>>,
     /// Local binding → the import that introduced it.
     pub imports: HashMap<String, ImportedSymbol>,
-    /// Definition key → the classes that definition declares its own local
-    /// bindings to be, for the receivers that are instances rather than
-    /// classes (carrick#776). Scoped per definition, like `callees`, because a
-    /// name means different things in different functions.
-    pub declared_types: HashMap<String, ReceiverTypes>,
     /// Class name → the classes that class declares its own FIELDS to be, for
     /// a `this.field.foo()` receiver (carrick#782). Keyed by class, not by
     /// definition: a field belongs to the class and every method sees it.
     pub field_types: HashMap<String, ReceiverTypes>,
-    /// Definition key → the specifiers that definition's own local bindings
-    /// trace their value back to (carrick#781). Read only when nothing states
-    /// a class for the receiver.
-    pub receiver_origins: HashMap<String, ReceiverOrigins>,
 }
 
 /// One class member a workspace package's surface publishes.
@@ -330,7 +320,7 @@ pub fn resolve_call_edges(
 
             let mut edges: Vec<FunctionCallRef> = Vec::new();
             for callee in &index.callees[caller_key] {
-                let Some(target) = resolver.resolve(index, caller_key, callee) else {
+                let Some(target) = resolver.resolve(index, callee) else {
                     continue;
                 };
                 // Direct recursion is not a dependency: it would make the
@@ -487,12 +477,7 @@ impl<'a> CallResolver<'a> {
         Some((file.to_path_buf(), definitions))
     }
 
-    fn resolve(
-        &mut self,
-        index: &'a FileCallIndex,
-        caller_key: &str,
-        callee: &CalleeRef,
-    ) -> Option<Target> {
+    fn resolve(&mut self, index: &'a FileCallIndex, callee: &CalleeRef) -> Option<Target> {
         match &callee.shape {
             CalleeShape::Bare => self.resolve_bare(index, &callee.name),
             // `this.x()` is the enclosing class's own member, so it can only
@@ -508,9 +493,7 @@ impl<'a> CallResolver<'a> {
                 let declared = index.field_types.get(class)?.get(field)?.clone();
                 self.resolve_class_member(index, &declared, &callee.name)
             }
-            CalleeShape::Member(object) => {
-                self.resolve_member(index, caller_key, object, &callee.name)
-            }
+            CalleeShape::Member(_) => self.resolve_member(index, callee),
         }
     }
 
@@ -545,46 +528,22 @@ impl<'a> CallResolver<'a> {
     /// most directly. A receiver the file says nothing about — a destructured
     /// binding, the result of an untyped call — still produces no edge rather
     /// than a guess.
-    fn resolve_member(
-        &mut self,
-        index: &'a FileCallIndex,
-        caller_key: &str,
-        object: &str,
-        name: &str,
-    ) -> Option<Target> {
-        // `obj` names the class itself: `Class.staticFn()`, or an imported
-        // class or namespace.
-        if let Some(target) = self.resolve_class_member(index, object, name) {
+    fn resolve_member(&mut self, index: &'a FileCallIndex, callee: &CalleeRef) -> Option<Target> {
+        if let Some(member) = &callee.receiver.local_member {
+            return same_file(index, member.clone());
+        }
+        // An import resolves through its module even when a nested class has
+        // the same name. Local shadows carry neither an import nor its origin.
+        if let Some(imported) = &callee.receiver.imported_name
+            && let Some(target) = self.resolve_imported_member(index, imported, &callee.name)
+        {
             return Some(target);
         }
-
-        // `obj` is an INSTANCE whose class the file declares — a typed
-        // parameter, a `new X()` local. The class name is then resolved
-        // exactly as a class named directly at the call site would be
-        // (carrick#776).
-        if let Some(declared) = index
-            .declared_types
-            .get(caller_key)
-            .and_then(|types| types.get(object))
-        {
-            if declared == object {
-                return None;
-            }
-            let declared = declared.clone();
-            // A DECLARED class is the file's own statement and settles the
-            // question either way: a type this repo has no source for resolves
-            // to nothing rather than falling through to the inference below.
-            return self.resolve_class_member(index, &declared, name);
+        if callee.receiver.declared {
+            return None;
         }
-
-        // Nothing states a class, but the file does state where the value came
-        // FROM (carrick#781).
-        let specifier = index
-            .receiver_origins
-            .get(caller_key)
-            .and_then(|origins| origins.get(object))?
-            .clone();
-        self.resolve_surface_member(&specifier, name)
+        let specifier = callee.receiver.origin.as_deref()?;
+        self.resolve_surface_member(specifier, &callee.name)
     }
 
     /// `obj.foo(...)` where `obj`'s value traces back to a workspace package:
@@ -693,6 +652,15 @@ impl<'a> CallResolver<'a> {
             return Some(target);
         }
 
+        self.resolve_imported_member(index, class, name)
+    }
+
+    fn resolve_imported_member(
+        &mut self,
+        index: &'a FileCallIndex,
+        class: &str,
+        name: &str,
+    ) -> Option<Target> {
         let symbol = index.imports.get(class)?.clone();
 
         // `import { queues } from "./index.js"` where the entry writes
@@ -900,9 +868,7 @@ mod tests {
                     .collect(),
                 callees: functions.callee_refs,
                 imports: imports.imported_symbols,
-                declared_types: functions.declared_types,
                 field_types: functions.field_types,
-                receiver_origins: functions.receiver_origins,
             };
             per_file.insert(path.clone(), index);
             per_file_definitions.push((path.clone(), functions.function_definitions));
@@ -1247,6 +1213,363 @@ mod tests {
         let call = &defs["useHelper"].calls[0];
         assert_eq!(call.line_number, 2, "callee is defined on line 2");
         assert_eq!(call.call_site_line, 7, "the call is written on line 7");
+    }
+
+    #[test]
+    fn nested_call_sites_have_one_indexed_owner() {
+        let (_dir, defs) = scan(&[(
+            "app.ts",
+            "function target() {}\n\
+             export function outer() {\n\
+               function nested() { target(); }\n\
+               const arrow = () => target();\n\
+               const expression = function () { target(); };\n\
+               class Local { method() { target(); } field = () => target(); }\n\
+               return [nested, arrow, expression, Local];\n\
+             }\n",
+        )]);
+        assert!(defs["outer"].calls.is_empty());
+        for owner in [
+            "nested",
+            "arrow",
+            "expression",
+            "Local.method",
+            "Local.field",
+        ] {
+            assert_eq!(callee_names(&defs, owner), vec!["target"], "{owner}");
+        }
+    }
+
+    #[test]
+    fn anonymous_callbacks_keep_the_nearest_indexed_owner() {
+        let (_dir, defs) = scan(&[(
+            "app.ts",
+            "function arrowTarget() {}\nfunction expressionTarget() {}\n\
+             export function outer() {\n\
+               const nested = () => {\n\
+                 return [() => arrowTarget(),\n\
+                   function () { expressionTarget(); }];\n\
+               };\n\
+               return nested;\n\
+             }\n",
+        )]);
+        assert!(defs["outer"].calls.is_empty());
+        assert_eq!(
+            callee_names(&defs, "nested"),
+            vec!["arrowTarget", "expressionTarget"]
+        );
+        for call in &defs["nested"].calls {
+            assert_eq!(
+                call.call_site_line,
+                if call.name == "arrowTarget" { 5 } else { 6 }
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_callbacks_own_their_calls_and_unindexed_callbacks_are_retained() {
+        let (_dir, defs) = scan(&[(
+            "app.ts",
+            "function target() {}\n\
+             export function outer() {\n\
+               register(() => target());\n\
+               register(function () { target(); });\n\
+             }\n",
+        )]);
+        // The existing extractor names the first callback register_handler;
+        // the second callback has no indexed row because that key is taken.
+        assert_eq!(callee_names(&defs, "register_handler"), vec!["target"]);
+        assert_eq!(defs["register_handler"].calls[0].call_site_line, 3);
+        assert_eq!(callee_names(&defs, "outer"), vec!["target"]);
+        assert_eq!(defs["outer"].calls[0].call_site_line, 4);
+    }
+
+    #[test]
+    fn separate_same_line_calls_keep_both_owners() {
+        let (_dir, defs) = scan(&[(
+            "app.ts",
+            "function target() {}\n\
+             export function outer() { function nested() { target(); } target(); return nested; }\n",
+        )]);
+        for owner in ["outer", "nested"] {
+            assert_eq!(callee_names(&defs, owner), vec!["target"]);
+            assert_eq!(defs[owner].calls[0].call_site_line, 2);
+        }
+    }
+
+    #[test]
+    fn nested_owner_resolves_a_captured_receiver() {
+        let (_dir, defs) = scan(&[(
+            "app.ts",
+            "class Client { send() {} }\n\
+             export function outer() {\n\
+               const client = new Client();\n\
+               const nested = () => client.send();\n\
+               return nested;\n\
+             }\n",
+        )]);
+        assert!(defs["outer"].calls.is_empty());
+        assert_eq!(callee_names(&defs, "nested"), vec!["Client.send"]);
+    }
+
+    #[test]
+    fn captured_receivers_keep_lexical_shadowing() {
+        let (_dir, defs) = scan(&[(
+            "app.ts",
+            r#"
+            class Client { send() {} }
+            class Other { send() {} }
+            export function outer() {
+                const client = new Client();
+                const captured = () => client.send();
+                const typed = (client: Other) => client.send();
+                const unknown = (client) => client.send();
+                const destructured = ({ client }) => client.send();
+                const defaulted = ({ client } = source) => client.send();
+                const array = ([client]) => client.send();
+                const rest = (...client) => client.send();
+                const local = () => { const { client } = source; client.send(); };
+                const block = () => {
+                    { const client = new Other(); client.send(); }
+                    client.send();
+                };
+                const caught = () => { try {} catch (client) { client.send(); } };
+                const loop = () => { for (const client of source) { client.send(); } };
+                const hoisted = () => { client.send(); var client; };
+                const before = () => client.send();
+                const sibling = () => { const client = new Other(); client.send(); };
+                return [captured, typed, unknown, destructured, defaulted, array,
+                    rest, local, block, caught, loop, hoisted, before, sibling];
+            }
+        "#,
+        )]);
+        assert!(defs["outer"].calls.is_empty());
+        for owner in ["captured", "before"] {
+            assert_eq!(callee_names(&defs, owner), ["Client.send"], "{owner}");
+        }
+        for owner in ["typed", "sibling"] {
+            assert_eq!(callee_names(&defs, owner), ["Other.send"], "{owner}");
+        }
+        assert_eq!(callee_names(&defs, "block"), ["Client.send", "Other.send"]);
+        for owner in [
+            "unknown",
+            "destructured",
+            "defaulted",
+            "array",
+            "rest",
+            "local",
+            "caught",
+            "loop",
+            "hoisted",
+        ] {
+            assert!(
+                defs[owner].calls.is_empty(),
+                "{owner}: {:?}",
+                defs[owner].calls
+            );
+        }
+    }
+
+    #[test]
+    fn already_resolved_type_declarations_keep_their_lexical_receivers() {
+        let (_dir, defs) = scan(&[(
+            "app.ts",
+            r#"
+            declare module "vendor" {
+                interface Client { send<T>(value: T): Promise<T>; }
+                function create(): Client;
+                export = create;
+            }
+            class Client { send() {} }
+            export function outer<T>(value: T) {
+                const client = new Client();
+                const nested = () => client.send();
+                return [nested, value];
+            }
+        "#,
+        )]);
+        assert!(defs["outer"].calls.is_empty());
+        assert_eq!(callee_names(&defs, "nested"), ["Client.send"]);
+    }
+
+    #[test]
+    fn repeated_declarations_preserve_agreeing_type_facts() {
+        let (_dir, defs) = scan(&[(
+            "app.ts",
+            r#"
+            class Client { send() {} }
+            export function outer() {
+                var client: Client = first();
+                var client: Client = second();
+                const nested = () => client.send();
+                return nested;
+            }
+        "#,
+        )]);
+        assert!(defs["outer"].calls.is_empty());
+        assert_eq!(callee_names(&defs, "nested"), ["Client.send"]);
+    }
+
+    #[test]
+    fn local_receivers_do_not_borrow_shadowed_class_or_import_names() {
+        let (_dir, defs) = scan(&[
+            ("client.ts", "export class Imported { static send() {} }"),
+            (
+                "app.ts",
+                r#"
+                import { Imported } from "./client";
+                class Client { static send() {} }
+                export function outer() {
+                    const direct = () => { Client.send(); Imported.send(); };
+                    const unknown = (Client, Imported) => { Client.send(); Imported.send(); };
+                    const destructured = ({ Client, Imported }) => { Client.send(); Imported.send(); };
+                    return [direct, unknown, destructured];
+                }
+            "#,
+            ),
+        ]);
+        assert_eq!(
+            callee_names(&defs, "direct"),
+            ["Client.send", "Imported.send"]
+        );
+        for owner in ["outer", "unknown", "destructured"] {
+            assert!(defs[owner].calls.is_empty(), "{owner}");
+        }
+    }
+
+    #[test]
+    fn captured_object_literal_members_keep_their_definition() {
+        let (_dir, defs) = scan(&[(
+            "app.ts",
+            r#"
+            export const client = { send() {} };
+            export function outer() {
+                const captured = () => client.send();
+                const unknown = (client) => client.send();
+                return [captured, unknown];
+            }
+        "#,
+        )]);
+        assert_eq!(callee_names(&defs, "captured"), ["client.send"]);
+        assert!(defs["outer"].calls.is_empty());
+        assert!(defs["unknown"].calls.is_empty());
+    }
+
+    #[test]
+    fn declared_receivers_do_not_borrow_shadowed_class_members() {
+        let (_dir, defs) = scan(&[(
+            "app.ts",
+            r#"
+            class Client { send() {} }
+            export function outer() {
+                class Client {}
+                const client = new Client();
+                const constructed = () => client.send();
+                const annotated = (client: Client) => client.send();
+                return [constructed, annotated];
+            }
+            export function original() {
+                const client = new Client();
+                const captured = () => { class Client {}; client.send(); };
+                return captured;
+            }
+        "#,
+        )]);
+        for owner in ["outer", "constructed", "annotated", "original"] {
+            assert!(
+                defs[owner].calls.is_empty(),
+                "{owner}: {:?}",
+                defs[owner].calls
+            );
+        }
+        assert_eq!(callee_names(&defs, "captured"), ["Client.send"]);
+    }
+
+    #[test]
+    fn empty_local_declarations_do_not_borrow_outer_members() {
+        let (_dir, defs) = scan(&[
+            ("client.ts", "export class Imported { static send() {} }"),
+            (
+                "app.ts",
+                r#"
+                import { Imported } from "./client";
+                class Client { static send() {} }
+                export function outer() {
+                    const objectShadow = () => { const Client = {}; Client.send(); };
+                    const classShadow = () => { class Imported {} Imported.send(); };
+                    return [objectShadow, classShadow];
+                }
+            "#,
+            ),
+        ]);
+        for owner in ["outer", "objectShadow", "classShadow"] {
+            assert!(defs[owner].calls.is_empty(), "{owner}");
+        }
+    }
+
+    #[test]
+    fn anonymous_captures_and_optional_calls_use_their_own_receiver_bindings() {
+        let (_dir, defs) = scan(&[(
+            "app.ts",
+            r#"
+            class Client { send() {} }
+            export function outer() {
+                const client = new Client();
+                const nested = () => [() => client.send?.(), (client) => client.send()];
+                return nested;
+            }
+        "#,
+        )]);
+        assert!(defs["outer"].calls.is_empty());
+        assert_eq!(callee_names(&defs, "nested"), ["Client.send"]);
+    }
+
+    #[test]
+    fn captured_package_origins_resolve_without_sibling_or_parameter_leaks() {
+        let (_dir, defs) = scan_origin(
+            &[],
+            r#"
+            import { runClientManager } from "@fixture/core/v2";
+            export function outer() {
+                const client = runClientManager.clientOrThrow();
+                const captured = () => client.subscribeToRun("id");
+                const aliased = () => { const alias = client; alias.subscribeToRun("id"); };
+                const unknown = (client) => client.subscribeToRun("id");
+                const destructured = ({ client }) => client.subscribeToRun("id");
+                const local = () => { const { client } = source; client.subscribeToRun("id"); };
+                const sibling = () => { const client = other(); client.subscribeToRun("id"); };
+                const managerShadow = (runClientManager) => {
+                    const client = runClientManager.clientOrThrow();
+                    client.subscribeToRun("id");
+                };
+                return [captured, aliased, unknown, destructured, local, sibling, managerShadow];
+            }
+        "#,
+        );
+        assert_eq!(
+            callee_names(&defs, "outer"),
+            ["runClientManager.clientOrThrow"]
+        );
+        for owner in ["captured", "aliased"] {
+            assert_eq!(
+                callee_names(&defs, owner),
+                ["RunClient.subscribeToRun"],
+                "{owner}"
+            );
+        }
+        for owner in [
+            "unknown",
+            "destructured",
+            "local",
+            "sibling",
+            "managerShadow",
+        ] {
+            assert!(
+                defs[owner].calls.is_empty(),
+                "{owner}: {:?}",
+                defs[owner].calls
+            );
+        }
     }
 
     /// A function called several times is one edge, reported at its first
@@ -1757,10 +2080,7 @@ mod tests {
         drop(dir);
     }
 
-    /// A nested function's parameter shadows the enclosing scope's binding,
-    /// and the call sites inside it are folded into the enclosing function —
-    /// so an origin that does not notice the parameter would answer for a
-    /// receiver that is something else entirely.
+    /// A nested parameter introduces a separate binding with no package origin.
     #[test]
     fn a_nested_parameter_shadows_an_origin() {
         let (dir, defs) = scan_origin(
