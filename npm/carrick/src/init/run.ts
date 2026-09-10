@@ -41,7 +41,6 @@ export function parseArgs(argv: string[], cwd = process.cwd()): InitOptions | st
         const value = argv[index + 1];
         if (!value) return "--project needs a slug";
         if (
-          value === "default" ||
           !/^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){2,31}$/.test(value)
         ) {
           return `invalid project slug "${value}": use 3-32 lowercase letters, digits, and single hyphens`;
@@ -196,7 +195,9 @@ export async function init(argv: string[]): Promise<number> {
       if (!repo.connected) say(`${repo.full_name} is not connected to this Carrick workspace.`);
       else if (repo.services.length === 0) {
         say(`${repo.full_name} is connected and has no hosted index yet.`);
-        say("  Add the workflow in that repo: carrick templates workflow > .github/workflows/carrick.yml");
+        say("  Add the workflow in that repo:");
+        say("    mkdir -p .github/workflows");
+        say("    carrick templates workflow > .github/workflows/carrick.yml");
       }
     }
   } catch (error) {
@@ -297,7 +298,12 @@ export async function init(argv: string[]): Promise<number> {
   say(`    ${MCP_LINE}`);
   say();
   say("  The CI check, once per repo (it needs no secret):");
+  say("    mkdir -p .github/workflows");
   say("    carrick templates workflow > .github/workflows/carrick.yml");
+  say();
+  say("  After the first successful scan on the repo's default branch, bring its hosted index here:");
+  say("    carrick refresh");
+  say("    carrick status");
   say();
   for (const line of editorLines(onPath)) say(line);
   say();

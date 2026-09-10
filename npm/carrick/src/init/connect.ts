@@ -78,10 +78,12 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
       return initial;
     }
     options.say(`Create project "${options.project}" if needed: ${projectUrl}`);
+    options.say(`  Choose Create project, enter a name, and set the slug to "${options.project}".`);
     if (!initial.workspace.installed || initial.repos.some((repo) => !repo.connected)) {
       options.say(`Connect any missing repos: ${connectUrl}`);
     }
     options.say(`Assign the requested repos: ${reposUrl}`);
+    options.say(`  Select ${repos.join(", ")}, choose the target project in "Move selected to", then choose "Move selected".`);
   } else {
     if (initial.workspace.installed && initial.repos.every((repo) => repo.connected)) return initial;
     options.say(`Connect repositories in your browser: ${connectUrl}`);

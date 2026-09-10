@@ -316,14 +316,18 @@ test("init reads its arguments", () => {
   assert.equal((parseArgs(["/code"], "/tmp") as { workspace: string }).workspace, "/code");
   assert.equal((parseArgs(["--project", "payments"]) as { project: string }).project, "payments");
   assert.match(parseArgs(["--project"]) as string, /needs a slug/);
-  for (const slug of ["UPPER", "ab", "double--hyphen", "default", "trailing-"]) {
+  assert.equal((parseArgs(["--project", "default"]) as { project: string }).project, "default");
+  for (const slug of ["UPPER", "ab", "double--hyphen", "trailing-"]) {
     assert.match(parseArgs(["--project", slug]) as string, /invalid project slug/);
   }
   assert.match(parseArgs(["--nope"]) as string, /unknown option/);
   assert.match(parseArgs(["--help"]) as string, /--project SLUG/);
 });
 
-test("the executable CLI rejects a different project and makes no local setup claim", () => {
+// The native override is an executable shebang fixture, which Windows cannot launch.
+const posixNativeFixture = { skip: process.platform === "win32" ? "native shebang fixture requires POSIX" : false };
+
+test("the executable CLI rejects a different project and makes no local setup claim", posixNativeFixture, () => {
   const fixture = executableInitFixture("default-project");
   try {
     const result = spawnSync(
@@ -343,7 +347,7 @@ test("the executable CLI rejects a different project and makes no local setup cl
   }
 });
 
-test("the executable CLI accepts the named assignment on repeated init", () => {
+test("the executable CLI accepts the named assignment on repeated init", posixNativeFixture, () => {
   const fixture = executableInitFixture("payments");
   try {
     for (let run = 0; run < 2; run += 1) {
@@ -361,7 +365,7 @@ test("the executable CLI accepts the named assignment on repeated init", () => {
   }
 });
 
-test("the executable CLI cannot verify a project without a GitHub repo identity", () => {
+test("the executable CLI cannot verify a project without a GitHub repo identity", posixNativeFixture, () => {
   const fixture = executableInitFixture("payments");
   try {
     execFileSync("git", ["-C", fixture.repo, "remote", "remove", "origin"]);
