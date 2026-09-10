@@ -4,6 +4,7 @@
   "description": "Shows what the other services in your workspace do with the routes and calls in the file you are editing",
   "version": "0.3.58",
   "publisher": "carrick-tools",
+  "icon": "icon.png",
   "license": "SEE LICENSE IN LICENSE.md",
   "repository": {
     "type": "git",
@@ -65,5 +66,9 @@
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
+  },
+  "galleryBanner": {
+    "color": "#0a0b0c",
+    "theme": "dark"
   }
 }
