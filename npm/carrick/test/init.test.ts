@@ -14,7 +14,7 @@ import {
   mergeCarrickHooks,
   ownEntryPoint,
 } from "../src/init/settings.ts";
-import { parseArgs } from "../src/init/run.ts";
+import { editorLines, parseArgs } from "../src/init/run.ts";
 
 function entries(names: Array<[string, boolean]>) {
   return names.map(([name, isDirectory]) => ({ name, isDirectory: () => isDirectory }));
@@ -210,6 +210,63 @@ test("the identity comes from the GitHub CLI, or a token, or init stops", () => 
   assert.equal(none.identity, null);
   assert.match(none.problem ?? "", /gh auth login/);
   assert.match(none.problem ?? "", /GITHUB_TOKEN/);
+});
+
+// The gallery an id resolves against is that editor's own, and the three
+// editors named below read three different ones. The extension is published to
+// each of those three, so an id is only ever printed for an editor whose
+// gallery carries it (carrick#915).
+test("no editor is handed an id for a gallery it does not read", () => {
+  const everyEditor = editorLines(() => true);
+  for (const line of everyEditor) {
+    const install = /^\s*(\S+) --install-extension (\S+)/.exec(line);
+    if (!install) continue;
+    const [, editor, target] = install;
+    assert.ok(
+      ["code", "cursor", "windsurf"].includes(editor!),
+      `${editor} resolves an id against a gallery this extension is not published to: ${line}`,
+    );
+    assert.equal(target, "carrick-tools.carrick");
+  }
+  // Every editor answers in a heading and a command a user can copy, so a block
+  // that has grown prose is a block that is explaining something away.
+  assert.equal(everyEditor.length, 6);
+});
+
+test("VS Code gets the gallery command like the others", () => {
+  const code = editorLines((command) => command === "code");
+  assert.deepEqual(code, [
+    "  VS Code, for diagnostics in the Problems panel:",
+    "    code --install-extension carrick-tools.carrick",
+  ]);
+  // A pointer somewhere else is what a missing publish reads like, and there is
+  // no missing publish.
+  assert.doesNotMatch(code.join("\n"), /\.vsix|docs\.carrick\.tools|Marketplace/);
+});
+
+test("Cursor and Windsurf get the gallery command, which is one they can run", () => {
+  const cursor = editorLines((command) => command === "cursor");
+  assert.deepEqual(cursor, [
+    "  Cursor, for diagnostics in the Problems panel:",
+    "    cursor --install-extension carrick-tools.carrick",
+  ]);
+  assert.match(
+    editorLines((command) => command === "windsurf").join("\n"),
+    /windsurf --install-extension carrick-tools\.carrick/,
+  );
+
+  // Both editors on one machine is two blocks, and an editor that is not on the
+  // machine is not named.
+  const forks = editorLines((command) => command === "cursor" || command === "windsurf");
+  assert.equal(forks.length, 4);
+  assert.doesNotMatch(forks.join("\n"), /VS Code|code --install-extension/);
+});
+
+test("an editor we have not tested gets the server's command and no claim", () => {
+  const unknown = editorLines(() => false);
+  assert.equal(unknown.length, 1);
+  assert.match(unknown[0]!, /carrick lsp --stdio/);
+  assert.doesNotMatch(unknown[0]!, /--install-extension/);
 });
 
 test("init reads its arguments", () => {
