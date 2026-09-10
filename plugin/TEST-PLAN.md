@@ -119,7 +119,7 @@ is still by hand is everything that needs the BINARY, because CI installs with
 | 1.11 | Upgrade from a previous version | **CI** (version half) | `plugin.yml`, the `upgrade` job: install the published `carrick`, then the packed tarball over it | `carrick --version` reports the version at HEAD and a missing platform package is still a message, so no file of the previous install is left answering. The `carrick status --json` half stays manual: it runs the binary, which an `--omit=optional` install does not have |
 | 1.12 | Node floor | **CI** | `plugin.yml`, the `node-floor` job: install on 24, then run `bin/carrick.mjs` on 22 | `carrick needs Node 24 or newer; this is Node 22.x` and exit 1. It must be that message and not a syntax error: the floor is checked before any TypeScript is imported, and the whole point is that an old Node gets an answer to "which Node do I need" |
 | 1.13 | `--ignore-scripts` | **CI** | as 1.1 | no lifecycle script exists anywhere in the package or the platform packages, so the install works with scripts disabled. If this ever needs one, this row is the reason it cannot have one |
-| 1.14 | Marketplace and Open VSX publish | **Blocked on publish** (carrick#834, carrick#710) | n/a | the publisher account and the namespace are owner actions. Until they exist, section 4 installs the `.vsix` by file |
+| 1.14 | Marketplace and Open VSX publish | **Marketplace: Blocked** (carrick#710), on a missing Azure DevOps token (`VSCE_PAT`) rather than the publisher account in the abstract; `https://marketplace.visualstudio.com/items?itemName=carrick-tools.carrick` returns 404 (checked 2026-09-10). **Open VSX: done**, not blocked; `https://open-vsx.org/api/carrick-tools/carrick` serves 0.3.54 through 0.3.58 (checked 2026-09-10) | n/a | Open VSX already publishes on every release, so the Cursor and Windsurf gallery install works today (see 4.3, 4.4). VS Code has no working gallery path until the Marketplace token lands, so section 4's `.vsix` route stays the fallback there. carrick#915 tracks `carrick init` still printing the Marketplace command and never mentioning Open VSX, the same stale assumption this row used to carry |
 
 **1.A, the install a row means.** Every "npm install" row above is this, with the
 tarballs from section 0 copied to the machine under test:
@@ -295,9 +295,9 @@ in Claude Code it is the site in the text.
 | # | Editor | Status | Install path | Activation trigger |
 |---|---|---|---|---|
 | 4.1 | VS Code, from `.vsix` | **Manual** | `cd plugin/vscode && npm install && npm run build && npx --yes @vscode/vsce package`, then `code --install-extension carrick-<version>.vsix` | opening any `.ts` or `.tsx` file (`onLanguage:typescript`, `onLanguage:typescriptreact`) |
-| 4.2 | VS Code, from the Marketplace | **Blocked** (carrick#710) | `code --install-extension carrick-tools.carrick` | as 4.1. Waits on the publisher account |
-| 4.3 | Cursor | **Manual** for the `.vsix` (`cursor --install-extension <file>.vsix`), **Blocked** for the gallery | Cursor resolves extensions from Open VSX, not the Marketplace, so the gallery row waits on the Open VSX namespace, not on 4.2 | as 4.1 |
-| 4.4 | Windsurf | as 4.3, with `windsurf --install-extension` | same | as 4.1 |
+| 4.2 | VS Code, from the Marketplace | **Blocked** (carrick#710), on the missing Azure DevOps token (`VSCE_PAT`) the Marketplace publish step in `release.yml` waits on, not on the publisher account in the abstract; `https://marketplace.visualstudio.com/items?itemName=carrick-tools.carrick` returns 404 | `code --install-extension carrick-tools.carrick` | as 4.1. Blocked on the token landing, nothing else |
+| 4.3 | Cursor | **Manual**, both routes: the gallery install (search "Carrick" in the Extensions view, which resolves from Open VSX, not the Marketplace) works today, since `https://open-vsx.org/api/carrick-tools/carrick` serves 0.3.54 through 0.3.58; the `.vsix` (`cursor --install-extension <file>.vsix`) stays as a fallback | Cursor resolves extensions from Open VSX, and the Open VSX namespace has published every release, so this row is not blocked by 4.2 | as 4.1 |
+| 4.4 | Windsurf | as 4.3, with `windsurf --install-extension` for the `.vsix` fallback | same | as 4.1 |
 | 4.5 | JetBrains | **Manual** | two candidate paths, and part of this row is finding out which works: **LSP4IJ** (a free plugin, works on the Community editions) configured with a new language server whose command is `carrick` and whose arguments are `lsp --stdio`, mapped to TypeScript files; or the **native LSP API**, which needs a plugin of its own written against it and is paid-IDE only. Record which path was used, and whether the other is viable | opening a TypeScript file after the server is configured |
 | 4.6 | Zed | **Manual** | again two routes: whether the installed Zed build accepts a custom server binary through settings, or whether it needs a small Zed extension to register one. Record which the build allows, and if it is the extension, that is a ticket rather than a step | opening a TypeScript file |
 | 4.7 | Neovim | **Manual** | there is no `nvim-lspconfig` entry for this server and none is claimed. Start it directly: `vim.lsp.start({ name = 'carrick', cmd = { 'carrick', 'lsp', '--stdio' }, root_dir = vim.fs.root(0, { '.carrick' }) })` from a `FileType` autocommand on `typescript,typescriptreact`. An `nvim-lspconfig` entry is worth filing once the package publishes | the autocommand, on opening a TypeScript buffer |
@@ -389,6 +389,15 @@ only), packed 2026-09-09 on macOS 15.5 arm64, Node 24.12.0.
 test before section 2 (6.6 s, `user-service` 3 routes 1 call, `order-service`
 0 routes 4 calls, `notification-service` 0 routes 3 calls, 6 counterpart links).
 
+**Second build under test (free smokes only, 2026-09-10):** `carrick@0.3.58`,
+installed from the npm registry (not packed locally) into a throwaway probe
+directory, macOS 15.5 arm64, Node 24.12.0. SMOKE.md §0 and §3 only; TEST-PLAN
+rows 2.2, 2.4, 2.6, 2.8, 2.9, 2.10 and 4.0. No model calls were made. Fixture:
+`tests/fixtures/local-mode-workspace` (the two-service, buildable-by-anyone
+fixture, not the owner-only demo workspace), copied to scratch and
+`git init`-ed, `carrick-workspace.json` written by hand. Full record in
+SMOKE.md §0 and §3 (2026-09-10 blocks); 4.0 above.
+
 ### Install matrix
 
 | Row | Platform / manager | Ran on | `--version` | `index` | verdict probe | Notes |
@@ -461,20 +470,28 @@ the file it wrote. Nothing else in section 2 failed.
 
 ### Editors
 
+No editor in this table was opened on 2026-09-10. VS Code, Cursor, Windsurf,
+JetBrains and Neovim are not installed on this machine; Zed is, but was not
+launched. The 4.0 row below is the generic-probe evidence that stands in for
+what an editor would show, per §4: it proves the server, not the client. Rows
+4.1 to 4.7 are left blank rather than filled from the probe, so a reader can
+tell "not run" from "ran and passed".
+
 | Row | Editor and version | Install path | How it found the binary | Server started | Producer diagnostic | Consumer diagnostic | Related info clickable | Boundary line | Root chosen | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 4.1 | VS Code | .vsix | | | | | | | | |
-| 4.3 | Cursor | .vsix | | | | | | | | |
-| 4.4 | Windsurf | .vsix | | | | | | | | |
-| 4.5 | JetBrains | LSP4IJ / native | | | | | | | | |
-| 4.6 | Zed | settings / extension | | | | | | | | |
-| 4.7 | Neovim | vim.lsp.start | | | | | | | | |
+| 4.0 | generic LSP probe, no editor (`lsp-probe.mjs`, `carrick@0.3.58` from npm) | `--server .../node_modules/carrick/dist/server.js`, `CARRICK_BIN` set to the same install (confirmed honoured: `cli.js` reads `CARRICK_BIN` before falling back to `carrick` on PATH) | `CARRICK_BIN` / `--server`, both explicit | yes, `carrick-lsp: start pid ...` on stderr | clean state: none, only the boundary line (`resolved`/`compatible`, nothing to flag). After the fixture's break, opened separately from the consumer: boundary line only. The route is now POST with 0 counterparts, so there is nothing on the producer side to flag | after the break: 2 `severity:warning, code:method_mismatch` diagnostics (lines 9 and 17), `GET ... method_mismatch (no type verdict): this call uses GET and the producer serves POST at /api/v1/widgets/:widgetId`, matching the fixture's README answer key. Warning, not error: `severityOf` in `npm/carrick/src/diagnostics.ts` demotes a routing finding to warning when the other side is not resolvable, and this fixture's broken route has 0 counterparts on disk, so that is the policy working as written, not a defect | not observable by the probe. `relatedInformation` was empty in both states, because the post-break route has 0 counterparts, so there was nothing to attach either way; the probe cannot say whether a location an editor did receive renders as clickable | yes, one `severity:information, code:boundary` diagnostic at line 1 of every opened file, in both states | `root .../ws (client)`, the workspace folder the probe sent, logged on the server's own stderr | Two runs against a scratch copy of `tests/fixtures/local-mode-workspace`. Clean state: 2 files opened, 1 diagnostic each, `OK 2 file(s) published`. Post-break state (`loader`->`action` edited by hand, then `carrick refresh --service catalog-web`): consumer opened alone, 3 diagnostics, `OK 1 file(s) published`; producer opened alone in a separate run, 1 diagnostic (boundary only). Exit 0 throughout. Full transcript in SMOKE.md §3 |
+| 4.1 | VS Code | .vsix | | not run | not run | not run | not run | not run | not run | VS Code not installed on this machine |
+| 4.3 | Cursor | .vsix | | not run | not run | not run | not run | not run | not run | Cursor not installed on this machine |
+| 4.4 | Windsurf | .vsix | | not run | not run | not run | not run | not run | not run | Windsurf not installed on this machine |
+| 4.5 | JetBrains | LSP4IJ / native | | not run | not run | not run | not run | not run | not run | JetBrains not installed on this machine |
+| 4.6 | Zed | settings / extension | | not run | not run | not run | not run | not run | not run | Zed is installed on this machine but was not opened for this smoke; the 4.6 row (which route the build allows) is still open |
+| 4.7 | Neovim | vim.lsp.start | | not run | not run | not run | not run | not run | not run | Neovim not installed on this machine |
 
 ### Multi-root and monorepo
 
 | Row | Case | Editor | Log line the server wrote | Diagnostics arrived | Notes |
 |---|---|---|---|---|---|
-| 4.9 | service as folder | | | | |
+| 4.9 | service as folder | generic probe (no editor), 2026-09-10, `carrick@0.3.58` server, `tests/fixtures/local-mode-workspace` scratch copy | `client workspace folder .../ws/inventory-svc has no .carrick/; using .../ws (ancestor)` | yes: 3 diagnostics on the opened consumer file, same as opening the workspace root directly | matches the expected wording in this row exactly. SMOKE.md §2 (2026-09-09, scanner 0.3.49) logged `(project_dir)` for the same walk; this is wording that changed between versions, confirmed by re-running the same case, not a defect |
 | 4.11 | first folder outside the tree | | | | |
 | 4.12 | folder added live | | | | |
 | 4.13 | monorepo | | | | |
