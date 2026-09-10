@@ -334,7 +334,14 @@ pub struct Packages {
 /// installs and build output are not the project's own manifests. The walk
 /// root itself is always traversed, even when its basename matches (a repo
 /// legitimately named `build` is still a repo).
-pub const MANIFEST_SKIP_DIRS: [&str; 5] = ["node_modules", "dist", "build", ".next", ".vite"];
+pub const MANIFEST_SKIP_DIRS: [&str; 6] = [
+    "node_modules",
+    "dist",
+    "build",
+    ".next",
+    ".vite",
+    ".carrick",
+];
 
 /// Deno configs that belong to the declared workspace, starting at the root.
 /// Nested configs outside a `workspace` list are intentionally absent.

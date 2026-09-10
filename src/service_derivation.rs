@@ -313,6 +313,26 @@ fn validate(root: &Path, services: &[Config]) -> Result<(), String> {
                     path.display()
                 ));
             }
+            if path
+                .file_name()
+                .is_some_and(|name| name == "deno.json" || name == "deno.jsonc")
+            {
+                let directory = root.join(service.directory.as_deref().unwrap_or("."));
+                let nearest = directory
+                    .ancestors()
+                    .take_while(|p| p.starts_with(root))
+                    .find_map(crate::deno_support::manifest_at);
+                let selected = path.canonicalize().map_err(|e| e.to_string())?;
+                if !nearest.is_some_and(|nearest| {
+                    nearest.file_name() == path.file_name()
+                        && nearest.canonicalize().ok().as_ref() == Some(&selected)
+                }) {
+                    return Err(format!(
+                        "Service '{label}' must select its nearest Deno manifest (deno.json takes precedence over deno.jsonc). Alternate Deno config '{}' is not supported; omit tsconfig to use the service manifest, or select an ordinary TypeScript config.",
+                        path.display()
+                    ));
+                }
+            }
         }
     }
     Ok(())

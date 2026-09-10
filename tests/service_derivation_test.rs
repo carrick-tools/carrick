@@ -307,3 +307,62 @@ fn unsupported_deno_version_fails_before_analysis() {
     assert!(!output.status.success());
     assert!(text.contains("2.9.4 or newer"), "{text}");
 }
+
+#[test]
+fn alternate_deno_config_is_rejected_by_the_shared_service_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "deno.json", "{}");
+    write(
+        dir.path(),
+        "deno.jsonc",
+        r#"{"compilerOptions":{"strict":false}}"#,
+    );
+    write(dir.path(), "carrick.json", r#"{"tsconfig":"deno.jsonc"}"#);
+    let error = resolve(dir.path()).unwrap_err();
+    assert!(error.contains("nearest Deno manifest"), "{error}");
+    write(dir.path(), "carrick.json", r#"{"tsconfig":"deno.json"}"#);
+    assert!(resolve(dir.path()).is_ok());
+    write(dir.path(), "tsconfig.json", "{}");
+    write(
+        dir.path(),
+        "carrick.json",
+        r#"{"tsconfig":"tsconfig.json"}"#,
+    );
+    assert!(resolve(dir.path()).is_ok());
+}
+
+#[test]
+fn generated_deno_cache_does_not_change_discovered_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "deno.json", "{}");
+    write(dir.path(), "src/api.ts", "export const value = 1;");
+    let discover = || {
+        carrick::file_finder::find_files(
+            dir.path().to_str().unwrap(),
+            &carrick::packages::MANIFEST_SKIP_DIRS,
+        )
+        .0
+    };
+    let before = discover();
+    assert_eq!(before.len(), 1);
+    write(
+        dir.path(),
+        ".carrick/deno/entry.ts",
+        "import '../../src/api.ts';",
+    );
+    write(
+        dir.path(),
+        ".carrick/deno/runtime.d.ts",
+        "declare namespace Deno { const version: string; }",
+    );
+    write(
+        dir.path(),
+        ".carrick/deno/remote/mod.ts",
+        "export const cached = 2;",
+    );
+    assert_eq!(
+        discover(),
+        before,
+        "type preparation must not feed generated sources back into the scanner"
+    );
+}
