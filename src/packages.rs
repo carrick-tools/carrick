@@ -74,7 +74,7 @@ pub struct Packages {
 /// installs and build output are not the project's own manifests. The walk
 /// root itself is always traversed, even when its basename matches (a repo
 /// legitimately named `build` is still a repo).
-pub const MANIFEST_SKIP_DIRS: [&str; 4] = ["node_modules", "dist", "build", ".next"];
+pub const MANIFEST_SKIP_DIRS: [&str; 5] = ["node_modules", "dist", "build", ".next", ".vite"];
 
 /// Names declared by every package.json under `repo_root` (workspace members
 /// included), skipping dependency/build directories. Used to recognize
@@ -294,7 +294,16 @@ mod tests {
         )
         .unwrap();
 
+        std::fs::create_dir_all(repo.path().join("packages/contracts/.vite/deps")).unwrap();
+        std::fs::write(
+            repo.path()
+                .join("packages/contracts/.vite/deps/package.json"),
+            r#"{"name":"cached-vendor"}"#,
+        )
+        .unwrap();
+
         let names = collect_internal_package_names(repo.path());
+        assert!(!names.contains("cached-vendor"));
         assert!(names.contains("platform-monorepo"));
         assert!(names.contains("@meridian/contracts"));
         assert!(

@@ -618,7 +618,7 @@ mod tests {
         // beyond node_modules behaves the same way.
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(repo.path().join("deno.json"), "{}").unwrap();
-        for dir in ["dist", "build", ".next"] {
+        for dir in ["dist", "build", ".next", ".vite/deps"] {
             std::fs::create_dir_all(repo.path().join(dir)).unwrap();
             std::fs::write(repo.path().join(dir).join("package.json"), "{}").unwrap();
         }

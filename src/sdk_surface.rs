@@ -158,10 +158,6 @@ const MAX_ENTRY_MODULES: usize = 32;
 /// it is recorded. A consumer's bare `import … from "pkg"` is this subpath.
 const ROOT_SUBPATH: &str = ".";
 
-/// Directories whose contents are build output or dependencies, never the
-/// package's own source.
-const NON_SOURCE_DIRS: [&str; 4] = ["node_modules", "dist", "build", ".next"];
-
 /// The `exports` conditions read before anything else at a given level, in
 /// this order. Not a filter: every other condition at that level is read too,
 /// after these. It exists so a package that states its entry plainly is not
@@ -503,7 +499,7 @@ fn is_typescript_source(path: &Path) -> bool {
         component
             .as_os_str()
             .to_str()
-            .is_some_and(|segment| NON_SOURCE_DIRS.contains(&segment))
+            .is_some_and(|segment| crate::packages::MANIFEST_SKIP_DIRS.contains(&segment))
     })
 }
 
@@ -1773,6 +1769,12 @@ mod tests {
 
         assert!(!is_typescript_source(Path::new("/repo/dist/index.d.ts")));
         assert!(!is_typescript_source(Path::new("/repo/dist/index.ts")));
+        assert!(!is_typescript_source(Path::new(
+            "/repo/.vite/deps/index.ts"
+        )));
+        assert!(is_typescript_source(Path::new(
+            "/repo/src/.vite-tools/index.ts"
+        )));
         assert!(!is_typescript_source(Path::new("/repo/src/index.js")));
         assert!(is_typescript_source(Path::new("/repo/src/index.ts")));
     }

@@ -3669,7 +3669,7 @@ fn resolve_services(repo_path: &str) -> Result<Vec<Config>, Box<dyn std::error::
 
 /// Build-artifact directories to skip everywhere.
 fn service_ignore_patterns(_service: &Config) -> Vec<&'static str> {
-    vec!["node_modules", "dist", "build", ".next"]
+    crate::packages::MANIFEST_SKIP_DIRS.to_vec()
 }
 
 /// Load the package data for a single service, scoped to its own
@@ -6491,6 +6491,47 @@ mod tests {
         assert_eq!(
             deserialized.package_json_hash,
             Some("abc123hash".to_string())
+        );
+    }
+
+    #[test]
+    fn vite_artifacts_are_excluded_from_service_and_include_roots() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        for directory in ["apps/api", "shared"] {
+            for subtree in ["src", ".vite/deps", "src/.vite/deps", "src/.vite-tools"] {
+                let dir = root.join(directory).join(subtree);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join("client.js"),
+                    "fetch('https://vendor.example/api');",
+                )
+                .unwrap();
+            }
+        }
+        let service = Config {
+            directory: Some("apps/api".to_string()),
+            include: vec!["shared".to_string()],
+            ..Default::default()
+        };
+        let (files, _) = crate::file_finder::find_service_files(
+            root.to_str().unwrap(),
+            &service,
+            &service_ignore_patterns(&service),
+        );
+        let mut relative: Vec<_> = files
+            .iter()
+            .map(|file| file.strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+        relative.sort();
+        assert_eq!(
+            relative,
+            vec![
+                PathBuf::from("apps/api/src/.vite-tools/client.js"),
+                PathBuf::from("apps/api/src/client.js"),
+                PathBuf::from("shared/src/.vite-tools/client.js"),
+                PathBuf::from("shared/src/client.js"),
+            ]
         );
     }
 
