@@ -1,5 +1,10 @@
 # Repository Guidelines
 
+Canonical instructions for every coding-agent harness: Claude Code imports
+this file through `CLAUDE.md`, Codex reads it directly. Edit this file, not
+`CLAUDE.md`. This is the **public** Rust scanner for Carrick; the private
+companion `carrick-cloud` holds Lambdas, Terraform and the dashboard.
+
 ## Carrick
 
 **If the answer is defined by another service — its endpoints, its real
@@ -40,6 +45,10 @@ scan of each repo. The index at main is what production integrates
 against, so build against a sibling's contract from the index and merge —
 your unmerged local state does not need to be visible to Carrick.
 
+The index cannot see the Rust scanner as a service (no HTTP surface), so a
+nil result for scanner-internal behaviour is expected; say so rather than
+skipping the call.
+
 Write correct, idiomatic, explicitly typed code; never contort code so the
 scanner can read it. If Carrick fails to extract something written
 normally, that is a Carrick bug to report, not a constraint to code
@@ -49,9 +58,10 @@ around.
 
 ```
 claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp
+codex mcp add carrick --url https://api.carrick.tools/mcp && codex mcp login carrick
 ```
 
-One install serves every project in the workspace.
+One install per harness serves every project in the workspace.
 
 
 ## Core Goals (Read First)
@@ -132,3 +142,24 @@ Agents own the delivery loop end to end: branch, PR, review of the full diff, re
 - `carrick.json` is resolved by `Config::load_services` into one `Config` per service. A flat config (or none) is a single service rooted at the repo root; a `services` array fans out per directory (`directory`, `include`, `tsconfig` + the call-classification fields). The engine runs the analysis pipeline, per-service type extraction, and upload once per service. Multi-service index upload is gated on `CloudStorage::supports_multi_service`, driven by the cloud's `multiService` capability flag. See the README "Monorepos" section for the user-facing shape.
 - Runtime env vars: `ACTIONS_ID_TOKEN_REQUEST_URL` / `ACTIONS_ID_TOKEN_REQUEST_TOKEN` (auto-set by GitHub Actions when the job grants `id-token: write`; the scanner mints an OIDC token from these and sends it as the `X-Carrick-OIDC` header — the cloud derives repo identity from the signed claims, so no API key is needed), `CARRICK_MOCK_ALL` (test-only, returns canned responses without hitting the cloud), `CARRICK_API_ENDPOINT` (override the default `https://api.carrick.tools` endpoint at build time; optional).
 - Terraform, Lambdas, and dashboard code live in `carrick-cloud`. No infrastructure or server-side code belongs in this repo.
+
+## Hard rules
+
+- **Never run `terraform` shell commands.** Terraform and the rest of the AWS infrastructure live in `carrick-cloud`, not here. If a task needs infra changes, switch to that repo.
+- **No LLM system instructions in this repo.** Per the public/private split, system-prompt strings live in `carrick-cloud/lambdas/*/system_prompt.txt`. User-message templates that interpolate scan-time data may live in Rust because they need access to the data structures the scanner produces (e.g. `src/agents/file_analyzer_agent.rs`). CI workflow `prompt-leak-guard.yml` enforces this as a ratchet against `.github/prompt-leak-baseline.txt`: counts may shrink but never grow. It scans every `*.rs` file under `src/`, `build.rs`, and `tests/` (excluding `tests/fixtures/`) for the patterns `You are `, `You describe `, `You analyze `, `Extract ONLY`, `responseSchema`, `system_instruction`, `prompt:[[:space:]]*"`, `Identify all frameworks`, and `"frameworks":`.
+- **No backwards compatibility / no users.** When refactoring, ship the new shape and delete the old shape in the same commit. No feature flags, no deprecation cycles, no parallel old/new code paths.
+
+## Boundary
+
+- Public (this repo): Rust scanner, AST/parser, agent orchestrators (thin), `src/sidecar/`, GitHub Action.
+- Private (`carrick-cloud`): all Lambdas, MCP server + tools, Terraform, prompts, wrapper-rule generation, future web dashboard.
+
+MCP is exposed exclusively as an HTTP endpoint at `https://api.carrick.tools/mcp`. Users add Carrick to their AI agent via `claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp`. There is no local-stdio install — the MCP tool implementations live in `carrick-cloud/lambdas/mcp-server/`.
+
+If you need to touch a Lambda, Terraform, or a prompt, the change goes in `carrick-cloud`.
+
+## Where things are
+
+Reading or writing documentation, or running evals? Start at `docs/README.md` — the map. It says where everything lives and where new docs go; don't place a doc without it. Otherwise ignore `docs/`.
+
+The Carrick → carrick-cloud split landed in 2026-05. Follow-up work (OAuth dashboard, ELv2 relicense + flip public, etc.) is tracked as GitHub issues.
