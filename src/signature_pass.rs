@@ -188,13 +188,34 @@ fn build_infer_requests(
 /// Compose the one-line signature hint, e.g.
 /// `(token: string, opts?: VerifyOpts) => Promise<AuthResult>`. Params without a
 /// known type render as the bare name; an unknown return renders as `unknown`.
+/// Defaulted trailing parameters are optional at the call site. Before a
+/// required parameter they still occupy a position, but accept `undefined`.
+/// Initializer source remains in the argument record rather than this type.
 fn compose_signature(def: &FunctionDefinition) -> String {
+    let last_required = def
+        .arguments
+        .iter()
+        .rposition(|arg| !arg.is_optional && !arg.has_default && !arg.is_rest);
     let params = def
         .arguments
         .iter()
-        .map(|arg| match &arg.type_string {
-            Some(ty) => format!("{}: {}", arg.name, ty),
-            None => arg.name.clone(),
+        .enumerate()
+        .map(|(index, arg)| {
+            let default_before_required =
+                arg.has_default && last_required.is_some_and(|required| index < required);
+            let optional = arg.is_optional || (arg.has_default && !default_before_required);
+            let mut param = arg.name.clone();
+            if optional {
+                param.push('?');
+            }
+            if default_before_required {
+                // Parentheses preserve function/intersection type precedence.
+                let ty = arg.type_string.as_deref().unwrap_or("unknown");
+                param.push_str(&format!(": ({ty}) | undefined"));
+            } else if let Some(ty) = &arg.type_string {
+                param.push_str(&format!(": {ty}"));
+            }
+            param
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -243,6 +264,10 @@ mod tests {
             type_ann: None,
             is_explicit: ty.is_some(),
             type_string: ty.map(|t| t.to_string()),
+            is_optional: false,
+            has_default: false,
+            default_value: None,
+            is_rest: name.starts_with("..."),
         }
     }
 
@@ -265,6 +290,20 @@ mod tests {
             intent_input_hash: None,
             dispatch_table: None,
         }
+    }
+
+    #[test]
+    fn default_before_required_accepts_undefined_even_without_initializer_source() {
+        let mut defaulted = arg("value", Some("number"));
+        defaulted.has_default = true;
+        let d = def(
+            vec![defaulted, arg("required", Some("string"))],
+            Some("void"),
+        );
+        assert_eq!(
+            compose_signature(&d),
+            "(value: (number) | undefined, required: string) => void"
+        );
     }
 
     #[test]

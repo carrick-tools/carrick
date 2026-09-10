@@ -27,6 +27,18 @@ pub struct FunctionArgument {
     /// it was inferred by the sidecar. Serves as a confidence signal to agents.
     #[serde(default)]
     pub is_explicit: bool,
+    /// Explicit `?` on the parameter itself, not on a destructured member.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_optional: bool,
+    /// A top-level initializer. This does not make a parameter before a
+    /// required parameter omittable; callers must still supply that position.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_default: bool,
+    /// Exact initializer source, when its span can be read. Never evaluated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_rest: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -920,10 +932,8 @@ impl FunctionDefinitionExtractor {
                 ident.type_ann.as_ref().map(|t| *t.clone()),
             ),
             Pat::Rest(rest) => {
-                let rest_name = match &*rest.arg {
-                    Pat::Ident(ident) => format!("...{}", ident.id.sym),
-                    _ => "...rest".to_string(),
-                };
+                let (name, _) = self.pat_name_and_type(&rest.arg);
+                let rest_name = format!("...{name}");
                 (rest_name, rest.type_ann.as_ref().map(|t| *t.clone()))
             }
             // A defaulted param (`role = "x"`); the annotation, if any, is on
@@ -984,14 +994,29 @@ impl FunctionDefinitionExtractor {
         format!("[{}]", elems.join(", "))
     }
 
-    /// Build a `FunctionArgument` from a resolved `(name, type annotation)`.
-    fn build_argument(&self, name: String, type_ann: Option<TsTypeAnn>) -> FunctionArgument {
+    /// Capture the top-level parameter pattern independently of its binding members.
+    fn build_argument(&self, pat: &Pat) -> FunctionArgument {
+        let (name, type_ann) = self.pat_name_and_type(pat);
+        let is_optional = match pat {
+            Pat::Ident(ident) => ident.id.optional,
+            Pat::Object(object) => object.optional,
+            Pat::Array(array) => array.optional,
+            _ => false,
+        };
+        let default_value = match pat {
+            Pat::Assign(assign) => self.source_map.span_to_snippet(assign.right.span()).ok(),
+            _ => None,
+        };
         let type_string = type_ann.as_ref().and_then(|t| self.type_ann_to_string(t));
         FunctionArgument {
             name,
             type_ann,
             is_explicit: type_string.is_some(),
             type_string,
+            is_optional,
+            has_default: matches!(pat, Pat::Assign(_)),
+            default_value,
+            is_rest: matches!(pat, Pat::Rest(_)),
         }
     }
 
@@ -999,22 +1024,13 @@ impl FunctionDefinitionExtractor {
     fn extract_arguments(&self, params: &[Param]) -> Vec<FunctionArgument> {
         params
             .iter()
-            .map(|param| {
-                let (name, type_ann) = self.pat_name_and_type(&param.pat);
-                self.build_argument(name, type_ann)
-            })
+            .map(|param| self.build_argument(&param.pat))
             .collect()
     }
 
     /// Extract arguments from arrow function parameters
     fn extract_arrow_arguments(&self, params: &[Pat]) -> Vec<FunctionArgument> {
-        params
-            .iter()
-            .map(|pat| {
-                let (name, type_ann) = self.pat_name_and_type(pat);
-                self.build_argument(name, type_ann)
-            })
-            .collect()
+        params.iter().map(|pat| self.build_argument(pat)).collect()
     }
 
     /// Mark functions as exported based on collected export names.
@@ -1880,6 +1896,149 @@ mod tests {
         module.visit_with(&mut extractor);
         extractor.finalize_exports();
         extractor.function_definitions
+    }
+
+    #[test]
+    fn parameter_facts_survive_signature_projection_and_storage() {
+        let mut defs = extract(
+            r#"
+            export function plain(required: string, optional?: string): void {}
+            export const arrow = (ordinal: number = 0, label: string, ...args: string[]): void => {};
+            export class Service {
+                method({ count = 1 }: { count?: number } = {}, [first]: string[] = ["a"]): void {}
+            }
+            export function nested({ count = 1 }: { count?: number }): void {}
+            export function defaults(value = makeValue(1, "x")): void {}
+            export function tupleRest(...[first, second]: [string, number]): void {}
+            export function callbackDefault(callback: () => number = () => 0, label: string, ordinal: number = 0): void {}
+            export function multilineDefault(value: string = `first
+second`): void {}
+        "#,
+        );
+        crate::signature_pass::populate_function_signatures(None, &mut defs, "/tmp");
+        assert_eq!(
+            defs["plain"].signature.as_deref(),
+            Some("(required: string, optional?: string) => void")
+        );
+        assert_eq!(
+            defs["arrow"].signature.as_deref(),
+            Some("(ordinal: (number) | undefined, label: string, ...args: string[]) => void")
+        );
+        assert_eq!(
+            defs["Service.method"].signature.as_deref(),
+            Some("({ count }?: { count?: number }, [first]?: string[]) => void")
+        );
+        assert_eq!(
+            defs["defaults"].signature.as_deref(),
+            Some("(value?) => void")
+        );
+
+        assert_eq!(
+            defs["tupleRest"].signature.as_deref(),
+            Some("(...[first, second]: [string, number]) => void")
+        );
+        assert!(defs["tupleRest"].arguments[0].is_rest);
+
+        assert_eq!(
+            defs["callbackDefault"].signature.as_deref(),
+            Some("(callback: (() => number) | undefined, label: string, ordinal?: number) => void")
+        );
+        assert_eq!(
+            defs["multilineDefault"].signature.as_deref(),
+            Some("(value?: string) => void")
+        );
+        assert_eq!(
+            defs["multilineDefault"].arguments[0]
+                .default_value
+                .as_deref(),
+            Some("`first\nsecond`")
+        );
+
+        let mut blob: crate::cloud_storage::CloudRepoData =
+            serde_json::from_value(serde_json::json!({
+                "repo_name": "example/service", "endpoints": [], "calls": [], "mounts": [],
+                "apps": {}, "imported_handlers": [], "function_definitions": {},
+                "last_updated": "2026-01-01T00:00:00Z", "commit_hash": "abc"
+            }))
+            .unwrap();
+        blob.function_definitions = defs;
+        let wire = serde_json::to_value(&blob).unwrap();
+        let functions = &wire["function_definitions"];
+        assert_eq!(
+            functions["plain"]["arguments"][0],
+            serde_json::json!({
+                "name": "required", "type_string": "string", "is_explicit": true
+            })
+        );
+        assert_eq!(
+            functions["plain"]["arguments"][1],
+            serde_json::json!({
+                "name": "optional", "type_string": "string", "is_explicit": true, "is_optional": true
+            })
+        );
+        assert_eq!(
+            functions["arrow"]["arguments"][0],
+            serde_json::json!({
+                "name": "ordinal", "type_string": "number", "is_explicit": true,
+                "has_default": true, "default_value": "0"
+            })
+        );
+        assert_eq!(
+            functions["arrow"]["arguments"][2],
+            serde_json::json!({
+                "name": "...args", "type_string": "string[]", "is_explicit": true, "is_rest": true
+            })
+        );
+        assert!(
+            functions["nested"]["arguments"][0]
+                .get("has_default")
+                .is_none()
+        );
+        assert!(
+            functions["nested"]["arguments"][0]
+                .get("is_optional")
+                .is_none()
+        );
+        let stored = serde_json::to_vec(&blob).unwrap();
+        let restored: crate::cloud_storage::CloudRepoData =
+            serde_json::from_slice(&stored).unwrap();
+        for (name, def) in &restored.function_definitions {
+            assert_eq!(
+                serde_json::to_value(&def.arguments).unwrap(),
+                wire["function_definitions"][name]["arguments"]
+            );
+            assert_eq!(
+                def.signature.as_deref(),
+                wire["function_definitions"][name]["signature"].as_str()
+            );
+        }
+
+        // Old records still read and stay sparse on write. No initializer or
+        // optionality may be invented from a type or the argument name.
+        let mut old = wire;
+        for def in old["function_definitions"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            for arg in def["arguments"].as_array_mut().unwrap() {
+                for field in ["is_optional", "has_default", "default_value", "is_rest"] {
+                    arg.as_object_mut().unwrap().remove(field);
+                }
+            }
+        }
+        let restored: crate::cloud_storage::CloudRepoData =
+            serde_json::from_value(old.clone()).unwrap();
+        for (name, def) in &restored.function_definitions {
+            assert_eq!(
+                serde_json::to_value(&def.arguments).unwrap(),
+                old["function_definitions"][name]["arguments"]
+            );
+            assert!(def.arguments.iter().all(|arg| !arg.is_optional
+                && !arg.has_default
+                && !arg.is_rest
+                && arg.default_value.is_none()));
+        }
     }
 
     #[test]
