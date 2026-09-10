@@ -17,6 +17,23 @@ carrick init
 requires that credential or a `CARRICK_TOKEN` environment override and verifies
 it before writing files. GitHub CLI credentials do not grant Carrick access.
 
+Existing users can initialise the local workspace against a named Carrick
+project:
+
+```
+carrick init --project payments
+```
+
+The command shows the current project assignment for every proposed GitHub
+repo and prints the project, GitHub App, and repo-assignment links needed for
+the remaining browser steps. In an interactive terminal, it also opens the
+workspace's project page. The browser creates projects and changes assignments;
+the CLI only reads `resolve-repos` until every proposed repo reports
+`project_slug: "payments"`. A repo connected to another project remains
+pending. In a noninteractive shell, an unmet target prints the same links and
+exits with status 1 without writing the local setup. Omit `--project` to keep
+the normal workspace init flow.
+
 Credentials live in `$XDG_CONFIG_HOME/carrick/credentials.json`, falling back
 to `~/.config/carrick/` on macOS and Linux or `%APPDATA%\carrick\` on Windows.
 The file is written with mode 0600. `carrick logout` removes it; unset
@@ -53,7 +70,7 @@ types runs on it.
 |---|---|
 | `carrick login` | Authorise a Carrick workspace in the browser, or verify `CARRICK_TOKEN` |
 | `carrick logout` | Remove the saved local credential |
-| `carrick init` | The repo list, the first index, the agent hooks, and the lines it cannot run for you |
+| `carrick init [--project SLUG]` | The repo list, optional project-assignment verification, the first index, the agent hooks, and the lines it cannot run for you |
 | `carrick index` | Derive the workspace, apply optional repo overrides and write `.carrick/` |
 | `carrick refresh [--service X]` | Re-scan one repo, or all of them, and re-join |
 | `carrick check <file>` | What the index knows about that file, verdicts included |

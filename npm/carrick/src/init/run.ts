@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { readCredential } from "../auth/credentials.ts";
 import { resolveRepos } from "../auth/read.ts";
 import { deriveWorkspace, writeConfigs, githubRemote } from "./repos.ts";
-import { connectRepos } from "./connect.ts";
+import { connectRepos, reposAreInProject } from "./connect.ts";
 import { hookCommand, mergeCarrickHooks } from "./settings.ts";
 import { renderTemplate } from "../templates.ts";
 import { resolveNativeBinary, nativeEnv, packageRoot } from "../native.ts";
@@ -17,6 +17,8 @@ const EXTENSION_ID = "carrick-tools.carrick";
 
 export type InitOptions = {
   workspace: string;
+  /** Require every proposed GitHub repo to belong to this project. */
+  project: string | null;
   /** Answer yes to the repo list rather than asking. */
   assumeYes: boolean;
   /** Write the files, print the lines, and do not build the index. */
@@ -24,7 +26,7 @@ export type InitOptions = {
 };
 
 export function parseArgs(argv: string[], cwd = process.cwd()): InitOptions | string {
-  const options: InitOptions = { workspace: cwd, assumeYes: false, skipIndex: false };
+  const options: InitOptions = { workspace: cwd, project: null, assumeYes: false, skipIndex: false };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     switch (argument) {
@@ -35,6 +37,19 @@ export function parseArgs(argv: string[], cwd = process.cwd()): InitOptions | st
       case "--skip-index":
         options.skipIndex = true;
         break;
+      case "--project": {
+        const value = argv[index + 1];
+        if (!value) return "--project needs a slug";
+        if (
+          value === "default" ||
+          !/^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){2,31}$/.test(value)
+        ) {
+          return `invalid project slug "${value}": use 3-32 lowercase letters, digits, and single hyphens`;
+        }
+        options.project = value;
+        index += 1;
+        break;
+      }
       case "--workspace":
       case "-w": {
         const value = argv[index + 1];
@@ -56,12 +71,15 @@ export function parseArgs(argv: string[], cwd = process.cwd()): InitOptions | st
 
 function help(): string {
   return [
-    "carrick init [DIRECTORY]",
+    "carrick init [DIRECTORY] [--project SLUG]",
     "",
     "Sign in with carrick login, then configure services, hooks and the first",
     "index in a repository or a folder of repos.",
+    "With --project, the browser creates or selects the project and assigns",
+    "the proposed GitHub repos. The CLI waits for Carrick to verify the assignment.",
     "",
     "    -w, --workspace DIR  The folder holding the repos (default: this one)",
+    "        --project SLUG   Require these repos in this Carrick project",
     "    -y, --yes            Take the repo list as proposed",
     "        --skip-index     Write the files and print the lines, index later",
   ].join("\n");
@@ -146,9 +164,32 @@ export async function init(argv: string[]): Promise<number> {
     const credential = readCredential();
     if (!credential) throw new Error("carrick init requires a Carrick login. Run carrick login, or set CARRICK_TOKEN.");
     plan = deriveWorkspace(workspace);
-    const names = [...new Set(plan.repos.map((repo) => githubRemote(repo.path)).filter((name): name is string => name !== null))];
+    const repoIdentities = plan.repos.map((repo) => ({ path: repo.path, name: githubRemote(repo.path) }));
+    const names = [...new Set(repoIdentities.map((repo) => repo.name).filter((name): name is string => name !== null))];
     if (names.length > 200) throw new Error("This workspace has more than 200 GitHub repos. Initialise smaller workspace groups.");
-    const identity = await connectRepos(credential.token, names, await resolveRepos(credential.token, names), { interactive: process.stdin.isTTY === true, say });
+    const missingIdentities = repoIdentities.filter((repo) => repo.name === null);
+    if (parsed.project && missingIdentities.length > 0) {
+      throw new Error(
+        `--project ${parsed.project} cannot verify ${missingIdentities.map((repo) => repo.path).join(", ")} because ${missingIdentities.length === 1 ? "it has" : "they have"} no GitHub origin. No project assignment was verified.`,
+      );
+    }
+    if (parsed.project && names.length === 0) {
+      throw new Error(`--project ${parsed.project} found no GitHub repos to verify.`);
+    }
+    if (parsed.project) {
+      say(`Repos requested for project "${parsed.project}":`);
+      for (const name of names) say(`  ${name}`);
+    }
+    const identity = await connectRepos(credential.token, names, await resolveRepos(credential.token, names), {
+      interactive: process.stdin.isTTY === true,
+      project: parsed.project ?? undefined,
+      say,
+    });
+    if (parsed.project && !reposAreInProject(identity, names, parsed.project)) {
+      throw new Error(
+        `Project "${parsed.project}" was not verified for every requested repo. Complete the browser steps and run carrick init --project ${parsed.project} again.`,
+      );
+    }
     say(`Carrick workspace: ${identity.workspace.slug}`);
     if (identity.allowance_sentence) say(identity.allowance_sentence);
     for (const repo of identity.repos) {
