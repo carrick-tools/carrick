@@ -8,15 +8,14 @@
 # route it cannot describe. `action.yml` calls this before "Run analysis".
 #
 # Posture (carrick#706):
-#   - lockfile-gated: no lockfile at the scan root, no install;
+#   - Node installs are lockfile-gated; Deno uses its declared configuration
+#     in frozen mode, including projects that disable the lockfile;
 #   - lifecycle scripts disabled everywhere, so nothing in the scanned repo
 #     executes during a scan;
 #   - time-boxed and tolerant: a failed or slow install prints a `::warning::`
 #     and the scan continues on the bare checkout exactly as before;
 #   - the scan root only, never a walk up to a hoisted workspace root: the
-#     sidecar reads `<scan root>/node_modules` when it decides `bare_checkout`,
-#     so installing anywhere else would report installed and still capture
-#     bare.
+#     Node reads local node_modules; Deno consumes its global dependency cache.
 #
 # Same-level precedence mirrors the sidecar's `lockfileVersions`
 # (src/sidecar/src/capture/lockfile.ts) so the install and the type capture
@@ -41,6 +40,10 @@ detect_manager() {
   elif [ -f "$root/yarn.lock" ]; then echo "yarn:$root/yarn.lock"
   elif [ -f "$root/bun.lock" ]; then echo "bun:$root/bun.lock"
   elif [ -f "$root/bun.lockb" ]; then echo "bun:$root/bun.lockb"
+  elif [ -f "$root/deno.json" ] || [ -f "$root/deno.jsonc" ]; then
+    if [ -f "$root/deno.lock" ]; then echo "deno:$root/deno.lock"
+    elif [ -f "$root/deno.json" ]; then echo "deno:$root/deno.json"
+    else echo "deno:$root/deno.jsonc"; fi
   fi
 }
 
@@ -52,6 +55,9 @@ detect_manager() {
 cache_dir_for() {
   local manager="$1" dir=""
   case "$manager" in
+    deno)
+      dir=$(deno info --json 2>/dev/null | node -e 'let text="";process.stdin.on("data",c=>text+=c);process.stdin.on("end",()=>{try{console.log(JSON.parse(text).denoDir||"")}catch{}})' || true)
+      ;;
     npm)
       command -v npm >/dev/null 2>&1 && dir=$(npm config get cache 2>/dev/null || true)
       ;;
@@ -97,7 +103,12 @@ cmd_detect() {
   manager="${found%%:*}"
   lockfile="${found#*:}"
 
-  if [ -d "$root/node_modules" ]; then
+  # Existing Node installs do not prove that the separate Deno cache is warm.
+  if [ "$manager" != "deno" ] && [ -d "$root/node_modules" ] &&
+      { [ -f "$root/deno.json" ] || [ -f "$root/deno.jsonc" ]; }; then
+    manager="deno"
+  fi
+  if [ "$manager" != "deno" ] && [ -d "$root/node_modules" ]; then
     echo "should_install=false"
     echo "manager=$manager"
     echo "reason=node_modules already present at the scan root"
@@ -109,6 +120,9 @@ cmd_detect() {
   echo "lockfile=$lockfile"
   echo "lockfile_sha256=$(sha256_of "$lockfile")"
   echo "cache_dir=$(cache_dir_for "$manager")"
+  if [ "$manager" != "deno" ] && { [ -f "$root/deno.json" ] || [ -f "$root/deno.jsonc" ]; }; then
+    echo "deno_cache_dir=$(cache_dir_for deno)"
+  fi
 }
 
 # Run one install command with scripts disabled, time-boxed, output to a log
@@ -128,13 +142,26 @@ run_install() {
 
 cmd_install() {
   local root="$1" manager="$2" log status
-  log="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/carrick-dependency-install.log"
+  if [ "$manager" != "deno" ] && { [ -f "$root/deno.json" ] || [ -f "$root/deno.jsonc" ]; }; then
+    # Mixed roots need the global Deno cache AND the Node compiler's local
+    # install. Neither preparation executes authorized project lifecycle code.
+    cmd_install "$root" deno
+  fi
+  log=$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/carrick-dependency-install.XXXXXX") || return 1
 
   # corepack ships with the Node the Action set up; it is how pnpm and yarn
   # reach the version the repo pins in `packageManager`.
   corepack enable >/dev/null 2>&1 || true
 
   case "$manager" in
+    deno)
+      # A project can authorize lifecycle scripts through allowScripts in its
+      # config. Deno has no --ignore-scripts: disabling node_modules is what
+      # prevents those scripts from running, even for an authorizing config.
+      # Frozen mode also prevents rewriting the project's lockfile.
+      run_install "$root" "$log" deno install --frozen --node-modules-dir=none
+      status=$?
+      ;;
     npm)
       run_install "$root" "$log" npm ci --ignore-scripts
       status=$?

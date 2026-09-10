@@ -53,9 +53,9 @@ pub struct ManifestFacts {
     pub workspace: Vec<String>,
 }
 
-pub fn read_manifest(path: &Path) -> Result<ManifestFacts, io::Error> {
+pub(crate) fn read_json_config(path: &Path) -> Result<serde_json::Value, io::Error> {
     let content = std::fs::read_to_string(path)?;
-    let json_text = if path.file_name().is_some_and(|name| name == "deno.jsonc") {
+    let json_text = if path.extension().is_some_and(|ext| ext == "jsonc") {
         strip_jsonc_syntax(&content).map_err(|message| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -71,6 +71,12 @@ pub fn read_manifest(path: &Path) -> Result<ManifestFacts, io::Error> {
             format!("Failed to parse {}: {}", path.display(), e),
         )
     })?;
+
+    Ok(json)
+}
+
+pub fn read_manifest(path: &Path) -> Result<ManifestFacts, io::Error> {
+    let json = read_json_config(path)?;
 
     if path.file_name().is_some_and(|name| name == "package.json") {
         let package = serde_json::from_value(json.clone()).map_err(|e| {
@@ -91,10 +97,21 @@ pub fn read_manifest(path: &Path) -> Result<ManifestFacts, io::Error> {
     }
 
     let mut dependencies = HashMap::new();
-    if let Some(imports) = json.get("imports").and_then(serde_json::Value::as_object) {
-        for target in imports.values().filter_map(serde_json::Value::as_str) {
-            if let Some((name, spec)) = deno_registry_identity(target) {
-                dependencies.entry(name).or_insert(spec);
+    let external_map = crate::deno_support::import_map_path(path, &json)?
+        .map(|path| read_json_config(&path))
+        .transpose()?;
+    for map in std::iter::once(&json).chain(external_map.as_ref()) {
+        let imports = map.get("imports").and_then(serde_json::Value::as_object);
+        let scopes = map.get("scopes").and_then(serde_json::Value::as_object);
+        for entries in imports.into_iter().chain(
+            scopes
+                .into_iter()
+                .flat_map(|scopes| scopes.values().filter_map(serde_json::Value::as_object)),
+        ) {
+            for target in entries.values().filter_map(serde_json::Value::as_str) {
+                if let Some((name, spec)) = deno_registry_identity(target) {
+                    dependencies.entry(name).or_insert(spec);
+                }
             }
         }
     }

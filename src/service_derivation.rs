@@ -218,7 +218,19 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
                 "Derived service name '{name}' is duplicated; declare unique names in carrick.json."
             ));
         }
-        let tsconfig = nearest_tsconfig(&root, &directory);
+        let tsconfig = if crate::deno_support::service_manifest(
+            &root,
+            &Config {
+                directory: Some(relative.to_string_lossy().into_owned()),
+                ..Config::default()
+            },
+        )
+        .is_some()
+        {
+            None
+        } else {
+            nearest_tsconfig(&root, &directory)
+        };
         services.push(Config {
             service_name: name,
             directory: (!relative.as_os_str().is_empty())
@@ -234,7 +246,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
         warnings.push("Workspace packages are proposed as services. Review service boundaries and shared source includes in carrick.json.".into());
     }
     if has_deno {
-        warnings.push("Deno manifest discovery does not supply import-map type configuration or Deno globals. The scanner's Deno support guard still applies.".into());
+        warnings.push("Deno services use their existing manifests and require Deno on PATH for type resolution.".into());
     }
     Ok(ServiceDerivation {
         reason: if reasons.is_empty() {

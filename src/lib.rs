@@ -8,6 +8,7 @@ pub mod call_graph;
 pub mod call_site_extractor;
 pub mod cloud_storage;
 pub mod config;
+pub mod deno_support;
 pub mod dispatch;
 pub mod engine;
 pub mod env_alias;

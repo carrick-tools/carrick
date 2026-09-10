@@ -195,7 +195,7 @@ fn malformed_workspace_and_unmatched_members_are_errors() {
 }
 
 #[test]
-fn deno_adapter_supplies_members_but_does_not_claim_type_program_support() {
+fn deno_adapter_supplies_members_and_leaves_config_discovery_to_sidecar() {
     let dir = tempfile::tempdir().unwrap();
     write(
         dir.path(),
@@ -208,7 +208,13 @@ fn deno_adapter_supplies_members_but_does_not_claim_type_program_support() {
         "shared/deno.json",
         r#"{"name":"@sample/shared","exports":"./mod.ts"}"#,
     );
+    write(
+        dir.path(),
+        "tsconfig.json",
+        r#"{"compilerOptions":{"types":["node"]}}"#,
+    );
     let derived = resolve(dir.path()).unwrap();
+    assert!(derived.services.iter().all(|s| s.tsconfig.is_none()));
     assert_eq!(derived.services.len(), 2);
     assert_eq!(
         derived.services[0].service_name.as_deref(),
@@ -220,4 +226,84 @@ fn deno_adapter_supplies_members_but_does_not_claim_type_program_support() {
             .iter()
             .any(|w| w.contains("Deno") && w.contains("type"))
     );
+}
+
+#[test]
+fn deno_missing_runtime_fails_before_cloud_or_type_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "deno.json", "{}");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_carrick"))
+        .arg(dir.path())
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("Deno is required"), "{text}");
+    assert!(!text.contains("can't scan Deno-native"), "{text}");
+}
+
+#[test]
+fn explicit_typescript_config_keeps_node_path_in_deno_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "deno.json", "{}");
+    write(dir.path(), "tsconfig.json", "{}");
+    write(
+        dir.path(),
+        "carrick.json",
+        r#"{"tsconfig":"tsconfig.json"}"#,
+    );
+    let derived = resolve(dir.path()).unwrap();
+    assert!(carrick::deno_support::service_manifest(dir.path(), &derived.services[0]).is_none());
+}
+
+#[test]
+fn unrelated_node_subtree_does_not_inherit_deno_but_declared_member_does() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "deno.json", "{}");
+    write(dir.path(), "tools/package.json", r#"{"name":"tooling"}"#);
+    let service = carrick::config::Config {
+        directory: Some("tools".into()),
+        ..Default::default()
+    };
+    assert!(carrick::deno_support::service_manifest(dir.path(), &service).is_none());
+    write(dir.path(), "deno.json", r#"{"workspace":["./tools"]}"#);
+    assert!(carrick::deno_support::service_manifest(dir.path(), &service).is_some());
+    write(dir.path(), "deno.json", "{}");
+    write(dir.path(), "tools/deno.json", "{}");
+    assert!(carrick::deno_support::service_manifest(dir.path(), &service).is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn unsupported_deno_version_fails_before_analysis() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "deno.json", "{}");
+    write(
+        dir.path(),
+        "bin/deno",
+        "#!/bin/sh\necho 'deno 2.6.0 (stable)'\n",
+    );
+    std::fs::set_permissions(
+        dir.path().join("bin/deno"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_carrick"))
+        .arg(dir.path())
+        .env("PATH", dir.path().join("bin"))
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success());
+    assert!(text.contains("2.9.4 or newer"), "{text}");
 }

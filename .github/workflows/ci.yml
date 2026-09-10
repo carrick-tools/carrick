@@ -44,6 +44,11 @@ jobs:
             tests/fixtures/koa-api/package.json
             src/sidecar/package-lock.json
 
+      - name: Install Deno for type and dependency preparation tests
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: "2.9.4"
+
       - name: Install test dependencies
         run: |
           cd examples/express-single && npm install
