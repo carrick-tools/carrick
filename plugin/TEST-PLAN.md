@@ -389,6 +389,15 @@ only), packed 2026-09-09 on macOS 15.5 arm64, Node 24.12.0.
 test before section 2 (6.6 s, `user-service` 3 routes 1 call, `order-service`
 0 routes 4 calls, `notification-service` 0 routes 3 calls, 6 counterpart links).
 
+**Second build under test (free smokes only, 2026-09-10):** `carrick@0.3.58`,
+installed from the npm registry (not packed locally) into a throwaway probe
+directory, macOS 15.5 arm64, Node 24.12.0. SMOKE.md §0 and §3 only; TEST-PLAN
+rows 2.2, 2.4, 2.6, 2.8, 2.9, 2.10 and 4.0. No model calls were made. Fixture:
+`tests/fixtures/local-mode-workspace` (the two-service, buildable-by-anyone
+fixture, not the owner-only demo workspace), copied to scratch and
+`git init`-ed, `carrick-workspace.json` written by hand. Full record in
+SMOKE.md §0 and §3 (2026-09-10 blocks); 4.0 above.
+
 ### Install matrix
 
 | Row | Platform / manager | Ran on | `--version` | `index` | verdict probe | Notes |
@@ -461,20 +470,28 @@ the file it wrote. Nothing else in section 2 failed.
 
 ### Editors
 
+No editor in this table was opened on 2026-09-10. VS Code, Cursor, Windsurf,
+JetBrains and Neovim are not installed on this machine; Zed is, but was not
+launched. The 4.0 row below is the generic-probe evidence that stands in for
+what an editor would show, per §4: it proves the server, not the client. Rows
+4.1 to 4.7 are left blank rather than filled from the probe, so a reader can
+tell "not run" from "ran and passed".
+
 | Row | Editor and version | Install path | How it found the binary | Server started | Producer diagnostic | Consumer diagnostic | Related info clickable | Boundary line | Root chosen | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 4.1 | VS Code | .vsix | | | | | | | | |
-| 4.3 | Cursor | .vsix | | | | | | | | |
-| 4.4 | Windsurf | .vsix | | | | | | | | |
-| 4.5 | JetBrains | LSP4IJ / native | | | | | | | | |
-| 4.6 | Zed | settings / extension | | | | | | | | |
-| 4.7 | Neovim | vim.lsp.start | | | | | | | | |
+| 4.0 | generic LSP probe, no editor (`lsp-probe.mjs`, `carrick@0.3.58` from npm) | `--server .../node_modules/carrick/dist/server.js`, `CARRICK_BIN` set to the same install (confirmed honoured: `cli.js` reads `CARRICK_BIN` before falling back to `carrick` on PATH) | `CARRICK_BIN` / `--server`, both explicit | yes, `carrick-lsp: start pid ...` on stderr | clean state: none, only the boundary line (`resolved`/`compatible`, nothing to flag). After the fixture's break, opened separately from the consumer: boundary line only. The route is now POST with 0 counterparts, so there is nothing on the producer side to flag | after the break: 2 `severity:warning, code:method_mismatch` diagnostics (lines 9 and 17), `GET ... method_mismatch (no type verdict): this call uses GET and the producer serves POST at /api/v1/widgets/:widgetId`, matching the fixture's README answer key. Warning, not error: `severityOf` in `npm/carrick/src/diagnostics.ts` demotes a routing finding to warning when the other side is not resolvable, and this fixture's broken route has 0 counterparts on disk, so that is the policy working as written, not a defect | not observable by the probe. `relatedInformation` was empty in both states, because the post-break route has 0 counterparts, so there was nothing to attach either way; the probe cannot say whether a location an editor did receive renders as clickable | yes, one `severity:information, code:boundary` diagnostic at line 1 of every opened file, in both states | `root .../ws (client)`, the workspace folder the probe sent, logged on the server's own stderr | Two runs against a scratch copy of `tests/fixtures/local-mode-workspace`. Clean state: 2 files opened, 1 diagnostic each, `OK 2 file(s) published`. Post-break state (`loader`->`action` edited by hand, then `carrick refresh --service catalog-web`): consumer opened alone, 3 diagnostics, `OK 1 file(s) published`; producer opened alone in a separate run, 1 diagnostic (boundary only). Exit 0 throughout. Full transcript in SMOKE.md §3 |
+| 4.1 | VS Code | .vsix | | not run | not run | not run | not run | not run | not run | VS Code not installed on this machine |
+| 4.3 | Cursor | .vsix | | not run | not run | not run | not run | not run | not run | Cursor not installed on this machine |
+| 4.4 | Windsurf | .vsix | | not run | not run | not run | not run | not run | not run | Windsurf not installed on this machine |
+| 4.5 | JetBrains | LSP4IJ / native | | not run | not run | not run | not run | not run | not run | JetBrains not installed on this machine |
+| 4.6 | Zed | settings / extension | | not run | not run | not run | not run | not run | not run | Zed is installed on this machine but was not opened for this smoke; the 4.6 row (which route the build allows) is still open |
+| 4.7 | Neovim | vim.lsp.start | | not run | not run | not run | not run | not run | not run | Neovim not installed on this machine |
 
 ### Multi-root and monorepo
 
 | Row | Case | Editor | Log line the server wrote | Diagnostics arrived | Notes |
 |---|---|---|---|---|---|
-| 4.9 | service as folder | | | | |
+| 4.9 | service as folder | generic probe (no editor), 2026-09-10, `carrick@0.3.58` server, `tests/fixtures/local-mode-workspace` scratch copy | `client workspace folder .../ws/inventory-svc has no .carrick/; using .../ws (ancestor)` | yes: 3 diagnostics on the opened consumer file, same as opening the workspace root directly | matches the expected wording in this row exactly. SMOKE.md §2 (2026-09-09, scanner 0.3.49) logged `(project_dir)` for the same walk; this is wording that changed between versions, confirmed by re-running the same case, not a defect |
 | 4.11 | first folder outside the tree | | | | |
 | 4.12 | folder added live | | | | |
 | 4.13 | monorepo | | | | |
