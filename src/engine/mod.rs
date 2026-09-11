@@ -526,8 +526,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     //
     // `CARRICK_ALLOW_PARTIAL_ANALYSIS` is the deliberate opt-out for someone
     // who wants the partial index anyway; the loss is reported either way.
-    // A budget that refused to answer is not a loss, so it is reported on its
-    // own line and never reaches the gate below (carrick#555).
+
+    // A budget that refused to answer is not a loss: the model was never
+    // asked, so there is nothing to re-run and nothing to protect the index
+    // from. Reported on its own line, and it never reaches the gate below
+    // (carrick#555).
     if let Some(line) = crate::scan_health::not_refreshed_line() {
         warn!("{line}");
         logging::annotate(logging::Annotation::Warning, &line);
@@ -562,12 +565,17 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 crate::scan_health::ALLOW_PARTIAL_ENV
             )
             .into());
+        } else {
+            // The only way past the gate with files lost, other than a first
+            // index, is the opt-out — so this line names it. An `else` and not
+            // a fall-through: it used to be one, and the first-index branch
+            // above would then have claimed a flag nobody set.
+            warn!(
+                "{}. Continuing anyway: {} is set",
+                summary,
+                crate::scan_health::ALLOW_PARTIAL_ENV
+            );
         }
-        warn!(
-            "{}. Continuing anyway: {} is set",
-            summary,
-            crate::scan_health::ALLOW_PARTIAL_ENV
-        );
     }
 
     // 5. Prepare each service's upload payload, but DEFER the actual upload
