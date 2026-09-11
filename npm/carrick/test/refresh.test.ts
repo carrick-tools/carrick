@@ -93,8 +93,8 @@ test("a workspace waiting for its first CI scan refreshes once, in the backgroun
   }
 });
 
-// `carrick init` reads the hosted side as it builds the first index, so a
-// session opened straight afterwards has nothing new to ask for.
+// The first `carrick index` reads the hosted side as it builds, so a session
+// opened straight afterwards has nothing new to ask for.
 test("an index that just read the hosted side is not asked to read it again", () => {
   const { root, cleanup } = workspace();
   try {

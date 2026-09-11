@@ -465,6 +465,7 @@ test("the executable CLI rejects a different project and makes no local setup cl
     assert.match(result.stderr, /Project "payments" was not verified/);
     assert.equal(fs.existsSync(path.join(fixture.repo, "carrick.json")), false);
     assert.equal(fs.existsSync(path.join(fixture.repo, ".claude")), false);
+    assert.equal(fs.existsSync(path.join(fixture.repo, ".carrick")), false);
   } finally {
     fixture.cleanup();
   }
@@ -567,6 +568,13 @@ test("a first init writes the proposal, its ignore file and the hook settings, a
 
     // The proposal is the whole derivation, including the config it would once
     // have written into the tree.
+    // And the set is ignored where it has to be: all git can see in the tree
+    // after a first run is the settings directory.
+    assert.equal(
+      execFileSync("git", ["-C", fixture.repo, "status", "--porcelain"], { encoding: "utf8" }),
+      "?? .claude/\n",
+    );
+
     const proposal = JSON.parse(fs.readFileSync(path.join(fixture.repo, PROPOSAL_FILE), "utf8"));
     assert.equal(proposal.schema, "carrick.derive/0");
     assert.equal(proposal.repos[0].services.length, 16);
