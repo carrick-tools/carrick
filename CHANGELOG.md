@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.3.59](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.58...carrick-v0.3.59) (2026-09-11)
+
+
+### Features
+
+* add CLI login and shared init derivation ([#949](https://github.com/carrick-tools/carrick/issues/949)) ([cea3122](https://github.com/carrick-tools/carrick/commit/cea3122293d29605c9dc03549430262414ecdf58))
+* **cli:** verify named projects during init ([#952](https://github.com/carrick-tools/carrick/issues/952)) ([9f71c06](https://github.com/carrick-tools/carrick/commit/9f71c069c6ecac2641c66b33bc7442c2ef60d992))
+* **init:** sign in, create the project, connect MCP clients, print the scaffold prompt, show scan progress ([#959](https://github.com/carrick-tools/carrick/issues/959)) ([2fb88b8](https://github.com/carrick-tools/carrick/commit/2fb88b8d53d95cbcc83a1e25b07bfe0b01dddf4c))
+* **local:** replay authenticated hosted indexes ([#950](https://github.com/carrick-tools/carrick/issues/950)) ([0b800e7](https://github.com/carrick-tools/carrick/commit/0b800e75a627de7b5f0aee42f7ddc239cbcda9d5))
+* read Deno workspace manifests ([#946](https://github.com/carrick-tools/carrick/issues/946)) ([b40cc66](https://github.com/carrick-tools/carrick/commit/b40cc66bf2c8f55bf3318b75d1782d42d483a71c))
+* **scanner:** integrate Deno services and safe Action preparation ([#953](https://github.com/carrick-tools/carrick/issues/953)) ([a066e37](https://github.com/carrick-tools/carrick/commit/a066e3716ab6d6e433c123ca6e4a247732bb3eed))
+* **sidecar:** resolve Deno imports and capture portable types ([#951](https://github.com/carrick-tools/carrick/issues/951)) ([ef73214](https://github.com/carrick-tools/carrick/commit/ef73214b1bf6f9158e9aab24ca4666bc85a8b230))
+
+
+### Bug Fixes
+
+* assign call sites to their lexical indexed owner ([#948](https://github.com/carrick-tools/carrick/issues/948)) ([b4f6f16](https://github.com/carrick-tools/carrick/commit/b4f6f16f4029b828eb728628ad7fbfe9cf10db88))
+* exclude Vite artifacts from scanner discovery ([#943](https://github.com/carrick-tools/carrick/issues/943)) ([aead3ef](https://github.com/carrick-tools/carrick/commit/aead3efe0f938a0f85455aef63af1c684062c4d5))
+* guard Deno roots against nested Node manifests ([#940](https://github.com/carrick-tools/carrick/issues/940)) ([1fb4fa2](https://github.com/carrick-tools/carrick/commit/1fb4fa28fbc49a54117bf9a3237f2e0810329088))
+* **init:** tell each editor the truth about the extension gallery ([#916](https://github.com/carrick-tools/carrick/issues/916)) ([d867e59](https://github.com/carrick-tools/carrick/commit/d867e5986fea2f5ea2e16d46d7ad70754413aab6))
+* **lsp:** underline the statement, and keep every pass's rows per file ([#924](https://github.com/carrick-tools/carrick/issues/924)) ([9a843af](https://github.com/carrick-tools/carrick/commit/9a843af65d6e5ae8c7f2b9cd9dd14272a67bb057))
+* preserve optional default and rest parameter facts ([#945](https://github.com/carrick-tools/carrick/issues/945)) ([6417561](https://github.com/carrick-tools/carrick/commit/64175618c0fbf741b960bb8979310b505f094f55))
+* respect class member accessibility in export facts ([#944](https://github.com/carrick-tools/carrick/issues/944)) ([1bdb8ef](https://github.com/carrick-tools/carrick/commit/1bdb8ef080faedc3b06dc8c1777fd6ef33d07abe))
+* **scanner:** build the framework-detect import sample deterministically ([#958](https://github.com/carrick-tools/carrick/issues/958)) ([d4c9868](https://github.com/carrick-tools/carrick/commit/d4c986801e27de80cb7c43ec2ee26e5787ab8c5c))
+
+
+### Documentation
+
+* fold CLAUDE.md into AGENTS.md as the single canonical instruction file ([#938](https://github.com/carrick-tools/carrick/issues/938)) ([4d846fd](https://github.com/carrick-tools/carrick/commit/4d846fdf785ad2d8cf9a22ba3fc1a30418c57991))
+
 ## [0.3.58](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.57...carrick-v0.3.58) (2026-09-09)
 
 
