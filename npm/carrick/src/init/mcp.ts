@@ -52,7 +52,12 @@ export function realEnvironment(): McpEnvironment {
       spawnSync(process.platform === "win32" ? "where" : "which", [command], {
         stdio: "ignore",
       }).status === 0,
-    run: (command, args) => spawnSync(command, args, { stdio: "ignore" }).status,
+    // Time-limited and with no stdin: a client's own command is someone
+    // else's code, and `init` has already written files by the time it runs.
+    // A command that hangs or asks a question reads as one that did not
+    // configure anything, and the line to run by hand is printed instead.
+    run: (command, args) =>
+      spawnSync(command, args, { stdio: "ignore", timeout: 15_000 }).status,
     home: os.homedir(),
     platform: process.platform,
     appData: process.env["APPDATA"] ?? null,
