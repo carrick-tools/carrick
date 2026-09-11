@@ -38,6 +38,7 @@ fn create_test_repo_data(repo_name: &str, commit_hash: &str) -> CloudRepoData {
         packages: Some(packages),
         last_updated: Utc::now(),
         commit_hash: commit_hash.to_string(),
+        dirty: None,
         mount_graph: None,
         bundled_types: None,
         type_manifest: None,
@@ -69,7 +70,7 @@ async fn test_upload_and_download_single_repo() {
     // When: we upload repo data
     let repo_data = create_test_repo_data("express-single", "abc123");
     storage
-        .upload_repo_data(&repo_data)
+        .upload_repo_data(&repo_data, true)
         .await
         .expect("Upload should succeed");
 
@@ -105,15 +106,15 @@ async fn test_upload_multiple_repos() {
     let repo3 = create_test_repo_data("repo-3", "hash3");
 
     storage
-        .upload_repo_data(&repo1)
+        .upload_repo_data(&repo1, true)
         .await
         .expect("Upload repo1 should succeed");
     storage
-        .upload_repo_data(&repo2)
+        .upload_repo_data(&repo2, true)
         .await
         .expect("Upload repo2 should succeed");
     storage
-        .upload_repo_data(&repo3)
+        .upload_repo_data(&repo3, true)
         .await
         .expect("Upload repo3 should succeed");
 
@@ -182,7 +183,7 @@ async fn test_concurrent_uploads() {
             let repo =
                 create_test_repo_data(&format!("concurrent-repo-{}", i), &format!("hash{}", i));
             storage_clone
-                .upload_repo_data(&repo)
+                .upload_repo_data(&repo, true)
                 .await
                 .expect("Concurrent upload should succeed");
         });
@@ -235,14 +236,14 @@ async fn test_update_existing_repo() {
 
     let repo_v1 = create_test_repo_data("versioned-repo", "hash1");
     storage
-        .upload_repo_data(&repo_v1)
+        .upload_repo_data(&repo_v1, true)
         .await
         .expect("Upload v1 should succeed");
 
     // When: we upload the same repo with a different commit hash
     let repo_v2 = create_test_repo_data("versioned-repo", "hash2");
     storage
-        .upload_repo_data(&repo_v2)
+        .upload_repo_data(&repo_v2, true)
         .await
         .expect("Upload v2 should succeed");
 
@@ -273,7 +274,7 @@ async fn test_packages_preserved_in_upload_download_cycle() {
 
     // When: we upload and download
     storage
-        .upload_repo_data(&repo_data)
+        .upload_repo_data(&repo_data, true)
         .await
         .expect("Upload should succeed");
 

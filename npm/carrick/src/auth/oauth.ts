@@ -1,7 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { APP_BASE, API_BASE } from "./credentials.ts";
+import { APP_BASE, API_BASE, SCOPE } from "./credentials.ts";
 
 /** Launch a URL as an argument, never through a shell. */
 export async function openBrowser(url: string): Promise<boolean> {
@@ -76,13 +76,13 @@ export async function authorize(options: OAuthOptions = {}): Promise<string> {
     const registration = await request(`${APP_BASE}/oauth/register`, {
       method: "POST", redirect: "error", signal,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ client_name: "Carrick CLI", redirect_uris: [redirect], token_endpoint_auth_method: "none", grant_types: ["authorization_code"], response_types: ["code"], scope: "mcp" }),
+      body: JSON.stringify({ client_name: "Carrick CLI", redirect_uris: [redirect], token_endpoint_auth_method: "none", grant_types: ["authorization_code"], response_types: ["code"], scope: SCOPE }),
     });
     if (!registration.ok) throw new Error(`Carrick client registration failed (HTTP ${registration.status}).`);
     const registered = await registration.json() as { client_id?: unknown };
     if (typeof registered.client_id !== "string" || !registered.client_id) throw new Error("Carrick registration returned no client ID.");
     const url = new URL(`${APP_BASE}/oauth/authorize`);
-    url.search = new URLSearchParams({ response_type: "code", client_id: registered.client_id, redirect_uri: redirect, scope: "mcp", resource: `${API_BASE}/mcp`, state, code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256" }).toString();
+    url.search = new URLSearchParams({ response_type: "code", client_id: registered.client_id, redirect_uri: redirect, scope: SCOPE, resource: `${API_BASE}/mcp`, state, code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256" }).toString();
     say(`Sign in to Carrick in your browser:\n${url}`);
     // Opening a browser is best effort. A manual browser can finish the same callback.
     void (options.open ?? openBrowser)(url.toString()).catch(() => false);
@@ -95,8 +95,12 @@ export async function authorize(options: OAuthOptions = {}): Promise<string> {
     });
     if (!result.ok) throw new Error(`Carrick token exchange failed (HTTP ${result.status}). Run carrick login again.`);
     const body = await result.json() as { access_token?: unknown; token_type?: unknown; scope?: unknown };
+    // The scope must come back as the one that was consented to. A server that
+    // answers with a different one has not minted the kind this credential
+    // needs, and keeping the token would leave a credential on disk that fails
+    // at the first upload with no way to say why.
     if (typeof body.access_token !== "string" || !body.access_token || /\s/.test(body.access_token) ||
-        typeof body.token_type !== "string" || body.token_type.toLowerCase() !== "bearer" || body.scope !== "mcp") {
+        typeof body.token_type !== "string" || body.token_type.toLowerCase() !== "bearer" || body.scope !== SCOPE) {
       throw new Error("Carrick returned an invalid OAuth token response.");
     }
     return body.access_token;

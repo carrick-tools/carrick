@@ -5,8 +5,8 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import http from "node:http";
 import test from "node:test";
-import { credentialPath, readCredential, saveCredential, removeCredential, API_BASE } from "../src/auth/credentials.ts";
-import { authorize } from "../src/auth/oauth.ts";
+import { credentialPath, readCredential, saveCredential, removeCredential, API_BASE, SCOPE } from "../src/auth/credentials.ts";
+import { authorize, type OAuthOptions } from "../src/auth/oauth.ts";
 import { resolveRepos } from "../src/auth/read.ts";
 
 test("credentials are private, replaced atomically, overridden only by CARRICK_TOKEN and removed locally", () => {
@@ -82,12 +82,12 @@ test("loopback login binds state, S256, resource and redirect to the token excha
       assert.equal(form.get("code"), "accepted");
       assert.equal(form.get("resource"), `${API_BASE}/mcp`);
       assert.equal(createHash("sha256").update(form.get("code_verifier")!).digest("base64url"), authorization.searchParams.get("code_challenge"));
-      return Response.json({ access_token: "issued", token_type: "Bearer", scope: "mcp", expires_in: 31536000 });
+      return Response.json({ access_token: "issued", token_type: "Bearer", scope: SCOPE, expires_in: 31536000 });
     },
     open: async (url) => {
       authorization = new URL(url);
       assert.equal(authorization.searchParams.get("code_challenge_method"), "S256");
-      assert.equal(authorization.searchParams.get("scope"), "mcp");
+      assert.equal(authorization.searchParams.get("scope"), SCOPE);
       const malformed = await new Promise<number | undefined>((resolve, reject) => {
         const request = http.request({ hostname: "127.0.0.1", port: new URL(redirect).port, path: "http://[" }, (response) => {
           response.resume();
@@ -107,6 +107,61 @@ test("loopback login binds state, S256, resource and redirect to the token excha
   assert.equal(token, "issued");
   assert.equal(exchanges, 1);
   await assert.rejects(fetch(redirect));
+});
+
+test("login asks for the cli scope, records it, and refuses a token minted under another", async () => {
+  // The registration, the authorization URL and the accepted token response
+  // must all name the same scope. A server that has not deployed the `cli`
+  // kind answers `mcp`, and taking that would leave a credential on disk that
+  // cannot upload, with nothing to say why (seam doc §1.1, §8.1).
+  assert.equal(SCOPE, "cli");
+  const exchange = (scope: unknown): OAuthOptions => {
+    let redirect = "";
+    return {
+      timeoutMs: 3000,
+      say: () => {},
+      fetch: async (input, options) => {
+        if (String(input).endsWith("/oauth/register")) {
+          const body = JSON.parse(options?.body as string);
+          assert.equal(body.scope, SCOPE);
+          redirect = body.redirect_uris[0];
+          return Response.json({ client_id: "client" });
+        }
+        return Response.json({ access_token: "issued", token_type: "Bearer", scope });
+      },
+      open: async (value) => {
+        const url = new URL(value);
+        assert.equal(url.searchParams.get("scope"), SCOPE);
+        await fetch(`${redirect}?code=accepted&state=${url.searchParams.get("state")}`);
+        return true;
+      },
+    };
+  };
+  assert.equal(await authorize(exchange(SCOPE)), "issued");
+  await assert.rejects(authorize(exchange("mcp")), /invalid OAuth token response/);
+});
+
+test("a saved credential records its scope, and one written before the field reads as mcp", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-scope-"));
+  const env = { XDG_CONFIG_HOME: dir };
+  try {
+    saveCredential("issued", "acme", env);
+    assert.equal(readCredential(env)?.scope, SCOPE);
+
+    // Every credential on disk today predates the field. Reading one must
+    // succeed and report no scope, which the Rust reader defaults to `mcp`;
+    // refusing it would sign out every installed CLI on this release.
+    const file = credentialPath(env);
+    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete value.scope;
+    fs.writeFileSync(file, JSON.stringify(value), { mode: 0o600 });
+    assert.equal(readCredential(env)?.scope, undefined);
+    assert.equal(readCredential(env)?.token, "issued");
+
+    // A scope of the wrong type is a malformed file, not an absent field.
+    fs.writeFileSync(file, JSON.stringify({ ...value, scope: 7 }), { mode: 0o600 });
+    assert.throws(() => readCredential(env), /carrick login/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("login timeout closes its listener and never exchanges a code", async () => {

@@ -1337,6 +1337,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test".to_string(),
+            dirty: None,
             mount_graph: None,
             bundled_types: None,
             type_manifest: if manifest.is_empty() {

@@ -11,108 +11,10 @@ use sha2::{Digest, Sha256};
 use super::workspace::Workspace;
 use crate::cloud_storage::CloudRepoData;
 
-const API_BASE: &str = "https://api.carrick.tools";
+use crate::credentials::{API_BASE, Credential};
+use crate::git_state::{remote_name, valid_repo_name};
+
 const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
-
-// Shared with npm/carrick/src/auth/credentials.ts. Never Debug: the token
-// must not enter logs, errors, or the persisted hosted cache.
-#[derive(Deserialize)]
-struct Credential {
-    api_base: String,
-    token: String,
-    workspace_slug: Option<String>,
-    obtained_at: String,
-}
-
-impl Credential {
-    fn load() -> Result<Option<Self>, String> {
-        if let Some(token) = std::env::var_os("CARRICK_TOKEN") {
-            let credential = Self {
-                api_base: API_BASE.into(),
-                token: token
-                    .into_string()
-                    .map_err(|_| "CARRICK_TOKEN is malformed")?,
-                workspace_slug: None,
-                obtained_at: String::new(),
-            };
-            credential.validate()?;
-            return Ok(Some(credential));
-        }
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                if cfg!(windows) {
-                    std::env::var_os("APPDATA").map(PathBuf::from)
-                } else {
-                    None
-                }
-            })
-            .or_else(|| dirs::home_dir().map(|p| p.join(".config")))
-            .ok_or("Could not locate Carrick credentials. Run carrick login.")?;
-        if !base.is_absolute() {
-            return Err("Carrick's configuration directory must be absolute.".into());
-        }
-        let path = base.join("carrick/credentials.json");
-        Self::read_file(&path)
-    }
-
-    fn read_file(path: &Path) -> Result<Option<Self>, String> {
-        use std::io::Read;
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        let mut file = match options.open(path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err("Could not read Carrick credentials. Run carrick login.".into()),
-        };
-        let metadata = file
-            .metadata()
-            .map_err(|_| "Could not inspect Carrick credentials")?;
-        if !metadata.is_file() {
-            return Err("Carrick credentials must be a private regular file.".into());
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o077 != 0 {
-                return Err("Carrick credentials are not private. Run carrick login.".into());
-            }
-        }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|_| "Could not read Carrick credentials")?;
-        let credential: Self = serde_json::from_slice(&bytes)
-            .map_err(|_| "Carrick credentials are invalid. Run carrick login.")?;
-        credential.validate()?;
-        Ok(Some(credential))
-    }
-
-    fn validate(&self) -> Result<(), String> {
-        if self.api_base != API_BASE
-            || self.token.is_empty()
-            || self.token.chars().any(char::is_whitespace)
-        {
-            return Err("Carrick credentials are invalid. Run carrick login.".into());
-        }
-        // The server governs expiry; obtained_at records provenance only.
-        let _ = &self.obtained_at;
-        Ok(())
-    }
-
-    fn identity(&self) -> String {
-        let mut hash = Sha256::new();
-        hash.update(self.api_base.as_bytes());
-        hash.update([0]);
-        hash.update(self.token.as_bytes());
-        format!("{:x}", hash.finalize())
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkspaceIdentity {
@@ -134,6 +36,20 @@ struct HostedService {
     hash: Option<String>,
     updated_at: Option<String>,
     scanner_version: Option<String>,
+    /// Where this row came from: `ci` or `laptop`, server-derived from the
+    /// credential that wrote it. `None` on a row stored before the field
+    /// existed, which was a CI row — but the surfaces say nothing rather than
+    /// asserting that. Additive under the same `carrick.resolve-repos/0` tag
+    /// (carrick-cloud `docs/internal/reference/laptop-scan-seam.md` §6.1).
+    #[serde(default)]
+    source: Option<String>,
+    /// The GitHub login of whoever uploaded it. Never the user id.
+    #[serde(default)]
+    uploaded_by: Option<String>,
+    /// The tree that produced it did not match its commit. A claim the
+    /// surfaces display and nothing ranks on.
+    #[serde(default)]
+    dirty: Option<bool>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ResolvedRepo {
@@ -178,6 +94,20 @@ impl Resolution {
                         }) {
                             return Err("Invalid resolve-repos service metadata".into());
                         }
+                        // The three provenance fields are additive: absent is
+                        // the pre-field row and must read as "nothing to say",
+                        // never as a parse failure that would cost the whole
+                        // response. Present, they must be the right type.
+                        if ["source", "uploaded_by"].iter().any(|key| {
+                            service
+                                .get(key)
+                                .is_some_and(|v| !(v.is_null() || v.is_string()))
+                        }) || service
+                            .get("dirty")
+                            .is_some_and(|v| !(v.is_null() || v.is_boolean()))
+                        {
+                            return Err("Invalid resolve-repos service provenance".into());
+                        }
                     }
                 }
             }
@@ -212,18 +142,6 @@ impl Resolution {
     }
 }
 
-fn valid_repo_name(name: &str) -> bool {
-    let parts: Vec<_> = name.split('/').collect();
-    parts.len() == 2
-        && parts.iter().all(|p| {
-            !p.is_empty()
-                && *p != "."
-                && *p != ".."
-                && p.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-        })
-}
-
 /// Provenance in the additive local check/status contract.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostedProvenance {
@@ -231,6 +149,22 @@ pub struct HostedProvenance {
     pub indexed_at: String,
     pub scanner_version: Option<String>,
     pub project: String,
+    /// `ci`, `laptop`, or `None` on a row stored before the field existed.
+    /// Server-derived from the credential that wrote the row, so nothing a
+    /// client said can change it.
+    ///
+    /// Skipped when absent, like every other addition to this contract: an
+    /// index written before the field existed round-trips unchanged, and a
+    /// reader of `carrick.check/0` sees no key rather than a null it has to
+    /// interpret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The GitHub login that uploaded it, when the row records one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploaded_by: Option<String>,
+    /// The tree that produced it carried uncommitted changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -556,39 +490,6 @@ fn persist(path: &Path, snapshot: &Snapshot) -> Result<(), String> {
     result.map_err(str::to_string)
 }
 
-fn remote_name(repo: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["remote", "get-url", "origin"])
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let url = String::from_utf8(output.stdout).ok()?;
-    parse_remote(url.trim())
-}
-
-fn parse_remote(remote: &str) -> Option<String> {
-    let name = if let Some(name) = remote.strip_prefix("git@github.com:") {
-        name.strip_suffix(".git").unwrap_or(name).to_string()
-    } else {
-        let url = reqwest::Url::parse(remote).ok()?;
-        if !url.host_str()?.eq_ignore_ascii_case("github.com")
-            || !matches!(url.scheme(), "https" | "ssh")
-        {
-            return None;
-        }
-        let name = url.path().strip_prefix('/')?;
-        name.strip_suffix(".git").unwrap_or(name).to_string()
-    };
-    valid_repo_name(&name).then_some(name)
-}
-
 impl HostedInput {
     pub(super) fn checked_at(&self) -> Option<String> {
         self.snapshot.as_ref().map(|s| s.checked_at.clone())
@@ -697,11 +598,28 @@ impl HostedInput {
             return result;
         };
         result.hosted_cache_version = previous.cache_version;
+        // Provenance comes from the resolve-repos ROW, not from the blob: the
+        // cloud derives `source` and `uploaded_by` from the credential that
+        // wrote the row and never echoes what a client claimed, so the row is
+        // the only place they can be read honestly (§1.4).
+        let row = previous
+            .service_name
+            .as_deref()
+            .or(Some(previous.repo_name.as_str()))
+            .and_then(|name| {
+                repo.services
+                    .as_ref()?
+                    .iter()
+                    .find(|service| service.service == name)
+            });
         result.hosted = Some(HostedProvenance {
             commit: previous.commit_hash.clone(),
             indexed_at: previous.last_updated.to_rfc3339(),
             scanner_version: previous.scanner_version.clone(),
             project: repo.project_slug.clone().unwrap_or_default(),
+            source: row.and_then(|service| service.source.clone()),
+            uploaded_by: row.and_then(|service| service.uploaded_by.clone()),
+            dirty: row.and_then(|service| service.dirty),
         });
         result.hosted_state = if previous.cache_version != Some(crate::engine::CACHE_VERSION) {
             HostedState::VersionMismatch
@@ -835,6 +753,7 @@ mod tests {
 
     fn credential(token: &str) -> Credential {
         Credential {
+            scope: None,
             api_base: API_BASE.into(),
             token: token.into(),
             workspace_slug: None,
@@ -1100,35 +1019,5 @@ mod tests {
             .push("another/api".into());
         assert!(input.local_blobs(Path::new("/w/api")).is_empty());
         assert!(input.remote_blobs().is_empty());
-    }
-
-    #[test]
-    fn remote_normalization_matches_npm_init_url_forms() {
-        for (remote, expected) in [
-            ("git@github.com:example/api.git", Some("example/api")),
-            ("https://GitHub.COM/example/api.git", Some("example/api")),
-            ("ssh://git@GitHub.COM/example/api.git", Some("example/api")),
-            ("https://github.com/example/api/", None),
-            ("https://github.com.evil.test/example/api", None),
-            ("/tmp/api", None),
-        ] {
-            assert_eq!(parse_remote(remote).as_deref(), expected, "{remote}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn credential_reader_checks_open_file_and_rejects_symlinks_and_public_permissions() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("credentials.json");
-        std::fs::write(&file,serde_json::to_vec(&json!({"api_base":API_BASE,"token":"test","workspace_slug":null,"obtained_at":"now"})).unwrap()).unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(Credential::read_file(&file).unwrap().is_some());
-        let link = dir.path().join("link");
-        symlink(&file, &link).unwrap();
-        assert!(Credential::read_file(&link).is_err());
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(Credential::read_file(&file).is_err());
     }
 }

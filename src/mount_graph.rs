@@ -1163,6 +1163,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test".to_string(),
+            dirty: None,
             mount_graph: Some(mg),
             bundled_types: None,
             type_manifest: None,

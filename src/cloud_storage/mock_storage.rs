@@ -29,7 +29,11 @@ impl MockStorage {
 
 #[async_trait]
 impl CloudStorage for MockStorage {
-    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<UploadOutcome, StorageError> {
+    async fn upload_repo_data(
+        &self,
+        data: &CloudRepoData,
+        _final_in_run: bool,
+    ) -> Result<UploadOutcome, StorageError> {
         debug!(
             "MOCK: Uploading repo data for repo: {} (service: {:?})",
             data.repo_name, data.service_name
@@ -112,6 +116,7 @@ impl CloudStorage for MockStorage {
                     packages: Some(mock_packages_a),
                     last_updated: Utc::now(),
                     commit_hash: "abc123".to_string(),
+                    dirty: None,
                     mount_graph: None,
                     bundled_types: None,
                     type_manifest: None,
@@ -147,6 +152,7 @@ impl CloudStorage for MockStorage {
                     packages: Some(mock_packages_b),
                     last_updated: Utc::now(),
                     commit_hash: "def456".to_string(),
+                    dirty: None,
                     mount_graph: None,
                     bundled_types: None,
                     type_manifest: None,

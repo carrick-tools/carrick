@@ -133,7 +133,7 @@ counter means this scan did not record it.
 | `index_commit` | string | the commit that service was indexed at |
 | `indexed_at` | string (RFC 3339) | when `index` (or the last `refresh` of this service) ran |
 | `scanner_version` | string | the scanner release that wrote the index |
-| `hosted` | object \| null | `{commit, indexed_at, scanner_version, project}` describing the hosted copy; its commit is separate from `index_commit` |
+| `hosted` | object \| null | `{commit, indexed_at, scanner_version, project}` describing the hosted copy; its commit is separate from `index_commit`. Adds `source` (`"ci"` \| `"laptop"`), `uploaded_by` (GitHub login) and `dirty` (boolean) when the hosted row records them; each key is absent, never null, on a row that does not |
 | `hosted_state` | string | `enriched`, `no_index_yet`, `not_connected`, `not_signed_in`, `version_mismatch`, `commit_missing`, or `read_failed`; the boundary explains any failed refresh alongside a retained copy |
 | `hosted_checked_at` | string \| null | when repository metadata last answered for this workspace; absent when no authenticated copy exists |
 | `changed_since_index` | int | files changed since `index_commit`: `git diff --name-only <commit>` plus what git does not track. Where git cannot answer at all (no repository, a commit a rebase dropped, no `git`), it falls back to whether the queried file's own mtime is newer than the index, and counts only that file. A rewrite that changes no bytes is not a change |

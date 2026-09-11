@@ -5,12 +5,38 @@ import path from "node:path";
 export const API_BASE = "https://api.carrick.tools";
 export const APP_BASE = "https://app.carrick.tools";
 
-/** Shared with the native read client. Tokens expire by server revocation. */
+/**
+ * The scope `carrick login` consents to, and the scope a fresh credential
+ * records.
+ *
+ * `cli` is the credential kind that may upload an index and ask for paid
+ * analysis; `mcp`, which login asked for until 0.3.60, may only read. The
+ * server mints the kind from the scope the USER approved and never from
+ * anything the client asserts, so asking for it here is the only way a laptop
+ * gets one — and a login against a server that does not advertise `cli` fails
+ * rather than quietly leaving a credential on disk that cannot scan. That is
+ * why the cloud deploys first (carrick-cloud
+ * `docs/internal/reference/laptop-scan-seam.md` §1.1, §8.1, §9).
+ */
+export const SCOPE = "cli";
+
+/** Shared with the native read client (`src/credentials.rs`). Tokens expire by server revocation. */
 export type Credential = {
   api_base: string;
   token: string;
   workspace_slug: string | null;
   obtained_at: string;
+  /**
+   * The OAuth scope this credential was consented under.
+   *
+   * Optional on read, always written from this release on. Every credential
+   * on disk today predates the field and is an `mcp` one, so its absence must
+   * read as `mcp` rather than as an invalid file — the Rust reader defaults it
+   * the same way. Without it the CLI cannot tell "re-login would unlock this"
+   * from "the cloud has not deployed it", which are the same 403 on the wire
+   * (carrick-cloud `docs/internal/reference/laptop-scan-seam.md` §1.6).
+   */
+  scope?: string;
 };
 
 export function credentialPath(env: NodeJS.ProcessEnv = process.env): string {
@@ -43,13 +69,14 @@ export function readCredential(env: NodeJS.ProcessEnv = process.env): Credential
     if (credential.api_base !== API_BASE || typeof credential.token !== "string" ||
         !credential.token || /\s/.test(credential.token) ||
         !(credential.workspace_slug === null || typeof credential.workspace_slug === "string") ||
+        !(credential.scope === undefined || typeof credential.scope === "string") ||
         typeof credential.obtained_at !== "string") throw new Error();
     return credential;
   } catch { throw new Error("Carrick credentials are invalid or not private. Run carrick login."); }
   finally { fs.closeSync(fd); }
 }
 
-export function saveCredential(token: string, workspace: string | null, env: NodeJS.ProcessEnv = process.env): void {
+export function saveCredential(token: string, workspace: string | null, env: NodeJS.ProcessEnv = process.env, scope: string = SCOPE): void {
   if (!token || /\s/.test(token)) throw new Error("The authorization server returned an invalid token.");
   const file = credentialPath(env);
   const directory = path.dirname(file);
@@ -59,7 +86,7 @@ export function saveCredential(token: string, workspace: string | null, env: Nod
   const temporary = fs.mkdtempSync(path.join(directory, ".login-"));
   try {
     const pending = path.join(temporary, "credentials.json");
-    const credential: Credential = { api_base: API_BASE, token, workspace_slug: workspace, obtained_at: new Date().toISOString() };
+    const credential: Credential = { api_base: API_BASE, token, workspace_slug: workspace, obtained_at: new Date().toISOString(), scope };
     fs.writeFileSync(pending, `${JSON.stringify(credential, null, 2)}\n`, { mode: 0o600, flag: "wx" });
     fs.renameSync(pending, file);
   } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
