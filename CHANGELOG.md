@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.60](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.59...carrick-v0.3.60) (2026-09-11)
+
+
+### Bug Fixes
+
+* **scanner:** record module-scope calls against the file as owner of last resort ([#970](https://github.com/carrick-tools/carrick/issues/970)) ([1127f9f](https://github.com/carrick-tools/carrick/commit/1127f9f6151bc1306ce6a8db9b01273a4ce826cc))
+* **scanner:** say so when CARRICK_OUTPUT_JSON suppresses the local-storage upload ([#971](https://github.com/carrick-tools/carrick/issues/971)) ([747d968](https://github.com/carrick-tools/carrick/commit/747d9681cad429746de5dd3f1a3717faee54f47b))
+* **sidecar:** read a route's validated body, never the context's response sender ([#967](https://github.com/carrick-tools/carrick/issues/967)) ([8f41686](https://github.com/carrick-tools/carrick/commit/8f416866f403e2310cf19c82013ec7cb777f8c9f))
+
 ## [0.3.59](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.58...carrick-v0.3.59) (2026-09-11)
 
 
