@@ -295,7 +295,14 @@ fn scan_repo(
         .env_remove("CARRICK_OUTPUT_JSON")
         .env_remove(super::JOIN_OUT_ENV);
     strip_ci_env(&mut command);
-    run_scan(command, &format!("scan of {}", repo.display()), label)
+    run_scan(
+        command,
+        &format!("scan of {}", repo.display()),
+        Reporting {
+            working: format!("indexing {label}"),
+            done: format!("indexed {label}"),
+        },
+    )
 }
 
 /// Phase 2: join every blob, and hand the result back.
@@ -314,7 +321,14 @@ fn join(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Result<LocalJoin, 
         .env_remove(super::hosted::PREVIOUS_ENV)
         .env_remove("CARRICK_OUTPUT_JSON");
     strip_ci_env(&mut command);
-    run_scan(command, "workspace join", "joining the workspace")?;
+    run_scan(
+        command,
+        "workspace join",
+        Reporting {
+            working: "joining the workspace".to_string(),
+            done: "joined the workspace".to_string(),
+        },
+    )?;
 
     let text = std::fs::read_to_string(out)
         .map_err(|e| format!("the join wrote no result to {}: {e}", out.display()))?;
@@ -328,7 +342,13 @@ fn join(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Result<LocalJoin, 
 /// reasons: the progress lines it carries are worth something only while the
 /// scan is still running (carrick#955), and the useful half of a failure is
 /// still the last few lines, which are kept as they go past.
-fn run_scan(mut command: Command, what: &str, label: &str) -> Result<(), String> {
+/// What one phase of a build calls itself while it runs and once it is done.
+struct Reporting {
+    working: String,
+    done: String,
+}
+
+fn run_scan(mut command: Command, what: &str, reporting: Reporting) -> Result<(), String> {
     command.stdout(Stdio::null()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
@@ -337,11 +357,11 @@ fn run_scan(mut command: Command, what: &str, label: &str) -> Result<(), String>
         .stderr
         .take()
         .ok_or_else(|| format!("the {what} produced no stderr to read"))?;
-    let bar = crate::logging::spinner(&format!("indexing {label}"));
+    let bar = crate::logging::spinner(&reporting.working);
     let mut tail: VecDeque<String> = VecDeque::with_capacity(12);
     for line in BufReader::new(stderr).lines().map_while(Result::ok) {
         if let Some(update) = crate::progress::parse(&line) {
-            bar.set_message(format!("indexing {label} — {}", update.render()));
+            bar.set_message(format!("{}: {}", reporting.working, update.render()));
             continue;
         }
         if tail.len() == 12 {
@@ -353,7 +373,7 @@ fn run_scan(mut command: Command, what: &str, label: &str) -> Result<(), String>
         .wait()
         .map_err(|e| format!("could not wait for the {what}: {e}"))?;
     if status.success() {
-        crate::logging::finish_spinner(&bar, &format!("indexed {label}"));
+        crate::logging::finish_spinner(&bar, &reporting.done);
         return Ok(());
     }
     bar.finish_and_clear();

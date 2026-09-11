@@ -60,15 +60,16 @@ impl Update {
             Phase::Files => "files",
             Phase::Intents => "intents",
         };
-        let service = if self.service_total > 1 {
-            format!(
-                "{} ({}/{})",
-                self.service, self.service_index, self.service_total
-            )
-        } else {
-            self.service.clone()
-        };
-        format!("{service}: {} of {} {unit}", self.done, self.total)
+        // A repo with one service is already named by whoever is rendering
+        // this, and its engine-side label for an unconfigured root is
+        // "(root)", which says nothing twice.
+        if self.service_total <= 1 {
+            return format!("{} of {} {unit}", self.done, self.total);
+        }
+        format!(
+            "{} ({}/{}): {} of {} {unit}",
+            self.service, self.service_index, self.service_total, self.done, self.total
+        )
     }
 }
 
@@ -204,6 +205,6 @@ mod tests {
             done: 3,
             total: 3,
         };
-        assert_eq!(update.render(), "repo: 3 of 3 intents");
+        assert_eq!(update.render(), "3 of 3 intents");
     }
 }
