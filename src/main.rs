@@ -8,6 +8,7 @@ mod call_graph;
 mod call_site_extractor;
 mod cloud_storage;
 mod config;
+mod credentials;
 mod deno_support;
 mod dispatch;
 mod engine;
@@ -21,6 +22,7 @@ mod file_finder;
 mod findings;
 mod formatter;
 mod framework_detector;
+mod git_state;
 mod graphql;
 mod help;
 mod import_bindings;
@@ -278,7 +280,15 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    if use_local_dir {
+    if use_local_dir && cloud_storage::laptop_scan_requested() {
+        // A laptop scan: the model answers through the cloud, the index is
+        // uploaded, and the same payload is written to the cache directory so
+        // the local read model is built from the run that produced it rather
+        // than from a later download (carrick#956 §8.3).
+        info!("Using TeeStorage (laptop scan: cloud upload + local cache)");
+        let storage = cloud_storage::TeeStorage::from_env(args.no_cache)?;
+        run_analysis_engine_with_sidecar(storage, &args.repo_path, sidecar_ref, args.no_cache).await
+    } else if use_local_dir {
         info!("Using LocalDirStorage (offline eval harness)");
         let storage = LocalDirStorage::from_env()?;
         run_analysis_engine_with_sidecar(storage, &args.repo_path, sidecar_ref, args.no_cache).await

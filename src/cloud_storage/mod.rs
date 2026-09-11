@@ -25,7 +25,9 @@ mod aws_storage;
 pub use aws_storage::AwsStorage;
 pub(crate) use aws_storage::INLINE_PAYLOAD_LIMIT_BYTES;
 mod local_dir_storage;
+mod tee_storage;
 pub use local_dir_storage::{CACHE_DIR_ENV, ISOLATE_ENV, LocalDirStorage};
+pub use tee_storage::{LAPTOP_SCAN_ENV, TeeStorage, laptop_scan_requested};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -369,6 +371,58 @@ pub struct SdkUnresolved {
     pub reason: String,
 }
 
+/// One file the model was asked about and did not answer for.
+///
+/// Sent with the write actions so the cloud can apply its first-scan partial
+/// rule: a service with no hosted rows accepts the partial index and echoes
+/// this list back, and a service that already has rows refuses it. `reason` is
+/// [`crate::agent_service::AgentCallError::code`] verbatim.
+///
+/// A file a budget refused is never in this list (carrick#555): nothing failed
+/// there, so there is nothing for the cloud to decide about.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct UnanalysedFile {
+    pub path: String,
+    pub reason: String,
+}
+
+/// What the engine knows about this run before it opens it.
+pub struct RunContext {
+    /// `owner/repo` from the git remote, when this clone has one. The laptop
+    /// gate keys on it; the CI path derives repo identity from the signed
+    /// OIDC claims instead and never reads this.
+    pub repo_full_name: Option<String>,
+    /// HEAD's commit.
+    pub commit: String,
+    /// The working tree carries changes HEAD does not describe.
+    pub dirty: bool,
+}
+
+/// What opening the run told the scanner.
+#[derive(Debug, Default)]
+pub struct RunStart {
+    /// The cloud's "candidates not refreshed since …" sentence, or `None`.
+    /// Printed before the scan starts, so a capped run says so at the top
+    /// rather than surprising the user at the end.
+    pub allowance_sentence: Option<String>,
+    /// Services of this repo that already have hosted rows, or `None` when
+    /// this is not a laptop run and the question was never asked. An empty
+    /// list means every service is a first index, which is what lets the
+    /// scanner skip its own lost-file abort and let the cloud decide (§4).
+    pub indexed_services: Option<Vec<String>>,
+}
+
+impl RunStart {
+    /// Whether this run is a laptop scan.
+    ///
+    /// Read off `indexed_services` rather than a second flag, because only
+    /// `start-scan` answers that question and only the laptop path asks it —
+    /// two fields could disagree, and this one cannot.
+    pub fn is_laptop(&self) -> bool {
+        self.indexed_services.is_some()
+    }
+}
+
 /// Why one service's type extraction failed. Structured rather than a
 /// prose string so the finding, the terminal report, and the index all read
 /// the same two fields.
@@ -396,6 +450,19 @@ pub struct CloudRepoData {
     pub packages: Option<Packages>, // Structured package data for dependency analysis
     pub last_updated: DateTime<Utc>,
     pub commit_hash: String,
+    /// The working tree carried changes `commit_hash` does not describe.
+    ///
+    /// In the blob rather than on the envelope because it QUALIFIES
+    /// `commit_hash`, which is already here: the blob's sentence is "this is
+    /// the index at 4f2a1c9", and for a dirty tree that sentence is false
+    /// without this field — every later reader of `previous_data` would
+    /// inherit the false version. Absent on a CI scan and on every blob
+    /// written before the field existed, both of which mean "clean".
+    ///
+    /// Wire contract: carrick-cloud
+    /// `docs/internal/reference/laptop-scan-seam.md` §2.2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mount_graph: Option<MountGraph>, // Mount graph for framework-agnostic analysis
     /// Bundled TypeScript type definitions (.d.ts content)
@@ -675,6 +742,7 @@ impl CloudRepoData {
             packages,
             last_updated: Utc::now(),
             commit_hash: get_current_commit_hash(repo_path),
+            dirty: None,
             mount_graph: Some(mount_graph.clone()), // Store mount graph for cross-repo analysis
             bundled_types: None,
             type_manifest: None,
@@ -805,7 +873,36 @@ pub struct UploadOutcome {
 
 #[async_trait]
 pub trait CloudStorage {
-    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<UploadOutcome, StorageError>;
+    /// Upload one service's payload.
+    ///
+    /// `final_in_run` marks the last write action of the whole run. A
+    /// multi-service repo sends N of these, and only the last releases the
+    /// cloud's in-flight scan slot — releasing on the first would leave the
+    /// rest of the run unprotected. The engine materialises every payload
+    /// before it uploads any, so it is the only place that knows which is
+    /// last (carrick-cloud `docs/internal/reference/laptop-scan-seam.md`
+    /// §2.2).
+    async fn upload_repo_data(
+        &self,
+        data: &CloudRepoData,
+        final_in_run: bool,
+    ) -> Result<UploadOutcome, StorageError>;
+
+    /// Open the run: prove connectivity, and on the laptop path claim the
+    /// scan slot and resolve the project before a single model call is paid
+    /// for.
+    ///
+    /// Replaces the health-check probe on that path rather than joining it.
+    /// The probe is a `check-or-upload` with `repo: "health"`, which a
+    /// workspace-scoped credential cannot reach, and the engine `?`s it — so
+    /// the first thing a laptop run did was fail. `start-scan` proves the
+    /// same things and more (C9).
+    ///
+    /// The default is today's probe, which is what every non-cloud backend
+    /// and the whole CI path keep doing.
+    async fn begin_run(&self, _run: &RunContext) -> Result<RunStart, StorageError> {
+        self.health_check().await.map(|()| RunStart::default())
+    }
 
     /// Whether this backend can store more than one service per git repo
     /// without collision. The production index keys on
@@ -841,6 +938,15 @@ pub trait CloudStorage {
     ) -> Result<(), StorageError>;
     async fn health_check(&self) -> Result<(), StorageError>;
     async fn upload_logs(&self, repo: &str, log_content: &str) -> Result<(), StorageError>;
+
+    /// Whether this run's debug log is shipped to the cloud at all.
+    ///
+    /// True everywhere it always was. False on the laptop path, where
+    /// `upload-logs` is not an action the credential may take and the log
+    /// names the developer's own machine.
+    fn uploads_run_logs(&self) -> bool {
+        true
+    }
 
     /// Relay a PR run's structured findings to the cloud, which renders and
     /// posts (and updates in place on later pushes) a single GitHub App
@@ -1437,6 +1543,7 @@ mod tests {
             packages: None,
             last_updated: Utc::now(),
             commit_hash: "deadbeef".to_string(),
+            dirty: None,
             mount_graph: None,
             bundled_types: None,
             type_manifest: None,

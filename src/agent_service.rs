@@ -105,6 +105,17 @@ fn is_quota_error(err: &AgentError) -> bool {
 /// doomed" apart from a genuine per-call failure.
 pub const QUOTA_ABORT_CODE: &str = "quota_exhausted";
 
+/// The cloud's code for "the model was not asked, on purpose": an operator
+/// kill switch, the daily bucket on an OIDC caller, or a spend allowance.
+/// `details.reason` says which, and nothing here reads it — every reason means
+/// the same thing to a scan.
+///
+/// Distinct from [`QUOTA_ABORT_CODE`] and from `rate_limited`: this call
+/// failed because a budget refused it, not because the backend is exhausted,
+/// so the breaker must not trip and the run must not fail (carrick#555, and
+/// C1 of carrick-cloud `docs/internal/reference/laptop-scan-seam.md`).
+pub const LLM_DISABLED_CODE: &str = "llm_disabled";
+
 /// The error returned for an individual call once the breaker is open. Scoped
 /// to what's true at the call level (this call fails fast); the engine turns a
 /// tripped breaker into a fatal, no-upload abort via [`rate_limit_tripped`].
@@ -163,6 +174,13 @@ impl AgentCallError {
     /// counting it as a retry failure overstates the loss.
     pub fn is_quota_abort(&self) -> bool {
         self.code == QUOTA_ABORT_CODE
+    }
+
+    /// Whether the model was deliberately not asked, rather than asked and
+    /// silent. A budget refusal is a fact about the account, not about the
+    /// file, so the file is not lost and the run does not fail.
+    pub fn is_budget_refusal(&self) -> bool {
+        self.code == LLM_DISABLED_CODE
     }
 }
 
@@ -260,6 +278,17 @@ fn body_excerpt(body: &str) -> String {
     }
 }
 
+/// The credential one prompt-lambda call sends, resolved.
+///
+/// [`crate::credentials::CloudAuth`] is the process's answer to "which
+/// credential do I hold"; this is the same answer with the OIDC provider
+/// already looked up, so the retry loop can be driven against a stub token
+/// endpoint in tests rather than the process global.
+enum RequestAuth<'a> {
+    Oidc(&'a OidcProvider),
+    Bearer(String),
+}
+
 /// Reusable service for making Agent API calls
 #[derive(Debug, Clone)]
 pub struct AgentService {
@@ -331,9 +360,21 @@ impl AgentService {
             return Ok(generate_mock_for_task(task_path, body, mock_seed));
         }
 
-        let provider = OidcProvider::global()
-            .map_err(|e| AgentCallError::permanent("oidc_unavailable", e.to_string()))?;
-        self.post_with_retry(provider, env!("CARRICK_API_ENDPOINT"), task_path, body)
+        // Which credential this process holds, read per call rather than
+        // cached, because it is cheap and the whole point of the branch is
+        // that a laptop and a runner never both apply. A laptop call carries
+        // `Authorization` and the scan slot; a runner call carries the OIDC
+        // header, exactly as it did.
+        let auth = match crate::credentials::CloudAuth::detect()
+            .map_err(|e| AgentCallError::permanent("oidc_unavailable", e))?
+        {
+            crate::credentials::CloudAuth::Oidc => RequestAuth::Oidc(
+                OidcProvider::global()
+                    .map_err(|e| AgentCallError::permanent("oidc_unavailable", e.to_string()))?,
+            ),
+            crate::credentials::CloudAuth::Bearer(token) => RequestAuth::Bearer(token),
+        };
+        self.post_with_retry(&auth, env!("CARRICK_API_ENDPOINT"), task_path, body)
             .await
     }
 
@@ -342,12 +383,12 @@ impl AgentService {
     /// only consumes a backoff attempt when the error is marked
     /// retriable=true (or on bare network failures).
     ///
-    /// `provider` and `api_base` are parameters rather than the globals the
+    /// `auth` and `api_base` are parameters rather than the globals the
     /// public entry point reads, so the retry loop can be driven against a
     /// stub in tests.
     async fn post_with_retry<B>(
         &self,
-        provider: &OidcProvider,
+        auth: &RequestAuth<'_>,
         api_base: &str,
         path: &str,
         body: &B,
@@ -384,20 +425,41 @@ impl AgentService {
             // large repo outlives a token, and the provider mints a fresh one
             // as soon as the cached one nears its expiry — so the retry that
             // happens ten minutes into a call chain carries a valid credential
-            // instead of the one this call started with (#461).
-            let token = provider
-                .token()
-                .await
-                .map_err(|e| AgentCallError::permanent("oidc_unavailable", e.to_string()))?;
+            // instead of the one this call started with (#461). A Bearer
+            // credential is long-lived and unchanged between attempts, but it
+            // is read the same way so the two branches differ only in the
+            // header they set.
+            let token = match auth {
+                RequestAuth::Oidc(provider) => provider
+                    .token()
+                    .await
+                    .map_err(|e| AgentCallError::permanent("oidc_unavailable", e.to_string()))?,
+                RequestAuth::Bearer(token) => token.clone(),
+            };
 
-            let request_builder = self
+            let mut request_builder = self
                 .client
                 .post(&endpoint)
                 .json(body)
                 .timeout(std::time::Duration::from_secs(60))
                 .header("X-Carrick-Scanner-Version", env!("CARGO_PKG_VERSION"))
-                .header("X-Carrick-Run-Id", crate::logging::run_id())
-                .header("X-Carrick-OIDC", &token);
+                .header("X-Carrick-Run-Id", crate::logging::run_id());
+            request_builder = match auth {
+                RequestAuth::Oidc(_) => request_builder.header("X-Carrick-OIDC", &token),
+                RequestAuth::Bearer(_) => {
+                    // The scan slot rides every prompt call of a laptop run:
+                    // it is how the cloud knows which repo is spending, and the
+                    // money gates read the repo out of the slot rather than out
+                    // of anything this client asserts (C4). Absent on the CI
+                    // path, where none was minted.
+                    let builder =
+                        request_builder.header("Authorization", format!("Bearer {token}"));
+                    match crate::credentials::scan_id() {
+                        Some(scan_id) => builder.header("X-Carrick-Scan-Id", scan_id),
+                        None => builder,
+                    }
+                }
+            };
 
             match request_builder.send().await {
                 Ok(response) => {
@@ -438,6 +500,31 @@ impl AgentService {
                     // sniffed, so a successful analysis of a file that happens
                     // to mention the code is never mistaken for one.
                     if is_oidc_rejection(status.as_u16(), &response_text) {
+                        // A Bearer credential cannot be re-minted: the only
+                        // thing that replaces it is a fresh consent in a
+                        // browser. So the rejection is stated and the call
+                        // stops, rather than spending a retry on the same
+                        // token (§8.2). `wrong_key_kind` arrives here too,
+                        // which is what an `mcp`-scoped credential gets until
+                        // the user logs in again.
+                        let RequestAuth::Oidc(provider) = auth else {
+                            // A Bearer credential cannot be re-minted: only a
+                            // fresh consent replaces it, so this call stops
+                            // rather than spending a retry on the same token
+                            // (§8.2). `is_oidc_rejection` matches 401 and the
+                            // kind gate; every other refusal on this path
+                            // (`scan_not_started`, a spend cap) falls through
+                            // to the envelope below and is read as what it is.
+                            return Err(AgentCallError::permanent(
+                                "credential_rejected",
+                                format!(
+                                    "Carrick Cloud rejected this credential (status {}): {}. \
+                                     Run carrick login and try again.",
+                                    status,
+                                    body_excerpt(&response_text)
+                                ),
+                            ));
+                        };
                         if reminted {
                             return Err(AgentCallError::permanent(
                                 "oidc_rejected",
@@ -1724,7 +1811,7 @@ fn find_matching_bracket(s: &str) -> Option<usize> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serial_test::serial;
 
@@ -1823,7 +1910,7 @@ mod tests {
     /// response and records the request it received. Reads the whole request
     /// (headers plus `Content-Length` body) before replying, because reqwest
     /// treats a response that arrives mid-upload as a transport failure.
-    fn stub_server(
+    pub(crate) fn stub_server(
         responses: Vec<(u16, String)>,
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{Read, Write};
@@ -1964,7 +2051,7 @@ mod tests {
         let service = AgentService::new();
         let result = service
             .post_with_retry(
-                &provider,
+                &RequestAuth::Oidc(&provider),
                 &api_base,
                 "/analyze-file",
                 &serde_json::json!({}),
@@ -2004,7 +2091,7 @@ mod tests {
         let service = AgentService::new();
         let err = service
             .post_with_retry(
-                &provider,
+                &RequestAuth::Oidc(&provider),
                 &api_base,
                 "/analyze-file",
                 &serde_json::json!({}),
@@ -2016,6 +2103,89 @@ mod tests {
         assert!(!err.retriable, "a rejected fresh token is not transient");
         assert_eq!(api_server.join().unwrap().len(), 2);
         token_server.join().unwrap();
+    }
+
+    fn header_of(request: &str, name: &str) -> Option<String> {
+        request.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+    }
+
+    /// The laptop branch of a prompt-lambda call: the credential goes in
+    /// `Authorization`, the OIDC header is absent, and the scan slot rides
+    /// along so the cloud's money gates can read the repo out of it rather
+    /// than out of anything this client asserts (§1.3, C4).
+    #[tokio::test]
+    async fn a_bearer_call_sends_the_credential_and_the_scan_slot() {
+        crate::credentials::set_scan_id("scan_01J");
+        let (api_base, server) = stub_server(vec![(
+            200,
+            r#"{"success":true,"text":"analysed"}"#.to_string(),
+        )]);
+
+        let service = AgentService::new();
+        let result = service
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &api_base,
+                "/analyze-file",
+                &serde_json::json!({}),
+            )
+            .await;
+        assert_eq!(result.unwrap(), "analysed");
+
+        let request = &server.join().unwrap()[0];
+        assert_eq!(
+            header_of(request, "authorization").as_deref(),
+            Some("Bearer carrick_sk_live_test")
+        );
+        assert!(
+            header_of(request, "x-carrick-oidc").is_none(),
+            "the laptop branch must not send the OIDC header: {request}"
+        );
+        // The version gate runs before authentication and applies to both
+        // credentials, so it is still sent.
+        assert_eq!(
+            header_of(request, "x-carrick-scanner-version").as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        // Presence, not value: the slot is a process-global and another test
+        // in this binary may have set it first. What matters is that a laptop
+        // call carries one at all.
+        assert!(
+            header_of(request, "x-carrick-scan-id").is_some(),
+            "a laptop call must carry its scan slot: {request}"
+        );
+    }
+
+    /// A Bearer credential cannot be re-minted — only a fresh consent replaces
+    /// it — so a rejection is a sentence and a stop, not a retry against the
+    /// same token (§8.2).
+    #[tokio::test]
+    async fn a_rejected_bearer_credential_stops_instead_of_reminting() {
+        let (api_base, server) = stub_server(vec![(401, r#"{"code":"oidc_invalid"}"#.to_string())]);
+
+        let service = AgentService::new();
+        let err = service
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &api_base,
+                "/analyze-file",
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, "credential_rejected");
+        assert!(!err.retriable);
+        assert!(err.message.contains("carrick login"), "{}", err.message);
+        assert_eq!(
+            server.join().unwrap().len(),
+            1,
+            "there is no second credential to try"
+        );
     }
 
     fn unix_now() -> u64 {

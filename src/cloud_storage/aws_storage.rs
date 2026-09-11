@@ -1,5 +1,8 @@
 use crate::agent_service::is_oidc_rejection;
-use crate::cloud_storage::{CloudRepoData, CloudStorage, StorageError, UploadOutcome};
+use crate::cloud_storage::{
+    CloudRepoData, CloudStorage, RunContext, RunStart, StorageError, UnanalysedFile, UploadOutcome,
+};
+use crate::credentials::CloudAuth;
 use crate::oidc::OidcProvider;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -84,11 +87,134 @@ fn is_transient_status(status: reqwest::StatusCode) -> bool {
         || status.is_server_error()
 }
 
+/// The error body both laptop gates and the upload actions use:
+/// `{ "error": "<sentence>", "code": "<machine code>" }`. Every field is
+/// optional, because a gateway can answer a non-envelope body on the same
+/// route.
+#[derive(Deserialize, Default)]
+struct RefusalBody {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+    /// Echoed by the first-scan partial rule's refusal, so the user is told
+    /// exactly which files the cloud would not accept.
+    #[serde(default)]
+    unanalysed_files: Option<Vec<UnanalysedFile>>,
+}
+
+impl RefusalBody {
+    fn of(body: &str) -> Self {
+        serde_json::from_str(body).unwrap_or_default()
+    }
+}
+
+/// What a non-2xx says, in the user's words rather than the transport's.
+///
+/// The gates answer 409 with a code the user can act on
+/// (`laptop_scan_in_flight`, `laptop_scan_daily_limit`, `partial_refused`),
+/// and "Lambda returned 409" says none of it. A body that is not the envelope
+/// falls back to the raw text, which is what it did before.
+fn refusal_message(status: reqwest::StatusCode, body: &str) -> String {
+    let refusal = RefusalBody::of(body);
+    let mut message = match (refusal.error, refusal.code) {
+        (Some(error), Some(code)) => format!("{} ({}, HTTP {})", error, code, status.as_u16()),
+        (Some(error), None) => format!("{} (HTTP {})", error, status.as_u16()),
+        (None, Some(code)) => format!("{} (HTTP {})", code, status.as_u16()),
+        (None, None) => format!("Lambda returned {}: {}", status, body),
+    };
+    // `partial_refused` echoes the list it would not accept. Naming the files
+    // is the difference between "re-run the scan" and "re-run the scan and
+    // watch these", so the refusal carries them rather than only its code.
+    if let Some(files) = refusal.unanalysed_files.filter(|f| !f.is_empty()) {
+        let named: Vec<&str> = files.iter().take(5).map(|f| f.path.as_str()).collect();
+        message.push_str(&format!(
+            ". {} file(s) had no analysis: {}{}",
+            files.len(),
+            named.join(", "),
+            if files.len() > named.len() {
+                format!(" and {} more", files.len() - named.len())
+            } else {
+                String::new()
+            }
+        ));
+    }
+    message
+}
+
+/// Say what the cloud accepted when it took an index that is missing files.
+///
+/// Only reachable on a first index of this service: once there are rows to
+/// protect the same list is refused with `409 partial_refused`, which arrives
+/// as an error rather than here. The echoed list is the server's, not the
+/// scanner's, so the user is told what was actually stored.
+fn report_partial_acceptance(response: &WriteActionResponse, data: &CloudRepoData) {
+    if response.partial != Some(true) {
+        return;
+    }
+    let files = response.unanalysed_files.as_deref().unwrap_or_default();
+    let named: Vec<&str> = files.iter().take(3).map(|f| f.path.as_str()).collect();
+    let and_more = if files.len() > named.len() {
+        format!(" and {} more", files.len() - named.len())
+    } else {
+        String::new()
+    };
+    let service = data.service_name.as_deref().unwrap_or(&data.repo_name);
+    warn!(
+        "Carrick indexed {} without {} file(s) the model did not answer for ({}{}). \
+         This was accepted because {} had no index yet; run the scan again to fill them in.",
+        service,
+        files.len(),
+        named.join(", "),
+        and_more,
+        service
+    );
+}
+
+/// Whether a refusal is about the credential rather than about the request.
+///
+/// A 401 always is. A 403 only when the kind gate raised it: the same status
+/// carries `repo_not_authorized` and `repo_not_connected`, which a fresh
+/// consent does not fix and which name their own remedy.
+fn is_credential_rejection(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED
+        || (status == reqwest::StatusCode::FORBIDDEN
+            && RefusalBody::of(body).code.as_deref() == Some("wrong_key_kind"))
+}
+
+/// What a laptop is told when the cloud refuses its credential.
+///
+/// A Bearer credential cannot be re-minted, so the OIDC path's "mint a fresh
+/// one and retry" has no equivalent: the only thing that fixes it is a new
+/// consent (§8.2). Also the shape a `403 wrong_key_kind` takes, which is what
+/// an `mcp`-scoped credential gets until the user logs in again.
+fn relogin_message(status: reqwest::StatusCode, body: &str) -> String {
+    let mut message = format!(
+        "Carrick rejected this credential: {}. Run carrick login and try again.",
+        refusal_message(status, body)
+    );
+    if let Some(hint) = crate::credentials::relogin_hint() {
+        message.push(' ');
+        message.push_str(&hint);
+    }
+    message
+}
+
 pub struct AwsStorage {
     lambda_url: String,
     http_client: Client,
+    auth: CloudAuth,
+    /// The slot the cloud minted for this run, from `start-scan`. Present only
+    /// on the laptop path; every prompt-lambda call and every write action of
+    /// the run carries it, and it is what the money gates key on (C4).
+    scan_id: std::sync::OnceLock<String>,
+    /// The tree this run scanned did not match its commit. Sent to
+    /// `start-scan`, stamped on every payload, and folded into
+    /// `force_reindex` so a second scan at the same HEAD is not told the
+    /// index is already current (C10).
+    dirty: std::sync::atomic::AtomicBool,
     /// Whether the cloud advertises a service-aware index key (set from the
-    /// health-check response). Until the cloud key includes a service
+    /// health-check response, or from `start-scan` on the laptop path). Until the cloud key includes a service
     /// discriminator this stays false, which gates multi-service uploads so
     /// they can't clobber each other.
     multi_service: std::sync::atomic::AtomicBool,
@@ -161,7 +287,67 @@ struct LambdaRequest {
     /// a cloud deployed before the field existed ignores it.
     #[serde(skip_serializing_if = "Option::is_none")]
     force_reindex: Option<bool>,
+    /// The slot `start-scan` minted for this run. Ties the write to the
+    /// in-flight slot and to the money meters; required when the credential
+    /// kind is `cli`, omitted entirely on the CI path so an Action upload's
+    /// body is byte-for-byte what it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scan_id: Option<String>,
+    /// Files the model was asked about and did not answer for, on the two
+    /// write actions. The cloud's first-scan partial rule reads it: a service
+    /// with no hosted rows accepts the partial index and echoes the list back,
+    /// one that already has rows refuses with `409 partial_refused`. Omitted
+    /// when empty, and never sent on the CI path where the scanner's own gate
+    /// already stopped the run (§4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unanalysed_files: Option<Vec<UnanalysedFile>>,
+    /// The last write action of the run, which is what releases the cloud's
+    /// in-flight scan slot. A multi-service repo sends N write actions and
+    /// only this one carries it; absent, the slot falls to its TTL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scan_final: Option<bool>,
 }
+
+/// `start-scan`: the first thing a laptop run does, before a single model
+/// call is paid for.
+///
+/// It decides three things the scanner cannot: may this holder write this
+/// repo, is a slot free, and is this the first index. It also replaces the
+/// health-check probe on this path, which a workspace-scoped credential
+/// cannot reach at all (C9).
+#[derive(Serialize)]
+struct StartScanRequest<'a> {
+    action: &'a str,
+    /// The full `owner/repo`, not the basename every other action on this
+    /// endpoint sends. The cloud canonicalises it for the index key itself.
+    repo: &'a str,
+    commit: &'a str,
+    dirty: bool,
+}
+
+/// The 200 body of `start-scan`. Additive-tolerant: every field the scanner
+/// does not need is ignored, and the schema tag is the handshake.
+#[derive(Deserialize)]
+struct StartScanResponse {
+    schema: String,
+    scan_id: String,
+    #[allow(dead_code)]
+    project_id: String,
+    project_slug: String,
+    #[serde(default)]
+    indexed_services: Vec<String>,
+    /// The cloud key carries a service discriminator. Sets the flag the
+    /// health check sets on the CI path and cannot set here.
+    #[serde(default)]
+    multi_service: bool,
+    #[serde(default)]
+    allowance_sentence: Option<String>,
+}
+
+/// The tag `start-scan` must answer under. Anything else is a cloud that has
+/// not deployed this action, and the scanner says so rather than reading a
+/// body it does not understand.
+const START_SCAN_SCHEMA: &str = "carrick.start-scan/0";
 
 /// Integrity fields for a payload that was staged to S3 rather than inlined.
 /// Computed once, from the same serialized bytes that are PUT.
@@ -230,6 +416,14 @@ struct WriteActionResponse {
     /// clouds deployed before the check existed, which reads as "it indexed".
     #[serde(default)]
     already_current: Option<bool>,
+    /// The cloud accepted an index that is missing files, because this
+    /// service had no hosted rows to protect. Present only in that case.
+    #[serde(default)]
+    partial: Option<bool>,
+    /// The list it accepted, echoed back, so the surface names exactly what
+    /// the server took rather than what the scanner sent.
+    #[serde(default)]
+    unanalysed_files: Option<Vec<UnanalysedFile>>,
 }
 
 #[derive(Deserialize)]
@@ -298,20 +492,83 @@ impl AwsStorage {
         let api_endpoint = env!("CARRICK_API_ENDPOINT");
         let lambda_url = format!("{}/types/check-or-upload", api_endpoint);
 
-        // Fail fast if OIDC isn't available — the cloud derives repo identity
-        // from the signed OIDC claims, so there is no other way to authenticate.
-        OidcProvider::global().map_err(|e| StorageError::ConnectionError(e.to_string()))?;
+        // Two ways to authenticate now, and which one this process uses is
+        // decided here rather than per request. A laptop has no OIDC to mint
+        // and a runner has no credential file to read, so the choice never
+        // changes inside a run. Wire contract: carrick-cloud
+        // `docs/internal/reference/laptop-scan-seam.md` §1.3 and §8.2.
+        let auth = CloudAuth::detect().map_err(StorageError::ConnectionError)?;
 
         let http_client = http_client_builder().build().map_err(|e| {
             StorageError::ConnectionError(format!("Failed to build HTTP client: {}", e))
         })?;
 
-        Ok(Self {
+        Ok(Self::with_parts(
             lambda_url,
             http_client,
+            auth,
+            force_reindex,
+        ))
+    }
+
+    fn with_parts(
+        lambda_url: String,
+        http_client: Client,
+        auth: CloudAuth,
+        force_reindex: bool,
+    ) -> Self {
+        Self {
+            lambda_url,
+            http_client,
+            auth,
+            scan_id: std::sync::OnceLock::new(),
+            dirty: std::sync::atomic::AtomicBool::new(false),
             multi_service: std::sync::atomic::AtomicBool::new(false),
             force_reindex,
-        })
+        }
+    }
+
+    /// A client pointed at a local test server, with a chosen auth mode. The
+    /// production configuration otherwise, plus `no_proxy` so an ambient
+    /// proxy variable cannot intercept the loopback call.
+    #[cfg(test)]
+    pub(crate) fn for_test(lambda_url: &str, auth: CloudAuth, force_reindex: bool) -> Self {
+        Self::with_parts(
+            lambda_url.to_string(),
+            http_client_builder().no_proxy().build().unwrap(),
+            auth,
+            force_reindex,
+        )
+    }
+
+    /// Whether the index this run writes describes a tree that did not match
+    /// its commit. Folded into `force_reindex` because the cloud's freshness
+    /// guard reasons about the commit hash, and a dirty run's hash is a claim
+    /// the tree does not support: without this a second scan at the same HEAD
+    /// is told the index is current and the dirty rows survive (C10).
+    fn forces_reindex(&self) -> bool {
+        self.force_reindex || self.dirty.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The slot this run holds, for the write actions. `None` on the CI path,
+    /// where the field is omitted entirely.
+    fn scan_id(&self) -> Option<String> {
+        self.scan_id.get().cloned()
+    }
+
+    /// The files this run lost, for the write actions, or `None` when it lost
+    /// none or is not on the laptop path.
+    ///
+    /// CI never sends the list: its own gate already aborted the run before
+    /// the upload, so a CI body is byte-for-byte what it was, and a CI caller
+    /// that set `CARRICK_ALLOW_PARTIAL_ANALYSIS` must not be answered with
+    /// the laptop rule's `409 partial_refused`.
+    fn unanalysed_files(&self) -> Option<Vec<UnanalysedFile>> {
+        if !self.auth.is_bearer() {
+            return None;
+        }
+        let lost = crate::scan_health::unanalysed_files();
+        (!lost.is_empty()).then_some(lost)
     }
 
     /// POSTs a JSON body to the upload endpoint with the OIDC bearer header,
@@ -324,6 +581,103 @@ impl AwsStorage {
     /// named action — the full budget for reads, one retry for the actions
     /// that write the index, where a lost response does not mean a lost write.
     async fn send_lambda<B>(&self, action: &str, body: &B) -> Result<String, StorageError>
+    where
+        B: serde::Serialize + ?Sized,
+    {
+        match &self.auth {
+            CloudAuth::Oidc => self.send_lambda_oidc(action, body).await,
+            CloudAuth::Bearer(token) => self.send_lambda_bearer(action, body, token).await,
+        }
+    }
+
+    /// The laptop path: one long-lived credential, sent as `Authorization`.
+    ///
+    /// Wire contract: carrick-cloud
+    /// `docs/internal/reference/laptop-scan-seam.md`, §1.3 for the headers,
+    /// §2.1 for the gate's refusals and §8.2 for why this branch exists.
+    ///
+    /// Shorter than the OIDC loop by exactly the part that cannot apply — a
+    /// Bearer credential cannot be re-minted, so a rejection is "run carrick
+    /// login", not a retry (§8.2). Transient statuses keep the same budget,
+    /// and every gate refusal is a 409, which `is_transient_status` already
+    /// excludes: a 429 would be retried with backoff, which is why the gates
+    /// are not allowed to use one (C6).
+    async fn send_lambda_bearer<B>(
+        &self,
+        action: &str,
+        body: &B,
+        token: &str,
+    ) -> Result<String, StorageError>
+    where
+        B: serde::Serialize + ?Sized,
+    {
+        let max_retries = max_retries_for_action(action);
+        let mut retries = 0u32;
+        loop {
+            let transient_error = match self
+                .http_client
+                .post(&self.lambda_url)
+                .header("Authorization", format!("Bearer {}", token))
+                .json(body)
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    match response.text().await {
+                        Ok(response_text) => {
+                            if status.is_success() {
+                                return Ok(response_text);
+                            }
+                            // Not every 403 is a credential problem. The gate
+                            // answers `repo_not_authorized` and
+                            // `repo_not_connected` with one too, and telling a
+                            // user to log in again when the repo is simply not
+                            // connected sends them to fix the one thing that
+                            // is already right (§2.1). Only a 401, or the
+                            // kind gate itself, is a re-login.
+                            if is_credential_rejection(status, &response_text) {
+                                return Err(StorageError::ConnectionError(relogin_message(
+                                    status,
+                                    &response_text,
+                                )));
+                            }
+                            if !is_transient_status(status) {
+                                return Err(StorageError::ConnectionError(refusal_message(
+                                    status,
+                                    &response_text,
+                                )));
+                            }
+                            refusal_message(status, &response_text)
+                        }
+                        Err(e) => format!("Failed to read response: {}", e),
+                    }
+                }
+                Err(e) => format!("Lambda request failed: {}", e),
+            };
+
+            if retries >= max_retries {
+                return Err(StorageError::ConnectionError(retry_exhausted_message(
+                    action,
+                    &transient_error,
+                    retries + 1,
+                )));
+            }
+
+            let backoff = retry_backoff(retries);
+            warn!(
+                "{}; retrying in {}s ({}/{})",
+                transient_error,
+                backoff.as_secs(),
+                retries + 1,
+                max_retries
+            );
+            tokio::time::sleep(backoff).await;
+            retries += 1;
+        }
+    }
+
+    async fn send_lambda_oidc<B>(&self, action: &str, body: &B) -> Result<String, StorageError>
     where
         B: serde::Serialize + ?Sized,
     {
@@ -512,6 +866,7 @@ impl AwsStorage {
         data: &CloudRepoData,
         s3_url: &str,
         staged: Option<&StagedPayload>,
+        final_in_run: bool,
     ) -> Result<UploadOutcome, StorageError> {
         let request = LambdaRequest {
             action: "store-metadata".to_string(),
@@ -525,14 +880,71 @@ impl AwsStorage {
             payload_in_s3: staged.is_some().then_some(true),
             payload_sha256: staged.map(|s| s.sha256.clone()),
             payload_size: staged.map(|s| s.size),
-            force_reindex: self.force_reindex.then_some(true),
+            force_reindex: self.forces_reindex().then_some(true),
+            scan_id: self.scan_id(),
+            unanalysed_files: self.unanalysed_files(),
+            scan_final: final_in_run.then_some(true),
         };
 
         let response: WriteActionResponse = self.call_lambda(&request).await?;
         debug!("Successfully stored metadata for {}", data.repo_name);
+        report_partial_acceptance(&response, data);
 
         Ok(UploadOutcome {
             already_current: response.already_current.unwrap_or(false),
+        })
+    }
+
+    /// Claim a scan slot and resolve the project, before any spend.
+    ///
+    /// The laptop path's replacement for the health-check probe (C9). It
+    /// proves connectivity, that this holder may write this repo, that a slot
+    /// is free, and whether this is a first index — and it answers
+    /// `multi_service`, which the probe is the only other source of and which
+    /// gates a multi-service upload. Every refusal is final: the gates answer
+    /// 409, which is not a transient status, so nothing here is retried (C6).
+    async fn start_scan(&self, run: &RunContext) -> Result<RunStart, StorageError> {
+        let repo = run.repo_full_name.as_deref().ok_or_else(|| {
+            StorageError::ConnectionError(
+                "This directory has no github.com origin remote, so Carrick cannot tell the \
+                 cloud which repository it is scanning. Add the remote, or run the scan in CI."
+                    .to_string(),
+            )
+        })?;
+        let request = StartScanRequest {
+            action: "start-scan",
+            repo,
+            commit: &run.commit,
+            dirty: run.dirty,
+        };
+        let response: StartScanResponse =
+            self.call_lambda_generic(request.action, &request).await?;
+        if response.schema != START_SCAN_SCHEMA {
+            return Err(StorageError::ConnectionError(format!(
+                "Carrick Cloud answered start-scan with schema '{}'; this scanner reads {}. \
+                 Upgrade with npm i -g carrick@latest.",
+                response.schema, START_SCAN_SCHEMA
+            )));
+        }
+        self.multi_service
+            .store(response.multi_service, std::sync::atomic::Ordering::Relaxed);
+        self.dirty
+            .store(run.dirty, std::sync::atomic::Ordering::Relaxed);
+        // `set` rather than an assignment: one run opens one scan, and a
+        // second start-scan would mean two slots for one upload. Published to
+        // the process-global as well, because the four prompt-lambda clients
+        // are built far from here and each of their calls must carry it.
+        crate::credentials::set_scan_id(&response.scan_id);
+        let _ = self.scan_id.set(response.scan_id);
+        info!(
+            "Scanning {} into project {} ({} service(s) already indexed)",
+            repo,
+            response.project_slug,
+            response.indexed_services.len()
+        );
+        Ok(RunStart {
+            allowance_sentence: response.allowance_sentence,
+            indexed_services: Some(response.indexed_services),
         })
     }
 
@@ -568,7 +980,11 @@ impl AwsStorage {
 
 #[async_trait]
 impl CloudStorage for AwsStorage {
-    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<UploadOutcome, StorageError> {
+    async fn upload_repo_data(
+        &self,
+        data: &CloudRepoData,
+        final_in_run: bool,
+    ) -> Result<UploadOutcome, StorageError> {
         let repo = &data.repo_name;
 
         // Payload staging decision (carrick#486): measure the serialized
@@ -600,6 +1016,14 @@ impl CloudStorage for AwsStorage {
             // The existence check indexes nothing, so there is nothing for it
             // to supersede; the flag rides the write actions below.
             force_reindex: None,
+            // The slot rides every action of the run, including this one: the
+            // cloud ties the whole scan to it, not only the writes (§2.2).
+            scan_id: self.scan_id(),
+            // Nothing is indexed here, so there is no partial index for the
+            // cloud to accept or refuse, and the slot is not released by a
+            // check.
+            unanalysed_files: None,
+            scan_final: None,
         };
 
         let lambda_response: LambdaResponse = self.call_lambda(&check_request).await?;
@@ -632,12 +1056,16 @@ impl CloudStorage for AwsStorage {
                     payload_in_s3: stage_payload.then_some(true),
                     payload_sha256: staged.as_ref().map(|s| s.sha256.clone()),
                     payload_size: staged.as_ref().map(|s| s.size),
-                    force_reindex: self.force_reindex.then_some(true),
+                    force_reindex: self.forces_reindex().then_some(true),
+                    scan_id: self.scan_id(),
+                    unanalysed_files: self.unanalysed_files(),
+                    scan_final: final_in_run.then_some(true),
                 };
 
                 let complete_response: WriteActionResponse =
                     self.call_lambda(&complete_request).await?;
                 debug!("Successfully completed upload and stored metadata");
+                report_partial_acceptance(&complete_response, data);
                 Ok(UploadOutcome {
                     already_current: complete_response.already_current.unwrap_or(false),
                 })
@@ -646,12 +1074,17 @@ impl CloudStorage for AwsStorage {
                     "No bundled types available for {}; storing metadata only",
                     repo
                 );
-                self.store_repo_metadata(data, &lambda_response.s3_url, staged.as_ref())
-                    .await
+                self.store_repo_metadata(
+                    data,
+                    &lambda_response.s3_url,
+                    staged.as_ref(),
+                    final_in_run,
+                )
+                .await
             }
         } else {
             debug!("Type file already exists, just updating metadata");
-            self.store_repo_metadata(data, &lambda_response.s3_url, staged.as_ref())
+            self.store_repo_metadata(data, &lambda_response.s3_url, staged.as_ref(), final_in_run)
                 .await
         }
     }
@@ -679,6 +1112,9 @@ impl CloudStorage for AwsStorage {
             payload_sha256: None,
             payload_size: None,
             force_reindex: None,
+            scan_id: None,
+            unanalysed_files: None,
+            scan_final: None,
         };
 
         let lambda_response: LambdaResponse = self.call_lambda(&request).await?;
@@ -751,6 +1187,7 @@ impl CloudStorage for AwsStorage {
                     packages: None,
                     last_updated: chrono::Utc::now(),
                     commit_hash: adjacent.hash,
+                    dirty: None,
                     mount_graph: None,
                     bundled_types: None,
                     type_manifest: None,
@@ -808,6 +1245,17 @@ impl CloudStorage for AwsStorage {
         Ok(())
     }
 
+    /// A laptop's debug log stays on the laptop.
+    ///
+    /// `upload-logs` is deliberately outside the set of actions a `cli`
+    /// credential may take (§1.2): the log is a 0644 file naming the
+    /// developer's own machine and paths, and shipping it to S3 is a CI
+    /// affordance. Answering here rather than letting the call 403 keeps a
+    /// guaranteed failure out of every laptop run's tail.
+    fn uploads_run_logs(&self) -> bool {
+        !self.auth.is_bearer()
+    }
+
     async fn post_pr_result(
         &self,
         payload: &crate::findings::PrResultPayload,
@@ -833,6 +1281,15 @@ impl CloudStorage for AwsStorage {
         Ok(())
     }
 
+    async fn begin_run(&self, run: &RunContext) -> Result<RunStart, StorageError> {
+        match &self.auth {
+            // The CI path, unchanged: the probe's body, its response and its
+            // error handling are exactly what they were.
+            CloudAuth::Oidc => self.health_check().await.map(|()| RunStart::default()),
+            CloudAuth::Bearer(_) => self.start_scan(run).await,
+        }
+    }
+
     async fn health_check(&self) -> Result<(), StorageError> {
         let request = LambdaRequest {
             action: "check-or-upload".to_string(),
@@ -847,6 +1304,9 @@ impl CloudStorage for AwsStorage {
             payload_sha256: None,
             payload_size: None,
             force_reindex: None,
+            scan_id: None,
+            unanalysed_files: None,
+            scan_final: None,
         };
 
         match self.call_lambda::<LambdaResponse>(&request).await {
@@ -933,6 +1393,9 @@ mod tests {
             payload_sha256: None,
             payload_size: None,
             force_reindex: None,
+            scan_id: None,
+            unanalysed_files: None,
+            scan_final: None,
         };
         let json = serde_json::to_string(&bare).unwrap();
         assert!(!json.contains("wantsPayloadUrl"));
@@ -1027,6 +1490,9 @@ mod tests {
             payload_sha256: None,
             payload_size: None,
             force_reindex: None,
+            scan_id: None,
+            unanalysed_files: None,
+            scan_final: None,
         };
         let json = serde_json::to_string(&inline).unwrap();
         assert!(!json.contains("payloadSha256"));
@@ -1065,6 +1531,9 @@ mod tests {
             payload_sha256: None,
             payload_size: None,
             force_reindex: None,
+            scan_id: None,
+            unanalysed_files: None,
+            scan_final: None,
         };
         let json = serde_json::to_string(&cached).unwrap();
         assert!(
@@ -1305,5 +1774,522 @@ mod tests {
         let malformed: CrossRepoResponse = serde_json::from_str(r#"{"staged":true}"#).unwrap();
         assert!(malformed.staged);
         assert!(malformed.staged_url.is_none());
+    }
+    /// One request against a local server, with the laptop credential. Returns
+    /// the raw request the server saw, so the headers and the body are both
+    /// assertable.
+    fn bearer_storage(
+        responses: Vec<(u16, String)>,
+    ) -> (AwsStorage, std::thread::JoinHandle<Vec<String>>) {
+        let (base, server) = crate::agent_service::tests::stub_server(responses);
+        let storage = AwsStorage::for_test(
+            &format!("{base}/types/check-or-upload"),
+            CloudAuth::Bearer("carrick_sk_live_test".to_string()),
+            false,
+        );
+        (storage, server)
+    }
+
+    fn run_context(dirty: bool) -> RunContext {
+        RunContext {
+            repo_full_name: Some("example/api".to_string()),
+            commit: "4f2a1c9000000000000000000000000000000000".to_string(),
+            dirty,
+        }
+    }
+
+    fn body_of(request: &str) -> serde_json::Value {
+        let (_, body) = request
+            .split_once("\r\n\r\n")
+            .expect("a request with a body");
+        serde_json::from_str(body).expect("a JSON body")
+    }
+
+    fn has_header(request: &str, name: &str, value: &str) -> bool {
+        request.lines().any(|line| {
+            line.to_ascii_lowercase()
+                .starts_with(&format!("{}:", name.to_ascii_lowercase()))
+                && line.contains(value)
+        })
+    }
+
+    /// The laptop branch of `begin_run`: `start-scan` instead of the health
+    /// probe, the credential as `Authorization`, and the three answers the
+    /// rest of the run needs — the slot, `multi_service`, and whether any
+    /// service already has rows (§2.1, C9).
+    #[tokio::test]
+    async fn start_scan_opens_a_laptop_run_and_carries_its_answers() {
+        let (storage, server) = bearer_storage(vec![(
+            200,
+            serde_json::json!({
+                "schema": "carrick.start-scan/0",
+                "scan_id": "scan_01J",
+                "project_id": "proj_1",
+                "project_slug": "payments",
+                "indexed_services": ["api", "web"],
+                "multi_service": true,
+                "allowance_sentence": "candidates not refreshed since 2026-09-01."
+            })
+            .to_string(),
+        )]);
+
+        let start = storage.begin_run(&run_context(true)).await.unwrap();
+        assert_eq!(
+            start.allowance_sentence.as_deref(),
+            Some("candidates not refreshed since 2026-09-01.")
+        );
+        assert_eq!(
+            start.indexed_services.as_deref(),
+            Some(["api".to_string(), "web".to_string()].as_slice())
+        );
+        // The probe is the only other source of this flag, and it is not on
+        // this path; without it a multi-service repo would scan, pay, and
+        // upload nothing but a warning.
+        assert!(storage.supports_multi_service());
+        // A dirty run supersedes its own generation, or the next scan at the
+        // same HEAD is told the index is current (C10).
+        assert!(storage.forces_reindex());
+        assert_eq!(storage.scan_id().as_deref(), Some("scan_01J"));
+
+        let request = &server.join().unwrap()[0];
+        assert!(
+            has_header(request, "authorization", "Bearer carrick_sk_live_test"),
+            "{request}"
+        );
+        assert!(
+            !request.to_ascii_lowercase().contains("x-carrick-oidc"),
+            "the laptop branch must not send the OIDC header: {request}"
+        );
+        let body = body_of(request);
+        assert_eq!(body["action"], "start-scan");
+        // The full owner/repo, not the basename every other action sends.
+        assert_eq!(body["repo"], "example/api");
+        assert_eq!(body["commit"], "4f2a1c9000000000000000000000000000000000");
+        assert_eq!(body["dirty"], true);
+    }
+
+    /// A count gate answers 409, and 409 is not a transient status — so the
+    /// refusal is made once and reported with the code the user can act on.
+    /// A 429 here would be retried with backoff, which is why the gates are
+    /// not allowed to use one (C6).
+    #[tokio::test]
+    async fn a_gate_refusal_is_final_and_names_its_code() {
+        let (storage, server) = bearer_storage(vec![(
+            409,
+            serde_json::json!({
+                "error": "A scan of example/api is already running.",
+                "code": "laptop_scan_in_flight"
+            })
+            .to_string(),
+        )]);
+
+        let error = storage.begin_run(&run_context(false)).await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("already running"), "{message}");
+        assert!(message.contains("laptop_scan_in_flight"), "{message}");
+
+        assert_eq!(
+            server.join().unwrap().len(),
+            1,
+            "a gate refusal must not be retried"
+        );
+    }
+
+    /// 409 is the status every laptop gate must use, precisely because this
+    /// classifier does not retry it. Pinned here so a later widening of the
+    /// transient set cannot silently turn a refusal into a retry storm.
+    #[test]
+    fn a_gate_refusal_status_is_not_transient() {
+        assert!(!is_transient_status(StatusCode::CONFLICT));
+    }
+
+    /// A credential the cloud will not accept cannot be re-minted, so the
+    /// answer is a sentence, not a retry (§8.2).
+    #[tokio::test]
+    async fn a_rejected_credential_says_run_carrick_login_and_stops() {
+        let (storage, server) = bearer_storage(vec![(
+            403,
+            serde_json::json!({ "error": "wrong key kind", "code": "wrong_key_kind" }).to_string(),
+        )]);
+
+        let message = storage
+            .begin_run(&run_context(false))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("carrick login"), "{message}");
+        assert!(message.contains("wrong_key_kind"), "{message}");
+        assert_eq!(server.join().unwrap().len(), 1, "a 403 is not retried");
+    }
+
+    /// A cloud that has not deployed the action answers something else, and
+    /// the scanner says so rather than reading a body it does not understand.
+    #[tokio::test]
+    async fn an_unknown_start_scan_schema_is_refused() {
+        let (storage, server) = bearer_storage(vec![(
+            200,
+            serde_json::json!({
+                "schema": "carrick.start-scan/1",
+                "scan_id": "s", "project_id": "p", "project_slug": "q"
+            })
+            .to_string(),
+        )]);
+        let message = storage
+            .begin_run(&run_context(false))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("carrick.start-scan/0"), "{message}");
+        server.join().unwrap();
+    }
+
+    /// The first-scan partial rule's two answers, as the scanner reads them.
+    /// A 200 carrying `partial` is an acceptance and the run continues; a 409
+    /// `partial_refused` is final and names the files, because "re-run the
+    /// scan" without them is not actionable (§4).
+    #[test]
+    fn the_partial_upload_envelopes_parse_as_acceptance_and_refusal() {
+        let accepted: WriteActionResponse = serde_json::from_str(
+            r#"{"success":true,"partial":true,
+                "unanalysed_files":[{"path":"src/routes/orders.ts","reason":"model_error"}]}"#,
+        )
+        .expect("the 200 acceptance parses");
+        assert_eq!(accepted.partial, Some(true));
+        assert_eq!(
+            accepted.unanalysed_files.as_deref(),
+            Some(
+                [UnanalysedFile {
+                    path: "src/routes/orders.ts".to_string(),
+                    reason: "model_error".to_string(),
+                }]
+                .as_slice()
+            )
+        );
+
+        // An ordinary 200 carries neither key, and must still parse.
+        let ordinary: WriteActionResponse =
+            serde_json::from_str(r#"{"success":true,"message":"done"}"#).unwrap();
+        assert_eq!(ordinary.partial, None);
+        assert!(ordinary.unanalysed_files.is_none());
+
+        let refusal = refusal_message(
+            StatusCode::CONFLICT,
+            r#"{"error":"This service already has an index.","code":"partial_refused",
+                "unanalysed_files":[{"path":"src/routes/orders.ts","reason":"model_error"},
+                                    {"path":"src/routes/refunds.ts","reason":"internal_error"}]}"#,
+        );
+        assert!(refusal.contains("already has an index"), "{refusal}");
+        assert!(refusal.contains("partial_refused"), "{refusal}");
+        assert!(refusal.contains("2 file(s) had no analysis"), "{refusal}");
+        assert!(refusal.contains("src/routes/refunds.ts"), "{refusal}");
+    }
+
+    /// The run-scoped envelope fields ride the write actions under the exact
+    /// snake_case keys the cloud reads, and every one of them is omitted when
+    /// unset — so a CI upload's body is byte-for-byte what it was before this
+    /// release and a cloud deployed without the readers ignores them (§8.6).
+    #[test]
+    fn the_run_scoped_envelope_fields_serialize_by_name_and_omit_when_none() {
+        let ci = LambdaRequest {
+            action: "store-metadata".to_string(),
+            repo: "r".to_string(),
+            service_name: None,
+            hash: "h".to_string(),
+            filename: "types.d.ts".to_string(),
+            cloud_repo_data: None,
+            s3_url: None,
+            wants_payload_url: None,
+            payload_in_s3: None,
+            payload_sha256: None,
+            payload_size: None,
+            force_reindex: None,
+            scan_id: None,
+            unanalysed_files: None,
+            scan_final: None,
+        };
+        let json = serde_json::to_string(&ci).unwrap();
+        for field in ["scan_id", "unanalysed_files", "scan_final"] {
+            assert!(!json.contains(field), "{field} must be omitted: {json}");
+        }
+
+        let laptop = LambdaRequest {
+            scan_id: Some("scan_01J".to_string()),
+            unanalysed_files: Some(vec![UnanalysedFile {
+                path: "src/a.ts".to_string(),
+                reason: "model_error".to_string(),
+            }]),
+            scan_final: Some(true),
+            ..ci
+        };
+        let v = serde_json::to_value(&laptop).unwrap();
+        assert_eq!(v["scan_id"], "scan_01J");
+        assert_eq!(v["scan_final"], true);
+        assert_eq!(v["unanalysed_files"][0]["path"], "src/a.ts");
+        assert_eq!(v["unanalysed_files"][0]["reason"], "model_error");
+    }
+
+    /// `unanalysed_files` is a laptop field. CI's own gate already aborts the
+    /// run before the upload, so sending the list there would offer the cloud
+    /// a decision it must not be asked to make — and would answer a CI caller
+    /// that set `CARRICK_ALLOW_PARTIAL_ANALYSIS` with `409 partial_refused`.
+    #[test]
+    fn the_unanalysed_list_is_never_sent_on_the_ci_path() {
+        let ci = AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Oidc, false);
+        assert!(ci.unanalysed_files().is_none());
+        assert!(ci.scan_id().is_none());
+        assert!(ci.uploads_run_logs());
+    }
+
+    /// A laptop's debug log names the developer's own machine, and
+    /// `upload-logs` is outside what a `cli` credential may do (§1.2).
+    #[test]
+    fn a_laptop_run_does_not_ship_its_debug_log() {
+        let laptop =
+            AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Bearer("t".into()), false);
+        assert!(!laptop.uploads_run_logs());
+    }
+
+    /// `start-scan` keys on the full `owner/repo`, and a clone with no GitHub
+    /// remote cannot supply one. Saying that beats sending a name the cloud
+    /// would resolve to the wrong repository.
+    #[tokio::test]
+    async fn a_clone_with_no_github_remote_is_told_why_it_cannot_scan() {
+        let storage =
+            AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Bearer("t".into()), false);
+        let message = storage
+            .begin_run(&RunContext {
+                repo_full_name: None,
+                commit: "abc".to_string(),
+                dirty: false,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("origin remote"), "{message}");
+    }
+
+    /// A storage holding a scan slot, as `start-scan` would have left it.
+    /// Set here rather than through the process-global, so two of these
+    /// running at once cannot see each other's slot.
+    fn bearer_storage_in_scan(
+        responses: Vec<(u16, String)>,
+        scan_id: &str,
+    ) -> (AwsStorage, std::thread::JoinHandle<Vec<String>>) {
+        let (storage, server) = bearer_storage(responses);
+        storage.scan_id.set(scan_id.to_string()).unwrap();
+        (storage, server)
+    }
+
+    fn blob() -> CloudRepoData {
+        serde_json::from_value(serde_json::json!({
+            "repo_name": "api",
+            "endpoints": [], "calls": [], "mounts": [], "apps": {},
+            "imported_handlers": [], "function_definitions": {},
+            "last_updated": "2026-09-11T00:00:00Z",
+            "commit_hash": "4f2a1c9"
+        }))
+        .unwrap()
+    }
+
+    fn check_ok() -> (u16, String) {
+        (
+            200,
+            serde_json::json!({
+                "exists": true, "s3Url": "s3://bucket/api.json",
+                "uploadUrl": null, "hash": "4f2a1c9", "multiService": true
+            })
+            .to_string(),
+        )
+    }
+
+    /// The run-scoped fields on a real write action, not just on a struct:
+    /// the slot ties the write to the meters, and `scan_final` on the last one
+    /// is what releases the cloud's in-flight slot. The existence check
+    /// carries the slot too but never `scan_final` — it indexes nothing
+    /// (§2.2).
+    #[tokio::test]
+    async fn the_last_write_action_of_a_run_carries_the_slot_and_releases_it() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            "scan_01J",
+        );
+
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+
+        let check = body_of(&requests[0]);
+        assert_eq!(check["action"], "check-or-upload");
+        assert_eq!(check["scan_id"], "scan_01J");
+        assert!(
+            check.get("scan_final").is_none(),
+            "the existence check indexes nothing, so it releases nothing: {check}"
+        );
+
+        let write = body_of(&requests[1]);
+        assert_eq!(write["action"], "store-metadata");
+        assert_eq!(write["scan_id"], "scan_01J");
+        assert_eq!(write["scan_final"], true);
+    }
+
+    /// C10's scanner half, on the wire. A dirty run's `hash` is HEAD's SHA
+    /// even though the tree was not HEAD, so without `force_reindex` the
+    /// cloud's freshness guard tells the next scan at the same commit that the
+    /// index is current — and the dirty rows survive at a commit they never
+    /// described. Both write actions carry it; the existence check does not,
+    /// because it indexes nothing to supersede.
+    #[tokio::test]
+    async fn a_dirty_run_forces_the_reindex_on_its_write_action() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            "scan_01J",
+        );
+        // What `start-scan` leaves behind on a dirty run.
+        storage
+            .dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        let requests = server.join().unwrap();
+        assert!(
+            body_of(&requests[0]).get("force_reindex").is_none(),
+            "the existence check supersedes nothing: {}",
+            body_of(&requests[0])
+        );
+        assert_eq!(body_of(&requests[1])["force_reindex"], true);
+    }
+
+    /// And a clean run does not: the field is omitted, so an ordinary upload's
+    /// body is byte-for-byte what it was.
+    #[tokio::test]
+    async fn a_clean_run_omits_force_reindex() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            "scan_01J",
+        );
+
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        let write = body_of(&server.join().unwrap()[1]);
+        assert!(write.get("force_reindex").is_none(), "{write}");
+    }
+
+    /// A service that is not the last one in the run must not release the
+    /// slot: the rest of the run would then be unprotected, and a second
+    /// laptop could start scanning the same repo halfway through this one.
+    #[tokio::test]
+    async fn a_write_that_is_not_the_last_leaves_the_slot_held() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            "scan_01J",
+        );
+
+        storage.upload_repo_data(&blob(), false).await.unwrap();
+
+        let write = body_of(&server.join().unwrap()[1]);
+        assert_eq!(write["scan_id"], "scan_01J");
+        assert!(
+            write.get("scan_final").is_none(),
+            "only the last write action of the run releases the slot: {write}"
+        );
+    }
+
+    /// The fail-closed half of the first-scan partial rule. The cloud refuses
+    /// with a 409, the scanner does not retry it — the existence check plus
+    /// one write action and no more — and the error names the files, because
+    /// "re-run the scan" without them is not actionable (§4, C6).
+    #[tokio::test]
+    async fn a_refused_partial_upload_is_final_and_names_the_files() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (
+                    409,
+                    serde_json::json!({
+                        "error": "This service already has an index.",
+                        "code": "partial_refused",
+                        "unanalysed_files": [
+                            { "path": "src/routes/orders.ts", "reason": "model_error" }
+                        ]
+                    })
+                    .to_string(),
+                ),
+            ],
+            "scan_01J",
+        );
+
+        let message = storage
+            .upload_repo_data(&blob(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("already has an index"), "{message}");
+        assert!(message.contains("partial_refused"), "{message}");
+        assert!(message.contains("src/routes/orders.ts"), "{message}");
+
+        assert_eq!(
+            server.join().unwrap().len(),
+            2,
+            "a refusal is not retried, on a write action least of all"
+        );
+    }
+
+    /// A refusal that is about the repo, not the credential, must not tell the
+    /// user to log in again: a fresh consent does not connect a repo, and the
+    /// sentence that does is the cloud's own (§2.1).
+    #[tokio::test]
+    async fn a_repo_refusal_is_not_reported_as_a_credential_problem() {
+        let (storage, server) = bearer_storage(vec![(
+            403,
+            serde_json::json!({
+                "error": "example/api is not connected to this workspace.",
+                "code": "repo_not_connected"
+            })
+            .to_string(),
+        )]);
+
+        let message = storage
+            .begin_run(&run_context(false))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("not connected to this workspace"),
+            "{message}"
+        );
+        assert!(message.contains("repo_not_connected"), "{message}");
+        assert!(
+            !message.contains("carrick login"),
+            "a repo that is not connected is not a credential to replace: {message}"
+        );
+        server.join().unwrap();
+    }
+
+    /// The kind gate IS a credential problem, and it is the one an `mcp`
+    /// credential hits until its holder logs in again.
+    #[test]
+    fn only_a_401_or_the_kind_gate_reads_as_a_credential_rejection() {
+        let kind = r#"{"error":"wrong key kind","code":"wrong_key_kind"}"#;
+        assert!(is_credential_rejection(StatusCode::FORBIDDEN, kind));
+        assert!(is_credential_rejection(StatusCode::UNAUTHORIZED, "{}"));
+        assert!(!is_credential_rejection(
+            StatusCode::FORBIDDEN,
+            r#"{"code":"repo_not_authorized"}"#
+        ));
+        assert!(!is_credential_rejection(StatusCode::CONFLICT, kind));
     }
 }

@@ -35,7 +35,11 @@ struct StubStorage {
 
 #[async_trait]
 impl CloudStorage for StubStorage {
-    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<UploadOutcome, StorageError> {
+    async fn upload_repo_data(
+        &self,
+        data: &CloudRepoData,
+        _final_in_run: bool,
+    ) -> Result<UploadOutcome, StorageError> {
         self.repos.lock().unwrap().push(data.clone());
         Ok(UploadOutcome::default())
     }

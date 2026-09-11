@@ -429,6 +429,28 @@ pub fn boundary_lines(
     lines
 }
 
+/// Who wrote the hosted row, as a clause inside the existing parenthesis.
+///
+/// Empty on a CI row and on a row stored before the fields existed, so those
+/// sentences read exactly as they did. A laptop row says so, and names the
+/// login when the row records one; "tree not clean" is a separate condition
+/// and appears whenever `dirty` is true, because a CI row is never dirty and
+/// a reader should not have to work that out. Wire contract: carrick-cloud
+/// `docs/internal/reference/laptop-scan-seam.md` §6.2.
+fn hosted_provenance_clause(hosted: &super::hosted::HostedProvenance) -> String {
+    let mut clause = String::new();
+    if hosted.source.as_deref() == Some("laptop") {
+        clause.push_str(" by a laptop scan");
+        if let Some(login) = hosted.uploaded_by.as_deref().filter(|s| !s.is_empty()) {
+            clause.push_str(&format!(" from @{login}"));
+        }
+    }
+    if hosted.dirty == Some(true) {
+        clause.push_str(", tree not clean");
+    }
+    clause
+}
+
 /// Hosted provenance feeds the same boundary renderer used by every local
 /// surface. Read commands never probe the network to compose this sentence.
 pub fn enrichment_note(
@@ -439,9 +461,10 @@ pub fn enrichment_note(
     let remote = enrichment.remote.as_deref().unwrap_or("this repo");
     let mut note = match (&enrichment.hosted_state, &enrichment.hosted) {
         (HostedState::Enriched, Some(hosted)) => format!(
-            "candidates: from the hosted index at {} (indexed {}); {} file(s) changed since then hold facts only.",
+            "candidates: from the hosted index at {} (indexed {}{}); {} file(s) changed since then hold facts only.",
             hosted.commit.chars().take(7).collect::<String>(),
             hosted.indexed_at,
+            hosted_provenance_clause(hosted),
             boundary
                 .and_then(|b| b.candidates_withheld_changed_files)
                 .unwrap_or(0)
@@ -561,5 +584,71 @@ mod hosted_change_tests {
             ])
         );
         assert!(changed_since(repo, "--output=elsewhere").is_none());
+    }
+    fn hosted_row(
+        source: Option<&str>,
+        uploaded_by: Option<&str>,
+        dirty: Option<bool>,
+    ) -> super::super::hosted::HostedProvenance {
+        super::super::hosted::HostedProvenance {
+            commit: "4f2a1c9000000000000000000000000000000000".to_string(),
+            indexed_at: "2026-09-11".to_string(),
+            scanner_version: Some("0.3.60".to_string()),
+            project: "payments".to_string(),
+            source: source.map(str::to_string),
+            uploaded_by: uploaded_by.map(str::to_string),
+            dirty,
+        }
+    }
+
+    fn note_for(hosted: super::super::hosted::HostedProvenance) -> String {
+        enrichment_note(
+            &super::super::hosted::ServiceEnrichment {
+                hosted: Some(hosted),
+                hosted_state: super::super::hosted::HostedState::Enriched,
+                remote: Some("example/api".to_string()),
+                failure: None,
+                allowance_sentence: None,
+                hosted_cache_version: Some(crate::engine::CACHE_VERSION),
+            },
+            None,
+        )
+    }
+
+    /// A laptop row says whose laptop and whether the tree was clean, inside
+    /// the parenthesis the sentence already had. Nothing else about the
+    /// sentence moves (§6.2).
+    #[test]
+    fn a_laptop_row_names_its_uploader_and_an_unclean_tree() {
+        assert_eq!(
+            note_for(hosted_row(Some("laptop"), Some("ihor"), Some(true))),
+            "candidates: from the hosted index at 4f2a1c9 (indexed 2026-09-11 by a laptop scan \
+             from @ihor, tree not clean); 0 file(s) changed since then hold facts only."
+        );
+    }
+
+    /// A CI row and a row written before the fields existed render exactly
+    /// today's sentence. A reader must not be able to tell the two apart,
+    /// because the index cannot.
+    #[test]
+    fn a_ci_row_and_a_pre_field_row_render_the_unchanged_sentence() {
+        let today = "candidates: from the hosted index at 4f2a1c9 (indexed 2026-09-11); \
+                     0 file(s) changed since then hold facts only.";
+        assert_eq!(
+            note_for(hosted_row(Some("ci"), Some("ihor"), Some(false))),
+            today
+        );
+        assert_eq!(note_for(hosted_row(None, None, None)), today);
+    }
+
+    /// A laptop row with no recorded login still says it was a laptop scan:
+    /// where the row came from is the fact that matters, and the login is the
+    /// detail.
+    #[test]
+    fn a_laptop_row_without_a_login_still_says_it_was_a_laptop_scan() {
+        let note = note_for(hosted_row(Some("laptop"), None, Some(false)));
+        assert!(note.contains("by a laptop scan)"), "{note}");
+        assert!(!note.contains('@'), "{note}");
+        assert!(!note.contains("tree not clean"), "{note}");
     }
 }

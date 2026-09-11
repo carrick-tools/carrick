@@ -709,6 +709,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "abc123".to_string(),
+            dirty: None,
             mount_graph: None,
             bundled_types: None,
             type_manifest: None,

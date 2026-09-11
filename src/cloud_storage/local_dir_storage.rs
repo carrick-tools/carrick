@@ -73,7 +73,11 @@ impl LocalDirStorage {
 
 #[async_trait]
 impl CloudStorage for LocalDirStorage {
-    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<UploadOutcome, StorageError> {
+    async fn upload_repo_data(
+        &self,
+        data: &CloudRepoData,
+        _final_in_run: bool,
+    ) -> Result<UploadOutcome, StorageError> {
         let path = self.cache_path(&data.repo_name, data.service_name.as_deref());
         debug!(
             "LOCAL: Uploading repo data for {} (service: {:?}) -> {}",

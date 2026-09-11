@@ -19,8 +19,12 @@ struct SharedMock(Arc<MockStorage>);
 
 #[async_trait]
 impl CloudStorage for SharedMock {
-    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<UploadOutcome, StorageError> {
-        self.0.upload_repo_data(data).await
+    async fn upload_repo_data(
+        &self,
+        data: &CloudRepoData,
+        final_in_run: bool,
+    ) -> Result<UploadOutcome, StorageError> {
+        self.0.upload_repo_data(data, final_in_run).await
     }
     async fn download_all_repo_data(
         &self,
@@ -59,7 +63,11 @@ struct StubStorage {
 
 #[async_trait]
 impl CloudStorage for StubStorage {
-    async fn upload_repo_data(&self, data: &CloudRepoData) -> Result<UploadOutcome, StorageError> {
+    async fn upload_repo_data(
+        &self,
+        data: &CloudRepoData,
+        _final_in_run: bool,
+    ) -> Result<UploadOutcome, StorageError> {
         self.repos.lock().unwrap().push(data.clone());
         Ok(UploadOutcome::default())
     }

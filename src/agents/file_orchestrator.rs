@@ -2252,17 +2252,18 @@ impl FileOrchestrator {
                     .map_err(|e| {
                         // Recorded here, where the error is still typed: this
                         // file has no analysis in the index, and the run must
-                        // not call itself a success. A call the quota breaker
-                        // aborted is excluded — it was never attempted, and
-                        // the breaker already fails the run on its own terms.
-                        let quota_abort = e
-                            .downcast_ref::<crate::agent_service::AgentCallError>()
-                            .is_some_and(|err| err.is_quota_abort());
-                        if !quota_abort {
+                        // not call itself a success. Two classes are excluded
+                        // and they are excluded for different reasons, which
+                        // `counts_as_lost_file` states: a call the quota
+                        // breaker aborted was never attempted, and a call a
+                        // budget refused was never asked (carrick#555).
+                        if crate::scan_health::counts_as_lost_file(e.as_ref()) {
                             crate::scan_health::record_unanalysed_file(
                                 &pf.path_str,
                                 &crate::scan_health::analysis_failure_reason(e.as_ref()),
                             );
+                        } else if crate::scan_health::is_budget_refusal(e.as_ref()) {
+                            crate::scan_health::record_candidates_not_refreshed(&pf.path_str);
                         }
                         e.to_string()
                     });

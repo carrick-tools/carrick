@@ -223,7 +223,7 @@ fn head_sha_from_event() -> Option<String> {
 }
 
 #[allow(dead_code)]
-pub async fn run_analysis_engine<T: CloudStorage>(
+pub async fn run_analysis_engine<T: CloudStorage + Sync>(
     storage: T,
     repo_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -236,7 +236,7 @@ pub async fn run_analysis_engine<T: CloudStorage>(
 /// the failing runs are exactly the ones whose logs we need. The inner
 /// pipeline lives in `run_analysis_engine_inner` so `?`-propagated errors
 /// don't bypass the upload.
-pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
+pub async fn run_analysis_engine_with_sidecar<T: CloudStorage + Sync>(
     storage: T,
     repo_path: &str,
     sidecar: Option<&TypeSidecar>,
@@ -247,7 +247,7 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage>(
     result
 }
 
-async fn run_analysis_engine_inner<T: CloudStorage>(
+async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     storage: &T,
     repo_path: &str,
     sidecar: Option<&TypeSidecar>,
@@ -269,13 +269,46 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
         logging::annotate(logging::Annotation::Warning, &warning);
     }
 
-    // 1. Health check
+    // 1. Open the run.
+    //
+    // What git says about the tree is computed once, here, because three
+    // things need it and they must agree: the warning printed below, the
+    // `dirty` claim `start-scan` is given, and the `dirty` field stamped on
+    // every payload.
+    let git_state = crate::git_state::inspect(repo_path);
+    let run_context = crate::cloud_storage::RunContext {
+        repo_full_name: crate::git_state::remote_name(std::path::Path::new(repo_path)),
+        commit: git_state.commit.clone(),
+        dirty: git_state.dirty,
+    };
     let sp = logging::spinner("Connecting to Carrick Cloud...");
-    storage
-        .health_check()
+    let run_start = storage
+        .begin_run(&run_context)
         .await
-        .map_err(|e| format!("Failed to connect to Carrick Cloud: {}", e))?;
+        // Not always a transport problem: on the laptop path this is the gate,
+        // and its refusals name their own cause. "Failed to connect" would
+        // send the user to check their network for a scan that is simply
+        // already running.
+        .map_err(|e| format!("Carrick Cloud did not open this scan: {}", e))?;
     logging::finish_spinner(&sp, "Connected to Carrick Cloud");
+    // Both said at the top, not the end.
+    //
+    // The git warning is a laptop concern: CI runs on a checkout git made, and
+    // a pull_request run is deliberately at a merge commit that is not
+    // origin/main, so warning there would be noise on every PR. Warn, never
+    // refuse (David's ruling, 2026-09-11) — nothing here can stop the run,
+    // and `dirty` rides the upload whatever the user does about it
+    // (carrick-cloud `docs/internal/reference/laptop-scan-seam.md` §8.4).
+    if run_start.is_laptop() {
+        for line in crate::git_state::warnings(&git_state) {
+            warn!("{line}");
+        }
+    }
+    // A run whose candidates will not be refreshed says so before it spends
+    // fifteen minutes not refreshing them.
+    if let Some(sentence) = &run_start.allowance_sentence {
+        warn!("{sentence}");
+    }
 
     // 2. Download all repos (moved earlier for incremental cache lookup)
     let sp = logging::spinner("Downloading cross-repo data...");
@@ -372,6 +405,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
                 .iter()
                 .find(|r| r.repo_name == repo_name && r.service_name == service.service_name)
                 .cloned()
+                .map(without_dirty_analysis)
         };
 
         let analysis_started = Instant::now();
@@ -492,9 +526,37 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     //
     // `CARRICK_ALLOW_PARTIAL_ANALYSIS` is the deliberate opt-out for someone
     // who wants the partial index anyway; the loss is reported either way.
+
+    // A budget that refused to answer is not a loss: the model was never
+    // asked, so there is nothing to re-run and nothing to protect the index
+    // from. Reported on its own line, and it never reaches the gate below
+    // (carrick#555).
+    if let Some(line) = crate::scan_health::not_refreshed_line() {
+        warn!("{line}");
+        logging::annotate(logging::Annotation::Warning, &line);
+    }
+
     if let Some(summary) = crate::scan_health::summary_line() {
         let allow_partial = crate::scan_health::allow_partial_from_env();
-        if crate::scan_health::should_fail_run(lost_files, allow_partial) {
+        // On a first index the cloud, not this gate, decides whether a partial
+        // upload is acceptable: there is no index to protect yet, and the
+        // alternative is a repo that can never produce its first one because
+        // one file failed. `start-scan` says which services already have rows,
+        // and an empty list means none do. The cloud re-checks at upload time
+        // and is authoritative, because a CI run may have landed meanwhile
+        // (§4). The CI path never reaches this branch — `indexed_services` is
+        // `None` there, because the question was never asked.
+        let first_index = run_start
+            .indexed_services
+            .as_deref()
+            .is_some_and(<[String]>::is_empty);
+        if first_index {
+            warn!(
+                "{}. This repo has no index yet, so the upload carries the list and the cloud \
+                 decides whether to accept it.",
+                summary
+            );
+        } else if crate::scan_health::should_fail_run(lost_files, allow_partial) {
             return Err(format!(
                 "{}. Aborting before upload so the existing index is not overwritten with \
                  partial results. Re-run to index the missing files, or set {} to upload \
@@ -503,12 +565,17 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
                 crate::scan_health::ALLOW_PARTIAL_ENV
             )
             .into());
+        } else {
+            // The only way past the gate with files lost, other than a first
+            // index, is the opt-out — so this line names it. An `else` and not
+            // a fall-through: it used to be one, and the first-index branch
+            // above would then have claimed a flag nobody set.
+            warn!(
+                "{}. Continuing anyway: {} is set",
+                summary,
+                crate::scan_health::ALLOW_PARTIAL_ENV
+            );
         }
-        warn!(
-            "{}. Continuing anyway: {} is set",
-            summary,
-            crate::scan_health::ALLOW_PARTIAL_ENV
-        );
     }
 
     // 5. Prepare each service's upload payload, but DEFER the actual upload
@@ -535,7 +602,12 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
             Some(
                 current_services_data
                     .iter()
-                    .map(|data| strip_ast_nodes(data.clone(), storage.stages_oversized_payloads()))
+                    .map(|data| {
+                        stamp_tree_state(
+                            strip_ast_nodes(data.clone(), storage.stages_oversized_payloads()),
+                            git_state.dirty,
+                        )
+                    })
                     .collect(),
             )
         }
@@ -939,6 +1011,14 @@ fn print_boundaries(boundaries: &[(String, crate::boundary::ServiceBoundary)]) {
 async fn upload_run_logs<T: CloudStorage>(storage: &T, repo_path: &str) {
     const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
+    // A laptop's debug log stays on the laptop: `upload-logs` is outside what
+    // a `cli` credential may do, and the log names the developer's own machine
+    // (§1.2). Asked before the file is read, so the tail of every laptop run
+    // is silent rather than a guaranteed 403.
+    if !storage.uploads_run_logs() {
+        return;
+    }
+
     let Some(log_path) = logging::get_log_file_path() else {
         return;
     };
@@ -1043,6 +1123,51 @@ where
     Ok(T::default())
 }
 
+/// The reader half of the dirty rule: a generation written from a tree that
+/// did not match its commit contributes no analysis to the next run.
+///
+/// The writer half drops `file_results` before the upload, so a blob this
+/// scanner wrote already carries none. This is the guard that does not depend
+/// on that: whatever produced the blob, its answers describe code that is not
+/// at the commit the replay keys on, and `git diff --name-only <prev> HEAD`
+/// cannot see the difference (§2.4). Everything else about the previous
+/// generation is still used — the detection and guidance caches describe the
+/// dependency set, not the edited files.
+fn without_dirty_analysis(mut previous: CloudRepoData) -> CloudRepoData {
+    if previous.dirty == Some(true) {
+        previous.file_results = None;
+    }
+    previous
+}
+
+/// Record what the tree looked like on the payload that describes it.
+///
+/// Two halves of one fact, and neither works alone.
+///
+/// `dirty` qualifies `commit_hash`, which the blob already carries: without it
+/// the blob says "this is the index at 4f2a1c9" about a tree that was not
+/// 4f2a1c9, and every later reader of it as `previous_data` inherits the false
+/// version.
+///
+/// Dropping `file_results` is what stops that analysis becoming permanent.
+/// The incremental cache is replayed for files `git diff --name-only
+/// <prev_commit> HEAD` says are unchanged, and that diff is commit to commit —
+/// it cannot see the working tree. So a file that was dirty when it was
+/// analysed and is later reverted reads as unchanged forever, and its analysis
+/// of code that exists in no commit is reused by every later run, CI's
+/// included. Superseding the row does not supersede that; only refusing to
+/// cache it does. The cost is one cold re-analysis of this service, and the
+/// laptop does not re-pay it because it writes its own local cache from the
+/// same run (carrick-cloud `docs/internal/reference/laptop-scan-seam.md`
+/// §2.2, §2.4).
+fn stamp_tree_state(mut payload: CloudRepoData, dirty: bool) -> CloudRepoData {
+    payload.dirty = dirty.then_some(true);
+    if dirty {
+        payload.file_results = None;
+    }
+    payload
+}
+
 /// Upload each already-prepared service payload to the cloud index, in order.
 /// On a mid-sequence failure, reports which services made it and which didn't:
 /// uploads are keyed per (repo, service) and idempotent, so a re-run restores
@@ -1055,7 +1180,11 @@ async fn upload_service_payloads<T: CloudStorage>(
     let sp = logging::spinner("Uploading results...");
     let mut outcomes: Vec<UploadOutcome> = Vec::with_capacity(payloads.len());
     for (i, payload) in payloads.iter().enumerate() {
-        match storage.upload_repo_data(payload).await {
+        // Only the last write action of the run releases the cloud's in-flight
+        // scan slot: a multi-service repo sends N of them, and releasing on
+        // the first would leave the rest of the run unprotected (§2.2).
+        let final_in_run = i + 1 == payloads.len();
+        match storage.upload_repo_data(payload, final_in_run).await {
             Ok(outcome) => outcomes.push(outcome),
             Err(e) => {
                 let uploaded: Vec<&str> = payloads[..i]
@@ -3198,6 +3327,7 @@ fn build_cloud_data_from_mount_graph(
         packages: Some(packages.clone()),
         last_updated: chrono::Utc::now(),
         commit_hash: get_current_commit_hash(repo_path),
+        dirty: None,
         mount_graph: Some(mount_graph.clone()),
         bundled_types: None,
         type_manifest: None,
@@ -4760,6 +4890,85 @@ async fn build_cross_repo_analyzer(
 
 #[cfg(test)]
 mod tests {
+
+    /// A blob with only the fields every generation has carried, so the test
+    /// states what it is about and nothing else.
+    fn bare_blob() -> CloudRepoData {
+        let mut blob: CloudRepoData = serde_json::from_value(serde_json::json!({
+            "repo_name": "api",
+            "endpoints": [], "calls": [], "mounts": [], "apps": {},
+            "imported_handlers": [], "function_definitions": {},
+            "last_updated": "2026-09-11T00:00:00Z",
+            "commit_hash": "4f2a1c9000000000000000000000000000000000"
+        }))
+        .expect("a bare blob deserializes");
+        blob.file_results = Some(HashMap::from([(
+            "src/routes/orders.ts".to_string(),
+            crate::agents::file_analyzer_agent::FileAnalysisResult::default(),
+        )]));
+        blob
+    }
+
+    /// The dirty-tree ruling is warn, never refuse — so the payload is still
+    /// uploaded, and it carries the two things that make the upload honest:
+    /// the flag beside the commit it qualifies, and no analysis cache, because
+    /// a commit-to-commit diff can never tell the next run that these files
+    /// changed (§2.2, §2.4).
+    #[test]
+    fn a_dirty_tree_still_uploads_and_says_so_without_seeding_the_cache() {
+        let dirty = stamp_tree_state(bare_blob(), true);
+        assert_eq!(dirty.dirty, Some(true));
+        assert!(
+            dirty.file_results.is_none(),
+            "a dirty run must not seed the next run's incremental cache"
+        );
+        // The commit is untouched: `dirty` qualifies it, it does not replace
+        // it, and the cloud keys the row on it.
+        assert_eq!(
+            dirty.commit_hash,
+            "4f2a1c9000000000000000000000000000000000"
+        );
+
+        let wire = serde_json::to_value(&dirty).unwrap();
+        assert_eq!(wire["dirty"], true);
+        assert!(
+            wire.get("file_results").is_none(),
+            "the cache is omitted, not sent as null: {wire}"
+        );
+    }
+
+    /// A clean tree is what CI always has, and its payload must be exactly
+    /// what it was before the field existed: no key at all, and the analysis
+    /// cache intact so the next run replays it.
+    #[test]
+    fn a_clean_tree_sends_no_dirty_key_and_keeps_its_cache() {
+        let clean = stamp_tree_state(bare_blob(), false);
+        assert_eq!(clean.dirty, None);
+        assert!(clean.file_results.is_some(), "a clean run seeds the cache");
+
+        let wire = serde_json::to_value(&clean).unwrap();
+        assert!(
+            wire.get("dirty").is_none(),
+            "a clean payload is byte-identical to a pre-field one: {wire}"
+        );
+    }
+
+    /// A blob written before the field existed reads as clean, which is what
+    /// it was. `null` reads the same way, for a writer that spells it out.
+    #[test]
+    fn an_older_blob_reads_as_clean() {
+        assert_eq!(bare_blob().dirty, None);
+        let explicit: CloudRepoData = serde_json::from_value(serde_json::json!({
+            "repo_name": "api",
+            "endpoints": [], "calls": [], "mounts": [], "apps": {},
+            "imported_handlers": [], "function_definitions": {},
+            "last_updated": "2026-09-11T00:00:00Z",
+            "commit_hash": "abc123",
+            "dirty": null
+        }))
+        .expect("an explicit null deserializes");
+        assert_eq!(explicit.dirty, None);
+    }
     use super::*;
     use crate::analyzer::ApiEndpointDetails;
     use crate::type_manifest::MISSING_ALIAS_MARKER;
@@ -5104,6 +5313,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: String::new(),
+            dirty: None,
             mount_graph: None,
             bundled_types: None,
             type_manifest: None,
@@ -5408,6 +5618,7 @@ mod tests {
             packages: Some(packages),
             last_updated: chrono::Utc::now(),
             commit_hash: "test".to_string(),
+            dirty: None,
             mount_graph: Some(graph),
             bundled_types: Some(format!(
                 "export type Order = import(\"{}\").Order;\n",
@@ -5595,6 +5806,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
+            dirty: None,
             mount_graph: None,
             bundled_types: None,
             type_manifest: None,
@@ -5645,6 +5857,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
+            dirty: None,
             mount_graph: None,
             bundled_types: None,
             type_manifest: None,
@@ -5735,6 +5948,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
+            dirty: None,
             mount_graph: None,
             bundled_types: None,
             type_manifest: None,
@@ -6334,6 +6548,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
+            dirty: None,
             mount_graph: None,
             bundled_types: None,
             type_manifest: None,
@@ -6389,6 +6604,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
+            dirty: None,
             mount_graph: None,
             bundled_types: None,
             type_manifest: None,
@@ -6450,6 +6666,7 @@ mod tests {
                 packages: None,
                 last_updated: chrono::Utc::now(),
                 commit_hash: "test-hash".to_string(),
+                dirty: None,
                 mount_graph: None,
                 bundled_types: None,
                 type_manifest: None,
@@ -6532,6 +6749,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
+            dirty: None,
             mount_graph: None,
             bundled_types: None,
             type_manifest: None,
@@ -6739,6 +6957,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "abc123".to_string(),
+            dirty: None,
             mount_graph: None,
             bundled_types: None,
             type_manifest: None,
@@ -6859,6 +7078,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "abc123".to_string(),
+            dirty: None,
             mount_graph: None,
             bundled_types: None,
             type_manifest: None,
@@ -6974,6 +7194,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "abc123".to_string(),
+            dirty: None,
             mount_graph: Some(graph),
             bundled_types: None,
             type_manifest: None,
@@ -7091,6 +7312,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "abc123".to_string(),
+            dirty: None,
             mount_graph: None,
             bundled_types: None,
             type_manifest: None,
@@ -10005,6 +10227,7 @@ mod tests {
             packages: None,
             last_updated: chrono::Utc::now(),
             commit_hash: "test-hash".to_string(),
+            dirty: None,
             mount_graph: None,
             bundled_types: Some(bundled_types.to_string()),
             type_manifest: None,

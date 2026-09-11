@@ -27,6 +27,15 @@
 //! unparseable file permanently red. The same line divides an environmental
 //! sidecar failure from a repeatable one; see
 //! [`crate::services::type_sidecar::SidecarError::is_environmental`].
+//!
+//! A file the model was deliberately not asked about is the other side of
+//! that line, and it is counted separately (carrick#555). When a budget says
+//! no, the cloud answers `llm_disabled` and every call fails individually;
+//! recording those as lost files made the run fail before the upload, so an
+//! organisation past its allowance got no index at all — the opposite of the
+//! ruling, which is that the scan completes facts-only and says so. The
+//! categories and their codes are pinned in carrick-cloud
+//! `docs/internal/reference/laptop-scan-seam.md` C1.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -60,6 +69,11 @@ struct Registry {
     attempted: usize,
     /// One entry per file the analyzer never answered for: (path, reason code).
     lost: Vec<(String, String)>,
+    /// One entry per file the model was deliberately not asked about, because
+    /// a budget refused the call. Not a loss the scan can fix by re-running,
+    /// and not a reason to fail: the file keeps its deterministic rows and its
+    /// candidates are simply not refreshed this run (carrick#555).
+    not_refreshed: Vec<String>,
     /// One entry per scope that got no type layer: (scope, reason). The scope
     /// is a service name, or [`WHOLE_SCAN`] when the sidecar never became
     /// ready at all and every service in the run is typeless.
@@ -75,6 +89,29 @@ impl Registry {
     /// Records that `path` has no analysis, and why.
     fn record_unanalysed_file(&mut self, path: &str, reason: &str) {
         self.lost.push((path.to_string(), reason.to_string()));
+    }
+
+    /// Records that the model was not asked about `path`, on purpose.
+    fn record_candidates_not_refreshed(&mut self, path: &str) {
+        self.not_refreshed.push(path.to_string());
+    }
+
+    /// One line naming how many files the budget refused, or `None`.
+    ///
+    /// Deliberately says nothing about which budget or until when: the cloud
+    /// owns that sentence (`allowance_sentence`, printed at the top of the
+    /// run) and a second, guessed version of it here would contradict it.
+    fn not_refreshed_line(&self) -> Option<String> {
+        if self.not_refreshed.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{} of {} files were not sent to the model: this workspace is past an inference \
+             allowance. They keep the rows the deterministic layer stated and their candidates \
+             were not refreshed this run",
+            self.not_refreshed.len(),
+            self.attempted
+        ))
     }
 
     /// Records that `scope` has no type layer this run, and why.
@@ -203,6 +240,45 @@ pub fn record_unanalysed_file(path: &str, reason: &str) {
         .record_unanalysed_file(path, reason);
 }
 
+/// Records that the model was deliberately not asked about `path`.
+///
+/// Not a lost file: nothing failed, a budget said no. The run does not fail,
+/// the file is not named in `unanalysed_files` on the upload, and the index
+/// keeps every row the deterministic layer stated about it.
+pub fn record_candidates_not_refreshed(path: &str) {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .record_candidates_not_refreshed(path);
+}
+
+/// Whether a failed analyzer call is a file this run LOST, as opposed to one
+/// it was told not to ask about.
+///
+/// Two codes are not losses, for different reasons:
+///
+/// - [`crate::agent_service::QUOTA_ABORT_CODE`]: the process-global breaker is
+///   open, so this call was never attempted. The breaker fails the run on its
+///   own terms.
+/// - [`crate::agent_service::LLM_DISABLED_CODE`]: a budget refused the call,
+///   whatever `details.reason` says. The ruling is that the scan completes
+///   facts-only and never fails, so counting these would abort the run before
+///   the upload and leave the organisation with no index (carrick#555).
+///
+/// Everything else — the model was asked and did not answer — is a loss.
+pub fn counts_as_lost_file(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<crate::agent_service::AgentCallError>()
+        .is_none_or(|e| !e.is_quota_abort() && !e.is_budget_refusal())
+}
+
+/// Whether a failed analyzer call means a budget refused it.
+pub fn is_budget_refusal(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<crate::agent_service::AgentCallError>()
+        .is_some_and(|e| e.is_budget_refusal())
+}
+
 /// Reason code for a failed file analysis, for [`record_unanalysed_file`].
 ///
 /// Reads the cloud's own error code where the failure came from a lambda call,
@@ -231,6 +307,33 @@ pub fn attempted_count() -> usize {
 /// One line naming what the run lost and why, or `None` when it lost nothing.
 pub fn summary_line() -> Option<String> {
     registry().lock().expect("scan health lock").summary_line()
+}
+
+/// One line naming how many files a budget refused, or `None` when none were.
+pub fn not_refreshed_line() -> Option<String> {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .not_refreshed_line()
+}
+
+/// The files this run lost, in the shape the upload reports them.
+///
+/// Only the second category: a file the model was asked about and did not
+/// answer for. A file a budget refused is never here, so the cloud's
+/// first-scan partial rule is never asked to accept a partial index that is
+/// only partial because the organisation is out of allowance.
+pub fn unanalysed_files() -> Vec<crate::cloud_storage::UnanalysedFile> {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .lost
+        .iter()
+        .map(|(path, reason)| crate::cloud_storage::UnanalysedFile {
+            path: path.clone(),
+            reason: reason.clone(),
+        })
+        .collect()
 }
 
 /// Whether [`ALLOW_PARTIAL_ENV`] is set for this run.
@@ -304,6 +407,90 @@ mod tests {
     /// the race #683 fixed, and the reason there is no `reset()` to call.
     fn run() -> Registry {
         Registry::default()
+    }
+
+    /// carrick#555, the incident this split exists for. On 2026-08-23 a daily
+    /// cap answered every analyzer call with `llm_disabled`; each one was
+    /// recorded as a lost file, the lost-file gate then failed the run, and
+    /// every scan in the installation ended with exit 1 and no index — while
+    /// its own message said the scan continues.
+    ///
+    /// The rule is that a file a budget refused is not a file the scan lost:
+    /// nothing failed, the model was not asked. It is counted on its own line,
+    /// the run does not fail, and the upload proceeds facts-only.
+    #[test]
+    fn a_budget_refusal_is_not_a_lost_file_and_does_not_fail_the_run() {
+        let refused = AgentCallError {
+            code: crate::agent_service::LLM_DISABLED_CODE.to_string(),
+            message: "past the monthly allowance".to_string(),
+            retriable: false,
+        };
+        assert!(!counts_as_lost_file(&refused));
+        assert!(is_budget_refusal(&refused));
+
+        let mut registry = run();
+        registry.record_files_attempted(3);
+        for path in ["src/a.ts", "src/b.ts", "src/c.ts"] {
+            assert!(!counts_as_lost_file(&refused));
+            registry.record_candidates_not_refreshed(path);
+        }
+
+        assert_eq!(registry.lost_file_count(), 0);
+        assert!(registry.summary_line().is_none(), "nothing was lost");
+        assert!(!should_fail_run(registry.lost_file_count(), false));
+
+        let line = registry.not_refreshed_line().expect("the run says so");
+        assert!(
+            line.contains("3 of 3 files were not sent to the model"),
+            "{line}"
+        );
+        assert!(line.contains("not refreshed"), "{line}");
+    }
+
+    /// The other half of the split, which must keep working exactly as it did:
+    /// the model WAS asked and did not answer, so the file is lost, the run
+    /// fails, and the upload is skipped so a thinner index cannot overwrite a
+    /// good one (#461).
+    #[test]
+    fn a_call_that_was_made_and_failed_is_still_a_lost_file() {
+        let failed = AgentCallError {
+            code: "model_error".to_string(),
+            message: "the model returned nothing".to_string(),
+            retriable: true,
+        };
+        assert!(counts_as_lost_file(&failed));
+        assert!(!is_budget_refusal(&failed));
+
+        let mut registry = run();
+        registry.record_files_attempted(2);
+        registry.record_unanalysed_file("src/a.ts", &analysis_failure_reason(&failed));
+        assert_eq!(registry.lost_file_count(), 1);
+        assert!(should_fail_run(registry.lost_file_count(), false));
+        assert!(registry.not_refreshed_line().is_none());
+        assert!(registry.summary_line().unwrap().contains("model_error"));
+    }
+
+    /// A call the quota breaker aborted was never attempted, and the breaker
+    /// fails the run on its own terms. It is neither category.
+    #[test]
+    fn a_quota_abort_is_neither_a_loss_nor_a_budget_refusal() {
+        let aborted = AgentCallError {
+            code: crate::agent_service::QUOTA_ABORT_CODE.to_string(),
+            message: "breaker open".to_string(),
+            retriable: false,
+        };
+        assert!(!counts_as_lost_file(&aborted));
+        assert!(!is_budget_refusal(&aborted));
+    }
+
+    /// A failure that never produced an envelope is a loss: the scanner cannot
+    /// know it was refused on purpose, so it must not assume it was.
+    #[test]
+    fn an_untyped_failure_counts_as_a_loss() {
+        let untyped = std::io::Error::other("connection reset");
+        assert!(counts_as_lost_file(&untyped));
+        assert!(!is_budget_refusal(&untyped));
+        assert_eq!(analysis_failure_reason(&untyped), "unparseable_response");
     }
 
     /// A run that lost nothing says nothing and passes.

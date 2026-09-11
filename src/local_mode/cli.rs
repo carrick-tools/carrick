@@ -17,7 +17,17 @@ pub enum LocalCommand {
     /// Read the shared workspace/service proposal without scanning or writing.
     Derive { workspace: Option<PathBuf> },
     /// Scan every repo the workspace lists, and build the index.
-    Index { workspace: Option<PathBuf> },
+    Index {
+        workspace: Option<PathBuf>,
+        /// Ask Carrick Cloud to classify what the deterministic passes could
+        /// not, and upload the result.
+        ///
+        /// Off by default and deliberately so: a local index costs nothing and
+        /// runs from a hook, and inference is paid analysis. `carrick init`
+        /// turns it on for the first run, which is the one that has nothing to
+        /// read yet.
+        infer: bool,
+    },
     /// What is on the other side of this file.
     Touch {
         file: PathBuf,
@@ -72,6 +82,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     let mut workspace: Option<PathBuf> = None;
     let mut service: Option<String> = None;
     let mut json = false;
+    let mut infer = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut index = 0;
@@ -92,6 +103,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
                 service = Some(value.clone());
             }
             "--json" => json = true,
+            "--infer" => infer = true,
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -102,6 +114,13 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             other => positional.push(other.to_string()),
         }
         index += 1;
+    }
+
+    // Only `index` infers. Accepting the flag elsewhere and ignoring it would
+    // let someone ask a hook-driven command to do the paid thing and believe
+    // it had.
+    if infer && name != "index" {
+        return Err(format!("unknown option for `carrick {name}`: --infer"));
     }
 
     match name {
@@ -119,7 +138,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             {
                 workspace = Some(PathBuf::from(first));
             }
-            Ok(LocalCommand::Index { workspace })
+            Ok(LocalCommand::Index { workspace, infer })
         }
         "refresh" => Ok(LocalCommand::Refresh { service, workspace }),
         "status" => {
@@ -168,15 +187,20 @@ pub fn run(command: LocalCommand) -> i32 {
                 1
             }
         },
-        LocalCommand::Index { workspace } => match build(workspace.as_deref(), None) {
-            Ok(()) => 0,
-            Err(message) => {
-                eprintln!("carrick index: {message}");
-                1
+        LocalCommand::Index { workspace, infer } => {
+            match build(workspace.as_deref(), None, infer) {
+                Ok(()) => 0,
+                Err(message) => {
+                    eprintln!("carrick index: {message}");
+                    1
+                }
             }
-        },
+        }
         LocalCommand::Refresh { service, workspace } => {
-            match build(workspace.as_deref(), service.as_deref()) {
+            // Never inferred. `refresh` runs from a session-start hook, and a
+            // hook that spends real money every time an editor opens is not a
+            // feature.
+            match build(workspace.as_deref(), service.as_deref(), false) {
                 Ok(()) => 0,
                 Err(message) => {
                     eprintln!("carrick refresh: {message}");
@@ -243,7 +267,12 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
 }
 
 /// `index` and `refresh`: scan, join, write, and print the map.
-fn build(root: Option<&Path>, service: Option<&str>) -> Result<(), String> {
+///
+/// `infer` makes each repo's scan a laptop scan: the model classifies what the
+/// deterministic passes could not, the result is uploaded, and the same
+/// payload is written to this build's cache directory so the read model comes
+/// from the run that produced it (carrick#956 §8.3).
+fn build(root: Option<&Path>, service: Option<&str>, infer: bool) -> Result<(), String> {
     // Build detection starts where the user asked. A parent's existing index
     // is useful to read commands, but must not widen this build's repo list.
     let root = root
@@ -279,7 +308,13 @@ fn build(root: Option<&Path>, service: Option<&str>) -> Result<(), String> {
         );
     }
 
-    let outcome = super::index::run(&workspace, service)?;
+    if infer {
+        eprintln!(
+            "carrick: this scan asks Carrick Cloud to classify what the deterministic passes \
+             could not, and uploads the result. It is the paid analysis; later scans read it."
+        );
+    }
+    let outcome = super::index::run(&workspace, service, infer)?;
     print_map(&outcome);
     Ok(())
 }
@@ -373,13 +408,17 @@ fn print_help() {
 
 USAGE:
     carrick derive  [--workspace <dir>] --json
-    carrick index   [--workspace <dir>]
+    carrick index   [--workspace <dir>] [--infer]
     carrick status  [--workspace <dir>] [--json]
     carrick touch   <file> [--workspace <dir>] [--json]
     carrick check   <file> [--workspace <dir>] [--json]
     carrick refresh [--service <name>] [--workspace <dir>]
 
     derive     Print the workspace and service proposal without writing files.
+    --infer on `index` asks Carrick Cloud to classify what the deterministic
+    passes could not and uploads the result. Off everywhere else, including
+    `refresh`, which runs from a hook.
+
     index      Detect repositories, apply optional workspace overrides and
                write <dir>/.carrick/. No model runs on this machine.
     status     What the workspace holds: every service, the commit it was
@@ -465,7 +504,27 @@ mod tests {
             parsed,
             LocalCommand::Index {
                 workspace: Some(PathBuf::from("/w")),
+                infer: false,
             }
+        );
+    }
+
+    /// Inference is paid analysis, so it is asked for and never assumed. The
+    /// command that runs from a session-start hook does not take the flag at
+    /// all, which is why it is on `Index` and not on `Refresh`.
+    #[test]
+    fn inference_is_opt_in_on_index_and_unavailable_to_refresh() {
+        let parsed = parse(&args(&["index", "/w", "--infer"])).unwrap().unwrap();
+        assert_eq!(
+            parsed,
+            LocalCommand::Index {
+                workspace: Some(PathBuf::from("/w")),
+                infer: true,
+            }
+        );
+        assert_eq!(
+            parse(&args(&["refresh", "--infer"])).unwrap(),
+            Err("unknown option for `carrick refresh`: --infer".to_string())
         );
     }
 
