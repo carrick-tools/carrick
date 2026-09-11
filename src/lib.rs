@@ -22,6 +22,7 @@ pub mod findings;
 pub mod formatter;
 pub mod framework_detector;
 pub mod graphql;
+pub mod help;
 pub mod import_bindings;
 pub mod imported_request_member;
 pub mod intent_generator;

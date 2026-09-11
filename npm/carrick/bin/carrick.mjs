@@ -94,22 +94,37 @@ async function printVersion() {
   process.stdout.write(`${version}\n`);
 }
 
+/**
+ * The commands this package adds to the binary's own.
+ *
+ * Printed after the scanner's help rather than woven into it: the binary is
+ * spawned for that text and answers none of these names, so its groups are
+ * repeated here as headings instead of being interleaved (carrick#976).
+ */
 function extraHelp() {
   return [
+    "This package carries the commands that put those answers where you work.",
     "",
-    "This package also carries the commands that put those answers where you work:",
+    "WORKSPACE:",
+    "    init [--project SLUG]        set up this folder: the repos to index, the",
+    "                                 first index, and the editor and agent wiring;",
+    "                                 with a project, verify every repo is in it",
     "",
-    "    carrick login                sign in to a Carrick workspace",
-    "    carrick logout               remove the saved local credential",
-    "    carrick init [--project X]   set up this folder: the repos to index, the first",
-    "                                 index, and the editor and agent wiring; with a",
-    "                                 project, verify every repo is assigned to it",
-    "    carrick lsp --stdio          the language server, for an editor or an agent",
+    "ACCOUNT:",
+    "    login                        sign in to a Carrick workspace",
+    "    logout                       remove the saved local credential",
+    "",
+    "INTEGRATION:",
+    "    lsp --stdio                  the language server, for an editor or an agent",
     "                                 that speaks LSP",
-    "    carrick hook post-edit       Claude Code PostToolUse hook (reads the tool",
+    "    hook post-edit               Claude Code PostToolUse hook (reads the tool",
     "                                 payload on stdin)",
-    "    carrick hook session-start   Claude Code SessionStart hook",
-    "    carrick templates workflow   print the CI workflow to add to a repo",
+    "    hook session-start           Claude Code SessionStart hook",
+    "    templates <name>             print a file to add to a repo: workflow, or",
+    "                                 carrick.json",
+    "    --version                    the version of this package",
+    "",
+    "`carrick init --help` prints its own arguments.",
     "",
   ].join("\n");
 }

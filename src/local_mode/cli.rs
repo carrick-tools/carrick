@@ -54,14 +54,15 @@ impl LocalCommand {
     }
 }
 
+/// Every subcommand the binary answers. `carrick --help` names each one with a
+/// description, and the test in `src/help.rs` holds it to this list.
+pub const LOCAL_COMMANDS: [&str; 6] = ["derive", "index", "refresh", "status", "check", "touch"];
+
 /// Read a local command from the argument list, or `None` when the first
-/// argument is not one of the four names.
+/// argument is not one of those names.
 pub fn parse(args: &[String]) -> Option<Result<LocalCommand, String>> {
     let name = args.first()?.as_str();
-    if !matches!(
-        name,
-        "derive" | "index" | "touch" | "check" | "refresh" | "status"
-    ) {
+    if !LOCAL_COMMANDS.contains(&name) {
         return None;
     }
     Some(parse_command(name, &args[1..]))

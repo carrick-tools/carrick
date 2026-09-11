@@ -22,6 +22,7 @@ mod findings;
 mod formatter;
 mod framework_detector;
 mod graphql;
+mod help;
 mod import_bindings;
 mod imported_request_member;
 mod intent_generator;
@@ -117,51 +118,7 @@ impl CliArgs {
     }
 
     fn print_help() {
-        eprintln!(
-            r#"Carrick - API Contract Analyzer
-
-USAGE:
-    carrick [OPTIONS] [REPO_PATH]
-
-ARGUMENTS:
-    [REPO_PATH]    Path to the repository to analyze (default: current directory)
-
-OPTIONS:
-    -h, --help     Print this help message
-    -v, --verbose  Enable verbose (debug-level) terminal output
-    --no-cache     Skip incremental cache and run a full analysis
-
-ENVIRONMENT VARIABLES:
-    ACTIONS_ID_TOKEN_REQUEST_URL    GitHub Actions OIDC token endpoint (auto-set
-                                    when the job grants `id-token: write`)
-    ACTIONS_ID_TOKEN_REQUEST_TOKEN  Bearer token for the OIDC endpoint (auto-set)
-    CARRICK_MOCK_ALL                Use mock storage instead of Carrick Cloud
-    CARRICK_API_ENDPOINT            API endpoint for the carrick service (build-time)
-    CARRICK_INTENT_CONCURRENCY      Concurrent function-intent requests (default 8).
-                                    Lower it if a large repo loses intents to
-                                    backend overload; capped by
-                                    CARRICK_CONCURRENCY_LIMIT
-    CARRICK_ALLOW_PARTIAL_ANALYSIS  Upload and exit 0 even when files were not
-                                    analysed. Off by default: a run that lost
-                                    analyzer results is reported and fails,
-                                    rather than overwriting the index with a
-                                    thinner one
-    CARRICK_SIDECAR_DIR             Directory holding the type sidecar's
-                                    dist/src/index.js. Set by the npm package,
-                                    where the binary and the sidecar install
-                                    into different directories; a source
-                                    checkout finds it without this
-    CARRICK_SIDECAR_READY_TIMEOUT_SECS
-                                    How long to wait for the type sidecar to
-                                    build its TypeScript program (default 180).
-                                    Raise it for a large monorepo whose
-                                    dependencies are installed
-    CARRICK_ALLOW_MISSING_TYPES     Scan and exit 0 even when the type sidecar
-                                    never became ready. Off by default: such a
-                                    run would index every endpoint with no
-                                    request or response types
-"#
-        );
+        eprintln!("{}", crate::help::HELP);
     }
 }
 
