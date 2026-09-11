@@ -7,6 +7,10 @@
 //! the edges live in `function_definitions[].calls` and that is what the
 //! cross-service caller join inverts.
 //!
+//! The last site in the fixture is written at module scope (carrick#965), so
+//! its owner is the file rather than a function; the same blob field carries
+//! it, under the file-qualified `<module>` key.
+//!
 //! Pre-fix baseline: `call_graph` resolved neither half of these sites — a
 //! receiver bound to an instance resolved to nothing, and a non-relative
 //! specifier resolved to nothing — so both positive assertions FAIL on the
@@ -156,6 +160,30 @@ fn a_this_field_receiver_records_an_edge_into_the_sibling_package() {
                 callee: "RunClient.fetchStream".to_string(),
                 callee_file: "packages/core/src/v2/client/index.ts".to_string(),
                 call_site_line: 45,
+            }]
+            .as_slice()
+        ),
+        "all edges were {edges:?}"
+    );
+}
+
+/// A call written at MODULE SCOPE (carrick#965). It belongs to no function, so
+/// the blob records it against the FILE — a definition key the source never
+/// declares — and `createRunClient` has a caller instead of reading as
+/// uncalled. Fails on the pre-fix scanner by construction: the key does not
+/// exist there at all.
+#[test]
+fn a_module_scope_call_records_an_edge_against_the_file() {
+    let edges = scan_edges();
+    assert_eq!(
+        edges
+            .get("<module>@packages/app/src/reader.ts")
+            .map(Vec::as_slice),
+        Some(
+            [Edge {
+                callee: "createRunClient".to_string(),
+                callee_file: "packages/core/src/v2/client/index.ts".to_string(),
+                call_site_line: 89,
             }]
             .as_slice()
         ),

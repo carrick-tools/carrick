@@ -50,6 +50,15 @@
 //! carries the sibling's file, which is exactly what the cross-service join
 //! needs to invert it.
 //!
+//! A call site's OWNER is the innermost function that contains it, and where
+//! no function does — `const logger = createLogger("x")` at module scope — the
+//! file itself ([`crate::visitor::MODULE_SCOPE_KEY`], carrick#965). Without
+//! that owner the call was recorded nowhere, so a function called only from
+//! module scope read as having no callers at all, which is the shape loggers,
+//! clients and database handles are usually used in. The file's row is
+//! qualified with its path by [`merge_definitions`] and kept only where it
+//! resolved at least one edge.
+//!
 //! Resolution is keyed on **(file, definition key)** throughout, taken from the
 //! per-file extractor output rather than from the merged function map, so a
 //! correct call edge never depends on which file happened to be walked last.
@@ -232,7 +241,12 @@ pub fn merge_definitions(
     for (path, file_definitions) in per_file {
         let relative = crate::engine::repo_relative(&path.to_string_lossy(), repo_root);
         for (key, definition) in file_definitions {
-            if colliding.contains_key(&key) {
+            // The module-scope owner IS a file (carrick#965), so its key
+            // carries one whether or not a second file also has one: an
+            // unqualified `<module>` would be one key making a different
+            // statement in every file it appears in, and a reader of a caller
+            // row could not tell which file it named.
+            if colliding.contains_key(&key) || key == crate::visitor::MODULE_SCOPE_KEY {
                 let merged = format!("{key}{FILE_QUALIFIER}{relative}");
                 keys.by_key
                     .entry(key)
@@ -337,6 +351,16 @@ pub fn resolve_call_edges(
             }
 
             dedupe_edges(&mut edges);
+
+            // The file-level owner exists only where it holds an edge
+            // (carrick#965). Module-scope calls into an external package or
+            // into a global resolve to nothing, and a row carrying an empty
+            // list says nothing a reader can use — it would just be one more
+            // row in every blob.
+            if caller_key == crate::visitor::MODULE_SCOPE_KEY && edges.is_empty() {
+                function_definitions.remove(caller_row);
+                continue;
+            }
 
             if let Some(def) = function_definitions.get_mut(caller_row) {
                 def.calls = edges;
@@ -2128,6 +2152,159 @@ mod tests {
         ]);
 
         assert!(callee_names(&defs, "Manager.read").is_empty());
+        drop(dir);
+    }
+
+    /// Every definition key the merged map holds for a file's module scope.
+    fn module_scope_keys(defs: &HashMap<String, FunctionDefinition>) -> Vec<String> {
+        let mut keys: Vec<String> = defs
+            .keys()
+            .filter(|key| key.starts_with(crate::visitor::MODULE_SCOPE_KEY))
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// A call written at MODULE SCOPE, through a workspace package import —
+    /// the shape a service entry point uses for its logger, its clients and
+    /// its database handle (carrick#965). It sits inside no function, so
+    /// before the file itself became an owner nothing recorded it and
+    /// `createLogger` read as having no callers at all.
+    #[test]
+    fn a_module_scope_call_is_recorded_against_the_file() {
+        let (dir, defs) = scan_service(
+            &[
+                (
+                    "package.json",
+                    r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+                ),
+                (
+                    "packages/core/package.json",
+                    r#"{"name":"@fixture/core","main":"./src/index.ts"}"#,
+                ),
+                (
+                    "packages/core/src/index.ts",
+                    "export function createLogger(name: string) {\n  return name;\n}\n",
+                ),
+                (
+                    "packages/app/package.json",
+                    r#"{"name":"@fixture/app","dependencies":{"@fixture/core":"workspace:*"}}"#,
+                ),
+                (
+                    "packages/app/src/index.ts",
+                    "import { createLogger } from \"@fixture/core\";\n\n\
+                     export const logger = createLogger(\"app\");\n",
+                ),
+            ],
+            "packages/app",
+        );
+
+        let key = "<module>@packages/app/src/index.ts";
+        assert_eq!(module_scope_keys(&defs), [key]);
+        assert_eq!(callee_names(&defs, key), ["createLogger"]);
+        assert_eq!(defs[key].calls[0].call_site_line, 3);
+        assert!(
+            callee_files(&defs, key)[0].ends_with("packages/core/src/index.ts"),
+            "the edge must point into the sibling package: {:?}",
+            callee_files(&defs, key)
+        );
+        drop(dir);
+    }
+
+    /// The file is the owner of LAST resort. A call inside a function belongs
+    /// to that function and must not be recorded twice, and a file whose calls
+    /// all have a function around them gets no row of its own.
+    #[test]
+    fn a_call_inside_a_function_leaves_the_file_no_row() {
+        let (dir, defs) = scan(&[
+            ("helper.ts", "export function helper() {\n  return 1;\n}\n"),
+            (
+                "app.ts",
+                "import { helper } from \"./helper\";\n\
+                 export function run() {\n  return helper();\n}\n",
+            ),
+        ]);
+
+        assert_eq!(callee_names(&defs, "run"), ["helper"]);
+        assert!(
+            module_scope_keys(&defs).is_empty(),
+            "no file owns a call here: {:?}",
+            module_scope_keys(&defs)
+        );
+        drop(dir);
+    }
+
+    /// A module-scope call inside a construct that carries no definition row —
+    /// an anonymous IIFE — has no function to belong to either, so the file
+    /// keeps it, once.
+    #[test]
+    fn a_module_scope_iife_leaves_its_calls_with_the_file() {
+        let (dir, defs) = scan(&[
+            ("helper.ts", "export function helper() {\n  return 1;\n}\n"),
+            (
+                "boot.ts",
+                "import { helper } from \"./helper\";\n\
+                 (() => {\n  helper();\n})();\n",
+            ),
+        ]);
+
+        let key = "<module>@boot.ts";
+        assert_eq!(module_scope_keys(&defs), [key]);
+        assert_eq!(callee_names(&defs, key), ["helper"]);
+        drop(dir);
+    }
+
+    /// Module-scope calls that resolve to nothing — an external package, a
+    /// global — leave no row behind: a file-level owner holding an empty list
+    /// states nothing.
+    #[test]
+    fn module_scope_calls_that_resolve_to_nothing_leave_no_row() {
+        let (dir, defs) = scan(&[
+            ("package.json", r#"{"name":"root"}"#),
+            (
+                "index.ts",
+                "import express from \"express\";\n\
+                 export const app = express();\n\
+                 console.log(\"listening\");\n",
+            ),
+        ]);
+
+        assert!(
+            module_scope_keys(&defs).is_empty(),
+            "nothing resolved, so nothing should be recorded: {:?}",
+            module_scope_keys(&defs)
+        );
+        drop(dir);
+    }
+
+    /// Two files calling at module scope keep one row each, and the key says
+    /// which file it is — the module key is always qualified, however many
+    /// files have one.
+    #[test]
+    fn each_file_owns_its_own_module_scope_row() {
+        let (dir, defs) = scan(&[
+            (
+                "helper.ts",
+                "export function helper() {\n  return 1;\n}\n\
+                 export function other() {\n  return 2;\n}\n",
+            ),
+            (
+                "first.ts",
+                "import { helper } from \"./helper\";\nexport const a = helper();\n",
+            ),
+            (
+                "second.ts",
+                "import { other } from \"./helper\";\nexport const b = other();\n",
+            ),
+        ]);
+
+        assert_eq!(
+            module_scope_keys(&defs),
+            ["<module>@first.ts", "<module>@second.ts"]
+        );
+        assert_eq!(callee_names(&defs, "<module>@first.ts"), ["helper"]);
+        assert_eq!(callee_names(&defs, "<module>@second.ts"), ["other"]);
         drop(dir);
     }
 }

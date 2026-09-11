@@ -37,6 +37,10 @@ struct SigTarget {
 
 /// Populate `signature` on every function definition, filling unannotated
 /// param/return types via the sidecar when one is available and ready.
+///
+/// The file-level owner of module-scope calls is not a function (carrick#965):
+/// it is skipped here as well as in the inference requests, or its row would
+/// claim `() => unknown` — a signature for something that has none.
 pub fn populate_function_signatures(
     sidecar: Option<&TypeSidecar>,
     function_definitions: &mut HashMap<String, FunctionDefinition>,
@@ -50,6 +54,9 @@ pub fn populate_function_signatures(
     }
 
     for def in function_definitions.values_mut() {
+        if def.name == crate::visitor::MODULE_SCOPE_KEY {
+            continue;
+        }
         def.signature = Some(compose_signature(def));
     }
 }
@@ -129,6 +136,13 @@ fn build_infer_requests(
 
     for name in names {
         let def = &function_definitions[name];
+        // The file-level owner of module-scope calls (carrick#965) is not a
+        // function: it has no return to infer and no parameter to type, and
+        // asking the sidecar about its first line would stamp whatever lives
+        // there onto the row.
+        if def.name == crate::visitor::MODULE_SCOPE_KEY {
+            continue;
+        }
         let file_path = to_absolute_path(&def.file_path.to_string_lossy(), repo_root_absolute);
 
         if def.return_type.is_none() {
@@ -290,6 +304,31 @@ mod tests {
             intent_input_hash: None,
             dispatch_table: None,
         }
+    }
+
+    /// The file-level owner of module-scope calls (carrick#965) is not a
+    /// function, so it is left without a signature rather than given
+    /// `() => unknown` — a row that claims a shape it does not have.
+    #[test]
+    fn the_module_scope_owner_is_left_without_a_signature() {
+        let mut module_owner = def(vec![], None);
+        module_owner.name = crate::visitor::MODULE_SCOPE_KEY.to_string();
+        let mut definitions = HashMap::from([
+            (crate::visitor::MODULE_SCOPE_KEY.to_string(), module_owner),
+            ("readRun".to_string(), def(vec![], Some("void"))),
+        ]);
+
+        populate_function_signatures(None, &mut definitions, ".");
+
+        assert_eq!(
+            definitions[crate::visitor::MODULE_SCOPE_KEY].signature,
+            None,
+            "the file owns calls, not a callable shape"
+        );
+        assert_eq!(
+            definitions["readRun"].signature.as_deref(),
+            Some("() => void")
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ existed.
 default condition names build output, and the source is what the scan has to
 read.
 
-Four of the ten sites in `packages/app/src/reader.ts` record an edge. The
+Five of the eleven sites in `packages/app/src/reader.ts` record an edge. The
 other six are answer keys for what must NOT resolve:
 
 - `readUnbound` — the receiver is a cast, so the file declares no class.
@@ -39,6 +39,13 @@ body declares as plainly as an annotated parameter does.
 than by a statement the file makes: the file names no class at all, only the
 package its receiver's value came out of, and `subscribeToRun` is declared by
 exactly one class across that package's surface (carrick#781).
+
+`bootClient` is the fifth, and the only site that belongs to no function at
+all: `createRunClient(...)` is written at MODULE SCOPE, the shape a service
+entry point uses for its logger, its clients and its database handle
+(carrick#965). Its edge is recorded against the file —
+`<module>@packages/app/src/reader.ts` — rather than against a function, so the
+answer key here is a definition key the source never declares.
 
 Every `__llm__` cassette is empty, so a row exists here only because a
 deterministic pass emitted it.

@@ -18,3 +18,11 @@ export class RunClient {
     throw new Error(`not implemented: ${url}`);
   }
 }
+
+/**
+ * The factory a consumer calls once, at import time, to get its client — the
+ * shape a module-scope `const` reaches for.
+ */
+export function createRunClient(baseUrl: string): RunClient {
+  return new RunClient(baseUrl);
+}

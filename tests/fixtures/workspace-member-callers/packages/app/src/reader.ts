@@ -1,4 +1,4 @@
-import { RunClient, runClientManager } from "@fixture/core/v2";
+import { RunClient, createRunClient, runClientManager } from "@fixture/core/v2";
 import type { VendorClient } from "vendor-runs";
 
 /**
@@ -80,3 +80,10 @@ export function readContestedByOrigin(runId: string) {
   const nested = (client: VendorClient) => client.subscribeToRun(runId);
   return nested;
 }
+
+/**
+ * A call at MODULE SCOPE (carrick#965). It sits inside no function, so until
+ * the file itself became an owner nothing recorded it, and `createRunClient`
+ * read as having no callers at all.
+ */
+export const bootClient = createRunClient("https://runs.example.test");
