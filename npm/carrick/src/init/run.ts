@@ -248,9 +248,16 @@ export async function init(argv: string[]): Promise<number> {
       say,
     });
     if (project !== null && !reposAreInProject(identity, names, project)) {
-      throw new Error(
-        `Project "${project}" was not verified for every requested repo. Complete the browser steps and run carrick init --project ${project} again.`,
-      );
+      // A project NAMED on the command line is a requirement, and an
+      // unverified one fails the run. A project picked during the step is not:
+      // stopping there would cost someone their hooks and their proposal for
+      // answering a question they were offered (carrick#987).
+      if (parsed.project !== null) {
+        throw new Error(
+          `Project "${project}" was not verified for every requested repo. Complete the browser steps and run carrick init --project ${project} again.`,
+        );
+      }
+      say(`Setup continues; finish the browser steps to put these repos in "${project}".`);
     }
     say(`Carrick workspace: ${identity.workspace.slug}`);
     if (identity.allowance_sentence) say(identity.allowance_sentence);
