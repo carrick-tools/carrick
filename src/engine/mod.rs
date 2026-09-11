@@ -31,7 +31,7 @@ use crate::url_normalizer::UrlNormalizer;
 use crate::utils::get_repository_name;
 use crate::visitor::{FunctionDefinition, FunctionDefinitionExtractor, ImportSymbolExtractor};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -105,7 +105,7 @@ pub(crate) const CACHE_VERSION: u32 = 22;
 type FileDiscoveryResult = Result<
     (
         Vec<PathBuf>,
-        HashMap<String, crate::visitor::ImportedSymbol>,
+        BTreeSet<crate::visitor::ImportedSymbol>,
         HashMap<String, FunctionDefinition>,
         String,
     ),
@@ -1355,7 +1355,7 @@ async fn analyze_current_repo_incremental(
 
     // Discover files and symbols (fast SWC pass, always full), scoped to the service
     let cm: Lrc<SourceMap> = Default::default();
-    let (files, all_imported_symbols, function_definitions, repo_name) =
+    let (files, all_import_facts, function_definitions, repo_name) =
         discover_files_and_symbols(repo_path, config, cm.clone())?;
     crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
 
@@ -1468,11 +1468,11 @@ async fn analyze_current_repo_incremental(
                     };
                     (det.clone(), guid.clone(), extraction)
                 } else {
-                    run_framework_detection_and_guidance(packages, &all_imported_symbols).await?
+                    run_framework_detection_and_guidance(packages, &all_import_facts).await?
                 }
             } else {
                 debug!("package.json changed, re-running framework detection");
-                run_framework_detection_and_guidance(packages, &all_imported_symbols).await?
+                run_framework_detection_and_guidance(packages, &all_import_facts).await?
             };
 
             // What this scan actually dispatches is decided per file inside the
@@ -1575,13 +1575,8 @@ async fn analyze_current_repo_incremental(
             // so cross-file staleness no longer slips through.
             let mut function_definitions = function_definitions;
             let prev_intents = intents_by_hash(&prev.function_definitions);
-            generate_function_intents(
-                &agent_service,
-                &mut function_definitions,
-                &all_imported_symbols,
-                &prev_intents,
-            )
-            .await;
+            generate_function_intents(&agent_service, &mut function_definitions, &prev_intents)
+                .await;
             crate::phase_timing::mark(crate::phase_timing::Phase::Intents);
 
             // Compose function signatures, inferring unannotated slots via sidecar.
@@ -1784,7 +1779,7 @@ async fn analyze_current_repo_incremental(
 /// cached together under the package_json_hash gate.
 async fn run_framework_detection_and_guidance(
     packages: &Packages,
-    imported_symbols: &HashMap<String, crate::visitor::ImportedSymbol>,
+    import_facts: &BTreeSet<crate::visitor::ImportedSymbol>,
 ) -> Result<
     (
         DetectionResult,
@@ -1796,7 +1791,7 @@ async fn run_framework_detection_and_guidance(
     let agent_service = AgentService::new();
     let framework_detector = FrameworkDetector::new(agent_service.clone());
     let detection = framework_detector
-        .detect_frameworks_and_libraries(packages, imported_symbols)
+        .detect_frameworks_and_libraries(packages, import_facts)
         .await?;
 
     let guidance_agent = FrameworkGuidanceAgent::new(agent_service);
@@ -3558,8 +3553,15 @@ fn discover_files_and_symbols(
 
     debug!("Found {} files to analyze in {}", files.len(), repo_path);
 
-    // Extract imported symbols and function definitions by parsing files
-    let mut all_imported_symbols = HashMap::new();
+    // Extract imported symbols and function definitions by parsing files.
+    //
+    // The service-wide sample is a set of import FACTS, not a local-name-keyed
+    // map: two files importing different modules under the same local name are
+    // both facts about this service, and collapsing them onto one key would
+    // let walk order decide which module is in the framework-detect body at
+    // all (carrick#954). The per-file maps below keep their local-name keying,
+    // which is what call resolution needs.
+    let mut all_import_facts = BTreeSet::new();
     // Definitions stay per file until every file has been parsed: the merge is
     // collision-aware (#582) and can only tell a colliding key from a unique
     // one once it can see them all.
@@ -3578,7 +3580,7 @@ fn discover_files_and_symbols(
             let mut import_extractor = ImportSymbolExtractor::new();
             module.visit_with(&mut import_extractor);
             let file_imports = import_extractor.imported_symbols;
-            all_imported_symbols.extend(file_imports.clone());
+            all_import_facts.extend(file_imports.values().cloned());
 
             // Extract function definitions with type annotations and source text
             let mut func_extractor =
@@ -3631,18 +3633,13 @@ fn discover_files_and_symbols(
     );
 
     debug!(
-        "Extracted {} imported symbols and {} function definitions from {} files",
-        all_imported_symbols.len(),
+        "Extracted {} import facts and {} function definitions from {} files",
+        all_import_facts.len(),
         all_function_definitions.len(),
         files.len()
     );
 
-    Ok((
-        files,
-        all_imported_symbols,
-        all_function_definitions,
-        repo_name,
-    ))
+    Ok((files, all_import_facts, all_function_definitions, repo_name))
 }
 
 /// Resolve a repo's `carrick.json` into one service config per service.
@@ -4397,7 +4394,7 @@ async fn analyze_current_repo(
 
     // Create shared SourceMap and discover files and symbols, scoped to the service
     let cm: Lrc<SourceMap> = Default::default();
-    let (files, all_imported_symbols, function_definitions, repo_name) =
+    let (files, all_import_facts, function_definitions, repo_name) =
         discover_files_and_symbols(repo_path, config, cm.clone())?;
     debug!(
         "Repository '{}': {} files, {} function definitions",
@@ -4434,7 +4431,7 @@ async fn analyze_current_repo(
         .run_complete_analysis(
             files.clone(),
             packages,
-            &all_imported_symbols,
+            &all_import_facts,
             &service_root.to_string_lossy(),
             Path::new(repo_path),
             &graphql_producer_hints,
@@ -4455,7 +4452,6 @@ async fn analyze_current_repo(
         generate_function_intents(
             &intent_agent,
             &mut function_definitions,
-            &all_imported_symbols,
             prev_intents_by_hash,
         )
         .await;

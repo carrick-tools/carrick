@@ -24,7 +24,7 @@ use crate::{
     url_normalizer::UrlNormalizer,
     visitor::ImportedSymbol,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use swc_common::{SourceMap, sync::Lrc};
 use tracing::debug;
 
@@ -83,7 +83,10 @@ impl MultiAgentOrchestrator {
         &self,
         files: Vec<std::path::PathBuf>,
         packages: &Packages,
-        imported_symbols: &HashMap<String, ImportedSymbol>,
+        // Every distinct import fact the service's files state, ordered and
+        // deduplicated: the framework-detect body is built from it and must
+        // not vary with walk order (carrick#954).
+        import_facts: &BTreeSet<ImportedSymbol>,
         // Root for file-based route derivation: the SERVICE directory when
         // carrick.json declares one, else the repo root (see
         // `engine::service_scan_root`).
@@ -115,7 +118,7 @@ impl MultiAgentOrchestrator {
         } else {
             let framework_detector = FrameworkDetector::new(self.agent_service.clone());
             framework_detector
-                .detect_frameworks_and_libraries(packages, imported_symbols)
+                .detect_frameworks_and_libraries(packages, import_facts)
                 .await?
         };
 
