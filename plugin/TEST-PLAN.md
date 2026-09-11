@@ -157,7 +157,7 @@ CI runs these commands against a real index.
 
 | # | Command | Expected observation | Exit |
 |---|---|---|---|
-| 2.1 | `carrick init` | asks nothing until it has an identity, then lists the repos it found, writes `carrick-workspace.json` and `.claude/settings.json`, runs the first index, and prints the two lines it cannot run (the MCP line and the workflow line). Re-running says `unchanged` for both files and adds no second hook entry | 0 |
+| 2.1 | `carrick init` | asks nothing until it has an identity, then lists the repos it found, settles the project (the one they are already in, or one picked or created from the list), writes `.carrick/proposal.json` and `.claude/settings.json` and nothing else in the tree, runs no scan, and ends on the prompt that has an agent write `carrick.json` (carrick#987). Re-running adds no second hook entry | 0 |
 | 2.1b | `carrick init` with `carrick` off PATH (run the entry point by absolute path, with a PATH holding node, git and gh only) | the hook command it writes is this install's own entry point, and it says so, with `npm install -g carrick` as the way back to the short command. It also says the plugin's language server is started as a bare `carrick`, which that machine cannot resolve, so the hooks are the channel there (carrick#837, #849) | 0 |
 | 2.2 | `carrick index` | `indexed N repo(s) in X.Xs at <time>`, one line per service with route and call counts and a short commit, the counterpart link count, then each service's boundary lines. On the demo workspace this takes about 7 s for three repos (7.1 s on 0.3.48, 6.6 s on 0.3.50) | 0 |
 | 2.3 | `carrick status` | one block per service: what the index holds, the commit, how far the repo has moved since, and the boundary lines | 0 |

@@ -37,6 +37,25 @@ function assignment(identity: ResolvedRepos, name: string): string {
   return repo?.connected === true ? repo.project_slug : "not connected";
 }
 
+/**
+ * The project each requested repo is in, in the order they were requested,
+ * with null for one this workspace does not hold.
+ *
+ * The project step reads this before it asks anything: a repo that is already
+ * in a project answers the question on its own (carrick#987).
+ */
+export function projectAssignments(
+  identity: ResolvedRepos,
+  repos: string[],
+): Array<string | null> {
+  return repos.map((name) => {
+    const repo = identity.repos.find(
+      (candidate) => candidate.full_name.toLowerCase() === name.toLowerCase(),
+    );
+    return repo?.connected === true ? repo.project_slug : null;
+  });
+}
+
 function reportAssignments(
   identity: ResolvedRepos,
   repos: string[],

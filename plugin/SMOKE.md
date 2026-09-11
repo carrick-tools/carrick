@@ -33,7 +33,7 @@ export PATH="/tmp/probe/node_modules/.bin:$PATH"
 
 ```
 cd "$WS"
-carrick init                 # or: carrick index --workspace "$WS"
+carrick index --workspace "$WS"   # init sets the workspace up; it builds no index
 carrick check <a file with a route> --json | python3 -m json.tool | head -40
 carrick status --json | python3 -m json.tool | head -40
 ```

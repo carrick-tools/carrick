@@ -23,9 +23,10 @@ pub enum LocalCommand {
         /// not, and upload the result.
         ///
         /// Off by default and deliberately so: a local index costs nothing and
-        /// runs from a hook, and inference is paid analysis. `carrick init`
-        /// turns it on for the first run, which is the one that has nothing to
-        /// read yet.
+        /// runs from a hook, and inference is paid analysis. It is refused
+        /// outright until every repo in the workspace has a `carrick.json`,
+        /// because the one paid scan runs against a config someone has read
+        /// (see [`inference_refusal`]).
         infer: bool,
     },
     /// What is on the other side of this file.
@@ -286,6 +287,10 @@ fn build(root: Option<&Path>, service: Option<&str>, infer: bool) -> Result<(), 
         .or_else(|| std::env::current_dir().ok())
         .ok_or("Could not locate the working directory")?;
     let workspace = Workspace::load(&root)?;
+    // Before anything is printed about a scan that is not going to happen.
+    if infer && let Some(refusal) = inference_refusal(&workspace.repos) {
+        return Err(refusal);
+    }
     if let Some(proposal) = &workspace.parent_proposal {
         eprintln!("carrick: {}", proposal.description());
     }
@@ -317,6 +322,47 @@ fn build(root: Option<&Path>, service: Option<&str>, infer: bool) -> Result<(), 
     let outcome = super::index::run(&workspace, service, infer)?;
     print_map(&outcome);
     Ok(())
+}
+
+/// Why this workspace may not be scanned with inference yet, if it may not.
+///
+/// The inferred scan is the paid one and it is meant to run once, so it runs
+/// against a configuration a person has read rather than one a structural pass
+/// guessed (ruling in carrick-cloud#799). `carrick init` no longer writes
+/// `carrick.json`: it derives the proposal into `.carrick/proposal.json` and
+/// prints the prompt that has an agent turn it into a config. A repo that has
+/// not been through that step would be scanned with its service boundaries
+/// unstated, its env vars undeclared, and no second free attempt.
+///
+/// The free `carrick index` is unaffected: it states what it can and marks the
+/// rest unclassified, which is exactly the pass that proves a new config.
+fn inference_refusal(repos: &[PathBuf]) -> Option<String> {
+    let missing: Vec<&PathBuf> = repos
+        .iter()
+        .filter(|repo| std::fs::symlink_metadata(repo.join("carrick.json")).is_err())
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let named = missing
+        .iter()
+        .take(5)
+        .map(|repo| repo.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = missing.len().saturating_sub(5);
+    Some(format!(
+        "no carrick.json in {named}{}, and an inferred scan is the paid one, so it runs \
+         after the config exists. `carrick init` wrote the derived services to \
+         .carrick/proposal.json and printed the prompt that has an agent turn it into \
+         carrick.json; then `carrick index` states what it can for nothing, and this \
+         command is the scan that classifies the rest.",
+        if rest > 0 {
+            format!(" and {rest} more")
+        } else {
+            String::new()
+        }
+    ))
 }
 
 /// The map a build prints: every service, what it holds, and what it could not
@@ -416,8 +462,9 @@ USAGE:
 
     derive     Print the workspace and service proposal without writing files.
     --infer on `index` asks Carrick Cloud to classify what the deterministic
-    passes could not and uploads the result. Off everywhere else, including
-    `refresh`, which runs from a hook.
+    passes could not and uploads the result. It is the paid scan, so it needs
+    a carrick.json in every repo and refuses without one. Off everywhere else,
+    including `refresh`, which runs from a hook.
 
     index      Detect repositories, apply optional workspace overrides and
                write <dir>/.carrick/. No model runs on this machine.
@@ -456,6 +503,45 @@ mod tests {
                 json: true,
             }
         );
+    }
+
+    /// The paid scan runs once, so it runs against a config someone has read.
+    /// A repo that has not been through the scaffold step is named, and the
+    /// refusal says what to do instead of it (carrick-cloud#799).
+    #[test]
+    fn inference_is_refused_until_every_repo_has_a_config() {
+        let workspace = tempfile::tempdir().unwrap();
+        let configured = workspace.path().join("api");
+        let bare = workspace.path().join("web");
+        std::fs::create_dir_all(&configured).unwrap();
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::write(configured.join("carrick.json"), "{}").unwrap();
+
+        assert_eq!(inference_refusal(std::slice::from_ref(&configured)), None);
+        let refusal = inference_refusal(&[configured.clone(), bare.clone()]).unwrap();
+        assert!(
+            refusal.contains(&bare.display().to_string()),
+            "the repo without a config is named: {refusal}"
+        );
+        assert!(
+            !refusal.contains(&configured.display().to_string()),
+            "the configured repo is not: {refusal}"
+        );
+        assert!(refusal.contains(".carrick/proposal.json"), "{refusal}");
+        assert!(refusal.contains("carrick index"), "{refusal}");
+    }
+
+    /// A long list of unconfigured repos is a folder someone pointed at, not a
+    /// screen of paths.
+    #[test]
+    fn the_refusal_caps_the_repos_it_names() {
+        let workspace = tempfile::tempdir().unwrap();
+        let repos: Vec<PathBuf> = (0..8)
+            .map(|n| workspace.path().join(format!("r{n}")))
+            .collect();
+        let refusal = inference_refusal(&repos).unwrap();
+        assert!(refusal.contains("and 3 more"), "{refusal}");
+        assert!(!refusal.contains("r7"), "{refusal}");
     }
 
     #[test]
