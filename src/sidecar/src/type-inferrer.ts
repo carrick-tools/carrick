@@ -31,6 +31,7 @@ import {
   type ObjectLiteralExpression,
   type ParameterDeclaration,
   type PropertyAssignment,
+  type StringLiteral,
   type Type,
   type Symbol as TsSymbol,
   ts,
@@ -157,6 +158,17 @@ const RESPONSE_HELPER_MAX_DEPTH = 4;
  * the branch an error path, whose shape is not the endpoint's contract.
  */
 const STATUS_MEMBER_NAMES = ['status', 'statusCode'] as const;
+
+/**
+ * The parts of a request that ARE the body, as validator middleware names them
+ * (`validate('json', Schema)`). HTTP vocabulary for how a body is carried — the
+ * same class of generic route vocabulary as the `schema` / `body` / `response` /
+ * `handler` keys the schema anchors already read, and deliberately not a list of
+ * libraries. Every other part a validator can bind (`query`, `param`, `header`,
+ * `cookie`) is NOT the body, so a schema bound to one of those declares no
+ * request contract.
+ */
+const REQUEST_BODY_PARTS = new Set<string>(['json', 'form', 'body']);
 
 /**
  * Print a `Type` to its string form WITHOUT the compiler's default truncation.
@@ -1170,17 +1182,18 @@ export class TypeInferrer {
     // ships as machinery and decays to `any` in the cross-repo surface.
     //
     // A DECLARED contract outranks whatever expression the locator picked,
-    // exactly as it does on the response side, so read anchors (a) and (b)
-    // first and fall through to the expression only when the route declares
-    // its request nowhere. The third registration anchor — the typed request
-    // READ inside the handler body — is deliberately not consulted here: that
-    // one is itself an expression, so the locator's own expression stays
-    // authoritative when nothing is declared.
+    // exactly as it does on the response side, so read the DECLARED anchors
+    // (a), (b) and (b2) first and fall through to the expression only when the
+    // route declares its request nowhere. The remaining registration anchor —
+    // the typed request READ inside the handler body — is deliberately not
+    // consulted here: that one is itself an expression, so the locator's own
+    // expression stays authoritative when nothing is declared.
     const declaredAt = this.registrationAtLine(sourceFile, request.line_number);
     if (declaredAt) {
-      const declared =
-        this.requestBodyFromHandlerParams(declaredAt.handler) ??
-        this.routeSchemaContractText(declaredAt.registration, 'body');
+      const declared = this.declaredRequestContract(
+        declaredAt.registration,
+        declaredAt.handler
+      );
       if (declared) {
         this.log(
           `Route registration at ${request.file_path}:${request.line_number} declares its ` +
@@ -1294,6 +1307,24 @@ export class TypeInferrer {
     if (explicitType) {
       typeString = explicitType;
       isExplicit = true;
+    }
+
+    // Publication guard (carrick#964): the locator landed on machinery — a
+    // callable member of the handler's context, a method reference, a handler
+    // binding — and neither a wrapper rule nor a declared type recovered a
+    // payload from it. Publishing that would assert an explicit contract for a
+    // type nothing can send over the wire, so abstain and let the row say
+    // unknown.
+    if (
+      this.isCallableType(payloadType) &&
+      !unwrapResult.wasUnwrapped &&
+      !explicitType
+    ) {
+      this.log(
+        `Request locator at ${request.file_path}:${request.line_number} resolved a callable ` +
+          `(${typeString}); a function is not a payload, leaving unresolved`
+      );
+      return null;
     }
 
     typeString = this.unwrapPromise(typeString, payloadType);
@@ -2137,6 +2168,34 @@ export class TypeInferrer {
     const useless = ['any', 'unknown', 'never', 'void', 'undefined', 'null', 'object', '{}'];
     const trimmed = typeString.trim();
     return useless.includes(trimmed) || trimmed === '';
+  }
+
+  /**
+   * A type that can be CALLED or constructed is machinery, never a payload
+   * (carrick#964).
+   *
+   * A context-object framework hands the handler one object that both reads the
+   * request and sends the response, so that object has a `body` MEMBER whose
+   * type is the response sender. Every anchor that reads a member off the
+   * handler's parameter, and every locator that lands on such a member, can
+   * therefore resolve to a perfectly concrete type that is the wrong side of
+   * the exchange — and, being concrete, it sails past the useless-type guard and
+   * publishes as an explicit contract.
+   *
+   * Nothing crosses an HTTP (or queue, or topic) boundary as a function, so the
+   * presence of call or construct signatures is a structural, framework-free
+   * proof that the resolution landed on machinery. The caller abstains, which
+   * leaves the row honestly unresolved instead of confidently wrong.
+   */
+  private isCallableType(type: Type): boolean {
+    try {
+      return (
+        type.getCallSignatures().length > 0 ||
+        type.getConstructSignatures().length > 0
+      );
+    } catch {
+      return false;
+    }
   }
 
   private unwrapExpressionNode(node: Node | undefined): Node {
@@ -3474,6 +3533,9 @@ export class TypeInferrer {
   private structuralTextFromTypeNode(typeNode: Node): string | null {
     try {
       const resolved = this.unwrapPromiseType(typeNode.getType());
+      if (this.isCallableType(resolved)) {
+        return null;
+      }
       const bare = typeText(resolved, typeNode);
       if (this.isUselessType(bare)) {
         return null;
@@ -3492,6 +3554,9 @@ export class TypeInferrer {
   private structuralTextFromType(type: Type, at: Node): string | null {
     try {
       const resolved = this.unwrapPromiseType(type);
+      if (this.isCallableType(resolved)) {
+        return null;
+      }
       const bare = typeText(resolved, at);
       if (this.isUselessType(bare)) {
         return null;
@@ -3588,9 +3653,30 @@ export class TypeInferrer {
     handler: FunctionLike
   ): string | null {
     return (
+      this.declaredRequestContract(registration, handler) ??
+      this.inferRequestReadFromHandler(handler)
+    );
+  }
+
+  /**
+   * The request contract a route DECLARES, in anchor order: the handler's
+   * parameter annotation (a), the registration's schema object (b), then a
+   * validator middleware bound to the request body (b2).
+   *
+   * Both callers — the registration locator and the expression locator whose
+   * line is a registration — consult exactly this set, so the two cannot drift.
+   * The typed request READ inside the handler body is deliberately not part of
+   * it: that anchor is itself an expression, and the expression path keeps its
+   * own locator authoritative when a route declares nothing.
+   */
+  private declaredRequestContract(
+    registration: Node,
+    handler: FunctionLike
+  ): string | null {
+    return (
       this.requestBodyFromHandlerParams(handler) ??
       this.routeSchemaContractText(registration, 'body') ??
-      this.inferRequestReadFromHandler(handler)
+      this.validatedBodyContractText(registration)
     );
   }
 
@@ -3629,6 +3715,69 @@ export class TypeInferrer {
         return text;
       }
     }
+    return null;
+  }
+
+  /**
+   * Anchor (b2): the contract declared by a VALIDATOR MIDDLEWARE on the
+   * registration (carrick#964).
+   *
+   * A route can declare its body by binding a schema to a named part of the
+   * request in a middleware the registration carries alongside the handler:
+   *
+   *   router.post('/search', validate('json', PayloadSchema), async (c) => …)
+   *
+   * The shape is a CALL among the registration's arguments whose own arguments
+   * are a request part and a schema value. Neither the middleware's name nor
+   * the schema library is checked: the part is read off the string literal, and
+   * the schema is whatever exposes a parsed output (`schemaOutputTypeText`) —
+   * the same test anchor (b) already applies to a `schema: { body: … }` object.
+   *
+   * `REQUEST_BODY_PARTS` is HTTP vocabulary for how a body is carried, not a
+   * framework list. A middleware bound to any other part (`query`, `param`,
+   * `header`, `cookie`) declares no BODY, and a middleware that names no part
+   * at all is not read: publishing a query schema as the request contract would
+   * be the same confident-and-wrong answer this anchor exists to remove.
+   */
+  private validatedBodyContractText(registration: Node): string | null {
+    if (!Node.isCallExpression(registration)) {
+      return null;
+    }
+
+    for (const argument of registration.getArguments()) {
+      const middleware = this.unwrapExpressionNode(argument);
+      if (!Node.isCallExpression(middleware)) {
+        continue;
+      }
+
+      const middlewareArgs = middleware
+        .getArguments()
+        .map((arg) => this.unwrapExpressionNode(arg));
+      const parts = middlewareArgs.filter((arg): arg is StringLiteral =>
+        Node.isStringLiteral(arg)
+      );
+      if (parts.length === 0) {
+        continue;
+      }
+      if (
+        !parts.some((part) =>
+          REQUEST_BODY_PARTS.has(part.getLiteralValue().toLowerCase())
+        )
+      ) {
+        continue;
+      }
+
+      for (const candidate of middlewareArgs) {
+        if (Node.isStringLiteral(candidate)) {
+          continue;
+        }
+        const declared = this.schemaOutputTypeText(candidate);
+        if (declared) {
+          return declared;
+        }
+      }
+    }
+
     return null;
   }
 
