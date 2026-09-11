@@ -64,6 +64,21 @@ pub enum Json {
     Object(HashMap<String, Json>),
 }
 
+/// The definition key a file's own module scope is indexed under
+/// (carrick#965).
+///
+/// A call written at module scope — `const logger = createLogger("x")` — sits
+/// inside no function, so before this key existed nothing recorded it and its
+/// callee read as having zero callers. The file is that call's lexical owner,
+/// the same model nested call sites already follow (carrick#931), so the file
+/// gets a row and the call is recorded against it.
+///
+/// Not a valid identifier and not a `Class.member` key, so it can never
+/// collide with a definition the source declares, and no call site can name
+/// it. [`crate::call_graph::merge_definitions`] always qualifies it with the
+/// file it came from.
+pub const MODULE_SCOPE_KEY: &str = "<module>";
+
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub enum FunctionNodeType {
@@ -981,7 +996,9 @@ impl FunctionDefinitionExtractor {
 
     /// Each exact call site belongs to its smallest enclosing indexed
     /// function (carrick#931). Callbacks without a definition row keep their
-    /// calls under the nearest indexed enclosing function.
+    /// calls under the nearest indexed enclosing function, and a call with no
+    /// indexed function around it at all keeps the file itself
+    /// ([`MODULE_SCOPE_KEY`], carrick#965).
     /// Retrieval tokens still include nested bodies.
     fn finalize_call_owners(&mut self) {
         let mut owners: HashMap<swc_common::Span, (u32, String)> = HashMap::new();
@@ -1012,6 +1029,68 @@ impl FunctionDefinitionExtractor {
         }
         for (key, calls) in &mut self.callee_refs {
             calls.retain(|call| owners.get(&call.span).is_none_or(|(_, owner)| owner == key));
+        }
+    }
+
+    /// Record the file's own call sites under [`MODULE_SCOPE_KEY`]
+    /// (carrick#965).
+    ///
+    /// The walk covers the WHOLE module, so every call in the file is
+    /// collected here as well as under the function that contains it.
+    /// [`Self::finalize_call_owners`] then hands each call to its innermost
+    /// indexed owner, and this row keeps only what no indexed function claims:
+    /// the calls written at module scope, and those inside a construct that
+    /// carries no definition row of its own.
+    ///
+    /// The synthetic definition's node is a `Placeholder`, whose span is
+    /// dummy, so the fold skips it when it collects owner candidates: the file
+    /// is the fallback owner of a call, never a contender for one a function
+    /// claims. Retrieval tokens are deliberately not built for it — they would
+    /// repeat every function's tokens in a single row — and it carries no body
+    /// source, so no intent is ever generated for it.
+    fn record_module_scope_callees(&mut self, module: &Module) {
+        let refs = self.walk_body(module).out;
+        if refs.is_empty() {
+            return;
+        }
+        self.callee_refs.insert(MODULE_SCOPE_KEY.to_string(), refs);
+        let line_number = self.line_number(module.span);
+        let end_line = self.end_line(module.span);
+        self.function_definitions.insert(
+            MODULE_SCOPE_KEY.to_string(),
+            FunctionDefinition {
+                name: MODULE_SCOPE_KEY.to_string(),
+                file_path: self.current_file_path.clone(),
+                node_type: FunctionNodeType::Placeholder,
+                arguments: vec![],
+                body_source: None,
+                is_exported: false,
+                line_number,
+                end_line,
+                intent: None,
+                calls: vec![],
+                tokens: vec![],
+                return_is_explicit: false,
+                return_type: None,
+                signature: None,
+                intent_input_hash: None,
+                dispatch_table: None,
+            },
+        );
+    }
+
+    /// Drop the module-scope row when the fold gave every call in the file to
+    /// a function — the common case. A file-level owner that holds no call of
+    /// its own states nothing, and would otherwise be one more row in every
+    /// blob.
+    fn prune_empty_module_scope(&mut self) {
+        if self
+            .callee_refs
+            .get(MODULE_SCOPE_KEY)
+            .is_none_or(|refs| refs.is_empty())
+        {
+            self.callee_refs.remove(MODULE_SCOPE_KEY);
+            self.function_definitions.remove(MODULE_SCOPE_KEY);
         }
     }
 
@@ -1855,9 +1934,14 @@ impl Visit for FunctionDefinitionExtractor {
     }
 
     /// Finalize ownership and lexical receivers after discovering every body.
+    ///
+    /// The file's own module scope is walked last and folded with the rest, so
+    /// a call that belongs to no function still has an owner (carrick#965).
     fn visit_module(&mut self, module: &Module) {
         module.visit_children_with(self);
+        self.record_module_scope_callees(module);
         self.finalize_call_owners();
+        self.prune_empty_module_scope();
         self.finalize_receiver_bindings(module);
     }
 

@@ -129,6 +129,13 @@ fn build_infer_requests(
 
     for name in names {
         let def = &function_definitions[name];
+        // The file-level owner of module-scope calls (carrick#965) is not a
+        // function: it has no return to infer and no parameter to type, and
+        // asking the sidecar about its first line would stamp whatever lives
+        // there onto the row.
+        if def.name == crate::visitor::MODULE_SCOPE_KEY {
+            continue;
+        }
         let file_path = to_absolute_path(&def.file_path.to_string_lossy(), repo_root_absolute);
 
         if def.return_type.is_none() {
