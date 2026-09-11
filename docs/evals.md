@@ -134,6 +134,15 @@ Label conventions the scorer normalizes for you:
 | `CARRICK_MOCK_ALL=1` | Fully offline scanner run (mocked LLM responses) |
 | `CARRICK_LOCAL_STORAGE_DIR` | Local upload cache dir — eval runs never write the real cloud index |
 
+`CARRICK_OUTPUT_JSON` suppresses the upload, so a run with both it and
+`CARRICK_LOCAL_STORAGE_DIR` set writes nothing to that directory. That is what
+the phases which READ the cache want (the cross-repo join, and the hermetic
+fixture harnesses that use the directory only to keep a scan off the cloud). A
+pass meant to FILL the cache must leave `CARRICK_OUTPUT_JSON` unset — it
+otherwise analyses everything, prints a full report, exits 0 and leaves an
+empty directory that looks exactly like one that was never filled. Every run
+with both set says so on stderr (carrick#966).
+
 ## Where results go
 
 - CI logs print the score report; workflow artifacts carry

@@ -3,9 +3,9 @@ use crate::agents::file_orchestrator::FileOrchestrator;
 use crate::agents::framework_guidance_agent::{FrameworkGuidanceAgent, ProtocolGuidance};
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{
-    CloudRepoData, CloudStorage, INLINE_PAYLOAD_LIMIT_BYTES, ManifestRole, ManifestTypeKind,
-    ManifestTypeState, TypeDegradation, TypeManifestEntry, UploadOutcome, get_current_commit_hash,
-    mount_graph_to_api_details,
+    CACHE_DIR_ENV, CloudRepoData, CloudStorage, INLINE_PAYLOAD_LIMIT_BYTES, ManifestRole,
+    ManifestTypeKind, ManifestTypeState, TypeDegradation, TypeManifestEntry, UploadOutcome,
+    get_current_commit_hash, mount_graph_to_api_details,
 };
 use crate::config::Config;
 use crate::file_finder::find_service_files;
@@ -120,6 +120,10 @@ fn should_upload_data() -> bool {
     // index with fixture "services". This is the upstream half of eval mode's
     // no-side-effects guarantee; the JSON output branch skips the markdown
     // report + PR comment downstream.
+    //
+    // This branch returning first is what leaves a named cache directory empty
+    // without saying so; `suppressed_upload_warning` is where the run says it
+    // (carrick#966).
     if env::var("CARRICK_OUTPUT_JSON").is_ok() {
         return false;
     }
@@ -156,6 +160,34 @@ fn should_upload_data() -> bool {
     // If we can't determine the context, default to upload (for local testing)
     // You might want to change this to false for stricter behavior
     true
+}
+
+/// What a run is told when it names a local cache directory and then
+/// suppresses every write into it (carrick#966).
+///
+/// `CARRICK_OUTPUT_JSON` returns false from [`should_upload_data`] before the
+/// `CARRICK_LOCAL_STORAGE_DIR` branch is reached. That is right for the phases
+/// that READ the cache and print a projection — the cross-repo join, and every
+/// hermetic fixture harness that uses the directory as a no-cloud sink — so
+/// the combination is refused nowhere. It is wrong, and silently so, for a
+/// pass meant to FILL the cache: it analyses every service, prints a complete
+/// report, exits 0, and writes no blob. An empty cache directory is
+/// indistinguishable from one that was never filled, so the phase that reads
+/// it back finds nothing and the pass — a paid one, on a live corpus — is
+/// lost.
+///
+/// Pure, so the wording is tested without touching the process environment.
+fn suppressed_upload_warning(output_json: bool, local_dir: Option<&str>) -> Option<String> {
+    let dir = local_dir?;
+    if !output_json {
+        return None;
+    }
+    Some(format!(
+        "CARRICK_OUTPUT_JSON is set, so this run uploads nothing: {dir} \
+         ({CACHE_DIR_ENV}) is left exactly as it was and no blob is written to \
+         it. A read-only pass wants that; a pass meant to FILL that cache must \
+         run with CARRICK_OUTPUT_JSON unset."
+    ))
 }
 
 /// The PR number for a `pull_request` run, or None on push/dispatch/local
@@ -223,6 +255,19 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let should_upload = should_upload_data();
     debug!(upload = should_upload, "Running Carrick in CI mode");
+
+    // Said before the scan, not after it: the point is that a capture pass set
+    // up this way costs a full pass and leaves nothing behind (carrick#966).
+    // `warn!` reaches a local run's stderr; the annotation puts the same line
+    // on the Actions step, where a green scan that did less than it was asked
+    // to is otherwise invisible.
+    if let Some(warning) = suppressed_upload_warning(
+        env::var("CARRICK_OUTPUT_JSON").is_ok(),
+        env::var(CACHE_DIR_ENV).ok().as_deref(),
+    ) {
+        warn!("{warning}");
+        logging::annotate(logging::Annotation::Warning, &warning);
+    }
 
     // 1. Health check
     let sp = logging::spinner("Connecting to Carrick Cloud...");
@@ -4718,6 +4763,36 @@ mod tests {
     use super::*;
     use crate::analyzer::ApiEndpointDetails;
     use crate::type_manifest::MISSING_ALIAS_MARKER;
+
+    /// A run that asks for a local cache directory and suppresses every write
+    /// into it is told so, in terms that name both variables and the directory
+    /// (carrick#966). The pass this catches exits 0 with a full report and an
+    /// empty directory behind it.
+    #[test]
+    fn a_suppressed_local_upload_names_both_variables_and_the_directory() {
+        let warning = suppressed_upload_warning(true, Some("/tmp/xrepo-cache"))
+            .expect("both set: the directory stays empty and the run must say so");
+        assert!(warning.contains("CARRICK_OUTPUT_JSON"), "{warning}");
+        assert!(warning.contains("CARRICK_LOCAL_STORAGE_DIR"), "{warning}");
+        assert!(warning.contains("/tmp/xrepo-cache"), "{warning}");
+    }
+
+    /// A capture pass — a local cache directory and no JSON output — writes its
+    /// blob, so there is nothing to say.
+    #[test]
+    fn a_local_cache_run_that_uploads_is_not_warned() {
+        assert_eq!(
+            suppressed_upload_warning(false, Some("/tmp/xrepo-cache")),
+            None
+        );
+    }
+
+    /// An eval run with no local cache directory is the ordinary read-only
+    /// case: no directory is named, so none is left empty.
+    #[test]
+    fn json_output_without_a_local_cache_directory_is_not_warned() {
+        assert_eq!(suppressed_upload_warning(true, None), None);
+    }
 
     /// The incremental upload path stamps the running release, same as the
     /// full-analysis path. Miss it here and every incremental scan — the common
