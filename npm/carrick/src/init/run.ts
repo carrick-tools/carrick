@@ -294,7 +294,12 @@ export async function init(argv: string[]): Promise<number> {
   say(`Repos to index, in ${plan.workspace} (${plan.repos_detected_by}):`);
   if (plan.parent_proposal) {
     const parent = plan.parent_proposal;
-    say(`The parent folder ${parent.directory} holds ${parent.repos.length} repo(s): ${parent.repos.join(", ")}. Run carrick init .. to initialise that workspace.`);
+    // Reads like the scanner's own sentence for the same proposal, capped the
+    // same way: a folder of scratch checkouts holds dozens, and the folder
+    // that holds them is already named here.
+    const names = parent.repos.map((repo) => path.basename(repo));
+    const shown = names.length > 3 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", ");
+    say(`The parent folder ${parent.directory} holds ${parent.repos.length} ${parent.repos.length === 1 ? "repo" : "repos"}: ${shown}. Run carrick init .. to initialise that workspace.`);
   }
   for (const repo of plan.repos) {
     say(`  ${repo.path} (${repo.reason})`);

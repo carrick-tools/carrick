@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { writeConfigs, type WorkspaceProposal } from "../src/init/repos.ts";
+import { deriveWorkspace, writeConfigs, type WorkspaceProposal } from "../src/init/repos.ts";
 import {
   carrickHooks,
   hookCommand,
@@ -357,6 +357,34 @@ test("init reads its arguments", () => {
 
 // The native override is an executable shebang fixture, which Windows cannot launch.
 const posixNativeFixture = { skip: process.platform === "win32" ? "native shebang fixture requires POSIX" : false };
+
+// What the scanner says when it finds no repos is the whole diagnosis
+// (carrick#975), so it has to arrive intact and prefixed once.
+test("a failed derive reaches the caller whole, with the scanner's own prefix removed", posixNativeFixture, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-derive-"));
+  const previous = process.env["CARRICK_NATIVE_BINARY"];
+  try {
+    const native = path.join(dir, "native.mjs");
+    const said = "carrick derive: no repos in /code.\\nLooked for: carrick.json, ...\\nFound: none of those manifests in /code. Inside it: no directories.";
+    fs.writeFileSync(native, `#!/usr/bin/env node\nprocess.stderr.write("${said}\\n");\nprocess.exit(1);\n`);
+    fs.chmodSync(native, 0o755);
+    process.env["CARRICK_NATIVE_BINARY"] = native;
+    assert.throws(
+      () => deriveWorkspace(dir),
+      (error: Error) => {
+        assert.ok(error.message.startsWith("no repos in /code."), error.message);
+        assert.doesNotMatch(error.message, /carrick derive:/);
+        assert.match(error.message, /Looked for: carrick\.json/);
+        assert.match(error.message, /Inside it: no directories\./);
+        return true;
+      },
+    );
+  } finally {
+    if (previous === undefined) delete process.env["CARRICK_NATIVE_BINARY"];
+    else process.env["CARRICK_NATIVE_BINARY"] = previous;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("the executable CLI rejects a different project and makes no local setup claim", posixNativeFixture, () => {
   const fixture = executableInitFixture("default-project");
