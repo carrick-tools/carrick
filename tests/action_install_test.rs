@@ -232,3 +232,71 @@ fn an_unknown_manager_warns_and_exits_zero() {
         installed.stdout
     );
 }
+
+#[test]
+fn deno_preparation_does_not_skip_existing_node_modules() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("deno.jsonc"), "{}").unwrap();
+    fs::write(dir.path().join("deno.lock"), "{}").unwrap();
+    fs::create_dir(dir.path().join("node_modules")).unwrap();
+    let result = detect(dir.path());
+    assert_eq!(result.status, 0);
+    assert!(result.stdout.contains("manager=deno"), "{}", result.stdout);
+    assert!(
+        result.stdout.contains("should_install=true"),
+        "{}",
+        result.stdout
+    );
+}
+
+#[test]
+fn deno_preparation_never_runs_declared_tasks_or_application_code() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("deno.json"),
+        r#"{
+      "nodeModulesDir":"auto", "allowScripts":["npm:fixture-dependency"],
+      "tasks":{"install":"touch APPLICATION_RAN"},
+      "imports":{"local":"./mod.ts"}
+    }"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("mod.ts"),
+        "Deno.writeTextFileSync('APPLICATION_RAN', 'bad'); export const value = 1;",
+    )
+    .unwrap();
+    // Runtime installed by CI; missing runtime is an actual failed check.
+    assert!(
+        Command::new("deno")
+            .arg("--version")
+            .output()
+            .expect("Deno must be installed for this integration test")
+            .status
+            .success()
+    );
+    let result = install(dir.path(), "deno");
+    assert_eq!(result.status, 0);
+    assert!(result.stdout.contains("Installed"), "{}", result.stdout);
+    assert!(!dir.path().join("APPLICATION_RAN").exists());
+    assert!(!dir.path().join("node_modules").exists());
+    assert!(
+        !dir.path().join("deno.lock").exists(),
+        "frozen prep must not create a lockfile"
+    );
+}
+
+#[test]
+fn deno_action_suppresses_config_authorized_npm_lifecycle_scripts() {
+    let output = Command::new("python3")
+        .arg(repo_root().join("tests/fixtures/action-install/deno-registry.py"))
+        .arg(script())
+        .output()
+        .expect("run local registry lifecycle fixture");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

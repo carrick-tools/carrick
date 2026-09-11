@@ -8,6 +8,7 @@ mod call_graph;
 mod call_site_extractor;
 mod cloud_storage;
 mod config;
+mod deno_support;
 mod dispatch;
 mod engine;
 mod env_alias;
@@ -208,23 +209,9 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    // A Deno-native scan root (deno.json/deno.jsonc, no root package.json)
-    // would otherwise produce a silently thin scan: dependency discovery,
-    // framework detection, and type resolution all start from a package.json
-    // manifest.
-    if is_deno_native_project(Path::new(&args.repo_path)) {
-        return Err(format!(
-            "'{}' looks like a Deno-native project (deno.json/deno.jsonc present, no package.json \
-             at the scan root). Carrick can't scan Deno-native projects yet: \
-             dependency discovery, framework detection, and type resolution all start \
-             from a package.json. Nested Node packages do not configure the Deno root. \
-             A project that also maintains a package.json at the scan root \
-             (npm-compatibility mode) may scan partially. Deno support is tracked at \
-             https://github.com/carrick-tools/carrick/issues/934",
-            args.repo_path
-        )
-        .into());
-    }
+    let services = service_derivation::resolve(Path::new(&args.repo_path))?.services;
+    deno_support::require_runtime(Path::new(&args.repo_path), &services)?;
+    let initial_service = services.first().cloned().unwrap_or_default();
 
     // =======================================================================
     // STEP 1: Discover and spawn sidecar (non-blocking)
@@ -236,7 +223,7 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(sidecar_path) => {
             sidecar_found = true;
             debug!("Found sidecar at: {}", sidecar_path.display());
-            match spawn_sidecar(&sidecar_path, &args.repo_path) {
+            match spawn_sidecar(&sidecar_path, &args.repo_path, &initial_service) {
                 Ok(sidecar) => {
                     debug!("Sidecar spawned, initializing in background...");
                     Some(sidecar)
@@ -402,15 +389,6 @@ fn discover_sidecar_path() -> Option<PathBuf> {
     None
 }
 
-/// A root Deno manifest needs a co-located Node manifest for the existing
-/// npm-compatibility path. Descendant manifests describe separate packages,
-/// including vendored workspaces, and cannot configure the Deno scan root.
-fn is_deno_native_project(repo_root: &Path) -> bool {
-    let has_deno_config =
-        repo_root.join("deno.json").is_file() || repo_root.join("deno.jsonc").is_file();
-    has_deno_config && !repo_root.join("package.json").is_file()
-}
-
 /// Get a path relative to the executable location
 fn get_executable_relative_path(relative: &str) -> PathBuf {
     if let Ok(exe_path) = env::current_exe()
@@ -425,6 +403,7 @@ fn get_executable_relative_path(relative: &str) -> PathBuf {
 fn spawn_sidecar(
     sidecar_path: &Path,
     repo_path: &str,
+    service: &config::Config,
 ) -> Result<TypeSidecar, Box<dyn std::error::Error>> {
     // Convert repo path to absolute path for the sidecar
     // The sidecar runs as a separate process and needs an absolute path
@@ -456,7 +435,10 @@ fn spawn_sidecar(
     // Spawn the sidecar process
     let sidecar = TypeSidecar::spawn(sidecar_path)?;
 
-    sidecar.start_init(&absolute_repo_path, None);
+    sidecar.start_init(
+        &absolute_repo_path.join(service.directory.as_deref().unwrap_or(".")),
+        service.tsconfig.as_deref(),
+    );
 
     Ok(sidecar)
 }
@@ -515,132 +497,5 @@ mod tests {
         assert!(cli.verbose);
         assert!(cli.no_cache);
         assert_eq!(cli.repo_path, "/my/repo");
-    }
-
-    #[test]
-    fn deno_native_project_is_flagged() {
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::write(repo.path().join("deno.json"), "{}").unwrap();
-        assert!(is_deno_native_project(repo.path()));
-    }
-
-    #[test]
-    fn deno_jsonc_counts_as_deno_config() {
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::write(repo.path().join("deno.jsonc"), "{}").unwrap();
-        assert!(is_deno_native_project(repo.path()));
-    }
-
-    #[test]
-    fn deno_with_package_json_is_not_flagged() {
-        // npm-compatibility mode: both manifests present → scan proceeds.
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::write(repo.path().join("deno.json"), "{}").unwrap();
-        std::fs::write(repo.path().join("package.json"), "{}").unwrap();
-        assert!(!is_deno_native_project(repo.path()));
-    }
-
-    #[test]
-    fn deno_with_nested_package_json_is_flagged() {
-        // A nested Node package does not describe the Deno scan root.
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::write(repo.path().join("deno.json"), "{}").unwrap();
-        std::fs::create_dir_all(repo.path().join("packages/api")).unwrap();
-        std::fs::write(repo.path().join("packages/api/package.json"), "{}").unwrap();
-        assert!(is_deno_native_project(repo.path()));
-    }
-
-    #[test]
-    fn deno_workspace_with_vendored_node_subworkspace_is_flagged() {
-        for config_name in ["deno.json", "deno.jsonc"] {
-            let repo = tempfile::tempdir().unwrap();
-            std::fs::write(
-                repo.path().join(config_name),
-                r#"{"workspace": ["./services/api", "./services/worker"]}"#,
-            )
-            .unwrap();
-            for member in ["services/api", "services/worker"] {
-                std::fs::create_dir_all(repo.path().join(member)).unwrap();
-                std::fs::write(repo.path().join(member).join(config_name), "{}").unwrap();
-            }
-            for package in [
-                "vendor/frontend",
-                "vendor/frontend/packages/client",
-                "tools",
-            ] {
-                std::fs::create_dir_all(repo.path().join(package)).unwrap();
-                std::fs::write(repo.path().join(package).join("package.json"), "{}").unwrap();
-            }
-            std::fs::write(
-                repo.path().join("vendor/frontend/pnpm-workspace.yaml"),
-                "packages:\n  - packages/*\n",
-            )
-            .unwrap();
-            assert!(is_deno_native_project(repo.path()), "{config_name}");
-            // Scanning the Node subtree itself remains supported.
-            assert!(!is_deno_native_project(
-                &repo.path().join("vendor/frontend")
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn deno_with_generated_config_is_refused_before_analysis() {
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::write(repo.path().join("deno.jsonc"), "{ // Deno config\n}").unwrap();
-        std::fs::write(repo.path().join("carrick.json"), "{}").unwrap();
-        std::fs::write(repo.path().join("tsconfig.json"), "{}").unwrap();
-        std::fs::create_dir_all(repo.path().join("tools")).unwrap();
-        std::fs::write(repo.path().join("tools/package.json"), "{}").unwrap();
-        let error = run_analysis(CliArgs::parse_from(&args(&[repo.path().to_str().unwrap()])))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("no package.json at the scan root"),
-            "{error}"
-        );
-        assert!(error.contains("Nested Node packages"), "{error}");
-    }
-
-    #[test]
-    fn deno_package_json_inside_node_modules_does_not_count() {
-        // A vendored dependency's manifest is not the project's manifest.
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::write(repo.path().join("deno.json"), "{}").unwrap();
-        std::fs::create_dir_all(repo.path().join("node_modules/koa")).unwrap();
-        std::fs::write(repo.path().join("node_modules/koa/package.json"), "{}").unwrap();
-        assert!(is_deno_native_project(repo.path()));
-    }
-
-    #[test]
-    fn deno_package_json_inside_build_output_does_not_count() {
-        // Build output isn't the project's own manifest — every skip dir
-        // beyond node_modules behaves the same way.
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::write(repo.path().join("deno.json"), "{}").unwrap();
-        for dir in ["dist", "build", ".next", ".vite/deps"] {
-            std::fs::create_dir_all(repo.path().join(dir)).unwrap();
-            std::fs::write(repo.path().join(dir).join("package.json"), "{}").unwrap();
-        }
-        assert!(is_deno_native_project(repo.path()));
-    }
-
-    #[test]
-    fn deno_scan_root_named_like_skip_dir_is_flagged() {
-        // The root manifest determines the guard even for a directory named build.
-        let parent = tempfile::tempdir().unwrap();
-        let repo = parent.path().join("build");
-        std::fs::create_dir_all(repo.join("packages/api")).unwrap();
-        std::fs::write(repo.join("deno.json"), "{}").unwrap();
-        std::fs::write(repo.join("packages/api/package.json"), "{}").unwrap();
-        assert!(is_deno_native_project(&repo));
-    }
-
-    #[test]
-    fn deno_guard_allows_plain_node_project() {
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::write(repo.path().join("package.json"), "{}").unwrap();
-        assert!(!is_deno_native_project(repo.path()));
     }
 }

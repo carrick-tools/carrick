@@ -273,11 +273,7 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
     let services = resolve_services(repo_path)?;
     let multi_service = services.len() > 1;
     if multi_service {
-        info!(
-            "carrick.json declares {} services in {}",
-            services.len(),
-            repo_name
-        );
+        info!("Resolved {} services in {}", services.len(), repo_name);
     }
     logging::finish_spinner(
         &sp,
@@ -1242,16 +1238,19 @@ fn hash_file_content(content: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Hash every discovered package.json (sorted, keyed by repo-relative path)
+/// Hash discovered manifests and Deno resolution inputs (sorted by relative path)
 /// for the detection/guidance/extraction-config cache gate. The artifacts
 /// behind the gate are generated from the MERGED dependency set, so the gate
 /// must cover workspace manifests too — hashing only the root package.json
 /// would let a dependency added in `packages/api/package.json` reuse a stale
 /// extraction config (and stale detection) indefinitely.
-fn hash_workspace_package_jsons(packages: &Packages, repo_path: &str) -> String {
+fn hash_workspace_package_jsons(
+    packages: &Packages,
+    repo_path: &str,
+) -> Result<String, std::io::Error> {
     let repo_root = Path::new(repo_path);
-    let mut keyed: Vec<(String, &PathBuf)> = packages
-        .source_paths
+    let inputs = crate::deno_support::resolution_inputs(repo_root, &packages.source_paths)?;
+    let mut keyed: Vec<(String, &PathBuf)> = inputs
         .iter()
         .map(|path| {
             let relative = path
@@ -1268,12 +1267,18 @@ fn hash_workspace_package_jsons(packages: &Packages, repo_path: &str) -> String 
     for (relative, path) in keyed {
         combined.push_str(&relative);
         combined.push('\0');
-        if let Ok(content) = std::fs::read_to_string(path) {
-            combined.push_str(&content);
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                combined.push_str(&content);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                combined.push_str("missing")
+            }
+            Err(error) => return Err(error),
         }
         combined.push('\0');
     }
-    hash_file_content(&combined)
+    Ok(hash_file_content(&combined))
 }
 
 /// Normalize file_results keys to be relative to repo root.
@@ -1427,7 +1432,7 @@ async fn analyze_current_repo_incremental(
             // detection/guidance/extraction config. Covers workspace
             // manifests, not just the repo root (raw file content, not the
             // serialized struct, for deterministic comparison).
-            let current_pkg_hash = hash_workspace_package_jsons(packages, repo_path);
+            let current_pkg_hash = hash_workspace_package_jsons(packages, repo_path)?;
 
             let pkg_changed = prev.package_json_hash.as_deref() != Some(&current_pkg_hash);
 
@@ -3198,9 +3203,6 @@ fn service_scan_root(repo_path: &str, service: &Config) -> std::path::PathBuf {
 
 fn scope_sidecar_to_service(sidecar: Option<&TypeSidecar>, repo_path: &str, service: &Config) {
     let Some(sidecar) = sidecar else { return };
-    if service.directory.is_none() && service.tsconfig.is_none() {
-        return; // whole-repo service: already initialized at the repo root
-    }
 
     // Match main()'s absolute-path init so the sidecar resolves files the same way.
     let canonical =
@@ -3419,12 +3421,37 @@ fn run_capture_for_service(
         &type_resolution.inferred_types,
     );
 
+    let absolute_repo = Path::new(repo_path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(repo_path));
+    let capture_root = absolute_repo.join(config.directory.as_deref().unwrap_or("."));
+    let capture_root = capture_root.canonicalize().unwrap_or(capture_root);
+    let capture_root = capture_root.to_string_lossy();
+    // Requests are collected relative to the repository, while capture uses
+    // the same service root as init. Absolute paths preserve shared includes.
+    let mut explicit = explicit;
+    for request in &mut explicit {
+        if Path::new(&request.source_file).is_relative() {
+            request.source_file = absolute_repo
+                .join(&request.source_file)
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    for request in &mut infer {
+        if Path::new(&request.file_path).is_relative() {
+            request.file_path = absolute_repo
+                .join(&request.file_path)
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
     let anchors = type_compat_v2::derive_capture_anchors(
         &explicit,
         &infer,
         &inline_aliases,
         &type_resolution.inferred_types,
-        repo_path,
+        &capture_root,
     );
     if anchors.is_empty() {
         return None;
@@ -3444,7 +3471,7 @@ fn run_capture_for_service(
     );
     match type_compat_v2::run_capture(
         sidecar,
-        repo_path,
+        &capture_root,
         &service_id,
         &anchors,
         &backfill_texts,
@@ -3649,13 +3676,24 @@ fn load_packages_for_service(
 ) -> Result<Packages, Box<dyn std::error::Error>> {
     let package_json_path =
         crate::file_finder::find_service_manifest(std::path::Path::new(repo_path), service);
-    let mut packages = if let Some(package_path) = package_json_path {
-        debug!("Found package.json: {}", package_path.display());
-        Packages::new(vec![package_path.clone()])
-            .map_err(|e| format!("Failed to parse {}: {}", package_path.display(), e))?
-    } else {
-        Packages::default()
-    };
+    let mut manifests: Vec<PathBuf> = package_json_path.into_iter().collect();
+    if let Some(config) = crate::deno_support::service_manifest(Path::new(repo_path), service) {
+        // Root imports apply to members. Preserve the existing Packages
+        // dependency-version selection policy across inherited manifests.
+        let mut inherited: Vec<_> = config
+            .parent()
+            .into_iter()
+            .flat_map(Path::ancestors)
+            .take_while(|p| p.starts_with(repo_path))
+            .filter_map(crate::deno_support::manifest_at)
+            .collect();
+        inherited.reverse();
+        inherited.extend(manifests);
+        manifests = inherited;
+        let mut seen = std::collections::HashSet::new();
+        manifests.retain(|p| seen.insert(p.clone()));
+    }
+    let mut packages = Packages::new(manifests)?;
     // Names of every package.json in the WHOLE repo tree (not just this
     // service's): a workspace member like `packages/contracts` is not a
     // service, but a dependency on it is internal, not a registry package.
@@ -4590,7 +4628,7 @@ async fn analyze_current_repo(
     cloud_data.cached_guidance = Some(analysis_result.framework_guidance.clone());
     cloud_data.cache_version = Some(CACHE_VERSION);
     // Same workspace-wide hash the incremental gate compares against.
-    cloud_data.package_json_hash = Some(hash_workspace_package_jsons(packages, repo_path));
+    cloud_data.package_json_hash = Some(hash_workspace_package_jsons(packages, repo_path)?);
 
     // 8. Last step: make every path in the payload repo-relative. This branch
     // builds its mount graph from `file_results` keyed by as-scanned ABSOLUTE
@@ -4685,6 +4723,221 @@ mod tests {
     /// The incremental upload path stamps the running release, same as the
     /// full-analysis path. Miss it here and every incremental scan — the common
     /// case — uploads an unattributed blob the cloud can never re-index.
+    #[test]
+    fn sidecar_service_scope_covers_capture_shared_includes_and_return_to_root() {
+        use crate::services::type_sidecar::SymbolRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("api")).unwrap();
+        std::fs::create_dir(root.join("shared")).unwrap();
+        std::fs::write(
+            root.join("api/types.ts"),
+            "export interface Local { id: string }",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("shared/types.ts"),
+            "export interface Shared { id: string }",
+        )
+        .unwrap();
+        let log = root.join("requests.jsonl");
+        let fake = root.join("sidecar.cjs");
+        std::fs::write(&fake, format!(r#"
+          const fs = require('fs');
+          require('readline').createInterface({{input:process.stdin}}).on('line', line => {{
+            const request = JSON.parse(line);
+            fs.appendFileSync({}, line + '\n');
+            if (request.action === 'shutdown') process.exit(0);
+            console.log(JSON.stringify({{request_id:request.request_id,
+              status:request.action === 'init' ? 'ready' : 'error', errors:['fixture capture stop']}}));
+          }});
+        "#, serde_json::to_string(&log).unwrap())).unwrap();
+        let sidecar = TypeSidecar::spawn(&fake).unwrap();
+        std::fs::write(root.join("api/tsconfig.json"), "{}").unwrap();
+        let member = Config {
+            directory: Some("api".into()),
+            tsconfig: Some("tsconfig.json".into()),
+            ..Config::default()
+        };
+        scope_sidecar_to_service(Some(&sidecar), root.to_str().unwrap(), &member);
+        let explicit: Vec<_> = [("Local", "api/types.ts"), ("Shared", "shared/types.ts")]
+            .into_iter()
+            .map(|(name, file)| SymbolRequest {
+                symbol_name: name.into(),
+                source_file: file.into(),
+                alias: Some(name.into()),
+                array_depth: None,
+                payload_borrow_witness: false,
+            })
+            .collect();
+        let mut data = service_data("fixture", Some("api"));
+        let resolution = TypeResolutionResult {
+            dts_content: None,
+            explicit_manifest: vec![],
+            inferred_types: vec![],
+            symbol_failures: vec![],
+            errors: vec![],
+        };
+        run_capture_for_service(
+            &sidecar,
+            &FileOrchestrator::new(crate::agent_service::AgentService::new()),
+            &HashMap::new(),
+            root.to_str().unwrap(),
+            &MountGraph::default(),
+            &member,
+            &explicit,
+            &[],
+            &resolution,
+            &mut data,
+        );
+        scope_sidecar_to_service(Some(&sidecar), root.to_str().unwrap(), &Config::default());
+        run_capture_for_service(
+            &sidecar,
+            &FileOrchestrator::new(crate::agent_service::AgentService::new()),
+            &HashMap::new(),
+            root.to_str().unwrap(),
+            &MountGraph::default(),
+            &Config::default(),
+            &explicit,
+            &[],
+            &resolution,
+            &mut data,
+        );
+        let requests: Vec<serde_json::Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let inits: Vec<_> = requests.iter().filter(|r| r["action"] == "init").collect();
+        assert_eq!(
+            inits.len(),
+            2,
+            "root service must reinitialize after a member"
+        );
+        assert_eq!(
+            Path::new(inits[0]["repo_root"].as_str().unwrap()),
+            root.join("api")
+        );
+        assert_eq!(Path::new(inits[1]["repo_root"].as_str().unwrap()), root);
+        let capture = requests
+            .iter()
+            .find(|r| r["action"] == "capture_v2")
+            .expect("capture request");
+        assert_eq!(
+            Path::new(capture["repo_root"].as_str().unwrap()),
+            root.join("api")
+        );
+        assert_eq!(
+            capture["tsconfig_path"], "tsconfig.json",
+            "capture must preserve the explicit compiler configuration used by init"
+        );
+        assert_eq!(inits[0]["tsconfig_path"], capture["tsconfig_path"]);
+        for anchor in capture["anchors"].as_array().unwrap() {
+            let source = root
+                .join("api")
+                .join(anchor["source_file"].as_str().unwrap())
+                .canonicalize()
+                .unwrap();
+            let expected = if anchor["alias"] == "Local" {
+                root.join("api/types.ts")
+            } else {
+                root.join("shared/types.ts")
+            };
+            assert_eq!(
+                source, expected,
+                "capture must preserve source identity across service boundary"
+            );
+        }
+        assert_eq!(capture["anchors"].as_array().unwrap().len(), 2);
+        let root_capture = requests
+            .iter()
+            .rev()
+            .find(|r| r["action"] == "capture_v2")
+            .unwrap();
+        assert_eq!(Path::new(root_capture["repo_root"].as_str().unwrap()), root);
+        assert!(
+            root_capture.get("tsconfig_path").is_none(),
+            "root capture must not retain the previous service's config"
+        );
+        assert!(
+            root_capture["anchors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|anchor| Path::new(anchor["source_file"].as_str().unwrap()).is_relative()),
+            "a trailing /. on the capture root must not leak absolute anchors and trigger literal fallback"
+        );
+    }
+
+    #[test]
+    fn npm_manifest_hash_preserves_existing_cache_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let packages = Packages::new(vec![dir.path().join("package.json")]).unwrap();
+        assert_eq!(
+            hash_workspace_package_jsons(&packages, dir.path().to_str().unwrap()).unwrap(),
+            hash_file_content("package.json\0{}\0")
+        );
+    }
+
+    #[test]
+    fn deno_resolution_inputs_invalidate_service_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("api")).unwrap();
+        std::fs::create_dir(root.join("shared")).unwrap();
+        std::fs::write(
+            root.join("deno.jsonc"),
+            r#"{
+          // inherited mapping and nondefault lock
+          "workspace":["./api","./shared"], "importMap":"./imports.json", "lock":"./deps.lock"
+        }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("imports.json"),
+            r#"{"imports":{"client":"npm:client-lib@1"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("api/deno.json"), r#"{"name":"@sample/api"}"#).unwrap();
+        std::fs::write(
+            root.join("shared/deno.json"),
+            r#"{"name":"@sample/shared","exports":"./v1.ts"}"#,
+        )
+        .unwrap();
+        let service = Config {
+            directory: Some("api".into()),
+            ..Config::default()
+        };
+        let packages = load_packages_for_service(root.to_str().unwrap(), &service).unwrap();
+        assert!(
+            packages
+                .package_jsons
+                .iter()
+                .any(|p| p.dependencies.contains_key("client-lib"))
+        );
+        let hash = || hash_workspace_package_jsons(&packages, root.to_str().unwrap()).unwrap();
+        let before = hash();
+        std::fs::write(root.join("deps.lock"), "{}").unwrap();
+        let locked = hash();
+        assert_ne!(before, locked, "new lock must invalidate");
+        std::fs::write(
+            root.join("imports.json"),
+            r#"{"imports":{"client":"npm:client-lib@2"}}"#,
+        )
+        .unwrap();
+        let mapped = hash();
+        assert_ne!(locked, mapped, "external map must invalidate");
+        std::fs::write(
+            root.join("shared/deno.json"),
+            r#"{"name":"@sample/shared","exports":"./v2.ts"}"#,
+        )
+        .unwrap();
+        assert_ne!(mapped, hash(), "sibling export must invalidate");
+        std::fs::remove_file(root.join("deps.lock")).unwrap();
+        assert_ne!(mapped, hash());
+    }
+
     #[test]
     fn incremental_cloud_data_stamps_the_running_scanner_version() {
         let data = build_cloud_data_from_mount_graph(

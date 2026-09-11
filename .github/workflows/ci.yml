@@ -44,6 +44,11 @@ jobs:
             tests/fixtures/koa-api/package.json
             src/sidecar/package-lock.json
 
+      - name: Install Deno for type and dependency preparation tests
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: "2.9.4"
+
       - name: Install test dependencies
         run: |
           cd examples/express-single && npm install
@@ -167,11 +172,8 @@ jobs:
       - name: Run pub/sub wrapper type-capture test
         run: cargo test --test pubsub_wrapper_type_capture_test --verbose
 
-      - name: Run Deno scan-root guard tests
-        env:
-          CARRICK_MOCK_ALL: "1"
-        run: cargo test --bin carrick deno --verbose
-
+      # Deno config/runtime transitions are covered by service_derivation_test
+      # above; the removed unsupported-project guard no longer has binary tests.
       - name: Run library tests
         run: cargo test --lib --verbose
 

@@ -85,6 +85,14 @@ runs:
       with:
         node-version: "24"
 
+    # The scanner selects Deno per declared service, including nested services
+    # and explicit configs. Supply the runtime even when installs are disabled.
+    - name: Set up Deno for type resolution
+      if: steps.fork-check.outputs.skip != 'true'
+      uses: denoland/setup-deno@v2
+      with:
+        deno-version: "2.9.4"
+
     - name: Resolve the Carrick version
       if: steps.fork-check.outputs.skip != 'true'
       id: version
@@ -199,8 +207,9 @@ runs:
 
     # The scanned repo's own dependencies, not Carrick's. Without them every
     # import from a package resolves to the compiler's `error` type and the
-    # indexed request/response types degrade to `any`. Lockfile-gated,
-    # scripts disabled, time-boxed, and tolerant: see
+    # indexed request/response types degrade to `any`. Node installs are
+    # lockfile-gated; Deno prepares its declared dependencies in frozen mode.
+    # Scripts disabled, time-boxed, and tolerant: see
     # scripts/install-scanned-deps.sh for the posture and why it installs at
     # the scan root only.
     - name: Detect the scanned repo's package manager
@@ -224,7 +233,9 @@ runs:
       if: steps.fork-check.outputs.skip != 'true' && steps.deps.outputs.should_install == 'true' && steps.deps.outputs.cache_dir != ''
       uses: actions/cache@v4
       with:
-        path: ${{ steps.deps.outputs.cache_dir }}
+        path: |
+          ${{ steps.deps.outputs.cache_dir }}
+          ${{ steps.deps.outputs.deno_cache_dir }}
         key: carrick-deps-${{ runner.os }}-${{ steps.deps.outputs.manager }}-${{ steps.deps.outputs.lockfile_sha256 }}
         restore-keys: |
           carrick-deps-${{ runner.os }}-${{ steps.deps.outputs.manager }}-

@@ -218,7 +218,19 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
                 "Derived service name '{name}' is duplicated; declare unique names in carrick.json."
             ));
         }
-        let tsconfig = nearest_tsconfig(&root, &directory);
+        let tsconfig = if crate::deno_support::service_manifest(
+            &root,
+            &Config {
+                directory: Some(relative.to_string_lossy().into_owned()),
+                ..Config::default()
+            },
+        )
+        .is_some()
+        {
+            None
+        } else {
+            nearest_tsconfig(&root, &directory)
+        };
         services.push(Config {
             service_name: name,
             directory: (!relative.as_os_str().is_empty())
@@ -234,7 +246,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
         warnings.push("Workspace packages are proposed as services. Review service boundaries and shared source includes in carrick.json.".into());
     }
     if has_deno {
-        warnings.push("Deno manifest discovery does not supply import-map type configuration or Deno globals. The scanner's Deno support guard still applies.".into());
+        warnings.push("Deno services use their existing manifests and require Deno on PATH for type resolution.".into());
     }
     Ok(ServiceDerivation {
         reason: if reasons.is_empty() {
@@ -300,6 +312,26 @@ fn validate(root: &Path, services: &[Config]) -> Result<(), String> {
                     "Service '{label}' declares tsconfig '{}', which does not exist",
                     path.display()
                 ));
+            }
+            if path
+                .file_name()
+                .is_some_and(|name| name == "deno.json" || name == "deno.jsonc")
+            {
+                let directory = root.join(service.directory.as_deref().unwrap_or("."));
+                let nearest = directory
+                    .ancestors()
+                    .take_while(|p| p.starts_with(root))
+                    .find_map(crate::deno_support::manifest_at);
+                let selected = path.canonicalize().map_err(|e| e.to_string())?;
+                if !nearest.is_some_and(|nearest| {
+                    nearest.file_name() == path.file_name()
+                        && nearest.canonicalize().ok().as_ref() == Some(&selected)
+                }) {
+                    return Err(format!(
+                        "Service '{label}' must select its nearest Deno manifest (deno.json takes precedence over deno.jsonc). Alternate Deno config '{}' is not supported; omit tsconfig to use the service manifest, or select an ordinary TypeScript config.",
+                        path.display()
+                    ));
+                }
             }
         }
     }
