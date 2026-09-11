@@ -432,8 +432,11 @@ fn walk_up(start: &Path) -> Option<PathBuf> {
 pub fn write_self_ignore(index_dir: &Path) -> std::io::Result<()> {
     std::fs::write(
         index_dir.join(".gitignore"),
-        "# Written by `carrick index`. The local index is derived from your\n\
-         # source and is rebuilt by re-running the command.\n*\n",
+        // Byte-identical to `SELF_IGNORE` in `npm/carrick/src/init/repos.ts`:
+        // `carrick init` writes the proposal into this directory before any
+        // index exists, so either command can be the one that creates it.
+        "# Written by Carrick. Everything here is derived from your source and is\n\
+         # rebuilt by re-running `carrick index`.\n*\n",
     )
 }
 

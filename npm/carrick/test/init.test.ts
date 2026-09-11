@@ -11,16 +11,62 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { deriveWorkspace, writeConfigs, type WorkspaceProposal } from "../src/init/repos.ts";
+import {
+  deriveWorkspace,
+  writeProposal,
+  PROPOSAL_FILE,
+  type WorkspaceProposal,
+} from "../src/init/repos.ts";
 import {
   carrickHooks,
   hookCommand,
   mergeCarrickHooks,
   ownEntryPoint,
 } from "../src/init/settings.ts";
-import { editorLines, parseArgs, init } from "../src/init/run.ts";
+import { projectStep, type Project, type ProjectPrompts } from "../src/init/projects.ts";
+import { AGENT_SCAFFOLD_PROMPT, editorLines, parseArgs, init } from "../src/init/run.ts";
 
 const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
+/**
+ * A workspace whose derived proposal carries a config to write.
+ *
+ * A fixture that proposes nothing (`config: null`) cannot tell "init no longer
+ * writes carrick.json" from "there was nothing to write", so the pinned-set
+ * test uses this one: sixteen workspace members, three of them applications
+ * and thirteen libraries, which is the shape a real monorepo's first run
+ * derives.
+ */
+function monorepoProposal(workspace: string): Record<string, unknown> {
+  const apps = ["gateway", "worker", "web"];
+  const libraries = Array.from({ length: 13 }, (_, index) => `lib-${index + 1}`);
+  return {
+    schema: "carrick.derive/0",
+    workspace,
+    repos_detected_by: "single repository",
+    repos_added: [],
+    repos_excluded: [],
+    missing: [],
+    parent_proposal: null,
+    repos: [
+      {
+        path: workspace,
+        reason: "deno workspace",
+        services: [...apps, ...libraries].map((name) => ({
+          serviceName: name,
+          directory: apps.includes(name) ? `apps/${name}` : `packages/${name}`,
+        })),
+        config: {
+          services: [...apps, ...libraries].map((name) => ({
+            name,
+            directory: apps.includes(name) ? `apps/${name}` : `packages/${name}`,
+          })),
+        },
+        warnings: [],
+      },
+    ],
+  };
+}
 
 function executableInitFixture(
   projectSlug: string,
@@ -28,6 +74,9 @@ function executableInitFixture(
   // deployed server: it answers an action it has never heard of with the
   // credential-kind gate, which is a 403 (carrick#955).
   projectActions: "absent" | "deployed" = "absent",
+  // What the scanner's `derive` answers. The default proposes no config; the
+  // monorepo one proposes a sixteen-service document.
+  derived: "no-config" | "monorepo" = "no-config",
 ): {
   root: string;
   repo: string;
@@ -41,15 +90,19 @@ function executableInitFixture(
   execFileSync("git", ["-C", repo, "remote", "add", "origin", "git@github.com:acme/api.git"]);
 
   const native = path.join(root, "native.mjs");
+  // Anything but `derive` exits 2, so a run that ends 0 is a run that never
+  // asked this binary to scan.
   fs.writeFileSync(native, `#!/usr/bin/env node
 const argv = process.argv.slice(2);
 if (argv[0] !== "derive") process.exit(2);
 const workspace = argv[argv.indexOf("--workspace") + 1];
-process.stdout.write(JSON.stringify({
+const monorepo = ${JSON.stringify(derived === "monorepo")};
+const proposal = monorepo ? ${JSON.stringify(monorepoProposal("WORKSPACE"))} : {
   schema: "carrick.derive/0", workspace, repos_detected_by: "single repository",
   repos_added: [], repos_excluded: [], missing: [], parent_proposal: null,
   repos: [{ path: workspace, reason: "single repository", services: [{ serviceName: null }], config: null, warnings: [] }],
-}));
+};
+process.stdout.write(JSON.stringify(proposal).replaceAll("WORKSPACE", workspace));
 `);
   fs.chmodSync(native, 0o755);
 
@@ -108,24 +161,31 @@ globalThis.fetch = async (input, init) => {
   };
 }
 
-test("init writes a missing native proposal once and preserves racing or malformed files", () => {
+// The seam document carrick-cloud#799 pins: the scaffold tool's agent reads
+// it, so what lands on disk has to be the scanner's own bytes, not a
+// re-serialisation of what this client could parse.
+test("the proposal is written as the scanner printed it, into an ignored directory", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-init-"));
   try {
     const plan: WorkspaceProposal = { schema: "carrick.derive/0", workspace: dir, repos_detected_by: "single repository", repos_added: [], repos_excluded: [], missing: [], parent_proposal: null, repos: [{ path: dir, reason: "single repository", services: [{ serviceName: "api" }], config: { services: [{ name: "api", include: ["shared"] }] }, warnings: [] }] };
-    const target = path.join(dir, "carrick.json");
-    assert.equal(writeConfigs(plan)[0]?.created, true);
-    const bytes = fs.readFileSync(target);
-    assert.equal(writeConfigs(plan)[0]?.created, false);
-    assert.deepEqual(fs.readFileSync(target), bytes);
-    for (const body of ["{broken", '{"services":[{"name":"hand-added","include":["../shared"]}]}']) {
-      fs.writeFileSync(target, body);
-      assert.equal(writeConfigs(plan)[0]?.created, false);
-      assert.equal(fs.readFileSync(target, "utf8"), body);
-    }
-    fs.unlinkSync(target);
-    fs.mkdirSync(target);
-    assert.equal(writeConfigs(plan)[0]?.created, false);
-    assert.ok(fs.statSync(target).isDirectory());
+    // A field this client's schema does not know: a later carrick.derive/0 may
+    // add one, and the agent must still receive it.
+    const document = JSON.stringify({ ...plan, unknown_to_this_client: ["keep me"] });
+    assert.equal(writeProposal(dir, { plan, document }), PROPOSAL_FILE);
+    const written = fs.readFileSync(path.join(dir, PROPOSAL_FILE), "utf8");
+    assert.equal(written, `${document}\n`);
+    assert.deepEqual(JSON.parse(written).unknown_to_this_client, ["keep me"]);
+
+    // Nothing under .carrick is ever committed, whichever command created it.
+    assert.equal(fs.readFileSync(path.join(dir, ".carrick", ".gitignore"), "utf8").trimEnd().split("\n").at(-1), "*");
+
+    // Derived, so re-running replaces it rather than preserving a stale seed.
+    const second = { plan, document: JSON.stringify(plan) };
+    writeProposal(dir, second);
+    assert.equal(fs.readFileSync(path.join(dir, PROPOSAL_FILE), "utf8"), `${second.document}\n`);
+
+    // And it is the only thing written: no carrick.json, at any depth.
+    assert.deepEqual(fs.readdirSync(dir).sort(), [".carrick"]);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -138,7 +198,7 @@ test("unsigned init refuses GH_TOKEN before deriving, writing or requesting the 
     process.env["GH_TOKEN"] = "github-is-not-carrick";
     delete process.env["CARRICK_TOKEN"];
     globalThis.fetch = async () => { throw new Error("must not request network"); };
-    assert.equal(await init(["--yes", "--skip-index", dir]), 1);
+    assert.equal(await init(["--yes", dir]), 1);
     assert.deepEqual(fs.readdirSync(dir), []);
   } finally {
     process.env = previous;
@@ -343,7 +403,7 @@ test("an editor we have not tested gets the server's command and no claim", () =
 
 test("init reads its arguments", () => {
   const parsed = parseArgs(["-y", "--project", "payments", "--workspace", "/code"], "/tmp");
-  assert.deepEqual(parsed, { workspace: "/code", assumeYes: true, skipIndex: false, project: "payments" });
+  assert.deepEqual(parsed, { workspace: "/code", assumeYes: true, project: "payments" });
   assert.equal((parseArgs(["/code"], "/tmp") as { workspace: string }).workspace, "/code");
   assert.equal((parseArgs(["--project", "payments"]) as { project: string }).project, "payments");
   assert.match(parseArgs(["--project"]) as string, /needs a slug/);
@@ -391,7 +451,7 @@ test("the executable CLI rejects a different project and makes no local setup cl
   try {
     const result = spawnSync(
       process.execPath,
-      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", "--skip-index", fixture.repo],
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", fixture.repo],
       { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
     );
     assert.equal(result.status, 1);
@@ -416,7 +476,7 @@ test("the executable CLI accepts the named assignment on repeated init", posixNa
     for (let run = 0; run < 2; run += 1) {
       const result = spawnSync(
         process.execPath,
-        [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", "--skip-index", fixture.repo],
+        [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", fixture.repo],
         { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
       );
       assert.equal(result.status, 0, result.stderr);
@@ -446,7 +506,7 @@ test("the executable CLI creates the named project when the API can", posixNativ
   try {
     const result = spawnSync(
       process.execPath,
-      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", "--skip-index", fixture.repo],
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", fixture.repo],
       { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
     );
     assert.equal(result.status, 1);
@@ -461,13 +521,200 @@ test("the executable CLI creates the named project when the API can", posixNativ
   }
 });
 
+/** Every path a run created under the workspace, git's own directory aside. */
+function pathsUnder(root: string): string[] {
+  const found: string[] = [];
+  const walk = (directory: string): void => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      if (entry.name === ".git") continue;
+      const full = path.join(directory, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else found.push(path.relative(root, full));
+    }
+  };
+  walk(root);
+  return found.sort();
+}
+
+// The pinned set (carrick#974). The first run leaves the repository as it
+// found it apart from the ignored `.carrick` directory and the hook settings:
+// carrick.json is the agent's to write, after someone has read it, and before
+// the one paid scan (carrick-cloud#799). A change to this set is a deliberate
+// diff in this list.
+test("a first init writes the proposal, its ignore file and the hook settings, and nothing else", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments", "absent", "monorepo");
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--yes", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    // The fixture binary exits 2 for every command but `derive`, so a run that
+    // ends 0 is a run that asked it for no scan.
+    assert.equal(result.status, 0, result.stderr);
+
+    const onPath =
+      spawnSync(process.platform === "win32" ? "where" : "which", ["carrick"], { stdio: "ignore" })
+        .status === 0;
+    assert.deepEqual(
+      pathsUnder(fixture.repo),
+      [
+        path.join(".carrick", ".gitignore"),
+        PROPOSAL_FILE,
+        path.join(".claude", onPath ? "settings.json" : "settings.local.json"),
+      ].sort(),
+    );
+
+    // The proposal is the whole derivation, including the config it would once
+    // have written into the tree.
+    const proposal = JSON.parse(fs.readFileSync(path.join(fixture.repo, PROPOSAL_FILE), "utf8"));
+    assert.equal(proposal.schema, "carrick.derive/0");
+    assert.equal(proposal.repos[0].services.length, 16);
+    assert.equal(proposal.repos[0].config.services.length, 16);
+    assert.equal(proposal.workspace, fixture.repo);
+
+    // And the run ends on the prompt that turns it into a config.
+    assert.match(result.stdout, /Paste this to your agent:/);
+    assert.equal(result.stdout.trimEnd().endsWith(AGENT_SCAFFOLD_PROMPT), true, result.stdout.slice(-400));
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+// carrick#960: this prompt is a copy of the scaffold tool's own instructions,
+// in another repository, and it once named a file the tool had stopped
+// returning. A drifted copy fails here rather than in a user's terminal.
+test("the scaffold prompt names only files that seam owns, and states the sequence", () => {
+  const named: string[] = AGENT_SCAFFOLD_PROMPT.match(/[\w./-]*\.(?:json|ya?ml|md)/g) ?? [];
+  for (const file of named) {
+    assert.ok(
+      [".carrick/proposal.json", "carrick.json", "AGENTS.md", ".github/workflows/carrick.yml"].includes(file),
+      `${file} is not a file the scaffold tool writes or reads`,
+    );
+  }
+  assert.ok(named.includes(".carrick/proposal.json"), AGENT_SCAFFOLD_PROMPT);
+  assert.ok(named.includes("carrick.json"), AGENT_SCAFFOLD_PROMPT);
+  // Free pass first, one paid scan after it (carrick-cloud#799).
+  assert.match(AGENT_SCAFFOLD_PROMPT, /`carrick index`, which is free/);
+  assert.match(AGENT_SCAFFOLD_PROMPT, /`carrick index --infer` once/);
+  assert.ok(
+    AGENT_SCAFFOLD_PROMPT.indexOf("`carrick index`") < AGENT_SCAFFOLD_PROMPT.indexOf("--infer"),
+  );
+});
+
+function recordingPrompts(
+  overrides: Partial<ProjectPrompts> = {},
+): ProjectPrompts & { lines: string[]; asked: string[] } {
+  const lines: string[] = [];
+  const asked: string[] = [];
+  return {
+    lines,
+    asked,
+    say: (line: string) => void lines.push(line),
+    ask: async (question: string) => {
+      asked.push(question);
+      return "";
+    },
+    confirm: async (question: string) => {
+      asked.push(question);
+      return true;
+    },
+    interactive: false,
+    assumeYes: false,
+    list: async () => null,
+    create: async () => ({ kind: "absent" }),
+    ...overrides,
+  };
+}
+
+const LISTED: Project[] = [
+  { slug: "default", name: "Default", archived: false, repo_count: 4 },
+  { slug: "payments", name: "Payments", archived: false, repo_count: 1 },
+];
+
+// carrick#987 item 3: a plain `carrick init` used to skip the project step
+// entirely, so a first run never saw the workspace's projects.
+test("a plain init takes the project the repos are already in", async () => {
+  const prompts = recordingPrompts({
+    list: async () => {
+      throw new Error("a settled assignment is not a question to ask the API");
+    },
+  });
+  assert.deepEqual(await projectStep("token", ["payments", "payments"], prompts), {
+    slug: "payments",
+    exists: true,
+  });
+  // The caller prints the assignment it then verifies, so this step adds no
+  // second sentence about it.
+  assert.deepEqual(prompts.lines, []);
+  assert.deepEqual(prompts.asked, []);
+});
+
+test("a plain init asks nothing without a terminal, and settles nothing it would have to guess", async () => {
+  for (const current of [["payments", "billing"], [null], []]) {
+    const prompts = recordingPrompts();
+    assert.deepEqual(await projectStep("token", current, prompts), { slug: null, exists: false });
+    assert.deepEqual(prompts.asked, []);
+  }
+});
+
+test("a plain init offers the list, and creates the project the terminal names", async () => {
+  const created: string[] = [];
+  const prompts = recordingPrompts({
+    interactive: true,
+    list: async () => LISTED,
+    ask: async () => "search",
+    confirm: async () => true,
+    create: async (_token, slug) => {
+      created.push(slug);
+      return { kind: "created", project: { slug, name: slug, archived: false, repo_count: 0 } };
+    },
+  });
+  assert.deepEqual(await projectStep("token", [null, "payments"], prompts), {
+    slug: "search",
+    exists: true,
+  });
+  assert.deepEqual(created, ["search"]);
+  assert.ok(prompts.lines.some((line) => line.includes("Projects in this workspace:")));
+  assert.ok(prompts.lines.some((line) => line.includes("payments")));
+});
+
+test("a plain init takes a listed project without creating anything", async () => {
+  const prompts = recordingPrompts({
+    interactive: true,
+    list: async () => LISTED,
+    ask: async () => "default",
+    create: async () => {
+      throw new Error("an existing project is not one to create");
+    },
+  });
+  assert.deepEqual(await projectStep("token", [null], prompts), { slug: "default", exists: true });
+});
+
+test("a plain init leaves the step to the browser on a refusal, an absent API or an unusable name", async () => {
+  // An API without the actions is every workspace until the cloud half ships.
+  const absent = recordingPrompts({ interactive: true, list: async () => null });
+  assert.deepEqual(await projectStep("token", [null], absent), { slug: null, exists: false });
+
+  const empty = recordingPrompts({ interactive: true, list: async () => LISTED, ask: async () => "" });
+  assert.deepEqual(await projectStep("token", [null], empty), { slug: null, exists: false });
+
+  const invalid = recordingPrompts({
+    interactive: true,
+    list: async () => LISTED,
+    ask: async () => "Not A Slug",
+  });
+  assert.deepEqual(await projectStep("token", [null], invalid), { slug: null, exists: false });
+  assert.ok(invalid.lines.some((line) => line.includes("is not a project slug")));
+});
+
 test("the executable CLI cannot verify a project without a GitHub repo identity", posixNativeFixture, () => {
   const fixture = executableInitFixture("payments");
   try {
     execFileSync("git", ["-C", fixture.repo, "remote", "remove", "origin"]);
     const result = spawnSync(
       process.execPath,
-      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", "--skip-index", fixture.repo],
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", fixture.repo],
       { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
     );
     assert.equal(result.status, 1);

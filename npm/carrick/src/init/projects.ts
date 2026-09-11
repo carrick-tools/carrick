@@ -145,6 +145,134 @@ export async function createProject(
   return parsed.success ? { kind: "created", project: parsed.data.project } : { kind: "absent" };
 }
 
+/** The slug shape the dashboard enforces, applied before anything is sent. */
+export const SLUG = /^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){2,31}$/;
+
+/** What init asks the terminal during the project step. */
+export type ProjectPrompts = {
+  say: (line: string) => void;
+  /** A free-text answer, already trimmed. Empty means "skip this". */
+  ask: (question: string) => Promise<string>;
+  confirm: (question: string) => Promise<boolean>;
+  interactive: boolean;
+  assumeYes: boolean;
+  list?: (token: string) => Promise<Project[] | null>;
+  create?: (token: string, slug: string) => Promise<CreateOutcome>;
+};
+
+/**
+ * The project these repos should be in, and whether this run can state that it
+ * exists.
+ *
+ * `slug: null` is the honest answer whenever the terminal could not settle it:
+ * an API without the project actions, a workspace whose repos are spread
+ * across projects with nobody at the keyboard, a declined offer. The caller
+ * then does what it did before this step existed — connect the repos and leave
+ * the project to the browser.
+ */
+export type ProjectChoice = { slug: string | null; exists: boolean };
+
+/**
+ * Make sure a named project exists, from the terminal where that is possible.
+ *
+ * Returns whether this run can state that it exists. `false` covers every case
+ * it could not settle — an API without the actions, a declined offer, a
+ * refused create — and the caller then prints the browser instructions, which
+ * include creating it.
+ */
+export async function ensureProject(
+  token: string,
+  slug: string,
+  prompts: ProjectPrompts,
+): Promise<boolean> {
+  const { say } = prompts;
+  const projects = await (prompts.list ?? ((token: string) => listProjects(token)))(token);
+  if (projects === null) return false;
+  if (projects.some((project) => project.slug === slug && !project.archived)) {
+    say(`Project "${slug}" is in this workspace.`);
+    return true;
+  }
+  say(projects.length === 0 ? "This workspace has no projects yet." : "Projects in this workspace:");
+  for (const line of projectLines(projects)) say(line);
+  const create =
+    prompts.assumeYes || (prompts.interactive && (await prompts.confirm(`Create project "${slug}"?`)));
+  if (!create) return false;
+  const outcome = await (prompts.create ?? ((token, slug) => createProject(token, slug)))(token, slug);
+  if (outcome.kind === "created") {
+    say(`Created project "${slug}".`);
+    return true;
+  }
+  if (outcome.kind === "refused") say(`Carrick did not create "${slug}": ${outcome.message}`);
+  return false;
+}
+
+/**
+ * The project step for a plain `carrick init`, with no `--project` to verify
+ * (carrick#987, decision record carrick-cloud#772 step 3).
+ *
+ * Without the flag this used to do nothing at all, so a first run never saw
+ * the workspace's projects and the repo silently stayed wherever the browser
+ * had put it. The order is: the assignment the repos already have, then the
+ * list, then a name the user types, which may be one that does not exist yet.
+ * Assignment itself is still the browser's, so everything settled here only
+ * removes a step from the wait.
+ *
+ * `current` is one entry per requested repo: the project it is in, or null
+ * when it is not connected to this workspace at all.
+ */
+export async function projectStep(
+  token: string,
+  current: Array<string | null>,
+  prompts: ProjectPrompts,
+): Promise<ProjectChoice> {
+  const list = prompts.list ?? ((token: string) => listProjects(token));
+  if (current.length === 0) return { slug: null, exists: false };
+
+  const assigned = [...new Set(current)];
+  const sole = assigned.length === 1 ? assigned[0] : null;
+  if (sole != null) {
+    // Every repo is connected and in one project. That is the answer unless
+    // someone at the keyboard says otherwise, and the caller states the
+    // assignment it verifies, so this says nothing of its own.
+    if (!prompts.interactive || prompts.assumeYes) return { slug: sole, exists: true };
+    if (await prompts.confirm(`These repos are in project "${sole}". Keep them there?`)) {
+      return { slug: sole, exists: true };
+    }
+  }
+  // Nothing to ask without a terminal, and nothing this run may assume: a
+  // repo's project is not a thing to guess at.
+  if (!prompts.interactive) return { slug: null, exists: false };
+
+  const projects = await list(token);
+  if (projects === null) return { slug: null, exists: false };
+  prompts.say(
+    projects.length === 0 ? "This workspace has no projects yet." : "Projects in this workspace:",
+  );
+  for (const line of projectLines(projects)) prompts.say(line);
+  const answer = await prompts.ask(
+    "Which project should these repos be in? Enter a slug, or press Enter to leave it to the browser.",
+  );
+  if (answer === "") return { slug: null, exists: false };
+  if (!SLUG.test(answer)) {
+    prompts.say(
+      `"${answer}" is not a project slug: use 3-32 lowercase letters, digits, and single hyphens. Leaving the project step to the browser.`,
+    );
+    return { slug: null, exists: false };
+  }
+  if (projects.some((project) => project.slug === answer && !project.archived)) {
+    return { slug: answer, exists: true };
+  }
+  const create = await prompts.confirm(`Create project "${answer}"?`);
+  if (!create) return { slug: answer, exists: false };
+  const outcome = await (prompts.create ?? ((token, slug) => createProject(token, slug)))(token, answer);
+  if (outcome.kind === "created") {
+    prompts.say(`Created project "${answer}".`);
+    return { slug: answer, exists: true };
+  }
+  if (outcome.kind === "refused") prompts.say(`Carrick did not create "${answer}": ${outcome.message}`);
+  return { slug: answer, exists: false };
+}
+
 /** The list as init prints it: one line per project, active ones first. */
 export function projectLines(projects: Project[]): string[] {
   const ordered = [...projects].sort((left, right) =>

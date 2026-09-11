@@ -27,14 +27,18 @@ carrick init --project payments
 The command shows the current project assignment for every proposed GitHub
 repo. When the project is not in the workspace yet, it lists the workspace's
 projects and offers to create the named one from the terminal; where the API
-has no such action it prints the project link instead, as before. Repository
-assignment stays in the browser, so the command prints the GitHub App and
-repo-assignment links and, in an interactive terminal, opens the page. The CLI
-then reads `resolve-repos` until every proposed repo reports
-`project_slug: "payments"`. A repo connected to another project remains
-pending. In a noninteractive shell, an unmet target prints the same links and
-exits with status 1 without writing the local setup. Omit `--project` to keep
-the normal workspace init flow.
+has no such action it prints the project link instead. Repository assignment
+stays in the browser, so the command prints the GitHub App and repo-assignment
+links and, in an interactive terminal, opens the page. The CLI then reads
+`resolve-repos` until every proposed repo reports `project_slug: "payments"`.
+A repo connected to another project remains pending. In a noninteractive shell,
+an unmet target prints the same links and exits with status 1 without writing
+the local setup.
+
+Without `--project` the project step still runs: the command takes the project
+the repos are already in, and otherwise lists the workspace's projects for you
+to name one, which it creates from the terminal where the API allows that. An
+empty answer leaves the step to the browser.
 
 Credentials live in `$XDG_CONFIG_HOME/carrick/credentials.json`, falling back
 to `~/.config/carrick/` on macOS and Linux or `%APPDATA%\carrick\` on Windows.
@@ -44,9 +48,12 @@ The file is written with mode 0600. `carrick logout` removes it; unset
 
 Rust derives the same services for CI, local indexing and `init`. An existing
 `carrick.json` is authoritative. When it is missing, `init` presents workspace
-packages and their compiler configuration, then creates the config once.
-Review service boundaries and shared source includes before committing it.
-Repeated init preserves existing config bytes, including hand edits.
+packages and their compiler configuration and writes that proposal to
+`.carrick/proposal.json`, which is ignored. It writes no `carrick.json`: your
+agent turns the proposal into one, so the config you commit is one somebody has
+read, and the first scan runs against it. `carrick index` is free and states
+what it can; `carrick index --infer` is the scan that asks Carrick to classify
+the rest, and it refuses to run until a `carrick.json` exists.
 
 Workspace detection handles a repo root or immediate sibling repositories.
 An optional `carrick-workspace.json` adds paths through `repos` and removes
@@ -85,7 +92,7 @@ types in a Node process.
 |---|---|
 | `carrick login` | Authorise a Carrick workspace in the browser, or verify `CARRICK_TOKEN` |
 | `carrick logout` | Remove the saved local credential |
-| `carrick init [--project SLUG]` | The repo list, optional project-assignment verification, the first index, the agent hooks, and the lines it cannot run for you |
+| `carrick init [--project SLUG]` | The repo list, the project, the service proposal in `.carrick/`, the agent hooks, the MCP connection, and the prompt that writes `carrick.json` |
 | `carrick index` | Derive the workspace, apply optional repo overrides and write `.carrick/` |
 | `carrick refresh [--service X]` | Re-scan one repo, or all of them, and re-join |
 | `carrick check <file>` | What the index knows about that file, verdicts included |
