@@ -11,7 +11,7 @@
 //! serves as the index; GitHub is the source of truth for code.
 
 use crate::agent_service::{AgentCallError, AgentService, rate_limit_tripped};
-use crate::visitor::{FunctionDefinition, ImportedSymbol};
+use crate::visitor::FunctionDefinition;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -219,7 +219,6 @@ where
 pub async fn generate_function_intents(
     agent_service: &AgentService,
     function_definitions: &mut HashMap<String, FunctionDefinition>,
-    _imported_symbols: &HashMap<String, ImportedSymbol>,
     prev_intents_by_hash: &HashMap<String, String>,
 ) {
     // Process every function with a body source, skipping trivial
@@ -897,13 +896,7 @@ mod tests {
         prev.insert(main_hash.clone(), "calls the helper".to_string());
 
         let agent = AgentService::new();
-        generate_function_intents(
-            &agent,
-            &mut defs,
-            &HashMap::<String, ImportedSymbol>::new(),
-            &prev,
-        )
-        .await;
+        generate_function_intents(&agent, &mut defs, &prev).await;
 
         // Both intents came from the cache, with their hashes recorded.
         assert_eq!(defs["helper"].intent.as_deref(), Some(helper_intent));
@@ -951,13 +944,7 @@ mod tests {
         defs.insert("getId".to_string(), def_with_body("getId", "return x.id;"));
 
         let agent = AgentService::new();
-        generate_function_intents(
-            &agent,
-            &mut defs,
-            &HashMap::<String, ImportedSymbol>::new(),
-            &HashMap::new(),
-        )
-        .await;
+        generate_function_intents(&agent, &mut defs, &HashMap::new()).await;
 
         assert!(defs["getId"].intent.is_none());
         assert!(defs["getId"].intent_input_hash.is_none());
@@ -1005,13 +992,7 @@ mod tests {
             std::env::set_var("CARRICK_SKIP_INTENTS", "1");
         }
         let mut defs = make_defs();
-        generate_function_intents(
-            &agent,
-            &mut defs,
-            &HashMap::<String, ImportedSymbol>::new(),
-            &HashMap::new(),
-        )
-        .await;
+        generate_function_intents(&agent, &mut defs, &HashMap::new()).await;
         unsafe {
             std::env::remove_var("CARRICK_SKIP_INTENTS");
         }
@@ -1030,13 +1011,7 @@ mod tests {
 
         // Control: with the flag unset (MOCK_ALL still on), intents flow.
         let mut defs = make_defs();
-        generate_function_intents(
-            &agent,
-            &mut defs,
-            &HashMap::<String, ImportedSymbol>::new(),
-            &HashMap::new(),
-        )
-        .await;
+        generate_function_intents(&agent, &mut defs, &HashMap::new()).await;
 
         // Restore whatever the environment had before the test.
         unsafe {

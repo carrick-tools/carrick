@@ -793,14 +793,20 @@ pub struct Mount {
     pub prefix: String,    // Path prefix for this mount
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SymbolKind {
     Named,
     Default,
     Namespace,
 }
 
-#[derive(Debug, Clone)]
+/// One import fact: what a file imported, from where, under what local name.
+///
+/// Ordered and hashable so a whole-service sample of import facts can be
+/// collected into a `BTreeSet` — the framework-detect body is built from one
+/// (see `framework_detector::FrameworkDetectionInput`) and must be identical
+/// across two scans of an unchanged checkout (carrick#954).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ImportedSymbol {
     #[allow(dead_code)]
     pub local_name: String,
