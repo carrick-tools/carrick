@@ -20,9 +20,10 @@
 //! sidecar it spawns for one repo's tsconfig), and five repos in one process
 //! would share it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use crate::cloud_storage::CloudRepoData;
@@ -120,7 +121,6 @@ fn run_generation(
     let mut scanned = Vec::new();
     for (position, repo) in targets.iter().enumerate() {
         let name = repo_label(repo);
-        eprintln!("indexing {name}...");
         let previous = generation.join("previous.json");
         std::fs::write(
             &previous,
@@ -131,7 +131,7 @@ fn run_generation(
         // scanner in its own directory so user labels cannot overwrite a
         // retained or hosted blob in the join input.
         let scan_dir = generation.join(format!("scan-{position}"));
-        scan_repo(&exe, repo, &scan_dir, &previous)?;
+        scan_repo(&exe, repo, &scan_dir, &previous, &name)?;
         for (service, blob) in read_blobs(&scan_dir)?.into_iter().enumerate() {
             std::fs::write(
                 blobs.join(format!("local-{position}-{service}.json")),
@@ -273,7 +273,13 @@ fn repo_for_service(workspace: &Workspace, blobs: &Path, service: &str) -> Resul
 }
 
 /// Phase 1 for one repo.
-fn scan_repo(exe: &Path, repo: &Path, blobs: &Path, previous: &Path) -> Result<(), String> {
+fn scan_repo(
+    exe: &Path,
+    repo: &Path,
+    blobs: &Path,
+    previous: &Path,
+    label: &str,
+) -> Result<(), String> {
     let mut command = Command::new(exe);
     command
         .arg(repo)
@@ -282,10 +288,21 @@ fn scan_repo(exe: &Path, repo: &Path, blobs: &Path, previous: &Path) -> Result<(
         .env(super::hosted::PREVIOUS_ENV, previous)
         .env(super::NO_MODEL_ENV, "1")
         .env("CARRICK_SKIP_INTENTS", "1")
+        // The scan is a subprocess whose output this indexer swallows, so it
+        // is asked for the one thing worth showing: how far through each
+        // service it is (carrick#955).
+        .env(crate::progress::PROGRESS_ENV, "1")
         .env_remove("CARRICK_OUTPUT_JSON")
         .env_remove(super::JOIN_OUT_ENV);
     strip_ci_env(&mut command);
-    run_scan(command, &format!("scan of {}", repo.display()))
+    run_scan(
+        command,
+        &format!("scan of {}", repo.display()),
+        Reporting {
+            working: format!("indexing {label}"),
+            done: format!("indexed {label}"),
+        },
+    )
 }
 
 /// Phase 2: join every blob, and hand the result back.
@@ -296,33 +313,74 @@ fn join(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Result<LocalJoin, 
         .env(crate::cloud_storage::CACHE_DIR_ENV, blobs)
         .env(super::NO_MODEL_ENV, "1")
         .env("CARRICK_SKIP_INTENTS", "1")
+        // The join reads every blob back and re-reads this repo, so it is the
+        // second phase worth a count rather than a silence (carrick#955).
+        .env(crate::progress::PROGRESS_ENV, "1")
         .env(super::JOIN_OUT_ENV, out)
         .env_remove(crate::cloud_storage::ISOLATE_ENV)
         .env_remove(super::hosted::PREVIOUS_ENV)
         .env_remove("CARRICK_OUTPUT_JSON");
     strip_ci_env(&mut command);
-    run_scan(command, "workspace join")?;
+    run_scan(
+        command,
+        "workspace join",
+        Reporting {
+            working: "joining the workspace".to_string(),
+            done: "joined the workspace".to_string(),
+        },
+    )?;
 
     let text = std::fs::read_to_string(out)
         .map_err(|e| format!("the join wrote no result to {}: {e}", out.display()))?;
     serde_json::from_str(&text).map_err(|e| format!("could not read the join result: {e}"))
 }
 
-/// Run one scan subprocess, and say what it printed if it failed. Output is
-/// captured rather than inherited: a scan writes a report to stdout that means
-/// nothing here, and the useful half of a failure is the last few lines of
-/// stderr.
-fn run_scan(mut command: Command, what: &str) -> Result<(), String> {
-    let output = command
-        .output()
+/// Run one scan subprocess, and say what it printed if it failed.
+///
+/// The scan's stdout is dropped — it is a report that means nothing here — and
+/// its stderr is read line by line rather than collected at the end, for two
+/// reasons: the progress lines it carries are worth something only while the
+/// scan is still running (carrick#955), and the useful half of a failure is
+/// still the last few lines, which are kept as they go past.
+/// What one phase of a build calls itself while it runs and once it is done.
+struct Reporting {
+    working: String,
+    done: String,
+}
+
+fn run_scan(mut command: Command, what: &str, reporting: Reporting) -> Result<(), String> {
+    command.stdout(Stdio::null()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
         .map_err(|e| format!("could not start the {what}: {e}"))?;
-    if output.status.success() {
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("the {what} produced no stderr to read"))?;
+    let bar = crate::logging::spinner(&reporting.working);
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(12);
+    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        if let Some(update) = crate::progress::parse(&line) {
+            bar.set_message(format!("{}: {}", reporting.working, update.render()));
+            continue;
+        }
+        if tail.len() == 12 {
+            tail.pop_front();
+        }
+        tail.push_back(line);
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("could not wait for the {what}: {e}"))?;
+    if status.success() {
+        crate::logging::finish_spinner(&bar, &reporting.done);
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let tail: Vec<&str> = stderr.lines().rev().take(12).collect();
-    let tail: Vec<&str> = tail.into_iter().rev().collect();
-    Err(format!("the {what} failed:\n{}", tail.join("\n")))
+    bar.finish_and_clear();
+    Err(format!(
+        "the {what} failed:\n{}",
+        tail.into_iter().collect::<Vec<_>>().join("\n")
+    ))
 }
 
 /// Strip the ambient CI context, exactly as the offline harness does. Without

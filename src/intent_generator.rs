@@ -299,6 +299,12 @@ pub async fn generate_function_intents(
     let mut hashes: HashMap<String, String> = HashMap::new();
     let mut reused = 0usize;
     let mut generated = 0usize;
+    // Intents are one call per eligible function and the long phase of a
+    // hosted scan, so this is the count a waiting parent renders
+    // (carrick#955). A function is counted once it is settled, whether that
+    // took a call or a cache hit.
+    let mut describing =
+        crate::progress::Ticker::new(crate::progress::Phase::Intents, eligible.len());
 
     for (level_idx, level) in levels.iter().enumerate() {
         // Compute each function's called_intents context and content hash, then
@@ -334,6 +340,7 @@ pub async fn generate_function_intents(
                 intents.insert(name.clone(), prev_intent.clone());
                 hashes.insert(name.clone(), hash);
                 reused += 1;
+                describing.item();
             } else {
                 to_generate.push(Pending {
                     name: name.clone(),
@@ -373,6 +380,7 @@ pub async fn generate_function_intents(
         let mut aborted = 0usize;
 
         for (pending, result) in outcomes {
+            describing.item();
             let Pending { name, hash, .. } = pending;
             match result {
                 Ok(intent) => {

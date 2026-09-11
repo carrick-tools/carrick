@@ -4,16 +4,39 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { spawnSync } from "node:child_process";
-import { readCredential } from "../auth/credentials.ts";
+import { readCredential, type Credential } from "../auth/credentials.ts";
+import { signIn } from "../auth/run.ts";
 import { resolveRepos } from "../auth/read.ts";
 import { deriveWorkspace, writeConfigs, githubRemote } from "./repos.ts";
 import { connectRepos, reposAreInProject } from "./connect.ts";
+import { listProjects, createProject, projectLines } from "./projects.ts";
+import { connectMcpClients, mcpLines } from "./mcp.ts";
 import { hookCommand, mergeCarrickHooks } from "./settings.ts";
 import { renderTemplate } from "../templates.ts";
 import { resolveNativeBinary, nativeEnv, packageRoot } from "../native.ts";
 
-const MCP_LINE = "claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp";
 const EXTENSION_ID = "carrick-tools.carrick";
+
+/**
+ * The prompt that makes an agent write this repo's setup files.
+ *
+ * A copy, and deliberately a verbatim one: the source of truth is
+ * `AGENT_SCAFFOLD_PROMPT` in the dashboard (carrick-cloud
+ * `app/src/lib/onboarding.ts`), whose own test checks every filename in it
+ * against what the `scaffold` MCP tool actually returns. It is printed here so
+ * the terminal path ends where the dashboard path ends — with the one prompt
+ * that turns a signed-in workspace into a repo that scans itself in CI
+ * (carrick#955). Keep the two in step; the tool's instructions, not this text,
+ * decide what gets written.
+ */
+const AGENT_SCAFFOLD_PROMPT =
+  "Run the carrick scaffold tool, passing this repo's owner/repo from " +
+  "`git remote get-url origin` as `repo`, and follow the instructions it " +
+  "returns: create each file at its path, populate carrick.json by scanning " +
+  "this repo for its service(s) and the env vars / domains they call (use a " +
+  "nested services config if it's a monorepo), and add the Carrick section " +
+  "to AGENTS.md if this repo already has one. Answer the closing checklist " +
+  "before you open the PR.";
 
 export type InitOptions = {
   workspace: string;
@@ -72,10 +95,12 @@ function help(): string {
   return [
     "carrick init [DIRECTORY] [--project SLUG]",
     "",
-    "Sign in with carrick login, then configure services, hooks and the first",
-    "index in a repository or a folder of repos.",
-    "With --project, the browser creates or selects the project and assigns",
-    "the proposed GitHub repos. The CLI waits for Carrick to verify the assignment.",
+    "Sign in (here, or beforehand with carrick login), then configure services,",
+    "hooks, the MCP connection and the first index in a repository or a folder",
+    "of repos.",
+    "With --project, a project missing from the workspace is offered for",
+    "creation here; the browser assigns the repos and the CLI waits for Carrick",
+    "to verify the assignment.",
     "",
     "    -w, --workspace DIR  The folder holding the repos (default: this one)",
     "        --project SLUG   Require these repos in this Carrick project",
@@ -144,6 +169,43 @@ export function editorLines(onPath: (command: string) => boolean): string[] {
   return lines;
 }
 
+/**
+ * Make sure the named project exists, from the terminal where that is possible.
+ *
+ * Returns whether this run can state that the project exists. `false` is the
+ * honest answer for every case it could not settle — an API without the
+ * actions, a declined offer, a refused create — and the caller then prints
+ * today's browser instructions, which include creating it.
+ */
+async function ensureProject(
+  token: string,
+  slug: string,
+  options: { say: (line: string) => void; interactive: boolean; assumeYes: boolean },
+): Promise<boolean> {
+  const { say } = options;
+  const projects = await listProjects(token);
+  if (projects === null) return false;
+  if (projects.some((project) => project.slug === slug && !project.archived)) {
+    say(`Project "${slug}" is in this workspace.`);
+    return true;
+  }
+  say(
+    projects.length === 0
+      ? "This workspace has no projects yet."
+      : "Projects in this workspace:",
+  );
+  for (const line of projectLines(projects)) say(line);
+  const create = options.assumeYes || (options.interactive && (await confirm(`Create project "${slug}"?`)));
+  if (!create) return false;
+  const outcome = await createProject(token, slug);
+  if (outcome.kind === "created") {
+    say(`Created project "${slug}".`);
+    return true;
+  }
+  if (outcome.kind === "refused") say(`Carrick did not create "${slug}": ${outcome.message}`);
+  return false;
+}
+
 export async function init(argv: string[]): Promise<number> {
   const parsed = parseArgs(argv);
   if (typeof parsed === "string") {
@@ -157,11 +219,23 @@ export async function init(argv: string[]): Promise<number> {
     return 1;
   }
 
+  const interactive = process.stdin.isTTY === true;
+
   // Authentication and all derivation validation precede local writes.
   let plan: ReturnType<typeof deriveWorkspace>;
   try {
-    const credential = readCredential();
-    if (!credential) throw new Error("carrick init requires a Carrick login. Run carrick login, or set CARRICK_TOKEN.");
+    // A machine that has never signed in signs in here rather than being told
+    // to run another command: `carrick login` is the same browser round trip,
+    // and refusing to take it was the first thing a new install did
+    // (carrick#955). Without a terminal there is no browser to hand it to.
+    let credential: Credential | null = readCredential();
+    if (!credential) {
+      if (!interactive) {
+        throw new Error("carrick init requires a Carrick login. Run carrick login, or set CARRICK_TOKEN.");
+      }
+      say("This machine is not signed in to Carrick.");
+      credential = await signIn(say);
+    }
     plan = deriveWorkspace(workspace);
     const repoIdentities = plan.repos.map((repo) => ({ path: repo.path, name: githubRemote(repo.path) }));
     const names = [...new Set(repoIdentities.map((repo) => repo.name).filter((name): name is string => name !== null))];
@@ -179,9 +253,22 @@ export async function init(argv: string[]): Promise<number> {
       say(`Repos requested for project "${parsed.project}":`);
       for (const name of names) say(`  ${name}`);
     }
-    const identity = await connectRepos(credential.token, names, await resolveRepos(credential.token, names), {
-      interactive: process.stdin.isTTY === true,
+    const initial = await resolveRepos(credential.token, names);
+    // The project half of the browser round trip, where this API can do it
+    // from here. Assignment still belongs to the browser, so this only ever
+    // removes the "create the project" step from the wait.
+    const projectExists =
+      parsed.project && !reposAreInProject(initial, names, parsed.project)
+        ? await ensureProject(credential.token, parsed.project, {
+            say,
+            interactive,
+            assumeYes: parsed.assumeYes,
+          })
+        : false;
+    const identity = await connectRepos(credential.token, names, initial, {
+      interactive,
       project: parsed.project ?? undefined,
+      projectExists,
       say,
     });
     if (parsed.project && !reposAreInProject(identity, names, parsed.project)) {
@@ -290,18 +377,24 @@ export async function init(argv: string[]): Promise<number> {
     }
   }
 
-  // 5. The lines it cannot run for you.
+  // 5. The MCP connection, for work that crosses repos this machine does not
+  //    hold. Configured here for every client this machine has, rather than
+  //    printed for one of them (carrick#955).
   say();
-  say("Next, and none of this is done for you:");
+  say("Next:");
   say();
-  say("  The org index, for work that crosses repos you do not have on disk:");
-  say(`    ${MCP_LINE}`);
+  for (const line of mcpLines(connectMcpClients())) say(line);
   say();
-  say("  The CI check, once per repo (it needs no secret):");
+  say("  The CI check, once per repo (it needs no secret). Paste this to your agent:");
+  say();
+  say(`    ${AGENT_SCAFFOLD_PROMPT}`);
+  say();
+  say("  Or write the workflow yourself:");
   say("    mkdir -p .github/workflows");
   say("    carrick templates workflow > .github/workflows/carrick.yml");
   say();
-  say("  After the first successful scan on the repo's default branch, bring its hosted index here:");
+  say("  The first scan on the repo's default branch writes the hosted index. A session");
+  say("  started in this folder afterwards picks it up on its own; by hand it is:");
   say("    carrick refresh");
   say("    carrick status");
   say();

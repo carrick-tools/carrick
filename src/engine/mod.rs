@@ -303,6 +303,9 @@ async fn run_analysis_engine_inner<T: CloudStorage>(
             index + 1,
             services.len()
         );
+        // The same fact, for a parent process that is rendering a line rather
+        // than reading a log (carrick#955).
+        crate::progress::service_started(label, index + 1, services.len());
         let service_started = Instant::now();
 
         let packages = load_packages_for_service(repo_path, service)?;
