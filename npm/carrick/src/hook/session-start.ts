@@ -17,6 +17,7 @@ import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
 import { renderSessionStart } from "../render.ts";
 import { resolveRoot, rootNote } from "../root.ts";
+import { refreshInBackground } from "./refresh.ts";
 
 const log = createLogger("carrick-session");
 
@@ -41,6 +42,17 @@ async function main(): Promise<void> {
   // Ends with a newline: this is a line a developer also runs by hand and
   // compares against `carrick status`, and that one ends its output properly.
   process.stdout.write(`${renderSessionStart(outcome.result)}\n`);
+
+  // The hosted index the first CI scan writes is picked up here rather than by
+  // a command the developer has to remember (carrick#955). Detached and
+  // unwaited: a refresh is minutes of work and a hook is not.
+  let started: string | null = null;
+  try {
+    started = refreshInBackground(choice.root, outcome.result);
+  } catch (error) {
+    log("background refresh not started", String(error));
+  }
+  if (started) process.stdout.write(`${started}\n`);
 }
 
 await main();

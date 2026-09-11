@@ -1,6 +1,36 @@
-import { readCredential, saveCredential, removeCredential } from "./credentials.ts";
+import { API_BASE, readCredential, saveCredential, removeCredential, type Credential } from "./credentials.ts";
 import { authorize } from "./oauth.ts";
 import { resolveRepos } from "./read.ts";
+
+/**
+ * Sign in through the browser and leave a saved credential behind.
+ *
+ * Shared with `carrick init`, which signs a machine in rather than stopping to
+ * say "run carrick login" (carrick#955): the first thing a new install does is
+ * the one thing it was refusing to do. The steps are the same either way, so
+ * there is one copy of them.
+ */
+export async function signIn(
+  say: (message: string) => void = (message) => process.stdout.write(`${message}\n`),
+  signal?: AbortSignal,
+): Promise<Credential> {
+  // An explicit override must be verified, never silently replaced by a browser login.
+  const override = process.env["CARRICK_TOKEN"] !== undefined ? readCredential() : null;
+  const token = override?.token ?? await authorize(signal ? { signal } : {});
+  // Keep an issued token if the new metadata endpoint is temporarily unavailable.
+  if (!override) saveCredential(token, null);
+  const resolved = await resolveRepos(token, []);
+  if (!override) saveCredential(token, resolved.workspace.slug);
+  say(`Signed in to Carrick workspace ${resolved.workspace.slug}${override ? " using CARRICK_TOKEN" : ""}.`);
+  return (
+    override ?? {
+      api_base: API_BASE,
+      token,
+      workspace_slug: resolved.workspace.slug,
+      obtained_at: new Date().toISOString(),
+    }
+  );
+}
 
 export async function login(argv: string[]): Promise<number> {
   if (argv.length) {
@@ -11,14 +41,7 @@ export async function login(argv: string[]): Promise<number> {
   const cancel = (): void => controller.abort();
   process.once("SIGINT", cancel);
   try {
-    // An explicit override must be verified, never silently replaced by a browser login.
-    const override = process.env["CARRICK_TOKEN"] !== undefined ? readCredential() : null;
-    const token = override?.token ?? await authorize({ signal: controller.signal });
-    // Keep an issued token if the new metadata endpoint is temporarily unavailable.
-    if (!override) saveCredential(token, null);
-    const resolved = await resolveRepos(token, []);
-    if (!override) saveCredential(token, resolved.workspace.slug);
-    process.stdout.write(`Signed in to Carrick workspace ${resolved.workspace.slug}${override ? " using CARRICK_TOKEN" : ""}.\n`);
+    await signIn(undefined, controller.signal);
     return 0;
   } catch (error) {
     process.stderr.write(`${(error as Error).message}\n`);

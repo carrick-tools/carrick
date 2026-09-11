@@ -13,8 +13,9 @@ carrick init
 ```
 
 `carrick login` opens the browser to authorise a Carrick workspace. `init`
-requires that credential or a `CARRICK_TOKEN` environment override and verifies
-it before writing files. GitHub CLI credentials do not grant Carrick access.
+accepts that credential or a `CARRICK_TOKEN` environment override, and signs in
+through the browser itself when a terminal has neither. GitHub CLI credentials
+do not grant Carrick access.
 
 Existing users can initialise the local workspace against a named Carrick
 project:
@@ -24,10 +25,12 @@ carrick init --project payments
 ```
 
 The command shows the current project assignment for every proposed GitHub
-repo and prints the project, GitHub App, and repo-assignment links needed for
-the remaining browser steps. In an interactive terminal, it also opens the
-workspace's project page. The browser creates projects and changes assignments;
-the CLI only reads `resolve-repos` until every proposed repo reports
+repo. When the project is not in the workspace yet, it lists the workspace's
+projects and offers to create the named one from the terminal; where the API
+has no such action it prints the project link instead, as before. Repository
+assignment stays in the browser, so the command prints the GitHub App and
+repo-assignment links and, in an interactive terminal, opens the page. The CLI
+then reads `resolve-repos` until every proposed repo reports
 `project_slug: "payments"`. A repo connected to another project remains
 pending. In a noninteractive shell, an unmet target prints the same links and
 exits with status 1 without writing the local setup. Omit `--project` to keep
@@ -145,11 +148,21 @@ runs on the local machine.
 
 Hosted queries cover connected, indexed repositories in the selected Carrick
 project, including repositories absent from this disk, using their most recent
-default-branch indexes. They are available over MCP:
+default-branch indexes. They are available over MCP, and `carrick init`
+connects the agent clients it finds on the machine: Claude Code through
+`claude mcp add`, and Cursor, Windsurf and VS Code by adding a `carrick` server
+to the client's own configuration file, leaving every other entry in it alone.
+A machine with none of them is given the line to run:
 
 ```
 claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp
 ```
+
+The first scan on a repository's default branch writes its hosted index. A
+Claude Code session opened in a workspace still waiting for one starts
+`carrick refresh` in the background, at most once an hour
+(`CARRICK_REFRESH_COOLDOWN_MS` states another gap), so the hosted rows arrive
+without a command to remember.
 
 ## Licence
 

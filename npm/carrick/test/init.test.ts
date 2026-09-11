@@ -22,7 +22,13 @@ import { editorLines, parseArgs, init } from "../src/init/run.ts";
 
 const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
-function executableInitFixture(projectSlug: string): {
+function executableInitFixture(
+  projectSlug: string,
+  // Whether this fixture's API has the project actions at all. "absent" is the
+  // deployed server: it answers an action it has never heard of with the
+  // credential-kind gate, which is a 403 (carrick#955).
+  projectActions: "absent" | "deployed" = "absent",
+): {
   root: string;
   repo: string;
   env: NodeJS.ProcessEnv;
@@ -49,9 +55,29 @@ process.stdout.write(JSON.stringify({
 
   const mockHttp = path.join(root, "mock-http.mjs");
   fs.writeFileSync(mockHttp, `
+const created = new Set();
 globalThis.fetch = async (input, init) => {
   if (String(input) !== "https://api.carrick.tools/types/check-or-upload") throw new Error("unexpected URL");
   const body = JSON.parse(String(init.body));
+  if (body.action === "list-projects" || body.action === "create-project") {
+    if (${JSON.stringify(projectActions)} === "absent") {
+      return Response.json({ error: "MCP keys cannot authenticate scan traffic." }, { status: 403 });
+    }
+    if (body.action === "create-project") {
+      created.add(body.slug);
+      return Response.json({
+        schema: "carrick.create-project/0",
+        project: { slug: body.slug, name: body.name, archived: false, repo_count: 0 },
+      });
+    }
+    return Response.json({
+      schema: "carrick.list-projects/0",
+      projects: [
+        { slug: "default", name: "Default", archived: false, repo_count: 1 },
+        ...[...created].map((slug) => ({ slug, name: slug, archived: false, repo_count: 0 })),
+      ],
+    });
+  }
   if (body.action !== "resolve-repos" || JSON.stringify(body.repos) !== JSON.stringify(["acme/api"])) throw new Error("unexpected request");
   return Response.json({
     schema: "carrick.resolve-repos/0",
@@ -71,6 +97,11 @@ globalThis.fetch = async (input, init) => {
       CARRICK_NATIVE_BINARY: native,
       CARRICK_TOKEN: "test-token",
       XDG_CONFIG_HOME: path.join(root, "config"),
+      // The MCP step configures the agent clients this machine has, and the
+      // detection is each client's own directory under the home directory.
+      // A test that did not state one would edit the developer's own clients.
+      HOME: path.join(root, "home"),
+      USERPROFILE: path.join(root, "home"),
       NODE_OPTIONS: `--import=${mockHttp}`,
     },
     cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
@@ -339,6 +370,10 @@ test("the executable CLI rejects a different project and makes no local setup cl
     assert.match(result.stdout, /acme\/api is currently in project "default-project"/);
     assert.match(result.stdout, /Create project "payments" if needed/);
     assert.match(result.stdout, /Assign the requested repos/);
+    // The project actions are not deployed, so nothing was listed and the
+    // browser still owns creating it.
+    assert.doesNotMatch(result.stdout, /Projects in this workspace/);
+    assert.doesNotMatch(result.stdout, /Created project/);
     assert.match(result.stderr, /Project "payments" was not verified/);
     assert.equal(fs.existsSync(path.join(fixture.repo, "carrick.json")), false);
     assert.equal(fs.existsSync(path.join(fixture.repo, ".claude")), false);
@@ -359,7 +394,40 @@ test("the executable CLI accepts the named assignment on repeated init", posixNa
       assert.equal(result.status, 0, result.stderr);
       assert.match(result.stdout, /Verified 1 repo in project "payments"/);
       assert.doesNotMatch(result.stdout, /Create project "payments" if needed/);
+      // A repo already in the project is not a project to look up or create.
+      assert.doesNotMatch(result.stdout, /Projects in this workspace/);
+      // Setup ends where the dashboard's checklist ends: the prompt that makes
+      // an agent write this repo's workflow and carrick.json (carrick#955).
+      assert.match(result.stdout, /Run the carrick scaffold tool/);
+      assert.match(result.stdout, /carrick\.json/);
+      // No agent client under this fixture's home, so the MCP step states the
+      // line rather than claiming a connection.
+      assert.match(result.stdout, /claude mcp add --scope user --transport http carrick/);
+      assert.match(result.stdout, /No agent client was found on this machine/);
     }
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+// The terminal half of the project step, against an API that has the actions:
+// the list is printed, the project is created from here, and the browser is
+// left with the one thing it still owns — assignment.
+test("the executable CLI creates the named project when the API can", posixNativeFixture, () => {
+  const fixture = executableInitFixture("default-project", "deployed");
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", "--skip-index", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /Projects in this workspace:/);
+    assert.match(result.stdout, /^ {2}default {2}Default {2}1 repo$/m);
+    assert.match(result.stdout, /Created project "payments"\./);
+    assert.doesNotMatch(result.stdout, /Create project "payments" if needed/);
+    assert.match(result.stdout, /Assign the requested repos/);
+    assert.match(result.stderr, /Project "payments" was not verified/);
   } finally {
     fixture.cleanup();
   }

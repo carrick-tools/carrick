@@ -133,6 +133,19 @@ export type StatusService = {
   boundary?: Boundary;
   boundary_note?: string;
   boundary_lines?: string[];
+  /**
+   * What the hosted index held for this service at the last index or refresh.
+   * `no_index_yet` is a connected repo whose first CI scan has not landed —
+   * the one state a session start can do something about (carrick#955).
+   */
+  hosted_state?:
+    | "enriched"
+    | "no_index_yet"
+    | "not_connected"
+    | "not_signed_in"
+    | "version_mismatch"
+    | "commit_missing"
+    | "read_failed";
 };
 
 /** `carrick status --json`: the workspace, with no file in the question. */
@@ -142,6 +155,8 @@ export type StatusResult = {
   workspace?: string;
   indexed_at?: string;
   scanner_version?: string;
+  /** RFC 3339, when this index last read the hosted side. */
+  hosted_checked_at?: string;
   services: StatusService[];
 };
 
@@ -217,6 +232,9 @@ export function parseStatusResult(stdout: string): StatusResult | null {
   if (typeof parsed["indexed_at"] === "string") result.indexed_at = parsed["indexed_at"];
   if (typeof parsed["scanner_version"] === "string") {
     result.scanner_version = parsed["scanner_version"];
+  }
+  if (typeof parsed["hosted_checked_at"] === "string") {
+    result.hosted_checked_at = parsed["hosted_checked_at"];
   }
   const services = Array.isArray(parsed["services"]) ? parsed["services"] : [];
   for (const entry of services) {

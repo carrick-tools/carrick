@@ -7,6 +7,8 @@ type ConnectOptions = {
   interactive: boolean;
   say: (message: string) => void;
   project?: string;
+  /** True when this run has already seen or created the project (carrick#955). */
+  projectExists?: boolean;
   open?: (url: string) => Promise<boolean>;
   poll?: (signal: AbortSignal) => Promise<ResolvedRepos>;
   wait?: (signal: AbortSignal) => Promise<void>;
@@ -77,8 +79,13 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
       options.say(verifiedLine(repos, options.project));
       return initial;
     }
-    options.say(`Create project "${options.project}" if needed: ${projectUrl}`);
-    options.say(`  Choose Create project, enter a name, and set the slug to "${options.project}".`);
+    // The create step is skipped only when this run has just seen the project
+    // in the workspace or created it; a browser is still where a repo is
+    // assigned to it.
+    if (!options.projectExists) {
+      options.say(`Create project "${options.project}" if needed: ${projectUrl}`);
+      options.say(`  Choose Create project, enter a name, and set the slug to "${options.project}".`);
+    }
     if (!initial.workspace.installed || initial.repos.some((repo) => !repo.connected)) {
       options.say(`Connect any missing repos: ${connectUrl}`);
     }
@@ -106,7 +113,8 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
   let latest = initial;
   const seen = new Set(initial.repos.filter((repo) => repo.connected).map((repo) => repo.full_name));
   try {
-    void (options.open ?? openBrowser)(options.project ? projectUrl : connectUrl).catch(() => false);
+    const target = options.project ? (options.projectExists ? reposUrl : projectUrl) : connectUrl;
+    void (options.open ?? openBrowser)(target).catch(() => false);
     while (!signal.aborted) {
       await (options.wait ?? (async (signal) => { await setTimeout(5000, undefined, { signal }); }))(signal);
       signal.throwIfAborted();
