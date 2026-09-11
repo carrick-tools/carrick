@@ -2136,6 +2136,55 @@ mod tests {
         assert_eq!(write["scan_final"], true);
     }
 
+    /// C10's scanner half, on the wire. A dirty run's `hash` is HEAD's SHA
+    /// even though the tree was not HEAD, so without `force_reindex` the
+    /// cloud's freshness guard tells the next scan at the same commit that the
+    /// index is current — and the dirty rows survive at a commit they never
+    /// described. Both write actions carry it; the existence check does not,
+    /// because it indexes nothing to supersede.
+    #[tokio::test]
+    async fn a_dirty_run_forces_the_reindex_on_its_write_action() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            "scan_01J",
+        );
+        // What `start-scan` leaves behind on a dirty run.
+        storage
+            .dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        let requests = server.join().unwrap();
+        assert!(
+            body_of(&requests[0]).get("force_reindex").is_none(),
+            "the existence check supersedes nothing: {}",
+            body_of(&requests[0])
+        );
+        assert_eq!(body_of(&requests[1])["force_reindex"], true);
+    }
+
+    /// And a clean run does not: the field is omitted, so an ordinary upload's
+    /// body is byte-for-byte what it was.
+    #[tokio::test]
+    async fn a_clean_run_omits_force_reindex() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            "scan_01J",
+        );
+
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        let write = body_of(&server.join().unwrap()[1]);
+        assert!(write.get("force_reindex").is_none(), "{write}");
+    }
+
     /// A service that is not the last one in the run must not release the
     /// slot: the rest of the run would then be unprotected, and a second
     /// laptop could start scanning the same repo halfway through this one.
