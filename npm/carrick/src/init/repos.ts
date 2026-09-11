@@ -21,7 +21,11 @@ export function deriveWorkspace(workspace: string): WorkspaceProposal {
     encoding: "utf8", env: nativeEnv(), timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
   });
   if (result.error) throw new Error(`Could not derive the workspace: ${result.error.message}`);
-  if (result.status !== 0) throw new Error(result.stderr.trim() || "The scanner could not derive the workspace.");
+  // The scanner prefixes its own command name, and every caller of this
+  // prefixes theirs: without the strip, a discovery failure reads
+  // "carrick init: carrick derive: no repos in ...", which looks like two
+  // failures and hides the sentence that matters.
+  if (result.status !== 0) throw new Error(result.stderr.trim().replace(/^carrick derive: /, "") || "The scanner could not derive the workspace.");
   const parsed = proposal.safeParse(JSON.parse(result.stdout));
   if (!parsed.success) throw new Error("The scanner returned an unsupported workspace proposal. Install matching Carrick CLI and scanner versions.");
   return parsed.data;

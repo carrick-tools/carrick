@@ -35,16 +35,44 @@ pub struct ParentProposal {
 
 impl ParentProposal {
     pub fn description(&self) -> String {
+        // Named by directory, not by full path: the folder holding them is in
+        // the same sentence, and a folder of scratch checkouts otherwise
+        // prints eighty absolute paths on one line.
+        let names = self
+            .repos
+            .iter()
+            .map(|repo| {
+                repo.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| repo.display().to_string())
+            })
+            .collect::<Vec<_>>();
         format!(
-            "The parent folder {} holds {} repo(s): {}. Run carrick init .. to initialise that workspace.",
+            "The parent folder {} holds {} {}: {}. Run carrick init .. to initialise that workspace.",
             self.directory.display(),
             self.repos.len(),
-            self.repos
-                .iter()
-                .map(|repo| repo.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
+            if self.repos.len() == 1 {
+                "repo"
+            } else {
+                "repos"
+            },
+            some_of(&names),
         )
+    }
+}
+
+/// The first few names, and a count of the rest. Used wherever a message would
+/// otherwise print a list nobody can read.
+fn some_of(names: &[String]) -> String {
+    let shown = names
+        .iter()
+        .take(NAMES_SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    match names.len().saturating_sub(NAMES_SHOWN) {
+        0 => shown,
+        rest => format!("{shown} and {rest} more"),
     }
 }
 
@@ -79,7 +107,9 @@ impl Workspace {
             }
             Err(e) => return Err(format!("could not read {}: {e}", file.display())),
         };
-        let (repos_detected_by, mut entries) = detect(root)?;
+        let detection = detect(root)?;
+        let repos_detected_by = detection.detected_by;
+        let mut entries = detection.repos;
         let repos_added = parsed.repos.clone();
         entries.extend(parsed.repos);
         let repos_excluded = parsed.exclude;
@@ -89,10 +119,26 @@ impl Workspace {
             None
         };
         if entries.is_empty() {
+            // What was looked for and what was there, both of them: a bare
+            // "no repos" cannot tell a user whether they are in the wrong
+            // folder, whether their manifest is a kind Carrick does not read,
+            // or whether every candidate was skipped as an artefact directory
+            // (carrick#975).
+            let listed = if file.is_file() {
+                format!("\n{WORKSPACE_FILE} is here and lists no repos either.")
+            } else {
+                String::new()
+            };
             return Err(format!(
-                "{} lists no repos and none were detected. {}",
+                "no repos in {}.\n{}{listed}\n{}",
                 root.display(),
-                parent_proposal.as_ref().map(ParentProposal::description).unwrap_or_else(|| format!("The immediate parent yielded no workspace proposal. Add repo paths to {WORKSPACE_FILE}."))
+                detection.census,
+                parent_proposal
+                    .as_ref()
+                    .map(ParentProposal::description)
+                    .unwrap_or_else(|| format!(
+                        "The folder above holds no repos either. Run carrick init in a repository, or list repo paths in a {WORKSPACE_FILE} in the folder that holds them."
+                    ))
             ));
         }
 
@@ -192,66 +238,139 @@ impl Workspace {
 fn inspect_parent(root: &Path) -> Option<ParentProposal> {
     let root = root.canonicalize().ok()?;
     let parent = root.parent()?;
-    let (_, paths) = detect(parent).ok()?;
+    let paths = detect(parent).ok()?.repos;
     if paths.is_empty() {
         return None;
     }
     Some(ParentProposal {
         directory: parent.to_path_buf(),
-        repos: paths.into_iter().map(|path| parent.join(path)).collect(),
+        repos: paths
+            .into_iter()
+            .map(|path| match path.trim_start_matches("./") {
+                "." => parent.to_path_buf(),
+                name => parent.join(name),
+            })
+            .collect(),
     })
 }
 
+/// What detection found, and what it looked at to find it.
+struct Detection {
+    /// The sentence naming how the repos were arrived at.
+    detected_by: String,
+    /// Repo paths relative to the root, or `.` for the root itself.
+    repos: Vec<String>,
+    /// Rendered whenever `repos` is empty: the files checked and the
+    /// directories walked, so a "no repos" answer can be acted on.
+    census: String,
+}
+
+/// The files that make a directory a repository worth indexing. Named in the
+/// census, so what a user is told is what was actually checked.
+const REPO_MARKERS: [&str; 6] = [
+    ".git",
+    "package.json",
+    "carrick.json",
+    "deno.json",
+    "deno.jsonc",
+    "pnpm-workspace.yaml",
+];
+
+/// The manifests that make the root itself the thing to index.
+const ROOT_MANIFESTS: &str =
+    "carrick.json, a package.json with workspaces, pnpm-workspace.yaml, deno.json or deno.jsonc";
+
+/// How many directories to name before counting the rest. A folder of scratch
+/// checkouts holds dozens, and a wall of names answers nothing.
+const NAMES_SHOWN: usize = 3;
+
 /// The same repository detection is used by init and every index build.
-fn detect(root: &Path) -> Result<(String, Vec<String>), String> {
+fn detect(root: &Path) -> Result<Detection, String> {
     if !root.is_dir() {
         return Err(format!("{} is not a directory", root.display()));
     }
+    let found = |detected_by: &str, repos: Vec<String>| Detection {
+        detected_by: detected_by.to_string(),
+        repos,
+        census: String::new(),
+    };
     if std::fs::symlink_metadata(root.join("carrick.json")).is_ok() {
-        return Ok(("carrick.json".into(), vec![".".into()]));
+        return Ok(found("carrick.json", vec![".".into()]));
     }
     if !crate::service_derivation::workspace_patterns(root)?.is_empty()
         || root.join("deno.json").is_file()
         || root.join("deno.jsonc").is_file()
     {
-        return Ok(("workspace manifest".into(), vec![".".into()]));
+        return Ok(found("workspace manifest", vec![".".into()]));
     }
     let mut repos = Vec::new();
+    let mut unmarked = Vec::new();
+    let mut skipped = 0usize;
     for entry in std::fs::read_dir(root).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        if !entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            continue;
+        }
         if name.starts_with('.')
             || crate::packages::MANIFEST_SKIP_DIRS.contains(&name.as_str())
             || ["target", "out", "coverage"].contains(&name.as_str())
-            || !entry.file_type().map_err(|e| e.to_string())?.is_dir()
         {
+            skipped += 1;
             continue;
         }
         if is_repo(&entry.path()) {
             repos.push(format!("./{name}"));
+        } else {
+            unmarked.push(name);
         }
     }
     if !repos.is_empty() {
         repos.sort();
-        return Ok(("sibling repositories".into(), repos));
+        return Ok(found("sibling repositories", repos));
     }
     if is_repo(root) {
-        return Ok(("single repository".into(), vec![".".into()]));
+        return Ok(found("single repository", vec![".".into()]));
     }
-    Ok(("workspace overrides".into(), Vec::new()))
+    unmarked.sort();
+    Ok(Detection {
+        detected_by: "workspace overrides".into(),
+        repos: Vec::new(),
+        census: census(root, &unmarked, skipped),
+    })
+}
+
+/// What detection looked for and what it saw, in two lines a user can act on.
+fn census(root: &Path, unmarked: &[String], skipped: usize) -> String {
+    let root = root.display();
+    let markers = REPO_MARKERS.join(", ");
+    let inside = if unmarked.is_empty() && skipped == 0 {
+        "Inside it: no directories.".to_string()
+    } else {
+        let mut parts = vec![format!("{} directories", unmarked.len() + skipped)];
+        if skipped > 0 {
+            parts.push(format!(
+                "{skipped} skipped as dot, build or dependency directories"
+            ));
+        }
+        if !unmarked.is_empty() {
+            parts.push(format!(
+                "{} holding none of those files ({})",
+                unmarked.len(),
+                some_of(unmarked)
+            ));
+        }
+        format!("Inside it: {}.", parts.join(", "))
+    };
+    format!(
+        "Looked for: {ROOT_MANIFESTS} in {root}, then a directory inside it holding one of {markers}.\nFound: none of those manifests in {root}. {inside}"
+    )
 }
 
 fn is_repo(root: &Path) -> bool {
-    [
-        ".git",
-        "package.json",
-        "carrick.json",
-        "deno.json",
-        "deno.jsonc",
-        "pnpm-workspace.yaml",
-    ]
-    .iter()
-    .any(|name| std::fs::symlink_metadata(root.join(name)).is_ok())
+    REPO_MARKERS
+        .iter()
+        .any(|name| std::fs::symlink_metadata(root.join(name)).is_ok())
 }
 
 /// Find the workspace root for a read-only command, in the order a caller can
@@ -284,7 +403,7 @@ pub fn locate(explicit: Option<&Path>, file: Option<&Path>) -> Option<PathBuf> {
         walk_up(&dir).or_else(|| {
             detect(&dir)
                 .ok()
-                .filter(|(_, repos)| !repos.is_empty())
+                .filter(|detection| !detection.repos.is_empty())
                 .map(|_| absolute(&dir))
         })
     })
@@ -391,7 +510,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("api")).unwrap();
         std::fs::write(dir.path().join("api/package.json"), "{}").unwrap();
         let error = Workspace::load(&dir.path().join("empty")).unwrap_err();
-        assert!(error.contains("1 repo(s)"), "{error}");
+        assert!(error.contains("holds 1 repo: api."), "{error}");
         assert!(error.contains("api"), "{error}");
         assert!(error.contains("carrick init .."), "{error}");
         let deep = Workspace::load(&dir.path().join("empty/deep")).unwrap_err();
@@ -400,6 +519,80 @@ mod tests {
             "must not inspect grandparent: {deep}"
         );
         assert!(!dir.path().join(INDEX_DIR).exists());
+    }
+
+    #[test]
+    fn a_repository_whose_only_manifest_is_deno_jsonc_is_one_repo() {
+        // The shape a first run was refused on (carrick#975): a git
+        // repository, a workspace manifest the package-manager patterns do not
+        // cover, and no package.json anywhere in it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("apps/api")).unwrap();
+        std::fs::create_dir_all(root.join("packages/shared")).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join("deno.jsonc"),
+            r#"{"workspace": ["./apps/api", "./packages/shared"]}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("apps/api/deno.json"), r#"{"name": "@scope/api"}"#).unwrap();
+        std::fs::write(
+            root.join("packages/shared/deno.json"),
+            r#"{"name": "@scope/shared"}"#,
+        )
+        .unwrap();
+        let workspace = Workspace::load(&root).unwrap();
+        assert_eq!(workspace.repos_detected_by, "workspace manifest");
+        assert_eq!(workspace.repos, [root.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn a_git_worktree_checkout_is_a_repository() {
+        // A linked worktree's `.git` is a file, not a directory, so detection
+        // reads the marker with symlink_metadata rather than is_dir.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("feature-branch");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".git"), "gitdir: /elsewhere/.git/worktrees/x\n").unwrap();
+        std::fs::write(root.join("src/main.ts"), "export const x = 1;\n").unwrap();
+        let workspace = Workspace::load(&root).unwrap();
+        assert_eq!(workspace.repos_detected_by, "single repository");
+        assert_eq!(workspace.repos, [root.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn finding_nothing_states_what_was_looked_for_and_what_was_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("folder");
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        std::fs::create_dir(root.join(".cache")).unwrap();
+        let error = Workspace::load(&root).unwrap_err();
+        assert!(error.starts_with("no repos in "), "{error}");
+        assert!(error.contains("deno.jsonc"), "{error}");
+        assert!(error.contains("pnpm-workspace.yaml"), "{error}");
+        assert!(
+            error.contains("Inside it: 6 directories, 2 skipped as dot, build or dependency directories, 4 holding none of those files (alpha, beta, delta and 1 more)."),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_parent_proposal_names_a_few_repos_and_counts_the_rest() {
+        let proposal = ParentProposal {
+            directory: PathBuf::from("/code"),
+            repos: (0..6)
+                .map(|n| PathBuf::from(format!("/code/repo{n}")))
+                .collect(),
+        };
+        let said = proposal.description();
+        assert!(
+            said.contains("holds 6 repos: repo0, repo1, repo2 and 3 more."),
+            "{said}"
+        );
     }
 
     #[test]
@@ -428,7 +621,9 @@ mod tests {
     fn an_empty_repo_list_is_an_error_with_the_shape_to_write() {
         let dir = workspace_with(r#"{"repos": []}"#);
         let err = Workspace::load(dir.path()).unwrap_err();
-        assert!(err.contains("lists no repos"), "{err}");
+        assert!(err.starts_with("no repos in "), "{err}");
+        assert!(err.contains(&format!("{WORKSPACE_FILE} is here")), "{err}");
+        assert!(err.contains("Inside it: no directories."), "{err}");
     }
 
     #[test]
