@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.61](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.60...carrick-v0.3.61) (2026-09-11)
+
+
+### Features
+
+* **scanner:** scanner half of the first-run laptop scan ([#983](https://github.com/carrick-tools/carrick/issues/983)) ([bfc8974](https://github.com/carrick-tools/carrick/commit/bfc89741e1bf430d87cbd7f1aacd8c255cdd4e85))
+
+
+### Bug Fixes
+
+* **cli:** name the product in --help, and every command the binary takes ([#980](https://github.com/carrick-tools/carrick/issues/980)) ([f8a8272](https://github.com/carrick-tools/carrick/commit/f8a8272d0ab1b326d29fd7bf638f3ed7cdb73d6e)), closes [#976](https://github.com/carrick-tools/carrick/issues/976)
+* **init:** say what repo discovery looked for and what it found ([#979](https://github.com/carrick-tools/carrick/issues/979)) ([944a623](https://github.com/carrick-tools/carrick/commit/944a6231b5a8b50033bf9f75b51eb443bc728d3c)), closes [#975](https://github.com/carrick-tools/carrick/issues/975)
+
 ## [0.3.60](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.59...carrick-v0.3.60) (2026-09-11)
 
 
