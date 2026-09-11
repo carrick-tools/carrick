@@ -36,6 +36,7 @@ mod operation;
 mod packages;
 mod parser;
 mod phase_timing;
+mod progress;
 mod receiver_origin;
 mod receiver_type;
 mod scan_health;

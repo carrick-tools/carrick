@@ -1311,7 +1311,12 @@ impl FileOrchestrator {
         // file usually raises no HTTP candidate at all, so the per-file maps
         // the analyzed files carry would never see it.
         let mut env_schema = EnvSchemaIndex::default();
+        // The deterministic pass over the files is the long phase of a scan
+        // with no model in it, and the only one that can state how far through
+        // it is; it ticks for a parent that renders a line (carrick#955).
+        let mut reading = crate::progress::Ticker::new(crate::progress::Phase::Files, files.len());
         for file_path in files {
+            reading.item();
             let path_str = file_path.to_string_lossy().to_string();
 
             // Read file content

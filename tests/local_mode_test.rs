@@ -573,6 +573,54 @@ fn a_thin_index_says_what_it_could_not_classify() {
     );
 }
 
+/// The scan's progress reaches the indexer, and nothing else does.
+///
+/// A scan states how far through it is on stderr, for a parent that is
+/// rendering a line rather than reading a log (carrick#955). The indexer
+/// consumes those lines, so the one thing that must never happen is a raw
+/// `@carrick-progress {...}` landing in front of the user: that is what a
+/// marker changed on one side and not the other looks like.
+#[test]
+#[serial]
+fn a_scan_states_its_progress_to_the_indexer_and_not_to_the_user() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+
+    let output = Command::new(carrick())
+        .args(["index", "--workspace", "."])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .output()
+        .expect("carrick index");
+    assert!(output.status.success(), "carrick index failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    for (name, stream) in [("stdout", &stdout), ("stderr", &stderr)] {
+        assert!(
+            !stream.contains("@carrick-progress"),
+            "the indexer reads the updates; one reached {name} raw:\n{stream}"
+        );
+    }
+    // One line per repo either way, because the animated form is a terminal's
+    // and this test is a pipe.
+    for repo in ["catalog-web", "inventory-svc"] {
+        assert!(
+            stderr.contains(&format!("indexing {repo}")),
+            "the repo being indexed is named while it happens:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("indexed {repo}")),
+            "and again when it is done:\n{stderr}"
+        );
+    }
+    assert!(
+        stdout.contains("indexed 2 repo(s)"),
+        "the summary is unchanged:\n{stdout}"
+    );
+}
+
 /// Rewrite a file with the bytes it already has, and push its mtime forward so
 /// the write is visible whatever the filesystem's timestamp granularity is.
 ///
