@@ -508,6 +508,13 @@ impl AgentService {
                         // which is what an `mcp`-scoped credential gets until
                         // the user logs in again.
                         let RequestAuth::Oidc(provider) = auth else {
+                            // A Bearer credential cannot be re-minted: only a
+                            // fresh consent replaces it, so this call stops
+                            // rather than spending a retry on the same token
+                            // (§8.2). `is_oidc_rejection` matches 401 and the
+                            // kind gate; every other refusal on this path
+                            // (`scan_not_started`, a spend cap) falls through
+                            // to the envelope below and is read as what it is.
                             return Err(AgentCallError::permanent(
                                 "credential_rejected",
                                 format!(
@@ -2096,6 +2103,89 @@ pub(crate) mod tests {
         assert!(!err.retriable, "a rejected fresh token is not transient");
         assert_eq!(api_server.join().unwrap().len(), 2);
         token_server.join().unwrap();
+    }
+
+    fn header_of(request: &str, name: &str) -> Option<String> {
+        request.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+    }
+
+    /// The laptop branch of a prompt-lambda call: the credential goes in
+    /// `Authorization`, the OIDC header is absent, and the scan slot rides
+    /// along so the cloud's money gates can read the repo out of it rather
+    /// than out of anything this client asserts (§1.3, C4).
+    #[tokio::test]
+    async fn a_bearer_call_sends_the_credential_and_the_scan_slot() {
+        crate::credentials::set_scan_id("scan_01J");
+        let (api_base, server) = stub_server(vec![(
+            200,
+            r#"{"success":true,"text":"analysed"}"#.to_string(),
+        )]);
+
+        let service = AgentService::new();
+        let result = service
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &api_base,
+                "/analyze-file",
+                &serde_json::json!({}),
+            )
+            .await;
+        assert_eq!(result.unwrap(), "analysed");
+
+        let request = &server.join().unwrap()[0];
+        assert_eq!(
+            header_of(request, "authorization").as_deref(),
+            Some("Bearer carrick_sk_live_test")
+        );
+        assert!(
+            header_of(request, "x-carrick-oidc").is_none(),
+            "the laptop branch must not send the OIDC header: {request}"
+        );
+        // The version gate runs before authentication and applies to both
+        // credentials, so it is still sent.
+        assert_eq!(
+            header_of(request, "x-carrick-scanner-version").as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        // Presence, not value: the slot is a process-global and another test
+        // in this binary may have set it first. What matters is that a laptop
+        // call carries one at all.
+        assert!(
+            header_of(request, "x-carrick-scan-id").is_some(),
+            "a laptop call must carry its scan slot: {request}"
+        );
+    }
+
+    /// A Bearer credential cannot be re-minted — only a fresh consent replaces
+    /// it — so a rejection is a sentence and a stop, not a retry against the
+    /// same token (§8.2).
+    #[tokio::test]
+    async fn a_rejected_bearer_credential_stops_instead_of_reminting() {
+        let (api_base, server) = stub_server(vec![(401, r#"{"code":"oidc_invalid"}"#.to_string())]);
+
+        let service = AgentService::new();
+        let err = service
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &api_base,
+                "/analyze-file",
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, "credential_rejected");
+        assert!(!err.retriable);
+        assert!(err.message.contains("carrick login"), "{}", err.message);
+        assert_eq!(
+            server.join().unwrap().len(),
+            1,
+            "there is no second credential to try"
+        );
     }
 
     fn unix_now() -> u64 {

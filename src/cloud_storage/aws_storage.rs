@@ -171,6 +171,17 @@ fn report_partial_acceptance(response: &WriteActionResponse, data: &CloudRepoDat
     );
 }
 
+/// Whether a refusal is about the credential rather than about the request.
+///
+/// A 401 always is. A 403 only when the kind gate raised it: the same status
+/// carries `repo_not_authorized` and `repo_not_connected`, which a fresh
+/// consent does not fix and which name their own remedy.
+fn is_credential_rejection(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED
+        || (status == reqwest::StatusCode::FORBIDDEN
+            && RefusalBody::of(body).code.as_deref() == Some("wrong_key_kind"))
+}
+
 /// What a laptop is told when the cloud refuses its credential.
 ///
 /// A Bearer credential cannot be re-minted, so the OIDC path's "mint a fresh
@@ -521,7 +532,7 @@ impl AwsStorage {
     /// production configuration otherwise, plus `no_proxy` so an ambient
     /// proxy variable cannot intercept the loopback call.
     #[cfg(test)]
-    fn for_test(lambda_url: &str, auth: CloudAuth, force_reindex: bool) -> Self {
+    pub(crate) fn for_test(lambda_url: &str, auth: CloudAuth, force_reindex: bool) -> Self {
         Self::with_parts(
             lambda_url.to_string(),
             http_client_builder().no_proxy().build().unwrap(),
@@ -581,6 +592,10 @@ impl AwsStorage {
 
     /// The laptop path: one long-lived credential, sent as `Authorization`.
     ///
+    /// Wire contract: carrick-cloud
+    /// `docs/internal/reference/laptop-scan-seam.md`, §1.3 for the headers,
+    /// §2.1 for the gate's refusals and §8.2 for why this branch exists.
+    ///
     /// Shorter than the OIDC loop by exactly the part that cannot apply — a
     /// Bearer credential cannot be re-minted, so a rejection is "run carrick
     /// login", not a retry (§8.2). Transient statuses keep the same budget,
@@ -614,9 +629,14 @@ impl AwsStorage {
                             if status.is_success() {
                                 return Ok(response_text);
                             }
-                            if status == reqwest::StatusCode::UNAUTHORIZED
-                                || status == reqwest::StatusCode::FORBIDDEN
-                            {
+                            // Not every 403 is a credential problem. The gate
+                            // answers `repo_not_authorized` and
+                            // `repo_not_connected` with one too, and telling a
+                            // user to log in again when the repo is simply not
+                            // connected sends them to fix the one thing that
+                            // is already right (§2.1). Only a 401, or the
+                            // kind gate itself, is a re-login.
+                            if is_credential_rejection(status, &response_text) {
                                 return Err(StorageError::ConnectionError(relogin_message(
                                     status,
                                     &response_text,
@@ -897,16 +917,8 @@ impl AwsStorage {
             commit: &run.commit,
             dirty: run.dirty,
         };
-        let response: StartScanResponse = self
-            .call_lambda_generic(request.action, &request)
-            .await
-            .map_err(|e| match e {
-                // Not a transport problem, and saying "failed to connect"
-                // would send the user to check their network for a refusal
-                // that names its own cause.
-                StorageError::ConnectionError(message) => StorageError::ConnectionError(message),
-                other => other,
-            })?;
+        let response: StartScanResponse =
+            self.call_lambda_generic(request.action, &request).await?;
         if response.schema != START_SCAN_SCHEMA {
             return Err(StorageError::ConnectionError(format!(
                 "Carrick Cloud answered start-scan with schema '{}'; this scanner reads {}. \
@@ -1004,7 +1016,12 @@ impl CloudStorage for AwsStorage {
             // The existence check indexes nothing, so there is nothing for it
             // to supersede; the flag rides the write actions below.
             force_reindex: None,
-            scan_id: None,
+            // The slot rides every action of the run, including this one: the
+            // cloud ties the whole scan to it, not only the writes (§2.2).
+            scan_id: self.scan_id(),
+            // Nothing is indexed here, so there is no partial index for the
+            // cloud to accept or refuse, and the slot is not released by a
+            // check.
             unanalysed_files: None,
             scan_final: None,
         };
@@ -2049,5 +2066,181 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(message.contains("origin remote"), "{message}");
+    }
+
+    /// A storage holding a scan slot, as `start-scan` would have left it.
+    /// Set here rather than through the process-global, so two of these
+    /// running at once cannot see each other's slot.
+    fn bearer_storage_in_scan(
+        responses: Vec<(u16, String)>,
+        scan_id: &str,
+    ) -> (AwsStorage, std::thread::JoinHandle<Vec<String>>) {
+        let (storage, server) = bearer_storage(responses);
+        storage.scan_id.set(scan_id.to_string()).unwrap();
+        (storage, server)
+    }
+
+    fn blob() -> CloudRepoData {
+        serde_json::from_value(serde_json::json!({
+            "repo_name": "api",
+            "endpoints": [], "calls": [], "mounts": [], "apps": {},
+            "imported_handlers": [], "function_definitions": {},
+            "last_updated": "2026-09-11T00:00:00Z",
+            "commit_hash": "4f2a1c9"
+        }))
+        .unwrap()
+    }
+
+    fn check_ok() -> (u16, String) {
+        (
+            200,
+            serde_json::json!({
+                "exists": true, "s3Url": "s3://bucket/api.json",
+                "uploadUrl": null, "hash": "4f2a1c9", "multiService": true
+            })
+            .to_string(),
+        )
+    }
+
+    /// The run-scoped fields on a real write action, not just on a struct:
+    /// the slot ties the write to the meters, and `scan_final` on the last one
+    /// is what releases the cloud's in-flight slot. The existence check
+    /// carries the slot too but never `scan_final` — it indexes nothing
+    /// (§2.2).
+    #[tokio::test]
+    async fn the_last_write_action_of_a_run_carries_the_slot_and_releases_it() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            "scan_01J",
+        );
+
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+
+        let check = body_of(&requests[0]);
+        assert_eq!(check["action"], "check-or-upload");
+        assert_eq!(check["scan_id"], "scan_01J");
+        assert!(
+            check.get("scan_final").is_none(),
+            "the existence check indexes nothing, so it releases nothing: {check}"
+        );
+
+        let write = body_of(&requests[1]);
+        assert_eq!(write["action"], "store-metadata");
+        assert_eq!(write["scan_id"], "scan_01J");
+        assert_eq!(write["scan_final"], true);
+    }
+
+    /// A service that is not the last one in the run must not release the
+    /// slot: the rest of the run would then be unprotected, and a second
+    /// laptop could start scanning the same repo halfway through this one.
+    #[tokio::test]
+    async fn a_write_that_is_not_the_last_leaves_the_slot_held() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            "scan_01J",
+        );
+
+        storage.upload_repo_data(&blob(), false).await.unwrap();
+
+        let write = body_of(&server.join().unwrap()[1]);
+        assert_eq!(write["scan_id"], "scan_01J");
+        assert!(
+            write.get("scan_final").is_none(),
+            "only the last write action of the run releases the slot: {write}"
+        );
+    }
+
+    /// The fail-closed half of the first-scan partial rule. The cloud refuses
+    /// with a 409, the scanner does not retry it — the existence check plus
+    /// one write action and no more — and the error names the files, because
+    /// "re-run the scan" without them is not actionable (§4, C6).
+    #[tokio::test]
+    async fn a_refused_partial_upload_is_final_and_names_the_files() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (
+                    409,
+                    serde_json::json!({
+                        "error": "This service already has an index.",
+                        "code": "partial_refused",
+                        "unanalysed_files": [
+                            { "path": "src/routes/orders.ts", "reason": "model_error" }
+                        ]
+                    })
+                    .to_string(),
+                ),
+            ],
+            "scan_01J",
+        );
+
+        let message = storage
+            .upload_repo_data(&blob(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("already has an index"), "{message}");
+        assert!(message.contains("partial_refused"), "{message}");
+        assert!(message.contains("src/routes/orders.ts"), "{message}");
+
+        assert_eq!(
+            server.join().unwrap().len(),
+            2,
+            "a refusal is not retried, on a write action least of all"
+        );
+    }
+
+    /// A refusal that is about the repo, not the credential, must not tell the
+    /// user to log in again: a fresh consent does not connect a repo, and the
+    /// sentence that does is the cloud's own (§2.1).
+    #[tokio::test]
+    async fn a_repo_refusal_is_not_reported_as_a_credential_problem() {
+        let (storage, server) = bearer_storage(vec![(
+            403,
+            serde_json::json!({
+                "error": "example/api is not connected to this workspace.",
+                "code": "repo_not_connected"
+            })
+            .to_string(),
+        )]);
+
+        let message = storage
+            .begin_run(&run_context(false))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("not connected to this workspace"),
+            "{message}"
+        );
+        assert!(message.contains("repo_not_connected"), "{message}");
+        assert!(
+            !message.contains("carrick login"),
+            "a repo that is not connected is not a credential to replace: {message}"
+        );
+        server.join().unwrap();
+    }
+
+    /// The kind gate IS a credential problem, and it is the one an `mcp`
+    /// credential hits until its holder logs in again.
+    #[test]
+    fn only_a_401_or_the_kind_gate_reads_as_a_credential_rejection() {
+        let kind = r#"{"error":"wrong key kind","code":"wrong_key_kind"}"#;
+        assert!(is_credential_rejection(StatusCode::FORBIDDEN, kind));
+        assert!(is_credential_rejection(StatusCode::UNAUTHORIZED, "{}"));
+        assert!(!is_credential_rejection(
+            StatusCode::FORBIDDEN,
+            r#"{"code":"repo_not_authorized"}"#
+        ));
+        assert!(!is_credential_rejection(StatusCode::CONFLICT, kind));
     }
 }

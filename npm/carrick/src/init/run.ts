@@ -370,13 +370,20 @@ export async function init(argv: string[]): Promise<number> {
       process.stderr.write(`carrick init: ${binary.problem}\n`);
       return 1;
     }
-    const scan = spawnSync(binary.binary, ["index", "--workspace", workspace], {
+    // `--infer` is what makes the first run produce an index worth reading.
+    // A local scan states the facts it can derive and leaves everything only
+    // the model can classify unclassified; this run asks Carrick Cloud for
+    // those, uploads the result, and writes the same payload into `.carrick`
+    // from the same run — so there is no scan, then wait, then download
+    // (carrick#956 §8.3). Every later `carrick index`, and every hook-driven
+    // `carrick refresh`, is the free local one.
+    const scan = spawnSync(binary.binary, ["index", "--workspace", workspace, "--infer"], {
       stdio: "inherit",
       env: nativeEnv(),
     });
     if (scan.status !== 0) {
       process.stderr.write(
-        `carrick init: the first index did not finish. The files above are written, so fix what it reported and run: carrick index\n`,
+        `carrick init: the first index did not finish. The files above are written, so fix what it reported and run: carrick index --infer\n`,
       );
       return scan.status ?? 1;
     }

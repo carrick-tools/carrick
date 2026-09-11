@@ -43,7 +43,12 @@ pub struct IndexOutcome {
 }
 
 /// Index every repo in the workspace, or re-index the one holding `only`.
-pub fn run(workspace: &Workspace, only: Option<&str>) -> Result<IndexOutcome, String> {
+///
+/// `infer` turns each per-repo scan into a laptop scan: model analysis through
+/// Carrick Cloud, an upload, and the same payload written into this build's
+/// cache directory. The join phase never infers — it analyses nothing, it
+/// reads blobs back.
+pub fn run(workspace: &Workspace, only: Option<&str>, infer: bool) -> Result<IndexOutcome, String> {
     let started = Instant::now();
     // Build into a fresh generation. A failed scan leaves the last complete
     // read model intact; account changes never inherit previous local rows.
@@ -79,11 +84,20 @@ pub fn run(workspace: &Workspace, only: Option<&str>) -> Result<IndexOutcome, St
     std::fs::create_dir_all(&blobs).map_err(|e| format!("{}: {e}", blobs.display()))?;
     super::workspace::write_self_ignore(&workspace.index_dir())
         .map_err(|e| format!("could not write the .carrick/.gitignore: {e}"))?;
-    let result = run_generation(workspace, &hosted, &generation, &blobs, &targets, started);
+    let result = run_generation(
+        workspace,
+        &hosted,
+        &generation,
+        &blobs,
+        &targets,
+        started,
+        infer,
+    );
     let _ = std::fs::remove_dir_all(&generation);
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_generation(
     workspace: &Workspace,
     hosted: &super::hosted::HostedInput,
@@ -91,6 +105,7 @@ fn run_generation(
     blobs: &Path,
     targets: &[PathBuf],
     started: Instant,
+    infer: bool,
 ) -> Result<IndexOutcome, String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("could not find the carrick binary to run a scan with: {e}"))?;
@@ -131,7 +146,7 @@ fn run_generation(
         // scanner in its own directory so user labels cannot overwrite a
         // retained or hosted blob in the join input.
         let scan_dir = generation.join(format!("scan-{position}"));
-        scan_repo(&exe, repo, &scan_dir, &previous, &name)?;
+        scan_repo(&exe, repo, &scan_dir, &previous, &name, infer)?;
         for (service, blob) in read_blobs(&scan_dir)?.into_iter().enumerate() {
             std::fs::write(
                 blobs.join(format!("local-{position}-{service}.json")),
@@ -279,22 +294,9 @@ fn scan_repo(
     blobs: &Path,
     previous: &Path,
     label: &str,
+    infer: bool,
 ) -> Result<(), String> {
-    let mut command = Command::new(exe);
-    command
-        .arg(repo)
-        .env(crate::cloud_storage::CACHE_DIR_ENV, blobs)
-        .env(crate::cloud_storage::ISOLATE_ENV, "1")
-        .env(super::hosted::PREVIOUS_ENV, previous)
-        .env(super::NO_MODEL_ENV, "1")
-        .env("CARRICK_SKIP_INTENTS", "1")
-        // The scan is a subprocess whose output this indexer swallows, so it
-        // is asked for the one thing worth showing: how far through each
-        // service it is (carrick#955).
-        .env(crate::progress::PROGRESS_ENV, "1")
-        .env_remove("CARRICK_OUTPUT_JSON")
-        .env_remove(super::JOIN_OUT_ENV);
-    strip_ci_env(&mut command);
+    let command = scan_command(exe, repo, blobs, previous, infer);
     run_scan(
         command,
         &format!("scan of {}", repo.display()),
@@ -303,6 +305,46 @@ fn scan_repo(
             done: format!("indexed {label}"),
         },
     )
+}
+
+/// The subprocess one repo's phase-1 scan runs as.
+///
+/// Built separately from the spawn so a test can read back what a laptop scan
+/// asks for and what a facts-only one does: the difference between them is
+/// entirely in this environment, and it is the difference between a free pass
+/// and a paid one.
+fn scan_command(exe: &Path, repo: &Path, blobs: &Path, previous: &Path, infer: bool) -> Command {
+    let mut command = Command::new(exe);
+    command
+        .arg(repo)
+        .env(crate::cloud_storage::CACHE_DIR_ENV, blobs)
+        .env(crate::cloud_storage::ISOLATE_ENV, "1")
+        .env(super::hosted::PREVIOUS_ENV, previous)
+        // The scan is a subprocess whose output this indexer swallows, so it
+        // is asked for the one thing worth showing: how far through each
+        // service it is (carrick#955).
+        .env(crate::progress::PROGRESS_ENV, "1")
+        .env_remove("CARRICK_OUTPUT_JSON")
+        .env_remove(super::JOIN_OUT_ENV);
+    if infer {
+        // A laptop scan asks the model, generates intents, and uploads — the
+        // same index a CI scan writes. The two flags a facts-only pass sets
+        // are the two that would make it something less.
+        command
+            .env(crate::cloud_storage::LAPTOP_SCAN_ENV, "1")
+            .env_remove(super::NO_MODEL_ENV)
+            .env_remove("CARRICK_SKIP_INTENTS");
+    } else {
+        command
+            .env(super::NO_MODEL_ENV, "1")
+            .env("CARRICK_SKIP_INTENTS", "1")
+            .env_remove(crate::cloud_storage::LAPTOP_SCAN_ENV);
+    }
+    // Always: the ambient CI context would name every repo in the workspace
+    // after the one whose shell this ran in, and on a laptop scan its OIDC
+    // variables would select the wrong credential entirely.
+    strip_ci_env(&mut command);
+    command
 }
 
 /// Phase 2: join every blob, and hand the result back.
@@ -319,6 +361,9 @@ fn join(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Result<LocalJoin, 
         .env(super::JOIN_OUT_ENV, out)
         .env_remove(crate::cloud_storage::ISOLATE_ENV)
         .env_remove(super::hosted::PREVIOUS_ENV)
+        // Never a laptop scan: this phase analyses nothing and uploads
+        // nothing, it reads blobs back and joins them.
+        .env_remove(crate::cloud_storage::LAPTOP_SCAN_ENV)
         .env_remove("CARRICK_OUTPUT_JSON");
     strip_ci_env(&mut command);
     run_scan(
@@ -828,4 +873,99 @@ fn evidence_for(operation: &JoinedOperation) -> Option<String> {
 /// RFC 3339, to the second.
 fn timestamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the phase-1 subprocess is asked to be, read off the command
+    /// itself. The whole difference between a free pass and a paid one lives
+    /// in this environment, so it is asserted rather than described.
+    fn env_of(command: &Command) -> BTreeMap<String, Option<String>> {
+        command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    fn scan_env(infer: bool) -> BTreeMap<String, Option<String>> {
+        env_of(&scan_command(
+            Path::new("/bin/carrick"),
+            Path::new("/repos/api"),
+            Path::new("/build/repos"),
+            Path::new("/build/previous.json"),
+            infer,
+        ))
+    }
+
+    /// The default is unchanged and costs nothing: no model, no intents, no
+    /// upload. `carrick refresh` runs from a session-start hook and this is
+    /// the command it runs.
+    #[test]
+    fn a_scan_without_inference_asks_for_no_model_and_no_intents() {
+        let env = scan_env(false);
+        assert_eq!(env.get(super::super::NO_MODEL_ENV), Some(&Some("1".into())));
+        assert_eq!(env.get("CARRICK_SKIP_INTENTS"), Some(&Some("1".into())));
+        assert_eq!(
+            env.get(crate::cloud_storage::LAPTOP_SCAN_ENV),
+            Some(&None),
+            "the laptop flag is explicitly cleared, not merely absent"
+        );
+    }
+
+    /// A laptop scan asks the model, generates intents and uploads — the same
+    /// index a CI scan writes. The two flags that make a pass facts-only are
+    /// removed rather than set to "0", because the readers test for presence.
+    #[test]
+    fn a_scan_with_inference_drops_the_two_flags_that_make_it_facts_only() {
+        let env = scan_env(true);
+        assert_eq!(
+            env.get(crate::cloud_storage::LAPTOP_SCAN_ENV),
+            Some(&Some("1".into()))
+        );
+        assert_eq!(env.get(super::super::NO_MODEL_ENV), Some(&None));
+        assert_eq!(env.get("CARRICK_SKIP_INTENTS"), Some(&None));
+    }
+
+    /// Both variants strip the ambient CI context. On a laptop scan that is
+    /// not tidiness: leaving `ACTIONS_ID_TOKEN_REQUEST_URL` in place would
+    /// select the OIDC credential inside a scan that has none to mint.
+    #[test]
+    fn every_scan_strips_the_ci_context() {
+        for infer in [false, true] {
+            let env = scan_env(infer);
+            for key in ["ACTIONS_ID_TOKEN_REQUEST_URL", "GITHUB_REPOSITORY", "CI"] {
+                assert_eq!(env.get(key), Some(&None), "{key} survived infer={infer}");
+            }
+        }
+    }
+
+    /// The cache directory and the previous generation are handed over the
+    /// same way either way: a laptop scan's cross-repo download is the
+    /// isolated local one, so this file is its only previous generation and
+    /// without it every laptop rescan would be a cold, paid one.
+    #[test]
+    fn both_variants_carry_the_cache_dir_and_the_previous_generation() {
+        for infer in [false, true] {
+            let env = scan_env(infer);
+            assert_eq!(
+                env.get(crate::cloud_storage::CACHE_DIR_ENV),
+                Some(&Some("/build/repos".into()))
+            );
+            assert_eq!(
+                env.get(crate::cloud_storage::ISOLATE_ENV),
+                Some(&Some("1".into()))
+            );
+            assert_eq!(
+                env.get(super::super::hosted::PREVIOUS_ENV),
+                Some(&Some("/build/previous.json".into()))
+            );
+        }
+    }
 }

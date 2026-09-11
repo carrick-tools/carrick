@@ -190,10 +190,15 @@ impl CloudAuth {
             // problem to fix, and saying so beats falling through to the OIDC
             // error, which would name a GitHub Actions permission on a laptop.
             Err(message) => Err(message),
-            Ok(None) => Err(crate::oidc::OidcProvider::global()
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "No Carrick credential. Run carrick login.".to_string())),
+            // Neither credential. The OIDC error names a GitHub Actions
+            // permission, which is the wrong first thing to say to someone at
+            // a terminal — so the laptop remedy leads and the CI one follows.
+            Ok(None) => Err(
+                "Carrick is not signed in on this machine and this is not a \
+                             GitHub Actions run. Run carrick login, or run the scan in \
+                             Actions with `permissions: id-token: write`."
+                    .to_string(),
+            ),
         }
     }
 
@@ -219,6 +224,12 @@ pub fn consented_scope() -> Option<String> {
 /// What to add to a refusal when the credential on disk cannot do the thing
 /// that was refused, because it was consented before this release existed.
 pub fn relogin_hint() -> Option<String> {
+    // `CARRICK_TOKEN` carries no scope, and `scope()` defaults an absent one
+    // to `mcp` — which for a file is the truth and for an env token is a
+    // consent that never happened. Say nothing rather than say that.
+    if std::env::var_os("CARRICK_TOKEN").is_some() {
+        return None;
+    }
     match consented_scope() {
         Some(scope) if scope != CLI_SCOPE => Some(format!(
             "This credential was consented under scope '{scope}'; uploading and paid analysis \

@@ -625,6 +625,14 @@ impl HostedInput {
             HostedState::VersionMismatch
         } else if super::query::changed_since(path, &previous.commit_hash).is_none() {
             HostedState::CommitMissing
+        } else if previous.dirty == Some(true) || row.and_then(|s| s.dirty) == Some(true) {
+            // A dirty generation deliberately carries no answers to replay
+            // (§2.4), so this is a state, not a failure to explain away as a
+            // broken read. Saying which one it is stops a user chasing a
+            // corrupt index that is behaving exactly as designed.
+            result.failure =
+                Some("Hosted index was written from a tree with uncommitted changes".into());
+            HostedState::ReadFailed
         } else if previous.file_results.is_none() {
             result.failure = Some("Hosted index has no reusable model answers".into());
             HostedState::ReadFailed
@@ -686,11 +694,20 @@ impl HostedInput {
     }
 }
 
-/// Explicit per-repo handoff to the scan subprocess. It is read only when
-/// local storage and no-model mode are both selected; it cannot change CI.
+/// Explicit per-repo handoff to the scan subprocess.
+///
+/// Read only when local storage is selected and the run is one the indexer
+/// drives — a facts-only pass or a laptop scan. It cannot change CI, which
+/// names no cache directory and sets neither flag.
+///
+/// The laptop scan needs it for a different reason than the facts-only pass
+/// does: its cross-repo download is the isolated local one, so without this
+/// there is no previous generation at all and every laptop rescan is a cold,
+/// paid one.
 pub(super) const PREVIOUS_ENV: &str = "CARRICK_LOCAL_HOSTED_PREVIOUS";
 pub(crate) fn previous_data() -> Result<Option<Vec<CloudRepoData>>, Box<dyn std::error::Error>> {
-    if !super::no_model() || std::env::var_os(crate::cloud_storage::CACHE_DIR_ENV).is_none() {
+    let driven_by_the_indexer = super::no_model() || crate::cloud_storage::laptop_scan_requested();
+    if !driven_by_the_indexer || std::env::var_os(crate::cloud_storage::CACHE_DIR_ENV).is_none() {
         return Ok(None);
     }
     let Some(path) = std::env::var_os(PREVIOUS_ENV) else {

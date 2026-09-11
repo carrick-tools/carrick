@@ -285,7 +285,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     let run_start = storage
         .begin_run(&run_context)
         .await
-        .map_err(|e| format!("Failed to connect to Carrick Cloud: {}", e))?;
+        // Not always a transport problem: on the laptop path this is the gate,
+        // and its refusals name their own cause. "Failed to connect" would
+        // send the user to check their network for a scan that is simply
+        // already running.
+        .map_err(|e| format!("Carrick Cloud did not open this scan: {}", e))?;
     logging::finish_spinner(&sp, "Connected to Carrick Cloud");
     // Both said at the top, not the end.
     //
@@ -401,6 +405,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 .iter()
                 .find(|r| r.repo_name == repo_name && r.service_name == service.service_name)
                 .cloned()
+                .map(without_dirty_analysis)
         };
 
         let analysis_started = Instant::now();
@@ -1108,6 +1113,23 @@ where
         }
     }
     Ok(T::default())
+}
+
+/// The reader half of the dirty rule: a generation written from a tree that
+/// did not match its commit contributes no analysis to the next run.
+///
+/// The writer half drops `file_results` before the upload, so a blob this
+/// scanner wrote already carries none. This is the guard that does not depend
+/// on that: whatever produced the blob, its answers describe code that is not
+/// at the commit the replay keys on, and `git diff --name-only <prev> HEAD`
+/// cannot see the difference (§2.4). Everything else about the previous
+/// generation is still used — the detection and guidance caches describe the
+/// dependency set, not the edited files.
+fn without_dirty_analysis(mut previous: CloudRepoData) -> CloudRepoData {
+    if previous.dirty == Some(true) {
+        previous.file_results = None;
+    }
+    previous
 }
 
 /// Record what the tree looked like on the payload that describes it.
