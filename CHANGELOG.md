@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.62](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.61...carrick-v0.3.62) (2026-09-11)
+
+
+### Features
+
+* **cli:** init writes the service proposal, and never the config or a scan ([#988](https://github.com/carrick-tools/carrick/issues/988)) ([d6f2609](https://github.com/carrick-tools/carrick/commit/d6f260933f7acb42e39142e9595e3d17f4683016))
+
 ## [0.3.61](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.60...carrick-v0.3.61) (2026-09-11)
 
 
