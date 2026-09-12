@@ -31,10 +31,10 @@ has no such action it prints the project link instead. Connected repos are then
 put in the project from the terminal too, so the GitHub App grant is the only
 browser step; where the API has no assignment action, the command prints the
 repo-assignment link and, in an interactive terminal, opens the page. Either
-way the claim comes from a read: the CLI reads `resolve-repos` until every
+way the claim comes from a read. The CLI reads `resolve-repos` until every
 proposed repo reports `project_slug: "payments"`, and a repo connected to
-another project remains pending. A target it cannot meet does not stop the run
-— the hooks, the MCP connection and the proposal are written, and the command
+another project remains pending. A target it cannot meet does not stop the run.
+The hooks, the MCP connection and the proposal are written, and the command
 says which browser steps are left.
 
 Without `--project` the project step still runs: the command takes the project
@@ -59,9 +59,12 @@ The file is written with mode 0600. `carrick logout` removes it; unset
 Rust derives the same services for CI, local indexing and `init`. An existing
 `carrick.json` is authoritative. When it is missing, `init` presents workspace
 packages and their compiler configuration and writes that proposal to
-`.carrick/proposal.json`, which is ignored. It writes no `carrick.json`: your
-agent turns the proposal into one, so the config you commit is one somebody has
-read, and the first scan runs against it. `carrick index` is free and states
+`.carrick/proposal.json`, which is ignored. Each member in it also carries what
+its own manifest says about it. That is `private`, `bin`, `main`, `exports`,
+any deployment descriptor in its directory, and the members that depend on it,
+so the application-versus-library decision is read rather than re-derived. It
+writes no `carrick.json`: your agent turns the proposal into one, so the config
+you commit is one somebody has read, and the first scan runs against it. `carrick index` is free and states
 what it can; `carrick index --infer` is the scan that asks Carrick to classify
 the rest, and it refuses to run until a `carrick.json` exists.
 

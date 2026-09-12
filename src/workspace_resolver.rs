@@ -412,7 +412,11 @@ fn longest_match<'a>(specifier: &str, names: impl Iterator<Item = &'a String>) -
 /// Collapse `.` and `..` lexically. Paths here are repo-relative and may not
 /// exist yet (the candidate list is about to test several spellings), so this
 /// cannot go through `canonicalize`.
-fn normalize(path: &Path) -> PathBuf {
+///
+/// Shared with [`crate::service_derivation`], which resolves import-map
+/// targets against a member directory for the same reason: one normalisation,
+/// not two that can disagree.
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {

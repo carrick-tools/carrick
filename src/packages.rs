@@ -49,8 +49,21 @@ pub struct ManifestFacts {
     pub package: PackageJson,
     pub main: Option<String>,
     pub exports: Option<serde_json::Value>,
+    /// `private: true`, the manifest's own statement that it is not published.
+    pub private: bool,
+    /// A declared `bin`, in either spelling npm accepts.
+    pub bin: bool,
     /// Deno workspace member directories, exactly as declared by this config.
     pub workspace: Vec<String>,
+    /// Import-map targets that name a path rather than a registry package,
+    /// relative to this manifest's directory.
+    ///
+    /// A Deno member depends on a sibling by path far more often than by
+    /// published identity, and nothing in `package` records that: the
+    /// dependency map holds registry identities only. Without these, every
+    /// Deno member would report no dependents, which is a claim rather than
+    /// an absence (carrick#994).
+    pub local_imports: Vec<String>,
 }
 
 pub(crate) fn read_json_config(path: &Path) -> Result<serde_json::Value, io::Error> {
@@ -92,11 +105,18 @@ pub fn read_manifest(path: &Path) -> Result<ManifestFacts, io::Error> {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
             exports: json.get("exports").cloned(),
+            private: json
+                .get("private")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            bin: json.get("bin").is_some(),
             workspace: Vec::new(),
+            local_imports: Vec::new(),
         });
     }
 
     let mut dependencies = HashMap::new();
+    let mut local_imports = Vec::new();
     let external_map = crate::deno_support::import_map_path(path, &json)?
         .map(|path| read_json_config(&path))
         .transpose()?;
@@ -111,6 +131,8 @@ pub fn read_manifest(path: &Path) -> Result<ManifestFacts, io::Error> {
             for target in entries.values().filter_map(serde_json::Value::as_str) {
                 if let Some((name, spec)) = deno_registry_identity(target) {
                     dependencies.entry(name).or_insert(spec);
+                } else if target.starts_with("./") || target.starts_with("../") {
+                    local_imports.push(target.to_string());
                 }
             }
         }
@@ -162,7 +184,13 @@ pub fn read_manifest(path: &Path) -> Result<ManifestFacts, io::Error> {
         package,
         main: None,
         exports: json.get("exports").cloned(),
+        private: json
+            .get("private")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        bin: json.get("bin").is_some(),
         workspace,
+        local_imports,
     })
 }
 

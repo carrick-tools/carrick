@@ -151,10 +151,13 @@ fn native_init_preview_and_ci_select_identical_services() {
     );
     let actual: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(actual["schema"], "carrick.derive/0");
+    // The service entries the command prints are the configuration and the
+    // member facts in one object (carrick#994); `config` stays the skeleton.
     assert_eq!(
         actual["repos"][0]["services"],
-        serde_json::to_value(expected.services).unwrap()
+        serde_json::to_value(expected.service_documents()).unwrap()
     );
+    assert_eq!(actual["repos"][0]["services"][0]["private"], false);
     assert_eq!(actual["repos"][0]["config"], expected.config);
     assert!(!dir.path().join("carrick.json").exists());
     assert!(!dir.path().join(".carrick").exists());
@@ -365,4 +368,124 @@ fn generated_deno_cache_does_not_change_discovered_sources() {
         before,
         "type preparation must not feed generated sources back into the scanner"
     );
+}
+
+/// carrick#994. Every workspace member is derived as a service, and the whole
+/// application-versus-library decision then lived in the scaffold
+/// instructions, so the agent had to re-derive it by walking imports. These
+/// are the facts that decision is made on, carried per member.
+#[test]
+fn member_facts_carry_what_decides_application_from_library() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"private":true,"workspaces":["apps/*","packages/*"]}"#,
+    );
+    write(root, "tsconfig.json", "{}");
+    write(
+        root,
+        "apps/gateway/package.json",
+        r#"{"name":"@sample/gateway","private":true,"bin":{"gateway":"./bin.js"},"dependencies":{"@sample/shared":"workspace:*"}}"#,
+    );
+    write(root, "apps/gateway/Dockerfile", "FROM node:24\n");
+    write(
+        root,
+        "packages/shared/package.json",
+        r#"{"name":"@sample/shared","main":"./src/index.js","exports":"./src/index.ts"}"#,
+    );
+
+    let derived = resolve(root).unwrap();
+    assert_eq!(derived.services.len(), 2);
+    assert_eq!(derived.members.len(), derived.services.len());
+    assert_eq!(
+        derived.services[0].service_name.as_deref(),
+        Some("@sample/gateway")
+    );
+
+    // The application: private, executable, deployed, imported by nobody.
+    let gateway = &derived.members[0];
+    assert!(gateway.private);
+    assert!(gateway.bin);
+    assert!(!gateway.main);
+    assert!(!gateway.exports);
+    assert_eq!(gateway.deploy_config, vec!["Dockerfile".to_string()]);
+    assert!(gateway.workspace_dependents.is_empty());
+
+    // The library: publishable, an import surface, nothing deployed beside it,
+    // and named by the member that depends on it.
+    let shared = &derived.members[1];
+    assert!(!shared.private);
+    assert!(!shared.bin);
+    assert!(shared.main);
+    assert!(shared.exports);
+    assert!(shared.deploy_config.is_empty());
+    assert_eq!(
+        shared.workspace_dependents,
+        vec!["@sample/gateway".to_string()]
+    );
+
+    // The facts ride on the service entries of `carrick.derive/0`, beside the
+    // configuration, and never in the `carrick.json` skeleton: `private` is
+    // something a repository states about itself, not a key Carrick accepts.
+    let documents = derived.service_documents();
+    assert_eq!(documents.len(), 2);
+    assert_eq!(documents[1]["serviceName"], "@sample/shared");
+    assert_eq!(documents[1]["exports"], true);
+    assert_eq!(documents[1]["private"], false);
+    assert_eq!(documents[1]["workspace_dependents"][0], "@sample/gateway");
+    assert_eq!(documents[0]["deploy_config"][0], "Dockerfile");
+    let written = serde_json::to_string(&derived.config).unwrap();
+    assert!(!written.contains("workspace_dependents"), "{written}");
+    assert!(!written.contains("deploy_config"), "{written}");
+
+    // And an explicit config is described the same way: the facts are read
+    // from the repository, not from how the services were chosen.
+    write(root, "carrick.json", &written);
+    let explicit = resolve(root).unwrap();
+    assert_eq!(explicit.reason, "carrick.json");
+    assert_eq!(explicit.members, derived.members);
+}
+
+/// A Deno member names a sibling by path far more often than by published
+/// identity, and the dependency map holds registry identities only. Without
+/// the import-map targets every Deno member would report no dependents, which
+/// is a claim rather than an absence.
+#[test]
+fn a_deno_member_imported_by_path_names_its_dependent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "deno.json",
+        r#"{"workspace":["./apps/api","./packages/lib"]}"#,
+    );
+    write(
+        root,
+        "apps/api/deno.json",
+        r#"{"name":"@sample/api","imports":{"@sample/lib":"../../packages/lib/mod.ts","zod":"npm:zod@^3"}}"#,
+    );
+    write(root, "apps/api/mod.ts", "export const a = 1;");
+    write(
+        root,
+        "packages/lib/deno.json",
+        r#"{"name":"@sample/lib","exports":"./mod.ts"}"#,
+    );
+    write(root, "packages/lib/mod.ts", "export const b = 2;");
+
+    let derived = resolve(root).unwrap();
+    assert_eq!(derived.services.len(), 2);
+    assert_eq!(
+        derived.services[0].service_name.as_deref(),
+        Some("@sample/api")
+    );
+    assert!(derived.members[0].workspace_dependents.is_empty());
+    assert_eq!(
+        derived.members[1].workspace_dependents,
+        vec!["@sample/api".to_string()]
+    );
+    assert!(derived.members[1].exports);
+    // A registry dependency is not a member, whatever it is named.
+    assert_eq!(derived.members[1].workspace_dependents.len(), 1);
 }

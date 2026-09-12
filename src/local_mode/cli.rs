@@ -232,7 +232,10 @@ fn derive(root: Option<&Path>) -> Result<serde_json::Value, String> {
     let mut repos = Vec::new();
     for repo in &workspace.repos {
         let derived = crate::service_derivation::resolve(repo)?;
-        repos.push(serde_json::json!({ "path": repo, "reason": derived.reason, "services": derived.services, "config": derived.config, "warnings": derived.warnings }));
+        // `services` carries the manifest facts that decide application from
+        // library beside each service; `config` stays the carrick.json
+        // skeleton, which those facts are not part of (carrick#994).
+        repos.push(serde_json::json!({ "path": repo, "reason": derived.reason, "services": derived.service_documents(), "config": derived.config, "warnings": derived.warnings }));
     }
     Ok(
         serde_json::json!({ "schema": "carrick.derive/0", "workspace": workspace.root, "repos_detected_by": workspace.repos_detected_by, "repos_added": workspace.repos_added, "repos_excluded": workspace.repos_excluded, "missing": workspace.missing, "parent_proposal": workspace.parent_proposal, "repos": repos }),
