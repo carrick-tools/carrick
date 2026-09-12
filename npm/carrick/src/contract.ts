@@ -200,6 +200,45 @@ export type RunningScan = {
     total?: number;
   };
   error?: string;
+  /** What this scan has paid so far, once an upload has come back with a figure. */
+  spend?: RunSpend;
+};
+
+/**
+ * One scan's Vertex spend, as Carrick Cloud reports it on the write action
+ * that closed the run (`carrick.scan-spend/0`).
+ *
+ * `priced` is false when any model in the month has no price on file, and it
+ * covers all three dollar figures at once: with one of them the run's own cost
+ * and both remainings are under-counts. A null amount is "not set", never
+ * "unlimited". Both rules are the CLI's to apply — this package carries the
+ * fields and prints none of them.
+ */
+export type ScanSpend = {
+  schema: string;
+  scan_id?: string;
+  first_index?: boolean;
+  priced?: boolean;
+  unpriced_models?: string[];
+  /** Null when `priced` is false. */
+  usd?: number | null;
+  input_tokens?: number;
+  output_tokens?: number;
+  cached_tokens?: number;
+  calls?: number;
+  first_index_ceiling_usd?: number | null;
+  first_index_remaining_usd?: number | null;
+  monthly_allowance_usd?: number | null;
+  monthly_remaining_usd?: number | null;
+  /** `YYYY-MM`, the month the monthly figure is for. */
+  period?: string;
+};
+
+/** What one run of `carrick index --infer` paid: one entry per repo it scanned. */
+export type RunSpend = {
+  /** RFC 3339, when the last figure in it landed. */
+  updated_at?: string;
+  scans: { repo: string; spend: ScanSpend }[];
 };
 
 /** `carrick status --json`: the workspace, with no file in the question. */
@@ -215,6 +254,12 @@ export type StatusResult = {
   repos?: StatusRepo[];
   /** Scans running (or stopped part-way) on this machine. Usually absent. */
   running_scans?: RunningScan[];
+  /**
+   * What the last paid scan of this workspace cost. Absent until one has run.
+   * Carried on the error body too: a first paid run killed before it wrote an
+   * index still spent the money.
+   */
+  last_scan?: RunSpend;
   services: StatusService[];
 };
 
@@ -306,6 +351,10 @@ export function parseStatusResult(stdout: string): StatusResult | null {
     if (!isRecord(entry)) continue;
     if (typeof entry["scan_id"] !== "string" || typeof entry["status"] !== "string") continue;
     (result.running_scans ??= []).push(entry as unknown as RunningScan);
+  }
+  const lastScan = parsed["last_scan"];
+  if (isRecord(lastScan) && Array.isArray(lastScan["scans"])) {
+    result.last_scan = lastScan as unknown as RunSpend;
   }
   const repos = Array.isArray(parsed["repos"]) ? parsed["repos"] : [];
   for (const entry of repos) {

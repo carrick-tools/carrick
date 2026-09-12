@@ -67,6 +67,11 @@ pub struct ErrorOutput {
     /// (carrick#992).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub running_scans: Vec<super::scan_state::ScanState>,
+    /// What the last paid scan of this workspace cost. Carried on the error
+    /// body too: a first run killed before it wrote an index still spent the
+    /// money, and this is the only surface that can say so (carrick#995).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scan: Option<crate::scan_spend::RunSpend>,
 }
 
 impl ErrorOutput {
@@ -78,11 +83,17 @@ impl ErrorOutput {
             schema: schema.to_string(),
             error: error.wire().to_string(),
             running_scans: Vec::new(),
+            last_scan: None,
         }
     }
 
     pub fn with_scans(mut self, scans: Vec<super::scan_state::ScanState>) -> Self {
         self.running_scans = scans;
+        self
+    }
+
+    pub fn with_last_scan(mut self, last_scan: Option<crate::scan_spend::RunSpend>) -> Self {
+        self.last_scan = last_scan;
         self
     }
 }
@@ -337,6 +348,11 @@ pub struct StatusOutput {
     /// visible through while it runs (carrick#992).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub running_scans: Vec<super::scan_state::ScanState>,
+    /// What the last paid scan of this workspace cost, one entry per repo it
+    /// scanned (carrick#995). Absent until one has run: the free pass pays for
+    /// nothing, and a scan that has not been priced yet states no figure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scan: Option<crate::scan_spend::RunSpend>,
     pub services: Vec<StatusService>,
 }
 
@@ -353,6 +369,18 @@ impl StatusOutput {
         }
         if !self.running_scans.is_empty() {
             out.push('\n');
+        }
+        // The paid scan prints this when it finishes, and a detached one
+        // prints it into a log nobody is tailing. So it is repeated here,
+        // dated, for the reader who is asking afterwards (carrick#995).
+        if let Some(spend) = &self.last_scan {
+            for line in spend.lines(Some(&spend.updated_at)) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+            if !spend.is_empty() {
+                out.push('\n');
+            }
         }
         out.push_str(&format!(
             "{} — {} service(s), indexed at {} by carrick {}\n\n",
@@ -564,11 +592,10 @@ mod hosted_wire_tests {
         assert_eq!(serde_json::to_value(round_tripped).unwrap(), value);
     }
 
-    /// A repo-level file is the repo's, stated once, and a service reports
-    /// only what its own scan reads (carrick#997 item 4).
-    #[test]
-    fn the_status_render_states_repo_level_changes_under_the_repo() {
-        let output = StatusOutput {
+    /// One workspace answer, for the renderer tests to vary one thing at
+    /// a time against.
+    fn status_output() -> StatusOutput {
+        StatusOutput {
             repos_detected_by: None,
             repos_added: Vec::new(),
             repos_excluded: Vec::new(),
@@ -578,6 +605,7 @@ mod hosted_wire_tests {
             indexed_at: "2026-09-12T10:00:00Z".to_string(),
             scanner_version: "test".to_string(),
             running_scans: Vec::new(),
+            last_scan: None,
             repos: vec![StatusRepo {
                 repo: "/repos/monorepo".to_string(),
                 name: "monorepo".to_string(),
@@ -609,7 +637,14 @@ mod hosted_wire_tests {
                 boundary_note: "note".to_string(),
                 boundary_lines: Vec::new(),
             }],
-        };
+        }
+    }
+
+    /// A repo-level file is the repo's, stated once, and a service reports
+    /// only what its own scan reads (carrick#997 item 4).
+    #[test]
+    fn the_status_render_states_repo_level_changes_under_the_repo() {
+        let output = status_output();
         let text = output.render();
         assert!(text.contains("changed since index: 1"), "{text}");
         assert!(
@@ -621,5 +656,75 @@ mod hosted_wire_tests {
             "{text}"
         );
         assert!(text.contains("changed  carrick.json"), "{text}");
+    }
+
+    /// `carrick status` repeats the last paid scan's line, because the scan
+    /// that paid printed it into a log nobody is tailing (carrick#995). It
+    /// leads the index, which describes a moment that has already passed.
+    #[test]
+    fn the_status_render_repeats_what_the_last_paid_scan_cost() {
+        let mut spend = crate::scan_spend::RunSpend::default();
+        spend.record(
+            "api",
+            crate::scan_spend::ScanSpend {
+                schema: crate::scan_spend::SCHEMA.to_string(),
+                scan_id: "scan_01J".to_string(),
+                first_index: true,
+                priced: true,
+                usd: Some(4.32),
+                first_index_ceiling_usd: Some(15.0),
+                first_index_remaining_usd: Some(10.68),
+                monthly_allowance_usd: Some(10.0),
+                monthly_remaining_usd: Some(10.0),
+                ..Default::default()
+            },
+        );
+        let mut output = status_output();
+        output.last_scan = Some(spend);
+
+        let text = output.render();
+        let line = text.lines().next().expect("the money line leads");
+        assert!(line.starts_with("The last paid scan, "), "{text}");
+        assert!(
+            line.ends_with(
+                "US$4.32. First-index ceiling left: US$10.68. Laptop allowance this month: \
+                 US$10.00 of US$10.00."
+            ),
+            "{text}"
+        );
+    }
+
+    /// A workspace with no paid scan behind it says nothing about money: there
+    /// is no placeholder for a figure that does not exist.
+    #[test]
+    fn the_status_render_says_nothing_about_money_when_nothing_was_paid() {
+        assert!(!status_output().render().contains("US$"));
+    }
+
+    /// The receipt rides the error body too. A first paid run killed before it
+    /// wrote an index still spent the money, and this is the only answer that
+    /// can say so.
+    #[test]
+    fn an_unindexed_workspace_still_reports_what_its_scan_cost() {
+        let mut spend = crate::scan_spend::RunSpend::default();
+        spend.record(
+            "api",
+            crate::scan_spend::ScanSpend {
+                schema: crate::scan_spend::SCHEMA.to_string(),
+                priced: true,
+                usd: Some(4.32),
+                ..Default::default()
+            },
+        );
+        let body = ErrorOutput::new(ReadError::NotIndexed, STATUS_SCHEMA)
+            .with_scans(Vec::new())
+            .with_last_scan(Some(spend));
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["last_scan"]["scans"][0]["repo"], "api");
+        assert_eq!(json["last_scan"]["scans"][0]["spend"]["usd"], 4.32);
+        // And absent entirely when there is none, rather than null.
+        let empty =
+            serde_json::to_value(ErrorOutput::new(ReadError::NotIndexed, STATUS_SCHEMA)).unwrap();
+        assert!(empty.get("last_scan").is_none(), "{empty}");
     }
 }

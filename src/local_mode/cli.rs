@@ -284,10 +284,18 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
     let Some(root) = super::workspace::locate(root, None) else {
         return report(ReadError::NotIndexed, json, super::contract::STATUS_SCHEMA);
     };
-    let scans = super::scan_state::read_all(&root.join(super::workspace::INDEX_DIR));
+    let index_dir = root.join(super::workspace::INDEX_DIR);
+    let scans = super::scan_state::read_all(&index_dir);
+    // Read beside the scans and before the index, for the same reason: a first
+    // paid run that was killed before it wrote an index still spent the money,
+    // and the question "what did that cost" has an answer either way
+    // (carrick#995).
+    let last_scan =
+        crate::scan_spend::RunSpend::read(&super::workspace::last_scan_file(&index_dir));
     match super::query::status(&root) {
         Ok(mut output) => {
             output.running_scans = scans;
+            output.last_scan = last_scan;
             if json {
                 match serde_json::to_string_pretty(&output) {
                     Ok(text) => println!("{text}"),
@@ -316,8 +324,20 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
                 for scan in &scans {
                     println!("{}", scan.line());
                 }
+                for line in last_scan
+                    .iter()
+                    .flat_map(|spend| spend.lines(Some(&spend.updated_at)))
+                {
+                    println!("{line}");
+                }
             }
-            report_with_scans(error, json, super::contract::STATUS_SCHEMA, scans)
+            report_with_scans(
+                error,
+                json,
+                super::contract::STATUS_SCHEMA,
+                scans,
+                last_scan,
+            )
         }
     }
 }
@@ -402,6 +422,12 @@ fn build_workspace(
     }
     let outcome = super::index::run(workspace, service, infer)?;
     print_map(&outcome);
+    // Last, because it is the one line about money: what this run cost, and
+    // what is left of each budget it was charged against (carrick#995). A free
+    // pass paid for nothing and prints nothing.
+    for line in outcome.spend.lines(None) {
+        println!("{line}");
+    }
     Ok(())
 }
 
@@ -632,7 +658,7 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode) -> i32 {
 /// Say why there is no answer, in the form the caller asked for, and still
 /// exit 0.
 fn report(error: ReadError, json: bool, schema: &str) -> i32 {
-    report_with_scans(error, json, schema, Vec::new())
+    report_with_scans(error, json, schema, Vec::new(), None)
 }
 
 /// The same, carrying any scan that is building the thing the caller asked
@@ -643,10 +669,13 @@ fn report_with_scans(
     json: bool,
     schema: &str,
     scans: Vec<super::scan_state::ScanState>,
+    last_scan: Option<crate::scan_spend::RunSpend>,
 ) -> i32 {
     eprintln!("carrick: {}", error.message());
     if json {
-        let body = ErrorOutput::new(error, schema).with_scans(scans);
+        let body = ErrorOutput::new(error, schema)
+            .with_scans(scans)
+            .with_last_scan(last_scan);
         if let Ok(text) = serde_json::to_string(&body) {
             println!("{text}");
         }

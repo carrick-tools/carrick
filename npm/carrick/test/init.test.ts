@@ -716,9 +716,12 @@ test("the scaffold prompt names only files that seam owns, and states the sequen
     // nothing to run against an index CI already built.
     assert.match(prompt, /`carrick index`, which is free/);
   }
-  // Free pass first, one paid scan after it (carrick-cloud#799).
+  // Free pass first, one paid scan after it (carrick-cloud#799), detached and
+  // then asked after: an agent's shell does not survive a fifteen-minute scan
+  // (carrick#960, cloud half carrick-cloud#821).
   const fresh = agentScaffoldPrompt(false);
-  assert.match(fresh, /`carrick index --infer` once/);
+  assert.match(fresh, /`carrick index --infer --detach` once/);
+  assert.match(fresh, /`carrick status`/);
   assert.ok(fresh.indexOf("`carrick index`") < fresh.indexOf("--infer"));
   // And where CI has already built the index, the paid scan is refused rather
   // than ordered: a laptop scan from a branch replaces that row for the whole

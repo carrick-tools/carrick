@@ -40,6 +40,9 @@ pub struct IndexOutcome {
     pub index: LocalIndex,
     pub scanned: Vec<String>,
     pub elapsed_secs: f64,
+    /// What this run paid Carrick Cloud, one entry per repo that was scanned
+    /// with `--infer`. Empty on the free pass, which pays for nothing.
+    pub spend: crate::scan_spend::RunSpend,
 }
 
 /// Index every repo in the workspace, or re-index the one holding `only`.
@@ -134,6 +137,10 @@ fn run_generation(
         .map_err(|e| e.to_string())?;
     }
     let mut scanned = Vec::new();
+    // The receipt, written as each figure lands rather than at the end: the
+    // money is spent at the upload, so a run killed after paying still leaves
+    // the record of it behind (carrick#995).
+    let mut spend = crate::scan_spend::RunSpend::default();
     for (position, repo) in targets.iter().enumerate() {
         let name = repo_label(repo);
         let previous = generation.join("previous.json");
@@ -146,7 +153,13 @@ fn run_generation(
         // scanner in its own directory so user labels cannot overwrite a
         // retained or hosted blob in the join input.
         let scan_dir = generation.join(format!("scan-{position}"));
-        scan_repo(&exe, repo, &scan_dir, &previous, &name, infer)?;
+        if let Some(paid) = scan_repo(&exe, repo, &scan_dir, &previous, &name, infer)? {
+            spend.record(&name, paid);
+            spend.write(&workspace.last_scan_file());
+            // And into the detached build's own state file, so the one
+            // artefact a killed scan leaves behind says what it had spent.
+            super::scan_state::spent(&spend);
+        }
         for (service, blob) in read_blobs(&scan_dir)?.into_iter().enumerate() {
             std::fs::write(
                 blobs.join(format!("local-{position}-{service}.json")),
@@ -254,6 +267,7 @@ fn run_generation(
         index,
         scanned,
         elapsed_secs: started.elapsed().as_secs_f64(),
+        spend,
     })
 }
 
@@ -287,7 +301,7 @@ fn repo_for_service(workspace: &Workspace, blobs: &Path, service: &str) -> Resul
         })
 }
 
-/// Phase 1 for one repo.
+/// Phase 1 for one repo, and what its scan cost when it was a paid one.
 fn scan_repo(
     exe: &Path,
     repo: &Path,
@@ -295,7 +309,7 @@ fn scan_repo(
     previous: &Path,
     label: &str,
     infer: bool,
-) -> Result<(), String> {
+) -> Result<Option<crate::scan_spend::ScanSpend>, String> {
     let command = scan_command(exe, repo, blobs, previous, infer);
     run_scan(
         command,
@@ -407,7 +421,11 @@ struct Reporting {
     done: String,
 }
 
-fn run_scan(mut command: Command, what: &str, reporting: Reporting) -> Result<(), String> {
+fn run_scan(
+    mut command: Command,
+    what: &str,
+    reporting: Reporting,
+) -> Result<Option<crate::scan_spend::ScanSpend>, String> {
     command.stdout(Stdio::null()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
@@ -423,10 +441,19 @@ fn run_scan(mut command: Command, what: &str, reporting: Reporting) -> Result<()
     // no-op unless this build was detached.
     super::scan_state::note(&reporting.working, None);
     let mut tail: VecDeque<String> = VecDeque::with_capacity(12);
+    // What this scan paid, if it paid anything. It crosses on the same
+    // channel as the progress, and for the same reason: this process swallows
+    // the scan's output, so a figure it does not lift out is a figure nobody
+    // ever sees (carrick#995).
+    let mut spend = None;
     for line in BufReader::new(stderr).lines().map_while(Result::ok) {
         if let Some(update) = crate::progress::parse(&line) {
             bar.set_message(format!("{}: {}", reporting.working, update.render()));
             super::scan_state::note(&reporting.working, Some(&update));
+            continue;
+        }
+        if let Some(reported) = crate::scan_spend::parse(&line) {
+            spend = Some(reported);
             continue;
         }
         if tail.len() == 12 {
@@ -439,7 +466,7 @@ fn run_scan(mut command: Command, what: &str, reporting: Reporting) -> Result<()
         .map_err(|e| format!("could not wait for the {what}: {e}"))?;
     if status.success() {
         crate::logging::finish_spinner(&bar, &reporting.done);
-        return Ok(());
+        return Ok(spend);
     }
     bar.finish_and_clear();
     Err(format!(
@@ -946,6 +973,54 @@ mod tests {
             Path::new("/build/previous.json"),
             infer,
         ))
+    }
+
+    /// The indexer swallows a scan's output, so what a paid scan cost reaches
+    /// this process only if this loop lifts it out — and it must come out of
+    /// the stream rather than into the failure tail (carrick#995).
+    #[test]
+    fn the_indexer_lifts_the_figure_out_of_the_scan_it_swallowed() {
+        let spend = crate::scan_spend::ScanSpend {
+            schema: crate::scan_spend::SCHEMA.to_string(),
+            scan_id: "scan_01J".to_string(),
+            first_index: true,
+            priced: true,
+            usd: Some(4.32),
+            ..Default::default()
+        };
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "echo 'analysing' >&2; echo '@carrick-spend {}' >&2",
+            serde_json::to_string(&spend).unwrap()
+        ));
+
+        let lifted = run_scan(
+            command,
+            "scan of /repos/api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(lifted, Some(spend));
+    }
+
+    /// A free pass reports nothing, and nothing is not a scan that cost zero.
+    #[test]
+    fn a_scan_that_states_no_figure_reports_none() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("echo 'analysing' >&2");
+        let lifted = run_scan(
+            command,
+            "scan of /repos/api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(lifted.is_none());
     }
 
     /// The default is unchanged and costs nothing: no model, no intents, no

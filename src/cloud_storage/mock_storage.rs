@@ -40,10 +40,8 @@ impl CloudStorage for MockStorage {
         );
         self.data.lock().unwrap().push(data.clone());
         // The mock always stores what it is given — it has no freshness check
-        // to short-circuit on.
-        Ok(UploadOutcome {
-            already_current: false,
-        })
+        // to short-circuit on, and no meter behind it to report a spend from.
+        Ok(UploadOutcome::default())
     }
 
     // In-memory store keyed per uploaded entry — safe to hold many services

@@ -82,6 +82,15 @@ fn enabled() -> bool {
     std::env::var_os(PROGRESS_ENV).is_some()
 }
 
+/// Whether a parent process is reading this scan's stderr for markers.
+///
+/// One flag for the whole channel: the indexer sets it on every scan it
+/// starts, and everything a scan states across that boundary — its progress,
+/// and what it spent (carrick#995) — crosses only when someone asked for it.
+pub fn parent_is_reading() -> bool {
+    enabled()
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

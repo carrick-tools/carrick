@@ -91,10 +91,9 @@ impl CloudStorage for LocalDirStorage {
             StorageError::ConnectionError(format!("Failed to write {}: {e}", path.display()))
         })?;
         // The cache file is rewritten unconditionally — there is no freshness
-        // check to short-circuit on.
-        Ok(UploadOutcome {
-            already_current: false,
-        })
+        // check to short-circuit on — and nothing here is metered, so there is
+        // no spend to report either.
+        Ok(UploadOutcome::default())
     }
 
     // Cache files are keyed by (repo, service), so each service of a

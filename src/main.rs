@@ -43,6 +43,7 @@ mod progress;
 mod receiver_origin;
 mod receiver_type;
 mod scan_health;
+mod scan_spend;
 mod sdk_edges;
 mod sdk_surface;
 mod service_derivation;

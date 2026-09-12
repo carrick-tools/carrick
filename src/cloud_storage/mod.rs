@@ -862,13 +862,17 @@ impl std::fmt::Display for StorageError {
 impl Error for StorageError {}
 
 /// What the cloud did with one uploaded payload.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct UploadOutcome {
     /// The cloud already held a row for this (repo, service) carrying both this
     /// commit hash and this scanner version, so it skipped re-indexing and
     /// nothing this run computed was stored. Only ever true for `AwsStorage`;
     /// the mock and local-dir backends always write, so they report `false`.
     pub already_current: bool,
+    /// What this scan cost, on the last write action of a laptop run and
+    /// nowhere else (carrick#995). `None` on every CI upload, on every write
+    /// before the last one, and on a cloud that does not send it.
+    pub scan_spend: Option<crate::scan_spend::ScanSpend>,
 }
 
 #[async_trait]
