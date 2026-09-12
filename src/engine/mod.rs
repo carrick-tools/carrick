@@ -1206,6 +1206,13 @@ async fn upload_service_payloads<T: CloudStorage>(
             }
         }
     }
+    // What the run cost, from the write action that closed it. A laptop run
+    // gets one; a CI upload never does, and neither does a cloud that has not
+    // deployed the field — both of which say nothing rather than zero
+    // (carrick#995).
+    if let Some(spend) = outcomes.iter().rev().find_map(|o| o.scan_spend.as_ref()) {
+        crate::scan_spend::report(spend);
+    }
     if forced_reanalysis_was_discarded(&outcomes, forced) {
         // A scan that finished having done less than it was asked to: the
         // annotation puts it on the run summary, where someone who asked for
@@ -5249,19 +5256,18 @@ mod tests {
     fn upload_finish_message_only_claims_current_when_every_payload_was_skipped() {
         let skipped = UploadOutcome {
             already_current: true,
+            ..UploadOutcome::default()
         };
-        let indexed = UploadOutcome {
-            already_current: false,
-        };
+        let indexed = UploadOutcome::default();
 
         assert_eq!(
-            upload_finish_message(&[skipped, skipped]),
+            upload_finish_message(&[skipped.clone(), skipped.clone()]),
             "Index already current for this commit and scanner version; nothing re-indexed"
         );
         // A multi-service repo where one service did get re-indexed uploaded
         // something, so it must not claim otherwise.
         assert_eq!(
-            upload_finish_message(&[skipped, indexed]),
+            upload_finish_message(&[skipped, indexed.clone()]),
             "Uploaded results to Carrick Cloud"
         );
         assert_eq!(
@@ -5283,19 +5289,27 @@ mod tests {
     fn a_forced_run_that_was_short_circuited_is_a_warning_not_a_status_line() {
         let skipped = UploadOutcome {
             already_current: true,
+            ..UploadOutcome::default()
         };
-        let indexed = UploadOutcome {
-            already_current: false,
-        };
+        let indexed = UploadOutcome::default();
 
-        assert!(forced_reanalysis_was_discarded(&[skipped, skipped], true));
+        assert!(forced_reanalysis_was_discarded(
+            &[skipped.clone(), skipped.clone()],
+            true
+        ));
 
         // A cached run that finds the index current is the ordinary case the
         // short-circuit exists for, and says nothing about a deploy.
-        assert!(!forced_reanalysis_was_discarded(&[skipped, skipped], false));
+        assert!(!forced_reanalysis_was_discarded(
+            &[skipped.clone(), skipped.clone()],
+            false
+        ));
 
         // Any service that was re-indexed means the cloud honoured the flag.
-        assert!(!forced_reanalysis_was_discarded(&[skipped, indexed], true));
+        assert!(!forced_reanalysis_was_discarded(
+            &[skipped, indexed.clone()],
+            true
+        ));
         assert!(!forced_reanalysis_was_discarded(&[indexed], true));
 
         // Nothing was uploaded, so nothing was discarded.

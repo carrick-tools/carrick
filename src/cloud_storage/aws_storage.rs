@@ -424,6 +424,28 @@ struct WriteActionResponse {
     /// the server took rather than what the scanner sent.
     #[serde(default)]
     unanalysed_files: Option<Vec<UnanalysedFile>>,
+    /// What this scan cost, on the write action that carried `scan_final` and
+    /// on a `cli` credential only (carrick-cloud#806/#813). Absent on every
+    /// other response, including every CI upload, and on a cloud deployed
+    /// before the field existed — all of which read as "no figure to state"
+    /// rather than as a zero (carrick#995).
+    #[serde(default)]
+    scan_spend: Option<crate::scan_spend::ScanSpend>,
+}
+
+impl WriteActionResponse {
+    /// What this write action did, for the run that made it.
+    ///
+    /// A spend under a tag this scanner does not read is dropped here rather
+    /// than carried: one place decides, so no surface downstream has to.
+    fn outcome(self) -> UploadOutcome {
+        UploadOutcome {
+            already_current: self.already_current.unwrap_or(false),
+            scan_spend: self
+                .scan_spend
+                .filter(crate::scan_spend::ScanSpend::understood),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -890,9 +912,7 @@ impl AwsStorage {
         debug!("Successfully stored metadata for {}", data.repo_name);
         report_partial_acceptance(&response, data);
 
-        Ok(UploadOutcome {
-            already_current: response.already_current.unwrap_or(false),
-        })
+        Ok(response.outcome())
     }
 
     /// Claim a scan slot and resolve the project, before any spend.
@@ -1066,9 +1086,7 @@ impl CloudStorage for AwsStorage {
                     self.call_lambda(&complete_request).await?;
                 debug!("Successfully completed upload and stored metadata");
                 report_partial_acceptance(&complete_response, data);
-                Ok(UploadOutcome {
-                    already_current: complete_response.already_current.unwrap_or(false),
-                })
+                Ok(complete_response.outcome())
             } else {
                 debug!(
                     "No bundled types available for {}; storing metadata only",
@@ -2206,6 +2224,160 @@ mod tests {
             write.get("scan_final").is_none(),
             "only the last write action of the run releases the slot: {write}"
         );
+    }
+
+    /// The wire shape of `carrick.scan-spend/0`, as the cloud sends it on the
+    /// write action that carried `scan_final` (carrick-cloud#813). Every field
+    /// reaches the outcome, because the surface that prints it cannot ask
+    /// again.
+    #[tokio::test]
+    async fn the_last_write_action_carries_what_the_scan_cost() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (
+                    200,
+                    serde_json::json!({
+                        "success": true,
+                        "scan_spend": {
+                            "schema": "carrick.scan-spend/0",
+                            "scan_id": "scan_01J",
+                            "first_index": true,
+                            "priced": true,
+                            "unpriced_models": [],
+                            "usd": 4.32,
+                            "input_tokens": 1170432,
+                            "output_tokens": 288114,
+                            "cached_tokens": 0,
+                            "calls": 412,
+                            "first_index_ceiling_usd": 15,
+                            "first_index_remaining_usd": 10.68,
+                            "monthly_allowance_usd": 10,
+                            "monthly_remaining_usd": 10,
+                            "period": "2026-09"
+                        }
+                    })
+                    .to_string(),
+                ),
+            ],
+            "scan_01J",
+        );
+
+        let outcome = storage.upload_repo_data(&blob(), true).await.unwrap();
+        let spend = outcome.scan_spend.expect("the figure the cloud sent");
+
+        assert_eq!(spend.scan_id, "scan_01J");
+        assert!(spend.first_index && spend.priced);
+        assert_eq!(spend.usd, Some(4.32));
+        assert_eq!(spend.input_tokens, 1_170_432);
+        assert_eq!(spend.output_tokens, 288_114);
+        assert_eq!(spend.calls, 412);
+        assert_eq!(spend.first_index_ceiling_usd, Some(15.0));
+        assert_eq!(spend.first_index_remaining_usd, Some(10.68));
+        assert_eq!(spend.monthly_allowance_usd, Some(10.0));
+        assert_eq!(spend.monthly_remaining_usd, Some(10.0));
+        assert_eq!(spend.period, "2026-09");
+        server.join().unwrap();
+    }
+
+    /// An unpriced run is the shipped state on day one: the price map is empty
+    /// in production, so the meters are real and the dollars are null. It must
+    /// parse, and it must not read as a scan that cost nothing.
+    #[tokio::test]
+    async fn an_unpriced_scan_still_parses_and_states_no_figure() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (
+                    200,
+                    serde_json::json!({
+                        "success": true,
+                        "scan_spend": {
+                            "schema": "carrick.scan-spend/0",
+                            "scan_id": "scan_01J",
+                            "first_index": true,
+                            "priced": false,
+                            "unpriced_models": ["a-preview-model"],
+                            "usd": null,
+                            "input_tokens": 1170432,
+                            "output_tokens": 288114,
+                            "cached_tokens": 0,
+                            "calls": 412,
+                            "first_index_ceiling_usd": null,
+                            "first_index_remaining_usd": null,
+                            "monthly_allowance_usd": null,
+                            "monthly_remaining_usd": null,
+                            "period": "2026-09"
+                        }
+                    })
+                    .to_string(),
+                ),
+            ],
+            "scan_01J",
+        );
+
+        let spend = storage
+            .upload_repo_data(&blob(), true)
+            .await
+            .unwrap()
+            .scan_spend
+            .expect("a body that carries the block carries it unpriced too");
+        assert!(!spend.priced);
+        assert_eq!(spend.usd, None);
+        assert_eq!(spend.unpriced_models, vec!["a-preview-model".to_string()]);
+        // The tokens are facts whatever the price map says.
+        assert_eq!(spend.calls, 412);
+        server.join().unwrap();
+    }
+
+    /// Every other answer carries no figure, and the absence is the statement:
+    /// a CI upload is not metered this way, a write before the last one has
+    /// nothing to report yet, and a cloud deployed before the field simply
+    /// omits it. None of them is a scan that cost nothing.
+    #[tokio::test]
+    async fn a_body_without_the_block_reports_no_spend() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            "scan_01J",
+        );
+
+        let outcome = storage.upload_repo_data(&blob(), true).await.unwrap();
+        assert!(outcome.scan_spend.is_none());
+        server.join().unwrap();
+    }
+
+    /// A tag this scanner does not read is a cloud that has moved on. Printing
+    /// dollars off a shape whose meaning may have changed is worse than
+    /// printing nothing, so the block is dropped here, once, rather than
+    /// guarded at every surface.
+    #[tokio::test]
+    async fn a_spend_under_an_unknown_tag_is_dropped() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (
+                    200,
+                    serde_json::json!({
+                        "success": true,
+                        "scan_spend": {
+                            "schema": "carrick.scan-spend/1",
+                            "scan_id": "scan_01J",
+                            "priced": true,
+                            "usd": 4.32
+                        }
+                    })
+                    .to_string(),
+                ),
+            ],
+            "scan_01J",
+        );
+
+        let outcome = storage.upload_repo_data(&blob(), true).await.unwrap();
+        assert!(outcome.scan_spend.is_none());
+        server.join().unwrap();
     }
 
     /// The fail-closed half of the first-scan partial rule. The cloud refuses

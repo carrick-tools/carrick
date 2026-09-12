@@ -1,6 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseCheckResult, problemItems, connectedItems, isCandidate } from "../src/contract.ts";
+import {
+  parseCheckResult,
+  parseStatusResult,
+  problemItems,
+  connectedItems,
+  isCandidate,
+} from "../src/contract.ts";
+import { renderSessionStart } from "../src/render.ts";
 import { fixture } from "./helpers.ts";
 
 test("a payload with the right schema parses", () => {
@@ -82,4 +89,45 @@ test("a candidate row is the one whose source says so", () => {
   const candidates = (result.items ?? []).filter(isCandidate);
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0]?.resolution_source, "model");
+});
+
+test("the last paid scan's figures survive the parse, and nothing here prints them", () => {
+  // carrick#995: the CLI owns the wording and the two rules behind it (an
+  // unpriced run states no dollars; a null amount is "not set"). This package
+  // carries the fields so a surface that wants them has them, and a session
+  // that starts hours later is not handed a bill.
+  const status = parseStatusResult(
+    JSON.stringify({
+      schema: "carrick.status/0",
+      error: "not_indexed",
+      services: [],
+      last_scan: {
+        updated_at: "2026-09-12T21:03:11Z",
+        scans: [
+          {
+            repo: "api",
+            spend: {
+              schema: "carrick.scan-spend/0",
+              scan_id: "scan_01J",
+              first_index: true,
+              priced: true,
+              usd: 4.32,
+              monthly_allowance_usd: 10,
+              monthly_remaining_usd: 10,
+            },
+          },
+        ],
+      },
+    }),
+  );
+  assert.equal(status?.last_scan?.scans[0]?.repo, "api");
+  assert.equal(status?.last_scan?.scans[0]?.spend.usd, 4.32);
+  assert.equal(status?.last_scan?.updated_at, "2026-09-12T21:03:11Z");
+  assert.doesNotMatch(renderSessionStart(status!), /US\$/);
+
+  // A body carrying something that is not a receipt carries no receipt.
+  const malformed = parseStatusResult(
+    '{"schema":"carrick.status/0","services":[],"last_scan":{"scans":"lots"}}',
+  );
+  assert.equal(malformed?.last_scan, undefined);
 });

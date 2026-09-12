@@ -23,6 +23,11 @@
 //! * **Nothing here is on the path of a scan that is not detached.** Every
 //!   writer is a no-op until [`begin`] has been called, which happens only in
 //!   a child that was handed [`SCAN_ID_ENV`].
+//!
+//! What a run PAID is recorded here too, because a detached scan's output goes
+//! to its log and a killed one leaves nothing else behind (carrick#995). It is
+//! not the durable record: a scan that finishes removes this file, and
+//! `.carrick/last-scan.json` is what `carrick status` repeats afterwards.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -57,7 +62,7 @@ struct Active {
 }
 
 /// What a detached scan is doing, as `carrick status` reads it back.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ScanState {
     pub scan_id: String,
     pub pid: u32,
@@ -77,6 +82,13 @@ pub struct ScanState {
     pub progress: Option<Update>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// What this scan has paid Carrick Cloud so far, once a repo's upload has
+    /// come back with a figure (carrick#995). A detached scan's own output
+    /// goes to its log, so this file is where a reader of a run nobody watched
+    /// finds what it cost — a killed one included, because the money was spent
+    /// at the upload. Absent on the free pass and before the first upload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend: Option<crate::scan_spend::RunSpend>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,11 +159,22 @@ impl ScanState {
         }
         match &self.error {
             Some(error) => format!("scan {} failed after {elapsed}: {error}", self.scan_id),
-            None => format!(
-                "scan {} stopped without finishing after {elapsed}, in {}{counts}. Nothing \
-                 was uploaded by it; run the command again.",
-                self.scan_id, self.phase
-            ),
+            // What a killed run left behind depends on how far it got: a
+            // multi-repo build uploads each repo as it finishes it, and every
+            // upload that came back with a figure was paid for. Saying
+            // "nothing was uploaded" over the top of that would be false.
+            None => match self.spend.as_ref().map(|spend| spend.scans.len()) {
+                Some(paid) if paid > 0 => format!(
+                    "scan {} stopped without finishing after {elapsed}, in {}{counts}. It had \
+                     uploaded {paid} repo(s) and paid for them; run the command again.",
+                    self.scan_id, self.phase
+                ),
+                _ => format!(
+                    "scan {} stopped without finishing after {elapsed}, in {}{counts}. Nothing \
+                     was uploaded by it; run the command again.",
+                    self.scan_id, self.phase
+                ),
+            },
         }
     }
 }
@@ -189,6 +212,7 @@ pub fn begin(index_dir: &Path, scan_id: &str, workspace: &Path, infer: bool) {
         phase: "starting".to_string(),
         progress: None,
         error: None,
+        spend: None,
     };
     let file = state_file(index_dir, scan_id);
     write(&file, &state);
@@ -241,6 +265,24 @@ pub fn note(phase: &str, update: Option<&Update>) {
         }
         active.last_log = Some(now);
     }
+}
+
+/// Record what this scan has paid so far. A no-op in a scan nobody detached,
+/// like every other writer here.
+///
+/// Written on the spot rather than at the end: a scan that is killed after an
+/// upload has already spent the money, and this file is what it leaves behind.
+pub fn spent(spend: &crate::scan_spend::RunSpend) {
+    let Ok(mut guard) = ACTIVE.lock() else {
+        return;
+    };
+    let Some(active) = guard.as_mut() else {
+        return;
+    };
+    active.state.spend = Some(spend.clone());
+    active.state.updated_at = timestamp();
+    write(&active.file, &active.state);
+    active.last_write = Some(Instant::now());
 }
 
 /// The scan is over. Success removes the file; a failure leaves it with the
@@ -317,6 +359,7 @@ mod tests {
             workspace: "/repos".to_string(),
             status,
             phase: "indexing gateway".to_string(),
+            spend: None,
             progress: Some(Update {
                 service: "gateway".to_string(),
                 service_index: 1,
@@ -364,6 +407,53 @@ mod tests {
         let line = failed.line();
         assert!(line.contains("failed after 3m12s"), "{line}");
         assert!(line.contains("did not open this scan"), "{line}");
+    }
+
+    /// A detached run's output goes to its log, so what it paid is kept here
+    /// as it is paid — and a scan that was killed after uploading a repo did
+    /// spend that money. "Nothing was uploaded by it" would be false.
+    #[test]
+    #[cfg(unix)]
+    fn a_killed_scan_that_had_already_paid_does_not_claim_it_uploaded_nothing() {
+        let mut killed = state(ScanStatus::Running, i32::MAX as u32);
+        let mut spend = crate::scan_spend::RunSpend::default();
+        spend.record(
+            "api",
+            crate::scan_spend::ScanSpend {
+                schema: crate::scan_spend::SCHEMA.to_string(),
+                priced: true,
+                usd: Some(4.32),
+                ..Default::default()
+            },
+        );
+        killed.spend = Some(spend);
+        let line = killed.line();
+        assert!(
+            line.contains("uploaded 1 repo(s) and paid for them"),
+            "{line}"
+        );
+        assert!(!line.contains("Nothing \\\nwas uploaded"), "{line}");
+        // The figure itself is not on this line: `carrick status` prints the
+        // receipt once, and a scan line that repeated it would say it twice.
+        assert!(!line.contains("US$"), "{line}");
+    }
+
+    /// A state file written before the field existed is still a scan this
+    /// binary can report on.
+    #[test]
+    fn a_state_file_without_a_spend_still_parses() {
+        let stored = serde_json::json!({
+            "scan_id": "5089ed60",
+            "pid": 4321,
+            "started_at": "2026-09-12T21:00:00Z",
+            "updated_at": "2026-09-12T21:03:00Z",
+            "infer": true,
+            "workspace": "/repos",
+            "status": "running",
+            "phase": "indexing gateway"
+        });
+        let read: ScanState = serde_json::from_value(stored).unwrap();
+        assert!(read.spend.is_none());
     }
 
     #[test]

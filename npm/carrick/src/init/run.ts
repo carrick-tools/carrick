@@ -50,8 +50,13 @@ export function agentScaffoldPrompt(hosted: boolean): string {
       ? "Do not run `carrick index --infer`: this repo already has a hosted " +
         "index, and a laptop scan from a branch replaces the CI row for " +
         "everyone. "
-      : "Then run `carrick index --infer` once for the scan that builds the " +
-        "index. ") +
+      : // carrick#960/#1003: an agent's shell caps a command well below the
+        // fifteen minutes a first paid scan takes, so the scan is detached and
+        // the agent asks `carrick status` how it went. Mirrors the scaffold
+        // tool's own wording (carrick-cloud#821).
+        "Then run `carrick index --infer --detach` once for the scan that " +
+        "builds the index, checking `carrick status` about once a minute " +
+        "until it says the scan finished, stopped or failed. ") +
     "Answer the closing checklist before you open the PR."
   );
 }

@@ -231,6 +231,21 @@ impl Workspace {
     pub fn join_file(&self) -> PathBuf {
         self.index_dir().join("join.json")
     }
+
+    /// What the last paid scan of this workspace cost (carrick#995).
+    ///
+    /// Beside the index rather than inside it: a free re-index rebuilds the
+    /// read model from scratch and would drop the figure, and a first paid run
+    /// that was killed before it wrote an index still spent the money.
+    pub fn last_scan_file(&self) -> PathBuf {
+        last_scan_file(&self.index_dir())
+    }
+}
+
+/// The same path, for a reader that has the `.carrick` directory and no
+/// loaded workspace — `carrick status` answers before the index is read.
+pub fn last_scan_file(index_dir: &Path) -> PathBuf {
+    index_dir.join("last-scan.json")
 }
 
 /// Use detection directly, not Workspace::load, so this cannot recurse to

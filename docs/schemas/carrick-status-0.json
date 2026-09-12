@@ -36,6 +36,7 @@
           "items": { "$ref": "#/$defs/running_scan" },
           "description": "Builds started with `carrick index --detach` that are running now, or stopped without finishing. Absent in the ordinary case."
         },
+        "last_scan": { "$ref": "#/$defs/run_spend" },
         "services": {
           "type": "array",
           "items": { "$ref": "#/$defs/service" }
@@ -68,7 +69,52 @@
           },
           "additionalProperties": true
         },
-        "error": { "type": "string" }
+        "error": { "type": "string" },
+        "spend": { "$ref": "#/$defs/run_spend" }
+      },
+      "additionalProperties": true
+    },
+    "run_spend": {
+      "type": "object",
+      "description": "What the last paid scan cost: one entry per repo `carrick index --infer` scanned. Absent until one has run. `priced: false` on any entry means print nothing about money at all — one unpriced model makes every dollar figure in the month an under-count — and a null amount is \"not set\", never \"unlimited\".",
+      "required": ["scans"],
+      "properties": {
+        "updated_at": { "type": "string", "description": "RFC 3339, when the last figure in it landed." },
+        "scans": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["repo", "spend"],
+            "properties": {
+              "repo": { "type": "string", "description": "The repo as the index labels it: its directory name." },
+              "spend": { "$ref": "#/$defs/scan_spend" }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "scan_spend": {
+      "type": "object",
+      "description": "One scan's spend, verbatim from Carrick Cloud's `carrick.scan-spend/0` block. A tag this CLI does not read is dropped rather than carried.",
+      "required": ["schema"],
+      "properties": {
+        "schema": { "const": "carrick.scan-spend/0" },
+        "scan_id": { "type": "string" },
+        "first_index": { "type": "boolean", "description": "Charged to this repo's first-index ceiling rather than to the monthly pool." },
+        "priced": { "type": "boolean", "description": "False when any model in any meter read has no price on file." },
+        "unpriced_models": { "type": "array", "items": { "type": "string" } },
+        "usd": { "type": ["number", "null"], "description": "This scan's Vertex spend. Null when priced is false." },
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0, "description": "Includes thinking tokens." },
+        "cached_tokens": { "type": "integer", "minimum": 0 },
+        "calls": { "type": "integer", "minimum": 0 },
+        "first_index_ceiling_usd": { "type": ["number", "null"] },
+        "first_index_remaining_usd": { "type": ["number", "null"] },
+        "monthly_allowance_usd": { "type": ["number", "null"] },
+        "monthly_remaining_usd": { "type": ["number", "null"] },
+        "period": { "type": "string", "description": "YYYY-MM, the month the monthly figure is for." }
       },
       "additionalProperties": true
     },
@@ -187,6 +233,10 @@
           "type": "array",
           "items": { "$ref": "#/$defs/running_scan" },
           "description": "Carried on the error body too: \"there is no index\" and \"one is being built right now\" are different answers, and a reader given only the first starts a second scan."
+        },
+        "last_scan": {
+          "$ref": "#/$defs/run_spend",
+          "description": "Carried on the error body too: a first paid run killed before it wrote an index still spent the money."
         }
       },
       "additionalProperties": true

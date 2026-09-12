@@ -31,10 +31,10 @@ npm install -g carrick
 In the folder that holds your repositories:
 
 ```bash
-# Finds the repos, writes the workspace file, runs the first index
+# Finds the repos, writes the service proposal, wires up the hooks. Runs no scan.
 carrick init
 
-# Refreshes the index as the code changes
+# Builds the index, and rebuilds it as the code changes. No model runs here.
 carrick index
 ```
 
