@@ -174,6 +174,34 @@ export type StatusRepo = {
   stale_files_truncated?: boolean;
 };
 
+/**
+ * A scan running on this machine right now, as `carrick status` reports it.
+ *
+ * The whole point of `carrick index --detach` is that the scan outlives the
+ * shell that started it, so something has to be able to say it is still going
+ * (carrick#992). `line` is not sent — the CLI renders the sentence and this
+ * package prints what it needs from the fields.
+ */
+export type RunningScan = {
+  scan_id: string;
+  pid: number;
+  started_at: string;
+  updated_at?: string;
+  infer?: boolean;
+  workspace?: string;
+  status: "running" | "failed";
+  phase?: string;
+  progress?: {
+    service?: string;
+    service_index?: number;
+    service_total?: number;
+    phase?: "files" | "intents";
+    done?: number;
+    total?: number;
+  };
+  error?: string;
+};
+
 /** `carrick status --json`: the workspace, with no file in the question. */
 export type StatusResult = {
   schema: string;
@@ -185,6 +213,8 @@ export type StatusResult = {
   hosted_checked_at?: string;
   /** Absent on an answer written before this field existed. */
   repos?: StatusRepo[];
+  /** Scans running (or stopped part-way) on this machine. Usually absent. */
+  running_scans?: RunningScan[];
   services: StatusService[];
 };
 
@@ -270,6 +300,12 @@ export function parseStatusResult(stdout: string): StatusResult | null {
     if (typeof entry["service"] !== "string" || typeof entry["repo"] !== "string") continue;
     if (typeof entry["index_commit"] !== "string") continue;
     result.services.push(entry as unknown as StatusService);
+  }
+  const scans = Array.isArray(parsed["running_scans"]) ? parsed["running_scans"] : [];
+  for (const entry of scans) {
+    if (!isRecord(entry)) continue;
+    if (typeof entry["scan_id"] !== "string" || typeof entry["status"] !== "string") continue;
+    (result.running_scans ??= []).push(entry as unknown as RunningScan);
   }
   const repos = Array.isArray(parsed["repos"]) ? parsed["repos"] : [];
   for (const entry of repos) {

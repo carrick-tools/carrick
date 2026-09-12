@@ -306,3 +306,35 @@ test("an item with no counterparts and no verdict still renders one line", () =>
   const line = itemLine({ kind: "route", method: "GET", path: "/x", line: 3, col: 1 }, "a.ts");
   assert.equal(line, "- a.ts:3:1 route GET /x");
 });
+
+test("a session that starts while a scan is running is told so, not told there is no index", () => {
+  // The detached scan is the ruled first run's shape (carrick#992): told "no
+  // index", an agent starts a second one.
+  const building = renderSessionStart({
+    schema: "carrick.status/0",
+    error: "not_indexed",
+    services: [],
+    running_scans: [
+      {
+        scan_id: "5089ed60",
+        pid: 41234,
+        started_at: "2026-09-12T10:00:00Z",
+        status: "running",
+        infer: true,
+        phase: "indexing gateway",
+        progress: { service: "gateway", phase: "files", done: 118, total: 240 },
+      },
+    ],
+  });
+  assert.match(building, /^Carrick has no index for this workspace yet, and a scan is building one\./);
+  assert.match(building, /- scan 5089ed60 is running: indexing gateway, 118 of 240 files/);
+  assert.match(building, /\.carrick\/scan-5089ed60\.log/);
+
+  const withIndex = renderSessionStart({
+    ...statusFixture("status-workspace.json"),
+    running_scans: [
+      { scan_id: "abc12345", pid: 1, started_at: "2026-09-12T10:00:00Z", status: "failed", error: "the scan of /repos/api failed" },
+    ],
+  });
+  assert.match(withIndex, /- scan abc12345 failed: the scan of \/repos\/api failed/);
+});

@@ -61,6 +61,12 @@ impl ReadError {
 pub struct ErrorOutput {
     pub schema: String,
     pub error: String,
+    /// A scan building the index the caller asked for, when one is running.
+    /// "There is no index" and "one is being built right now" are different
+    /// answers, and a reader given only the first starts a second scan
+    /// (carrick#992).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub running_scans: Vec<super::scan_state::ScanState>,
 }
 
 impl ErrorOutput {
@@ -71,7 +77,13 @@ impl ErrorOutput {
         Self {
             schema: schema.to_string(),
             error: error.wire().to_string(),
+            running_scans: Vec::new(),
         }
+    }
+
+    pub fn with_scans(mut self, scans: Vec<super::scan_state::ScanState>) -> Self {
+        self.running_scans = scans;
+        self
     }
 }
 
@@ -320,6 +332,11 @@ pub struct StatusOutput {
     /// One entry per indexed repo, whatever its services hold.
     #[serde(default)]
     pub repos: Vec<StatusRepo>,
+    /// Scans running right now, or stopped without finishing. Empty in the
+    /// ordinary case; this is what a detached `carrick index --infer` is
+    /// visible through while it runs (carrick#992).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub running_scans: Vec<super::scan_state::ScanState>,
     pub services: Vec<StatusService>,
 }
 
@@ -327,13 +344,23 @@ impl StatusOutput {
     /// The human form: one block per service, boundary last, same order as
     /// every other local answer.
     pub fn render(&self) -> String {
-        let mut out = format!(
+        let mut out = String::new();
+        // First, because it is the only line about right now: everything below
+        // it describes the index as it was when the last build finished.
+        for scan in &self.running_scans {
+            out.push_str(&scan.line());
+            out.push('\n');
+        }
+        if !self.running_scans.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!(
             "{} — {} service(s), indexed at {} by carrick {}\n\n",
             self.workspace,
             self.services.len(),
             self.indexed_at,
             self.scanner_version
-        );
+        ));
         for service in &self.services {
             let waiting = service
                 .boundary
@@ -550,6 +577,7 @@ mod hosted_wire_tests {
             workspace: "/repos".to_string(),
             indexed_at: "2026-09-12T10:00:00Z".to_string(),
             scanner_version: "test".to_string(),
+            running_scans: Vec::new(),
             repos: vec![StatusRepo {
                 repo: "/repos/monorepo".to_string(),
                 name: "monorepo".to_string(),

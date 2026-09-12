@@ -417,10 +417,16 @@ fn run_scan(mut command: Command, what: &str, reporting: Reporting) -> Result<()
         .take()
         .ok_or_else(|| format!("the {what} produced no stderr to read"))?;
     let bar = crate::logging::spinner(&reporting.working);
+    // The same update, to the two places that can be waiting on it: the
+    // spinner a person is watching, and the state file `carrick status` reads
+    // for a scan nobody is watching at all (carrick#992). The second is a
+    // no-op unless this build was detached.
+    super::scan_state::note(&reporting.working, None);
     let mut tail: VecDeque<String> = VecDeque::with_capacity(12);
     for line in BufReader::new(stderr).lines().map_while(Result::ok) {
         if let Some(update) = crate::progress::parse(&line) {
             bar.set_message(format!("{}: {}", reporting.working, update.render()));
+            super::scan_state::note(&reporting.working, Some(&update));
             continue;
         }
         if tail.len() == 12 {

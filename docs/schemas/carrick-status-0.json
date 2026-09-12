@@ -31,10 +31,44 @@
           "items": { "$ref": "#/$defs/repo" },
           "description": "One entry per indexed repo, for what changed in it that no service reads. Absent on an answer written before this field existed."
         },
+        "running_scans": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/running_scan" },
+          "description": "Builds started with `carrick index --detach` that are running now, or stopped without finishing. Absent in the ordinary case."
+        },
         "services": {
           "type": "array",
           "items": { "$ref": "#/$defs/service" }
         }
+      },
+      "additionalProperties": true
+    },
+    "running_scan": {
+      "type": "object",
+      "required": ["scan_id", "pid", "started_at", "status"],
+      "properties": {
+        "scan_id": { "type": "string", "description": "Also the name of .carrick/scan-<id>.log, and the head of the run id the scan logs under." },
+        "pid": { "type": "integer", "minimum": 0 },
+        "started_at": { "type": "string", "description": "RFC 3339. Elapsed time is computed from it, never stored." },
+        "updated_at": { "type": "string" },
+        "infer": { "type": "boolean", "description": "Whether this is the paid pass." },
+        "workspace": { "type": "string" },
+        "status": { "enum": ["running", "failed"] },
+        "phase": { "type": "string", "description": "`indexing <repo>` or `joining the workspace`." },
+        "progress": {
+          "type": "object",
+          "description": "The last count the scan reported inside that phase.",
+          "properties": {
+            "service": { "type": "string" },
+            "service_index": { "type": "integer", "minimum": 0 },
+            "service_total": { "type": "integer", "minimum": 0 },
+            "phase": { "enum": ["files", "intents"] },
+            "done": { "type": "integer", "minimum": 0 },
+            "total": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": true
+        },
+        "error": { "type": "string" }
       },
       "additionalProperties": true
     },
@@ -148,6 +182,11 @@
         "error": {
           "enum": ["not_indexed", "not_in_workspace", "index_unreadable"],
           "description": "Exit code is 0 anyway: a read-only command never fails a session."
+        },
+        "running_scans": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/running_scan" },
+          "description": "Carried on the error body too: \"there is no index\" and \"one is being built right now\" are different answers, and a reader given only the first starts a second scan."
         }
       },
       "additionalProperties": true

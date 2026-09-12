@@ -28,6 +28,15 @@ pub enum LocalCommand {
         /// because the one paid scan runs against a config someone has read
         /// (see [`inference_refusal`]).
         infer: bool,
+        /// Run the build in the background, and answer at once with its id.
+        ///
+        /// The ruled first run has an agent run `carrick index --infer`, and a
+        /// first paid scan of a mid-sized monorepo takes about fifteen
+        /// minutes — longer than the two-minute default and the ten-minute cap
+        /// of the shell an agent runs it through (carrick#992). Detached, the
+        /// scan outlives that shell, its output lands in
+        /// `.carrick/scan-<id>.log`, and `carrick status` says where it is.
+        detach: bool,
     },
     /// What is on the other side of this file.
     Touch {
@@ -84,6 +93,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     let mut service: Option<String> = None;
     let mut json = false;
     let mut infer = false;
+    let mut detach = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut index = 0;
@@ -105,6 +115,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             }
             "--json" => json = true,
             "--infer" => infer = true,
+            "--detach" => detach = true,
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -123,6 +134,11 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     if infer && name != "index" {
         return Err(format!("unknown option for `carrick {name}`: --infer"));
     }
+    // Same rule, same reason: a hook-driven command that accepted `--detach`
+    // and ran in the foreground anyway would be a promise nobody kept.
+    if detach && name != "index" {
+        return Err(format!("unknown option for `carrick {name}`: --detach"));
+    }
 
     match name {
         "derive" => {
@@ -139,7 +155,11 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             {
                 workspace = Some(PathBuf::from(first));
             }
-            Ok(LocalCommand::Index { workspace, infer })
+            Ok(LocalCommand::Index {
+                workspace,
+                infer,
+                detach,
+            })
         }
         "refresh" => Ok(LocalCommand::Refresh { service, workspace }),
         "status" => {
@@ -188,15 +208,26 @@ pub fn run(command: LocalCommand) -> i32 {
                 1
             }
         },
-        LocalCommand::Index { workspace, infer } => {
-            match build(workspace.as_deref(), None, infer) {
-                Ok(()) => 0,
-                Err(message) => {
-                    eprintln!("carrick index: {message}");
-                    1
-                }
+        LocalCommand::Index {
+            workspace,
+            infer,
+            detach: true,
+        } => match start_detached(workspace.as_deref(), infer) {
+            Ok(()) => 0,
+            Err(message) => {
+                eprintln!("carrick index: {message}");
+                1
             }
-        }
+        },
+        LocalCommand::Index {
+            workspace, infer, ..
+        } => match build(workspace.as_deref(), None, infer) {
+            Ok(()) => 0,
+            Err(message) => {
+                eprintln!("carrick index: {message}");
+                1
+            }
+        },
         LocalCommand::Refresh { service, workspace } => {
             // Never inferred. `refresh` runs from a session-start hook, and a
             // hook that spends real money every time an editor opens is not a
@@ -243,12 +274,20 @@ fn derive(root: Option<&Path>) -> Result<serde_json::Value, String> {
 }
 
 /// `status`: the workspace, with no file in the question.
+///
+/// A scan may be running while this is asked — that is the ordinary case a
+/// minute after `carrick index --infer --detach`, and the only surface that
+/// can say so (carrick#992). It is reported first, and before the index is
+/// read at all: the first detached scan of a workspace is answering the very
+/// question "is anything happening", and at that moment there is no index.
 fn status(root: Option<&Path>, json: bool) -> i32 {
     let Some(root) = super::workspace::locate(root, None) else {
         return report(ReadError::NotIndexed, json, super::contract::STATUS_SCHEMA);
     };
+    let scans = super::scan_state::read_all(&root.join(super::workspace::INDEX_DIR));
     match super::query::status(&root) {
-        Ok(output) => {
+        Ok(mut output) => {
+            output.running_scans = scans;
             if json {
                 match serde_json::to_string_pretty(&output) {
                     Ok(text) => println!("{text}"),
@@ -266,7 +305,20 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
             }
             0
         }
-        Err(error) => report(error, json, super::contract::STATUS_SCHEMA),
+        Err(error) => {
+            // No index yet, or one this binary cannot read — and possibly a
+            // scan building it as we speak. The scan is the answer to "what is
+            // happening"; the error is the answer to "what is there". A reader
+            // that asked for JSON gets both in the body and nothing else on
+            // stdout: one line of prose in front of it is an unparseable
+            // answer.
+            if !json {
+                for scan in &scans {
+                    println!("{}", scan.line());
+                }
+            }
+            report_with_scans(error, json, super::contract::STATUS_SCHEMA, scans)
+        }
     }
 }
 
@@ -277,10 +329,33 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
 /// payload is written to this build's cache directory so the read model comes
 /// from the run that produced it (carrick#956 §8.3).
 fn build(root: Option<&Path>, service: Option<&str>, infer: bool) -> Result<(), String> {
-    // Build detection starts where the user asked. A parent's existing index
-    // is useful to read commands, but must not widen this build's repo list.
-    let root = root
-        .map(Path::to_path_buf)
+    let workspace = Workspace::load(&resolve_root(root)?)?;
+    // Before anything is printed about a scan that is not going to happen.
+    if infer && let Some(refusal) = inference_refusal(&workspace.repos) {
+        return Err(refusal);
+    }
+    // A detached build records where it is, so `carrick status` can answer for
+    // it and a scan that is killed leaves evidence rather than silence
+    // (carrick#992). Nothing is recorded in a build nobody detached.
+    let detached = std::env::var(super::scan_state::SCAN_ID_ENV)
+        .ok()
+        .filter(|id| !id.trim().is_empty());
+    if let Some(scan_id) = &detached {
+        super::scan_state::begin(&workspace.index_dir(), scan_id, &workspace.root, infer);
+    }
+    let outcome = build_workspace(&workspace, service, infer);
+    if detached.is_some() {
+        super::scan_state::finish(outcome.as_ref().err().map(String::as_str));
+    }
+    outcome
+}
+
+/// Where a build acts, before anything is loaded from it.
+///
+/// Build detection starts where the user asked. A parent's existing index is
+/// useful to read commands, but must not widen this build's repo list.
+fn resolve_root(root: Option<&Path>) -> Result<PathBuf, String> {
+    root.map(Path::to_path_buf)
         .or_else(|| {
             std::env::var(super::workspace::WORKSPACE_ENV)
                 .ok()
@@ -288,12 +363,15 @@ fn build(root: Option<&Path>, service: Option<&str>, infer: bool) -> Result<(), 
                 .map(PathBuf::from)
         })
         .or_else(|| std::env::current_dir().ok())
-        .ok_or("Could not locate the working directory")?;
-    let workspace = Workspace::load(&root)?;
-    // Before anything is printed about a scan that is not going to happen.
-    if infer && let Some(refusal) = inference_refusal(&workspace.repos) {
-        return Err(refusal);
-    }
+        .ok_or_else(|| "Could not locate the working directory".to_string())
+}
+
+/// The build itself: say what is about to happen, do it, print the map.
+fn build_workspace(
+    workspace: &Workspace,
+    service: Option<&str>,
+    infer: bool,
+) -> Result<(), String> {
     if let Some(proposal) = &workspace.parent_proposal {
         eprintln!("carrick: {}", proposal.description());
     }
@@ -322,9 +400,111 @@ fn build(root: Option<&Path>, service: Option<&str>, infer: bool) -> Result<(), 
              could not, and uploads the result. It is the paid analysis; later scans read it."
         );
     }
-    let outcome = super::index::run(&workspace, service, infer)?;
+    let outcome = super::index::run(workspace, service, infer)?;
     print_map(&outcome);
     Ok(())
+}
+
+/// `index --detach`: start the build in its own session and answer at once.
+///
+/// Everything that can refuse this build refuses it HERE, in the process the
+/// user is watching: an unreadable workspace and a repo with no `carrick.json`
+/// are answers, and an answer nobody reads because it went to a log file is
+/// not one. What goes to the log is the scan.
+///
+/// The child is put in a session of its own, so that killing the shell that
+/// started it — which is what an agent's tool timeout does — does not take the
+/// scan with it. That is the whole point of the flag (carrick#992).
+fn start_detached(root: Option<&Path>, infer: bool) -> Result<(), String> {
+    let workspace = Workspace::load(&resolve_root(root)?)?;
+    if infer && let Some(refusal) = inference_refusal(&workspace.repos) {
+        return Err(refusal);
+    }
+    let index_dir = workspace.index_dir();
+    std::fs::create_dir_all(&index_dir).map_err(|e| format!("{}: {e}", index_dir.display()))?;
+    super::workspace::write_self_ignore(&index_dir)
+        .map_err(|e| format!("could not write the .carrick/.gitignore: {e}"))?;
+
+    // The run id is already the key that joins this build's own logs to the
+    // cloud's; its head is short enough to type and unique enough to name a
+    // file by, so the scan id is not a second identifier for one run.
+    let scan_id: String = crate::logging::run_id().chars().take(8).collect();
+    let log = super::scan_state::log_file(&index_dir, &scan_id);
+    let handle = std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("could not find the carrick binary to run the scan with: {e}"))?;
+
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("index")
+        .arg("--workspace")
+        .arg(&workspace.root)
+        .env(super::scan_state::SCAN_ID_ENV, &scan_id)
+        // One run id across the parent, the detached build and every scan it
+        // drives, and the log says which of them is writing (carrick#997).
+        .env(crate::logging::RUN_ID_ENV, crate::logging::run_id())
+        .env(
+            crate::logging::RUN_PHASE_ENV,
+            format!("detached build {scan_id}"),
+        )
+        .stdin(std::process::Stdio::null())
+        .stdout(
+            handle
+                .try_clone()
+                .map_err(|e| format!("could not write to {}: {e}", log.display()))?,
+        )
+        .stderr(handle);
+    if infer {
+        command.arg("--infer");
+    }
+    detach_process(&mut command);
+
+    let child = command
+        .spawn()
+        .map_err(|e| format!("could not start the scan: {e}"))?;
+    println!(
+        "scan {scan_id} started in the background (pid {}).",
+        child.id()
+    );
+    println!("  watch it:  tail -f {}", log.display());
+    println!(
+        "  or:        carrick status --workspace {}",
+        workspace.root.display()
+    );
+    println!(
+        "The scan keeps running after this shell closes. `carrick status` names the service it \
+         is on, how far through it is, and how long it has been running."
+    );
+    Ok(())
+}
+
+/// Put the child in a session (Unix) or a process group (Windows) of its own.
+///
+/// A tool that times out kills its process GROUP, and a child that shares one
+/// with the shell dies with it — with the cloud's in-flight slot for that repo
+/// held until its TTL and nothing uploaded.
+#[cfg(unix)]
+fn detach_process(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `setsid` is async-signal-safe and is called in the child between
+    // fork and exec, which is the only place this closure runs.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+fn detach_process(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    // DETACHED_PROCESS: no console of its own, and none inherited.
+    // CREATE_NEW_PROCESS_GROUP: a Ctrl-C in the starting console is not
+    // delivered to it.
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
 }
 
 /// Why this workspace may not be scanned with inference yet, if it may not.
@@ -452,9 +632,21 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode) -> i32 {
 /// Say why there is no answer, in the form the caller asked for, and still
 /// exit 0.
 fn report(error: ReadError, json: bool, schema: &str) -> i32 {
+    report_with_scans(error, json, schema, Vec::new())
+}
+
+/// The same, carrying any scan that is building the thing the caller asked
+/// for: "there is no index" and "one is being built right now" are different
+/// answers, and a reader that only gets the first will start a second scan.
+fn report_with_scans(
+    error: ReadError,
+    json: bool,
+    schema: &str,
+    scans: Vec<super::scan_state::ScanState>,
+) -> i32 {
     eprintln!("carrick: {}", error.message());
     if json {
-        let body = ErrorOutput::new(error, schema);
+        let body = ErrorOutput::new(error, schema).with_scans(scans);
         if let Ok(text) = serde_json::to_string(&body) {
             println!("{text}");
         }
@@ -468,7 +660,7 @@ fn print_help() {
 
 USAGE:
     carrick derive  [--workspace <dir>] --json
-    carrick index   [--workspace <dir>] [--infer]
+    carrick index   [--workspace <dir>] [--infer] [--detach]
     carrick status  [--workspace <dir>] [--json]
     carrick touch   <file> [--workspace <dir>] [--json]
     carrick check   <file> [--workspace <dir>] [--json]
@@ -479,6 +671,12 @@ USAGE:
     passes could not and uploads the result. It is the paid scan, so it needs
     a carrick.json in every repo and refuses without one. Off everywhere else,
     including `refresh`, which runs from a hook.
+    --detach on `index` starts the build in the background and answers at once
+    with a scan id. Its output goes to <workspace>/.carrick/scan-<id>.log and
+    `carrick status` names the service it is on, how far through it is and how
+    long it has been running. Use it when the shell running the command has a
+    timeout shorter than the scan: a first inferred scan of a mid-sized
+    monorepo takes about fifteen minutes.
 
     index      Detect repositories, apply optional workspace overrides and
                write <dir>/.carrick/. No model runs on this machine.
@@ -605,6 +803,7 @@ mod tests {
             LocalCommand::Index {
                 workspace: Some(PathBuf::from("/w")),
                 infer: false,
+                detach: false,
             }
         );
     }
@@ -620,11 +819,48 @@ mod tests {
             LocalCommand::Index {
                 workspace: Some(PathBuf::from("/w")),
                 infer: true,
+                detach: false,
             }
         );
         assert_eq!(
             parse(&args(&["refresh", "--infer"])).unwrap(),
             Err("unknown option for `carrick refresh`: --infer".to_string())
+        );
+    }
+
+    /// The flag the ruled first run needs, on the one command that can take
+    /// minutes. `refresh` runs from a hook and has no shell to outlive, so it
+    /// refuses the flag rather than accepting it and running in the foreground
+    /// (carrick#992).
+    #[test]
+    fn a_scan_can_be_detached_from_the_shell_that_starts_it() {
+        assert_eq!(
+            parse(&args(&["index", "/w", "--infer", "--detach"]))
+                .unwrap()
+                .unwrap(),
+            LocalCommand::Index {
+                workspace: Some(PathBuf::from("/w")),
+                infer: true,
+                detach: true,
+            }
+        );
+        // The free pass may be detached too: nothing about the flag is about
+        // money, it is about how long the command takes.
+        assert_eq!(
+            parse(&args(&["index", "--detach"])).unwrap().unwrap(),
+            LocalCommand::Index {
+                workspace: None,
+                infer: false,
+                detach: true,
+            }
+        );
+        assert_eq!(
+            parse(&args(&["refresh", "--detach"])).unwrap(),
+            Err("unknown option for `carrick refresh`: --detach".to_string())
+        );
+        assert_eq!(
+            parse(&args(&["status", "--detach"])).unwrap(),
+            Err("unknown option for `carrick status`: --detach".to_string())
         );
     }
 
