@@ -149,6 +149,11 @@ async fn main() {
         }
     }
 
+    if let Some(problem) = unknown_command(&argv) {
+        eprintln!("carrick: {problem}");
+        std::process::exit(2);
+    }
+
     let args = CliArgs::parse();
     logging::init(args.verbose);
 
@@ -156,6 +161,44 @@ async fn main() {
         error!("Analysis failed: {}", e);
         std::process::exit(1);
     }
+}
+
+/// A first argument that is neither a command nor a path, and what to say
+/// about it.
+///
+/// `carrick whoami` used to reach the scan and answer "Repository path
+/// 'whoami' does not exist or is not a directory", which reads as a broken
+/// checkout rather than a mistyped command and names no alternative
+/// (carrick#997 item 6). What counts as a path is anything that exists on
+/// disk, and anything WRITTEN as one — a separator, a leading dot. A bare word
+/// that is neither is a command, and there are exactly two kinds: the ones the
+/// npm package serves, which are named rather than denied, and the rest.
+fn unknown_command(argv: &[String]) -> Option<String> {
+    let word = argv
+        .iter()
+        .find(|arg| !arg.starts_with('-'))
+        .filter(|arg| !arg.is_empty())?;
+    let written_as_a_path = word.starts_with('.')
+        || word.contains('/')
+        || word.contains(std::path::MAIN_SEPARATOR)
+        || Path::new(word).exists();
+    if written_as_a_path {
+        return None;
+    }
+    if help::PACKAGE_COMMANDS.contains(&word.as_str()) {
+        return Some(format!(
+            "`carrick {word}` comes from the carrick npm package, and this is the scanner \
+             binary on its own. Install the package with `npm i -g carrick` and run it from \
+             there."
+        ));
+    }
+    Some(format!(
+        "`{word}` is not a carrick command. Commands: {}, and {} from the npm package. To \
+         scan a repository, pass a path that exists (`carrick .`). `carrick --help` lists \
+         them all.",
+        local_mode::cli::LOCAL_COMMANDS.join(", "),
+        help::PACKAGE_COMMANDS.join(", ")
+    ))
 }
 
 async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -465,5 +508,42 @@ mod tests {
         assert!(cli.verbose);
         assert!(cli.no_cache);
         assert_eq!(cli.repo_path, "/my/repo");
+    }
+
+    /// A mistyped command is answered as a command, and the answer names the
+    /// commands there are (carrick#997 item 6).
+    #[test]
+    fn a_bare_word_that_is_not_a_command_is_not_read_as_a_repository() {
+        let problem = unknown_command(&args(&["whoami"])).expect("an unknown command");
+        assert!(problem.contains("not a carrick command"), "{problem}");
+        assert!(problem.contains("status"), "{problem}");
+        assert!(problem.contains("pass a path that exists"), "{problem}");
+    }
+
+    /// The package's own commands are named, not denied: the binary cannot run
+    /// `carrick init`, and "unknown command" would be a lie about where the
+    /// first run starts (carrick#997 item 5).
+    #[test]
+    fn a_package_command_says_where_it_lives() {
+        let problem = unknown_command(&args(&["init"])).expect("a package command");
+        assert!(problem.contains("npm i -g carrick"), "{problem}");
+    }
+
+    /// Anything written as a path still reaches the scan, and a path that does
+    /// not exist still gets the scan's own error about the path.
+    #[test]
+    fn a_path_is_left_to_the_scan() {
+        assert_eq!(unknown_command(&args(&["."])), None);
+        assert_eq!(unknown_command(&args(&["../sibling"])), None);
+        assert_eq!(unknown_command(&args(&["/repos/api", "--no-cache"])), None);
+        assert_eq!(unknown_command(&args(&["--verbose"])), None);
+        assert_eq!(unknown_command(&args(&[])), None);
+        // A bare word that is a directory on disk: cargo runs a unit test with
+        // the package root as its working directory, so `src` is one.
+        assert_eq!(
+            unknown_command(&args(&["src"])),
+            None,
+            "a bare name that exists is a repository path"
+        );
     }
 }

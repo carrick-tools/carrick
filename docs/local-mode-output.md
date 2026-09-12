@@ -312,6 +312,16 @@ it finds, under 300 ms.
   "workspace": "/Users/dev/repos",
   "indexed_at": "2026-09-06T21:14:03Z",
   "scanner_version": "0.3.41",
+  "repos": [
+    {
+      "repo": "/Users/dev/repos/webapp",
+      "name": "webapp",
+      "changed_since_index": 5,
+      "outside_every_service": 2,
+      "stale_files": ["carrick.json", ".github/workflows/carrick.yml"],
+      "stale_files_truncated": false
+    }
+  ],
   "services": [
     {
       "service": "webapp",
@@ -335,9 +345,11 @@ it finds, under 300 ms.
 | field | meaning |
 |---|---|
 | `workspace` | the folder holding `carrick-workspace.json` and `.carrick/` |
-| `services[].repo` | absolute; services of one repo share a commit and a changed-file count, and this is what says so |
-| `services[].changed_since_index` | the exact number of changed and untracked files in that repo |
+| `services[].repo` | absolute; services of one repo share a commit, and this is what says so |
+| `services[].changed_since_index` | the exact number of changed and untracked files **this service's scan reads**: its `directory` and its `include` roots. A file two services both include counts for both; a file no service reads counts for neither, and is on the repo's entry instead |
 | `services[].stale_files` | up to 50 of them, repo-relative; `stale_files_total` is always exact and `stale_files_truncated` says which you are looking at |
+| `repos[]` | one per indexed repo: `changed_since_index` is the whole tree, `outside_every_service` is how many of those no service reads, and `stale_files` is up to 50 of THOSE. A workflow file, a lockfile or an editor's settings belongs here and not to every service in the monorepo |
+| `services[].boundary.candidates_awaiting_model` | candidates no model has been asked about, so `0 route(s) 0 call(s)` from a free pass is distinguishable from a service with no API in it. Zero after a scan that ran the model; absent on an index written before the count existed |
 | `services[].boundary_lines` | the same pre-rendered lines `check` and `touch` carry |
 | `services[].hosted`, `services[].hosted_state` | the same provenance and replay state as `check` |
 | `hosted_checked_at` | when repository metadata last answered for this workspace |

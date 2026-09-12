@@ -22,6 +22,9 @@ SCAN:
                    the types, and uploads that repository's index.
 
 WORKSPACE:
+    init       Set up this folder: sign in, connect the repos, propose the
+               services, and wire up your editor and agent. The command the
+               first run starts with. Installed by the npm package.
     derive     Print the repos and services a folder resolves to, writing nothing.
     index      Scan every repo in the workspace and build <workspace>/.carrick/.
     refresh    Re-scan one service, or every repo, and re-join the index.
@@ -77,6 +80,13 @@ ENVIRONMENT VARIABLES:
                                     request or response types
 "#;
 
+/// The commands the `carrick` npm package adds on top of this binary's own
+/// (`npm/carrick/bin/carrick.mjs`). The binary cannot run them, and it must
+/// still be able to say where they are: `init` is where the first run starts,
+/// so "unknown command" is the wrong answer for it, and a user who reached
+/// the binary directly needs the package named rather than the name denied.
+pub const PACKAGE_COMMANDS: [&str; 6] = ["init", "login", "logout", "lsp", "hook", "templates"];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +104,20 @@ mod tests {
                 "`carrick {command}` is named in --help with no description: {line}"
             );
         }
+    }
+
+    /// The command the first run starts with is named here, whichever half of
+    /// the install a user reaches (carrick#997 item 5). It is the npm
+    /// package's, so the text says so and the binary's unknown-command answer
+    /// points at the package rather than denying the name.
+    #[test]
+    fn the_command_the_flow_starts_with_is_named_too() {
+        let line = HELP
+            .lines()
+            .find(|line| line.trim_start().starts_with("init "))
+            .expect("`carrick init` is named in --help");
+        assert!(line.trim_start().len() > "init".len() + 8, "{line}");
+        assert!(PACKAGE_COMMANDS.contains(&"init"));
     }
 
     #[test]

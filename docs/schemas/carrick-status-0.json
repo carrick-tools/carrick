@@ -26,10 +26,40 @@
           "type": "string",
           "description": "Scanner release that wrote the index."
         },
+        "repos": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/repo" },
+          "description": "One entry per indexed repo, for what changed in it that no service reads. Absent on an answer written before this field existed."
+        },
         "services": {
           "type": "array",
           "items": { "$ref": "#/$defs/service" }
         }
+      },
+      "additionalProperties": true
+    },
+    "repo": {
+      "type": "object",
+      "required": ["repo", "name", "changed_since_index", "outside_every_service"],
+      "properties": {
+        "repo": { "type": "string", "description": "Absolute path on this machine." },
+        "name": { "type": "string", "description": "Its directory name, which is what the index keys blobs by." },
+        "changed_since_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Everything in the repo that differs from the indexed commit or that git does not track, services included."
+        },
+        "outside_every_service": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many of those no service in this repo reads."
+        },
+        "stale_files": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Up to 50 of THOSE, repo-relative and sorted."
+        },
+        "stale_files_truncated": { "type": "boolean" }
       },
       "additionalProperties": true
     },
@@ -64,7 +94,7 @@
         },
         "repo": {
           "type": "string",
-          "description": "Absolute path of the repo this service belongs to. Services of one repo share a commit and a changed-file count."
+          "description": "Absolute path of the repo this service belongs to. Services of one repo share a commit; each states its own changed-file count."
         },
         "index_commit": { "type": "string" },
         "indexed_at": { "type": "string" },
@@ -73,7 +103,7 @@
         "changed_since_index": {
           "type": "integer",
           "minimum": 0,
-          "description": "Exact count of files in this service's repo that differ from index_commit or that git does not track."
+          "description": "Exact count of files THIS SERVICE's scan reads — its directory and its include roots — that differ from index_commit or that git does not track. What no service reads is on the repo entry."
         },
         "stale_files": {
           "type": "array",
@@ -92,7 +122,13 @@
         "boundary": {
           "type": ["object", "null"],
           "description": "ServiceBoundary for this service (src/boundary.rs), verbatim.",
-          "properties": { "candidates_withheld_changed_files": { "type": "integer", "minimum": 0 } },
+          "properties": {
+            "candidates_withheld_changed_files": { "type": "integer", "minimum": 0 },
+            "candidates_awaiting_model": { "type": "integer", "minimum": 0 },
+            "unemitted_literal_candidates": { "type": "integer", "minimum": 0 },
+            "unemitted_literal_sites": { "type": "array", "items": { "type": "string" } },
+            "type_extraction_status": { "type": "string" }
+          },
           "additionalProperties": true
         },
         "boundary_note": { "type": "string" },

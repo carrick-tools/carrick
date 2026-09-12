@@ -317,6 +317,11 @@ fn scan_command(exe: &Path, repo: &Path, blobs: &Path, previous: &Path, infer: b
     let mut command = Command::new(exe);
     command
         .arg(repo)
+        .env(crate::logging::RUN_ID_ENV, crate::logging::run_id())
+        .env(
+            crate::logging::RUN_PHASE_ENV,
+            format!("scan of {}", repo_label(repo)),
+        )
         .env(crate::cloud_storage::CACHE_DIR_ENV, blobs)
         .env(crate::cloud_storage::ISOLATE_ENV, "1")
         .env(super::hosted::PREVIOUS_ENV, previous)
@@ -349,9 +354,29 @@ fn scan_command(exe: &Path, repo: &Path, blobs: &Path, previous: &Path, infer: b
 
 /// Phase 2: join every blob, and hand the result back.
 fn join(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Result<LocalJoin, String> {
+    run_scan(
+        join_command(exe, repo, blobs, out),
+        "workspace join",
+        Reporting {
+            working: "joining the workspace".to_string(),
+            done: "joined the workspace".to_string(),
+        },
+    )?;
+
+    let text = std::fs::read_to_string(out)
+        .map_err(|e| format!("the join wrote no result to {}: {e}", out.display()))?;
+    serde_json::from_str(&text).map_err(|e| format!("could not read the join result: {e}"))
+}
+
+/// The subprocess the join phase runs as, built apart from the spawn for the
+/// same reason [`scan_command`] is: what this phase asks for is entirely in
+/// its environment, and a test reads it back from here.
+fn join_command(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Command {
     let mut command = Command::new(exe);
     command
         .arg(repo)
+        .env(crate::logging::RUN_ID_ENV, crate::logging::run_id())
+        .env(crate::logging::RUN_PHASE_ENV, "workspace join")
         .env(crate::cloud_storage::CACHE_DIR_ENV, blobs)
         .env(super::NO_MODEL_ENV, "1")
         .env("CARRICK_SKIP_INTENTS", "1")
@@ -366,18 +391,7 @@ fn join(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Result<LocalJoin, 
         .env_remove(crate::cloud_storage::LAPTOP_SCAN_ENV)
         .env_remove("CARRICK_OUTPUT_JSON");
     strip_ci_env(&mut command);
-    run_scan(
-        command,
-        "workspace join",
-        Reporting {
-            working: "joining the workspace".to_string(),
-            done: "joined the workspace".to_string(),
-        },
-    )?;
-
-    let text = std::fs::read_to_string(out)
-        .map_err(|e| format!("the join wrote no result to {}: {e}", out.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("could not read the join result: {e}"))
+    command
 }
 
 /// Run one scan subprocess, and say what it printed if it failed.
@@ -476,6 +490,29 @@ fn service_directory(blob: &CloudRepoData) -> Option<String> {
         .filter(|directory| !directory.is_empty())
 }
 
+/// The extra source roots this service was scanned with. Empty for a blob
+/// whose config declares none and for one whose config does not parse.
+fn service_include(blob: &CloudRepoData) -> Vec<String> {
+    let Some(config) = blob.config_json.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(config) else {
+        return Vec::new();
+    };
+    parsed
+        .get("include")
+        .and_then(|include| include.as_array())
+        .map(|roots| {
+            roots
+                .iter()
+                .filter_map(|root| root.as_str())
+                .map(|root| root.trim_matches('/').to_string())
+                .filter(|root| !root.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Every blob in the cache dir, in a stable order.
 fn read_blobs(blobs: &Path) -> Result<Vec<CloudRepoData>, String> {
     let Ok(entries) = std::fs::read_dir(blobs) else {
@@ -520,6 +557,7 @@ fn build(
                 enrichment: Default::default(),
                 name: service_id(blob),
                 directory: service_directory(blob),
+                include: service_include(blob),
                 commit: blob.commit_hash.clone(),
                 indexed_at: blob.last_updated.to_rfc3339(),
                 boundary: blob.boundary.clone(),
@@ -967,5 +1005,33 @@ mod tests {
                 Some(&Some("/build/previous.json".into()))
             );
         }
+    }
+
+    /// One build, one run id. Every subprocess is handed this process's id and
+    /// the name of the phase it is, so the second banner in a build's output
+    /// reads as a phase of one run rather than as a second run with a key
+    /// nothing can join (carrick#997 item 2).
+    #[test]
+    fn every_subprocess_carries_this_run_and_says_which_phase_it_is() {
+        let expected = Some(&Some(crate::logging::run_id().to_string()));
+        for infer in [false, true] {
+            let env = scan_env(infer);
+            assert_eq!(env.get(crate::logging::RUN_ID_ENV), expected);
+            assert_eq!(
+                env.get(crate::logging::RUN_PHASE_ENV),
+                Some(&Some("scan of api".into()))
+            );
+        }
+        let env = env_of(&join_command(
+            Path::new("/bin/carrick"),
+            Path::new("/repos/api"),
+            Path::new("/build/repos"),
+            Path::new("/build/join.json"),
+        ));
+        assert_eq!(env.get(crate::logging::RUN_ID_ENV), expected);
+        assert_eq!(
+            env.get(crate::logging::RUN_PHASE_ENV),
+            Some(&Some("workspace join".into()))
+        );
     }
 }

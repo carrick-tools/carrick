@@ -67,7 +67,7 @@ Carrick has no index for this workspace, so nothing in this session is checked a
 ### status-workspace.json :: renderSessionStart
 Carrick indexed 3 service(s) in /workspace at 2026-09-06T21:14:03Z, scanner 0.3.41.
 - user-service at 6a1b2c3: 157 route(s), 12 call(s), changed since index: 7 (src/routes/users.ts, src/routes/orders.ts, src/lib/db.ts, src/lib/http.ts, src/util/format.ts, +2 more)
-- user-admin at 6a1b2c3: 12 route(s), 3 call(s). Same repo as user-service, so the same 7 changed file(s)
+- user-admin at 6a1b2c3: 12 route(s), 3 call(s), changed since index: 7 (src/routes/users.ts, +6 more)
 - order-service at 9988776: 40 route(s), 61 call(s), changed since index: 120 (src/file1.ts, src/file2.ts, src/file3.ts, src/file4.ts, src/file5.ts, +115 more)
 A local index holds what the deterministic passes state: 41 candidate(s) in this service need a model and were not classified here.
 boundary (user-service): 4 unemitted literal candidates.

@@ -261,8 +261,11 @@ pub struct StatusService {
     pub indexed_at: String,
     pub routes: usize,
     pub calls: usize,
-    /// Files in this service's repo that differ from `index_commit`, or that
-    /// git does not track.
+    /// Files THIS SERVICE's scan reads that differ from `index_commit`, or
+    /// that git does not track: its own directory and its `include` roots.
+    /// Files in the repo that no service reads are under `repos` instead — a
+    /// workflow file is not a change to every service in the monorepo
+    /// (carrick#997 item 4).
     pub changed_since_index: usize,
     /// Up to [`MAX_STALE_FILES`] of them, repo-relative.
     pub stale_files: Vec<String>,
@@ -273,6 +276,28 @@ pub struct StatusService {
     pub boundary: Option<ServiceBoundary>,
     pub boundary_note: String,
     pub boundary_lines: Vec<String>,
+}
+
+/// One repo of the workspace: what moved in it that belongs to no service.
+///
+/// Every count here is about the tree, not about an API. The services carry
+/// what a service's own scan reads; this carries the rest of the repo, once,
+/// so a repo-level file is neither attributed to a service that never reads it
+/// nor dropped from the answer entirely.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StatusRepo {
+    /// Absolute path on this machine.
+    pub repo: String,
+    /// Its directory name, which is what the index keys blobs by.
+    pub name: String,
+    /// Everything in the repo that differs from the indexed commit or that git
+    /// does not track, services included.
+    pub changed_since_index: usize,
+    /// How many of those no service in this repo reads.
+    pub outside_every_service: usize,
+    /// Up to [`MAX_STALE_FILES`] of THOSE, repo-relative.
+    pub stale_files: Vec<String>,
+    pub stale_files_truncated: bool,
 }
 
 /// What `carrick status` answers: the workspace, not a file.
@@ -292,6 +317,9 @@ pub struct StatusOutput {
     pub workspace: String,
     pub indexed_at: String,
     pub scanner_version: String,
+    /// One entry per indexed repo, whatever its services hold.
+    #[serde(default)]
+    pub repos: Vec<StatusRepo>,
     pub services: Vec<StatusService>,
 }
 
@@ -307,13 +335,20 @@ impl StatusOutput {
             self.scanner_version
         );
         for service in &self.services {
+            let waiting = service
+                .boundary
+                .as_ref()
+                .and_then(|boundary| boundary.awaiting_model())
+                .map(|sentence| format!("  {sentence}"))
+                .unwrap_or_default();
             out.push_str(&format!(
-                "  {:<28} {:>4} route(s)  {:>4} call(s)  {}  changed since index: {}\n",
+                "  {:<28} {:>4} route(s)  {:>4} call(s)  {}  changed since index: {}{}\n",
                 service.service,
                 service.routes,
                 service.calls,
                 short_commit(&service.index_commit),
-                service.changed_since_index
+                service.changed_since_index,
+                waiting
             ));
             for file in &service.stale_files {
                 out.push_str(&format!("      changed  {file}\n"));
@@ -322,6 +357,24 @@ impl StatusOutput {
                 out.push_str(&format!(
                     "      ... and {} more\n",
                     service.stale_files_total - service.stale_files.len()
+                ));
+            }
+        }
+        for repo in &self.repos {
+            if repo.outside_every_service == 0 {
+                continue;
+            }
+            out.push_str(&format!(
+                "  {}: {} file(s) changed outside every service\n",
+                repo.name, repo.outside_every_service
+            ));
+            for file in &repo.stale_files {
+                out.push_str(&format!("      changed  {file}\n"));
+            }
+            if repo.stale_files_truncated {
+                out.push_str(&format!(
+                    "      ... and {} more\n",
+                    repo.outside_every_service - repo.stale_files.len()
                 ));
             }
         }
@@ -446,6 +499,7 @@ mod hosted_wire_tests {
         let status: StatusOutput = serde_json::from_value(value).unwrap();
         assert!(status.hosted_checked_at.is_none());
         assert!(status.services[0].hosted.is_none());
+        assert!(status.repos.is_empty(), "a payload written before `repos`");
         let boundary = ServiceBoundary::default();
         let mut value = serde_json::to_value(boundary).unwrap();
         assert!(value.get("candidates_withheld_changed_files").is_none());
@@ -453,5 +507,91 @@ mod hosted_wire_tests {
         let parsed: ServiceBoundary = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(parsed.candidates_withheld_changed_files, Some(3));
         assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+    }
+
+    /// The three fields carrick#997 adds to the boundary are additive and
+    /// sparse, and nothing that was a number stopped being one: the cloud's
+    /// MCP server reads `unemitted_literal_candidates` as an integer.
+    #[test]
+    fn the_boundary_additions_are_sparse_and_change_no_existing_type() {
+        let empty = serde_json::to_value(ServiceBoundary::default()).unwrap();
+        for field in [
+            "unemitted_literal_sites",
+            "candidates_awaiting_model",
+            "type_extraction_status",
+        ] {
+            assert!(empty.get(field).is_none(), "{field} is written when set");
+        }
+        assert!(empty["unemitted_literal_candidates"].is_number());
+
+        let stated = ServiceBoundary {
+            unemitted_literal_candidates: 1,
+            unemitted_literal_sites: vec!["src/a.ts:4".to_string()],
+            candidates_awaiting_model: Some(8),
+            type_extraction_status: Some("sidecar unavailable".to_string()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&stated).unwrap();
+        assert!(value["unemitted_literal_candidates"].is_number());
+        let round_tripped: ServiceBoundary = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(round_tripped).unwrap(), value);
+    }
+
+    /// A repo-level file is the repo's, stated once, and a service reports
+    /// only what its own scan reads (carrick#997 item 4).
+    #[test]
+    fn the_status_render_states_repo_level_changes_under_the_repo() {
+        let output = StatusOutput {
+            repos_detected_by: None,
+            repos_added: Vec::new(),
+            repos_excluded: Vec::new(),
+            hosted_checked_at: None,
+            schema: STATUS_SCHEMA.to_string(),
+            workspace: "/repos".to_string(),
+            indexed_at: "2026-09-12T10:00:00Z".to_string(),
+            scanner_version: "test".to_string(),
+            repos: vec![StatusRepo {
+                repo: "/repos/monorepo".to_string(),
+                name: "monorepo".to_string(),
+                changed_since_index: 3,
+                outside_every_service: 2,
+                stale_files: vec![
+                    "carrick.json".to_string(),
+                    ".github/workflows/x.yml".to_string(),
+                ],
+                stale_files_truncated: false,
+            }],
+            services: vec![StatusService {
+                hosted: None,
+                hosted_state: Default::default(),
+                service: "gateway".to_string(),
+                repo: "/repos/monorepo".to_string(),
+                index_commit: "abc1234".to_string(),
+                indexed_at: "2026-09-12T10:00:00Z".to_string(),
+                routes: 0,
+                calls: 0,
+                changed_since_index: 1,
+                stale_files: vec!["apps/gateway/main.ts".to_string()],
+                stale_files_total: 1,
+                stale_files_truncated: false,
+                boundary: Some(ServiceBoundary {
+                    candidates_awaiting_model: Some(3),
+                    ..Default::default()
+                }),
+                boundary_note: "note".to_string(),
+                boundary_lines: Vec::new(),
+            }],
+        };
+        let text = output.render();
+        assert!(text.contains("changed since index: 1"), "{text}");
+        assert!(
+            text.contains("3 candidate(s) waiting for --infer"),
+            "{text}"
+        );
+        assert!(
+            text.contains("monorepo: 2 file(s) changed outside every service"),
+            "{text}"
+        );
+        assert!(text.contains("changed  carrick.json"), "{text}");
     }
 }

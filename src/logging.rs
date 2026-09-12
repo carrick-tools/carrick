@@ -20,11 +20,29 @@ static RUN_START_OFFSET: OnceLock<u64> = OnceLock::new();
 /// same key joins customer-side and CloudWatch logs for one scan.
 static RUN_ID: OnceLock<String> = OnceLock::new();
 
-/// Stable identifier for this scanner run. Initializes lazily on first
-/// call to a fresh UUID v4, then returns the same string for the rest
-/// of the process.
+/// Set by a process that drives scans as subprocesses, so the whole build is
+/// one run: `carrick index` runs a scan per repo and a join, and each of them
+/// minting its own id printed a second "Carrick run starting" banner with a
+/// different key and left the cloud's logs unable to join them (carrick#997
+/// item 2). Internal, like [`crate::progress::PROGRESS_ENV`]; nothing asks a
+/// user to set it.
+pub const RUN_ID_ENV: &str = "CARRICK_RUN_ID";
+
+/// What this process is inside that run, for its own banner. Set beside
+/// [`RUN_ID_ENV`]; absent in the process a user started.
+pub const RUN_PHASE_ENV: &str = "CARRICK_RUN_PHASE";
+
+/// Stable identifier for this scanner run. Taken from the parent that drives
+/// this one when there is one, else a fresh UUID v4 on first call, then the
+/// same string for the rest of the process.
 pub fn run_id() -> &'static str {
-    RUN_ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
+    RUN_ID.get_or_init(|| {
+        std::env::var(RUN_ID_ENV)
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+    })
 }
 
 /// Initialize the global tracing subscriber with two layers:
@@ -371,6 +389,21 @@ pub fn get_run_log_offset() -> Option<u64> {
 fn emit_run_preamble() {
     fn env(name: &str) -> String {
         std::env::var(name).unwrap_or_else(|_| "<unset>".to_string())
+    }
+
+    // A process a parent drives says which part of that parent's run it is, so
+    // the second banner in a build's output is readable as the phase it
+    // belongs to rather than as a second run (carrick#997 item 2).
+    if let Ok(phase) = std::env::var(RUN_PHASE_ENV)
+        && !phase.trim().is_empty()
+    {
+        info!(
+            run_id = run_id(),
+            scanner_version = env!("CARGO_PKG_VERSION"),
+            phase = %phase,
+            "Carrick run continuing"
+        );
+        return;
     }
 
     info!(

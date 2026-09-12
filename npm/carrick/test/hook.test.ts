@@ -168,7 +168,8 @@ test("the session line asks status about the workspace, and states what it holds
   assert.ok(run.stdout.endsWith("\n"), "the session line ends with a newline");
   assert.ok(!run.stdout.endsWith("\n\n"), "and with exactly one");
   assert.match(run.stdout, /\n- user-service at 6a1b2c3: 157 route\(s\), 12 call\(s\), changed since index: 7 \(/);
-  assert.match(run.stdout, /\n- user-admin .*Same repo as user-service, so the same 7 changed file\(s\)/);
+  // Each service states the count of what its own scan reads (carrick#997).
+  assert.match(run.stdout, /\n- user-admin at 6a1b2c3: 12 route\(s\), 3 call\(s\), changed since index: 7 \(/);
   const call = firstCall(argvLog);
   assert.ok(call);
   assert.deepEqual(call.argv.slice(0, 2), ["status", "--workspace"]);

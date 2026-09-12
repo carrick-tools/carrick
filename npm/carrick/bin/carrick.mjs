@@ -100,15 +100,15 @@ async function printVersion() {
  * Printed after the scanner's help rather than woven into it: the binary is
  * spawned for that text and answers none of these names, so its groups are
  * repeated here as headings instead of being interleaved (carrick#976).
+ *
+ * `init` is named in the binary's own WORKSPACE block instead of here: it is
+ * where the first run starts, and a help text a reader stops part-way through
+ * must not be the reason they never find it (carrick#997 item 5). Its
+ * arguments are still this package's.
  */
 function extraHelp() {
   return [
     "This package carries the commands that put those answers where you work.",
-    "",
-    "WORKSPACE:",
-    "    init [--project SLUG]        set up this folder: the repos to index, the",
-    "                                 first index, and the editor and agent wiring;",
-    "                                 with a project, verify every repo is in it",
     "",
     "ACCOUNT:",
     "    login                        sign in to a Carrick workspace",
@@ -124,7 +124,8 @@ function extraHelp() {
     "                                 carrick.json",
     "    --version                    the version of this package",
     "",
-    "`carrick init --help` prints its own arguments.",
+    "`carrick init [--project SLUG]` sets this folder up; `carrick init --help`",
+    "prints its own arguments.",
     "",
   ].join("\n");
 }

@@ -13,6 +13,7 @@ import {
   type CheckResult,
   type Counted,
   type Counterpart,
+  type StatusRepo,
   type StatusResult,
   type StatusService,
 } from "./contract.ts";
@@ -63,8 +64,12 @@ export function boundaryLines(boundary: Boundary | undefined, service: string | 
   push(boundary.routes_without_response_type, "route(s) with no resolved response type");
   push(boundary.calls_without_expected_type, "call(s) with no resolved expected type");
   if ((boundary.unemitted_literal_candidates ?? 0) > 0) {
+    const sites = boundary.unemitted_literal_sites ?? [];
+    const where = sites.length
+      ? ` (${(boundary.unemitted_literal_candidates ?? 0) > 1 ? "e.g. " : ""}${sites[0]})`
+      : "";
     out.push(
-      `  ${boundary.unemitted_literal_candidates} bare route-literal call site(s) left unclassified`,
+      `  ${boundary.unemitted_literal_candidates} bare route-literal call site(s) left unclassified${where}`,
     );
   }
   if ((boundary.model_only_rows ?? 0) > 0) {
@@ -77,10 +82,14 @@ export function boundaryLines(boundary: Boundary | undefined, service: string | 
       `  ${boundary.model_endpoints_discarded_in_claimed_modules} model endpoint(s) dropped in modules a routing convention claims`,
     );
   }
+  // One event, one line: the stage when the scan recorded one, otherwise the
+  // sentence it wrote about the same event (carrick#997 item 3).
   if (boundary.types_degraded) {
     out.push(
       `  types degraded at ${boundary.types_degraded.stage ?? "an unnamed stage"}: ${boundary.types_degraded.detail ?? "no detail"}`,
     );
+  } else if (boundary.type_extraction_status) {
+    out.push(`  warning: ${boundary.type_extraction_status}`);
   }
   if (boundary.bare_checkout) {
     out.push("  types captured on a bare checkout: anything through a dependency is `any`");
@@ -298,20 +307,33 @@ function staleText(service: StatusService): string {
 }
 
 /**
- * One line per service: what it holds, at which commit, and how far its repo
- * has moved since.
+ * One line per service: what it holds, at which commit, how far the part of
+ * the tree it reads has moved since, and what is waiting for a paid scan.
  *
- * Services of one repo share a commit and a changed-file count, so the count is
- * stated on the first service of each repo and the others point at it. Saying
- * it once is the difference between one repo with three services and three
- * repos that all happen to have moved by the same number of files.
+ * Services of one repo share a commit and no longer share a changed-file
+ * count: each is told about the files its own scan reads, and the repo's own
+ * line carries what belongs to no service (carrick#997 item 4).
  */
-export function serviceLine(service: StatusService, sharesRepoWith: string | null): string {
+export function serviceLine(service: StatusService): string {
   const head = `- ${service.service} at ${shortHash(service.index_commit)}: ${service.routes} route(s), ${service.calls} call(s)`;
-  if (sharesRepoWith) {
-    return `${head}. Same repo as ${sharesRepoWith}, so the same ${service.changed_since_index} changed file(s)`;
-  }
-  return `${head}, changed since index: ${service.changed_since_index}${staleText(service)}`;
+  const waiting = service.boundary?.candidates_awaiting_model;
+  const awaiting = waiting ? `, ${waiting} candidate(s) waiting for --infer` : "";
+  return `${head}, changed since index: ${service.changed_since_index}${staleText(service)}${awaiting}`;
+}
+
+/**
+ * One line per repo, for the files no service in it reads: a workflow, a
+ * lockfile, an editor's settings. Empty when there are none, because a repo
+ * whose every change is inside a service has nothing to add.
+ */
+export function repoLine(repo: StatusRepo): string | null {
+  if (!repo.outside_every_service) return null;
+  const shown = (repo.stale_files ?? []).slice(0, MAX_STALE_FILES);
+  const rest = repo.outside_every_service - shown.length;
+  const listed = shown.length
+    ? ` (${rest > 0 ? `${shown.join(", ")}, +${rest} more` : shown.join(", ")})`
+    : "";
+  return `- ${repo.name}: ${repo.outside_every_service} file(s) changed outside every service${listed}`;
 }
 
 /**
@@ -340,11 +362,12 @@ export function renderSessionStart(status: StatusResult): string {
     `Carrick indexed ${status.services.length} service(s)${where}${when}${version}.`,
   ];
 
-  const firstOfRepo = new Map<string, string>();
   for (const service of status.services) {
-    const shared = firstOfRepo.get(service.repo) ?? null;
-    if (!shared) firstOfRepo.set(service.repo, service.service);
-    lines.push(serviceLine(service, shared));
+    lines.push(serviceLine(service));
+  }
+  for (const repo of status.repos ?? []) {
+    const line = repoLine(repo);
+    if (line) lines.push(line);
   }
   for (const service of status.services) {
     for (const line of serviceBoundary(service)) lines.push(line);
