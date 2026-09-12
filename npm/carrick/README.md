@@ -40,6 +40,14 @@ the repos are already in, and otherwise lists the workspace's projects for you
 to name one, which it creates from the terminal where the API allows that. An
 empty answer leaves the step to the browser.
 
+Each repository is identified by its `origin` remote. A remote written through
+a per-account SSH host alias (`git@github.com-work:owner/repo.git`) is resolved
+with `ssh -G`, so an alias whose `HostName` is `github.com` is an ordinary
+GitHub repository here. When a repository still names none, `init` says which
+one it was and what it read, and leaves that repository out of the project and
+connection steps rather than dropping it quietly. `carrick init --repo
+owner/repo` names the repository in that case.
+
 Credentials live in `$XDG_CONFIG_HOME/carrick/credentials.json`, falling back
 to `~/.config/carrick/` on macOS and Linux or `%APPDATA%\carrick\` on Windows.
 The file is written with mode 0600. `carrick logout` removes it; unset
@@ -92,7 +100,7 @@ types in a Node process.
 |---|---|
 | `carrick login` | Authorise a Carrick workspace in the browser, or verify `CARRICK_TOKEN` |
 | `carrick logout` | Remove the saved local credential |
-| `carrick init [--project SLUG]` | The repo list, the project, the service proposal in `.carrick/`, the agent hooks, the MCP connection, and the prompt that writes `carrick.json` |
+| `carrick init [--project SLUG] [--repo OWNER/REPO]` | The repo list, the project, the service proposal in `.carrick/`, the agent hooks, the MCP connection, and the prompt that writes `carrick.json` |
 | `carrick index` | Derive the workspace, apply optional repo overrides and write `.carrick/` |
 | `carrick refresh [--service X]` | Re-scan one repo, or all of them, and re-join |
 | `carrick check <file>` | What the index knows about that file, verdicts included |
