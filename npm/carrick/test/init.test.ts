@@ -13,6 +13,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   deriveWorkspace,
+  repoIdentity,
   writeProposal,
   PROPOSAL_FILE,
   type WorkspaceProposal,
@@ -77,6 +78,12 @@ function executableInitFixture(
   // What the scanner's `derive` answers. The default proposes no config; the
   // monorepo one proposes a sixteen-service document.
   derived: "no-config" | "monorepo" = "no-config",
+  // How this clone names its origin, and what a fake `ssh` on PATH resolves a
+  // host alias to. Both default to the ordinary case: a literal github.com
+  // remote, which resolves nothing and spawns no ssh. `expectRepos` is what
+  // the workspace read must ask for, so a run that loses an identity fails
+  // here rather than passing quietly.
+  clone: { origin?: string; sshHostname?: string; expectRepos?: string[] } = {},
 ): {
   root: string;
   repo: string;
@@ -87,7 +94,7 @@ function executableInitFixture(
   const repo = path.join(root, "repo");
   fs.mkdirSync(repo);
   execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "remote", "add", "origin", "git@github.com:acme/api.git"]);
+  execFileSync("git", ["-C", repo, "remote", "add", "origin", clone.origin ?? "git@github.com:acme/api.git"]);
 
   const native = path.join(root, "native.mjs");
   // Anything but `derive` exits 2, so a run that ends 0 is a run that never
@@ -131,16 +138,28 @@ globalThis.fetch = async (input, init) => {
       ],
     });
   }
-  if (body.action !== "resolve-repos" || JSON.stringify(body.repos) !== JSON.stringify(["acme/api"])) throw new Error("unexpected request");
+  if (body.action !== "resolve-repos" || JSON.stringify(body.repos) !== JSON.stringify(${JSON.stringify(clone.expectRepos ?? ["acme/api"])})) throw new Error("unexpected request");
   return Response.json({
     schema: "carrick.resolve-repos/0",
     workspace: { slug: "acme", billing_tier: "free", installed: true },
     allowance_sentence: null,
-    repos: [{ full_name: "acme/api", connected: true, project_id: "p1", project_slug: ${JSON.stringify(projectSlug)}, services: [] }],
-    project_repos: [{ project_slug: ${JSON.stringify(projectSlug)}, repos: ["acme/api"] }],
+    repos: body.repos.map((name) => ({ full_name: name, connected: true, project_id: "p1", project_slug: ${JSON.stringify(projectSlug)}, services: [] })),
+    project_repos: [{ project_slug: ${JSON.stringify(projectSlug)}, repos: body.repos }],
   });
 };
 `);
+
+  // A fake `ssh` for the alias cases: OpenSSH reads ~/.ssh/config through the
+  // password database rather than $HOME, so a temporary config file would not
+  // be read and this is the only way to state the machine.
+  let binDirectory: string | null = null;
+  if (clone.sshHostname !== undefined) {
+    binDirectory = path.join(root, "bin");
+    fs.mkdirSync(binDirectory);
+    const ssh = path.join(binDirectory, "ssh");
+    fs.writeFileSync(ssh, `#!/bin/sh\necho "hostname ${clone.sshHostname}"\n`);
+    fs.chmodSync(ssh, 0o755);
+  }
 
   return {
     root,
@@ -156,6 +175,9 @@ globalThis.fetch = async (input, init) => {
       HOME: path.join(root, "home"),
       USERPROFILE: path.join(root, "home"),
       NODE_OPTIONS: `--import=${mockHttp}`,
+      ...(binDirectory === null
+        ? {}
+        : { PATH: `${binDirectory}${path.delimiter}${process.env["PATH"] ?? ""}` }),
     },
     cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
   };
@@ -403,7 +425,12 @@ test("an editor we have not tested gets the server's command and no claim", () =
 
 test("init reads its arguments", () => {
   const parsed = parseArgs(["-y", "--project", "payments", "--workspace", "/code"], "/tmp");
-  assert.deepEqual(parsed, { workspace: "/code", assumeYes: true, project: "payments" });
+  assert.deepEqual(parsed, { workspace: "/code", assumeYes: true, project: "payments", repo: null });
+  assert.equal((parseArgs(["--repo", "acme/api"]) as { repo: string }).repo, "acme/api");
+  assert.match(parseArgs(["--repo"]) as string, /needs an owner\/repo/);
+  for (const name of ["acme", "acme/api/extra", "https://github.com/acme/api"]) {
+    assert.match(parseArgs(["--repo", name]) as string, /invalid repo/);
+  }
   assert.equal((parseArgs(["/code"], "/tmp") as { workspace: string }).workspace, "/code");
   assert.equal((parseArgs(["--project", "payments"]) as { project: string }).project, "payments");
   assert.match(parseArgs(["--project"]) as string, /needs a slug/);
@@ -728,6 +755,147 @@ test("the executable CLI cannot verify a project without a GitHub repo identity"
     assert.equal(result.status, 1);
     assert.match(result.stderr, /cannot verify .* because it has no GitHub origin/);
     assert.doesNotMatch(result.stdout, /Verified/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+// carrick#991 / carrick#978. A machine signed in to two GitHub accounts writes
+// its remotes through a per-account ssh alias, and the repository behind that
+// alias is an ordinary GitHub repository. Reading the host literally dropped
+// it, and a dropped repo took the project step, the connection check and the
+// workspace read with it, in silence.
+const ALIAS_REMOTE = "git@github.com-work:acme/api.git";
+
+test("a GitHub remote written through an ssh host alias names the repository", () => {
+  const asked: string[] = [];
+  const identity = repoIdentity("/w/api", {
+    remote: () => ALIAS_REMOTE,
+    sshHostname: (host) => {
+      asked.push(host);
+      return "github.com";
+    },
+  });
+  assert.deepEqual(identity, { path: "/w/api", name: "acme/api", remote: ALIAS_REMOTE, problem: null });
+  // Resolved the way ssh resolves it, from the user's own configuration.
+  assert.deepEqual(asked, ["github.com-work"]);
+
+  // The ssh:// spelling of the same alias, which is a URL rather than an scp path.
+  assert.equal(
+    repoIdentity("/w/api", { remote: () => "ssh://git@github.com-work/acme/api.git", sshHostname: () => "github.com" }).name,
+    "acme/api",
+  );
+
+  // A host that is already github.com costs no subprocess at all.
+  const never: Parameters<typeof repoIdentity>[1] = {
+    remote: () => "git@github.com:acme/api.git",
+    sshHostname: () => {
+      throw new Error("a literal github.com host must not be resolved");
+    },
+  };
+  assert.equal(repoIdentity("/w/api", never).name, "acme/api");
+  assert.equal(repoIdentity("/w/api", { ...never, remote: () => "https://github.com/acme/api.git" }).name, "acme/api");
+  // An alias spelled without a user, which parses as a URL whose scheme is the host.
+  assert.equal(
+    repoIdentity("/w/api", { remote: () => "github.com-work:acme/api.git", sshHostname: () => "github.com" }).name,
+    "acme/api",
+  );
+});
+
+test("a repo that names no GitHub identity says which remote was read and why", () => {
+  // `ssh -G` exits 0 for a host no configuration entry matches and echoes the
+  // name back, so an unresolvable alias is a hostname that is not github.com,
+  // never a non-zero status.
+  const echoed = repoIdentity("/w/api", { remote: () => ALIAS_REMOTE, sshHostname: (host) => host });
+  assert.equal(echoed.name, null);
+  assert.equal(echoed.remote, ALIAS_REMOTE);
+  assert.match(echoed.problem ?? "", /github\.com-work/);
+  assert.match(echoed.problem ?? "", /not github\.com/);
+
+  // No ssh on this machine, which is a different sentence from a wrong host.
+  const absent = repoIdentity("/w/api", { remote: () => ALIAS_REMOTE, sshHostname: () => null });
+  assert.equal(absent.name, null);
+  assert.match(absent.problem ?? "", /ssh could not resolve/);
+
+  // And the remotes that never were a GitHub repository.
+  assert.equal(repoIdentity("/w/api", { remote: () => null, sshHostname: () => null }).problem, "it has no origin remote");
+  const elsewhere = repoIdentity("/w/api", { remote: () => "https://example.com/acme/api.git", sshHostname: () => null });
+  assert.equal(elsewhere.name, null);
+  assert.match(elsewhere.problem ?? "", /not github\.com/);
+  const local = repoIdentity("/w/api", { remote: () => "/srv/mirrors/api.git", sshHostname: () => null });
+  assert.equal(local.name, null);
+  assert.match(local.problem ?? "", /not a GitHub URL/);
+});
+
+test("the executable CLI resolves an ssh host alias and verifies the repo", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments", "absent", "no-config", {
+    origin: ALIAS_REMOTE,
+    sshHostname: "github.com",
+  });
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Repos requested for project "payments":\n {2}acme\/api/);
+    assert.match(result.stdout, /Verified 1 repo in project "payments"/);
+    assert.doesNotMatch(result.stdout, /contributes no GitHub identity/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("the executable CLI names the repo it could not identify, and says what it skipped", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments", "absent", "no-config", {
+    // An alias with no entry in this machine's ssh configuration: ssh answers
+    // with the alias itself.
+    origin: ALIAS_REMOTE,
+    sshHostname: "github.com-work",
+    // The workspace read asks for nothing, because nothing was identified.
+    expectRepos: [],
+  });
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--yes", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    // The path, the remote as written, and what ssh made of it.
+    assert.ok(
+      result.stdout.includes(
+        `${fixture.repo} contributes no GitHub identity: its origin ${ALIAS_REMOTE} names the host "github.com-work"`,
+      ),
+      result.stdout,
+    );
+    assert.match(result.stdout, /carrick init --repo owner\/repo/);
+    assert.match(result.stdout, /HostName github\.com line in your ssh config/);
+    assert.match(result.stdout, /chooses no project and checks no connection/);
+    // The local half still happened: this is a loud run, not a failed one.
+    assert.equal(fs.existsSync(path.join(fixture.repo, PROPOSAL_FILE)), true);
+    assert.equal(fs.existsSync(path.join(fixture.repo, ".claude")), true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("the executable CLI takes --repo for the identity a remote could not give", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments", "absent", "no-config", {
+    origin: ALIAS_REMOTE,
+    sshHostname: "github.com-work",
+  });
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--repo", "acme/api", "--yes", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(result.stdout.includes(`Taking acme/api as the GitHub repository for ${fixture.repo}`), result.stdout);
+    assert.match(result.stdout, /Verified 1 repo in project "payments"/);
+    assert.doesNotMatch(result.stdout, /contributes no GitHub identity/);
   } finally {
     fixture.cleanup();
   }

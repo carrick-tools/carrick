@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { readCredential, type Credential } from "../auth/credentials.ts";
 import { signIn } from "../auth/run.ts";
 import { resolveRepos } from "../auth/read.ts";
-import { deriveWorkspace, writeProposal, PROPOSAL_FILE, githubRemote } from "./repos.ts";
+import { deriveWorkspace, writeProposal, PROPOSAL_FILE, repoIdentity } from "./repos.ts";
 import { connectRepos, reposAreInProject, projectAssignments } from "./connect.ts";
 import { ensureProject, projectStep, SLUG } from "./projects.ts";
 import { connectMcpClients, mcpLines } from "./mcp.ts";
@@ -47,12 +47,16 @@ export type InitOptions = {
   workspace: string;
   /** Require every proposed GitHub repo to belong to this project. */
   project: string | null;
+  /** The `owner/repo` to use when the origin remote names none (carrick#991). */
+  repo: string | null;
   /** Answer yes to the repo list rather than asking. */
   assumeYes: boolean;
 };
 
+const OWNER_REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
 export function parseArgs(argv: string[], cwd = process.cwd()): InitOptions | string {
-  const options: InitOptions = { workspace: cwd, project: null, assumeYes: false };
+  const options: InitOptions = { workspace: cwd, project: null, repo: null, assumeYes: false };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     switch (argument) {
@@ -67,6 +71,14 @@ export function parseArgs(argv: string[], cwd = process.cwd()): InitOptions | st
           return `invalid project slug "${value}": use 3-32 lowercase letters, digits, and single hyphens`;
         }
         options.project = value;
+        index += 1;
+        break;
+      }
+      case "--repo": {
+        const value = argv[index + 1];
+        if (!value) return "--repo needs an owner/repo";
+        if (!OWNER_REPO.test(value)) return `invalid repo "${value}": use owner/repo as GitHub spells it`;
+        options.repo = value;
         index += 1;
         break;
       }
@@ -91,7 +103,7 @@ export function parseArgs(argv: string[], cwd = process.cwd()): InitOptions | st
 
 function help(): string {
   return [
-    "carrick init [DIRECTORY] [--project SLUG]",
+    "carrick init [DIRECTORY] [--project SLUG] [--repo OWNER/REPO]",
     "",
     "Sign in (here, or beforehand with carrick login), then set up a repository",
     "or a folder of repos: the project, the repo connection, the agent hooks,",
@@ -104,6 +116,7 @@ function help(): string {
     "",
     "    -w, --workspace DIR  The folder holding the repos (default: this one)",
     "        --project SLUG   Require these repos in this Carrick project",
+    "        --repo OWNER/REPO  Name the GitHub repo whose origin remote names none",
     "    -y, --yes            Take the repo list as proposed",
   ].join("\n");
 }
@@ -209,10 +222,49 @@ export async function init(argv: string[]): Promise<number> {
       credential = await signIn(say);
     }
     derived = deriveWorkspace(workspace);
-    const repoIdentities = derived.plan.repos.map((repo) => ({ path: repo.path, name: githubRemote(repo.path) }));
+    const derivedIdentities = derived.plan.repos.map((repo) => repoIdentity(repo.path));
+    // `--repo` names what a remote could not: an ssh alias ssh itself cannot
+    // resolve, a mirror, a clone with no origin. It names one repository, so
+    // it is taken only when exactly one repo here is missing an identity.
+    const unnamed = derivedIdentities.filter((repo) => repo.name === null);
+    let taken: string | null = null;
+    if (parsed.repo !== null) {
+      if (unnamed.length > 1) {
+        throw new Error(
+          `--repo names one repository, but ${unnamed.length} repos here have no GitHub identity: ${unnamed.map((repo) => repo.path).join(", ")}. Run carrick init --repo in each of them, or fix their origin remotes.`,
+        );
+      }
+      if (unnamed.length === 0) {
+        say(`--repo ${parsed.repo} was not needed: every repo here names its own GitHub repository.`);
+      } else {
+        taken = unnamed[0]!.path;
+        say(`Taking ${parsed.repo} as the GitHub repository for ${taken}.`);
+      }
+    }
+    const repoIdentities = derivedIdentities.map((repo) =>
+      repo.path === taken ? { ...repo, name: parsed.repo, problem: null } : repo,
+    );
     const names = [...new Set(repoIdentities.map((repo) => repo.name).filter((name): name is string => name !== null))];
     if (names.length > 200) throw new Error("This workspace has more than 200 GitHub repos. Initialise smaller workspace groups.");
     const missingIdentities = repoIdentities.filter((repo) => repo.name === null);
+    // Said before anything is requested, and said whether or not --project was
+    // given: a repo with no identity is left out of the project step, the
+    // connection check and the workspace read, and a run that dropped it in
+    // silence read as a complete one (carrick#991).
+    // A folder of clones can hold dozens, so the list is capped and the rest
+    // is counted rather than dropped.
+    for (const repo of missingIdentities.slice(0, 10)) {
+      say(`${repo.path} contributes no GitHub identity: ${repo.problem}.`);
+    }
+    if (missingIdentities.length > 10) {
+      say(`${missingIdentities.length - 10} more repos here name no GitHub identity either.`);
+    }
+    if (missingIdentities.length > 0) {
+      const one = missingIdentities.length === 1;
+      say(
+        `  Carrick has nothing to connect ${one ? "it" : "them"} to. Run carrick init --repo owner/repo${one ? "" : " in each of them"}, or give the alias a HostName github.com line in your ssh config.`,
+      );
+    }
     if (parsed.project && missingIdentities.length > 0) {
       throw new Error(
         `--project ${parsed.project} cannot verify ${missingIdentities.map((repo) => repo.path).join(", ")} because ${missingIdentities.length === 1 ? "it has" : "they have"} no GitHub origin. No project assignment was verified.`,
@@ -224,6 +276,11 @@ export async function init(argv: string[]): Promise<number> {
     if (parsed.project) {
       say(`Repos requested for project "${parsed.project}":`);
       for (const name of names) say(`  ${name}`);
+    } else if (names.length === 0) {
+      // The sentence that stops the rest of this run from reading as a
+      // complete one: no project is chosen, no connection is checked, and a
+      // later upload has no repo identity to resolve a project from.
+      say("No repo here names a GitHub repository, so this run chooses no project and checks no connection.");
     }
     const initial = await resolveRepos(credential.token, names);
     // The project half of the browser round trip, where this API can do it

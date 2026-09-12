@@ -78,17 +78,119 @@ export function writeProposal(workspace: string, derived: DerivedWorkspace): str
   return PROPOSAL_FILE;
 }
 
-/** Only GitHub origin identities are sent to the workspace metadata read. */
-export function githubRemote(repo: string): string | null {
+/**
+ * What one repository on disk says it is on GitHub, and why it said nothing.
+ *
+ * `problem` is a clause, so a caller can put it after the path it read: it is
+ * printed for every repo that contributes no identity, because a repo silently
+ * left out of the project and connection steps looked like a complete run
+ * (carrick#991).
+ */
+export type RepoIdentity = {
+  path: string;
+  /** `owner/repo`, or null when this repo names no GitHub repository. */
+  name: string | null;
+  /** The origin remote as written, for the line that says what was read. */
+  remote: string | null;
+  problem: string | null;
+};
+
+/** The two machine reads, injected so tests never spawn anything. */
+export type IdentityProbe = {
+  /** `git remote get-url origin`, or null when there is no origin. */
+  remote: (repo: string) => string | null;
+  /** The `hostname` ssh resolves a host to, or null when ssh cannot say. */
+  sshHostname: (host: string) => string | null;
+};
+
+function gitOrigin(repo: string): string | null {
   const result = spawnSync("git", ["-C", repo, "remote", "get-url", "origin"], { encoding: "utf8", timeout: 5000 });
-  if (result.status !== 0) return null;
-  const remote = result.stdout.trim();
-  const scp = /^git@github\.com:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/.exec(remote);
-  if (scp) return scp[1]!;
-  try {
-    const url = new URL(remote);
-    if (url.hostname.toLowerCase() !== "github.com" || !["https:", "ssh:"].includes(url.protocol)) return null;
-    const name = url.pathname.replace(/^\//, "").replace(/\.git$/, "");
-    return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(name) ? name : null;
-  } catch { return null; }
+  return result.status === 0 ? result.stdout.trim() : null;
+}
+
+/**
+ * The host ssh itself would dial, which for a per-account alias
+ * (`Host github.com-work` / `HostName github.com`) is not the host in the
+ * remote. `ssh -G` prints the whole resolved configuration and connects to
+ * nothing, so this reads the user's own `~/.ssh/config` without a list of
+ * alias spellings. An alias no config entry matches is not an error: ssh
+ * exits 0 and echoes the name back, which is why an unresolvable alias is
+ * detected by the hostname it returns rather than by a status.
+ */
+function sshHostname(host: string): string | null {
+  // Never spawn on a string that could be read as an option, and never on one
+  // ssh would reject anyway.
+  if (!/^[A-Za-z0-9._-]+$/.test(host) || host.startsWith("-")) return null;
+  const result = spawnSync("ssh", ["-G", host], {
+    encoding: "utf8",
+    timeout: 5000,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (result.error || result.status !== 0 || typeof result.stdout !== "string") return null;
+  const line = /^hostname (\S+)$/im.exec(result.stdout);
+  return line ? line[1]! : null;
+}
+
+const DEFAULT_PROBE: IdentityProbe = { remote: gitOrigin, sshHostname };
+
+/** The host and `owner/repo` a remote names, in either spelling git accepts. */
+function splitRemote(remote: string): { host: string; name: string | null; ssh: boolean } | null {
+  let host: string;
+  let repoPath: string;
+  let ssh: boolean;
+  // The two spellings are told apart by the `//`, not by whether `new URL`
+  // throws: a host alias with no user (`host-work:owner/repo`) parses as a URL
+  // whose scheme is the host, and would otherwise be read as neither form.
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(remote)) {
+    let url: URL;
+    try { url = new URL(remote); } catch { return null; }
+    if (!["https:", "http:", "ssh:"].includes(url.protocol)) return null;
+    host = url.hostname;
+    repoPath = url.pathname;
+    ssh = url.protocol === "ssh:";
+  } else {
+    // The scp spelling `[user@]host:owner/repo`, which is not a URL.
+    const scp = /^(?:[^@\s/]+@)?([^:/\s]+):(\S+)$/.exec(remote);
+    if (!scp) return null;
+    host = scp[1]!;
+    repoPath = scp[2]!;
+    ssh = true;
+  }
+  const name = repoPath.replace(/^\/+/, "").replace(/\.git$/, "");
+  return { host, name: /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(name) ? name : null, ssh };
+}
+
+/**
+ * Only GitHub origin identities are sent to the workspace metadata read.
+ *
+ * A host that is already github.com is taken without spawning anything; an ssh
+ * host that is not is resolved through the user's ssh configuration, because a
+ * machine with two GitHub accounts writes its remotes through a per-account
+ * alias and that repository is an ordinary GitHub repository (carrick#991,
+ * carrick#978).
+ */
+export function repoIdentity(repo: string, probe: IdentityProbe = DEFAULT_PROBE): RepoIdentity {
+  const remote = probe.remote(repo);
+  if (remote === null) return { path: repo, name: null, remote: null, problem: "it has no origin remote" };
+  const parts = splitRemote(remote);
+  if (!parts) return { path: repo, name: null, remote, problem: `its origin ${remote} is not a GitHub URL` };
+  const { host, name, ssh } = parts;
+  if (name === null) {
+    return { path: repo, name: null, remote, problem: `its origin ${remote} names no owner/repo path` };
+  }
+  if (host.toLowerCase() === "github.com") return { path: repo, name, remote, problem: null };
+  if (!ssh) {
+    return { path: repo, name: null, remote, problem: `its origin ${remote} is on ${host}, not github.com` };
+  }
+  const resolved = probe.sshHostname(host);
+  if (resolved === null) {
+    return { path: repo, name: null, remote, problem: `its origin ${remote} names the host "${host}", which ssh could not resolve` };
+  }
+  if (resolved.toLowerCase() === "github.com") return { path: repo, name, remote, problem: null };
+  return {
+    path: repo,
+    name: null,
+    remote,
+    problem: `its origin ${remote} names the host "${host}", which ssh resolves to "${resolved}", not github.com`,
+  };
 }
