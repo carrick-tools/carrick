@@ -211,6 +211,10 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadError> {
         indexed_at: index.indexed_at.clone(),
         scanner_version: index.scanner_version.clone(),
         repos,
+        // Filled in by the caller: whether a scan is running is a question
+        // about this machine right now, and everything else here is a read of
+        // the index (carrick#992).
+        running_scans: Vec::new(),
         services,
     })
 }

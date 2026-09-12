@@ -23,6 +23,7 @@ pub(crate) mod index;
 mod join;
 pub(crate) mod query;
 mod read_model;
+pub(crate) mod scan_state;
 mod workspace;
 
 pub use join::LocalJoin;

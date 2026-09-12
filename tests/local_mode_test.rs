@@ -870,3 +870,191 @@ fn an_unknown_subcommand_is_not_read_as_a_repository_path() {
         String::from_utf8_lossy(&path.stderr)
     );
 }
+
+/// The scan outlives the command that started it, and the command comes back
+/// at once with the id to watch it by (carrick#992).
+///
+/// The shell an agent runs `carrick index --infer` through caps a command at
+/// two minutes by default and ten at most, and a first inferred scan of a
+/// mid-sized monorepo takes about fifteen. This is the free pass — the timing
+/// is what is under test, not the model — so what it proves is the shape:
+/// the parent returns, the child finishes the build on its own, its output is
+/// in the log, and the state file is gone once it is done.
+#[test]
+#[serial]
+fn a_detached_scan_outlives_the_command_that_started_it() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+
+    let started = Instant::now();
+    let stdout = run(root, &["index", "--workspace", ".", "--detach"]);
+    let returned_in = started.elapsed();
+
+    assert!(
+        stdout.contains("started in the background"),
+        "the command answers with the scan, not with the index:\n{stdout}"
+    );
+    let scan_id = stdout
+        .split_whitespace()
+        .nth(1)
+        .expect("the id is the second word")
+        .to_string();
+    assert_eq!(scan_id.len(), 8, "a short id to type: {stdout}");
+    assert!(
+        stdout.contains(&format!("scan-{scan_id}.log")),
+        "and names the log to tail:\n{stdout}"
+    );
+
+    let log = root.join(".carrick").join(format!("scan-{scan_id}.log"));
+    let state = root.join(".carrick").join(format!("scan-{scan_id}.json"));
+    assert!(
+        log.is_file(),
+        "the log exists before the scan does anything"
+    );
+
+    // The build itself takes tens of seconds; returning is immediate. The
+    // bound is generous because a debug binary on a loaded box is not a
+    // stopwatch — an order of magnitude is the claim, not a millisecond.
+    assert!(
+        returned_in < Duration::from_secs(10),
+        "the command returned in {returned_in:?}, which is not 'at once'"
+    );
+
+    // Wait on the index, not on the state file: the child writes that file a
+    // moment after it starts, so its absence right now means "not yet", not
+    // "done".
+    let index = root.join(".carrick").join("index.json");
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while Instant::now() < deadline && !index.is_file() {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // The file is removed after the index is written, so give the child the
+    // moment between the two.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && state.exists() {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        !state.exists(),
+        "a finished scan removes its state file; it is evidence of a process, not of a result"
+    );
+    assert!(
+        index.is_file(),
+        "the detached child built the index this process never waited for:\n{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+    let printed = std::fs::read_to_string(&log).expect("the log is readable");
+    assert!(
+        printed.contains("indexed 2 repo(s)"),
+        "the whole run is in the log, including the map:\n{printed}"
+    );
+    // And the index it wrote answers like any other.
+    let status = run(root, &["status", "--workspace", "."]);
+    assert!(status.contains("catalog-web"), "{status}");
+}
+
+/// A scan killed part-way is the case the flag exists for, so it is the one
+/// `carrick status` must name rather than going quiet (carrick#992).
+///
+/// The state file is written here rather than by killing a real scan: what is
+/// under test is the reading, and a test that races a subprocess to kill it at
+/// the right moment proves less, not more.
+#[test]
+#[serial]
+fn status_names_a_scan_that_stopped_without_finishing() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web"]);
+    let root = workspace.path();
+    index(root);
+
+    let state = serde_json::json!({
+        "scan_id": "5089ed60",
+        // Above every platform's pid_max, and positive: `kill` reads a
+        // negative argument as a process group rather than a process.
+        "pid": i32::MAX,
+        "started_at": "2026-09-12T10:00:00Z",
+        "updated_at": "2026-09-12T10:09:41Z",
+        "infer": true,
+        "workspace": root.to_string_lossy(),
+        "status": "running",
+        "phase": "indexing catalog-web",
+        "progress": {
+            "service": "catalog-web",
+            "service_index": 1,
+            "service_total": 2,
+            "phase": "files",
+            "done": 118,
+            "total": 240
+        }
+    });
+    std::fs::write(
+        root.join(".carrick").join("scan-5089ed60.json"),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .expect("write the scan state");
+
+    let rendered = run(root, &["status", "--workspace", "."]);
+    assert!(
+        rendered.contains("scan 5089ed60 stopped without finishing"),
+        "a scan whose process is gone is named:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("indexing catalog-web") && rendered.contains("118 of 240 files"),
+        "with where it got to:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("run the command again"),
+        "and what to do about it:\n{rendered}"
+    );
+
+    let body: serde_json::Value =
+        serde_json::from_str(&run(root, &["status", "--workspace", ".", "--json"]))
+            .expect("status --json was not JSON");
+    assert_eq!(
+        body["running_scans"][0]["scan_id"],
+        serde_json::json!("5089ed60"),
+        "and a reader parsing JSON gets it too:\n{body:#}"
+    );
+}
+
+/// A workspace with no index at all, and a scan building one: the answer is
+/// the scan, in whichever form the caller asked for. `--json` must stay
+/// parseable — a line of prose in front of the body is not an answer
+/// (carrick#992).
+#[test]
+#[serial]
+fn a_scan_is_reported_before_there_is_any_index_to_report() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web"]);
+    let root = workspace.path();
+    std::fs::create_dir_all(root.join(".carrick")).expect("the index directory");
+    std::fs::write(
+        root.join(".carrick").join("scan-5089ed60.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "scan_id": "5089ed60",
+            "pid": std::process::id(),
+            "started_at": "2026-09-12T10:00:00Z",
+            "updated_at": "2026-09-12T10:00:41Z",
+            "infer": true,
+            "workspace": root.to_string_lossy(),
+            "status": "running",
+            "phase": "indexing catalog-web",
+        }))
+        .unwrap(),
+    )
+    .expect("write the scan state");
+
+    let rendered = run(root, &["status", "--workspace", "."]);
+    assert!(
+        rendered.contains("scan 5089ed60 running"),
+        "the scan is the answer when there is no index yet:\n{rendered}"
+    );
+
+    let text = run(root, &["status", "--workspace", ".", "--json"]);
+    let body: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("status --json was not JSON: {e}\n{text}"));
+    assert_eq!(body["error"], serde_json::json!("not_indexed"));
+    assert_eq!(
+        body["running_scans"][0]["scan_id"],
+        serde_json::json!("5089ed60"),
+        "and the error body carries the scan:\n{body:#}"
+    );
+}

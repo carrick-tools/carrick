@@ -13,6 +13,7 @@ import {
   type CheckResult,
   type Counted,
   type Counterpart,
+  type RunningScan,
   type StatusRepo,
   type StatusResult,
   type StatusService,
@@ -322,6 +323,23 @@ export function serviceLine(service: StatusService): string {
 }
 
 /**
+ * One line for a scan happening right now, which is the only thing in a status
+ * answer that is not about the past (carrick#992). A session that starts while
+ * the first index is still being built should be told that, rather than told
+ * there is no index and left to start a second one.
+ */
+export function runningScanLine(scan: RunningScan): string {
+  const counts = scan.progress?.total
+    ? `, ${scan.progress.done ?? 0} of ${scan.progress.total} ${scan.progress.phase ?? "files"}`
+    : "";
+  const where = scan.phase ? `: ${scan.phase}` : "";
+  if (scan.status === "failed") {
+    return `- scan ${scan.scan_id} failed${scan.error ? `: ${scan.error}` : ""}`;
+  }
+  return `- scan ${scan.scan_id} is running${where}${counts}. Its output is in .carrick/scan-${scan.scan_id}.log`;
+}
+
+/**
  * One line per repo, for the files no service in it reads: a workflow, a
  * lockfile, an editor's settings. Empty when there are none, because a repo
  * whose every change is inside a service has nothing to add.
@@ -345,7 +363,16 @@ export function repoLine(repo: StatusRepo): string | null {
  * contract holds.
  */
 export function renderSessionStart(status: StatusResult): string {
+  const scans = (status.running_scans ?? []).map(runningScanLine);
   if (status.error === "not_indexed") {
+    // A first index being built right now is the answer, not "there is none":
+    // told the latter, an agent starts a second scan (carrick#992).
+    if (scans.length) {
+      return [
+        "Carrick has no index for this workspace yet, and a scan is building one.",
+        ...scans,
+      ].join("\n");
+    }
     return "Carrick has no index for this workspace, so nothing in this session is checked against the other services. `carrick index --workspace <dir>` builds one.";
   }
   if (status.error) {
@@ -360,6 +387,7 @@ export function renderSessionStart(status: StatusResult): string {
   const when = status.indexed_at ? ` at ${status.indexed_at}` : "";
   const lines: string[] = [
     `Carrick indexed ${status.services.length} service(s)${where}${when}${version}.`,
+    ...scans,
   ];
 
   for (const service of status.services) {
