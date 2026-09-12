@@ -13,10 +13,81 @@ use crate::packages::{MANIFEST_SKIP_DIRS, deno_workspace_manifest_paths, read_ma
 pub struct ServiceDerivation {
     pub reason: String,
     pub services: Vec<Config>,
+    /// One entry per service, in the same order, carrying what the member's
+    /// own manifest says about it (carrick#994).
+    pub members: Vec<MemberFacts>,
     /// The exact proposal init may create with exclusive-create semantics.
     pub config: serde_json::Value,
     pub warnings: Vec<String>,
 }
+
+/// The manifest facts that decide application from library.
+///
+/// Every workspace member is derived as a service here, and the whole
+/// application-versus-library decision then sat in the scaffold instructions,
+/// so the agent had to re-derive it by walking imports (carrick#994). These
+/// are the facts that decision is actually made on, read from what the member
+/// declares about itself and from what its siblings declare about it.
+///
+/// Every field is a statement, never a guess: `false` and `[]` mean the
+/// manifest declares nothing, not that nothing is there. Field names are
+/// snake_case, unlike the `carrick.json` keys they sit beside, because these
+/// are derived facts rather than configuration anyone writes.
+#[derive(Debug, Serialize, Clone, Default, PartialEq, Eq)]
+pub struct MemberFacts {
+    /// `private: true`: this package is not published.
+    pub private: bool,
+    /// A declared `bin`, which is an executable rather than an import target.
+    pub bin: bool,
+    /// A declared `main`.
+    pub main: bool,
+    /// A declared `exports`, the modern statement of an import surface.
+    pub exports: bool,
+    /// Deployment descriptors in the member's own directory, in a fixed order.
+    pub deploy_config: Vec<String>,
+    /// The other members that declare a dependency on this one, by the name
+    /// this proposal gives them.
+    pub workspace_dependents: Vec<String>,
+}
+
+impl ServiceDerivation {
+    /// The `services` array of `carrick.derive/0`: each service's
+    /// configuration and the facts about the member it came from, in one
+    /// object per service.
+    ///
+    /// Additive, so the schema tag does not move. The facts are deliberately
+    /// absent from `config`, which is the `carrick.json` skeleton someone
+    /// writes: `private` and `bin` are things a repository states about
+    /// itself, never configuration Carrick accepts.
+    pub fn service_documents(&self) -> Vec<serde_json::Value> {
+        #[derive(Serialize)]
+        struct ServiceDocument<'a> {
+            #[serde(flatten)]
+            config: &'a Config,
+            #[serde(flatten)]
+            facts: &'a MemberFacts,
+        }
+        self.services
+            .iter()
+            .zip(self.members.iter())
+            .map(|(config, facts)| {
+                serde_json::to_value(ServiceDocument { config, facts })
+                    .expect("a service and its facts both serialize as JSON objects")
+            })
+            .collect()
+    }
+}
+
+/// Deployment descriptors, read only in the member's own directory: one of
+/// these beside a package is the strongest statement in a repository that it
+/// is deployed rather than imported.
+const DEPLOY_CONFIG: [&str; 5] = [
+    "netlify.toml",
+    "vercel.json",
+    "serverless.yml",
+    "wrangler.toml",
+    "Dockerfile",
+];
 
 #[derive(Deserialize)]
 struct PnpmWorkspace {
@@ -70,9 +141,11 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
                 }
             })?;
             validate(root, &services)?;
+            let members = member_facts(root, &services);
             return Ok(ServiceDerivation {
                 reason: "carrick.json".into(),
                 config: serde_json::Value::Null,
+                members,
                 services,
                 warnings: Vec::new(),
             });
@@ -248,16 +321,135 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
     if has_deno {
         warnings.push("Deno services use their existing manifests and require Deno on PATH for type resolution.".into());
     }
+    let members = member_facts(&root, &services);
     Ok(ServiceDerivation {
         reason: if reasons.is_empty() {
             "single repository".into()
         } else {
             reasons.join(" + ")
         },
+        members,
         services,
         config,
         warnings,
     })
+}
+
+/// The manifest a service's own directory holds, npm's before Deno's.
+fn member_manifest(root: &Path, service: &Config) -> Option<PathBuf> {
+    let directory = root.join(service.directory.as_deref().unwrap_or("."));
+    let package = directory.join("package.json");
+    if package.is_file() {
+        return Some(package);
+    }
+    crate::deno_support::manifest_at(&directory)
+}
+
+/// What this proposal calls a service, so a dependent names it the same way.
+fn label(service: &Config) -> String {
+    service
+        .service_name
+        .clone()
+        .or_else(|| service.directory.clone())
+        .unwrap_or_else(|| ".".to_string())
+}
+
+/// What every member declares about itself, and what its siblings declare
+/// about it (carrick#994).
+///
+/// Manifests only. `derive` runs inside `carrick init`, before anything has
+/// been scanned, so a dependency edge here is one a package manager already
+/// records: a dependency entry naming another member's package, or a Deno
+/// import-map target resolving inside another member's directory. Walking
+/// imports would answer more and would make a first run pay for a parse it
+/// has nowhere to put.
+///
+/// Returns one entry per service, in the same order.
+pub fn member_facts(root: &Path, services: &[Config]) -> Vec<MemberFacts> {
+    let manifests: Vec<Option<crate::packages::ManifestFacts>> = services
+        .iter()
+        .map(|service| member_manifest(root, service).and_then(|path| read_manifest(&path).ok()))
+        .collect();
+    let directories: Vec<PathBuf> = services
+        .iter()
+        .map(|service| {
+            crate::workspace_resolver::normalize(
+                &root.join(service.directory.as_deref().unwrap_or(".")),
+            )
+        })
+        .collect();
+    let mut by_package: BTreeMap<&str, usize> = BTreeMap::new();
+    for (index, manifest) in manifests.iter().enumerate() {
+        if let Some(name) = manifest
+            .as_ref()
+            .and_then(|facts| facts.package.name.as_deref())
+        {
+            by_package.entry(name).or_insert(index);
+        }
+    }
+
+    let mut facts: Vec<MemberFacts> = services
+        .iter()
+        .enumerate()
+        .map(|(index, service)| {
+            let manifest = manifests[index].as_ref();
+            let directory = root.join(service.directory.as_deref().unwrap_or("."));
+            MemberFacts {
+                private: manifest.is_some_and(|facts| facts.private),
+                bin: manifest.is_some_and(|facts| facts.bin),
+                main: manifest.is_some_and(|facts| facts.main.is_some()),
+                exports: manifest.is_some_and(|facts| facts.exports.is_some()),
+                deploy_config: DEPLOY_CONFIG
+                    .iter()
+                    .filter(|name| directory.join(name).is_file())
+                    .map(|name| (*name).to_string())
+                    .collect(),
+                workspace_dependents: Vec::new(),
+            }
+        })
+        .collect();
+
+    for (index, manifest) in manifests.iter().enumerate() {
+        let Some(manifest) = manifest else { continue };
+        let mut depends_on: BTreeSet<usize> = BTreeSet::new();
+        let package = &manifest.package;
+        for name in package
+            .dependencies
+            .keys()
+            .chain(package.dev_dependencies.keys())
+            .chain(package.peer_dependencies.keys())
+            .chain(package.optional_dependencies.keys())
+        {
+            if let Some(&other) = by_package.get(name.as_str()) {
+                depends_on.insert(other);
+            }
+        }
+        for target in &manifest.local_imports {
+            let resolved =
+                crate::workspace_resolver::normalize(&directories[index].join(target.as_str()));
+            // The deepest member the target sits in, so a package inside
+            // another package's directory takes its own import.
+            if let Some((other, _)) = directories
+                .iter()
+                .enumerate()
+                .filter(|(_, directory)| resolved.starts_with(directory))
+                .max_by_key(|(_, directory)| directory.as_os_str().len())
+            {
+                depends_on.insert(other);
+            }
+        }
+        depends_on.remove(&index);
+        for other in depends_on {
+            facts[other]
+                .workspace_dependents
+                .push(label(&services[index]));
+        }
+    }
+    for entry in &mut facts {
+        entry.workspace_dependents.sort();
+        entry.workspace_dependents.dedup();
+    }
+    facts
 }
 
 fn nearest_tsconfig(root: &Path, directory: &Path) -> Option<String> {
