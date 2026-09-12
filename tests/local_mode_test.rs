@@ -714,3 +714,159 @@ fn without_git_the_mtime_is_the_only_signal() {
         "and the count is the same signal, never a contradicting one:\n{after:#}"
     );
 }
+
+/// A file no service's scan reads belongs to the repo, once — not to every
+/// service in the monorepo (carrick#997 item 4).
+///
+/// The monorepo fixture is the shape that shows it: two services with their
+/// own directories, and repo-level files (`carrick.json`, a workflow, an
+/// editor's settings) that neither of them reads.
+#[test]
+#[serial]
+fn status_attributes_a_repo_level_file_to_the_repo_and_not_to_every_service() {
+    let workspace = workspace("xrepo-corpus-1", &["orders-monorepo"]);
+    let root = workspace.path();
+    index(root);
+
+    let repo = root.join("orders-monorepo");
+    std::fs::write(repo.join("renovate.json"), "{}\n").expect("a repo-level file");
+    std::fs::create_dir_all(repo.join(".github/workflows")).expect("the workflow directory");
+    std::fs::write(repo.join(".github/workflows/carrick.yml"), "on: push\n").expect("a workflow");
+    std::fs::write(
+        repo.join("packages/gateway/notes.txt"),
+        "inside one service\n",
+    )
+    .expect("a file inside a service");
+
+    let body: serde_json::Value =
+        serde_json::from_str(&run(root, &["status", "--workspace", ".", "--json"]))
+            .expect("status --json was not JSON");
+    let service = |name: &str| -> serde_json::Value {
+        body["services"]
+            .as_array()
+            .expect("services")
+            .iter()
+            .find(|service| service["service"] == serde_json::json!(name))
+            .unwrap_or_else(|| panic!("no service named {name} in {body:#}"))
+            .clone()
+    };
+
+    let gateway = service("gateway");
+    assert_eq!(
+        gateway["changed_since_index"],
+        serde_json::json!(1),
+        "only the file inside this service:\n{gateway:#}"
+    );
+    assert_eq!(
+        gateway["stale_files"][0],
+        serde_json::json!("packages/gateway/notes.txt"),
+        "{gateway:#}"
+    );
+    let sibling = service("orders-pkg");
+    assert_eq!(
+        sibling["changed_since_index"],
+        serde_json::json!(0),
+        "a sibling service reads none of those three files:\n{sibling:#}"
+    );
+
+    let repos = body["repos"].as_array().expect("repos");
+    assert_eq!(repos.len(), 1, "{body:#}");
+    assert_eq!(
+        repos[0]["outside_every_service"],
+        serde_json::json!(2),
+        "the two repo-level files, stated once:\n{:#}",
+        repos[0]
+    );
+    assert_eq!(repos[0]["changed_since_index"], serde_json::json!(3));
+    let outside: Vec<&str> = repos[0]["stale_files"]
+        .as_array()
+        .expect("stale_files")
+        .iter()
+        .map(|file| file.as_str().expect("a path"))
+        .collect();
+    assert_eq!(
+        outside,
+        vec![".github/workflows/carrick.yml", "renovate.json"]
+    );
+
+    let rendered = run(root, &["status", "--workspace", "."]);
+    assert!(
+        rendered.contains("orders-monorepo: 2 file(s) changed outside every service"),
+        "and the human form says it under the repo:\n{rendered}"
+    );
+}
+
+/// A free pass states what is waiting for the paid one, so `0 route(s) 0
+/// call(s)` is not the same table cell as a service with no API in it
+/// (carrick#997 item 8).
+#[test]
+#[serial]
+fn the_free_pass_counts_what_is_waiting_for_the_paid_one() {
+    let workspace = workspace("xrepo-corpus-2", &["notifications-svc"]);
+    let root = workspace.path();
+
+    let map = index(root);
+    let waiting = map
+        .lines()
+        .find(|line| line.contains("candidate(s) waiting for --infer"))
+        .unwrap_or_else(|| panic!("no service line states what is waiting:\n{map}"));
+    assert!(
+        waiting.contains("route(s)") && waiting.contains("call(s)"),
+        "it is on the service's own table line:\n{map}"
+    );
+
+    let status = run(root, &["status", "--workspace", "."]);
+    assert!(
+        status.contains("candidate(s) waiting for --infer"),
+        "and the session answer says it too:\n{status}"
+    );
+}
+
+/// A mistyped command is answered as a command. It used to reach the scan and
+/// come back as a missing repository path, which reads as a broken checkout
+/// (carrick#997 item 6).
+#[test]
+#[serial]
+fn an_unknown_subcommand_is_not_read_as_a_repository_path() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let output = Command::new(carrick())
+        .arg("whoami")
+        .current_dir(dir.path())
+        .output()
+        .expect("carrick whoami");
+    assert_eq!(output.status.code(), Some(2), "a usage error, not a scan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not a carrick command"), "{stderr}");
+    assert!(
+        stderr.contains("status"),
+        "and names the commands:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("does not exist or is not a directory"),
+        "never as a path:\n{stderr}"
+    );
+
+    // The package's own commands are named, not denied.
+    let init = Command::new(carrick())
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("carrick init");
+    assert!(
+        String::from_utf8_lossy(&init.stderr).contains("npm i -g carrick"),
+        "{:?}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    // And a path that does not exist is still a path.
+    let path = Command::new(carrick())
+        .arg("./no-such-repo")
+        .current_dir(dir.path())
+        .output()
+        .expect("carrick ./no-such-repo");
+    assert!(
+        String::from_utf8_lossy(&path.stderr).contains("does not exist or is not a directory"),
+        "{:?}",
+        String::from_utf8_lossy(&path.stderr)
+    );
+}

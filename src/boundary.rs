@@ -93,6 +93,24 @@ pub struct ServiceBoundary {
     /// producer/consumer role, so the scanner counts the gap rather than
     /// guessing at it (the 2026-09-05 ruling).
     pub unemitted_literal_candidates: usize,
+    /// Where those sites are, `file:line`, up to [`MAX_REASONS`] of them. The
+    /// count above stays a count and keeps its type — the cloud's MCP server
+    /// reads it as a number — and this says which sites it counted, so the
+    /// line reconciles against the file instead of hanging in the air
+    /// (carrick#997 item 7).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unemitted_literal_sites: Vec<String>,
+    /// Candidates in files no model was asked about, with no deterministic row
+    /// at their span: what a paid scan would classify and this one did not.
+    /// Zero on any scan that ran the model. `None` on a blob from a scanner
+    /// that did not count it — absent is not the same as counting none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates_awaiting_model: Option<usize>,
+    /// Why this service's types are degraded, in the sentence the scan
+    /// recorded. Carried here so the boundary renderer prints it: it was on
+    /// every blob and on no screen (carrick#997 item 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_extraction_status: Option<String>,
     /// Call sites that named a client member and did not resolve to it
     /// (carrick#656), so a consumer listing for those operations is incomplete.
     pub consumers_not_resolved: Counted,
@@ -157,12 +175,21 @@ impl ServiceBoundary {
             .iter()
             .map(|reason| reason.replace(&prefix, ""))
             .collect();
+        let mut sites: Vec<String> = stats
+            .unemitted_literal_sites
+            .iter()
+            .map(|site| site.replace(&prefix, ""))
+            .collect();
+        sites.truncate(MAX_REASONS);
         Self {
             candidates_withheld_changed_files: None,
             commit_hash: data.commit_hash.clone(),
             files_attempted: stats.files_model_dispatched,
             files_lost: Counted::new(stats.files_analysis_failed, lost),
             unemitted_literal_candidates: stats.unemitted_literal_candidates,
+            unemitted_literal_sites: sites,
+            candidates_awaiting_model: Some(stats.candidates_awaiting_model),
+            type_extraction_status: data.type_extraction_status.clone(),
             consumers_not_resolved: unfollowed_members(data),
             // Known only after the cross-repo SDK join; see `fold_sdk_unresolved`.
             sdk_unresolved: Counted::default(),
@@ -233,8 +260,12 @@ impl ServiceBoundary {
         );
         if self.unemitted_literal_candidates > 0 {
             out.push(format!(
-                "  {} bare route-literal call site(s) left unclassified",
-                self.unemitted_literal_candidates
+                "  {} bare route-literal call site(s) left unclassified{}",
+                self.unemitted_literal_candidates,
+                first_site(
+                    &self.unemitted_literal_sites,
+                    self.unemitted_literal_candidates
+                )
             ));
         }
         if self.model_only_rows > 0 {
@@ -250,11 +281,18 @@ impl ServiceBoundary {
                 "  {discarded} model endpoint(s) dropped in modules a routing convention claims"
             ));
         }
+        // One reason, once. `types_degraded` names the stage and the error;
+        // `type_extraction_status` is the sentence a scan wrote about the same
+        // event, and on the one path that sets only the second (the extraction
+        // config, which is the model's and absent whenever no model ran) it is
+        // the only record there is (carrick#997 item 3).
         if let Some(degraded) = &self.types_degraded {
             out.push(format!(
                 "  types degraded at {}: {}",
                 degraded.stage, degraded.detail
             ));
+        } else if let Some(status) = &self.type_extraction_status {
+            out.push(format!("  warning: {status}"));
         }
         if self.bare_checkout {
             out.push(
@@ -263,6 +301,32 @@ impl ServiceBoundary {
             );
         }
         out
+    }
+}
+
+impl ServiceBoundary {
+    /// What a scan left for a model to classify, as a table cell — empty when
+    /// there is nothing waiting, or when this blob predates the count.
+    ///
+    /// The free pass reads `0 route(s) 0 call(s)` both when a service holds no
+    /// API at all and when every candidate in it is waiting for the paid scan.
+    /// This is the number that tells those two apart (carrick#997 item 8), and
+    /// the summary tables print it beside the route and call counts.
+    pub fn awaiting_model(&self) -> Option<String> {
+        match self.candidates_awaiting_model {
+            Some(count) if count > 0 => Some(format!("{count} candidate(s) waiting for --infer")),
+            _ => None,
+        }
+    }
+}
+
+/// ` (e.g. src/a.ts:4)` — one of the sites a count counted, so the number can
+/// be reconciled against the file. Empty when the scan recorded none.
+fn first_site(sites: &[String], total: usize) -> String {
+    match sites.first() {
+        None => String::new(),
+        Some(first) if total > 1 => format!(" (e.g. {first})"),
+        Some(first) => format!(" ({first})"),
     }
 }
 
@@ -460,5 +524,84 @@ mod tests {
             "a count names one of the things it counts: {stated:?}"
         );
         assert!(stated.iter().any(|line| line.contains("bare checkout")));
+    }
+
+    /// A count of something nobody can point at is a number to argue with. The
+    /// line names one of the sites it counted (carrick#997 item 7).
+    #[test]
+    fn the_unclassified_line_names_a_site() {
+        let boundary = ServiceBoundary {
+            commit_hash: "0123456".to_string(),
+            unemitted_literal_candidates: 2,
+            unemitted_literal_sites: vec![
+                "apps/gateway/main.ts:11".to_string(),
+                "apps/gateway/main.ts:40".to_string(),
+            ],
+            ..Default::default()
+        };
+        let lines = boundary.lines("gateway");
+        assert!(
+            lines.iter().any(|line| line
+                .contains("2 bare route-literal call site(s) left unclassified")
+                && line.contains("e.g. apps/gateway/main.ts:11")),
+            "{lines:?}"
+        );
+    }
+
+    /// The reason a service's types are thin is printed, once. A scan that
+    /// recorded a stage keeps the line that names the stage; a scan that
+    /// recorded only the sentence prints the sentence (carrick#997 item 3).
+    #[test]
+    fn a_degraded_type_pass_states_its_reason_once() {
+        let mut boundary = ServiceBoundary {
+            commit_hash: "0123456".to_string(),
+            type_extraction_status: Some("machinery unwrapping disabled this run".to_string()),
+            ..Default::default()
+        };
+        let lines = boundary.lines("gateway");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("machinery unwrapping"))
+                .count(),
+            1,
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("warning:")),
+            "{lines:?}"
+        );
+
+        boundary.types_degraded = Some(TypeDegradation {
+            stage: "spawn".to_string(),
+            detail: "sidecar unavailable".to_string(),
+        });
+        let lines = boundary.lines("gateway");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("types degraded at spawn")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("warning:")),
+            "one event, one line: {lines:?}"
+        );
+    }
+
+    /// `0 route(s) 0 call(s)` reads the same for a service with no API and for
+    /// one whose every candidate is waiting for the paid scan. A blob that
+    /// predates the count says nothing rather than zero (carrick#997 item 8).
+    #[test]
+    fn what_is_waiting_for_the_model_is_a_sentence_or_nothing() {
+        let mut boundary = ServiceBoundary::default();
+        assert_eq!(boundary.awaiting_model(), None, "never counted");
+        boundary.candidates_awaiting_model = Some(0);
+        assert_eq!(boundary.awaiting_model(), None, "counted none");
+        boundary.candidates_awaiting_model = Some(8);
+        assert_eq!(
+            boundary.awaiting_model().as_deref(),
+            Some("8 candidate(s) waiting for --infer")
+        );
     }
 }

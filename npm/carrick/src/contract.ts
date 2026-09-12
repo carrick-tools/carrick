@@ -21,6 +21,12 @@ export type Boundary = {
   files_attempted?: number;
   files_lost?: Counted;
   unemitted_literal_candidates?: number;
+  /** `file:line` for up to 200 of those sites, so the count can be checked. */
+  unemitted_literal_sites?: string[];
+  /** Candidates no model has been asked about: what `--infer` would classify. */
+  candidates_awaiting_model?: number;
+  /** Why this service's types are thin, when the scan recorded a reason. */
+  type_extraction_status?: string;
   consumers_not_resolved?: Counted;
   sdk_unresolved?: Counted;
   unknown_call_paths?: Counted;
@@ -124,6 +130,10 @@ export type StatusService = {
   indexed_at?: string;
   routes: number;
   calls: number;
+  /**
+   * Files THIS SERVICE reads that changed: its directory and its `include`
+   * roots. What belongs to no service is on the repo's own entry.
+   */
   changed_since_index: number;
   /** Up to 50, repo-relative and sorted. */
   stale_files?: string[];
@@ -148,6 +158,22 @@ export type StatusService = {
     | "read_failed";
 };
 
+/**
+ * One repo of the workspace, for what moved in it that belongs to no service:
+ * a workflow file, a lockfile, an editor's settings. Stated once here rather
+ * than under every service that never reads it (carrick#997 item 4).
+ */
+export type StatusRepo = {
+  repo: string;
+  name: string;
+  /** The whole repo, services included. */
+  changed_since_index: number;
+  outside_every_service: number;
+  /** Up to 50 of the ones outside every service, repo-relative. */
+  stale_files?: string[];
+  stale_files_truncated?: boolean;
+};
+
 /** `carrick status --json`: the workspace, with no file in the question. */
 export type StatusResult = {
   schema: string;
@@ -157,6 +183,8 @@ export type StatusResult = {
   scanner_version?: string;
   /** RFC 3339, when this index last read the hosted side. */
   hosted_checked_at?: string;
+  /** Absent on an answer written before this field existed. */
+  repos?: StatusRepo[];
   services: StatusService[];
 };
 
@@ -242,6 +270,13 @@ export function parseStatusResult(stdout: string): StatusResult | null {
     if (typeof entry["service"] !== "string" || typeof entry["repo"] !== "string") continue;
     if (typeof entry["index_commit"] !== "string") continue;
     result.services.push(entry as unknown as StatusService);
+  }
+  const repos = Array.isArray(parsed["repos"]) ? parsed["repos"] : [];
+  for (const entry of repos) {
+    if (!isRecord(entry)) continue;
+    if (typeof entry["repo"] !== "string" || typeof entry["name"] !== "string") continue;
+    if (typeof entry["outside_every_service"] !== "number") continue;
+    (result.repos ??= []).push(entry as unknown as StatusRepo);
   }
   return result;
 }

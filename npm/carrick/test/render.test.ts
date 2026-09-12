@@ -244,21 +244,51 @@ test("at most five stale files are named, and the rest are counted", () => {
   assert.match(truncated, /, \+115 more\)$/, "the count comes from stale_files_total, not the list");
 });
 
-test("services sharing a repo say the changed count once", () => {
+test("every service states the count of what its own scan reads", () => {
+  // Services of one repo no longer share a changed-file count: each is told
+  // about the files it reads, and the repo carries the rest (carrick#997).
   const lines = renderSessionStart(statusFixture("status-workspace.json")).split("\n");
-  assert.match(lines[2] ?? "", /^- user-admin at 6a1b2c3: 12 route\(s\), 3 call\(s\)\. Same repo as user-service, so the same 7 changed file\(s\)$/);
+  assert.match(lines[2] ?? "", /^- user-admin at 6a1b2c3: 12 route\(s\), 3 call\(s\), changed since index: /);
   assert.equal(
-    (lines[2] ?? "").includes("changed since index:"),
+    (lines[2] ?? "").includes("Same repo as"),
     false,
-    "the second service of a repo does not restate the count",
+    "no service points at another service's count",
   );
 });
 
-test("a service line names its own repo's count when the repo is new", () => {
+test("a service line names its own count, and what is waiting for a paid scan", () => {
   const [service] = statusFixture("status-workspace.json").services;
   assert.ok(service);
-  assert.match(serviceLine(service, null), /changed since index: 7/);
-  assert.match(serviceLine(service, "another"), /Same repo as another, so the same 7 changed file\(s\)$/);
+  assert.match(serviceLine(service), /changed since index: 7/);
+  assert.equal(
+    serviceLine(service).includes("waiting for --infer"),
+    false,
+    "a service with nothing waiting says nothing",
+  );
+  assert.match(
+    serviceLine({ ...service, boundary: { ...service.boundary, candidates_awaiting_model: 8 } }),
+    /8 candidate\(s\) waiting for --infer$/,
+  );
+});
+
+test("files outside every service are the repo's line, not each service's", () => {
+  const status = statusFixture("status-workspace.json");
+  const rendered = renderSessionStart({
+    ...status,
+    repos: [
+      {
+        repo: "/repos/monorepo",
+        name: "monorepo",
+        changed_since_index: 9,
+        outside_every_service: 2,
+        stale_files: ["carrick.json", ".github/workflows/carrick.yml"],
+      },
+    ],
+  });
+  assert.match(
+    rendered,
+    /- monorepo: 2 file\(s\) changed outside every service \(carrick\.json, \.github\/workflows\/carrick\.yml\)/,
+  );
 });
 
 test("no index gives one line and the command that builds one", () => {

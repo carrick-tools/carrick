@@ -307,6 +307,8 @@ fn test_processing_stats_tracking() {
         model_endpoints_discarded_in_claimed_modules: 0,
         model_only_rows: 0,
         unemitted_literal_candidates: 0,
+        unemitted_literal_sites: Vec::new(),
+        candidates_awaiting_model: 0,
         receiver_classified_endpoints: 0,
         receiver_classified_calls: 0,
         receiver_unresolved: 0,

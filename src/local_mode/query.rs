@@ -12,7 +12,7 @@ use std::process::Command;
 
 use super::contract::{
     CheckOutput, Counterpart, Item, MAX_STALE_FILES, ReadError, SCHEMA, STATUS_SCHEMA,
-    StatusOutput, StatusService, Verdict,
+    StatusOutput, StatusRepo, StatusService, Verdict,
 };
 use super::read_model::{IndexedItem, IndexedRepo, LocalIndex};
 
@@ -129,8 +129,12 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadError> {
 
     // Git is asked once per REPO, not once per service: a monorepo's services
     // share a tree, and asking again per service is the difference between two
-    // git calls and thirty.
+    // git calls and thirty. What each service is told about, though, is only
+    // the part of that answer its own scan reads: a repo-level file
+    // (`carrick.json`, a workflow, an editor's settings) belongs to no service
+    // and used to be counted under every one of them (carrick#997 item 4).
     let mut services = Vec::new();
+    let mut repos = Vec::new();
     for repo in &index.repos {
         let repo_root = PathBuf::from(&repo.path);
         let commit = repo
@@ -146,12 +150,17 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadError> {
             .into_iter()
             .collect();
         changed.sort();
-        let total = changed.len();
-        let truncated = total > MAX_STALE_FILES;
-        changed.truncate(MAX_STALE_FILES);
 
         for service in &repo.services {
             let note = enrichment_note(&service.enrichment, service.boundary.as_ref());
+            let mut owned: Vec<String> = changed
+                .iter()
+                .filter(|file| service.covers(file))
+                .cloned()
+                .collect();
+            let total = owned.len();
+            let truncated = total > MAX_STALE_FILES;
+            owned.truncate(MAX_STALE_FILES);
             services.push(StatusService {
                 hosted: service.enrichment.hosted.clone(),
                 hosted_state: service.enrichment.hosted_state.clone(),
@@ -162,7 +171,7 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadError> {
                 routes: service.routes,
                 calls: service.calls,
                 changed_since_index: total,
-                stale_files: changed.clone(),
+                stale_files: owned,
                 stale_files_total: total,
                 stale_files_truncated: truncated,
                 boundary_lines: boundary_lines(&service.name, &note, service.boundary.as_ref()),
@@ -170,6 +179,26 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadError> {
                 boundary: service.boundary.clone(),
             });
         }
+
+        // Stated once, under the repo, and only when there is something to
+        // state: these are the files no service's scan reads, so no service
+        // should be reporting them.
+        let mut outside: Vec<String> = changed
+            .iter()
+            .filter(|file| !repo.services.iter().any(|service| service.covers(file)))
+            .cloned()
+            .collect();
+        let outside_total = outside.len();
+        let outside_truncated = outside_total > MAX_STALE_FILES;
+        outside.truncate(MAX_STALE_FILES);
+        repos.push(StatusRepo {
+            repo: repo.path.clone(),
+            name: repo.name.clone(),
+            changed_since_index: changed.len(),
+            outside_every_service: outside_total,
+            stale_files: outside,
+            stale_files_truncated: outside_truncated,
+        });
     }
 
     Ok(StatusOutput {
@@ -181,6 +210,7 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadError> {
         workspace: workspace_root.to_string_lossy().into_owned(),
         indexed_at: index.indexed_at.clone(),
         scanner_version: index.scanner_version.clone(),
+        repos,
         services,
     })
 }
@@ -480,8 +510,13 @@ pub fn enrichment_note(
             "hosted index at {}, which this clone does not have; candidates not replayed. Run git fetch.",
             hosted.commit.chars().take(7).collect::<String>()
         ),
+        // The writer named here is the one the ruled first run uses
+        // (carrick-cloud#799): the user's own `carrick index --infer`, not a CI
+        // run that may be days away or may never be wired up. A CI run on main
+        // writes the same index, and says so when it does; what this sentence
+        // owes the reader is the next move available to them (carrick#997).
         (HostedState::NoIndexYet, _) => format!(
-            "{}; {remote} is connected and has no hosted index yet. The first CI run on main writes it, and the next carrick index reads it.",
+            "{}; {remote} is connected and has no hosted index yet. Run `carrick index --infer` once to classify them.",
             super::NOT_CLASSIFIED_LOCALLY
         ),
         (HostedState::NotConnected, _) => format!(

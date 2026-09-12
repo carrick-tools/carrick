@@ -213,6 +213,15 @@ pub struct ProcessingStats {
     /// so emitting it would need a classification rule the scanner does not
     /// have; this counts the gap rather than guessing at it.
     pub unemitted_literal_candidates: usize,
+    /// Where those sites are, `file:line`, in the order they were counted. A
+    /// count of something nobody can point at is a number to argue with, not a
+    /// fact to act on (carrick#997 item 7).
+    pub unemitted_literal_sites: Vec<String>,
+    /// Candidates in files the model was never asked about — local mode, where
+    /// no model runs — that no deterministic row covers. What the paid scan
+    /// would classify, counted so a free pass is distinguishable from an empty
+    /// one (carrick#997 item 8).
+    pub candidates_awaiting_model: usize,
     /// Bare literal candidates the receiver's type classified (carrick#695),
     /// split by the role it stated. Both are subsets of what
     /// `unemitted_literal_candidates` would have counted before the arm
@@ -2388,8 +2397,19 @@ impl FileOrchestrator {
                     Self::count_unemitted_literal_candidates(
                         &deterministic,
                         &pf.candidate_map,
+                        &pf.path_str,
                         &mut stats,
                     );
+                    // Only the not-asked arm: a file the analyzer answered for
+                    // and a file whose call failed have both been asked, and
+                    // nothing about them is waiting for a later scan.
+                    if matches!(unanswered, ModelAnswer::NotAsked) {
+                        Self::count_candidates_awaiting_model(
+                            &deterministic,
+                            &pf.candidate_map,
+                            &mut stats,
+                        );
+                    }
 
                     stats.total_mounts += deterministic.mounts.len();
                     stats.total_endpoints += deterministic.endpoints.len();
@@ -6005,7 +6025,7 @@ impl FileOrchestrator {
             );
         }
 
-        Self::count_unemitted_literal_candidates(result, candidate_map, stats);
+        Self::count_unemitted_literal_candidates(result, candidate_map, file_path, stats);
     }
 
     /// What the deterministic layer read a route literal and a verb off, and
@@ -6022,23 +6042,71 @@ impl FileOrchestrator {
     fn count_unemitted_literal_candidates(
         result: &FileAnalysisResult,
         candidate_map: &HashMap<String, CandidateTarget>,
+        file_path: &str,
         stats: &mut ProcessingStats,
     ) {
-        stats.unemitted_literal_candidates += candidate_map
+        let mut counted: Vec<&CandidateTarget> = candidate_map
             .values()
             .filter(|candidate| candidate.protocol == Protocol::Http)
             .filter(|candidate| {
                 matches!(candidate.request_shape, RequestShapeSignal::Known(_))
-                    && Self::route_literal_from_snippet(candidate.path_snippet.as_deref()).is_some()
-                    && !result.endpoints.iter().any(|endpoint| {
-                        endpoint.call_expression_span_start == Some(candidate.span_start)
-                    })
-                    && !result
-                        .data_calls
-                        .iter()
-                        .any(|call| call.call_expression_span_start == Some(candidate.span_start))
+                    && Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
+                        .is_some_and(|literal| Self::is_route_shaped(&literal))
+                    && !Self::row_at_span(result, candidate.span_start)
             })
+            .collect();
+        // `candidate_map` is a HashMap, so the sites are ordered here rather
+        // than left to whatever the iteration gave: the first one is what the
+        // printed line names, and it must be the same one on every run.
+        counted.sort_by_key(|candidate| candidate.span_start);
+        stats.unemitted_literal_candidates += counted.len();
+        stats.unemitted_literal_sites.extend(
+            counted
+                .iter()
+                .map(|candidate| format!("{file_path}:{}", candidate.line_number)),
+        );
+    }
+
+    /// Candidates in a file the model was never asked about that no row
+    /// covers. The model would have been asked about every candidate in the
+    /// map; a candidate the deterministic layer already stated a row for is
+    /// not waiting for anybody (carrick#997 item 8).
+    fn count_candidates_awaiting_model(
+        result: &FileAnalysisResult,
+        candidate_map: &HashMap<String, CandidateTarget>,
+        stats: &mut ProcessingStats,
+    ) {
+        stats.candidates_awaiting_model += candidate_map
+            .values()
+            .filter(|candidate| !Self::row_at_span(result, candidate.span_start))
             .count();
+    }
+
+    /// Whether a literal read off a candidate's first argument is a ROUTE
+    /// literal: a path, not a word.
+    ///
+    /// `route_literal_from_snippet` answers "is this an unambiguous string
+    /// literal", which is the right question where a literal OVERRIDES a path
+    /// the model stated — the caller there already knows the argument is a
+    /// path. The count of sites neither layer classified asked it a different
+    /// question and got `Deno.env.get("LEDGER_URL")` counted as an
+    /// unclassified route site, so the printed number named a file that holds
+    /// no such call (carrick#997 item 7). A route is written as a path; an
+    /// absolute URL states a consumer outright and is not this shape either.
+    fn is_route_shaped(literal: &str) -> bool {
+        literal.starts_with('/')
+    }
+
+    /// Whether this file's rows hold anything at a candidate's call span.
+    fn row_at_span(result: &FileAnalysisResult, span_start: u32) -> bool {
+        result
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.call_expression_span_start == Some(span_start))
+            || result
+                .data_calls
+                .iter()
+                .any(|call| call.call_expression_span_start == Some(span_start))
     }
 
     /// Fold one model row into the deterministic row at its span.
@@ -13297,6 +13365,37 @@ export { routes };
         assert_eq!(result.endpoints.len(), 0);
         assert_eq!(result.data_calls.len(), 0);
         assert_eq!(stats.unemitted_literal_candidates, 1);
+        assert_eq!(
+            stats.unemitted_literal_sites,
+            vec!["src/thing.ts:12".to_string()],
+            "and the count says which site it counted"
+        );
+    }
+
+    /// A quoted word is not a route. `Deno.env.get("LEDGER_URL")` raised an
+    /// HTTP candidate with a readable shape and a string first argument, and
+    /// was counted as an unclassified route site — a number on the screen that
+    /// the file it pointed at does not contain (carrick#997 item 7).
+    #[test]
+    fn a_quoted_word_that_is_not_a_path_is_not_an_unclassified_route_site() {
+        let candidates = bare_literal_map("Deno.env", "LEDGER_URL");
+        let (result, stats) = emit_and_join_with_receivers(
+            FileAnalysisResult::default(),
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/config.ts",
+            false,
+            &HashMap::new(),
+        );
+
+        assert_eq!(result.endpoints.len(), 0);
+        assert_eq!(result.data_calls.len(), 0);
+        assert_eq!(stats.unemitted_literal_candidates, 0);
+        assert!(stats.unemitted_literal_sites.is_empty());
     }
 
     #[test]

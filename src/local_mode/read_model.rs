@@ -21,7 +21,7 @@ use crate::boundary::ServiceBoundary;
 /// Bumped whenever this file's shape changes. A mismatch makes every read-only
 /// command answer `index_unreadable`, which tells the user to re-index instead
 /// of showing them rows in a shape the reader half-understands.
-pub const READ_MODEL_VERSION: u32 = 3;
+pub const READ_MODEL_VERSION: u32 = 4;
 
 /// A route the service serves, or a call it makes.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,12 +134,41 @@ pub struct IndexedService {
     /// with whichever service sorted first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory: Option<String>,
+    /// The extra source roots this service pulls in, as `carrick.json`
+    /// declares them (`packages/shared`). A file under one of them is scanned
+    /// as part of this service — and may be part of a sibling service too, so
+    /// this is a coverage question, never a partition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
     pub commit: String,
     /// RFC 3339, when this service was last indexed or refreshed.
     pub indexed_at: String,
     pub boundary: Option<ServiceBoundary>,
     pub routes: usize,
     pub calls: usize,
+}
+
+impl IndexedService {
+    /// Whether this service's scan reaches a repo-relative path: its own
+    /// directory, or one of its `include` roots. A service that declares no
+    /// directory is the whole repo.
+    ///
+    /// The same roots `file_finder::find_service_files` walks, so what a
+    /// surface attributes to a service is what the scan of that service read
+    /// (carrick#997 item 4). Include roots are directories, not globs, which
+    /// is why this is a prefix test and not a pattern match.
+    pub fn covers(&self, relative: &str) -> bool {
+        fn under(root: &str, relative: &str) -> bool {
+            let root = root.trim().trim_start_matches("./").trim_matches('/');
+            root.is_empty() || relative == root || relative.starts_with(&format!("{root}/"))
+        }
+        match self.directory.as_deref() {
+            None => true,
+            Some(directory) => {
+                under(directory, relative) || self.include.iter().any(|root| under(root, relative))
+            }
+        }
+    }
 }
 
 /// One repo on this machine, its services, and its files.

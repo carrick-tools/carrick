@@ -381,12 +381,23 @@ fn print_map(outcome: &super::index::IndexOutcome) {
     );
     for repo in &index.repos {
         for service in &repo.services {
+            // `0 route(s) 0 call(s)` is the same table cell for a service with
+            // no API in it and for one whose every candidate is waiting for
+            // the paid scan. The third number is what tells them apart
+            // (carrick#997 item 8).
+            let waiting = service
+                .boundary
+                .as_ref()
+                .and_then(|boundary| boundary.awaiting_model())
+                .map(|sentence| format!("  {sentence}"))
+                .unwrap_or_default();
             println!(
-                "  {:<28} {:>4} route(s)  {:>4} call(s)  {}",
+                "  {:<28} {:>4} route(s)  {:>4} call(s)  {}{}",
                 service.name,
                 service.routes,
                 service.calls,
-                &service.commit[..service.commit.len().min(7)]
+                &service.commit[..service.commit.len().min(7)],
+                waiting
             );
         }
     }
