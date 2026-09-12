@@ -158,9 +158,14 @@ pub fn warnings(state: &GitState) -> Vec<String> {
         ));
     }
     if state.dirty {
+        // The cost clause is the part a laptop run cannot see for itself: an
+        // uncommitted file is analysed without a cache entry here AND again in
+        // full by the next CI scan, because the row it wrote describes a tree
+        // no commit names (carrick#993 row 17).
         lines.push(
             "This tree has uncommitted changes. They will be indexed, and marked as such. \
-             Cached analysis will not be kept for them."
+             Cached analysis will not be kept for them, and the next CI scan re-analyses \
+             this service in full."
                 .to_string(),
         );
     }
@@ -209,7 +214,8 @@ mod tests {
         assert_eq!(
             lines[1],
             "This tree has uncommitted changes. They will be indexed, and marked as such. \
-             Cached analysis will not be kept for them."
+             Cached analysis will not be kept for them, and the next CI scan re-analyses \
+             this service in full."
         );
         assert_eq!(lines[2], LEAVE_ROUTINE_SCANS_TO_CI);
     }

@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { listProjects, createProject, projectLines } from "../src/init/projects.ts";
+import { listProjects, createProject, assignRepos, projectLines } from "../src/init/projects.ts";
 
 const TOKEN = "test-token";
 
@@ -29,6 +29,10 @@ test("the deployed server's answer to an action it has never heard of is a fallb
   const request = answering(() => KIND_GATE);
   assert.equal(await listProjects(TOKEN, request), null);
   assert.deepEqual(await createProject(TOKEN, "payments", "payments", request), { kind: "absent" });
+  // The one that decides this release: `assign-repos` is served by a lambda
+  // that is merged and not deployed, so every workspace answers the gate until
+  // the apply lands (carrick#999).
+  assert.deepEqual(await assignRepos(TOKEN, "payments", ["acme/api"], request), { kind: "absent" });
 });
 
 test("a 404, an unreadable body and an unknown schema are all absences", async () => {
@@ -126,6 +130,82 @@ test("a slug the server refuses is reported with its reason", async () => {
       answering(() => new Response("", { status: 409 })),
     ),
     { kind: "absent" },
+  );
+});
+
+// carrick#999. The action the GitHub App grant used to hand to a second
+// browser page. What matters on this side is the three-way read of the answer:
+// a 200 carries a per-repo outcome and is never a refusal, a 400 or a 409
+// carries a sentence to print, and everything else sends the run back to the
+// browser it was written to remove.
+test("an assignment sends the repos and reads back what each one did", async () => {
+  const outcome = await assignRepos(
+    TOKEN,
+    "payments",
+    ["acme/api", "acme/web"],
+    answering((body) => {
+      assert.equal(body["action"], "assign-repos");
+      assert.equal(body["project"], "payments");
+      assert.deepEqual(body["repos"], ["acme/api", "acme/web"]);
+      return Response.json({
+        schema: "carrick.assign-repos/0",
+        project_slug: "payments",
+        repos: [
+          { full_name: "acme/api", assigned: true, moved: true, project_slug: "payments", reason: null },
+          {
+            full_name: "acme/web",
+            assigned: false,
+            moved: false,
+            project_slug: null,
+            reason: "not connected to this Carrick workspace. Install the Carrick GitHub App on it first.",
+          },
+        ],
+      });
+    }),
+  );
+  assert.equal(outcome.kind, "placed");
+  // A repo that could not be placed rides inside the 200: a partial result is
+  // reported, never discarded.
+  assert.deepEqual(
+    outcome.kind === "placed" ? outcome.repos.map((repo) => [repo.full_name, repo.assigned, repo.moved]) : [],
+    [
+      ["acme/api", true, true],
+      ["acme/web", false, false],
+    ],
+  );
+});
+
+test("an assignment refusal is printed, and everything else is an absence", async () => {
+  for (const status of [400, 409]) {
+    assert.deepEqual(
+      await assignRepos(
+        TOKEN,
+        "payments",
+        ["acme/api"],
+        answering(() => Response.json({ error: "project \"payments\" is archived.", code: "project_archived" }, { status })),
+      ),
+      { kind: "refused", message: 'project "payments" is archived.' },
+    );
+  }
+  // The two statuses the server sends on purpose outside the refusal pair, and
+  // the shapes this client cannot read: all of them mean the browser.
+  for (const reply of [
+    () => new Response("", { status: 404 }),
+    () => Response.json({ error: "could not check your role.", code: "role_unverified" }, { status: 503 }),
+    () => new Response("", { status: 500 }),
+    () => new Response("not json", { status: 200 }),
+    () => Response.json({ schema: "carrick.assign-repos/1", project_slug: "payments", repos: [] }),
+    // An answer about another project is not an answer about this one.
+    () => Response.json({ schema: "carrick.assign-repos/0", project_slug: "default", repos: [] }),
+  ]) {
+    assert.deepEqual(await assignRepos(TOKEN, "payments", ["acme/api"], answering(reply)), {
+      kind: "absent",
+    });
+  }
+  // And a credential the server rejects is never a missing feature.
+  await assert.rejects(
+    assignRepos(TOKEN, "payments", ["acme/api"], answering(() => Response.json({ error: "no" }, { status: 401 }))),
+    /Run carrick login/,
   );
 });
 

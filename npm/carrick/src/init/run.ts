@@ -6,7 +6,7 @@ import readline from "node:readline/promises";
 import { spawnSync } from "node:child_process";
 import { readCredential, type Credential } from "../auth/credentials.ts";
 import { signIn } from "../auth/run.ts";
-import { resolveRepos } from "../auth/read.ts";
+import { resolveRepos, type ResolvedRepos } from "../auth/read.ts";
 import { deriveWorkspace, writeProposal, PROPOSAL_FILE, repoIdentity } from "./repos.ts";
 import { connectRepos, reposAreInProject, projectAssignments } from "./connect.ts";
 import { ensureProject, projectStep, SLUG } from "./projects.ts";
@@ -20,28 +20,41 @@ const EXTENSION_ID = "carrick-tools.carrick";
 /**
  * The prompt that makes an agent write this repo's config and setup files.
  *
- * A copy, and deliberately a verbatim one: the source of truth is the
- * `scaffold` MCP tool's own instructions and the dashboard copy beside them
- * (carrick-cloud#800), whose test checks every filename against what the tool
- * returns. It is printed here so the terminal path ends where the dashboard
- * path ends, and it states the sequence the ruling in carrick-cloud#799 fixed:
- * the agent writes a complete `carrick.json` from the proposal this command
- * derived, `carrick index` proves it for nothing, and only then does the one
- * paid scan run. Keep the two copies in step; the tool's instructions, not
- * this text, decide what gets written.
+ * A copy of the `scaffold` MCP tool's own instructions and the dashboard copy
+ * beside them (carrick-cloud#800), whose test checks every filename against
+ * what the tool returns. It is printed here so the terminal path ends where
+ * the dashboard path ends, and it states the sequence the ruling in
+ * carrick-cloud#799 fixed: the agent writes a complete `carrick.json` from the
+ * proposal this command derived, `carrick index` proves it for nothing, and
+ * only then does the one paid scan run. Keep the two copies in step; the
+ * tool's instructions, not this text, decide what gets written.
+ *
+ * One clause is this side's alone, because only this side knows it: whether
+ * the workspace read found a hosted index for these repos. Where there is one,
+ * the paid scan has already run in CI and a laptop scan from a branch would
+ * replace that row for everyone in the workspace, so the agent is told not to
+ * run it (carrick#993, cloud half carrick-cloud#805).
  */
-export const AGENT_SCAFFOLD_PROMPT =
-  "Run the carrick scaffold tool, passing this repo's owner/repo from " +
-  "`git remote get-url origin` as `repo`, and follow the instructions it " +
-  "returns: create each file at its path, and write carrick.json from the " +
-  "proposal in .carrick/proposal.json, taking applications as services and " +
-  "library workspace members as shared includes of the services that import " +
-  "them, with the env vars and domains each service calls. Add the Carrick " +
-  "section to AGENTS.md if this repo already has one. Then run `carrick " +
-  "index`, which is free and runs no model, fix whatever it reports as " +
-  "unclassified or in no service, and run `carrick index --infer` once for " +
-  "the scan that builds the index. Answer the closing checklist before you " +
-  "open the PR.";
+export function agentScaffoldPrompt(hosted: boolean): string {
+  return (
+    "Run the carrick scaffold tool, passing this repo's owner/repo from " +
+    "`git remote get-url origin` as `repo`, and follow the instructions it " +
+    "returns: create each file at its path, and write carrick.json from the " +
+    "proposal in .carrick/proposal.json, taking applications as services and " +
+    "library workspace members as shared includes of the services that import " +
+    "them, with the env vars and domains each service calls. Add the Carrick " +
+    "section to AGENTS.md if this repo already has one. Then run `carrick " +
+    "index`, which is free and runs no model, and fix whatever it reports as " +
+    "unclassified or in no service. " +
+    (hosted
+      ? "Do not run `carrick index --infer`: this repo already has a hosted " +
+        "index, and a laptop scan from a branch replaces the CI row for " +
+        "everyone. "
+      : "Then run `carrick index --infer` once for the scan that builds the " +
+        "index. ") +
+    "Answer the closing checklist before you open the PR."
+  );
+}
 
 export type InitOptions = {
   workspace: string;
@@ -111,8 +124,8 @@ function help(): string {
     "carrick.json. It writes nothing into the repository but the ignored",
     ".carrick directory and the hook settings, and it runs no scan.",
     "With --project, a project missing from the workspace is offered for",
-    "creation here; the browser assigns the repos and the CLI waits for Carrick",
-    "to verify the assignment.",
+    "creation here, and the repos are put in it from the terminal once the",
+    "GitHub App grant connects them.",
     "",
     "    -w, --workspace DIR  The folder holding the repos (default: this one)",
     "        --project SLUG   Require these repos in this Carrick project",
@@ -162,6 +175,40 @@ function onPath(command: string): boolean {
 }
 
 /**
+ * The repos a project holds that this folder does not, one line per project.
+ *
+ * Carrick answers across every repo in a project, so a machine holding half of
+ * one gets half the answers, and the connection lines above name only what is
+ * here. `project_repos` is the workspace read's answer to that: the whole
+ * membership of every project the requested repos are in (carrick#993 row 18).
+ * Capped and counted like the identity lines, because a project can hold two
+ * hundred.
+ */
+export function absentRepos(
+  identity: ResolvedRepos,
+  names: string[],
+  project: string | null,
+): string[] {
+  const onDisk = new Set(names.map((name) => name.toLowerCase()));
+  const sole = identity.project_repos.length === 1;
+  const lines: string[] = [];
+  for (const entry of identity.project_repos) {
+    // With a project settled, the others are somebody else's business.
+    if (project !== null && entry.project_slug !== project) continue;
+    const absent = entry.repos.filter((repo) => !onDisk.has(repo.toLowerCase()));
+    if (absent.length === 0) continue;
+    const shown =
+      absent.length > 10
+        ? `${absent.slice(0, 10).join(", ")} and ${absent.length - 10} more`
+        : absent.join(", ");
+    const where =
+      sole || entry.project_slug === project ? "this project" : `project "${entry.project_slug}"`;
+    lines.push(`Also in ${where}, not on this machine: ${shown}.`);
+  }
+  return lines;
+}
+
+/**
  * The editor lines, one line per editor that is on the machine.
  *
  * `--install-extension <id>` resolves the id against that editor's own gallery,
@@ -208,6 +255,11 @@ export async function init(argv: string[]): Promise<number> {
 
   // Authentication and all derivation validation precede local writes.
   let derived: ReturnType<typeof deriveWorkspace>;
+  // What the workspace read said about these repos, for the closing lines
+  // printed long after it: a repo Carrick already holds an index for must not
+  // be told to run the paid scan again (carrick#993).
+  let requested: string[] = [];
+  const hostedIndex: string[] = [];
   try {
     // A machine that has never signed in signs in here rather than being told
     // to run another command: `carrick login` is the same browser round trip,
@@ -282,12 +334,14 @@ export async function init(argv: string[]): Promise<number> {
       // later upload has no repo identity to resolve a project from.
       say("No repo here names a GitHub repository, so this run chooses no project and checks no connection.");
     }
+    requested = names;
     const initial = await resolveRepos(credential.token, names);
     // The project half of the browser round trip, where this API can do it
-    // from here. Assignment still belongs to the browser, so this only ever
-    // removes the "create the project" step from the wait. Without --project
-    // the step reads the assignment the repos already have and offers the
-    // list, rather than doing nothing at all (carrick#987).
+    // from here: the project is created here, and `connectRepos` puts the
+    // repos in it as the grant connects them (carrick#999), so the wait is on
+    // the GitHub App grant and nothing else. Without --project the step reads
+    // the assignment the repos already have and offers the list, rather than
+    // doing nothing at all (carrick#987).
     const prompts = { say, ask, confirm, interactive, assumeYes: parsed.assumeYes };
     let project = parsed.project;
     let projectExists = false;
@@ -305,16 +359,13 @@ export async function init(argv: string[]): Promise<number> {
       say,
     });
     if (project !== null && !reposAreInProject(identity, names, project)) {
-      // A project NAMED on the command line is a requirement, and an
-      // unverified one fails the run. A project picked during the step is not:
-      // stopping there would cost someone their hooks and their proposal for
-      // answering a question they were offered (carrick#987).
-      if (parsed.project !== null) {
-        throw new Error(
-          `Project "${project}" was not verified for every requested repo. Complete the browser steps and run carrick init --project ${project} again.`,
-        );
-      }
-      say(`Setup continues; finish the browser steps to put these repos in "${project}".`);
+      // An unverified project does not end the run, whether it was named on
+      // the command line or picked here. Stopping cost someone their hooks and
+      // their proposal for a browser step they could only take afterwards, and
+      // the documented command then needed two runs (carrick#993 row 8).
+      say(
+        `Setup continues; finish the browser steps above to put these repos in "${project}", then run carrick init --project ${project} again to verify.`,
+      );
     }
     say(`Carrick workspace: ${identity.workspace.slug}`);
     if (identity.allowance_sentence) say(identity.allowance_sentence);
@@ -323,7 +374,13 @@ export async function init(argv: string[]): Promise<number> {
       // How to give it one is the last thing this command prints, once, rather
       // than a workflow line per repo before anything is set up.
       else if (repo.services.length === 0) say(`${repo.full_name} is connected and has no hosted index yet.`);
+      else hostedIndex.push(repo.full_name);
     }
+    // The rest of the project, which this machine does not hold. Carrick
+    // answers across every repo in a project, so a folder holding half of one
+    // is a partial index and nothing here would otherwise say so
+    // (carrick#993 row 18).
+    for (const line of absentRepos(identity, names, project)) say(line);
   } catch (error) {
     process.stderr.write(`carrick init: ${(error as Error).message}\n`);
     return 1;
@@ -424,16 +481,34 @@ export async function init(argv: string[]): Promise<number> {
   // No scan ran here, and that is the point (carrick-cloud#799): the one paid
   // scan runs against a config someone has read, so the last thing this
   // command prints is the prompt that produces that config.
-  say(`  There is no index yet. ${PROPOSAL_FILE} holds the services this run derived;`);
-  say("  an agent turns it into carrick.json, adds the CI check (which needs no secret),");
-  say("  and builds the index: `carrick index` is free and runs no model, and");
-  say("  `carrick index --infer` is the single scan that asks Carrick to classify the rest.");
-  say("  By hand instead: `carrick templates workflow > .github/workflows/carrick.yml`, a");
-  say("  carrick.json per https://docs.carrick.tools/carrick-json, then those two commands.");
+  //
+  // Unless CI has already built one. The hosted index is the whole workspace's
+  // row, and `--infer` from a laptop on a branch replaces it for everyone who
+  // queries it, so where the workspace read found services this says so and
+  // names the free command instead (carrick#993 row 2).
+  if (hostedIndex.length > 0) {
+    const subject =
+      hostedIndex.length === requested.length && requested.length === 1
+        ? "This repo"
+        : hostedIndex.length > 3
+          ? `${hostedIndex.slice(0, 3).join(", ")} and ${hostedIndex.length - 3} more`
+          : hostedIndex.join(", ");
+    say(`  ${subject} already ${hostedIndex.length === 1 ? "has" : "have"} a hosted index. Run \`carrick index\` (free); do not run`);
+    say("  `carrick index --infer`, a laptop scan from a branch replaces the CI row for");
+    say(`  everyone. ${PROPOSAL_FILE} holds the services this run derived, to compare`);
+    say("  with the carrick.json already committed.");
+  } else {
+    say(`  There is no index yet. ${PROPOSAL_FILE} holds the services this run derived;`);
+    say("  an agent turns it into carrick.json, adds the CI check (which needs no secret),");
+    say("  and builds the index: `carrick index` is free and runs no model, and");
+    say("  `carrick index --infer` is the single scan that asks Carrick to classify the rest.");
+    say("  By hand instead: `carrick templates workflow > .github/workflows/carrick.yml`, a");
+    say("  carrick.json per https://docs.carrick.tools/carrick-json, then those two commands.");
+  }
   say();
   say("  Paste this to your agent:");
   say();
-  say(`    ${AGENT_SCAFFOLD_PROMPT}`);
+  say(`    ${agentScaffoldPrompt(hostedIndex.length > 0)}`);
   return 0;
 }
 
