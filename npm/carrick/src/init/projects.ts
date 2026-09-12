@@ -1,9 +1,11 @@
-// Listing and creating Carrick projects from the terminal (carrick#955).
+// Listing, creating and filling Carrick projects from the terminal
+// (carrick#955, carrick#999).
 //
 // `carrick init --project <slug>` could only ever point at a browser: the
 // workspace read (`resolve-repos`) returns the projects the named repos are
-// already in, never the workspace's project list, and creation lived only in
-// the dashboard. These two actions are the terminal half.
+// already in, never the workspace's project list, and creation and assignment
+// lived only in the dashboard. These three actions are the terminal half, and
+// they leave the GitHub App grant as the only browser step.
 //
 // **The server may not have them.** They are a separate cloud change, so
 // every call here is a probe: a workspace whose API does not answer them gets
@@ -44,9 +46,43 @@ const createResponse = z.object({
   project,
 });
 
+/** What one repo's assignment did, as the server reports it (carrick#999). */
+const placement = z.object({
+  full_name: z.string(),
+  /** This repo is in the project now, including one that already was. */
+  assigned: z.boolean(),
+  /** Whether a write happened. False for a repo that was already there. */
+  moved: z.boolean(),
+  project_slug: z.string().nullable(),
+  /** Why this repo was not placed, as a sentence completing its name. */
+  reason: z.string().nullable(),
+});
+
+/** One repo's outcome inside a successful `assign-repos` answer. */
+export type Placement = z.infer<typeof placement>;
+
+const assignResponse = z.object({
+  schema: z.literal("carrick.assign-repos/0"),
+  project_slug: z.string(),
+  repos: z.array(placement),
+});
+
 /** What a create attempt did. `absent` is "this server has no such action". */
 export type CreateOutcome =
   | { kind: "created"; project: Project }
+  | { kind: "refused"; message: string }
+  | { kind: "absent" };
+
+/**
+ * What an assignment attempt did.
+ *
+ * `placed` is a 200: the action ran, and every repo in it carries its own
+ * outcome. A repo the workspace does not hold, or one whose write failed, is
+ * reported there rather than as a refusal, so a partial result is read rather
+ * than discarded.
+ */
+export type AssignOutcome =
+  | { kind: "placed"; repos: Placement[] }
   | { kind: "refused"; message: string }
   | { kind: "absent" };
 
@@ -145,8 +181,54 @@ export async function createProject(
   return parsed.success ? { kind: "created", project: parsed.data.project } : { kind: "absent" };
 }
 
+/**
+ * Put the named repos in the named project, where this API can do it.
+ *
+ * The second browser step this command used to end on: the GitHub App grant
+ * puts a newly connected repo in the workspace's default project, so a run
+ * started with `--project` sat waiting for someone to move it on the Repos
+ * page (carrick#999). The action is idempotent, which is what makes it safe
+ * to call from inside the polling loop as repos arrive from the grant.
+ *
+ * `absent` is the same wide condition the other two actions use: this client
+ * is published ahead of the deploy that serves the action, and until it lands
+ * the credential-kind gate answers first. The caller then prints the browser
+ * instruction it printed before.
+ */
+export async function assignRepos(
+  token: string,
+  project: string,
+  repos: string[],
+  request: typeof fetch = fetch,
+  signal?: AbortSignal,
+): Promise<AssignOutcome> {
+  const result = await post(token, { action: "assign-repos", project, repos }, request, signal);
+  if (!result) return { kind: "absent" };
+  if (result.status === 401) throw new Error(REJECTED);
+  if (!result.ok) {
+    const message = await refusal(result);
+    return message ? { kind: "refused", message } : { kind: "absent" };
+  }
+  let payload: unknown;
+  try {
+    payload = await result.json();
+  } catch {
+    return { kind: "absent" };
+  }
+  const parsed = assignResponse.safeParse(payload);
+  // The schema tag is the handshake, as it is for the list: an answer this
+  // client cannot read is the same situation as an API without the action.
+  return parsed.success && parsed.data.project_slug === project
+    ? { kind: "placed", repos: parsed.data.repos }
+    : { kind: "absent" };
+}
+
 /** The slug shape the dashboard enforces, applied before anything is sent. */
 export const SLUG = /^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){2,31}$/;
+
+/** What a project is, said once, above the picker that asks for one. */
+export const PROJECT_RULE =
+  "One project per interconnected system: repos that call each other belong together.";
 
 /** What init asks the terminal during the project step. */
 export type ProjectPrompts = {
@@ -245,6 +327,11 @@ export async function projectStep(
 
   const projects = await list(token);
   if (projects === null) return { slug: null, exists: false };
+  // The one thing someone picking a project has to know, said where the
+  // question is asked: a project is the boundary every cross-service answer
+  // is computed inside, so repos split across two of them see nothing of each
+  // other (carrick#993).
+  prompts.say(PROJECT_RULE);
   prompts.say(
     projects.length === 0 ? "This workspace has no projects yet." : "Projects in this workspace:",
   );

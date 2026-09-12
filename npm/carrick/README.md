@@ -27,13 +27,15 @@ carrick init --project payments
 The command shows the current project assignment for every proposed GitHub
 repo. When the project is not in the workspace yet, it lists the workspace's
 projects and offers to create the named one from the terminal; where the API
-has no such action it prints the project link instead. Repository assignment
-stays in the browser, so the command prints the GitHub App and repo-assignment
-links and, in an interactive terminal, opens the page. The CLI then reads
-`resolve-repos` until every proposed repo reports `project_slug: "payments"`.
-A repo connected to another project remains pending. In a noninteractive shell,
-an unmet target prints the same links and exits with status 1 without writing
-the local setup.
+has no such action it prints the project link instead. Connected repos are then
+put in the project from the terminal too, so the GitHub App grant is the only
+browser step; where the API has no assignment action, the command prints the
+repo-assignment link and, in an interactive terminal, opens the page. Either
+way the claim comes from a read: the CLI reads `resolve-repos` until every
+proposed repo reports `project_slug: "payments"`, and a repo connected to
+another project remains pending. A target it cannot meet does not stop the run
+— the hooks, the MCP connection and the proposal are written, and the command
+says which browser steps are left.
 
 Without `--project` the project step still runs: the command takes the project
 the repos are already in, and otherwise lists the workspace's projects for you
