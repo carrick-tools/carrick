@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.63](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.62...carrick-v0.3.63) (2026-09-12)
+
+
+### Features
+
+* **cli:** init places the repos itself, and stops ordering a scan CI already ran ([#1000](https://github.com/carrick-tools/carrick/issues/1000)) ([cb319bf](https://github.com/carrick-tools/carrick/commit/cb319bf91884c2e34f6d5104be6a13f70c97cd30))
+* **cli:** say what a paid scan cost, and keep saying it ([#1006](https://github.com/carrick-tools/carrick/issues/1006)) ([29307fc](https://github.com/carrick-tools/carrick/commit/29307fcf78b5af3e5dd366a87ecb75ac4c37ee92))
+* **cli:** start a scan that outlives the shell, and say where it got to ([#1003](https://github.com/carrick-tools/carrick/issues/1003)) ([56e6f25](https://github.com/carrick-tools/carrick/commit/56e6f2560a99365451147afa0e4d77525027ea50))
+* **scanner:** carry the manifest facts that decide application from library ([#1001](https://github.com/carrick-tools/carrick/issues/1001)) ([83f38d3](https://github.com/carrick-tools/carrick/commit/83f38d35187e093bf31def1788554852a6f29b95))
+
+
+### Bug Fixes
+
+* **cli:** resolve ssh host aliases, and name every repo that gives no identity ([#996](https://github.com/carrick-tools/carrick/issues/996)) ([ed5513d](https://github.com/carrick-tools/carrick/commit/ed5513dda7be94f062ecfcf16e30c5c7d9bf2e21))
+* **cli:** say what a free pass left for the model, and attribute changes to the service that reads them ([#1002](https://github.com/carrick-tools/carrick/issues/1002)) ([1b1d910](https://github.com/carrick-tools/carrick/commit/1b1d91033409cc82d4898b703b47def1d4062fe1)), closes [#997](https://github.com/carrick-tools/carrick/issues/997)
+
 ## [0.3.62](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.61...carrick-v0.3.62) (2026-09-11)
 
 
