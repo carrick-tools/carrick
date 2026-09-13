@@ -258,23 +258,3 @@ export function connectMcpClients(env: McpEnvironment = realEnvironment()): McpO
   }
   return outcomes;
 }
-
-/** The lines init prints for the MCP step, whatever it could configure. */
-export function mcpLines(outcomes: McpOutcome[]): string[] {
-  if (outcomes.length === 0) {
-    return [
-      "  The org index, for work that crosses repos you do not have on disk.",
-      "  No agent client was found on this machine; in Claude Code that is:",
-      `    ${MCP_LINE}`,
-      `  Any other client takes the same server over HTTP: ${MCP_URL}`,
-    ];
-  }
-  const lines = [`  The org index (${MCP_URL}), once per machine:`];
-  for (const outcome of outcomes) {
-    const verb =
-      outcome.state === "written" ? "wrote" : outcome.state === "present" ? "unchanged" : "could not";
-    lines.push(`    ${verb}  ${outcome.client}: ${outcome.detail}`);
-  }
-  lines.push("  Restart a running client to pick the server up.");
-  return lines;
-}

@@ -25,7 +25,18 @@ import {
   ownEntryPoint,
 } from "../src/init/settings.ts";
 import { PROJECT_RULE, projectStep, type Project, type ProjectPrompts } from "../src/init/projects.ts";
-import { absentRepos, agentScaffoldPrompt, editorLines, parseArgs, init } from "../src/init/run.ts";
+import {
+  absentRepos,
+  configuredLine,
+  connectedLine,
+  mcpClientLines,
+  packagesLine,
+  parseArgs,
+  init,
+  SCAFFOLD_SENTENCE,
+} from "../src/init/run.ts";
+import { hostedReport } from "../src/init/hosted.ts";
+import { DOCS, plainOutput } from "../src/init/output.ts";
 import type { ResolvedRepos } from "../src/auth/read.ts";
 
 const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -427,63 +438,6 @@ test("a quoted absolute hook command is ours too, and a lookalike is not", () =>
   assert.deepEqual(commands, ["carrickctl hook post-edit", "carrick hook post-edit"]);
 });
 
-// The gallery an id resolves against is that editor's own, and the three
-// editors named below read three different ones. The extension is published to
-// each of those three, so an id is only ever printed for an editor whose
-// gallery carries it (carrick#915).
-test("no editor is handed an id for a gallery it does not read", () => {
-  const everyEditor = editorLines(() => true);
-  for (const line of everyEditor) {
-    const install = /^\s*(\S+) --install-extension (\S+)/.exec(line);
-    if (!install) continue;
-    const [, editor, target] = install;
-    assert.ok(
-      ["code", "cursor", "windsurf"].includes(editor!),
-      `${editor} resolves an id against a gallery this extension is not published to: ${line}`,
-    );
-    assert.equal(target, "carrick-tools.carrick");
-  }
-  // Every editor answers in a heading and a command a user can copy, so a block
-  // that has grown prose is a block that is explaining something away.
-  assert.equal(everyEditor.length, 6);
-});
-
-test("VS Code gets the gallery command like the others", () => {
-  const code = editorLines((command) => command === "code");
-  assert.deepEqual(code, [
-    "  VS Code, for diagnostics in the Problems panel:",
-    "    code --install-extension carrick-tools.carrick",
-  ]);
-  // A pointer somewhere else is what a missing publish reads like, and there is
-  // no missing publish.
-  assert.doesNotMatch(code.join("\n"), /\.vsix|docs\.carrick\.tools|Marketplace/);
-});
-
-test("Cursor and Windsurf get the gallery command, which is one they can run", () => {
-  const cursor = editorLines((command) => command === "cursor");
-  assert.deepEqual(cursor, [
-    "  Cursor, for diagnostics in the Problems panel:",
-    "    cursor --install-extension carrick-tools.carrick",
-  ]);
-  assert.match(
-    editorLines((command) => command === "windsurf").join("\n"),
-    /windsurf --install-extension carrick-tools\.carrick/,
-  );
-
-  // Both editors on one machine is two blocks, and an editor that is not on the
-  // machine is not named.
-  const forks = editorLines((command) => command === "cursor" || command === "windsurf");
-  assert.equal(forks.length, 4);
-  assert.doesNotMatch(forks.join("\n"), /VS Code|code --install-extension/);
-});
-
-test("an editor we have not tested gets the server's command and no claim", () => {
-  const unknown = editorLines(() => false);
-  assert.equal(unknown.length, 1);
-  assert.match(unknown[0]!, /carrick lsp --stdio/);
-  assert.doesNotMatch(unknown[0]!, /--install-extension/);
-});
-
 test("init reads its arguments", () => {
   const parsed = parseArgs(["-y", "--project", "payments", "--workspace", "/code"], "/tmp");
   assert.deepEqual(parsed, { workspace: "/code", assumeYes: true, project: "payments", repo: null });
@@ -558,7 +512,7 @@ test("the executable CLI finishes setup when the named project is not verified",
     assert.doesNotMatch(result.stdout, /Verified/);
     assert.ok(
       result.stdout.includes(
-        'Setup continues; finish the browser steps above to put these repos in "payments", then run carrick init --project payments again to verify.',
+        '▲ Finish the browser steps above to put these repos in "payments", then run carrick init --project payments again to verify.',
       ),
       result.stdout,
     );
@@ -581,18 +535,24 @@ test("the executable CLI accepts the named assignment on repeated init", posixNa
         { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
       );
       assert.equal(result.status, 0, result.stderr);
-      assert.match(result.stdout, /Verified 1 repo in project "payments"/);
+      // The project is stated once, where the login is (carrick#1026), and the
+      // line that used to repeat it as a verdict is gone.
+      assert.ok(result.stdout.includes("◇ Signed in as acme · project payments"), result.stdout);
+      assert.doesNotMatch(result.stdout, /Verified 1 repo in project/);
       assert.doesNotMatch(result.stdout, /Create project "payments" if needed/);
       // A repo already in the project is not a project to look up or create.
       assert.doesNotMatch(result.stdout, /Projects in this workspace/);
-      // Setup ends where the dashboard's checklist ends: the prompt that makes
-      // an agent write this repo's workflow and carrick.json (carrick#955).
-      assert.match(result.stdout, /Run the carrick scaffold tool/);
-      assert.match(result.stdout, /carrick\.json/);
+      // Setup ends where the dashboard's checklist ends: one sentence naming
+      // the scaffold tool, which carries the instructions (cloud#832).
+      assert.ok(result.stdout.includes(SCAFFOLD_SENTENCE), result.stdout);
       // No agent client under this fixture's home, so the MCP step states the
       // line rather than claiming a connection.
-      assert.match(result.stdout, /claude mcp add --scope user --transport http carrick/);
-      assert.match(result.stdout, /No agent client was found on this machine/);
+      assert.ok(
+        result.stdout.includes(
+          "▲ No agent client found on this machine. In Claude Code: claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp",
+        ),
+        result.stdout,
+      );
     }
   } finally {
     fixture.cleanup();
@@ -618,7 +578,7 @@ test("the executable CLI creates the named project and puts the repos in it", po
     assert.doesNotMatch(result.stdout, /Create project "payments" if needed/);
     assert.match(result.stdout, /Moved acme\/api into project "payments"\./);
     // Claimed only because resolve-repos read it back afterwards.
-    assert.match(result.stdout, /Verified 1 repo in project "payments"/);
+    assert.ok(result.stdout.includes("◇ Signed in as acme · project payments"), result.stdout);
     // And no browser step is asked for, because none is left.
     assert.doesNotMatch(result.stdout, /Assign the requested repos/);
     assert.doesNotMatch(result.stdout, /Setup continues/);
@@ -651,7 +611,7 @@ test("the executable CLI reads the hosted index onto an indexed repo and names t
     // machine with no index and told the reader not to run the only command
     // that would have built one (carrick#1020).
     assert.ok(
-      result.stdout.includes("Hosted index for 2 services downloaded into .carrick/."),
+      result.stdout.includes("◇ Hosted index for 2 services downloaded into .carrick/"),
       result.stdout,
     );
     assert.doesNotMatch(result.stdout, /already has a hosted index\. Do not run/);
@@ -660,9 +620,11 @@ test("the executable CLI reads the hosted index onto an indexed repo and names t
     // is this command's, and `carrick index` stays the only scan in the flow
     // (carrick#1008, cloud#832).
     assert.doesNotMatch(result.stdout, /carrick refresh/);
-    // The prompt the run ends on is the agent's copy, and it still orders no
-    // scan: a laptop scan from a branch replaces the CI row for everyone.
-    assert.match(result.stdout, /Do not run `carrick index`/);
+    // Both branches end on the same sentence: whether a scan runs at all is
+    // the scaffold tool's to state, from the repo it is asked about
+    // (cloud#832), so the terminal carries no second copy of it.
+    assert.ok(result.stdout.trimEnd().endsWith(`Docs: ${DOCS}`), result.stdout);
+    assert.ok(result.stdout.includes(SCAFFOLD_SENTENCE), result.stdout);
     assert.doesNotMatch(result.stdout, /is connected and has no hosted index yet/);
   } finally {
     fixture.cleanup();
@@ -687,7 +649,7 @@ test("a hosted index older than this CLI is reported as such, and no downgrade i
     assert.equal(result.status, 0, result.stderr);
     assert.ok(
       result.stdout.includes(
-        "The hosted index is older than this CLI; run `carrick index --detach` once from main to refresh it.",
+        "▲ Hosted index is older than this CLI: run `carrick index --detach` once from main",
       ),
       result.stdout,
     );
@@ -716,11 +678,13 @@ test("a hosted read that fails leaves the setup written and says what went wrong
     assert.equal(result.status, 0, result.stderr);
     assert.ok(
       result.stdout.includes(
-        "The hosted index could not be read into .carrick/: api has no carrick.json.",
+        "■ Hosted index could not be read into .carrick/: api has no carrick.json",
       ),
       result.stdout,
     );
-    assert.match(result.stdout, /run carrick init again/);
+    // A refusal does not end the run: the rest of the setup is written, and
+    // the closing block is the one every other branch ends on.
+    assert.ok(result.stdout.trimEnd().endsWith(`Docs: ${DOCS}`), result.stdout);
     assert.equal(fs.existsSync(path.join(fixture.repo, PROPOSAL_FILE)), true);
   } finally {
     fixture.cleanup();
@@ -786,53 +750,26 @@ test("a first init writes the proposal, its ignore file and the hook settings, a
     assert.equal(proposal.repos[0].config.services.length, 16);
     assert.equal(proposal.workspace, fixture.repo);
 
-    // And the run ends on the prompt that turns it into a config. This
-    // workspace read reports no services, so it is the prompt that runs the
-    // one paid scan.
-    assert.match(result.stdout, /Paste this to your agent:/);
-    assert.equal(result.stdout.trimEnd().endsWith(agentScaffoldPrompt(false)), true, result.stdout.slice(-400));
-    assert.match(result.stdout, /There is no index yet\./);
+    // And the run ends where the ticket rules it ends: the state of the index,
+    // one sentence for the agent, and the link that carries everything else
+    // (carrick#1026). This workspace read reports no services, so the scan is
+    // still to run.
+    assert.equal(
+      result.stdout.trimEnd().split("\n").slice(-6).join("\n"),
+      [
+        "◇ No index yet: your agent runs the one scan",
+        "",
+        "Next: paste this to your agent",
+        `  ${SCAFFOLD_SENTENCE}`,
+        "",
+      ].join("\n") + `\nDocs: ${DOCS}`,
+      result.stdout,
+    );
+    // The quickstart carries what left the terminal, and none of it is printed.
+    assert.doesNotMatch(result.stdout, /--plugin-dir|--install-extension|carrick templates workflow|docs\.carrick\.tools\/carrick-json/);
   } finally {
     fixture.cleanup();
   }
-});
-
-// carrick#960: this prompt is a copy of the scaffold tool's own instructions,
-// in another repository, and it once named a file the tool had stopped
-// returning. A drifted copy fails here rather than in a user's terminal.
-test("the scaffold prompt names only files that seam owns, and states the sequence", () => {
-  for (const prompt of [agentScaffoldPrompt(false), agentScaffoldPrompt(true)]) {
-    const named: string[] = prompt.match(/[\w./-]*\.(?:json|ya?ml|md)/g) ?? [];
-    for (const file of named) {
-      assert.ok(
-        [".carrick/proposal.json", "carrick.json", "AGENTS.md", ".github/workflows/carrick.yml"].includes(file),
-        `${file} is not a file the scaffold tool writes or reads`,
-      );
-    }
-    assert.ok(named.includes(".carrick/proposal.json"), prompt);
-    assert.ok(named.includes("carrick.json"), prompt);
-    // What proves the config in both branches is a READ, not a rehearsal
-    // scan: the facts-only pass left the product in carrick#1008, and
-    // cloud#832 rewrote step 5 around reading the config back.
-    assert.match(prompt, /read carrick\.json back against the repo/);
-    assert.doesNotMatch(prompt, /carrick refresh/);
-    // The removed flag is named nowhere: an agent that pastes this prompt
-    // would be told the flag is gone rather than get a scan (carrick#1008).
-    assert.doesNotMatch(prompt, /--infer/);
-  }
-  // One scan, detached, and then asked after: an agent's shell does not
-  // survive a fifteen-minute scan (carrick#960, cloud half carrick-cloud#821),
-  // and the three words it polls for are carrick#1007 item 4's.
-  const fresh = agentScaffoldPrompt(false);
-  assert.match(fresh, /`carrick index --detach` once for the first scan/);
-  assert.match(fresh, /`carrick status` about once a minute/);
-  assert.match(fresh, /finished, stopped or failed/);
-  // And where CI has already built the index, no scan is ordered at all: a
-  // laptop scan from a branch replaces that row for the whole workspace
-  // (carrick#993 row 2, cloud#832).
-  const hosted = agentScaffoldPrompt(true);
-  assert.match(hosted, /Do not run `carrick index`/);
-  assert.doesNotMatch(hosted, /--detach/);
 });
 
 function recordingPrompts(
@@ -1044,8 +981,8 @@ test("the executable CLI resolves an ssh host alias and verifies the repo", posi
       { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
     );
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /Repos requested for project "payments":\n {2}acme\/api/);
-    assert.match(result.stdout, /Verified 1 repo in project "payments"/);
+    assert.ok(result.stdout.includes("◇ Repo acme/api connected"), result.stdout);
+    assert.ok(result.stdout.includes("◇ Signed in as acme · project payments"), result.stdout);
     assert.doesNotMatch(result.stdout, /contributes no GitHub identity/);
   } finally {
     fixture.cleanup();
@@ -1098,8 +1035,8 @@ test("the executable CLI takes --repo for the identity a remote could not give",
       { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
     );
     assert.equal(result.status, 0, result.stderr);
-    assert.ok(result.stdout.includes(`Taking acme/api as the GitHub repository for ${fixture.repo}`), result.stdout);
-    assert.match(result.stdout, /Verified 1 repo in project "payments"/);
+    assert.ok(result.stdout.includes(`◇ acme/api taken as the GitHub repository for ${fixture.repo}`), result.stdout);
+    assert.ok(result.stdout.includes("◇ Signed in as acme · project payments"), result.stdout);
     assert.doesNotMatch(result.stdout, /contributes no GitHub identity/);
   } finally {
     fixture.cleanup();
@@ -1164,4 +1101,126 @@ test("the rest of the project is named, capped, and never guessed at", () => {
   assert.deepEqual(absentRepos(workspace([{ project_slug: "payments", repos: many }]), [], "payments"), [
     `Also in this project, not on this machine: ${many.slice(0, 10).join(", ")} and 4 more.`,
   ]);
+});
+
+// carrick#1026. The rendering, stated once: every executable test above spawns
+// the CLI with its stdout on a pipe, so what they pin is the plain rendering —
+// and the plain rendering is what a CI job, an agent's shell and a `| tee` get.
+// The three markers are `@clack/prompts`'s own, so the terminal and the pipe
+// say the same words with the same symbols; only the gutter, the colour and the
+// spinner are the terminal's.
+test("the plain rendering is one line per thing, with no colour and no box", () => {
+  const written: string[] = [];
+  const out = plainOutput((text) => void written.push(text));
+  out.done("Repo acme/api connected");
+  out.warn("Hosted index is older than this CLI");
+  out.refuse("Hosted index could not be read into .carrick/: no reason");
+  out.say("Connect repositories in your browser: https://app.carrick.tools/repos");
+  out.note("Next: paste this to your agent", [SCAFFOLD_SENTENCE]);
+  assert.deepEqual(written.join("").split("\n"), [
+    "◇ Repo acme/api connected",
+    "▲ Hosted index is older than this CLI",
+    "■ Hosted index could not be read into .carrick/: no reason",
+    "Connect repositories in your browser: https://app.carrick.tools/repos",
+    "",
+    "Next: paste this to your agent",
+    `  ${SCAFFOLD_SENTENCE}`,
+    "",
+    "",
+  ]);
+  // No ANSI anywhere: a captured log is read by a person or an agent, and an
+  // escape sequence in it is noise in both cases.
+  assert.doesNotMatch(written.join(""), /\[/);
+});
+
+// The four index states, as lines rather than as tags. Each one says what this
+// machine now holds; the two with something to do about it carry the marker
+// that says so, and the one that produced nothing is a refusal (carrick#1020,
+// carrick#1026).
+test("every hosted outcome is one line, and only an actionable one is a warning", () => {
+  assert.deepEqual(hostedReport({ kind: "downloaded", services: 2 }), {
+    kind: "done",
+    text: "Hosted index for 2 services downloaded into .carrick/",
+  });
+  assert.deepEqual(hostedReport({ kind: "downloaded", services: 1 }).text, "Hosted index for 1 service downloaded into .carrick/");
+  const older = hostedReport({ kind: "version_mismatch", services: 2 });
+  assert.equal(older.kind, "warn");
+  assert.match(older.text, /run `carrick index --detach` once from main/);
+  // And never a downgrade: `CACHE_VERSION` moves most weeks (carrick#1012).
+  assert.doesNotMatch(older.text, /npm i -g carrick@/);
+  const local = hostedReport({ kind: "local_only", services: 3, state: "commit_missing" });
+  assert.equal(local.kind, "warn");
+  assert.match(local.text, /\.carrick\/ holds 3 services as this machine read them; the commit/);
+  const failed = hostedReport({ kind: "failed", problem: "api has no carrick.json" });
+  assert.deepEqual(failed, {
+    kind: "refuse",
+    text: "Hosted index could not be read into .carrick/: api has no carrick.json",
+  });
+  // No branch forbids a command: the sentence that did left the reader with no
+  // index and nothing that would build one (carrick#1020).
+  for (const outcome of [older, local, failed]) {
+    assert.doesNotMatch(outcome.text, /Do not run/);
+  }
+});
+
+test("the derived line names the manifest kind only where every repo agrees", () => {
+  const plan = (repos: Array<{ reason: string; services: number }>): WorkspaceProposal => ({
+    schema: "carrick.derive/0",
+    workspace: "/code",
+    repos_detected_by: "test",
+    repos_added: [],
+    repos_excluded: [],
+    missing: [],
+    parent_proposal: null,
+    repos: repos.map((repo) => ({
+      path: "/code",
+      reason: repo.reason,
+      services: Array.from({ length: repo.services }, (_, index) => ({ serviceName: `s${index}` })),
+      config: null,
+      warnings: [],
+    })),
+  });
+  assert.equal(packagesLine(plan([{ reason: "Deno manifests", services: 4 }])), `4 Deno packages found, proposal in ${PROPOSAL_FILE}`);
+  assert.equal(packagesLine(plan([{ reason: "npm workspaces", services: 1 }])), `1 npm package found, proposal in ${PROPOSAL_FILE}`);
+  assert.equal(packagesLine(plan([{ reason: "pnpm workspaces", services: 9 }])), `9 pnpm packages found, proposal in ${PROPOSAL_FILE}`);
+  // A repo with no workspace manifests, and a workspace of two kinds: neither
+  // has one word for what was found, so neither gets one.
+  assert.equal(packagesLine(plan([{ reason: "single repository", services: 1 }])), `1 package found, proposal in ${PROPOSAL_FILE}`);
+  assert.equal(
+    packagesLine(plan([{ reason: "npm workspaces", services: 2 }, { reason: "Deno manifests", services: 3 }])),
+    `5 packages found, proposal in ${PROPOSAL_FILE}`,
+  );
+});
+
+// A client is named only where this run changed something for it: a first run
+// used to print four lines about clients it had left exactly as they were
+// (carrick#1026).
+test("the setup line names the clients this run changed, and no others", () => {
+  assert.equal(
+    configuredLine([{ client: "Claude Code", state: "written", detail: "connected for this user" }]),
+    "Claude Code hooks and MCP configured (restart the client)",
+  );
+  assert.equal(
+    configuredLine([{ client: "Claude Code", state: "present", detail: 'already connected as "carrick"' }]),
+    "Claude Code hooks configured",
+  );
+  // Another client is its own line, naming the file this run guessed at and
+  // wrote: a wrong guess has to be one line and one entry to delete.
+  const machine = [
+    { client: "Claude Code", state: "written", detail: "connected for this user" } as const,
+    { client: "Cursor", state: "written", detail: "/home/.cursor/mcp.json" } as const,
+    { client: "Windsurf", state: "present", detail: "already in /home/.codeium/windsurf/mcp_config.json" } as const,
+    { client: "VS Code", state: "failed", detail: "not valid JSON" } as const,
+  ];
+  assert.equal(configuredLine(machine), "Claude Code hooks and MCP configured (restart the client)");
+  assert.deepEqual(mcpClientLines(machine), ["MCP added for Cursor: /home/.cursor/mcp.json"]);
+});
+
+test("the connected repos are one line however many there are", () => {
+  assert.equal(connectedLine(["acme/api"]), "Repo acme/api connected");
+  assert.equal(connectedLine(["acme/api", "acme/web"]), "2 repos connected: acme/api, acme/web");
+  assert.equal(
+    connectedLine(["a/1", "a/2", "a/3", "a/4", "a/5"]),
+    "5 repos connected: a/1, a/2, a/3 and 2 more",
+  );
 });

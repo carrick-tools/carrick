@@ -49,7 +49,7 @@ export type HostedDownload =
  * in a sentence of its own. Its stdout is the index map, which this command
  * summarises in its own words, so that is captured and dropped.
  */
-function spawnNative(args: string[]): Promise<{ status: number | null; stdout: string; stderr: string }> {
+function spawnNative(args: string[], quiet: boolean): Promise<{ status: number | null; stdout: string; stderr: string }> {
   const native = resolveNativeBinary();
   if (!native.binary) {
     return Promise.resolve({
@@ -58,7 +58,6 @@ function spawnNative(args: string[]): Promise<{ status: number | null; stdout: s
       stderr: native.problem ?? "The Carrick scanner is not installed.",
     });
   }
-  const quiet = args.includes("--json");
   return new Promise((resolve) => {
     const child = spawn(native.binary as string, args, {
       env: nativeEnv(),
@@ -75,7 +74,11 @@ function spawnNative(args: string[]): Promise<{ status: number | null; stdout: s
       // Bounded: a scan of a large workspace prints thousands of lines, and
       // all this holds them for is the sentence at the end.
       stderr = `${stderr}${chunk}`.slice(-8192);
-      if (!quiet) process.stderr.write(chunk);
+      // Quiet under a spinner: a spinner owns its line and rewrites it, and a
+      // scanner line landing in the middle of that is a corrupted terminal.
+      // Where there is no spinner — a pipe, CI, an agent shell — the progress
+      // is the only sign a minutes-long read is alive (carrick#1021).
+      if (!quiet && !args.includes("--json")) process.stderr.write(chunk);
     });
     child.on("error", (error) => resolve({ status: 1, stdout: "", stderr: error.message }));
     child.on("close", (code) => resolve({ status: code, stdout, stderr }));
@@ -98,9 +101,13 @@ function firstLine(text: string, fallback: string): string {
  * wrote the proposal into — so the index this builds is the one every later
  * read of that workspace finds.
  */
+export function nativeRunner(quiet: boolean): NativeRun {
+  return (args) => spawnNative(args, quiet);
+}
+
 export async function downloadHostedIndex(
   workspace: string,
-  run: NativeRun = spawnNative,
+  run: NativeRun = nativeRunner(false),
 ): Promise<HostedDownload> {
   const refreshed = await run(["refresh", "--workspace", workspace]);
   if (refreshed.status !== 0) {
@@ -132,13 +139,6 @@ export async function downloadHostedIndex(
 }
 
 /**
- * What init prints about it, indented into the closing block.
- *
- * Every branch states what happened and what this machine now holds. None of
- * them forbids a command: the sentence that did told the reader not to run the
- * only thing that would have given them an index (carrick#1020).
- */
-/**
  * Why a hosted index this machine asked for is not in the answer.
  *
  * The state tag is the index's own word for it and reads as jargon in a
@@ -164,32 +164,34 @@ function stateClause(state: string): string {
   }
 }
 
-export function hostedLines(outcome: HostedDownload): string[] {
+/**
+ * The one line init prints about it, and which marker it carries.
+ *
+ * Every branch states what happened and what this machine now holds. None of
+ * them forbids a command: the sentence that did told the reader not to run the
+ * only thing that would have given them an index (carrick#1020). A state with
+ * an instruction attached is a warning rather than a done line, and a read that
+ * produced nothing is a refusal (carrick#1026).
+ */
+export function hostedReport(outcome: HostedDownload): {
+  kind: "done" | "warn" | "refuse";
+  text: string;
+} {
   const plural = (count: number): string => `${count} service${count === 1 ? "" : "s"}`;
   switch (outcome.kind) {
     case "downloaded":
-      return [
-        `  Hosted index for ${plural(outcome.services)} downloaded into .carrick/.`,
-        "  `carrick status` says what it holds, and the hooks and the editor read it from there.",
-        "  CI keeps the hosted copy current, so nothing was scanned into Carrick here and",
-        "  nothing was paid for.",
-      ];
+      return { kind: "done", text: `Hosted index for ${plural(outcome.services)} downloaded into .carrick/` };
     case "version_mismatch":
-      return [
-        "  The hosted index is older than this CLI; run `carrick index --detach` once from main to refresh it.",
-        `  Until then .carrick/ holds ${plural(outcome.services)} as this machine read them, without the`,
-        "  hosted classifications.",
-      ];
+      return {
+        kind: "warn",
+        text: "Hosted index is older than this CLI: run `carrick index --detach` once from main",
+      };
     case "local_only":
-      return [
-        `  .carrick/ holds ${plural(outcome.services)} as this machine read them; ${stateClause(outcome.state)}.`,
-        "  `carrick status` says what it holds, and what it could not read.",
-      ];
+      return {
+        kind: "warn",
+        text: `.carrick/ holds ${plural(outcome.services)} as this machine read them; ${stateClause(outcome.state)}`,
+      };
     case "failed":
-      return [
-        `  The hosted index could not be read into .carrick/: ${outcome.problem}.`,
-        "  `carrick status` has nothing to answer from until it can be; run carrick init again",
-        "  once that is fixed.",
-      ];
+      return { kind: "refuse", text: `Hosted index could not be read into .carrick/: ${outcome.problem}` };
   }
 }

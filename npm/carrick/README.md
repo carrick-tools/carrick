@@ -17,6 +17,14 @@ accepts that credential or a `CARRICK_TOKEN` environment override, and signs in
 through the browser itself when a terminal has neither. GitHub CLI credentials
 do not grant Carrick access.
 
+`init` prints one line per thing it did — `◇` done, `▲` a warning with what to
+do about it, `■` something it could not do and why — and ends on the sentence
+to paste to your agent. Everything else, including the editor extension, how
+the hooks deliver, the CI check and a `carrick.json` written by hand, is in the
+[quickstart](https://docs.carrick.tools/quickstart). Without a terminal — CI, an
+agent's shell, a pipe — the same lines are written as plain text, with no colour
+and no spinner.
+
 Existing users can initialise the local workspace against a named Carrick
 project:
 
