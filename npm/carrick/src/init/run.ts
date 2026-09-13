@@ -1,69 +1,51 @@
 // Authenticated setup; Rust owns the workspace and service proposal.
+//
+// What this prints is one line per thing that happened (carrick#1026). The
+// reasoning behind each step — how the hooks deliver, which editor extension
+// to install, why the scan is left to CI, what a hand-written carrick.json
+// looks like — is the quickstart's, at `output.ts`'s `DOCS`, and this command
+// links to it rather than repeating it. The record of the run stays here,
+// because nothing else can state it: this login, this project, these repos,
+// this many packages, this index.
 
 import fs from "node:fs";
 import path from "node:path";
-import readline from "node:readline/promises";
 import { spawnSync } from "node:child_process";
 import { readCredential, type Credential } from "../auth/credentials.ts";
 import { signIn } from "../auth/run.ts";
 import { resolveRepos, type ResolvedRepos } from "../auth/read.ts";
-import { deriveWorkspace, writeProposal, PROPOSAL_FILE, repoIdentity } from "./repos.ts";
+import {
+  deriveWorkspace,
+  writeProposal,
+  PROPOSAL_FILE,
+  repoIdentity,
+  type WorkspaceProposal,
+} from "./repos.ts";
 import { connectRepos, reposAreInProject, projectAssignments } from "./connect.ts";
-import { downloadHostedIndex, hostedLines } from "./hosted.ts";
+import { downloadHostedIndex, hostedReport, nativeRunner } from "./hosted.ts";
 import { ensureProject, projectStep, SLUG } from "./projects.ts";
-import { connectMcpClients, mcpLines } from "./mcp.ts";
+import { connectMcpClients, MCP_LINE, type McpOutcome } from "./mcp.ts";
 import { hookCommand, mergeCarrickHooks } from "./settings.ts";
+import { createOutput, DOCS, type InitOutput } from "./output.ts";
 import { renderTemplate } from "../templates.ts";
-import { packageRoot } from "../native.ts";
-
-const EXTENSION_ID = "carrick-tools.carrick";
 
 /**
- * The prompt that makes an agent write this repo's config and setup files.
+ * The one sentence the run ends on.
  *
- * A copy of the `scaffold` MCP tool's own instructions and the dashboard copy
- * beside them (carrick-cloud#800), whose test checks every filename against
- * what the tool returns. It is printed here so the terminal path ends where
- * the dashboard path ends, and it states the sequence the ruling in
- * carrick-cloud#799 fixed: the agent writes a complete `carrick.json` from the
- * proposal this command derived, READS it back against the repo, and then runs
- * the one scan. There is no rehearsal in front of it — `carrick index` is the
- * only scan in the flow (carrick#1008, cloud#832), and a facts-only pass has
- * no user here, so nothing in this copy names one. Keep the two copies in
- * step; the tool's instructions, not this text, decide what gets written.
+ * The scaffold tool carries the instructions — which files to create, how to
+ * seed `carrick.json` from the proposal, whether to run the scan at all
+ * (carrick-cloud#832) — so the terminal names the tool and stops. The copy
+ * that used to stand here was a second statement of the same instructions, and
+ * two copies of a sequence drift.
  *
- * One clause is this side's alone, because only this side knows it: whether
- * the workspace read found a hosted index for these repos. Where there is one,
- * the scan has already run in CI and a laptop scan from a branch would replace
- * that row for everyone in the workspace, so the agent runs no scan at all and
- * checks the config by reading it (carrick#993, cloud half carrick-cloud#805,
- * cloud#832).
+ * The argument is named because the tool's branch turns on it and turns soft
+ * without it: `repo` is what resolves the hosted rows, and with no `repo` the
+ * response keeps its default ending and tells the agent to run the scan — on a
+ * repo CI already indexes, which is the row the whole workspace reads
+ * (carrick-cloud `src/tools/scaffold.ts`, cloud#805 item 1).
  */
-export function agentScaffoldPrompt(hosted: boolean): string {
-  return (
-    "Run the carrick scaffold tool, passing this repo's owner/repo from " +
-    "`git remote get-url origin` as `repo`, and follow the instructions it " +
-    "returns: create each file at its path, write carrick.json by seeding it " +
-    "from .carrick/proposal.json and reading this repo's source for the env " +
-    "vars and domains its services call (a nested services config for a " +
-    "monorepo, with library packages folded into the services that import " +
-    "them), and add the Carrick section to AGENTS.md if this repo already " +
-    "has one. " +
-    (hosted
-      ? "Then read carrick.json back against the repo. Do not run `carrick " +
-        "index`: it is the scan, this repo already has a hosted index, and a " +
-        "laptop scan from a branch replaces the CI row for everyone. "
-      : // carrick#960/#1003: an agent's shell caps a command well below the
-        // fifteen minutes a first scan takes, so the scan is detached and the
-        // agent asks `carrick status` how it went. The three words it polls
-        // for are carrick#1007 item 4's. Mirrors the scaffold tool's own
-        // wording (carrick-cloud#821, rewritten in carrick-cloud#832).
-        "Then read carrick.json back against the repo and run `carrick index " +
-        "--detach` once for the first scan, checking `carrick status` about " +
-        "once a minute until it says the scan finished, stopped or failed. ") +
-    "Answer the closing checklist before you open the PR."
-  );
-}
+export const SCAFFOLD_SENTENCE =
+  "Run the carrick scaffold tool for this repo, passing its owner/repo as `repo`, and follow what it returns.";
 
 export type InitOptions = {
   workspace: string;
@@ -134,39 +116,14 @@ function help(): string {
     ".carrick directory and the hook settings, and it runs no paid scan: where",
     "Carrick already holds an index for these repos, it reads that index into",
     ".carrick so this machine can answer from it.",
-    "With --project, a project missing from the workspace is offered for",
-    "creation here, and the repos are put in it from the terminal once the",
-    "GitHub App grant connects them.",
     "",
     "    -w, --workspace DIR  The folder holding the repos (default: this one)",
     "        --project SLUG   Require these repos in this Carrick project",
     "        --repo OWNER/REPO  Name the GitHub repo whose origin remote names none",
     "    -y, --yes            Take the repo list as proposed",
+    "",
+    `The editor extension, the hooks, CI and a carrick.json written by hand: ${DOCS}`,
   ].join("\n");
-}
-
-function say(line = ""): void {
-  process.stdout.write(`${line}\n`);
-}
-
-async function confirm(question: string): Promise<boolean> {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    const answer = await rl.question(`${question} [Y/n] `);
-    return answer.trim() === "" || /^y(es)?$/i.test(answer.trim());
-  } finally {
-    rl.close();
-  }
-}
-
-/** A typed answer, for the questions whose answer is not yes or no. */
-async function ask(question: string): Promise<string> {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    return (await rl.question(`${question}\n> `)).trim();
-  } finally {
-    rl.close();
-  }
 }
 
 function writeIfChanged(target: string, body: string): "written" | "unchanged" {
@@ -189,7 +146,7 @@ function onPath(command: string): boolean {
  * The repos a project holds that this folder does not, one line per project.
  *
  * Carrick answers across every repo in a project, so a machine holding half of
- * one gets half the answers, and the connection lines above name only what is
+ * one gets half the answers, and the connection line above names only what is
  * here. `project_repos` is the workspace read's answer to that: the whole
  * membership of every project the requested repos are in (carrick#993 row 18).
  * Capped and counted like the identity lines, because a project can hold two
@@ -219,34 +176,62 @@ export function absentRepos(
   return lines;
 }
 
+/** The repos this run connected, as one line however many there are. */
+export function connectedLine(names: string[]): string {
+  if (names.length === 1) return `Repo ${names[0]} connected`;
+  const shown = names.length > 3 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", ");
+  return `${names.length} repos connected: ${shown}`;
+}
+
 /**
- * The editor lines, one line per editor that is on the machine.
+ * What the derive found, in the words the workspace stated it in.
  *
- * `--install-extension <id>` resolves the id against that editor's own gallery,
- * and the three editors below read three different ones: VS Code the VS Code
- * Marketplace, Cursor and Windsurf each their own. The extension is published
- * to all three, so the id is a command every one of them can run
- * (carrick#915). Any other editor gets the server's command and no claim about
- * the editor: the per-editor results table in `plugin/TEST-PLAN.md` section 6
- * is still empty.
- *
- * `onPath` is injected so a test can state each machine.
+ * The manifest kind is the scanner's own `reason` for each repo — "npm
+ * workspaces", "pnpm workspaces", "Deno manifests", "carrick.json", "single
+ * repository", or a `+` join of them (`src/service_derivation.rs`) — and it is
+ * named only where every repo here agrees on one, because a mixed workspace
+ * has no one word for what was found.
  */
-export function editorLines(onPath: (command: string) => boolean): string[] {
-  const lines: string[] = [];
-  for (const [command, editor] of [
-    ["code", "VS Code"],
-    ["cursor", "Cursor"],
-    ["windsurf", "Windsurf"],
-  ] as const) {
-    if (!onPath(command)) continue;
-    lines.push(`  ${editor}, for diagnostics in the Problems panel:`);
-    lines.push(`    ${command} --install-extension ${EXTENSION_ID}`);
-  }
-  if (lines.length === 0) {
-    lines.push("  Any editor with an LSP client starts the server itself as `carrick lsp --stdio`.");
-  }
-  return lines;
+export function packagesFound(plan: WorkspaceProposal): string {
+  const count = plan.repos.reduce((total, repo) => total + repo.services.length, 0);
+  const reasons = plan.repos.map((repo) => repo.reason);
+  const every = (word: string): boolean => reasons.length > 0 && reasons.every((reason) => reason.includes(word));
+  const kind = every("Deno") ? "Deno " : every("pnpm") ? "pnpm " : every("npm") ? "npm " : "";
+  return `${count} ${kind}package${count === 1 ? "" : "s"}`;
+}
+
+/** The line that states it, and names where the proposal landed. */
+export function packagesLine(plan: WorkspaceProposal): string {
+  return `${packagesFound(plan)} found, proposal in ${PROPOSAL_FILE}`;
+}
+
+/**
+ * The one line for the hooks and the MCP connection.
+ *
+ * A client is named only where this run changed something for it: an "already
+ * connected" line is a line about nothing, and a first run prints four of them
+ * (carrick#1026). The hooks are always this repo's, so they are always the
+ * subject.
+ */
+export function configuredLine(mcp: McpOutcome[]): string {
+  const claude = mcp.some((outcome) => outcome.client === "Claude Code" && outcome.state === "written");
+  return claude
+    ? "Claude Code hooks and MCP configured (restart the client)"
+    : "Claude Code hooks configured";
+}
+
+/**
+ * One line per other client this run wrote a file for, naming that file.
+ *
+ * The path is printed because this command guessed it: a client detected by its
+ * own data directory gets an entry written into its own config file, and a
+ * wrong guess has to be one visible line and one entry to delete (`mcp.ts`).
+ * A client left exactly as it was gets no line at all (carrick#1026).
+ */
+export function mcpClientLines(mcp: McpOutcome[]): string[] {
+  return mcp
+    .filter((outcome) => outcome.state === "written" && outcome.client !== "Claude Code")
+    .map((outcome) => `MCP added for ${outcome.client}: ${outcome.detail}`);
 }
 
 export async function init(argv: string[]): Promise<number> {
@@ -263,13 +248,12 @@ export async function init(argv: string[]): Promise<number> {
   }
 
   const interactive = process.stdin.isTTY === true;
+  const out: InitOutput = createOutput();
 
   // Authentication and all derivation validation precede local writes.
   let derived: ReturnType<typeof deriveWorkspace>;
-  // What the workspace read said about these repos, for the closing lines
-  // printed long after it: a repo Carrick already holds an index for must not
-  // be told to run the paid scan again (carrick#993).
-  let requested: string[] = [];
+  // The repos the workspace read found an index for: where CI has already built
+  // one, this run reads it rather than ordering a scan (carrick#993 row 2).
   const hostedIndex: string[] = [];
   try {
     // A machine that has never signed in signs in here rather than being told
@@ -281,8 +265,7 @@ export async function init(argv: string[]): Promise<number> {
       if (!interactive) {
         throw new Error("carrick init requires a Carrick login. Run carrick login, or set CARRICK_TOKEN.");
       }
-      say("This machine is not signed in to Carrick.");
-      credential = await signIn(say);
+      credential = await signIn(out.say);
     }
     derived = deriveWorkspace(workspace);
     const derivedIdentities = derived.plan.repos.map((repo) => repoIdentity(repo.path));
@@ -298,10 +281,10 @@ export async function init(argv: string[]): Promise<number> {
         );
       }
       if (unnamed.length === 0) {
-        say(`--repo ${parsed.repo} was not needed: every repo here names its own GitHub repository.`);
+        out.warn(`--repo ${parsed.repo} was not needed: every repo here names its own GitHub repository.`);
       } else {
         taken = unnamed[0]!.path;
-        say(`Taking ${parsed.repo} as the GitHub repository for ${taken}.`);
+        out.done(`${parsed.repo} taken as the GitHub repository for ${taken}`);
       }
     }
     const repoIdentities = derivedIdentities.map((repo) =>
@@ -317,15 +300,15 @@ export async function init(argv: string[]): Promise<number> {
     // A folder of clones can hold dozens, so the list is capped and the rest
     // is counted rather than dropped.
     for (const repo of missingIdentities.slice(0, 10)) {
-      say(`${repo.path} contributes no GitHub identity: ${repo.problem}.`);
+      out.warn(`${repo.path} contributes no GitHub identity: ${repo.problem}.`);
     }
     if (missingIdentities.length > 10) {
-      say(`${missingIdentities.length - 10} more repos here name no GitHub identity either.`);
+      out.warn(`${missingIdentities.length - 10} more repos here name no GitHub identity either.`);
     }
     if (missingIdentities.length > 0) {
       const one = missingIdentities.length === 1;
-      say(
-        `  Carrick has nothing to connect ${one ? "it" : "them"} to. Run carrick init --repo owner/repo${one ? "" : " in each of them"}, or give the alias a HostName github.com line in your ssh config.`,
+      out.warn(
+        `Carrick has nothing to connect ${one ? "it" : "them"} to. Run carrick init --repo owner/repo${one ? "" : " in each of them"}, or give the alias a HostName github.com line in your ssh config.`,
       );
     }
     if (parsed.project && missingIdentities.length > 0) {
@@ -336,16 +319,12 @@ export async function init(argv: string[]): Promise<number> {
     if (parsed.project && names.length === 0) {
       throw new Error(`--project ${parsed.project} found no GitHub repos to verify.`);
     }
-    if (parsed.project) {
-      say(`Repos requested for project "${parsed.project}":`);
-      for (const name of names) say(`  ${name}`);
-    } else if (names.length === 0) {
+    if (names.length === 0) {
       // The sentence that stops the rest of this run from reading as a
       // complete one: no project is chosen, no connection is checked, and a
       // later upload has no repo identity to resolve a project from.
-      say("No repo here names a GitHub repository, so this run chooses no project and checks no connection.");
+      out.warn("No repo here names a GitHub repository, so this run chooses no project and checks no connection.");
     }
-    requested = names;
     const initial = await resolveRepos(credential.token, names);
     // The project half of the browser round trip, where this API can do it
     // from here: the project is created here, and `connectRepos` puts the
@@ -353,7 +332,7 @@ export async function init(argv: string[]): Promise<number> {
     // the GitHub App grant and nothing else. Without --project the step reads
     // the assignment the repos already have and offers the list, rather than
     // doing nothing at all (carrick#987).
-    const prompts = { say, ask, confirm, interactive, assumeYes: parsed.assumeYes };
+    const prompts = { say: out.say, ask: out.ask, confirm: out.confirm, interactive, assumeYes: parsed.assumeYes };
     let project = parsed.project;
     let projectExists = false;
     if (project === null) {
@@ -367,77 +346,89 @@ export async function init(argv: string[]): Promise<number> {
       interactive,
       project: project ?? undefined,
       projectExists,
-      say,
+      say: out.say,
     });
+    // Who this machine is, and where its answers come from. The workspace slug
+    // is the login: nothing on the credential or in the workspace read names a
+    // user (carrick#1026).
+    out.done(
+      project === null
+        ? `Signed in as ${identity.workspace.slug}`
+        : `Signed in as ${identity.workspace.slug} · project ${project}`,
+    );
     if (project !== null && !reposAreInProject(identity, names, project)) {
       // An unverified project does not end the run, whether it was named on
       // the command line or picked here. Stopping cost someone their hooks and
       // their proposal for a browser step they could only take afterwards, and
       // the documented command then needed two runs (carrick#993 row 8).
-      say(
-        `Setup continues; finish the browser steps above to put these repos in "${project}", then run carrick init --project ${project} again to verify.`,
+      out.warn(
+        `Finish the browser steps above to put these repos in "${project}", then run carrick init --project ${project} again to verify.`,
       );
     }
-    say(`Carrick workspace: ${identity.workspace.slug}`);
-    if (identity.allowance_sentence) say(identity.allowance_sentence);
+    if (identity.allowance_sentence) out.say(identity.allowance_sentence);
+    const connected: string[] = [];
     for (const repo of identity.repos) {
-      if (!repo.connected) say(`${repo.full_name} is not connected to this Carrick workspace.`);
-      // How to give it one is the last thing this command prints, once, rather
-      // than a workflow line per repo before anything is set up.
-      else if (repo.services.length === 0) say(`${repo.full_name} is connected and has no hosted index yet.`);
-      else hostedIndex.push(repo.full_name);
+      if (!repo.connected) out.warn(`${repo.full_name} is not connected to this Carrick workspace.`);
+      else {
+        connected.push(repo.full_name);
+        if (repo.services.length > 0) hostedIndex.push(repo.full_name);
+      }
     }
+    if (connected.length > 0) out.done(connectedLine(connected));
     // The rest of the project, which this machine does not hold. Carrick
     // answers across every repo in a project, so a folder holding half of one
     // is a partial index and nothing here would otherwise say so
     // (carrick#993 row 18).
-    for (const line of absentRepos(identity, names, project)) say(line);
+    for (const line of absentRepos(identity, names, project)) out.warn(line);
   } catch (error) {
     process.stderr.write(`carrick init: ${(error as Error).message}\n`);
     return 1;
   }
   const plan = derived.plan;
-  say(`Repos to index, in ${plan.workspace} (${plan.repos_detected_by}):`);
   if (plan.parent_proposal) {
     const parent = plan.parent_proposal;
-    // Reads like the scanner's own sentence for the same proposal, capped the
-    // same way: a folder of scratch checkouts holds dozens, and the folder
-    // that holds them is already named here.
     const names = parent.repos.map((repo) => path.basename(repo));
     const shown = names.length > 3 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", ");
-    say(`The parent folder ${parent.directory} holds ${parent.repos.length} ${parent.repos.length === 1 ? "repo" : "repos"}: ${shown}. Run carrick init .. to initialise that workspace.`);
+    out.warn(`The parent folder ${parent.directory} holds ${parent.repos.length} ${parent.repos.length === 1 ? "repo" : "repos"}: ${shown}. Run carrick init .. to initialise that workspace.`);
   }
-  for (const repo of plan.repos) {
-    say(`  ${repo.path} (${repo.reason})`);
-    for (const service of repo.services) {
-      say(`    ${service.serviceName ?? "<repository>"}: directory ${service.directory ?? "."}, tsconfig ${service.tsconfig ?? "scanner default"}`);
-    }
-    for (const warning of repo.warnings) say(`    ${warning}`);
-  }
-  for (const missing of plan.missing) say(`Missing workspace override: ${missing}`);
+  // The scanner's own warnings about what it proposed. Capped: the proposal
+  // file carries every one of them, and it is named on the line above.
+  const warnings = plan.repos.flatMap((repo) => repo.warnings);
+  for (const warning of warnings.slice(0, 3)) out.warn(warning);
+  if (warnings.length > 3) out.warn(`${warnings.length - 3} more notes on the proposal are in ${PROPOSAL_FILE}.`);
+  for (const missing of plan.missing) out.warn(`Missing workspace override: ${missing}`);
+  const proposed = packagesLine(plan);
+  const subject = packagesFound(plan);
   if (!parsed.assumeYes) {
     if (!process.stdin.isTTY) {
       process.stderr.write("carrick init: use --yes to accept this proposal without a terminal.\n");
       return 1;
     }
-    if (!await confirm("Write this proposal and configure hooks?")) return 0;
+    // The count is in the question, because the listing that used to stand
+    // above it is gone: this is where a reader decides (carrick#1026).
+    if (!await out.confirm(`Write the proposal for ${subject} and configure hooks?`)) return 0;
   }
   try {
     // The proposal is a seed for an agent, not a config: nothing derived
     // without a model is written into the repository, because the first scan
     // is the paid one and it has to run against a config someone has read
     // (carrick-cloud#799).
-    say(`wrote  ${writeProposal(plan.workspace, derived)}`);
+    writeProposal(plan.workspace, derived);
+    out.done(proposed);
   } catch (error) {
     process.stderr.write(`carrick init: ${(error as Error).message}\n`);
     return 1;
   }
 
-  // 3. The agent hooks. Merged by command: this file may already hold a user's
-  //    own hooks, or the hook pack the hosted index installs.
+  // The agent hooks, merged by command: this file may already hold a user's
+  // own hooks, or the hook pack the hosted index installs. And the MCP
+  // connection, for work that crosses repos this machine does not hold,
+  // configured for every client this machine has rather than printed for one
+  // of them (carrick#955).
   const command = hookCommand({ onPath });
   const settingsName = path.join(".claude", command.bare ? "settings.json" : "settings.local.json");
   const settingsFile = path.join(workspace, settingsName);
+  let hooksWritten = true;
   try {
     const settings = fs.existsSync(settingsFile) ? fs.readFileSync(settingsFile, "utf8") : null;
     const otherFile = path.join(workspace, ".claude", command.bare ? "settings.local.json" : "settings.json");
@@ -446,93 +437,46 @@ export async function init(argv: string[]): Promise<number> {
     const hooks = mergeCarrickHooks(settings, command.command);
     // Validate both documents before migrating our entries between them.
     if (cleaned?.changed) writeIfChanged(otherFile, cleaned.body);
-    const wroteHooks = writeIfChanged(settingsFile, hooks.body);
-    say(`${wroteHooks === "written" ? "wrote" : "unchanged"}  ${settingsName}`);
-    if (!command.bare) {
-      say(
-        `         \`carrick\` is not on PATH here, so those hooks name this install: ${command.command}.`,
-      );
-      say(
-        "         An npx run leaves nothing on PATH afterwards, and a hook that cannot find carrick",
-      );
-      say(
-        "         says nothing rather than failing your edit. `npm install -g carrick` and run init",
-      );
-      say("         again to write the short command instead.");
-    }
+    writeIfChanged(settingsFile, hooks.body);
   } catch (error) {
-    say(
-      `Could not configure Carrick hooks: ${(error as Error).message}. Fix the settings files and run carrick init again.`,
+    hooksWritten = false;
+    out.refuse(
+      `Could not configure Carrick hooks: ${(error as Error).message}. Fix ${settingsName} and run carrick init again.`,
     );
   }
-
-  // 4. The MCP connection, for work that crosses repos this machine does not
-  //    hold. Configured here for every client this machine has, rather than
-  //    printed for one of them (carrick#955).
-  say();
-  say("Next:");
-  say();
-  for (const line of mcpLines(connectMcpClients())) say(line);
-  say();
-  for (const line of editorLines(onPath)) say(line);
-  say();
-  say(`Start Claude Code in this folder — the hooks above are ${settingsName} here, and`);
-  say("the index covers every repo in it. The hooks need no plugin; the language server does:");
-  const plugin = path.join(packageRoot(), "plugin");
-  say(`    claude --plugin-dir ${fs.existsSync(plugin) ? plugin : "<carrick checkout>/plugin"}`);
+  const mcp = connectMcpClients();
+  if (hooksWritten) out.done(configuredLine(mcp));
+  for (const line of mcpClientLines(mcp)) out.done(line);
   if (!command.bare) {
-    say(
-      "    That plugin's language server is started as `carrick`, which this machine cannot resolve;",
+    out.warn(
+      `\`carrick\` is not on PATH, so the hooks in ${settingsName} name this install. Run \`npm install -g carrick\` and carrick init again for the short command.`,
     );
-    say("    install it globally first, or the hooks above are the channel.");
   }
-  say("Once the index exists, editing a file with a route or a call in it is what");
-  say("Carrick answers on; `carrick status` says what the index holds.");
-  say();
-  // No scan ran here, and that is the point (carrick-cloud#799): the one scan
-  // runs against a config someone has read, so the last thing this command
-  // prints is the prompt that produces that config. Nothing here names a
-  // rehearsal pass: `carrick index` is the only scan in the flow, and a
-  // facts-only one has no user (carrick#1008, cloud#832).
-  //
-  // Unless CI has already built one. The hosted index is the whole workspace's
-  // row, and `carrick index` from a laptop on a branch replaces it for
-  // everyone who queries it, so where the workspace read found services this
-  // run orders no scan (carrick#993 row 2) and reads that index onto this
-  // machine instead. Saying "do not run the scan" and leaving `.carrick`
-  // empty left the reader with no index and no command that would make one,
-  // which is every second developer on a team (carrick#1020).
+  for (const outcome of mcp.filter((entry) => entry.state === "failed")) {
+    out.warn(`MCP not configured for ${outcome.client}: ${outcome.detail}`);
+  }
+  if (mcp.length === 0) out.warn(`No agent client found on this machine. In Claude Code: ${MCP_LINE}`);
+
+  // No paid scan ran here, and that is the point (carrick-cloud#799): the one
+  // scan runs against a config someone has read. Where CI has already built an
+  // index, this run reads it onto the machine instead — the hosted index is
+  // the whole workspace's row, and `carrick index` from a laptop on a branch
+  // replaces it for everyone who queries it (carrick#993 row 2, carrick#1020).
   if (hostedIndex.length > 0) {
-    const subject =
-      hostedIndex.length === requested.length && requested.length === 1
-        ? "This repo"
-        : hostedIndex.length > 3
-          ? `${hostedIndex.slice(0, 3).join(", ")} and ${hostedIndex.length - 3} more`
-          : hostedIndex.join(", ");
-    say(`  ${subject} already ${hostedIndex.length === 1 ? "has" : "have"} a hosted index, so this run reads it`);
-    say("  into .carrick/ rather than scanning: no model runs and nothing is uploaded.");
-    say("  It re-reads the source on this machine once, which on a large workspace is a");
-    say("  few minutes.");
-    say();
-    for (const line of hostedLines(await downloadHostedIndex(plan.workspace))) say(line);
-    say(`  ${PROPOSAL_FILE} holds the services this run derived, to compare`);
-    say("  with the carrick.json already committed.");
+    const outcome = await out.step("Reading the hosted index into .carrick/", () =>
+      downloadHostedIndex(plan.workspace, nativeRunner(out.quiet)),
+    );
+    const report = hostedReport(outcome);
+    out[report.kind](report.text);
   } else {
-    say(`  There is no index yet. ${PROPOSAL_FILE} holds the services this run derived;`);
-    say("  an agent turns it into carrick.json, adds the CI check (which needs no secret),");
-    say("  reads the config back against the repo, and runs `carrick index --detach` once:");
-    say("  the single scan that builds the index and asks Carrick to classify the rest.");
-    say("  By hand instead: `carrick templates workflow > .github/workflows/carrick.yml`, a");
-    say("  carrick.json per https://docs.carrick.tools/carrick-json, then that command.");
+    out.done("No index yet: your agent runs the one scan");
   }
-  say();
-  say("  Paste this to your agent:");
-  say();
-  say(`    ${agentScaffoldPrompt(hostedIndex.length > 0)}`);
+  out.note("Next: paste this to your agent", [SCAFFOLD_SENTENCE]);
+  out.say(`Docs: ${out.accent(DOCS)}`);
   return 0;
 }
 
-/** `carrick templates <name>`, so the workflow above is one command. */
+/** `carrick templates <name>`, so a workflow is one command. */
 export function templates(argv: string[]): number {
   const [name, ...rest] = argv;
   const variables: Record<string, string> = {};

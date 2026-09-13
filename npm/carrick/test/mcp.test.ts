@@ -10,7 +10,6 @@ import test from "node:test";
 import path from "node:path";
 import {
   connectMcpClients,
-  mcpLines,
   mergeServerEntry,
   MCP_LINE,
   MCP_URL,
@@ -60,9 +59,6 @@ test("a machine with no agent client is told the line, and nothing is written", 
   const { env, written } = machine({ commands: ["claude"] });
   assert.deepEqual(connectMcpClients(env), []);
   assert.deepEqual(written, {});
-  const lines = mcpLines([]);
-  assert.ok(lines.some((line) => line.includes(MCP_LINE)));
-  assert.ok(lines.some((line) => line.includes(MCP_URL)));
 });
 
 test("Claude Code is connected by its own command, once", () => {
@@ -100,7 +96,6 @@ test("a command that fails leaves the line to copy, and no claim", () => {
   const outcomes = connectMcpClients(env);
   assert.equal(outcomes[0]?.state, "failed");
   assert.equal(outcomes[0]?.detail, MCP_LINE);
-  assert.ok(mcpLines(outcomes).some((line) => line.includes("could not")));
 });
 
 test("a client with no config file yet gets one in that client's own shape", () => {
@@ -203,9 +198,11 @@ test("a hand-edited file that no longer parses is reported, never replaced", () 
   assert.deepEqual(written, {});
 });
 
-test("every path written is printed", () => {
+test("every path written is reported, for the line init prints", () => {
   const { env } = machine({ directories: [path.join(HOME, ".cursor")] });
-  const lines = mcpLines(connectMcpClients(env)).join("\n");
-  assert.ok(lines.includes(cursorFile));
-  assert.ok(lines.includes(MCP_URL));
+  const outcomes = connectMcpClients(env);
+  assert.equal(outcomes[0]?.state, "written");
+  // The detail IS the path, and `mcpClientLines` prints it: a guessed config
+  // file has to be one visible line and one entry to delete.
+  assert.equal(outcomes[0]?.detail, cursorFile);
 });

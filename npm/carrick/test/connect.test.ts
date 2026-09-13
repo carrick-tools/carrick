@@ -73,7 +73,10 @@ test("a repo connected to another project remains pending until it reaches the r
   assert.match(lines.join("\n"), /acme\/api is currently in project "default-project"/);
   assert.match(lines.join("\n"), /Create project "payments" if needed: https:\/\/app\.carrick\.tools\/w\/acme\/projects/);
   assert.match(lines.join("\n"), /Assign the requested repos: https:\/\/app\.carrick\.tools\/w\/acme\/repos/);
-  assert.match(lines.join("\n"), /Verified 1 repo in project "payments"/);
+  // The settled assignment is the claim, read back from the poll. The line
+  // that repeated it as a verdict is gone: init states the project once, on the
+  // line that names the login (carrick#1026).
+  assert.match(lines.join("\n"), /acme\/api is currently in project "payments"/);
 });
 
 test("a wrong project cannot be replayed as though it were selected", async () => {
@@ -118,8 +121,10 @@ test("an already verified repeated init neither opens nor polls", async () => {
   });
 
   assert.deepEqual(result, assignedToPayments);
-  assert.match(lines.join("\n"), /acme\/api is currently in project "payments"/);
-  assert.match(lines.join("\n"), /Verified 1 repo in project "payments"/);
+  // And says nothing at all: a repo already where it was asked to be is not a
+  // thing that happened, and init states the project once, on the line that
+  // names the login (carrick#1026).
+  assert.deepEqual(lines, []);
 });
 
 test("noninteractive project setup prints browser steps and returns unverified", async () => {
@@ -190,7 +195,10 @@ test("the requested repos are placed from here, and the claim still comes from t
   assert.deepEqual(asked, [["acme/api"]]);
   assert.deepEqual(result, assignedToPayments);
   assert.match(lines.join("\n"), /Moved acme\/api into project "payments"\./);
-  assert.match(lines.join("\n"), /Verified 1 repo in project "payments"/);
+  // The settled assignment is the claim, read back from the poll. The line
+  // that repeated it as a verdict is gone: init states the project once, on the
+  // line that names the login (carrick#1026).
+  assert.match(lines.join("\n"), /acme\/api is currently in project "payments"/);
   // The browser step this replaces is not printed at all.
   assert.doesNotMatch(lines.join("\n"), /Assign the requested repos/);
   assert.doesNotMatch(lines.join("\n"), /not verified/);
@@ -285,7 +293,10 @@ test("assignment happens when the poll sees the repo, not before", async () => {
 
   assert.deepEqual(asked, [["acme/api"]]);
   assert.deepEqual(result, assignedToPayments);
-  assert.match(lines.join("\n"), /Verified 1 repo in project "payments"/);
+  // The settled assignment is the claim, read back from the poll. The line
+  // that repeated it as a verdict is gone: init states the project once, on the
+  // line that names the login (carrick#1026).
+  assert.match(lines.join("\n"), /acme\/api is currently in project "payments"/);
   assert.doesNotMatch(lines.join("\n"), /Assign the requested repos/);
 });
 

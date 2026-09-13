@@ -92,12 +92,6 @@ function reportAssignments(
   }
 }
 
-function verifiedLine(repos: string[], project: string): string {
-  return repos.length === 1
-    ? `Verified 1 repo in project "${project}".`
-    : `Verified ${repos.length} repos in project "${project}".`;
-}
-
 /**
  * The repos this run may still place: connected to the workspace, and in some
  * other project than the one asked for.
@@ -129,6 +123,15 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
   const assignments = new Map<string, string>();
   const poll = options.poll ?? ((signal?: AbortSignal) => resolveRepos(token, repos, fetch, signal));
   const project = options.project;
+  // A repo that is already where it was asked to be is not news: the run states
+  // the project once, on the line naming the login (carrick#1026). Seeding the
+  // map with those repos leaves this reporting only what CHANGED or what is
+  // somewhere else, which is what a reader can act on.
+  if (project !== undefined) {
+    for (const name of repos) {
+      if (assignment(initial, name) === project) assignments.set(name.toLowerCase(), project);
+    }
+  }
   const assign =
     options.assign ??
     ((names: string[], signal?: AbortSignal) => assignRepos(token, project ?? "", names, fetch, signal));
@@ -193,12 +196,10 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
   if (project !== undefined) {
     reportAssignments(latest, repos, assignments, options.say);
     if (reposAreInProject(latest, repos, project)) {
-      options.say(verifiedLine(repos, project));
       return latest;
     }
     latest = await settle(latest, options.signal);
     if (reposAreInProject(latest, repos, project)) {
-      options.say(verifiedLine(repos, project));
       return latest;
     }
     // The create step is skipped only when this run has just seen the project
@@ -255,7 +256,6 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
         reportAssignments(latest, repos, assignments, options.say);
         latest = await settle(latest, signal);
         if (reposAreInProject(latest, repos, project)) {
-          options.say(verifiedLine(repos, project));
           return latest;
         }
         if (!placeable) browserAssign();
