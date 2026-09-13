@@ -310,7 +310,17 @@ function staleLine(result: CheckResult): string | null {
     typeof changed === "number"
       ? ` ${changed} file(s) in the workspace have changed since ${shortHash(result.index_commit)}.`
       : "";
-  return `This file has changed since the index, so these verdicts describe the indexed version.${suffix}`;
+  // A re-check that ran has already answered from the working tree, so the
+  // sentence that sends a reader to re-index would be false (carrick#1036).
+  const ran = result.recheck?.ran;
+  if (ran && ran !== "none") {
+    return `These verdicts were re-computed from your working tree in ${result.recheck?.elapsed_ms} ms.${suffix}`;
+  }
+  const since = result.recheck?.stale_since;
+  const budget = since
+    ? ` The re-check did not finish inside its budget, so this is the answer computed at ${since}.`
+    : "";
+  return `This file has changed since the index, so these verdicts describe the indexed version.${suffix}${budget}`;
 }
 
 /**

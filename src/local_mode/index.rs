@@ -350,7 +350,13 @@ fn scan_repo(
 /// asks for and what a facts-only one does: the difference between them is
 /// entirely in this environment, and it is the difference between a free pass
 /// and a paid one.
-fn scan_command(exe: &Path, repo: &Path, blobs: &Path, previous: &Path, infer: bool) -> Command {
+pub(super) fn scan_command(
+    exe: &Path,
+    repo: &Path,
+    blobs: &Path,
+    previous: &Path,
+    infer: bool,
+) -> Command {
     let mut command = Command::new(exe);
     command
         .arg(repo)
@@ -409,7 +415,7 @@ fn join(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Result<LocalJoin, 
 /// The subprocess the join phase runs as, built apart from the spawn for the
 /// same reason [`scan_command`] is: what this phase asks for is entirely in
 /// its environment, and a test reads it back from here.
-fn join_command(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Command {
+pub(super) fn join_command(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Command {
     let mut command = Command::new(exe);
     command
         .arg(repo)
@@ -609,7 +615,7 @@ pub(super) fn repo_label(repo: &Path) -> String {
 }
 
 /// `service_name ?? repo_name`, the identity every cross-repo surface uses.
-fn service_id(blob: &CloudRepoData) -> String {
+pub(super) fn service_id(blob: &CloudRepoData) -> String {
     blob.service_name
         .clone()
         .unwrap_or_else(|| blob.repo_name.clone())
@@ -652,7 +658,7 @@ fn service_include(blob: &CloudRepoData) -> Vec<String> {
 }
 
 /// Every blob in the cache dir, in a stable order.
-fn read_blobs(blobs: &Path) -> Result<Vec<CloudRepoData>, String> {
+pub(super) fn read_blobs(blobs: &Path) -> Result<Vec<CloudRepoData>, String> {
     let Ok(entries) = std::fs::read_dir(blobs) else {
         return Ok(Vec::new());
     };
@@ -673,7 +679,7 @@ fn read_blobs(blobs: &Path) -> Result<Vec<CloudRepoData>, String> {
 }
 
 /// Fold the blobs and the join into the read model.
-fn build(
+pub(super) fn build(
     workspace: &Workspace,
     blobs_dir: &Path,
     join: &LocalJoin,

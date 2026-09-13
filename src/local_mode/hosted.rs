@@ -550,16 +550,35 @@ fn project_is_unchanged(
     named == held
 }
 
+/// The remotes and the cached snapshot, with no network request of any kind.
+///
+/// What a re-check reads (carrick#1036): the hosted services it judges against
+/// are the ones the last `index` or `refresh` already downloaded, so an edit
+/// costs a scan of one repo and nothing on the wire. The snapshot is subject to
+/// the same credential gate as every other read — a different account, or a
+/// different authenticated workspace, is no snapshot at all rather than another
+/// account's rows.
+///
+/// `failure` is left unset: not reading the cloud is this function's contract,
+/// not a degradation of it, and a caller with no snapshot answers from local
+/// counterparts alone.
+pub(super) fn cached(workspace: &Workspace) -> HostedInput {
+    let mut input = HostedInput {
+        remotes: remotes_of(workspace),
+        ..Default::default()
+    };
+    let Ok(Some(credential)) = Credential::load() else {
+        return input;
+    };
+    input.snapshot = read_snapshot(workspace, &credential);
+    input
+}
+
 /// Read only at explicit index/refresh time. A separate thread owns its Tokio
 /// runtime because the CLI dispatcher itself already runs inside Tokio.
 pub(super) fn refresh(workspace: &Workspace) -> HostedInput {
-    let remotes = workspace
-        .repos
-        .iter()
-        .filter_map(|path| remote_name(path).map(|name| (path.clone(), name)))
-        .collect();
     let mut input = HostedInput {
-        remotes,
+        remotes: remotes_of(workspace),
         ..Default::default()
     };
     let credential = match Credential::load() {
@@ -571,20 +590,7 @@ pub(super) fn refresh(workspace: &Workspace) -> HostedInput {
         }
     };
     let cache = workspace.index_dir().join("hosted/snapshot.json");
-    let old: Option<Snapshot> = std::fs::read(&cache)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .filter(|s: &Snapshot| {
-            s.identity == credential.identity()
-                && serde_json::to_value(&s.resolution)
-                    .ok()
-                    .and_then(|v| Resolution::parse(v).ok())
-                    .is_some()
-                && credential
-                    .workspace_slug
-                    .as_ref()
-                    .is_none_or(|w| *w == s.resolution.workspace.slug)
-        });
+    let old = read_snapshot(workspace, &credential);
     let repos = input.remotes.values().cloned().collect();
     let fallback = old.clone();
     let result = std::thread::spawn(move || {
@@ -617,6 +623,34 @@ pub(super) fn refresh(workspace: &Workspace) -> HostedInput {
         }
     }
     input
+}
+
+/// The git remote of every repo in the workspace that has one.
+fn remotes_of(workspace: &Workspace) -> BTreeMap<PathBuf, String> {
+    workspace
+        .repos
+        .iter()
+        .filter_map(|path| remote_name(path).map(|name| (path.clone(), name)))
+        .collect()
+}
+
+/// The snapshot on disk, if it belongs to this credential and this
+/// authenticated workspace and this build can still parse its resolution.
+fn read_snapshot(workspace: &Workspace, credential: &Credential) -> Option<Snapshot> {
+    std::fs::read(workspace.index_dir().join("hosted/snapshot.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .filter(|s: &Snapshot| {
+            s.identity == credential.identity()
+                && serde_json::to_value(&s.resolution)
+                    .ok()
+                    .and_then(|v| Resolution::parse(v).ok())
+                    .is_some()
+                && credential
+                    .workspace_slug
+                    .as_ref()
+                    .is_none_or(|w| *w == s.resolution.workspace.slug)
+        })
 }
 
 fn persist(path: &Path, snapshot: &Snapshot) -> Result<(), String> {

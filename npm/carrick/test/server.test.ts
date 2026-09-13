@@ -56,6 +56,8 @@ test("the CLI runs from the workspace root with the file relative to it", async 
 
   const call = firstCall(argvLog);
   assert.ok(call);
+  // No `--recheck`: this runs on every save, and a re-check would put a scan
+  // of the repo behind each one (carrick#1036).
   assert.deepEqual(call.argv, ["check", "user-service/src/routes/users.ts", "--json"]);
   assert.equal(fs.realpathSync(call.cwd), fs.realpathSync(workspace.root));
 });

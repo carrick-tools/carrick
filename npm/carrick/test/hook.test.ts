@@ -87,6 +87,23 @@ test("an edit to a file the index has no rows for runs no CLI at all", async (t)
   assert.equal(fs.existsSync(argvLog), false);
 });
 
+test("an edit asks for the file to be re-judged from the working tree", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const argvLog = path.join(workspace.root, "argv.log");
+
+  await runHook("post-edit.ts", {
+    payload: editPayload(workspace),
+    env: fakeEnv({ CARRICK_FAKE_ARGV_LOG: argvLog }),
+  });
+  const call = firstCall(argvLog);
+  assert.ok(call);
+  // The language server's own call is asserted without it in server.test.ts:
+  // this surface fires once per completed edit, that one fires on every save
+  // (carrick#1036).
+  assert.ok(call.argv.includes("--recheck"), call.argv.join(" "));
+});
+
 test("a broken CLI never fails the edit", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());

@@ -78,7 +78,11 @@ async function main(): Promise<void> {
   if (note) log(note);
 
   const relative = path.isAbsolute(file) ? path.relative(choice.root, file) : file;
-  const outcome = await check(relative, { cwd: choice.root });
+  // The edit just landed, so the index describes the file as it was before it.
+  // This is the one surface that asks for the file to be re-judged from the
+  // working tree; it fires once per completed edit, where the language server
+  // fires on every save (carrick#1036).
+  const outcome = await check(relative, { cwd: choice.root, recheck: true });
   if (!outcome.result) {
     log("no answer for", relative, outcome.failure ?? "");
     return;
