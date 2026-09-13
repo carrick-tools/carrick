@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.64](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.63...carrick-v0.3.64) (2026-09-13)
+
+
+### Features
+
+* **local:** carrick index always infers, and --infer is refused ([#1015](https://github.com/carrick-tools/carrick/issues/1015)) ([11e06bd](https://github.com/carrick-tools/carrick/commit/11e06bd1a4be8fab605aef84c269fbca02463f2e)), closes [#1008](https://github.com/carrick-tools/carrick/issues/1008)
+
+
+### Bug Fixes
+
+* **local:** finish the drift filter, the fold key and the published status ([#1019](https://github.com/carrick-tools/carrick/issues/1019)) ([7203550](https://github.com/carrick-tools/carrick/commit/7203550cb5abd1f731c6fdc9755cfee8b6f37c35)), closes [#1007](https://github.com/carrick-tools/carrick/issues/1007)
+* the first ten minutes after a paid scan ([#1007](https://github.com/carrick-tools/carrick/issues/1007)), the silent editor after an upgrade ([#1009](https://github.com/carrick-tools/carrick/issues/1009)), and the rolled-log crash ([#936](https://github.com/carrick-tools/carrick/issues/936)) ([#1016](https://github.com/carrick-tools/carrick/issues/1016)) ([0e6c2e4](https://github.com/carrick-tools/carrick/commit/0e6c2e4aeab97bcf9b2971d251d2fa17851d785f))
+
 ## [0.3.63](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.62...carrick-v0.3.63) (2026-09-12)
 
 
