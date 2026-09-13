@@ -747,8 +747,11 @@ fn without_git_the_mtime_is_the_only_signal() {
 /// service in the monorepo (carrick#997 item 4).
 ///
 /// The monorepo fixture is the shape that shows it: two services with their
-/// own directories, and repo-level files (`carrick.json`, a workflow, an
-/// editor's settings) that neither of them reads.
+/// own directories, and repo-level files that neither of them reads.
+///
+/// And only the ones a scan reads: a changed workflow or `renovate.json`
+/// holds no indexed row, so it cannot make one stale, and counting it read as
+/// drift on a tree nobody had touched (carrick#1007 item 5).
 #[test]
 #[serial]
 fn status_attributes_a_repo_level_file_to_the_repo_and_not_to_every_service() {
@@ -757,9 +760,14 @@ fn status_attributes_a_repo_level_file_to_the_repo_and_not_to_every_service() {
     index(root);
 
     let repo = root.join("orders-monorepo");
+    // What onboarding leaves behind: no service reads these, and no index row
+    // comes from them either.
     std::fs::write(repo.join("renovate.json"), "{}\n").expect("a repo-level file");
     std::fs::create_dir_all(repo.join(".github/workflows")).expect("the workflow directory");
     std::fs::write(repo.join(".github/workflows/carrick.yml"), "on: push\n").expect("a workflow");
+    // A source file outside every service: this one IS drift the repo owns.
+    std::fs::create_dir_all(repo.join("tools")).expect("the tools directory");
+    std::fs::write(repo.join("tools/release.ts"), "export const a = 1;\n").expect("a script");
     std::fs::write(
         repo.join("packages/gateway/notes.txt"),
         "inside one service\n",
@@ -801,26 +809,27 @@ fn status_attributes_a_repo_level_file_to_the_repo_and_not_to_every_service() {
     assert_eq!(repos.len(), 1, "{body:#}");
     assert_eq!(
         repos[0]["outside_every_service"],
-        serde_json::json!(2),
-        "the two repo-level files, stated once:\n{:#}",
+        serde_json::json!(1),
+        "the one repo-level SOURCE file, stated once:\n{:#}",
         repos[0]
     );
-    assert_eq!(repos[0]["changed_since_index"], serde_json::json!(3));
+    assert_eq!(repos[0]["changed_since_index"], serde_json::json!(4));
     let outside: Vec<&str> = repos[0]["stale_files"]
         .as_array()
         .expect("stale_files")
         .iter()
         .map(|file| file.as_str().expect("a path"))
         .collect();
-    assert_eq!(
-        outside,
-        vec![".github/workflows/carrick.yml", "renovate.json"]
-    );
+    assert_eq!(outside, vec!["tools/release.ts"]);
 
     let rendered = run(root, &["status", "--workspace", "."]);
     assert!(
-        rendered.contains("orders-monorepo: 2 file(s) changed outside every service"),
+        rendered.contains("orders-monorepo: 1 file(s) changed outside every service"),
         "and the human form says it under the repo:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("carrick.yml") && !rendered.contains("renovate.json"),
+        "a file no scan reads is not drift:\n{rendered}"
     );
 }
 
@@ -963,16 +972,20 @@ fn a_detached_scan_outlives_the_command_that_started_it() {
     while Instant::now() < deadline && !index.is_file() {
         std::thread::sleep(Duration::from_millis(250));
     }
-    // The file is removed after the index is written, so give the child the
-    // moment between the two.
+    // The record is rewritten after the index is written, so give the child
+    // the moment between the two.
     let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline && state.exists() {
+    while Instant::now() < deadline
+        && !std::fs::read_to_string(&state).is_ok_and(|text| text.contains("\"finished\""))
+    {
         std::thread::sleep(Duration::from_millis(250));
     }
-    assert!(
-        !state.exists(),
-        "a finished scan removes its state file; it is evidence of a process, not of a result"
-    );
+    // The word the scaffold tells an agent to poll for. The record is kept
+    // until the next build so that `carrick status` can say it once
+    // (carrick#1007 item 4).
+    let record = std::fs::read_to_string(&state).expect("the finished record is kept");
+    assert!(record.contains("\"status\": \"finished\""), "{record}");
+    assert!(record.contains("finished_at"), "{record}");
     assert!(
         index.is_file(),
         "the detached child built the index this process never waited for:\n{}",
@@ -983,9 +996,28 @@ fn a_detached_scan_outlives_the_command_that_started_it() {
         printed.contains("indexed 2 repo(s)"),
         "the whole run is in the log, including the map:\n{printed}"
     );
-    // And the index it wrote answers like any other.
+    // And the index it wrote answers like any other, with the scan's own
+    // outcome above it.
     let status = run(root, &["status", "--workspace", "."]);
     assert!(status.contains("catalog-web"), "{status}");
+    assert!(
+        status.contains("finished after") && status.contains("The index is written"),
+        "status says the word the poll waits for:\n{status}"
+    );
+    // The log's last line is the scan's outcome, not a count that stopped.
+    let printed = std::fs::read_to_string(&log).expect("the log is readable");
+    assert!(
+        printed.lines().any(|line| line.contains("finished after")),
+        "the log ends on the outcome:\n{printed}"
+    );
+
+    // The next build is what forgets it.
+    run(root, &["index", "--workspace", "."]);
+    assert!(
+        !state.exists(),
+        "a build clears the finished record it found:\n{}",
+        std::fs::read_to_string(&state).unwrap_or_default()
+    );
 }
 
 /// A scan killed part-way is the case the flag exists for, so it is the one

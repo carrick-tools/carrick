@@ -52,6 +52,68 @@ pub(crate) fn syntax_for_path(file_path: &Path) -> (Syntax, bool) {
     }
 }
 
+/// Reads one fact out of a module: the specifiers it imports from.
+///
+/// It owns a source map and a quiet diagnostic handler, as
+/// [`crate::import_bindings::BindingResolver`] does, so a caller reading many
+/// files pays for that setup once. A file that does not parse contributes
+/// nothing rather than failing the pass — the caller is answering "what does
+/// this member import", and an unparseable file is an unanswerable part of it.
+///
+/// Static specifiers only: `import`, `export ... from` and `export * from`.
+/// A `await import(expr)` names its target inside an expression and is not
+/// read here; nothing in this scanner depends on it being.
+pub struct ModuleReader {
+    source_map: Lrc<SourceMap>,
+    handler: Handler,
+}
+
+impl Default for ModuleReader {
+    fn default() -> Self {
+        let source_map: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(
+            swc_common::errors::ColorConfig::Never,
+            false,
+            false,
+            Some(source_map.clone()),
+        );
+        Self {
+            source_map,
+            handler,
+        }
+    }
+}
+
+impl ModuleReader {
+    /// Every module specifier `file` imports from, in source order.
+    ///
+    /// Type-only imports are included: a package imported for its types alone
+    /// is still imported, and a shared types package is exactly the member a
+    /// dependents list exists to name.
+    pub fn import_specifiers(&mut self, file: &Path) -> Vec<String> {
+        use swc_ecma_ast::{ModuleDecl, ModuleItem};
+        let Some(module) = parse_file(file, &self.source_map, &self.handler) else {
+            return Vec::new();
+        };
+        module
+            .body
+            .iter()
+            .filter_map(|item| match item {
+                ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
+                    Some(import.src.value.to_string())
+                }
+                ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(export)) => {
+                    export.src.as_ref().map(|src| src.value.to_string())
+                }
+                ModuleItem::ModuleDecl(ModuleDecl::ExportAll(export)) => {
+                    Some(export.src.value.to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 /// Parse a JavaScript or TypeScript file into an AST
 pub fn parse_file(
     file_path: &Path,

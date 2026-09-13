@@ -42,11 +42,22 @@ pub struct MemberFacts {
     /// A declared `main`.
     pub main: bool,
     /// A declared `exports`, the modern statement of an import surface.
+    ///
+    /// It separates a library from an application in an npm workspace and it
+    /// does NOT in a Deno one: a Deno workspace member declares `name` and
+    /// `exports` to be importable by its siblings at all, so every member of a
+    /// Deno workspace carries it, applications included (carrick#1007 item 6).
+    /// `workspace_dependents` is the field that separates them there.
     pub exports: bool,
     /// Deployment descriptors in the member's own directory, in a fixed order.
     pub deploy_config: Vec<String>,
-    /// The other members that declare a dependency on this one, by the name
-    /// this proposal gives them.
+    /// The other members that depend on this one, by the name this proposal
+    /// gives them.
+    ///
+    /// From the manifests where the manifests record it (an npm dependency
+    /// entry, a Deno import-map path), and from the import specifiers in a
+    /// Deno member's own source where they do not: a Deno member is imported
+    /// by its workspace NAME and no manifest anywhere records that edge.
     pub workspace_dependents: Vec<String>,
 }
 
@@ -445,11 +456,97 @@ pub fn member_facts(root: &Path, services: &[Config]) -> Vec<MemberFacts> {
                 .push(label(&services[index]));
         }
     }
+    // Where no manifest can record the edge, the source is the record. A Deno
+    // workspace member is importable by the `name` it declares, and a sibling
+    // that imports it writes that name and nothing else: no dependency entry,
+    // no import-map path, nothing in the lock file (which records a member's
+    // dependencies only when the member declares some). Reading the specifiers
+    // is the only way not to report `[]` — a claim — for every member of every
+    // Deno workspace (carrick#1007 item 6, following carrick#994).
+    for (index, manifest) in manifests.iter().enumerate() {
+        if manifest.is_none() || !is_deno_member(root, &services[index]) {
+            continue;
+        }
+        for other in imported_members(&directories, index, &by_package, &manifests) {
+            facts[other]
+                .workspace_dependents
+                .push(label(&services[index]));
+        }
+    }
     for entry in &mut facts {
         entry.workspace_dependents.sort();
         entry.workspace_dependents.dedup();
     }
     facts
+}
+
+/// Whether this service's own manifest is a Deno config rather than a
+/// `package.json`. Only there is a sibling dependency absent from every
+/// manifest.
+fn is_deno_member(root: &Path, service: &Config) -> bool {
+    member_manifest(root, service)
+        .is_some_and(|path| path.file_name().is_some_and(|name| name != "package.json"))
+}
+
+/// The members whose declared package name this member's source imports.
+///
+/// Bounded on purpose: the walk skips what every scan skips, a file is read
+/// as text and parsed only when it holds a member's name at all, and a file
+/// that belongs to a deeper member is that member's, not this one's. A file
+/// that does not parse contributes nothing, like every other read here.
+fn imported_members(
+    directories: &[PathBuf],
+    index: usize,
+    by_package: &BTreeMap<&str, usize>,
+    manifests: &[Option<crate::packages::ManifestFacts>],
+) -> BTreeSet<usize> {
+    let mut found = BTreeSet::new();
+    if by_package.is_empty() {
+        return found;
+    }
+    let (files, _) =
+        crate::file_finder::find_files(&directories[index].to_string_lossy(), &MANIFEST_SKIP_DIRS);
+    let mut resolver = crate::parser::ModuleReader::default();
+    for file in files {
+        // A file inside a nested member is that member's source, and its
+        // imports are that member's dependencies.
+        let owner = directories
+            .iter()
+            .enumerate()
+            .filter(|(_, directory)| file.starts_with(directory))
+            .max_by_key(|(_, directory)| directory.as_os_str().len())
+            .map(|(owner, _)| owner);
+        if owner != Some(index) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        // Nothing can be imported from a file that does not name it, so the
+        // parse is only paid for where an edge is possible.
+        if !by_package.keys().any(|name| text.contains(name)) {
+            continue;
+        }
+        for specifier in resolver.import_specifiers(&file) {
+            let Some(&other) = by_package.get(specifier.as_str()).or_else(|| {
+                // `@scope/shared/sub` imports the member `@scope/shared`.
+                by_package
+                    .iter()
+                    .find(|(name, _)| {
+                        specifier.starts_with(*name)
+                            && specifier.as_bytes().get(name.len()) == Some(&b'/')
+                    })
+                    .map(|(_, other)| other)
+            }) else {
+                continue;
+            };
+            if other != index && manifests[other].is_some() {
+                found.insert(other);
+            }
+        }
+    }
+    found.remove(&index);
+    found
 }
 
 fn nearest_tsconfig(root: &Path, directory: &Path) -> Option<String> {
