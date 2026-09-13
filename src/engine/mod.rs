@@ -998,6 +998,26 @@ fn print_boundaries(boundaries: &[(String, crate::boundary::ServiceBoundary)]) {
     }
 }
 
+/// How much of the log file this run's upload reads, and from where.
+///
+/// Start at this run's own offset, but never before the last 5 MB of the
+/// file: a pathologically chatty run must not ship hundreds of megabytes.
+///
+/// The clamp to `file_len` is the whole reason this is a function of its own.
+/// The day's log is rolled aside when it reaches its cap, and a build that
+/// crosses that moment holds an offset INTO THE ROLLED FILE while the live one
+/// is small or empty — so `file_len - start` underflowed, `Vec::with_capacity`
+/// was asked for something near `u64::MAX` bytes, and the process aborted on
+/// an allocation failure that read as a scanner crash (carrick#936). Past the
+/// end there is nothing of this run's left to upload, and an empty read says
+/// so.
+fn log_tail_range(file_len: u64, run_start: Option<u64>) -> (u64, usize) {
+    const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+    let cap_start = file_len.saturating_sub(MAX_LOG_BYTES);
+    let start = run_start.unwrap_or(0).max(cap_start).min(file_len);
+    (start, file_len.saturating_sub(start) as usize)
+}
+
 /// Best-effort upload of the current run's log tail to S3.
 ///
 /// Reads from the byte offset captured at `logging::init` time so the upload
@@ -1009,8 +1029,6 @@ fn print_boundaries(boundaries: &[(String, crate::boundary::ServiceBoundary)]) {
 /// ones whose logs we need. Errors here are non-fatal: a failed upload is
 /// logged at warn but never propagated.
 async fn upload_run_logs<T: CloudStorage>(storage: &T, repo_path: &str) {
-    const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
-
     // A laptop's debug log stays on the laptop: `upload-logs` is outside what
     // a `cli` credential may do, and the log names the developer's own machine
     // (§1.2). Asked before the file is read, so the tail of every laptop run
@@ -1031,18 +1049,13 @@ async fn upload_run_logs<T: CloudStorage>(storage: &T, repo_path: &str) {
 
     use std::io::{Read, Seek};
 
-    let file_len = metadata.len();
-    // Start from this run's offset, but cap at 5 MB worth from the end so a
-    // pathologically chatty run doesn't ship hundreds of megabytes.
-    let run_start = logging::get_run_log_offset().unwrap_or(0);
-    let cap_start = file_len.saturating_sub(MAX_LOG_BYTES);
-    let start = run_start.max(cap_start);
+    let (start, expected) = log_tail_range(metadata.len(), logging::get_run_log_offset());
 
     if file.seek(std::io::SeekFrom::Start(start)).is_err() {
         return;
     }
 
-    let mut buf = Vec::with_capacity((file_len - start) as usize);
+    let mut buf = Vec::with_capacity(expected);
     if file.read_to_end(&mut buf).is_err() {
         return;
     }
@@ -5231,6 +5244,31 @@ mod tests {
         assert_ne!(mapped, hash(), "sibling export must invalidate");
         std::fs::remove_file(root.join("deps.lock")).unwrap();
         assert_ne!(mapped, hash());
+    }
+
+    /// The log is rolled aside at its cap, and a build that crosses that
+    /// moment holds an offset into the file that was rolled: the live one is
+    /// smaller than the offset. Subtracting the other way round asked
+    /// `Vec::with_capacity` for about 18 exabytes and aborted the process
+    /// (carrick#936).
+    #[test]
+    fn a_log_offset_past_the_end_of_a_rolled_file_reads_nothing() {
+        // The rolled case: this run wrote 200 MB, then the file it was writing
+        // to was renamed and a new one started.
+        assert_eq!(super::log_tail_range(4_096, Some(209_715_200)), (4_096, 0));
+        // The file is gone entirely and a fresh one has not been written yet.
+        assert_eq!(super::log_tail_range(0, Some(209_715_200)), (0, 0));
+        // The ordinary case is unchanged: this run's own bytes, in full.
+        assert_eq!(super::log_tail_range(10_000, Some(4_000)), (4_000, 6_000));
+        // A run with no recorded offset reads from the start of the file.
+        assert_eq!(super::log_tail_range(10_000, None), (0, 10_000));
+        // And the cap holds: 6 MB of one run ships its last 5 MB.
+        let six_mb = 6 * 1024 * 1024;
+        let five_mb = 5 * 1024 * 1024;
+        assert_eq!(
+            super::log_tail_range(six_mb, Some(0)),
+            (six_mb - five_mb, five_mb as usize)
+        );
     }
 
     #[test]

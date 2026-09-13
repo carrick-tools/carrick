@@ -429,10 +429,16 @@ fn join_command(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Command {
 /// Run one scan subprocess, and say what it printed if it failed.
 ///
 /// The scan's stdout is dropped — it is a report that means nothing here — and
-/// its stderr is read line by line rather than collected at the end, for two
-/// reasons: the progress lines it carries are worth something only while the
-/// scan is still running (carrick#955), and the useful half of a failure is
-/// still the last few lines, which are kept as they go past.
+/// its stderr is read line by line rather than collected at the end, because
+/// the progress lines it carries are worth something only while the scan is
+/// still running (carrick#955).
+///
+/// What is kept of a failure is its HEAD and its tail, not the tail alone. A
+/// Rust panic prints `thread '...' panicked at <file:line>` and then a
+/// backtrace note, and a scan that panics keeps logging on the way down: the
+/// last twelve lines were the shutdown noise and the sentence naming the
+/// panic had already been evicted, which is how carrick#936 reached a user as
+/// "the scan of <path> failed" with no cause anywhere.
 /// What one phase of a build calls itself while it runs and once it is done.
 struct Reporting {
     working: String,
@@ -458,7 +464,11 @@ fn run_scan(
     // for a scan nobody is watching at all (carrick#992). The second is a
     // no-op unless this build was detached.
     super::scan_state::note(&reporting.working, None);
-    let mut tail: VecDeque<String> = VecDeque::with_capacity(12);
+    let mut head: Vec<String> = Vec::with_capacity(KEPT_LINES);
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(KEPT_LINES);
+    // The sentence that explains a crash, wherever in the output it fell.
+    let mut panics: Vec<String> = Vec::new();
+    let mut dropped = 0usize;
     // What this scan paid, if it paid anything. It crosses on the same
     // channel as the progress, and for the same reason: this process swallows
     // the scan's output, so a figure it does not lift out is a figure nobody
@@ -474,8 +484,16 @@ fn run_scan(
             spend = Some(reported);
             continue;
         }
-        if tail.len() == 12 {
+        if line.contains(PANIC_MARKER) && panics.len() < KEPT_PANICS {
+            panics.push(line.clone());
+        }
+        if head.len() < KEPT_LINES {
+            head.push(line);
+            continue;
+        }
+        if tail.len() == KEPT_LINES {
             tail.pop_front();
+            dropped += 1;
         }
         tail.push_back(line);
     }
@@ -489,8 +507,40 @@ fn run_scan(
     bar.finish_and_clear();
     Err(format!(
         "the {what} failed:\n{}",
-        tail.into_iter().collect::<Vec<_>>().join("\n")
+        failure_excerpt(head, panics, tail, dropped)
     ))
+}
+
+/// How many lines of a failed child's stderr are kept from each end.
+const KEPT_LINES: usize = 12;
+/// How many panic lines are lifted out of the middle.
+const KEPT_PANICS: usize = 4;
+/// What the Rust runtime prints when a thread dies, whatever the message is.
+const PANIC_MARKER: &str = "panicked at";
+
+/// The lines of a failed scan worth repeating: the first twelve, anything that
+/// named a panic, the last twelve, and a count of what was dropped between
+/// them.
+fn failure_excerpt(
+    head: Vec<String>,
+    panics: Vec<String>,
+    tail: VecDeque<String>,
+    dropped: usize,
+) -> String {
+    let mut lines = head;
+    let middle: Vec<String> = panics
+        .into_iter()
+        .filter(|panic| !lines.contains(panic) && !tail.contains(panic))
+        .collect();
+    if dropped > 0 {
+        lines.push(format!(
+            "... {dropped} line(s) not shown{} ...",
+            if middle.is_empty() { "" } else { ", except" }
+        ));
+    }
+    lines.extend(middle);
+    lines.extend(tail);
+    lines.join("\n")
 }
 
 /// Strip the ambient CI context, exactly as the offline harness does. Without
@@ -1132,5 +1182,59 @@ mod tests {
             env.get(crate::logging::RUN_PHASE_ENV),
             Some(&Some("workspace join".into()))
         );
+    }
+
+    /// A scan that panics keeps logging on the way down, so the last twelve
+    /// lines were shutdown noise and the sentence naming the panic had been
+    /// evicted before anyone read the failure (carrick#936).
+    #[test]
+    fn a_failed_scan_reports_the_panic_it_died_of_wherever_it_fell() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            "for i in $(seq 1 20); do echo \"starting step $i\" >&2; done; \
+             echo \"thread 'main' panicked at src/engine/mod.rs:1045: capacity overflow\" >&2; \
+             for i in $(seq 1 40); do echo \"shutting down $i\" >&2; done; exit 1",
+        );
+        let error = run_scan(
+            command,
+            "scan of /repos/api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+        )
+        .expect_err("the child exited non-zero");
+
+        assert!(
+            error.contains("panicked at src/engine/mod.rs:1045"),
+            "{error}"
+        );
+        // The two ends are still there, and the middle says how much is not.
+        assert!(error.contains("starting step 1\n"), "{error}");
+        assert!(error.contains("shutting down 40"), "{error}");
+        assert!(error.contains("line(s) not shown"), "{error}");
+        // And a bounded excerpt: the whole 61 lines are not repeated.
+        assert!(error.lines().count() < 35, "{error}");
+    }
+
+    /// A failure short enough to state in full is stated in full: nothing is
+    /// dropped and no "not shown" line appears.
+    #[test]
+    fn a_short_failure_is_repeated_whole() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo 'could not read carrick.json' >&2; exit 2");
+        let error = run_scan(
+            command,
+            "scan of /repos/api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+        )
+        .expect_err("the child exited non-zero");
+        assert!(error.ends_with("could not read carrick.json"), "{error}");
+        assert!(!error.contains("not shown"), "{error}");
     }
 }
