@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.66](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.65...carrick-v0.3.66) (2026-09-13)
+
+
+### Features
+
+* **cli:** init prints one line per thing it did ([#1030](https://github.com/carrick-tools/carrick/issues/1030)) ([c19b9c7](https://github.com/carrick-tools/carrick/commit/c19b9c772374641d072925291d2b00ec2e477598)), closes [#1026](https://github.com/carrick-tools/carrick/issues/1026)
+
+
+### Bug Fixes
+
+* **sidecar:** publish the json body, never the Response wrapper ([#1027](https://github.com/carrick-tools/carrick/issues/1027)) ([4f858b7](https://github.com/carrick-tools/carrick/commit/4f858b70c94eeb29764979d48476627cdd34dadc)), closes [#1017](https://github.com/carrick-tools/carrick/issues/1017)
+
 ## [0.3.65](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.64...carrick-v0.3.65) (2026-09-13)
 
 
