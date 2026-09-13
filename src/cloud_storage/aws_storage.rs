@@ -223,6 +223,11 @@ pub struct AwsStorage {
     /// for this commit. Set once from the CLI flag and sent on every write
     /// action; see `force_reindex` on [`LambdaRequest`].
     force_reindex: bool,
+    /// The repository this run was authorised to write, as the cloud names it:
+    /// the basename of the `owner/repo` `start-scan` opened the scan with.
+    /// Present only on the laptop path, where it is the name every action of
+    /// the run reports (see [`AwsStorage::authorized_copy`]).
+    authorized_repo: std::sync::OnceLock<String>,
 }
 
 #[derive(Serialize)]
@@ -547,6 +552,7 @@ impl AwsStorage {
             dirty: std::sync::atomic::AtomicBool::new(false),
             multi_service: std::sync::atomic::AtomicBool::new(false),
             force_reindex,
+            authorized_repo: std::sync::OnceLock::new(),
         }
     }
 
@@ -576,6 +582,41 @@ impl AwsStorage {
     /// where the field is omitted entirely.
     fn scan_id(&self) -> Option<String> {
         self.scan_id.get().cloned()
+    }
+
+    /// A copy of `data` under the repository name this run was authorised to
+    /// write, or `None` when the blob already carries it.
+    ///
+    /// A laptop scan derives the blob's `repo_name` from the checkout, because
+    /// the indexer strips `GITHUB_REPOSITORY` from the child scan and
+    /// `get_repository_name` then falls back to the directory — which is
+    /// whatever the user cloned into and need not be the repository's name. The
+    /// cloud compares the reported name with the basename of the repo the scan
+    /// was opened for and refuses the write when they differ
+    /// (`repo_not_authorized`), after the analysis has already been paid for
+    /// (carrick#1022).
+    ///
+    /// So the name that leaves the machine is the one `start-scan` was
+    /// authorised with, and the directory label stays on the blob — the local
+    /// join keys every cached blob on it, and `TeeStorage` writes that copy
+    /// from the caller's `data`, which this never touches.
+    ///
+    /// `None` on the CI path, where no scan is opened: those bodies are
+    /// byte-for-byte what they were, and the repo identity there comes from the
+    /// signed OIDC claims anyway.
+    fn authorized_copy(&self, data: &CloudRepoData) -> Option<CloudRepoData> {
+        let authorized = self.authorized_repo.get()?;
+        if *authorized == data.repo_name {
+            return None;
+        }
+        debug!(
+            "Uploading the index of {} as {}, the repository this scan was authorised for",
+            data.repo_name, authorized
+        );
+        Some(CloudRepoData {
+            repo_name: authorized.clone(),
+            ..data.clone()
+        })
     }
 
     /// The files this run lost, for the write actions, or `None` when it lost
@@ -956,6 +997,12 @@ impl AwsStorage {
         // are built far from here and each of their calls must carry it.
         crate::credentials::set_scan_id(&response.scan_id);
         let _ = self.scan_id.set(response.scan_id);
+        // The name every later action of this run must report for the repo,
+        // taken from the string the scan was authorised with rather than from
+        // anything the checkout happens to be called (carrick#1022).
+        let _ = self
+            .authorized_repo
+            .set(repo.rsplit('/').next().unwrap_or(repo).to_string());
         info!(
             "Scanning {} into project {} ({} service(s) already indexed)",
             repo,
@@ -1005,6 +1052,11 @@ impl CloudStorage for AwsStorage {
         data: &CloudRepoData,
         final_in_run: bool,
     ) -> Result<UploadOutcome, StorageError> {
+        // Everything below — the action bodies' `repo`, the inline
+        // `cloudRepoData`, the staged payload's bytes — names the repository
+        // from this one blob, so the substitution happens once, here.
+        let authorized = self.authorized_copy(data);
+        let data = authorized.as_ref().unwrap_or(data);
         let repo = &data.repo_name;
 
         // Payload staging decision (carrick#486): measure the serialized
@@ -2152,6 +2204,74 @@ mod tests {
         assert_eq!(write["action"], "store-metadata");
         assert_eq!(write["scan_id"], "scan_01J");
         assert_eq!(write["scan_final"], true);
+    }
+
+    /// carrick#1022: the name a laptop upload reports is the repository the
+    /// scan was authorised for, never the folder the blob was built in.
+    ///
+    /// A laptop scan's blob is named after the checkout directory — the
+    /// indexer strips `GITHUB_REPOSITORY` from the child scan, so
+    /// `get_repository_name` falls back to it — and the cloud compares the
+    /// reported name against the basename of the repo `start-scan` opened,
+    /// refusing the write with `repo_not_authorized` when they differ. The
+    /// refusal lands after the analysis has been paid for, so the scan is a
+    /// total loss.
+    #[tokio::test]
+    async fn a_laptop_upload_reports_the_repo_it_was_authorised_for() {
+        let (storage, server) = bearer_storage(vec![
+            (
+                200,
+                serde_json::json!({
+                    "schema": "carrick.start-scan/0",
+                    "scan_id": "scan_01J",
+                    "project_id": "proj_1",
+                    "project_slug": "payments",
+                    "indexed_services": [],
+                    "multi_service": true
+                })
+                .to_string(),
+            ),
+            check_ok(),
+            (200, serde_json::json!({ "success": true }).to_string()),
+        ]);
+
+        // `run_context` opens the scan for example/api; this clone sits in a
+        // folder called `ws`.
+        storage.begin_run(&run_context(false)).await.unwrap();
+        let mut cloned_into_ws = blob();
+        cloned_into_ws.repo_name = "ws".to_string();
+        storage
+            .upload_repo_data(&cloned_into_ws, true)
+            .await
+            .unwrap();
+
+        let requests = server.join().unwrap();
+        let check = body_of(&requests[1]);
+        let write = body_of(&requests[2]);
+        assert_eq!(check["repo"], "api", "{check}");
+        assert_eq!(write["repo"], "api", "{write}");
+        // And the blob as the cloud stores it, which is what every later read
+        // of the index — the hosted replay included — matches by name.
+        assert_eq!(write["cloudRepoData"]["repo_name"], "api", "{write}");
+    }
+
+    /// The other side of #1022: nothing renames a blob on a run that opened no
+    /// scan. That is the CI path, where the repo identity comes from the signed
+    /// OIDC claims and the request body is byte-for-byte what it always was.
+    #[tokio::test]
+    async fn an_upload_outside_a_laptop_scan_keeps_the_name_it_was_given() {
+        let (storage, server) = bearer_storage(vec![
+            check_ok(),
+            (200, serde_json::json!({ "success": true }).to_string()),
+        ]);
+
+        let mut named = blob();
+        named.repo_name = "ws".to_string();
+        storage.upload_repo_data(&named, true).await.unwrap();
+
+        let requests = server.join().unwrap();
+        assert_eq!(body_of(&requests[0])["repo"], "ws");
+        assert_eq!(body_of(&requests[1])["repo"], "ws");
     }
 
     /// C10's scanner half, on the wire. A dirty run's `hash` is HEAD's SHA

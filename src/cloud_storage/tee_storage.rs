@@ -240,6 +240,107 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// carrick#1022, over a real checkout: a clone that landed in a folder
+    /// which is not the repository's name uploads under the repository's name,
+    /// and keeps the folder's name on the copy the local join reads.
+    ///
+    /// The reproduction is the whole point — `git clone <url>` names the folder
+    /// after the repo, so this only bites a clone given a target name or a
+    /// renamed directory, and it bites it after the analysis is paid for.
+    #[tokio::test]
+    async fn a_clone_in_a_differently_named_folder_uploads_under_the_repo_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("ws");
+        std::fs::create_dir(&checkout).unwrap();
+        git(&checkout, &["init"]);
+        git(
+            &checkout,
+            &["remote", "add", "origin", "https://github.com/acme/api.git"],
+        );
+
+        // The two names the scan has for one repository, derived the way the
+        // engine derives them. The blob's is the directory: the indexer strips
+        // `GITHUB_REPOSITORY` from the child scan, so `get_repository_name`
+        // falls back to it. Read here through `file_name` rather than that
+        // helper because CI sets `GITHUB_REPOSITORY` for the test process
+        // itself, and it would win over the fixture.
+        let remote = crate::git_state::remote_name(&checkout);
+        assert_eq!(remote.as_deref(), Some("acme/api"));
+        let folder = checkout.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(folder, "ws");
+
+        let cache = dir.path().join("cache");
+        let (storage, server) = tee(
+            vec![
+                (
+                    200,
+                    serde_json::json!({
+                        "schema": "carrick.start-scan/0",
+                        "scan_id": "scan_01J",
+                        "project_id": "proj_1",
+                        "project_slug": "acme",
+                        "indexed_services": [],
+                        "multi_service": true
+                    })
+                    .to_string(),
+                ),
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            &cache,
+        );
+
+        storage
+            .begin_run(&RunContext {
+                repo_full_name: remote,
+                commit: "4f2a1c9".to_string(),
+                dirty: false,
+            })
+            .await
+            .unwrap();
+        let mut payload = blob();
+        payload.repo_name = folder;
+        storage.upload_repo_data(&payload, true).await.unwrap();
+
+        let requests = server.join().unwrap();
+        let write = body_of(&requests[2]);
+        assert_eq!(body_of(&requests[1])["repo"], "api");
+        assert_eq!(write["repo"], "api", "{write}");
+        assert_eq!(write["cloudRepoData"]["repo_name"], "api", "{write}");
+
+        // And the local half is untouched: every cached blob is keyed on the
+        // directory label, and a scan that renamed its own copy would be
+        // invisible to the join that reads it back.
+        let cached: CloudRepoData =
+            serde_json::from_slice(&std::fs::read(cache.join("ws.json")).unwrap()).unwrap();
+        assert_eq!(cached.repo_name, "ws");
+        assert!(
+            !cache.join("api.json").exists(),
+            "the local copy was renamed with the upload"
+        );
+    }
+
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git is on PATH");
+        assert!(
+            status.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+
+    fn body_of(request: &str) -> serde_json::Value {
+        let (_, body) = request
+            .split_once("\r\n\r\n")
+            .expect("a request with a body");
+        serde_json::from_str(body).expect("a JSON body")
+    }
+
     /// The flag is the indexer's handoff and nothing else: unset, or set to
     /// anything but `1`, is a facts-only pass.
     #[test]
