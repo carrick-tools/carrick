@@ -147,7 +147,14 @@ export function interactiveOutput(): InitOutput {
  * stdout decides, not stdin: a run whose output is piped or captured is read
  * as text by whatever holds the other end, and a spinner's rewrites and box
  * art are noise there even when a terminal is still attached to the input.
+ *
+ * A width of zero is the second half of the test, and it is not hypothetical: a
+ * pty with no window size — which is what `script` and several agent harnesses
+ * hand a child — reports `isTTY` true and `columns` 0, and clack then wraps its
+ * box to one character per line. Measured on macOS, 2026-09-13 (carrick#1026).
  */
-export function createOutput(tty: boolean = process.stdout.isTTY === true): InitOutput {
+export function createOutput(
+  tty: boolean = process.stdout.isTTY === true && (process.stdout.columns ?? 0) > 0,
+): InitOutput {
   return tty ? interactiveOutput() : plainOutput();
 }
