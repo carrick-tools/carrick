@@ -357,4 +357,20 @@ test("a session that starts while a scan is running is told so, not told there i
     ],
   });
   assert.match(withIndex, /- scan abc12345 failed: the scan of \/repos\/api failed/);
+
+  // The word the scaffold's poll loop waits for (carrick#1007 item 4).
+  const done = renderSessionStart({
+    ...statusFixture("status-workspace.json"),
+    running_scans: [
+      {
+        scan_id: "5089ed60",
+        pid: 41234,
+        started_at: "2026-09-12T10:00:00Z",
+        finished_at: "2026-09-12T10:00:58Z",
+        infer: true,
+        status: "finished",
+      },
+    ],
+  });
+  assert.match(done, /- scan 5089ed60 finished, paid\. The index is written\./);
 });

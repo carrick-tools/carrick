@@ -58,6 +58,10 @@ pub fn run(workspace: &Workspace, only: Option<&str>, infer: bool) -> Result<Ind
     let requested = only
         .map(|name| repo_for_service(workspace, &workspace.blobs_dir(), name))
         .transpose()?;
+    // The word `carrick status` said for the last scan is history the moment
+    // this build starts: whatever it wrote, this run is writing a newer index
+    // (carrick#1007 item 4).
+    super::scan_state::forget_finished(&workspace.index_dir());
     let hosted = super::hosted::refresh(workspace);
     let previous = LocalIndex::read(&workspace.index_file()).ok();
     let same_sources = previous.as_ref().is_some_and(|index| {

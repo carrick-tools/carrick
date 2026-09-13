@@ -201,7 +201,12 @@ export type RunningScan = {
    */
   infer?: boolean;
   workspace?: string;
-  status: "running" | "failed";
+  /**
+   * `finished` is written by the scan itself and cleared by the next build, so
+   * the poll the scaffold describes terminates on the word it waits for
+   * (carrick#1007 item 4).
+   */
+  status: "running" | "finished" | "failed";
   phase?: string;
   progress?: {
     service?: string;
@@ -212,6 +217,8 @@ export type RunningScan = {
     total?: number;
   };
   error?: string;
+  /** RFC 3339, when the scan ended. Absent while it is running. */
+  finished_at?: string;
   /** What this scan has paid so far, once an upload has come back with a figure. */
   spend?: RunSpend;
 };
