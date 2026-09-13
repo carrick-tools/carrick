@@ -158,6 +158,16 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadFailure> {
             let mut owned: Vec<String> = changed
                 .iter()
                 .filter(|file| service.covers(file))
+                // Source files only, for the reason the repo line below is
+                // filtered: this count is about indexed rows going out of
+                // date. It matters MOST here — a single-service repo has no
+                // service directory, so its service covers `carrick.json`,
+                // the workflow and the `.claude` files, and onboarding read
+                // as three files of drift against a minute-old index
+                // (carrick#1007 item 5).
+                .filter(|file| {
+                    crate::file_finder::is_scanned_source(&repo_root.join(file), &repo_root)
+                })
                 .cloned()
                 .collect();
             let total = owned.len();
@@ -722,6 +732,73 @@ mod drift_tests {
             routes: 0,
             calls: 0,
         }
+    }
+
+    /// The same, in the shape the first run of a single-service repo has: no
+    /// service directory, so that service COVERS `carrick.json`, the workflow
+    /// and the `.claude` files, and they were three files of drift on its own
+    /// line against an index a minute old (carrick#1007 item 5).
+    #[test]
+    fn onboarding_artefacts_are_not_drift_for_a_single_service_repo_either() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "fixture@carrick.test"],
+            vec!["config", "user.name", "fixture"],
+        ] {
+            assert!(git(repo, &args).is_some());
+        }
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/main.ts"), "export const a = 1;").unwrap();
+        git(repo, &["add", "."]).unwrap();
+        git(repo, &["commit", "-qm", "base"]).unwrap();
+        let commit = git(repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        std::fs::create_dir_all(repo.join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(repo.join("carrick.json"), "{}").unwrap();
+        std::fs::write(repo.join(".github/workflows/carrick.yml"), "on: push").unwrap();
+        std::fs::write(repo.join(".claude/settings.json"), "{}").unwrap();
+        std::fs::write(repo.join("src/main.ts"), "export const a = 2;").unwrap();
+
+        let index = LocalIndex {
+            hosted_identity: None,
+            hosted_workspace: None,
+            repos_detected_by: None,
+            repos_added: Vec::new(),
+            repos_excluded: Vec::new(),
+            hosted_source_key: None,
+            hosted_checked_at: None,
+            version: crate::local_mode::read_model::READ_MODEL_VERSION,
+            scanner_version: "test".to_string(),
+            indexed_at: "2026-09-12T10:00:00Z".to_string(),
+            repos: vec![IndexedRepo {
+                path: repo.to_string_lossy().into_owned(),
+                // No directory: this service is the whole repo, which is what
+                // makes it cover every one of those files.
+                services: vec![service(None, &commit)],
+                name: "service-repo".to_string(),
+                files: Default::default(),
+            }],
+        };
+        let index_dir = repo.join(crate::local_mode::workspace::INDEX_DIR);
+        std::fs::create_dir_all(&index_dir).unwrap();
+        crate::local_mode::workspace::write_self_ignore(&index_dir).unwrap();
+        index.write(&index_dir.join("index.json")).unwrap();
+
+        let answer = status(repo).expect("the index is readable");
+        let service = &answer.services[0];
+        assert_eq!(service.changed_since_index, 1, "{:?}", service.stale_files);
+        assert_eq!(service.stale_files, vec!["src/main.ts".to_string()]);
+        // And nothing is quietly moved to the repo line instead.
+        assert_eq!(answer.repos[0].outside_every_service, 0);
+        let text = answer.render();
+        assert!(!text.contains("carrick.json"), "{text}");
+        assert!(!text.contains(".claude"), "{text}");
     }
 
     /// Straight after onboarding, `status` and the session-start hook reported

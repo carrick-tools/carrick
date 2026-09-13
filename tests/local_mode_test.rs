@@ -768,11 +768,18 @@ fn status_attributes_a_repo_level_file_to_the_repo_and_not_to_every_service() {
     // A source file outside every service: this one IS drift the repo owns.
     std::fs::create_dir_all(repo.join("tools")).expect("the tools directory");
     std::fs::write(repo.join("tools/release.ts"), "export const a = 1;\n").expect("a script");
+    // A source file inside one service: the service's own drift. A note or a
+    // README beside it would not be — no row comes from one.
     std::fs::write(
-        repo.join("packages/gateway/notes.txt"),
-        "inside one service\n",
+        repo.join("packages/gateway/notes.ts"),
+        "export const note = 1;\n",
     )
     .expect("a file inside a service");
+    std::fs::write(
+        repo.join("packages/gateway/notes.txt"),
+        "inside one service, and read by no scan\n",
+    )
+    .expect("a file no scan reads");
 
     let body: serde_json::Value =
         serde_json::from_str(&run(root, &["status", "--workspace", ".", "--json"]))
@@ -795,7 +802,7 @@ fn status_attributes_a_repo_level_file_to_the_repo_and_not_to_every_service() {
     );
     assert_eq!(
         gateway["stale_files"][0],
-        serde_json::json!("packages/gateway/notes.txt"),
+        serde_json::json!("packages/gateway/notes.ts"),
         "{gateway:#}"
     );
     let sibling = service("orders-pkg");
@@ -813,7 +820,7 @@ fn status_attributes_a_repo_level_file_to_the_repo_and_not_to_every_service() {
         "the one repo-level SOURCE file, stated once:\n{:#}",
         repos[0]
     );
-    assert_eq!(repos[0]["changed_since_index"], serde_json::json!(4));
+    assert_eq!(repos[0]["changed_since_index"], serde_json::json!(5));
     let outside: Vec<&str> = repos[0]["stale_files"]
         .as_array()
         .expect("stale_files")

@@ -333,6 +333,12 @@ pub struct StatusService {
     /// Files in the repo that no service reads are under `repos` instead — a
     /// workflow file is not a change to every service in the monorepo
     /// (carrick#997 item 4).
+    ///
+    /// Source files only, like `StatusRepo::outside_every_service`: this is a
+    /// count of rows that may have gone stale, and `carrick.json`, a workflow
+    /// or an editor's settings hold none. A single-service repo has no service
+    /// directory, so without the filter its one service owns every one of them
+    /// (carrick#1007 item 5).
     pub changed_since_index: usize,
     /// Up to [`MAX_STALE_FILES`] of them, repo-relative.
     pub stale_files: Vec<String>,
