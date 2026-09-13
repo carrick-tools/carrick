@@ -428,6 +428,12 @@ fn join_command(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Command {
     command
 }
 
+/// What one phase of a build calls itself while it runs and once it is done.
+struct Reporting {
+    working: String,
+    done: String,
+}
+
 /// Run one scan subprocess, and say what it printed if it failed.
 ///
 /// The scan's stdout is dropped — it is a report that means nothing here — and
@@ -441,12 +447,6 @@ fn join_command(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Command {
 /// last twelve lines were the shutdown noise and the sentence naming the
 /// panic had already been evicted, which is how carrick#936 reached a user as
 /// "the scan of <path> failed" with no cause anywhere.
-/// What one phase of a build calls itself while it runs and once it is done.
-struct Reporting {
-    working: String,
-    done: String,
-}
-
 fn run_scan(
     mut command: Command,
     what: &str,

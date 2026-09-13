@@ -95,12 +95,6 @@ impl ReadFailure {
     }
 }
 
-impl From<ReadError> for ReadFailure {
-    fn from(error: ReadError) -> Self {
-        Self::new(error)
-    }
-}
-
 /// The error body, printed to stdout so a reader parsing JSON always gets JSON.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ErrorOutput {
