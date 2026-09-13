@@ -115,6 +115,7 @@ types in a Node process.
 | `carrick login` | Authorise a Carrick workspace in the browser, or verify `CARRICK_TOKEN` |
 | `carrick logout` | Remove the saved local credential |
 | `carrick init [--project SLUG] [--repo OWNER/REPO]` | The repo list, the project, the service proposal in `.carrick/`, the agent hooks, the MCP connection, and the prompt that writes `carrick.json` |
+| `carrick remove [--keep-login]` | Undo all of that on this machine, and list the files the scaffold added to the repository |
 | `carrick index` | Derive the workspace, apply optional repo overrides and write `.carrick/`, with Carrick classifying what the deterministic passes could not |
 | `carrick refresh [--service X]` | Re-scan one repo, or all of them, and re-join the index. What the session-start hook runs |
 | `carrick check <file>` | What the index knows about that file, verdicts included |
@@ -192,6 +193,31 @@ Claude Code session opened in a workspace still waiting for one starts
 `carrick refresh` in the background, at most once an hour
 (`CARRICK_REFRESH_COOLDOWN_MS` states another gap), so the hosted rows arrive
 without a command to remember.
+
+## Removing Carrick
+
+```
+carrick remove
+npm uninstall -g carrick
+```
+
+`carrick remove` reverses `carrick init` on this machine, one line per thing it
+removed: the Carrick hook entries in this folder's `.claude` settings, the
+`carrick` MCP server in each agent client's configuration, the `.carrick`
+directory, and the saved credential. Other hooks, other MCP servers and the
+settings files themselves stay; an MCP server called `carrick` that points at
+anything other than `api.carrick.tools` is left alone and reported. Pass
+`--keep-login` to keep the credential, and `--workspace DIR` to name a folder
+other than this one. Running it twice is safe: the second run says there is
+nothing left to remove.
+
+Files the onboarding pull request added to the repository are version
+controlled, so the command lists them with the `git rm` line that removes them
+rather than deleting them itself, and names the sections — the `## Carrick`
+section of an `AGENTS.md`, the hook-pack entries in a committed
+`.claude/settings.json`, the `.claude` negations in `.gitignore` — that only
+their owner can unpick. Revoking the key itself is a separate action, at
+[app.carrick.tools/account](https://app.carrick.tools/account).
 
 ## Licence
 

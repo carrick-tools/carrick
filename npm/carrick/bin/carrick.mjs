@@ -125,7 +125,8 @@ function extraHelp() {
     "    --version                    the version of this package",
     "",
     "`carrick init [--project SLUG]` sets this folder up; `carrick init --help`",
-    "prints its own arguments.",
+    "prints its own arguments. `carrick remove` undoes what init wrote on this",
+    "machine and lists the files the scaffold added to the repository.",
     "",
   ].join("\n");
 }
@@ -160,6 +161,13 @@ switch (command) {
   case "init": {
     const { init } = await import("../dist/init/run.js");
     process.exit(await init(rest));
+  }
+  // Named here rather than left to the binary: `remove` is this package's own
+  // command, and the binary reads a name it does not know as a path to scan
+  // (carrick#981).
+  case "remove": {
+    const { remove } = await import("../dist/init/remove.js");
+    process.exit(await remove(rest));
   }
   case "templates": {
     const { templates } = await import("../dist/init/run.js");

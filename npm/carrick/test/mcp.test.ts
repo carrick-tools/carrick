@@ -10,7 +10,9 @@ import test from "node:test";
 import path from "node:path";
 import {
   connectMcpClients,
+  disconnectMcpClients,
   mergeServerEntry,
+  removeServerEntry,
   MCP_LINE,
   MCP_URL,
   type McpEnvironment,
@@ -25,6 +27,8 @@ type Machine = {
   files?: Record<string, string>;
   /** Exit status per command line, keyed by `command args...`. */
   statuses?: Record<string, number>;
+  /** What a command prints, keyed the same way, for the reads that parse it. */
+  outputs?: Record<string, string>;
 };
 
 function machine(state: Machine): { env: McpEnvironment; written: Record<string, string>; ran: string[] } {
@@ -37,6 +41,11 @@ function machine(state: Machine): { env: McpEnvironment; written: Record<string,
       const line = [command, ...args].join(" ");
       ran.push(line);
       return state.statuses?.[line] ?? 0;
+    },
+    capture: (command, args) => {
+      const line = [command, ...args].join(" ");
+      ran.push(line);
+      return { status: state.statuses?.[line] ?? 0, stdout: state.outputs?.[line] ?? "" };
     },
     home: HOME,
     platform: "linux",
@@ -205,4 +214,145 @@ test("every path written is reported, for the line init prints", () => {
   // The detail IS the path, and `mcpClientLines` prints it: a guessed config
   // file has to be one visible line and one entry to delete.
   assert.equal(outcomes[0]?.detail, cursorFile);
+});
+
+// The other half: what `carrick remove` takes back out (carrick#1034). Each
+// test states the machine the same way, because the subject is still a user's
+// own configuration files.
+
+const CLAUDE_GET = `carrick:
+  Scope: User config (available in all your projects)
+  Type: http
+  URL: ${MCP_URL}
+`;
+
+test("what the writer added is exactly what the remover takes away", () => {
+  // One document per client shape, each holding something of somebody else's,
+  // so the round trip proves the file comes back as it was rather than as an
+  // empty object.
+  const documents = [
+    JSON.stringify({ mcpServers: { other: { command: "uvx", args: ["some-server"] } }, somethingElse: 1 }, null, 2),
+    JSON.stringify({ mcpServers: { other: { serverUrl: "https://example.test/mcp" } } }, null, 2),
+    JSON.stringify({ servers: { other: { type: "http", url: "https://example.test/mcp" } } }, null, 2),
+    "{}\n",
+  ];
+  for (const before of documents) {
+    const written = mergeServerEntry(cursor, before);
+    assert.equal(written.state, "written");
+    const removed = removeServerEntry(written.body);
+    assert.equal(removed.state, "removed");
+    assert.deepEqual(JSON.parse(removed.body), JSON.parse(before));
+  }
+
+  // And a file this package created from nothing comes back to nothing.
+  const fresh = mergeServerEntry(cursor, null).body;
+  assert.deepEqual(JSON.parse(removeServerEntry(fresh).body), {});
+});
+
+test("a carrick entry that points somewhere else is kept, whatever it is called", () => {
+  const elsewhere = JSON.stringify({ mcpServers: { carrick: { url: "https://mcp.example.test/mcp" } } }, null, 2);
+  const kept = removeServerEntry(elsewhere);
+  assert.equal(kept.state, "kept");
+  assert.deepEqual(JSON.parse(kept.body), JSON.parse(elsewhere));
+
+  // A stdio server named carrick states no URL at all, so it cannot be ours.
+  const stdio = JSON.stringify({ mcpServers: { carrick: { command: "carrick-mcp" } } }, null, 2);
+  assert.equal(removeServerEntry(stdio).state, "kept");
+
+  const { env, written } = machine({
+    directories: [path.join(HOME, ".cursor")],
+    files: { [cursorFile]: elsewhere },
+  });
+  const removal = disconnectMcpClients(env)[0];
+  assert.equal(removal?.state, "kept");
+  assert.match(removal!.detail, /does not point at api\.carrick\.tools/);
+  assert.deepEqual(written, {});
+});
+
+test("a file with no carrick server is left byte for byte", () => {
+  const existing = JSON.stringify({ mcpServers: { other: { url: "https://example.test/mcp" } } }, null, 2);
+  const outcome = removeServerEntry(existing);
+  assert.equal(outcome.state, "absent");
+  assert.equal(outcome.body, existing);
+
+  const { env, written } = machine({
+    directories: [path.join(HOME, ".cursor")],
+    files: { [cursorFile]: existing },
+  });
+  assert.equal(disconnectMcpClients(env)[0]?.state, "absent");
+  assert.deepEqual(written, {});
+});
+
+test("Claude Code is disconnected by its own command, and only on the URL it prints", () => {
+  const { env, ran } = machine({
+    commands: ["claude"],
+    directories: [path.join(HOME, ".claude")],
+    outputs: { "claude mcp get carrick": CLAUDE_GET },
+  });
+  assert.deepEqual(disconnectMcpClients(env), [
+    { client: "Claude Code", state: "removed", detail: "MCP server removed for this user" },
+  ]);
+  assert.deepEqual(ran, ["claude mcp get carrick", "claude mcp remove --scope user carrick"]);
+
+  // A server of that name pointing elsewhere is not ours to remove, and the
+  // read is the only thing that can say so.
+  const other = machine({
+    commands: ["claude"],
+    directories: [path.join(HOME, ".claude")],
+    outputs: { "claude mcp get carrick": "carrick:\n  URL: https://mcp.example.test/mcp\n" },
+  });
+  assert.equal(disconnectMcpClients(other.env)[0]?.state, "kept");
+  assert.deepEqual(other.ran, ["claude mcp get carrick"]);
+
+  // Nothing configured: the read fails, and nothing else runs.
+  const none = machine({
+    commands: ["claude"],
+    directories: [path.join(HOME, ".claude")],
+    statuses: { "claude mcp get carrick": 1 },
+  });
+  assert.equal(disconnectMcpClients(none.env)[0]?.state, "absent");
+  assert.deepEqual(none.ran, ["claude mcp get carrick"]);
+});
+
+test("a removal command that fails prints the line that finishes it", () => {
+  const { env } = machine({
+    commands: ["claude"],
+    directories: [path.join(HOME, ".claude")],
+    outputs: { "claude mcp get carrick": CLAUDE_GET },
+    statuses: { "claude mcp remove --scope user carrick": 1 },
+  });
+  const removal = disconnectMcpClients(env)[0];
+  assert.equal(removal?.state, "failed");
+  assert.equal(removal?.detail, "claude mcp remove carrick");
+});
+
+test("removal touches only the clients this machine has, and reports each file", () => {
+  const entry = (key: "url" | "serverUrl"): string =>
+    JSON.stringify({ mcpServers: { carrick: { [key]: MCP_URL } } }, null, 2);
+  const { env, written } = machine({
+    directories: [path.join(HOME, ".cursor"), path.join(HOME, ".codeium", "windsurf")],
+    files: { [cursorFile]: entry("url"), [windsurfFile]: entry("serverUrl") },
+  });
+  const removals = disconnectMcpClients(env);
+  assert.deepEqual(
+    removals.map((removal) => [removal.client, removal.state, removal.detail]),
+    [
+      ["Cursor", "removed", cursorFile],
+      ["Windsurf", "removed", windsurfFile],
+    ],
+  );
+  assert.deepEqual(Object.keys(written).sort(), [cursorFile, windsurfFile].sort());
+  for (const body of Object.values(written)) assert.deepEqual(JSON.parse(body), {});
+});
+
+test("a hand-edited file that no longer parses is reported by the remover too", () => {
+  assert.throws(() => removeServerEntry("{ not json"));
+  const { env, written } = machine({
+    directories: [path.join(HOME, ".cursor")],
+    files: { [cursorFile]: "{ not json" },
+  });
+  const removal = disconnectMcpClients(env)[0];
+  assert.equal(removal?.state, "failed");
+  assert.match(removal!.detail, /not valid JSON/);
+  assert.deepEqual(written, {});
 });
