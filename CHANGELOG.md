@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.65](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.64...carrick-v0.3.65) (2026-09-13)
+
+
+### Bug Fixes
+
+* **init:** the already-indexed branch reads the hosted index into .carrick/ ([#1021](https://github.com/carrick-tools/carrick/issues/1021)) ([59fe3e8](https://github.com/carrick-tools/carrick/commit/59fe3e8faa0907e820853ee72fda0fbde8155d73))
+
 ## [0.3.64](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.63...carrick-v0.3.64) (2026-09-13)
 
 
