@@ -392,6 +392,7 @@ pub(super) fn scan_command(
     // after the one whose shell this ran in, and on a laptop scan its OIDC
     // variables would select the wrong credential entirely.
     strip_ci_env(&mut command);
+    no_colour(&mut command);
     command
 }
 
@@ -435,6 +436,7 @@ pub(super) fn join_command(exe: &Path, repo: &Path, blobs: &Path, out: &Path) ->
         .env_remove(crate::cloud_storage::LAPTOP_SCAN_ENV)
         .env_remove("CARRICK_OUTPUT_JSON");
     strip_ci_env(&mut command);
+    no_colour(&mut command);
     command
 }
 
@@ -479,8 +481,8 @@ fn run_scan(
     super::scan_state::note(&reporting.working, None);
     let mut head: Vec<String> = Vec::with_capacity(KEPT_LINES);
     let mut tail: VecDeque<String> = VecDeque::with_capacity(KEPT_LINES);
-    // The sentence that explains a crash, wherever in the output it fell.
-    let mut panics: Vec<String> = Vec::new();
+    // The sentences that explain the failure, wherever in the output they fell.
+    let mut causes: VecDeque<String> = VecDeque::with_capacity(KEPT_CAUSES);
     let mut dropped = 0usize;
     // What this scan paid, if it paid anything. It crosses on the same
     // channel as the progress, and for the same reason: this process swallows
@@ -521,8 +523,15 @@ fn run_scan(
             spend = Some(reported);
             continue;
         }
-        if line.contains(PANIC_MARKER) && panics.len() < KEPT_PANICS {
-            panics.push(line.clone());
+        // Kept clean from here on: what this loop keeps is read back by a
+        // JSON reader and by a log file, neither of which renders escapes
+        // (carrick#1023 item 6).
+        let line = strip_ansi(&line);
+        if names_a_failure(&line) {
+            if causes.len() == KEPT_CAUSES {
+                causes.pop_front();
+            }
+            causes.push_back(line.clone());
         }
         if head.len() < KEPT_LINES {
             head.push(line);
@@ -545,7 +554,7 @@ fn run_scan(
     bar.finish_and_clear();
     Err(format!(
         "the {what} failed:\n{}",
-        failure_excerpt(head, panics, tail, dropped)
+        failure_excerpt(head, causes, tail, dropped)
     ))
 }
 
@@ -556,24 +565,40 @@ const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How many lines of a failed child's stderr are kept from each end.
 const KEPT_LINES: usize = 12;
-/// How many panic lines are lifted out of the middle.
-const KEPT_PANICS: usize = 4;
+/// How many lines naming a failure are lifted out of the middle. The LAST
+/// twelve, not the first: a scan that prints a dozen `error` lines on its way
+/// to the one that killed it would otherwise evict exactly the line this cap
+/// exists to keep.
+const KEPT_CAUSES: usize = 12;
 /// What the Rust runtime prints when a thread dies, whatever the message is.
 const PANIC_MARKER: &str = "panicked at";
 
+/// Whether a line from a failed scan is one that says what went wrong.
+///
+/// The head and the tail are position, not meaning: a scan of five services
+/// spends its middle on them, so the twelve lines a scan of the fifth failed
+/// on were exactly the ones elided — the excerpt kept the startup banner and
+/// the shutdown noise and dropped the cause (carrick#1023 item 8). Matched
+/// case-insensitively, because the same word arrives from the scanner, from
+/// `tsc` and from a runtime in three spellings.
+fn names_a_failure(line: &str) -> bool {
+    let lowered = line.to_ascii_lowercase();
+    lowered.contains(PANIC_MARKER) || lowered.contains("failed") || lowered.contains("error")
+}
+
 /// The lines of a failed scan worth repeating: the first twelve, anything that
-/// named a panic, the last twelve, and a count of what was dropped between
+/// named a failure, the last twelve, and a count of what was dropped between
 /// them.
 fn failure_excerpt(
     head: Vec<String>,
-    panics: Vec<String>,
+    causes: VecDeque<String>,
     tail: VecDeque<String>,
     dropped: usize,
 ) -> String {
     let mut lines = head;
-    let middle: Vec<String> = panics
+    let middle: Vec<String> = causes
         .into_iter()
-        .filter(|panic| !lines.contains(panic) && !tail.contains(panic))
+        .filter(|cause| !lines.contains(cause) && !tail.contains(cause))
         .collect();
     if dropped > 0 {
         lines.push(format!(
@@ -584,6 +609,62 @@ fn failure_excerpt(
     lines.extend(middle);
     lines.extend(tail);
     lines.join("\n")
+}
+
+/// A line of child output with its terminal control sequences removed.
+///
+/// What a scan prints is kept for two readers that have no terminal to
+/// interpret them: the JSON `error` string `carrick status` serves, and the
+/// `.carrick/scan-<id>.log` a detached run writes to a file. Both carried raw
+/// escapes (carrick#1023 item 6). The producer was not identified — nothing in
+/// this repo colours its output off a TTY — so this strips them wherever they
+/// came from, and [`no_colour`] asks every child not to write them.
+fn strip_ansi(line: &str) -> String {
+    let mut clean = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\u{1b}' {
+            clean.push(character);
+            continue;
+        }
+        // CSI (`ESC [`) runs to a byte in `@`-`~`; every other escape is two
+        // characters, so dropping the one that follows is the whole of it.
+        match chars.next() {
+            Some('[') => {
+                for following in chars.by_ref() {
+                    if ('@'..='~').contains(&following) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                // OSC runs to BEL or ST (`ESC \`).
+                while let Some(following) = chars.next() {
+                    if following == '\u{7}' {
+                        break;
+                    }
+                    if following == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    clean
+}
+
+/// Tell a child not to colour what it prints.
+///
+/// Every child this module starts writes to a pipe or to a log file, and
+/// neither reader renders escapes. `NO_COLOR` is the convention most tools
+/// honour; the two force variables are removed because a caller's environment
+/// can carry them and they override it.
+fn no_colour(command: &mut Command) {
+    command.env("NO_COLOR", "1");
+    command.env_remove("FORCE_COLOR");
+    command.env_remove("CLICOLOR_FORCE");
 }
 
 /// Strip the ambient CI context, exactly as the offline harness does. Without
@@ -1286,6 +1367,64 @@ mod tests {
         assert!(error.contains("line(s) not shown"), "{error}");
         // And a bounded excerpt: the whole 61 lines are not repeated.
         assert!(error.lines().count() < 35, "{error}");
+    }
+
+    /// The elided middle is where a multi-service scan does its work, so the
+    /// line that named the failure was the line the excerpt dropped: the head
+    /// was the banner, the tail was the shutdown, and the service that broke
+    /// was in neither (carrick#1023 item 8). Terminal control sequences go too:
+    /// the excerpt is read back out of a JSON string and out of a log file,
+    /// and neither renders them (item 6).
+    #[test]
+    fn a_failed_scan_keeps_the_lines_that_name_the_failure_and_no_escapes() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            "for i in $(seq 1 20); do echo \"starting step $i\" >&2; done; \
+             printf '\\033[31manalysis of gateway failed: deno resolve\\033[0m\\n' >&2; \
+             echo 'error: LedgerEntry could not be resolved' >&2; \
+             for i in $(seq 1 40); do echo \"shutting down $i\" >&2; done; exit 1",
+        );
+        let failure = run_scan(
+            command,
+            "scan of /repos/api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+            HEARTBEAT,
+        )
+        .expect_err("the child exited non-zero");
+
+        assert!(
+            failure.contains("analysis of gateway failed: deno resolve"),
+            "the line that named the failure survives the elision:\n{failure}"
+        );
+        assert!(
+            failure.contains("error: LedgerEntry could not be resolved"),
+            "and so does the one that named the cause:\n{failure}"
+        );
+        assert!(
+            !failure.contains('\u{1b}'),
+            "no escape reaches the JSON body or the log:\n{failure:?}"
+        );
+        assert!(failure.contains("line(s) not shown"), "{failure}");
+    }
+
+    /// The excerpt is text by the time anything reads it, whatever the child
+    /// wrote (carrick#1023 item 6).
+    #[test]
+    fn escape_sequences_are_stripped_from_a_kept_line() {
+        assert_eq!(strip_ansi("\u{1b}[31mfailed\u{1b}[0m: two"), "failed: two");
+        assert_eq!(strip_ansi("\u{1b}[?25lhidden cursor"), "hidden cursor");
+        assert_eq!(
+            strip_ansi("\u{1b}]0;a title\u{7}indexing"),
+            "indexing",
+            "an OSC title runs to its terminator, not to the end of the line"
+        );
+        assert_eq!(strip_ansi("plain"), "plain", "text is left alone");
     }
 
     /// A failure short enough to state in full is stated in full: nothing is

@@ -223,12 +223,16 @@ fn deno_adapter_supplies_members_and_leaves_config_discovery_to_sidecar() {
         derived.services[0].service_name.as_deref(),
         Some("@sample/api")
     );
+    // Standing advice about a Deno proposal, not something this run found: it
+    // rides in the proposal document and the terminal never prints it
+    // (carrick#1032).
     assert!(
         derived
-            .warnings
+            .notes
             .iter()
             .any(|w| w.contains("Deno") && w.contains("type"))
     );
+    assert!(derived.warnings.is_empty(), "{:?}", derived.warnings);
 }
 
 #[test]

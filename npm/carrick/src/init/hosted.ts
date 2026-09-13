@@ -21,6 +21,7 @@
 import { spawn } from "node:child_process";
 import { parseStatusResult } from "../contract.ts";
 import { nativeEnv, resolveNativeBinary } from "../native.ts";
+import type { StepReport } from "./output.ts";
 
 /** One run of the scanner binary, injected so tests spawn nothing. */
 export type NativeRun = (args: string[]) => Promise<{
@@ -180,11 +181,11 @@ function stateClause(state: string): string {
  * only thing that would have given them an index (carrick#1020). A state with
  * an instruction attached is a warning rather than a done line, and a read that
  * produced nothing is a refusal (carrick#1026).
+ *
+ * This is the step's report, so it is also the line the spinner stops on: one
+ * line for the hosted read, in a terminal as everywhere else (carrick#1032).
  */
-export function hostedReport(outcome: HostedDownload): {
-  kind: "done" | "warn" | "refuse";
-  text: string;
-} {
+export function hostedReport(outcome: HostedDownload): StepReport {
   const plural = (count: number): string => `${count} service${count === 1 ? "" : "s"}`;
   switch (outcome.kind) {
     case "downloaded":

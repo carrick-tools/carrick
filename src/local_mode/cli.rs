@@ -205,9 +205,11 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     }
 }
 
-/// Run a local command. The returned code is the process exit code: a
-/// read-only command always answers 0, whatever it found, so an editor hook
-/// cannot fail an edit.
+/// Run a local command. The returned code is the process exit code: what a
+/// read-only command FOUND never moves it — nothing local mode says blocks
+/// anything — and the one exception is `check` refusing to answer at all,
+/// which a script has to be able to tell from a clean verdict (carrick#1023
+/// item 2, [`read`]).
 pub fn run(command: LocalCommand) -> i32 {
     match command {
         LocalCommand::Derive { workspace } => match derive(workspace.as_deref()) {
@@ -295,7 +297,10 @@ fn derive(root: Option<&Path>) -> Result<serde_json::Value, String> {
         // `services` carries the manifest facts that decide application from
         // library beside each service; `config` stays the carrick.json
         // skeleton, which those facts are not part of (carrick#994).
-        repos.push(serde_json::json!({ "path": repo, "reason": derived.reason, "services": derived.service_documents(), "config": derived.config, "warnings": derived.warnings }));
+        // `warnings` is what this derivation found and a caller prints;
+        // `notes` is the standing advice about a proposal of this shape, which
+        // rides in this document and nowhere else (carrick#1032).
+        repos.push(serde_json::json!({ "path": repo, "reason": derived.reason, "services": derived.service_documents(), "config": derived.config, "warnings": derived.warnings, "notes": derived.notes }));
     }
     Ok(
         serde_json::json!({ "schema": "carrick.derive/0", "workspace": workspace.root, "repos_detected_by": workspace.repos_detected_by, "repos_added": workspace.repos_added, "repos_excluded": workspace.repos_excluded, "missing": workspace.missing, "parent_proposal": workspace.parent_proposal, "repos": repos }),
@@ -312,7 +317,7 @@ fn derive(root: Option<&Path>) -> Result<serde_json::Value, String> {
 fn status(root: Option<&Path>, json: bool) -> i32 {
     let Some(root) = super::workspace::locate(root, None) else {
         return report(
-            ReadFailure::new(ReadError::NotIndexed),
+            ReadFailure::detailed(ReadError::NotIndexed, no_index_here(root, &[])),
             json,
             super::contract::STATUS_SCHEMA,
         );
@@ -364,6 +369,15 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
                     println!("{line}");
                 }
             }
+            // `status` takes no file and cannot be told to run a scan that is
+            // already running: the refusal is rewritten here rather than in
+            // `ReadError`, whose sentence belongs to `touch` and `check`
+            // (carrick#1023 item 1).
+            let error = if error.error == ReadError::NotIndexed {
+                ReadFailure::detailed(ReadError::NotIndexed, no_index_here(Some(&root), &scans))
+            } else {
+                error
+            };
             report_with_scans(
                 error,
                 json,
@@ -398,6 +412,18 @@ fn build(root: Option<&Path>, service: Option<&str>, infer: bool) -> Result<(), 
         super::scan_state::begin(&workspace.index_dir(), scan_id, &workspace.root, infer);
     }
     let outcome = build_workspace(&workspace, service, infer);
+    // An index has just been written, so every record of a scan that is over
+    // describes an older world — including the failed one a re-run was ordered
+    // because of, which `carrick status` was still leading with (carrick#1023
+    // item 13). Before this build's own record is finished, so that record
+    // survives for the poll the scaffold tells an agent to run.
+    //
+    // Only the paid pass sweeps. `refresh` runs from the session-start hook,
+    // and a hook that fires when an editor opens must not be the thing that
+    // erases the only account of why a paid scan failed.
+    if infer && outcome.is_ok() {
+        super::scan_state::forget_superseded(&workspace.index_dir());
+    }
     if detached.is_some() {
         super::scan_state::finish(outcome.as_ref().err().map(String::as_str));
     }
@@ -514,6 +540,12 @@ fn start_detached(root: Option<&Path>) -> Result<(), String> {
             crate::logging::RUN_PHASE_ENV,
             format!("detached build {scan_id}"),
         )
+        // Everything this child prints goes into a log file that nothing
+        // renders, so it is asked for text rather than terminal control
+        // sequences (carrick#1023 item 6).
+        .env("NO_COLOR", "1")
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .stdin(std::process::Stdio::null())
         .stdout(
             handle
@@ -672,14 +704,52 @@ fn print_map(outcome: &super::index::IndexOutcome) {
     }
 }
 
+/// What `carrick status` says when it found no index to read.
+///
+/// [`ReadError::NotIndexed`]'s own sentence is written for `touch` and
+/// `check`, which take a file; this command takes none, and a workspace with a
+/// scan in flight would be told to start the scan that is already running —
+/// which is what a first paid run reads a minute after starting it
+/// (carrick#1023 item 1). The scan's own line is printed above this one, so
+/// the sentence points at it rather than repeating its id.
+fn no_index_here(root: Option<&Path>, scans: &[super::scan_state::ScanState]) -> String {
+    if scans.iter().any(|scan| scan.is_running()) {
+        return "no index in this workspace yet: the scan above is still building it. Ask again \
+                when it says it finished."
+            .to_string();
+    }
+    match root {
+        Some(root) => format!(
+            "no index in {}. Run `carrick index --workspace {}` in the folder holding your repos.",
+            root.join(super::workspace::INDEX_DIR).display(),
+            root.display()
+        ),
+        None => "no index above this directory. Run `carrick index --workspace <dir>` in the \
+                 folder holding your repos."
+            .to_string(),
+    }
+}
+
 /// `touch` and `check`: answer about one file.
+///
+/// A refusal from `check` is the one read that exits non-zero. `check` is the
+/// command a script runs to ask whether this file's contracts hold, and "no
+/// contract problems" and "there is no index" were the same exit code, so
+/// nothing downstream could tell an answer from the absence of one
+/// (carrick#1023 item 2). A VERDICT never moves the exit code — the command is
+/// advisory and nothing blocks — and `touch`, the editor's read, still exits 0
+/// whatever it finds, because an edit must never fail on a missing index.
 fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode, freshness: Freshness) -> i32 {
+    let refused = match mode {
+        Mode::Check => 1,
+        Mode::Touch => 0,
+    };
+    let refuse = |failure: ReadFailure| -> i32 {
+        report(failure, json, super::contract::SCHEMA);
+        refused
+    };
     let Some(root) = super::workspace::locate(root, Some(file)) else {
-        return report(
-            ReadFailure::new(ReadError::NotIndexed),
-            json,
-            super::contract::SCHEMA,
-        );
+        return refuse(ReadFailure::new(ReadError::NotIndexed));
     };
     match super::query::answer(&root, file, mode, freshness) {
         Ok(output) => {
@@ -688,11 +758,7 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode, freshness: Fre
                     Ok(text) => println!("{text}"),
                     Err(e) => {
                         eprintln!("carrick: could not serialize the answer: {e}");
-                        return report(
-                            ReadFailure::new(ReadError::IndexUnreadable),
-                            json,
-                            super::contract::SCHEMA,
-                        );
+                        return refuse(ReadFailure::new(ReadError::IndexUnreadable));
                     }
                 }
             } else {
@@ -700,12 +766,13 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode, freshness: Fre
             }
             0
         }
-        Err(error) => report(error, json, super::contract::SCHEMA),
+        Err(error) => refuse(error),
     }
 }
 
-/// Say why there is no answer, in the form the caller asked for, and still
-/// exit 0.
+/// Say why there is no answer, in the form the caller asked for, and answer 0.
+/// A caller that has decided a refusal of its own is worth an exit code says
+/// so itself; see [`read`].
 fn report(failure: ReadFailure, json: bool, schema: &str) -> i32 {
     report_with_scans(failure, json, schema, Vec::new(), None)
 }

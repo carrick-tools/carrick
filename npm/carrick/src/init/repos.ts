@@ -56,8 +56,8 @@ export const PROPOSAL_FILE = path.join(".carrick", "proposal.json");
  * the other's file. Keep the two in step.
  */
 const SELF_IGNORE =
-  "# Written by Carrick. Everything here is derived from your source and is\n" +
-  "# rebuilt by re-running `carrick index`.\n*\n";
+  "# Written by Carrick. Everything here is derived from your source and the\n" +
+  "# hosted index, and `carrick refresh` rebuilds it.\n*\n";
 
 /**
  * Write the derived proposal where the scaffold tool's agent reads it.

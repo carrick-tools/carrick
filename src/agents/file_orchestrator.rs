@@ -5859,7 +5859,8 @@ impl FileOrchestrator {
                 .any(|kept| Self::model_row_key(kept) == key)
             {
                 warn!(
-                    "[FileOrchestrator] Model endpoint {} {} in {} restates a row already                      emitted for this file: dropped",
+                    "[FileOrchestrator] Model endpoint {} {} in {} restates a row already \
+                     emitted for this file: dropped",
                     endpoint.method, endpoint.path, file_path
                 );
                 continue;

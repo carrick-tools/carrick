@@ -188,6 +188,16 @@ pub struct ServiceEnrichment {
     pub failure: Option<String>,
     pub allowance_sentence: Option<String>,
     pub hosted_cache_version: Option<u32>,
+    /// This service's candidates were classified by the model in THIS run.
+    ///
+    /// Every other field here describes the hosted row. This one describes the
+    /// scan that wrote the index, and it is what keeps `carrick index` from
+    /// ending on `refresh`'s sentence: a paid scan whose hosted row cannot be
+    /// replayed afterwards (a dirty tree is the ordinary case on a first run)
+    /// still ran the model on this machine, and the index it wrote carries
+    /// those rows (carrick#1023 item 14).
+    #[serde(default)]
+    pub classified_here: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -780,13 +790,30 @@ impl HostedInput {
                 HostedState::NoIndexYet
             } else if self.failure.is_some() {
                 HostedState::ReadFailed
-            } else if repo
+            } else if let Some(hosted_names) = repo
                 .services
                 .as_ref()
-                .is_some_and(|services| !services.is_empty())
+                .filter(|services| !services.is_empty())
             {
-                result.failure =
-                    Some("No unambiguous hosted blob matched this local service".into());
+                // Name both sides. The index is keyed on the service NAME, and
+                // the name a hosted row carries is the one that was in
+                // `carrick.json` when the row was written — so a local
+                // `@scope/thing`, which is what a workspace member's manifest
+                // derives, matches a hosted `thing` nowhere, and the symptom
+                // ("candidates not replayed") says nothing about the cause
+                // (carrick#1023 item 12).
+                let local = blob.service_name.as_deref().unwrap_or(&blob.repo_name);
+                let hosted = hosted_names
+                    .iter()
+                    .map(|service| service.service.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                result.failure = Some(format!(
+                    "local service `{local}` has no hosted match; the hosted index holds \
+                     [{hosted}]. `serviceName` in carrick.json is the key the index is written \
+                     under, and a scoped package name is not one of the names these hosted rows \
+                     carry."
+                ));
                 HostedState::ReadFailed
             } else {
                 HostedState::NoIndexYet
@@ -889,6 +916,9 @@ impl HostedInput {
                 dirty: blob.dirty,
             }),
             hosted_state: HostedState::Enriched,
+            // This process ran the model over this service and wrote the blob,
+            // whatever becomes of the hosted row below (carrick#1023 item 14).
+            classified_here: true,
         };
         if blob.dirty == Some(true) {
             result.failure =

@@ -34,8 +34,16 @@ change bumps it to `carrick.check/1` and both are emitted for one release.
 opening a session asks. `touch` and `check` never call a model and never call
 the cloud. Without `--recheck` they never parse the file either: they read what
 `index` already computed. `touch` answers "what is on the other side of what I
-am editing"; `check` adds the contract verdicts. Both exit 0 whatever they
-find: local mode is advisory, nothing blocks.
+am editing"; `check` adds the contract verdicts. What either one FINDS never
+moves the exit code: local mode is advisory, nothing blocks, and an index full
+of mismatches exits 0. The one exception is `check` refusing to answer at
+all — no index, the file outside the workspace, an index this build cannot
+read — which exits 1, because a script asking whether this file's contracts
+hold could not otherwise tell "no contract problems" from "no answer"
+(carrick#1023 item 2). `touch` and `status` exit 0 even then: they are the
+editor's and the session's reads, and an edit must never fail because an index
+is missing. The refusal body is printed either way, so a reader parsing the
+JSON is unaffected by the code.
 
 `carrick check --recheck` is the one read that recomputes (carrick#1036). When
 the file has changed since the index, it re-scans **that file's repo only** —
@@ -388,8 +396,13 @@ The workspace question has its own command and its own schema, below.
 
 What a surface opening a session asks: what is indexed, at which commit, how
 far each repo has moved since, and what each service could not classify. Same
-rules as the other reads: local index and credential identity, exit 0 whatever
-it finds, under 300 ms.
+rules as the other reads: local index and credential identity, under 300 ms,
+and exit 0 whatever it finds — including a refusal, unlike `check`.
+
+Its refusal is written for a command that takes no file, and it never names the
+scan that is already running: a workspace whose first paid scan is in flight is
+told that, not told to start one (carrick#1023 item 1). The running scan is
+printed above the sentence, and carried in `running_scans` on the error body.
 
 `--json` prints **`carrick.status/0`**
 ([`schemas/carrick-status-0.json`](./schemas/carrick-status-0.json)):
