@@ -9,6 +9,7 @@ import { signIn } from "../auth/run.ts";
 import { resolveRepos, type ResolvedRepos } from "../auth/read.ts";
 import { deriveWorkspace, writeProposal, PROPOSAL_FILE, repoIdentity } from "./repos.ts";
 import { connectRepos, reposAreInProject, projectAssignments } from "./connect.ts";
+import { downloadHostedIndex, hostedLines } from "./hosted.ts";
 import { ensureProject, projectStep, SLUG } from "./projects.ts";
 import { connectMcpClients, mcpLines } from "./mcp.ts";
 import { hookCommand, mergeCarrickHooks } from "./settings.ts";
@@ -130,7 +131,9 @@ function help(): string {
     "or a folder of repos: the project, the repo connection, the agent hooks,",
     "the MCP connection, and the service proposal your agent turns into",
     "carrick.json. It writes nothing into the repository but the ignored",
-    ".carrick directory and the hook settings, and it runs no scan.",
+    ".carrick directory and the hook settings, and it runs no paid scan: where",
+    "Carrick already holds an index for these repos, it reads that index into",
+    ".carrick so this machine can answer from it.",
     "With --project, a project missing from the workspace is offered for",
     "creation here, and the repos are put in it from the terminal once the",
     "GitHub App grant connects them.",
@@ -495,7 +498,10 @@ export async function init(argv: string[]): Promise<number> {
   // Unless CI has already built one. The hosted index is the whole workspace's
   // row, and `carrick index` from a laptop on a branch replaces it for
   // everyone who queries it, so where the workspace read found services this
-  // says so and orders no scan at all (carrick#993 row 2).
+  // run orders no scan (carrick#993 row 2) and reads that index onto this
+  // machine instead. Saying "do not run the scan" and leaving `.carrick`
+  // empty left the reader with no index and no command that would make one,
+  // which is every second developer on a team (carrick#1020).
   if (hostedIndex.length > 0) {
     const subject =
       hostedIndex.length === requested.length && requested.length === 1
@@ -503,8 +509,12 @@ export async function init(argv: string[]): Promise<number> {
         : hostedIndex.length > 3
           ? `${hostedIndex.slice(0, 3).join(", ")} and ${hostedIndex.length - 3} more`
           : hostedIndex.join(", ");
-    say(`  ${subject} already ${hostedIndex.length === 1 ? "has" : "have"} a hosted index. Do not run \`carrick index\`:`);
-    say("  from a branch it replaces the CI row for everyone, and CI keeps it current.");
+    say(`  ${subject} already ${hostedIndex.length === 1 ? "has" : "have"} a hosted index, so this run reads it`);
+    say("  into .carrick/ rather than scanning: no model runs and nothing is uploaded.");
+    say("  It re-reads the source on this machine once, which on a large workspace is a");
+    say("  few minutes.");
+    say();
+    for (const line of hostedLines(await downloadHostedIndex(plan.workspace))) say(line);
     say(`  ${PROPOSAL_FILE} holds the services this run derived, to compare`);
     say("  with the carrick.json already committed.");
   } else {

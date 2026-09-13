@@ -556,16 +556,17 @@ pub fn enrichment_note(
         ),
         _ => boundary_note(boundary),
     };
-    if enrichment.hosted_state == HostedState::VersionMismatch
-        && let Some(version) = enrichment
-            .hosted
-            .as_ref()
-            .and_then(|h| h.scanner_version.as_ref())
-        && semver::Version::parse(version).is_ok()
-    {
-        note.push_str(&format!(
-            " Run npm i -g carrick@{version}, or re-index main with the current Action."
-        ));
+    // Not "install the version that wrote the blob": `CACHE_VERSION` moves
+    // most weeks, so a hosted blob is behind the installed CLI far more often
+    // than the CLI is wrong, and asking for a downgrade asks the reader to
+    // give up every fix since. The move available to them is to write a newer
+    // blob, from main, where a laptop scan replaces nobody else's row
+    // (carrick#1012 item 1, carrick#1020).
+    if enrichment.hosted_state == HostedState::VersionMismatch {
+        note.push_str(
+            " The hosted index is older than this CLI; run `carrick index --detach` once from \
+             main to refresh it.",
+        );
     }
     if let Some(failure) = &enrichment.failure {
         if let Some(hosted) = &enrichment.hosted {
@@ -598,6 +599,26 @@ mod tests {
         let note = boundary_note(Some(&boundary));
         assert!(note.contains("not classified locally"), "{note}");
         assert!(note.contains("7 route-literal call site(s)"), "{note}");
+    }
+
+    /// carrick#1012 item 1. `CACHE_VERSION` moves most weeks, so a hosted
+    /// blob is behind the installed CLI far more often than the CLI is wrong,
+    /// and the sentence that named a version asked the reader to downgrade.
+    #[test]
+    fn a_hosted_index_behind_this_cli_asks_for_a_newer_blob_not_an_older_cli() {
+        let enrichment = crate::local_mode::hosted::ServiceEnrichment {
+            hosted_state: crate::local_mode::hosted::HostedState::VersionMismatch,
+            ..Default::default()
+        };
+        let note = enrichment_note(&enrichment, None);
+        assert!(
+            note.contains(
+                "The hosted index is older than this CLI; run `carrick index --detach` once from \
+                 main to refresh it."
+            ),
+            "{note}"
+        );
+        assert!(!note.contains("npm i -g carrick@"), "{note}");
     }
 
     #[test]

@@ -88,7 +88,16 @@ function executableInitFixture(
   // What the workspace read says about the repos beyond their connection:
   // whether Carrick already holds an index for them, and which other repos
   // the project holds that this machine does not (carrick#993 rows 2 and 18).
-  workspace: { indexed?: boolean; alsoInProject?: string[] } = {},
+  // An indexed workspace is also the one whose `refresh` and `status` the
+  // fixture binary answers, because that is the branch that reads the hosted
+  // index onto this machine (carrick#1020): `hostedState` is what the status
+  // it writes reports, and `refreshFails` is the scanner refusing the read.
+  workspace: {
+    indexed?: boolean;
+    alsoInProject?: string[];
+    hostedState?: string;
+    refreshFails?: boolean;
+  } = {},
 ): {
   root: string;
   repo: string;
@@ -102,10 +111,34 @@ function executableInitFixture(
   execFileSync("git", ["-C", repo, "remote", "add", "origin", clone.origin ?? "git@github.com:acme/api.git"]);
 
   const native = path.join(root, "native.mjs");
-  // Anything but `derive` exits 2, so a run that ends 0 is a run that never
-  // asked this binary to scan.
+  // Anything but `derive` — and, on an indexed workspace, the free `refresh`
+  // and `status` that read the hosted index onto this machine — exits 2, so a
+  // run that ends 0 is a run that never asked this binary to scan.
   fs.writeFileSync(native, `#!/usr/bin/env node
 const argv = process.argv.slice(2);
+const indexed = ${JSON.stringify(workspace.indexed === true)};
+const at = (flag) => argv[argv.indexOf(flag) + 1];
+if (indexed && argv[0] === "refresh") {
+  if (${JSON.stringify(workspace.refreshFails === true)}) {
+    process.stderr.write("carrick refresh: api has no carrick.json\\n");
+    process.exit(1);
+  }
+  process.stdout.write("indexed 1 repo(s) in 4.0s\\n");
+  process.exit(0);
+}
+if (indexed && argv[0] === "status") {
+  const service = (name, state) => ({
+    service: name, repo: at("--workspace"), index_commit: "abc1234",
+    indexed_at: "2026-09-12T00:00:00Z", routes: 3, calls: 2, changed_since_index: 0,
+    hosted_state: state,
+  });
+  const state = ${JSON.stringify(workspace.hostedState ?? "enriched")};
+  process.stdout.write(JSON.stringify({
+    schema: "carrick.status/0", workspace: at("--workspace"),
+    services: [service("api", state), service("web", state)],
+  }));
+  process.exit(0);
+}
 if (argv[0] !== "derive") process.exit(2);
 const workspace = argv[argv.indexOf("--workspace") + 1];
 const monorepo = ${JSON.stringify(derived === "monorepo")};
@@ -594,10 +627,11 @@ test("the executable CLI creates the named project and puts the repos in it", po
   }
 });
 
-// carrick#993 rows 2 and 18: what a second machine joining an indexed project
-// is told. The paid scan has already run in CI, and the project holds repos
-// this folder does not.
-test("the executable CLI refuses the paid scan on an indexed repo and names the rest of the project", posixNativeFixture, () => {
+// carrick#993 rows 2 and 18 and carrick#1020: what a second machine joining an
+// indexed project is told, and what it ends up holding. The paid scan has
+// already run in CI, the project holds repos this folder does not, and the
+// hosted index is read onto this machine instead of being withheld from it.
+test("the executable CLI reads the hosted index onto an indexed repo and names the rest of the project", posixNativeFixture, () => {
   const fixture = executableInitFixture("payments", "absent", "no-config", {}, {
     indexed: true,
     alsoInProject: ["acme/web", "acme/worker"],
@@ -613,19 +647,81 @@ test("the executable CLI refuses the paid scan on an indexed repo and names the 
       result.stdout.includes("Also in this project, not on this machine: acme/web, acme/worker."),
       result.stdout,
     );
+    // What happened, not a prohibition: the sentence this replaces left the
+    // machine with no index and told the reader not to run the only command
+    // that would have built one (carrick#1020).
     assert.ok(
-      result.stdout.includes("This repo already has a hosted index. Do not run `carrick index`"),
+      result.stdout.includes("Hosted index for 2 services downloaded into .carrick/."),
       result.stdout,
     );
-    assert.match(result.stdout, /it replaces the CI row for everyone/);
+    assert.doesNotMatch(result.stdout, /already has a hosted index\. Do not run/);
     assert.doesNotMatch(result.stdout, /There is no index yet/);
-    // And it orders no scan at all, not a cheaper one: there is no facts-only
-    // pass in the flow (carrick#1008, cloud#832).
+    // And nothing tells the reader to run a free pass by hand: the read above
+    // is this command's, and `carrick index` stays the only scan in the flow
+    // (carrick#1008, cloud#832).
     assert.doesNotMatch(result.stdout, /carrick refresh/);
-    // Including in the prompt the run ends on, which is the copy an agent acts
-    // on rather than reads.
+    // The prompt the run ends on is the agent's copy, and it still orders no
+    // scan: a laptop scan from a branch replaces the CI row for everyone.
     assert.match(result.stdout, /Do not run `carrick index`/);
     assert.doesNotMatch(result.stdout, /is connected and has no hosted index yet/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+// carrick#1012 item 1. `CACHE_VERSION` moves most weeks, so a hosted blob is
+// behind the installed CLI far more often than the CLI is wrong, and the
+// sentence that asked for a downgrade asked the reader to give up every fix
+// since.
+test("a hosted index older than this CLI is reported as such, and no downgrade is asked for", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments", "absent", "no-config", {}, {
+    indexed: true,
+    hostedState: "version_mismatch",
+  });
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(
+      result.stdout.includes(
+        "The hosted index is older than this CLI; run `carrick index --detach` once from main to refresh it.",
+      ),
+      result.stdout,
+    );
+    assert.doesNotMatch(result.stdout, /npm i -g carrick@/);
+    // And no claim that the hosted rows arrived, because they did not.
+    assert.doesNotMatch(result.stdout, /downloaded into \.carrick/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+// A read that fails is a sentence, not a crash and not a silence: the rest of
+// the setup is written either way, and the reader is told there is nothing to
+// answer from yet.
+test("a hosted read that fails leaves the setup written and says what went wrong", posixNativeFixture, () => {
+  const fixture = executableInitFixture("payments", "absent", "no-config", {}, {
+    indexed: true,
+    refreshFails: true,
+  });
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(
+      result.stdout.includes(
+        "The hosted index could not be read into .carrick/: api has no carrick.json.",
+      ),
+      result.stdout,
+    );
+    assert.match(result.stdout, /run carrick init again/);
+    assert.equal(fs.existsSync(path.join(fixture.repo, PROPOSAL_FILE)), true);
   } finally {
     fixture.cleanup();
   }
