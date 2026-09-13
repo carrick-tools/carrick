@@ -95,16 +95,24 @@ function firstLine(text: string, fallback: string): string {
 }
 
 /**
+ * A runner for the scanner, told whether the terminal is somebody else's.
+ *
+ * `quiet` is true while a spinner is showing: a spinner owns its line, and the
+ * scanner's progress landing in the middle of it corrupts the terminal. Without
+ * one — a pipe, CI, an agent's shell — the progress is the only sign a
+ * minutes-long read is alive (carrick#1021, carrick#1026).
+ */
+export function nativeRunner(quiet: boolean): NativeRun {
+  return (args) => spawnNative(args, quiet);
+}
+
+/**
  * Populate `.carrick/` from the hosted index, and say what arrived.
  *
  * `workspace` is the derived workspace root — the directory `carrick init`
  * wrote the proposal into — so the index this builds is the one every later
  * read of that workspace finds.
  */
-export function nativeRunner(quiet: boolean): NativeRun {
-  return (args) => spawnNative(args, quiet);
-}
-
 export async function downloadHostedIndex(
   workspace: string,
   run: NativeRun = nativeRunner(false),

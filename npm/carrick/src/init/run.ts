@@ -246,10 +246,8 @@ export async function init(argv: string[]): Promise<number> {
 
   // Authentication and all derivation validation precede local writes.
   let derived: ReturnType<typeof deriveWorkspace>;
-  // What the workspace read said about these repos, for the lines printed long
-  // after it: a repo Carrick already holds an index for must not be told to
-  // run the paid scan again (carrick#993).
-  let requested: string[] = [];
+  // The repos the workspace read found an index for: where CI has already built
+  // one, this run reads it rather than ordering a scan (carrick#993 row 2).
   const hostedIndex: string[] = [];
   try {
     // A machine that has never signed in signs in here rather than being told
@@ -321,7 +319,6 @@ export async function init(argv: string[]): Promise<number> {
       // later upload has no repo identity to resolve a project from.
       out.warn("No repo here names a GitHub repository, so this run chooses no project and checks no connection.");
     }
-    requested = names;
     const initial = await resolveRepos(credential.token, names);
     // The project half of the browser round trip, where this API can do it
     // from here: the project is created here, and `connectRepos` puts the
