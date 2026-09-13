@@ -1011,8 +1011,9 @@ fn a_detached_scan_outlives_the_command_that_started_it() {
         "the log ends on the outcome:\n{printed}"
     );
 
-    // The next build is what forgets it.
-    run(root, &["index", "--workspace", "."]);
+    // The next build is what forgets it — `refresh` here, which is the build
+    // that pays for nothing (carrick#1008).
+    run(root, &["refresh", "--workspace", "."]);
     assert!(
         !state.exists(),
         "a build clears the finished record it found:\n{}",
