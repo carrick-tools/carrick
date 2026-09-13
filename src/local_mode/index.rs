@@ -58,6 +58,10 @@ pub fn run(workspace: &Workspace, only: Option<&str>, infer: bool) -> Result<Ind
     let requested = only
         .map(|name| repo_for_service(workspace, &workspace.blobs_dir(), name))
         .transpose()?;
+    // The word `carrick status` said for the last scan is history the moment
+    // this build starts: whatever it wrote, this run is writing a newer index
+    // (carrick#1007 item 4).
+    super::scan_state::forget_finished(&workspace.index_dir());
     let hosted = super::hosted::refresh(workspace);
     let previous = LocalIndex::read(&workspace.index_file()).ok();
     let same_sources = previous.as_ref().is_some_and(|index| {
@@ -137,6 +141,11 @@ fn run_generation(
         .map_err(|e| e.to_string())?;
     }
     let mut scanned = Vec::new();
+    // The repos this run scanned WITH the model and uploaded. A laptop scan
+    // that returns here has written its blob to the cloud — the tee propagates
+    // the cloud's error, so a refused upload fails the scan — and that is the
+    // one fact the pre-scan hosted snapshot cannot know (carrick#1007 item 1).
+    let mut uploaded: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     // The receipt, written as each figure lands rather than at the end: the
     // money is spent at the upload, so a run killed after paying still leaves
     // the record of it behind (carrick#995).
@@ -153,7 +162,11 @@ fn run_generation(
         // scanner in its own directory so user labels cannot overwrite a
         // retained or hosted blob in the join input.
         let scan_dir = generation.join(format!("scan-{position}"));
-        if let Some(paid) = scan_repo(&exe, repo, &scan_dir, &previous, &name, infer)? {
+        let paid = scan_repo(&exe, repo, &scan_dir, &previous, &name, infer)?;
+        if infer {
+            uploaded.insert(repo.clone());
+        }
+        if let Some(paid) = paid {
             spend.record(&name, paid);
             spend.write(&workspace.last_scan_file());
             // And into the detached build's own state file, so the one
@@ -213,7 +226,12 @@ fn run_generation(
                 .iter()
                 .find(|b| b.repo_name == repo.name && service_id(b) == service.name)
             {
-                service.enrichment = hosted.service(Path::new(&repo.path), blob);
+                let path = PathBuf::from(&repo.path);
+                service.enrichment = if uploaded.contains(&path) {
+                    hosted.uploaded(&path, blob)
+                } else {
+                    hosted.service(&path, blob)
+                };
             }
         }
         for item in repo.files.values_mut().flatten() {
@@ -318,6 +336,7 @@ fn scan_repo(
             working: format!("indexing {label}"),
             done: format!("indexed {label}"),
         },
+        HEARTBEAT,
     )
 }
 
@@ -375,6 +394,7 @@ fn join(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Result<LocalJoin, 
             working: "joining the workspace".to_string(),
             done: "joined the workspace".to_string(),
         },
+        HEARTBEAT,
     )?;
 
     let text = std::fs::read_to_string(out)
@@ -408,23 +428,30 @@ fn join_command(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Command {
     command
 }
 
-/// Run one scan subprocess, and say what it printed if it failed.
-///
-/// The scan's stdout is dropped — it is a report that means nothing here — and
-/// its stderr is read line by line rather than collected at the end, for two
-/// reasons: the progress lines it carries are worth something only while the
-/// scan is still running (carrick#955), and the useful half of a failure is
-/// still the last few lines, which are kept as they go past.
 /// What one phase of a build calls itself while it runs and once it is done.
 struct Reporting {
     working: String,
     done: String,
 }
 
+/// Run one scan subprocess, and say what it printed if it failed.
+///
+/// The scan's stdout is dropped — it is a report that means nothing here — and
+/// its stderr is read line by line rather than collected at the end, because
+/// the progress lines it carries are worth something only while the scan is
+/// still running (carrick#955).
+///
+/// What is kept of a failure is its HEAD and its tail, not the tail alone. A
+/// Rust panic prints `thread '...' panicked at <file:line>` and then a
+/// backtrace note, and a scan that panics keeps logging on the way down: the
+/// last twelve lines were the shutdown noise and the sentence naming the
+/// panic had already been evicted, which is how carrick#936 reached a user as
+/// "the scan of <path> failed" with no cause anywhere.
 fn run_scan(
     mut command: Command,
     what: &str,
     reporting: Reporting,
+    heartbeat: std::time::Duration,
 ) -> Result<Option<crate::scan_spend::ScanSpend>, String> {
     command.stdout(Stdio::null()).stderr(Stdio::piped());
     let mut child = command
@@ -440,13 +467,41 @@ fn run_scan(
     // for a scan nobody is watching at all (carrick#992). The second is a
     // no-op unless this build was detached.
     super::scan_state::note(&reporting.working, None);
-    let mut tail: VecDeque<String> = VecDeque::with_capacity(12);
+    let mut head: Vec<String> = Vec::with_capacity(KEPT_LINES);
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(KEPT_LINES);
+    // The sentence that explains a crash, wherever in the output it fell.
+    let mut panics: Vec<String> = Vec::new();
+    let mut dropped = 0usize;
     // What this scan paid, if it paid anything. It crosses on the same
     // channel as the progress, and for the same reason: this process swallows
     // the scan's output, so a figure it does not lift out is a figure nobody
     // ever sees (carrick#995).
     let mut spend = None;
-    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+    // The child's stderr is read on a thread of its own so that this loop can
+    // wake up when the child says NOTHING. A scan's quiet stretches are its
+    // long ones — a model call, a type check — and the log's pulse used to be
+    // driven entirely by lines arriving, so it stopped exactly when a reader
+    // most needed it and the last thing it had said was a part-finished count
+    // (carrick#1007 item 3).
+    let (lines, from_child) = std::sync::mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        let line = match from_child.recv_timeout(heartbeat) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Same phase, same counts, new moment: the state file's
+                // `updated_at` moves and the log gets its pulse.
+                super::scan_state::note(&reporting.working, None);
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         if let Some(update) = crate::progress::parse(&line) {
             bar.set_message(format!("{}: {}", reporting.working, update.render()));
             super::scan_state::note(&reporting.working, Some(&update));
@@ -456,11 +511,20 @@ fn run_scan(
             spend = Some(reported);
             continue;
         }
-        if tail.len() == 12 {
+        if line.contains(PANIC_MARKER) && panics.len() < KEPT_PANICS {
+            panics.push(line.clone());
+        }
+        if head.len() < KEPT_LINES {
+            head.push(line);
+            continue;
+        }
+        if tail.len() == KEPT_LINES {
             tail.pop_front();
+            dropped += 1;
         }
         tail.push_back(line);
     }
+    let _ = reader.join();
     let status = child
         .wait()
         .map_err(|e| format!("could not wait for the {what}: {e}"))?;
@@ -471,8 +535,45 @@ fn run_scan(
     bar.finish_and_clear();
     Err(format!(
         "the {what} failed:\n{}",
-        tail.into_iter().collect::<Vec<_>>().join("\n")
+        failure_excerpt(head, panics, tail, dropped)
     ))
+}
+
+/// How long this process waits on a silent child before saying where it is.
+/// Shorter than the log's own pulse, so the pulse decides how often a line is
+/// written and this only decides how often it is offered one.
+const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How many lines of a failed child's stderr are kept from each end.
+const KEPT_LINES: usize = 12;
+/// How many panic lines are lifted out of the middle.
+const KEPT_PANICS: usize = 4;
+/// What the Rust runtime prints when a thread dies, whatever the message is.
+const PANIC_MARKER: &str = "panicked at";
+
+/// The lines of a failed scan worth repeating: the first twelve, anything that
+/// named a panic, the last twelve, and a count of what was dropped between
+/// them.
+fn failure_excerpt(
+    head: Vec<String>,
+    panics: Vec<String>,
+    tail: VecDeque<String>,
+    dropped: usize,
+) -> String {
+    let mut lines = head;
+    let middle: Vec<String> = panics
+        .into_iter()
+        .filter(|panic| !lines.contains(panic) && !tail.contains(panic))
+        .collect();
+    if dropped > 0 {
+        lines.push(format!(
+            "... {dropped} line(s) not shown{} ...",
+            if middle.is_empty() { "" } else { ", except" }
+        ));
+    }
+    lines.extend(middle);
+    lines.extend(tail);
+    lines.join("\n")
 }
 
 /// Strip the ambient CI context, exactly as the offline harness does. Without
@@ -980,6 +1081,9 @@ mod tests {
     /// the stream rather than into the failure tail (carrick#995).
     #[test]
     fn the_indexer_lifts_the_figure_out_of_the_scan_it_swallowed() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let spend = crate::scan_spend::ScanSpend {
             schema: crate::scan_spend::SCHEMA.to_string(),
             scan_id: "scan_01J".to_string(),
@@ -1001,6 +1105,7 @@ mod tests {
                 working: "indexing api".to_string(),
                 done: "indexed api".to_string(),
             },
+            HEARTBEAT,
         )
         .unwrap();
         assert_eq!(lifted, Some(spend));
@@ -1009,6 +1114,9 @@ mod tests {
     /// A free pass reports nothing, and nothing is not a scan that cost zero.
     #[test]
     fn a_scan_that_states_no_figure_reports_none() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut command = Command::new("sh");
         command.arg("-c").arg("echo 'analysing' >&2");
         let lifted = run_scan(
@@ -1018,6 +1126,7 @@ mod tests {
                 working: "indexing api".to_string(),
                 done: "indexed api".to_string(),
             },
+            HEARTBEAT,
         )
         .unwrap();
         assert!(lifted.is_none());
@@ -1114,5 +1223,129 @@ mod tests {
             env.get(crate::logging::RUN_PHASE_ENV),
             Some(&Some("workspace join".into()))
         );
+    }
+
+    /// A scan that panics keeps logging on the way down, so the last twelve
+    /// lines were shutdown noise and the sentence naming the panic had been
+    /// evicted before anyone read the failure (carrick#936).
+    #[test]
+    fn a_failed_scan_reports_the_panic_it_died_of_wherever_it_fell() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            "for i in $(seq 1 20); do echo \"starting step $i\" >&2; done; \
+             echo \"thread 'main' panicked at src/engine/mod.rs:1045: capacity overflow\" >&2; \
+             for i in $(seq 1 40); do echo \"shutting down $i\" >&2; done; exit 1",
+        );
+        let error = run_scan(
+            command,
+            "scan of /repos/api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+            HEARTBEAT,
+        )
+        .expect_err("the child exited non-zero");
+
+        assert!(
+            error.contains("panicked at src/engine/mod.rs:1045"),
+            "{error}"
+        );
+        // The two ends are still there, and the middle says how much is not.
+        assert!(error.contains("starting step 1\n"), "{error}");
+        assert!(error.contains("shutting down 40"), "{error}");
+        assert!(error.contains("line(s) not shown"), "{error}");
+        // And a bounded excerpt: the whole 61 lines are not repeated.
+        assert!(error.lines().count() < 35, "{error}");
+    }
+
+    /// A failure short enough to state in full is stated in full: nothing is
+    /// dropped and no "not shown" line appears.
+    #[test]
+    fn a_short_failure_is_repeated_whole() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo 'could not read carrick.json' >&2; exit 2");
+        let error = run_scan(
+            command,
+            "scan of /repos/api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+            HEARTBEAT,
+        )
+        .expect_err("the child exited non-zero");
+        assert!(error.ends_with("could not read carrick.json"), "{error}");
+        assert!(!error.contains("not shown"), "{error}");
+    }
+
+    /// Every test that drives [`run_scan`] writes through the one process-wide
+    /// scan-state record, so two of them at once are two phases fighting over
+    /// it (carrick#592's family). They take this in turn instead.
+    static SCAN_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A scan's long stretches are its quiet ones — a model call, a type
+    /// check — and the log's pulse used to be driven entirely by lines
+    /// arriving from the child. So the detached log stopped moving exactly
+    /// when a reader most needed it, on a part-finished count, while `carrick
+    /// status` was reporting a different service (carrick#1007 item 3).
+    #[test]
+    fn a_silent_child_still_moves_the_scan_state() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        super::super::scan_state::begin(dir.path(), "heartbt1", dir.path(), true);
+        let state = super::super::scan_state::state_file(dir.path(), "heartbt1");
+        let at_start = std::fs::read_to_string(&state).unwrap();
+
+        let update = crate::progress::Update {
+            service: "ledger".to_string(),
+            service_index: 2,
+            service_total: 2,
+            phase: crate::progress::Phase::Files,
+            done: 1,
+            total: 2,
+        };
+        let mut command = Command::new("sh");
+        // One count, then a silence longer than the state file's own write
+        // gap: the shape of a scan waiting on the model. Nothing arrives from
+        // the child in that window, so before this fix nothing was written in
+        // it either.
+        command.arg("-c").arg(format!(
+            "echo '@carrick-progress {}' >&2; sleep 2.5",
+            serde_json::to_string(&update).unwrap()
+        ));
+        run_scan(
+            command,
+            "scan of /repos/ledger",
+            Reporting {
+                working: "indexing ledger".to_string(),
+                done: "indexed ledger".to_string(),
+            },
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap();
+
+        let after = std::fs::read_to_string(&state).unwrap();
+        assert_ne!(at_start, after, "the state file never moved");
+        assert!(
+            !after.contains("\"phase\": \"starting\""),
+            "the pulse never replaced the starting record: {after}"
+        );
+        let read: super::super::scan_state::ScanState = serde_json::from_str(&after).unwrap();
+        assert_eq!(read.phase, "indexing ledger");
+        // The pulse states where the scan is; it must not erase where it got
+        // to, which is the only count a reader has.
+        assert_eq!(read.progress, Some(update));
+        super::super::scan_state::finish(None);
     }
 }

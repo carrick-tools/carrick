@@ -489,3 +489,113 @@ fn a_deno_member_imported_by_path_names_its_dependent() {
     // A registry dependency is not a member, whatever it is named.
     assert_eq!(derived.members[1].workspace_dependents.len(), 1);
 }
+
+/// The ordinary Deno workspace: members import each other by the NAME the
+/// workspace makes importable, and nothing records that edge — not a
+/// dependency entry, not an import map, not the lock file. Every member
+/// carried `exports: true` and an empty dependents list, so neither field
+/// separated the apps from the library they share (carrick#1007 item 6).
+#[test]
+fn a_deno_member_imported_by_workspace_name_names_its_dependents() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "deno.json",
+        r#"{"workspace":["./apps/gateway","./apps/ledger","./packages/shared"]}"#,
+    );
+    write(
+        root,
+        "apps/gateway/deno.json",
+        r#"{"name":"@sample/gateway","exports":"./main.ts"}"#,
+    );
+    // Types only, which is still an import: a shared types package is exactly
+    // the member a dependents list exists to name.
+    write(
+        root,
+        "apps/gateway/main.ts",
+        "import type { Entry } from \"@sample/shared\";\nexport const port = 8080;\n",
+    );
+    write(
+        root,
+        "apps/ledger/deno.json",
+        r#"{"name":"@sample/ledger","exports":"./main.ts"}"#,
+    );
+    write(
+        root,
+        "apps/ledger/main.ts",
+        "import { format } from \"@sample/shared/money\";\nexport const port = 8081;\n",
+    );
+    write(
+        root,
+        "packages/shared/deno.json",
+        r#"{"name":"@sample/shared","exports":"./mod.ts"}"#,
+    );
+    write(
+        root,
+        "packages/shared/mod.ts",
+        "export type Entry = { id: string };\nexport const format = (n: number) => `${n}`;\n",
+    );
+
+    let derived = resolve(root).unwrap();
+    let by_name = |name: &str| {
+        derived
+            .services
+            .iter()
+            .position(|service| service.service_name.as_deref() == Some(name))
+            .map(|index| &derived.members[index])
+            .unwrap_or_else(|| panic!("no member named {name}"))
+    };
+
+    // Both apps declare `exports`, as every Deno member must to be importable
+    // at all, so that field cannot be what separates them.
+    assert!(by_name("@sample/gateway").exports);
+    assert!(by_name("@sample/ledger").exports);
+    assert!(by_name("@sample/shared").exports);
+
+    assert_eq!(
+        by_name("@sample/shared").workspace_dependents,
+        vec!["@sample/gateway".to_string(), "@sample/ledger".to_string()]
+    );
+    // An application is imported by nobody, which is the whole distinction.
+    assert!(by_name("@sample/gateway").workspace_dependents.is_empty());
+    assert!(by_name("@sample/ledger").workspace_dependents.is_empty());
+}
+
+/// An npm workspace answers from its manifests and reads no source: a member
+/// that imports a sibling it does not declare is a manifest defect, and
+/// inventing the edge here would hide it.
+#[test]
+fn an_npm_member_still_answers_from_its_manifest_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+    );
+    write(
+        root,
+        "packages/app/package.json",
+        r#"{"name":"@sample/app","private":true}"#,
+    );
+    write(
+        root,
+        "packages/app/index.ts",
+        "import { thing } from \"@sample/lib\";\nexport const app = thing;\n",
+    );
+    write(
+        root,
+        "packages/lib/package.json",
+        r#"{"name":"@sample/lib","main":"index.js"}"#,
+    );
+    write(root, "packages/lib/index.ts", "export const thing = 1;\n");
+
+    let derived = resolve(root).unwrap();
+    let lib = derived
+        .services
+        .iter()
+        .position(|service| service.service_name.as_deref() == Some("@sample/lib"))
+        .expect("the library is a member");
+    assert!(derived.members[lib].workspace_dependents.is_empty());
+}

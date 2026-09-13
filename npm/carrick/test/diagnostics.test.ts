@@ -208,8 +208,10 @@ test("a deleted file is surfaced as producer removed", () => {
   );
 });
 
-test("an error payload publishes nothing", () => {
-  assert.equal(diagnosticsFor("check-not-indexed.json").size, 0);
+test("an error payload publishes one row, not silence (carrick#1009)", () => {
+  const rows = diagnosticsFor("check-not-indexed.json").get(CHECKED_ABS) ?? [];
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.severity, SEVERITY.information);
 });
 
 // ---------------------------------------------------------------- the budget
@@ -550,4 +552,48 @@ test("a span is in UTF-16 code units, so a multi-byte line is not off by its byt
     start: { line: 6, character: 2 },
     end: { line: 6, character: 16 },
   });
+});
+
+test("a refused check publishes the CLI's own sentence on line 1 (carrick#1009)", () => {
+  // The refusal every scanner release creates for every existing workspace:
+  // the index is a format this build does not read. Published as nothing at
+  // all, the editor looks like a working editor with no Carrick in it.
+  const refused = toDiagnostics(
+    {
+      schema: "carrick.check/0",
+      error: "index_unreadable",
+      message:
+        "/workspace/.carrick/index.json was written by a different scanner (index format 2, this build reads 3). Re-run `carrick index`.",
+    },
+    ROOT,
+    CHECKED,
+    { exists },
+  );
+  const rows = refused.get(CHECKED_ABS) ?? [];
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.severity, SEVERITY.information);
+  assert.equal(rows[0]?.code, "index");
+  assert.equal(rows[0]?.range.start.line, 0);
+  assert.match(rows[0]?.message ?? "", /index format 2, this build reads 3/);
+  // Only the file the editor has open: a refusal is about the workspace and
+  // there is no payload to mirror anywhere else.
+  assert.equal(refused.size, 1);
+});
+
+test("a refusal with no sentence still says which refusal it was", () => {
+  const rows =
+    toDiagnostics({ schema: "carrick.check/0", error: "not_indexed" }, ROOT, CHECKED, { exists }).get(
+      CHECKED_ABS,
+    ) ?? [];
+  assert.match(rows[0]?.message ?? "", /not_indexed/);
+});
+
+test("a client that turned diagnostics off is not sent the refusal either", () => {
+  const off = toDiagnostics(
+    { schema: "carrick.check/0", error: "index_unreadable", message: "unreadable" },
+    ROOT,
+    CHECKED,
+    { exists, surfaces: { ...DEFAULT_SURFACES, diagnostics: false } },
+  );
+  assert.equal(off.size, 0);
 });

@@ -15,11 +15,15 @@
 //!
 //! Two rules the shape enforces:
 //!
-//! * **The file is evidence of a process, not of a result.** It exists while a
-//!   scan runs, is removed when one finishes, and is left behind with
-//!   `status: failed` when one fails. A file whose pid is gone is a scan that
-//!   was killed — which is the case this ticket exists for, and the one state
-//!   a reader most needs named.
+//! * **The file is evidence of a process, and it outlives it by one build.** It
+//!   exists while a scan runs and is rewritten when one ends: `finished` with
+//!   the time it took, or `failed` with the reason. A file whose pid is gone
+//!   while it still says `running` is a scan that was killed — which is the
+//!   case this ticket exists for, and the one state a reader most needs named.
+//!   A finished record is cleared by the next build, not by the scan that
+//!   wrote it: the scaffold tells an agent to poll `carrick status` until it
+//!   says finished, and a record removed at the end of the scan means that
+//!   sentence is never printed (carrick#1007 item 4).
 //! * **Nothing here is on the path of a scan that is not detached.** Every
 //!   writer is a no-op until [`begin`] has been called, which happens only in
 //!   a child that was handed [`SCAN_ID_ENV`].
@@ -57,6 +61,7 @@ static ACTIVE: Mutex<Option<Active>> = Mutex::new(None);
 struct Active {
     file: PathBuf,
     state: ScanState,
+    started: Instant,
     last_write: Option<Instant>,
     last_log: Option<Instant>,
 }
@@ -75,6 +80,11 @@ pub struct ScanState {
     pub infer: bool,
     pub workspace: String,
     pub status: ScanStatus,
+    /// RFC 3339, when the scan ended. Set on a finished or failed record, so
+    /// the line says how long the scan took rather than how long ago it
+    /// started — those are the same number only while it is still running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
     /// What the build is doing: `indexing <repo>`, `joining the workspace`.
     pub phase: String,
     /// The last count the scan reported inside that phase, if it reported one.
@@ -95,16 +105,25 @@ pub struct ScanState {
 #[serde(rename_all = "snake_case")]
 pub enum ScanStatus {
     Running,
+    Finished,
     Failed,
 }
 
 impl ScanState {
-    /// Seconds since this scan started, from the timestamp it recorded.
+    /// How long this scan has been going, or how long it took: seconds from
+    /// the timestamp it started at to the one it ended at, and to now while it
+    /// is still running.
     pub fn elapsed_secs(&self) -> i64 {
         let Ok(started) = chrono::DateTime::parse_from_rfc3339(&self.started_at) else {
             return 0;
         };
-        (chrono::Utc::now() - started.with_timezone(&chrono::Utc))
+        let until = self
+            .finished_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| at.with_timezone(&chrono::Utc))
+            .unwrap_or_else(chrono::Utc::now);
+        (until - started.with_timezone(&chrono::Utc))
             .num_seconds()
             .max(0)
     }
@@ -155,6 +174,15 @@ impl ScanState {
             return format!(
                 "scan {} running for {elapsed}{paid}: {}{counts}",
                 self.scan_id, self.phase
+            );
+        }
+        // The word the scaffold's poll loop waits for. It is stated by the
+        // record the finished scan leaves behind, and the next build clears it
+        // (carrick#1007 item 4).
+        if self.status == ScanStatus::Finished {
+            return format!(
+                "scan {} finished after {elapsed}{paid}. The index is written.",
+                self.scan_id
             );
         }
         match &self.error {
@@ -209,6 +237,7 @@ pub fn begin(index_dir: &Path, scan_id: &str, workspace: &Path, infer: bool) {
         infer,
         workspace: workspace.to_string_lossy().into_owned(),
         status: ScanStatus::Running,
+        finished_at: None,
         phase: "starting".to_string(),
         progress: None,
         error: None,
@@ -220,6 +249,7 @@ pub fn begin(index_dir: &Path, scan_id: &str, workspace: &Path, infer: bool) {
         *active = Some(Active {
             file,
             state,
+            started: Instant::now(),
             last_write: None,
             last_log: None,
         });
@@ -257,11 +287,23 @@ pub fn note(phase: &str, update: Option<&Update>) {
     }
     // The log is the other half of the answer: `carrick status` says where a
     // scan is, and the log says where it has been. A line on every phase
-    // change, and a pulse inside a long one.
-    if phase_changed || due(active.last_log, LOG_GAP) {
+    // change, on the last count of a phase, and a pulse inside a long one.
+    //
+    // The last count matters because without it a phase's line stops at
+    // whatever number happened to be due — the log's final word on a service
+    // was "1 of 5 intents" for a service that finished all five. Each line
+    // carries the scan's age, so a reader tailing the log can tell a pulse
+    // from a repeat (carrick#1007 item 3).
+    let counted_out = active
+        .state
+        .progress
+        .as_ref()
+        .is_some_and(|update| update.total > 0 && update.done >= update.total);
+    if phase_changed || counted_out || due(active.last_log, LOG_GAP) {
+        let age = human_duration(now.duration_since(active.started).as_secs() as i64);
         match &active.state.progress {
-            Some(update) => eprintln!("carrick: {phase}: {}", update.render()),
-            None => eprintln!("carrick: {phase}"),
+            Some(update) => eprintln!("carrick: {age} {phase}: {}", update.render()),
+            None => eprintln!("carrick: {age} {phase}"),
         }
         active.last_log = Some(now);
     }
@@ -285,8 +327,13 @@ pub fn spent(spend: &crate::scan_spend::RunSpend) {
     active.last_write = Some(Instant::now());
 }
 
-/// The scan is over. Success removes the file; a failure leaves it with the
-/// reason, so `carrick status` can say what happened rather than going quiet.
+/// The scan is over, and the record says which way and how long it took.
+///
+/// Neither outcome removes the file. The scaffold has an agent poll `carrick
+/// status` until it says finished, stopped or failed; a record deleted here
+/// made the first of those unsayable — the scan simply stopped being mentioned
+/// and the poll never terminated on the word it was told to wait for
+/// (carrick#1007 item 4). [`forget_finished`] clears it at the next build.
 pub fn finish(error: Option<&str>) {
     let Ok(mut guard) = ACTIVE.lock() else {
         return;
@@ -294,18 +341,36 @@ pub fn finish(error: Option<&str>) {
     let Some(active) = guard.as_mut() else {
         return;
     };
-    match error {
-        None => {
-            let _ = std::fs::remove_file(&active.file);
-        }
+    active.state.status = match error {
+        None => ScanStatus::Finished,
         Some(error) => {
-            active.state.status = ScanStatus::Failed;
             active.state.error = Some(error.to_string());
-            active.state.updated_at = timestamp();
-            write(&active.file, &active.state);
+            ScanStatus::Failed
+        }
+    };
+    let now = timestamp();
+    active.state.finished_at = Some(now.clone());
+    active.state.updated_at = now;
+    write(&active.file, &active.state);
+    // The last line of the log, so a reader tailing it sees the end rather
+    // than a progress count that simply stopped moving.
+    eprintln!("carrick: {}", active.state.line());
+    *guard = None;
+}
+
+/// Drop the records of scans that ended well, at the start of a build.
+///
+/// A finished record is kept so that `carrick status` can say the word once,
+/// and a build is the event that makes it history: whatever it says about the
+/// index, this build is writing a newer one. A failed record is left alone —
+/// its reason is the only trace of what went wrong — as is any scan still
+/// running, including this build's own.
+pub fn forget_finished(index_dir: &Path) {
+    for state in read_all(index_dir) {
+        if state.status == ScanStatus::Finished {
+            let _ = std::fs::remove_file(state_file(index_dir, &state.scan_id));
         }
     }
-    *guard = None;
 }
 
 /// Every scan this workspace has a state file for, newest first.
@@ -358,6 +423,7 @@ mod tests {
             infer: true,
             workspace: "/repos".to_string(),
             status,
+            finished_at: None,
             phase: "indexing gateway".to_string(),
             spend: None,
             progress: Some(Update {
@@ -464,6 +530,49 @@ mod tests {
         let read = read_all(dir.path());
         assert_eq!(read, vec![written]);
         assert!(read_all(&dir.path().join("nothing-here")).is_empty());
+    }
+
+    /// The scaffold tells an agent to poll until `status` says finished; the
+    /// scan used to stop being mentioned instead, so the word never arrived
+    /// (carrick#1007 item 4).
+    #[test]
+    fn a_finished_scan_says_so_with_the_time_it_took() {
+        let mut finished = state(ScanStatus::Finished, std::process::id());
+        finished.finished_at = Some(
+            (chrono::DateTime::parse_from_rfc3339(&finished.started_at).unwrap()
+                + chrono::Duration::seconds(58))
+            .to_rfc3339(),
+        );
+        let line = finished.line();
+        assert!(line.contains("scan 5089ed60 finished after 58s"), "{line}");
+        assert!(line.contains("paid"), "{line}");
+        assert!(line.contains("The index is written"), "{line}");
+        // Not "stopped without finishing", which is what every non-running
+        // record said before this state existed.
+        assert!(!line.contains("stopped"), "{line}");
+        assert!(!finished.is_running());
+    }
+
+    /// The record is kept for the poll to read and cleared by the next build.
+    /// A failed one stays: its reason is the only trace of what went wrong.
+    #[test]
+    fn the_next_build_forgets_a_finished_scan_and_keeps_a_failed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut finished = state(ScanStatus::Finished, std::process::id());
+        finished.scan_id = "aaaaaaaa".to_string();
+        let mut failed = state(ScanStatus::Failed, std::process::id());
+        failed.scan_id = "bbbbbbbb".to_string();
+        let running = state(ScanStatus::Running, std::process::id());
+        for scan in [&finished, &failed, &running] {
+            write(&state_file(dir.path(), &scan.scan_id), scan);
+        }
+        forget_finished(dir.path());
+        let left: Vec<String> = read_all(dir.path())
+            .into_iter()
+            .map(|scan| scan.scan_id)
+            .collect();
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert!(!left.contains(&"aaaaaaaa".to_string()), "{left:?}");
     }
 
     #[test]

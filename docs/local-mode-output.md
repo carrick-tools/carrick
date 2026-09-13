@@ -219,12 +219,22 @@ never fail an edit. A missing or unreadable index prints one line to stderr
 saying what to do, and with `--json` this to stdout:
 
 ```json
-{ "schema": "carrick.check/0", "error": "not_indexed" }
+{
+  "schema": "carrick.check/0",
+  "error": "index_unreadable",
+  "message": "/w/.carrick/index.json was written by a different scanner (index format 2, this build reads 3). Re-run `carrick index`."
+}
 ```
 
 A caller parsing JSON therefore always gets JSON. Without `--json` the sentence
 on stderr is the whole answer: printing a JSON body into a human's terminal
 would be noise, not an error report.
+
+`error` is the code and `message` is the sentence beside it, on every refusal.
+The code is coarse on purpose — three values cover everything — so a surface
+showing a human why there is no answer prints `message`, never the code
+(carrick#1009). The language server publishes it as one Information diagnostic
+on line 1 of the open file, and the session-start line repeats it.
 
 | `error` | meaning |
 |---|---|
@@ -362,8 +372,8 @@ it finds, under 300 ms.
 | `repos_detected_by` | `carrick_json`, `workspace_manifest`, `siblings`, `single_repo`, or `workspace_overrides` |
 | `repos_added`, `repos_excluded` | explicit workspace override paths; absent when empty |
 
-Errors are the same three, under this schema:
-`{ "schema": "carrick.status/0", "error": "not_indexed" }`.
+Errors are the same three, with the same `message` beside the code, under this
+schema: `{ "schema": "carrick.status/0", "error": "not_indexed", "message": "..." }`.
 
 ## Out of scope in this version
 

@@ -336,6 +336,9 @@ export function runningScanLine(scan: RunningScan): string {
   if (scan.status === "failed") {
     return `- scan ${scan.scan_id} failed${scan.error ? `: ${scan.error}` : ""}`;
   }
+  if (scan.status === "finished") {
+    return `- scan ${scan.scan_id} finished${scan.infer ? ", paid" : ""}. The index is written.`;
+  }
   return `- scan ${scan.scan_id} is running${where}${counts}. Its output is in .carrick/scan-${scan.scan_id}.log`;
 }
 
@@ -376,7 +379,10 @@ export function renderSessionStart(status: StatusResult): string {
     return "Carrick has no index for this workspace, so nothing in this session is checked against the other services. `carrick index --workspace <dir>` builds one.";
   }
   if (status.error) {
-    return `Carrick could not read its index for this workspace (${status.error}).`;
+    // The CLI's own sentence, which names the move: a format mismatch says
+    // which scanner wrote the index and that `carrick index` rebuilds it. The
+    // wire code alone told a reader nothing they could act on (carrick#1009).
+    return `Carrick could not read its index for this workspace: ${status.message ?? status.error}`;
   }
   if (!status.services.length) {
     return `Carrick has an index at ${status.workspace ?? "this workspace"} and it holds no services.`;

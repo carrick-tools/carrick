@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::contract::{
-    CheckOutput, Counterpart, Item, MAX_STALE_FILES, ReadError, SCHEMA, STATUS_SCHEMA,
+    CheckOutput, Counterpart, Item, MAX_STALE_FILES, ReadError, ReadFailure, SCHEMA, STATUS_SCHEMA,
     StatusOutput, StatusRepo, StatusService, Verdict,
 };
 use super::read_model::{IndexedItem, IndexedRepo, LocalIndex};
@@ -26,10 +26,12 @@ pub enum Mode {
 }
 
 /// Answer about one file.
-pub fn answer(workspace_root: &Path, file: &Path, mode: Mode) -> Result<CheckOutput, ReadError> {
+pub fn answer(workspace_root: &Path, file: &Path, mode: Mode) -> Result<CheckOutput, ReadFailure> {
     let index = read_index(workspace_root)?;
 
-    let (repo, relative) = index.locate_file(file).ok_or(ReadError::NotInWorkspace)?;
+    let (repo, relative) = index
+        .locate_file(file)
+        .ok_or_else(|| ReadFailure::new(ReadError::NotInWorkspace))?;
     let items = repo.files.get(&relative).cloned().unwrap_or_default();
 
     // The service is the file's own when the index holds rows for it, and
@@ -124,7 +126,7 @@ pub fn answer(workspace_root: &Path, file: &Path, mode: Mode) -> Result<CheckOut
 /// response with the file left out: every `carrick.check/0` answer is about one
 /// file, and a reader that always has one should not have to defend against a
 /// response that does not.
-pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadError> {
+pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadFailure> {
     let index = read_index(workspace_root)?;
 
     // Git is asked once per REPO, not once per service: a monorepo's services
@@ -183,9 +185,17 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadError> {
         // Stated once, under the repo, and only when there is something to
         // state: these are the files no service's scan reads, so no service
         // should be reporting them.
+        //
+        // And only the files a scan reads AT ALL. A changed `carrick.json`, a
+        // workflow, an editor's settings hold no indexed row, so none of them
+        // can make the index stale; counting them read as drift on a tree
+        // nobody had touched, which is what onboarding leaves behind
+        // (carrick#1007 item 5). `changed_since_index` below is still the whole
+        // repo's count, so nothing is hidden — only this line is about rows.
         let mut outside: Vec<String> = changed
             .iter()
             .filter(|file| !repo.services.iter().any(|service| service.covers(file)))
+            .filter(|file| crate::file_finder::is_scanned_source(&repo_root.join(file), &repo_root))
             .cloned()
             .collect();
         let outside_total = outside.len();
@@ -339,22 +349,24 @@ fn verdict_for(
 }
 
 /// The read model, or why there is no answer.
-fn read_index(workspace_root: &Path) -> Result<LocalIndex, ReadError> {
+fn read_index(workspace_root: &Path) -> Result<LocalIndex, ReadFailure> {
     let index_file = workspace_root
         .join(super::workspace::INDEX_DIR)
         .join("index.json");
     if !index_file.is_file() {
-        return Err(ReadError::NotIndexed);
+        return Err(ReadFailure::new(ReadError::NotIndexed));
     }
-    let index = LocalIndex::read(&index_file).map_err(|e| {
-        eprintln!("carrick: {e}");
-        ReadError::IndexUnreadable
-    })?;
+    // Each refusal carries the sentence that names it. A format mismatch is
+    // the one every release that moves READ_MODEL_VERSION creates for every
+    // existing workspace, and "the index could not be read" is not an answer a
+    // user can act on (carrick#1009).
+    let index = LocalIndex::read(&index_file)
+        .map_err(|e| ReadFailure::detailed(ReadError::IndexUnreadable, e))?;
     if !super::hosted::can_read_index(&index) {
-        eprintln!(
-            "carrick: the hosted index belongs to a different or unavailable credential. Run carrick login and carrick index."
-        );
-        return Err(ReadError::IndexUnreadable);
+        return Err(ReadFailure::detailed(
+            ReadError::IndexUnreadable,
+            "the hosted index belongs to a different or unavailable credential. Run carrick login and carrick index.",
+        ));
     }
     Ok(index)
 }
@@ -690,5 +702,99 @@ mod hosted_change_tests {
         assert!(note.contains("by a laptop scan)"), "{note}");
         assert!(!note.contains('@'), "{note}");
         assert!(!note.contains("tree not clean"), "{note}");
+    }
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+    use crate::local_mode::read_model::{IndexedRepo, IndexedService, LocalIndex};
+
+    fn service(directory: Option<&str>, commit: &str) -> IndexedService {
+        IndexedService {
+            enrichment: Default::default(),
+            name: "gateway".to_string(),
+            directory: directory.map(str::to_string),
+            include: Vec::new(),
+            commit: commit.to_string(),
+            indexed_at: "2026-09-12T10:00:00Z".to_string(),
+            boundary: None,
+            routes: 0,
+            calls: 0,
+        }
+    }
+
+    /// Straight after onboarding, `status` and the session-start hook reported
+    /// the files onboarding had just written — `carrick.json`, the workflow,
+    /// the editor settings — as the index drifting. None of them holds an
+    /// indexed row, so none of them can make one stale (carrick#1007 item 5).
+    #[test]
+    fn onboarding_artefacts_are_not_reported_as_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "fixture@carrick.test"],
+            vec!["config", "user.name", "fixture"],
+        ] {
+            assert!(git(repo, &args).is_some());
+        }
+        std::fs::create_dir_all(repo.join("apps/gateway")).unwrap();
+        std::fs::write(repo.join("apps/gateway/main.ts"), "export const a = 1;").unwrap();
+        git(repo, &["add", "."]).unwrap();
+        git(repo, &["commit", "-qm", "base"]).unwrap();
+        let commit = git(repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // What onboarding leaves behind, plus one real source edit outside
+        // every service.
+        std::fs::create_dir_all(repo.join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(repo.join("carrick.json"), "{}").unwrap();
+        std::fs::write(repo.join(".github/workflows/carrick.yml"), "on: push").unwrap();
+        std::fs::write(repo.join(".claude/settings.json"), "{}").unwrap();
+        std::fs::create_dir_all(repo.join("tools")).unwrap();
+        std::fs::write(repo.join("tools/release.ts"), "export const b = 2;").unwrap();
+
+        let index = LocalIndex {
+            hosted_identity: None,
+            hosted_workspace: None,
+            repos_detected_by: None,
+            repos_added: Vec::new(),
+            repos_excluded: Vec::new(),
+            hosted_source_key: None,
+            hosted_checked_at: None,
+            version: crate::local_mode::read_model::READ_MODEL_VERSION,
+            scanner_version: "test".to_string(),
+            indexed_at: "2026-09-12T10:00:00Z".to_string(),
+            repos: vec![IndexedRepo {
+                path: repo.to_string_lossy().into_owned(),
+                name: "monorepo".to_string(),
+                services: vec![service(Some("apps/gateway"), &commit)],
+                files: Default::default(),
+            }],
+        };
+        let index_dir = repo.join(crate::local_mode::workspace::INDEX_DIR);
+        std::fs::create_dir_all(&index_dir).unwrap();
+        // As a real build does, so `.carrick/` itself is not one of the
+        // changes this answer is about.
+        crate::local_mode::workspace::write_self_ignore(&index_dir).unwrap();
+        index.write(&index_dir.join("index.json")).unwrap();
+
+        let answer = status(repo).expect("the index is readable");
+        let stated = &answer.repos[0];
+        // Four files moved and one of them is a file a scan reads.
+        assert_eq!(stated.changed_since_index, 4, "{:?}", stated.stale_files);
+        assert_eq!(stated.outside_every_service, 1, "{:?}", stated.stale_files);
+        assert_eq!(stated.stale_files, vec!["tools/release.ts".to_string()]);
+        let text = answer.render();
+        assert!(!text.contains("carrick.json"), "{text}");
+        assert!(!text.contains(".claude"), "{text}");
+        assert!(
+            text.contains("monorepo: 1 file(s) changed outside every service"),
+            "{text}"
+        );
     }
 }

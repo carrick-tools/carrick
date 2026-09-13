@@ -88,6 +88,12 @@ export type CheckResult = {
   schema: string;
   /** Set instead of the payload, e.g. `not_indexed`. */
   error?: string;
+  /**
+   * The sentence the CLI printed for that refusal, which is the one a user can
+   * act on: the code says `index_unreadable` where the sentence says which
+   * scanner wrote the index and which format this build reads (carrick#1009).
+   */
+  message?: string;
   file?: string;
   /** Absolute path of the repo owning `file`; `repo` + `file` is openable. */
   repo?: string;
@@ -195,7 +201,12 @@ export type RunningScan = {
    */
   infer?: boolean;
   workspace?: string;
-  status: "running" | "failed";
+  /**
+   * `finished` is written by the scan itself and cleared by the next build, so
+   * the poll the scaffold describes terminates on the word it waits for
+   * (carrick#1007 item 4).
+   */
+  status: "running" | "finished" | "failed";
   phase?: string;
   progress?: {
     service?: string;
@@ -206,6 +217,8 @@ export type RunningScan = {
     total?: number;
   };
   error?: string;
+  /** RFC 3339, when the scan ended. Absent while it is running. */
+  finished_at?: string;
   /** What this scan has paid so far, once an upload has come back with a figure. */
   spend?: RunSpend;
 };
@@ -251,6 +264,8 @@ export type RunSpend = {
 export type StatusResult = {
   schema: string;
   error?: string;
+  /** The refusal's own sentence, as on `CheckResult` (carrick#1009). */
+  message?: string;
   workspace?: string;
   indexed_at?: string;
   scanner_version?: string;
@@ -295,6 +310,7 @@ export function parseCheckResult(stdout: string): CheckResult | null {
     items,
   };
   if (typeof parsed["error"] === "string") result.error = parsed["error"];
+  if (typeof parsed["message"] === "string") result.message = parsed["message"];
   if (typeof parsed["file"] === "string") result.file = parsed["file"];
   if (typeof parsed["repo"] === "string") result.repo = parsed["repo"];
   if (typeof parsed["service"] === "string") result.service = parsed["service"];
@@ -337,6 +353,7 @@ export function parseStatusResult(stdout: string): StatusResult | null {
   if (parsed["schema"] !== STATUS_SCHEMA) return null;
   const result: StatusResult = { schema: STATUS_SCHEMA, services: [] };
   if (typeof parsed["error"] === "string") result.error = parsed["error"];
+  if (typeof parsed["message"] === "string") result.message = parsed["message"];
   if (typeof parsed["workspace"] === "string") result.workspace = parsed["workspace"];
   if (typeof parsed["indexed_at"] === "string") result.indexed_at = parsed["indexed_at"];
   if (typeof parsed["scanner_version"] === "string") {

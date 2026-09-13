@@ -5069,6 +5069,23 @@ impl FileOrchestrator {
     /// Segment whitespace is trimmed and a whitespace-only path collapses to `/`:
     /// the LLM emits root routes as `"/ "` and the space otherwise survives into
     /// `full_path`, breaking matching both ways (#332).
+    /// What makes two endpoint rows the same operation: the method, the path
+    /// in its canonical form, and the dispatch case behind it.
+    ///
+    /// The same three the cross-repo merge keys on
+    /// (`MountGraph::merge_from_repos`), so a pair this calls equal is a pair
+    /// every reader of the index would have folded anyway. The dispatch case
+    /// is load-bearing: the operations behind one body-dispatching route share
+    /// a method and a path and are not one row (carrick#831).
+    fn model_row_key(endpoint: &crate::agents::file_analyzer_agent::EndpointResult) -> String {
+        format!(
+            "{}|{}{}",
+            endpoint.method.to_ascii_uppercase(),
+            Self::canonicalize_route_path(&endpoint.path),
+            crate::dispatch::Dispatch::key_suffix(endpoint.dispatch.as_ref())
+        )
+    }
+
     fn canonicalize_route_path(path: &str) -> String {
         let mut out = String::with_capacity(path.len());
         for (i, seg) in path.split('/').enumerate() {
@@ -5813,6 +5830,31 @@ impl FileOrchestrator {
                 endpoint.path = literal;
                 endpoint.resolution_source = Some(ResolutionSource::InlineLiteral);
                 stats.model_contradictions_discarded += 1;
+            }
+            // One registration, stated twice by the model, is one row. The
+            // handler branch for a route can hold several calls the scanner
+            // raises candidates at — `return entry ? Response.json(entry) :
+            // Response.json({error}, {status: 404})` is two — and the model
+            // answers each with the route that branch serves. Those are not
+            // two operations: they carry the same method, the same path and
+            // the same dispatch case, and every reader downstream folds them
+            // (the cross-repo merge keys on exactly this). Folding them here
+            // instead is what stops the CLI saying `5 route(s)` where the
+            // hosted index says 4 (carrick#1007 item 2).
+            //
+            // Only against the rows THIS loop has pushed: a model row that
+            // agrees with a deterministic row must fold onto it and keep its
+            // source, which is the twin search below.
+            let key = Self::model_row_key(&endpoint);
+            if result.endpoints[deterministic_rows..]
+                .iter()
+                .any(|kept| Self::model_row_key(kept) == key)
+            {
+                warn!(
+                    "[FileOrchestrator] Model endpoint {} {} in {} restates a row already                      emitted for this file: dropped",
+                    endpoint.method, endpoint.path, file_path
+                );
+                continue;
             }
             // A structural route the deterministic layer already stated. The
             // two agree on method and path by construction of the match, and
@@ -13529,6 +13571,125 @@ export { routes };
             &mut stats,
         );
         (result, stats)
+    }
+
+    /// One handler branch can hold several calls the scanner raises candidates
+    /// at — `return entry ? Response.json(entry) : Response.json({error}, {status: 404})`
+    /// is two — and the model answers each with the route that branch serves.
+    /// The blob carried `GET /entries/:id` twice at one line, so the CLI said
+    /// `5 route(s)` where the hosted index, which folds them, said 4
+    /// (carrick#1007 item 2).
+    #[test]
+    fn two_model_rows_for_one_route_in_one_file_are_one_row() {
+        let branch = |id: &str, span: u32, line: i32| {
+            let mut candidate = candidate_with_snippet(id, None);
+            candidate.span_start = span;
+            candidate.span_end = span + 30;
+            candidate.line_number = line as usize;
+            candidate.callee_object = "Response".to_string();
+            candidate.callee_property = Some("json".to_string());
+            candidate
+        };
+        let mut candidates = HashMap::new();
+        candidates.insert("happy".to_string(), branch("happy", 400, 41));
+        candidates.insert("missing".to_string(), branch("missing", 440, 41));
+
+        let route = |candidate_id: &str, path: &str| EndpointResult {
+            handler_declaration_line: None,
+            view_module: false,
+            candidate_id: candidate_id.to_string(),
+            line_number: 41,
+            owner_node: "Deno.serve".to_string(),
+            method: "GET".to_string(),
+            path: path.to_string(),
+            handler_name: "<anonymous>".to_string(),
+            pattern_matched: "Response.json(".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            resolution_source: None,
+            dispatch: None,
+        };
+
+        let (result, stats) = emit_and_join(
+            FileAnalysisResult {
+                endpoints: vec![
+                    route("happy", "/entries/:id"),
+                    route("missing", "/entries/:id"),
+                ],
+                ..Default::default()
+            },
+            &candidates,
+            "apps/ledger/main.ts",
+        );
+
+        assert_eq!(
+            result
+                .endpoints
+                .iter()
+                .map(|endpoint| (endpoint.method.as_str(), endpoint.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("GET", "/entries/:id")],
+        );
+        // The first row is the one kept: it is the branch that returns the
+        // route's own payload, so it carries the type anchor.
+        assert_eq!(result.endpoints[0].candidate_id, "happy");
+        assert_eq!(stats.model_only_rows, 1);
+    }
+
+    /// The operations behind one body-dispatching route share a method and a
+    /// path and are NOT one row — the whole point of carrick#831. The fold
+    /// keys on the dispatch case for exactly this reason.
+    #[test]
+    fn two_dispatch_cases_at_one_route_are_two_rows() {
+        let mut candidates = HashMap::new();
+        candidates.insert(
+            "handler".to_string(),
+            candidate_with_snippet("handler", Some("'/rpc'")),
+        );
+
+        let case = |value: &str| EndpointResult {
+            handler_declaration_line: None,
+            view_module: false,
+            candidate_id: "handler".to_string(),
+            line_number: 12,
+            owner_node: "app".to_string(),
+            method: "POST".to_string(),
+            path: "/rpc".to_string(),
+            handler_name: "rpc".to_string(),
+            pattern_matched: ".post(".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            resolution_source: None,
+            dispatch: Some(crate::dispatch::Dispatch {
+                location: crate::dispatch::DispatchLocation::Body,
+                field: "action".to_string(),
+                value: value.to_string(),
+            }),
+        };
+
+        let (result, _) = emit_and_join(
+            FileAnalysisResult {
+                endpoints: vec![case("create"), case("archive")],
+                ..Default::default()
+            },
+            &candidates,
+            "src/rpc.ts",
+        );
+        assert_eq!(result.endpoints.len(), 2);
     }
 
     fn emit_and_join(

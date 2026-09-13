@@ -185,12 +185,16 @@
     },
     "error": {
       "type": "object",
-      "required": ["schema", "error"],
+      "required": ["schema", "error", "message"],
       "properties": {
         "schema": { "const": "carrick.check/0" },
         "error": {
           "enum": ["not_indexed", "not_in_workspace", "index_unreadable"],
           "description": "Exit code is 0 anyway: a read-only command never fails an edit."
+        },
+        "message": {
+          "type": "string",
+          "description": "The sentence the CLI printed for this refusal, which is the one a user can act on. The code is coarse by design: an index written in a format this build does not read and a truncated write are both index_unreadable, and only the sentence says which and what to run (carrick#1009). Surfaces that show a human why there is no answer print this."
         }
       },
       "additionalProperties": true
