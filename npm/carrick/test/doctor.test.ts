@@ -253,6 +253,35 @@ test("hooks that are installed, current, and run this package", () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("an install PATH reaches through a shim, and a doctor run under npx, prove resolution and stop", () => {
+  // A pnpm global install and every Windows install put a shim on PATH, and a
+  // shim does not realpath to an entry point. Comparing it to this package's
+  // would report two installs on a machine that has one, and the command exits
+  // non-zero on any finding, so that is every run for those users.
+  const shim = withHooks("carrick");
+  const shimLines = checkHooks(
+    shim,
+    hookMachine({ resolveOnPath: () => "/home/dev/.local/share/pnpm/carrick" }),
+  );
+  assert.equal(findingCount(shimLines), 0, texts(shimLines).join("\n"));
+  assert.match(shimLines[0]!.text, /resolves to \/home\/dev\/\.local\/share\/pnpm\/carrick\.$/);
+
+  // `npx carrick doctor` makes the transient copy the one asking. The hooks
+  // are pointing at the real install; blaming them for it inverts the finding.
+  const underNpx = withHooks("carrick");
+  const npxLines = checkHooks(
+    underNpx,
+    hookMachine({
+      resolveOnPath: () => "/usr/lib/node_modules/carrick/bin/carrick.mjs",
+      entryPoint: "/home/dev/.npm/_npx/abc123/node_modules/carrick/bin/carrick.mjs",
+    }),
+  );
+  assert.equal(findingCount(npxLines), 0, texts(npxLines).join("\n"));
+  assert.match(npxLines[0]!.text, /cannot say whether that is the same one/);
+
+  for (const root of [shim, underNpx]) fs.rmSync(root, { recursive: true, force: true });
+});
+
 test("the ways a hook entry stops working, each named", () => {
   const missing = workspace({});
   assert.match(checkHooks(missing, hookMachine())[0]!.text, /No \.claude settings in this folder/);

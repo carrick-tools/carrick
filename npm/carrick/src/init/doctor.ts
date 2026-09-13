@@ -541,7 +541,7 @@ export function checkHooks(workspace: string, machine: HookMachine): Line[] {
     );
     return lines;
   }
-  if (resolved.includes(`${path.sep}_npx${path.sep}`)) {
+  if (isTransient(resolved)) {
     lines.push(
       warn(
         `The hooks here run \`${target}\`, which resolves to a temporary npx install (${resolved}). It will not resolve on the next edit. Install carrick globally and re-run \`carrick init\`.`,
@@ -549,7 +549,37 @@ export function checkHooks(workspace: string, machine: HookMachine): Line[] {
     );
     return lines;
   }
+
+  // Which install answers, and whether that question can be answered at all.
+  //
+  // Comparing the resolved path to this package's entry point only means
+  // something when what resolved IS an entry point. A pnpm global install and
+  // every Windows install put a shim on PATH — a shell script, a `.cmd` — and
+  // a shim does not realpath to `bin/carrick.mjs`, so a comparison would
+  // report two installs on a machine that has one. And when `carrick doctor`
+  // is itself run through `npx`, the transient copy is the one asking: the
+  // hooks are pointing at the real install and the sentence would blame them
+  // for it. In both cases the check that matters has already passed — the
+  // command resolves, so the hook will not fail silently — and identity is
+  // reported as what it is: unproven.
   const own = machine.realpath(machine.entryPoint) ?? machine.entryPoint;
+  const entryPointName = path.basename(machine.entryPoint);
+  if (path.basename(resolved) !== entryPointName) {
+    if (findingCount(lines) === 0) {
+      lines.push(done(`Agent hooks are installed here and run \`${target}\`, which resolves to ${resolved}.`));
+    }
+    return lines;
+  }
+  if (isTransient(own)) {
+    if (findingCount(lines) === 0) {
+      lines.push(
+        done(
+          `Agent hooks are installed here and run ${resolved}. This check is running from a temporary npx install, so it cannot say whether that is the same one.`,
+        ),
+      );
+    }
+    return lines;
+  }
   if (resolved !== own) {
     lines.push(
       warn(
@@ -562,6 +592,11 @@ export function checkHooks(workspace: string, machine: HookMachine): Line[] {
     lines.push(done(`Agent hooks are installed here and run this package (${own}).`));
   }
   return lines;
+}
+
+/** A path inside npm's `_npx` cache: it exists for one command and no longer. */
+function isTransient(target: string): boolean {
+  return target.includes(`${path.sep}_npx${path.sep}`);
 }
 
 /** The MCP server entry in each agent client this machine has. */
