@@ -26,7 +26,7 @@ fn git(path: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().into()
 }
 
-fn run(root: &Path, args: &[&str], token: Option<&str>) -> Value {
+fn spawn(root: &Path, args: &[&str], token: Option<&str>) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_carrick"));
     command
         .args(args)
@@ -44,17 +44,41 @@ fn run(root: &Path, args: &[&str], token: Option<&str>) -> Value {
     if let Some(token) = token {
         command.env("CARRICK_TOKEN", token);
     }
-    let output = command.output().unwrap();
+    command.output().unwrap()
+}
+
+fn body(args: &[&str], output: &std::process::Output) -> Value {
+    if args.contains(&"--json") {
+        serde_json::from_slice(&output.stdout).unwrap()
+    } else {
+        Value::String(String::from_utf8(output.stdout.clone()).unwrap())
+    }
+}
+
+fn run(root: &Path, args: &[&str], token: Option<&str>) -> Value {
+    let output = spawn(root, args, token);
     assert!(
         output.status.success(),
         "{args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    if args.contains(&"--json") {
-        serde_json::from_slice(&output.stdout).unwrap()
-    } else {
-        Value::String(String::from_utf8(output.stdout).unwrap())
-    }
+    body(args, &output)
+}
+
+/// A read the CLI refuses, and the body it prints anyway.
+///
+/// `check` exits 1 when it cannot answer at all, so that a script can tell
+/// "no contract problems" from "no answer" (carrick#1023 item 2). The refusal
+/// body is still on stdout, which is what every reader of it depends on.
+fn refused(root: &Path, args: &[&str], token: Option<&str>) -> Value {
+    let output = spawn(root, args, token);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{args:?} was expected to refuse: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    body(args, &output)
 }
 
 fn init_repo(path: &Path) -> String {
@@ -195,7 +219,7 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
             .unwrap()
             .ends_with("Candidates not refreshed since 2026-09-09.")
     );
-    let wrong_account = run(
+    let wrong_account = refused(
         root,
         &["check", "orders/app.ts", "--workspace", ".", "--json"],
         Some("another-workspace-token"),
