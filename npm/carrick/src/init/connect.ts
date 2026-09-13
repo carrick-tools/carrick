@@ -123,6 +123,15 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
   const assignments = new Map<string, string>();
   const poll = options.poll ?? ((signal?: AbortSignal) => resolveRepos(token, repos, fetch, signal));
   const project = options.project;
+  // A repo that is already where it was asked to be is not news: the run states
+  // the project once, on the line naming the login (carrick#1026). Seeding the
+  // map with those repos leaves this reporting only what CHANGED or what is
+  // somewhere else, which is what a reader can act on.
+  if (project !== undefined) {
+    for (const name of repos) {
+      if (assignment(initial, name) === project) assignments.set(name.toLowerCase(), project);
+    }
+  }
   const assign =
     options.assign ??
     ((names: string[], signal?: AbortSignal) => assignRepos(token, project ?? "", names, fetch, signal));

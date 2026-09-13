@@ -121,11 +121,10 @@ test("an already verified repeated init neither opens nor polls", async () => {
   });
 
   assert.deepEqual(result, assignedToPayments);
-  assert.match(lines.join("\n"), /acme\/api is currently in project "payments"/);
-  // The settled assignment is the claim, read back from the poll. The line
-  // that repeated it as a verdict is gone: init states the project once, on the
-  // line that names the login (carrick#1026).
-  assert.match(lines.join("\n"), /acme\/api is currently in project "payments"/);
+  // And says nothing at all: a repo already where it was asked to be is not a
+  // thing that happened, and init states the project once, on the line that
+  // names the login (carrick#1026).
+  assert.deepEqual(lines, []);
 });
 
 test("noninteractive project setup prints browser steps and returns unverified", async () => {
