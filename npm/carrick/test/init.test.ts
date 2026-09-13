@@ -36,7 +36,8 @@ import {
   SCAFFOLD_SENTENCE,
 } from "../src/init/run.ts";
 import { hostedReport } from "../src/init/hosted.ts";
-import { DOCS, plainOutput } from "../src/init/output.ts";
+import { DOCS, interactiveOutput, plainOutput } from "../src/init/output.ts";
+import { Writable } from "node:stream";
 import type { ResolvedRepos } from "../src/auth/read.ts";
 
 const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -1131,6 +1132,54 @@ test("the plain rendering is one line per thing, with no colour and no box", () 
   // No ANSI anywhere: a captured log is read by a person or an agent, and an
   // escape sequence in it is noise in both cases.
   assert.doesNotMatch(written.join(""), /\[/);
+});
+
+// carrick#1032. A step is ONE line, whichever rendering is in play, and the
+// line is the one its work reported: the label the step started with is
+// scaffolding, and printing it as well spent two lines on one event.
+test("a step prints its work's report, and never the label it started with", async () => {
+  const written: string[] = [];
+  const out = plainOutput((text) => void written.push(text));
+  const value = await out.step("Reading the hosted index into .carrick/", async () => 3, (count) => ({
+    kind: "warn",
+    text: `.carrick/ holds ${count} services as this machine read them`,
+  }));
+  assert.equal(value, 3);
+  assert.deepEqual(written, ["▲ .carrick/ holds 3 services as this machine read them\n"]);
+});
+
+// The interactive rendering, which no other test can see: every executable
+// test spawns the CLI with its stdout on a pipe, so all of them pin the plain
+// one. clack draws into the stream it is handed, so handing it one is the
+// whole of the harness (carrick#1032).
+test("the interactive step stops the spinner on the marker its work earned", async () => {
+  const drawn: string[] = [];
+  const stream = new Writable({
+    write(chunk, _encoding, done) {
+      drawn.push(chunk.toString());
+      done();
+    },
+  });
+  const out = interactiveOutput(stream);
+  await out.step("Reading the hosted index into .carrick/", async () => "local_only", () =>
+    hostedReport({ kind: "local_only", services: 3, state: "read_failed" }),
+  );
+  await out.step("Reading the hosted index into .carrick/", async () => "downloaded", () =>
+    hostedReport({ kind: "downloaded", services: 2 }),
+  );
+  // Rendered, then read as text: the colours and the cursor are the
+  // terminal's business and the markers are the contract.
+  const plain = drawn.join("").replace(/\[[0-9;?]*[A-Za-z]/g, "");
+  const lines = plain
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter((line) => line.length > 0 && line !== "│");
+  assert.deepEqual(lines, [
+    "▲ .carrick/ holds 3 services as this machine read them; the hosted rows could not be replayed onto this checkout",
+    "◇ Hosted index for 2 services downloaded into .carrick/",
+  ]);
+  // The label is the spinner's while it spins, and nothing once it stops.
+  assert.doesNotMatch(plain.split("\n").filter((line) => /[◇▲■]/.test(line)).join("\n"), /Reading the hosted index/);
 });
 
 // The four index states, as lines rather than as tags. Each one says what this

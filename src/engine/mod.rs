@@ -367,9 +367,17 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     if multi_service {
         info!("Resolved {} services in {}", services.len(), repo_name);
     }
+    // What was downloaded is every OTHER repo in the project: a project whose
+    // only repo is this one has nothing to fetch, and "from 0 repos" under a
+    // green tick read as a download that had silently failed (carrick#1023
+    // item 10).
     logging::finish_spinner(
         &sp,
-        &format!("Downloaded data from {} repos", all_repo_data.len()),
+        &if all_repo_data.is_empty() {
+            "No sibling repos to download: this project holds only this one".to_string()
+        } else {
+            format!("Downloaded data from {} repos", all_repo_data.len())
+        },
     );
 
     let local_previous = crate::local_mode::hosted::previous_data()?;
@@ -1199,6 +1207,7 @@ fn stamp_tree_state(mut payload: CloudRepoData, dirty: bool) -> CloudRepoData {
 /// On a mid-sequence failure, reports which services made it and which didn't:
 /// uploads are keyed per (repo, service) and idempotent, so a re-run restores
 /// consistency, but until then the index is mixed-generation for this repo.
+/// A failure on the FIRST payload changed nothing at all, and says so.
 async fn upload_service_payloads<T: CloudStorage>(
     storage: &T,
     payloads: &[CloudRepoData],
@@ -1222,14 +1231,25 @@ async fn upload_service_payloads<T: CloudStorage>(
                     .iter()
                     .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
                     .collect();
-                return Err(format!(
-                    "Failed to upload repo data: {}. Uploaded: [{}]; not uploaded: [{}]. \
-                     The index is mixed-generation for this repo until a successful re-run.",
-                    e,
-                    uploaded.join(", "),
-                    not_uploaded.join(", ")
-                )
-                .into());
+                // Only a PARTIAL upload leaves the index mixed-generation. On
+                // the first payload nothing was replaced, and the sentence
+                // read as damage that needed a re-run — a paid one — over the
+                // top of `Uploaded: []` (carrick#1023 item 4).
+                let outcome = if uploaded.is_empty() {
+                    format!(
+                        "Nothing was uploaded: [{}] did not reach the index, which still holds \
+                         what it held before this scan.",
+                        not_uploaded.join(", ")
+                    )
+                } else {
+                    format!(
+                        "Uploaded: [{}]; not uploaded: [{}]. The index is mixed-generation for \
+                         this repo until a successful re-run.",
+                        uploaded.join(", "),
+                        not_uploaded.join(", ")
+                    )
+                };
+                return Err(format!("Failed to upload repo data: {e}. {outcome}").into());
             }
         }
     }

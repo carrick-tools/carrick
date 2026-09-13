@@ -26,8 +26,17 @@
 // A spinner writes and rewrites one line, so anything else printing while it
 // spins corrupts it: `step()` owns the terminal for the duration of the work
 // it wraps, and the hosted read is quiet underneath it (see `hosted.ts`).
+//
+// A step also OWNS the line its work is reported on. `spinner.stop(text)` in
+// 1.8.1 takes no status code, so a step that stopped with its own label and
+// left the caller to print the outcome spent two lines on the one thing, and a
+// step that stopped with the outcome printed a warning under a done marker.
+// The spinner's three finishers carry the three markers exactly — `stop` is
+// `◇`, `error` is `▲`, `cancel` is `■` — so the work's report goes to `step`
+// and the spinner stops as whatever the work turned out to be (carrick#1032).
 
 import readline from "node:readline/promises";
+import type { Writable } from "node:stream";
 import * as clack from "@clack/prompts";
 import pc from "picocolors";
 
@@ -36,6 +45,15 @@ export const WARN = "▲";
 export const REFUSE = "■";
 
 export const DOCS = "https://docs.carrick.tools/quickstart";
+
+/**
+ * What a step's work turned out to be: the line, and the marker it carries.
+ *
+ * The three kinds are the three markers, and they are the same three
+ * [`InitOutput`] prints by hand — a step is one of these lines, produced by
+ * work rather than by a decision already made.
+ */
+export type StepReport = { kind: "done" | "warn" | "refuse"; text: string };
 
 /** Everything `init` prints or asks. */
 export type InitOutput = {
@@ -49,8 +67,14 @@ export type InitOutput = {
   say(text: string): void;
   /** The closing block: a title and the lines under it. */
   note(title: string, body: string[]): void;
-  /** Run `work`, showing progress while it runs. */
-  step<T>(label: string, work: () => Promise<T>): Promise<T>;
+  /**
+   * Run `work`, showing progress while it runs, and report what it did.
+   *
+   * One line for the whole step, whichever rendering this is: `report` turns
+   * the work's value into the line and the marker, and a spinner stops as that
+   * marker rather than repeating the label it started with (carrick#1032).
+   */
+  step<T>(label: string, work: () => Promise<T>, report: (value: T) => StepReport): Promise<T>;
   /** Yes or no, defaulting to yes, as the old readline prompt did. */
   confirm(question: string): Promise<boolean>;
   /** A typed answer, for the questions whose answer is not yes or no. */
@@ -66,6 +90,8 @@ export function plainOutput(write: (text: string) => void = (text) => process.st
   const line = (marker: string, text: string): void => {
     for (const entry of text.split("\n")) write(`${marker} ${entry}\n`);
   };
+  const marker = (kind: StepReport["kind"]): string =>
+    kind === "done" ? DONE : kind === "warn" ? WARN : REFUSE;
   return {
     done: (text) => line(DONE, text),
     warn: (text) => line(WARN, text),
@@ -77,7 +103,15 @@ export function plainOutput(write: (text: string) => void = (text) => process.st
       for (const entry of body) write(`  ${entry}\n`);
       write("\n");
     },
-    step: async (_label, work) => await work(),
+    // No spinner here, so the label was never printed: the step is exactly the
+    // one line its work reports, which is what the plain rendering already
+    // spent on it.
+    step: async (_label, work, report) => {
+      const value = await work();
+      const outcome = report(value);
+      line(marker(outcome.kind), outcome.text);
+      return value;
+    },
     // No colour, ever. picocolors turns itself ON when `CI` is set, which is
     // exactly the run whose output is captured as text, so the decision is made
     // here from the terminal rather than by the library from the environment.
@@ -106,34 +140,53 @@ export function plainOutput(write: (text: string) => void = (text) => process.st
   };
 }
 
-/** clack's rendering, for a terminal. */
-export function interactiveOutput(): InitOutput {
+/**
+ * clack's rendering, for a terminal.
+ *
+ * `output` is where the rendering goes. It is threaded into every clack call
+ * rather than left to the library's default because that is the only way this
+ * rendering can be read back: a terminal's own bytes are not capturable, and
+ * the plain one — which every executable test spawns — is a different renderer
+ * with different lines. A test that hands this a stream is the only thing that
+ * sees the interactive markers at all (carrick#1032).
+ */
+export function interactiveOutput(output: Writable = process.stdout): InitOutput {
   return {
-    done: (text) => clack.log.step(text),
-    warn: (text) => clack.log.warn(text),
-    refuse: (text) => clack.log.error(text),
-    say: (text) => clack.log.message(text),
-    note: (title, body) => clack.note(body.join("\n"), title),
-    step: async (label, work) => {
-      const spinner = clack.spinner();
+    done: (text) => clack.log.step(text, { output }),
+    warn: (text) => clack.log.warn(text, { output }),
+    refuse: (text) => clack.log.error(text, { output }),
+    say: (text) => clack.log.message(text, { output }),
+    note: (title, body) => clack.note(body.join("\n"), title, { output }),
+    // The spinner's finishers ARE the markers: `stop` prints `◇`, `error`
+    // prints `▲` and `cancel` prints `■`, so the step ends on one line with
+    // the marker its work earned. Stopping with the label instead cost the
+    // hosted read two lines, and stopping with the outcome text alone put
+    // warnings and refusals under a done marker (carrick#1032).
+    step: async (label, work, report) => {
+      const spinner = clack.spinner({ output });
       spinner.start(label);
+      let value: Awaited<ReturnType<typeof work>>;
       try {
-        const value = await work();
-        spinner.stop(label);
-        return value;
+        value = await work();
       } catch (error) {
-        spinner.stop(label);
+        // The step did not finish, so it is a refusal: the caller prints why.
+        spinner.cancel(label);
         throw error;
       }
+      const outcome = report(value);
+      if (outcome.kind === "done") spinner.stop(outcome.text);
+      else if (outcome.kind === "warn") spinner.error(outcome.text);
+      else spinner.cancel(outcome.text);
+      return value;
     },
     // A cancelled prompt is a no: `init` returns 0 and writes nothing, which
     // is what answering "n" has always done.
     confirm: async (question) => {
-      const answer = await clack.confirm({ message: question, initialValue: true });
+      const answer = await clack.confirm({ message: question, initialValue: true, output });
       return clack.isCancel(answer) ? false : answer;
     },
     ask: async (question) => {
-      const answer = await clack.text({ message: question });
+      const answer = await clack.text({ message: question, output });
       return clack.isCancel(answer) ? "" : answer.trim();
     },
     accent: (text) => pc.dim(text),

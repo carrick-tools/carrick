@@ -221,13 +221,13 @@ When Carrick sees a call like `fetch(process.env.ORDER_SERVICE_URL + '/orders')`
   },
   "services": [
     {
-      "name": "check-or-upload",
+      "serviceName": "check-or-upload",
       "directory": "lambdas/check-or-upload",
       "include": ["lambdas/_shared"],
       "internalEnvVars": ["CARRICK_API_ENDPOINT"]
     },
     {
-      "name": "dashboard",
+      "serviceName": "dashboard",
       "directory": "app",
       "tsconfig": "tsconfig.json"
     }
@@ -237,7 +237,7 @@ When Carrick sees a call like `fetch(process.env.ORDER_SERVICE_URL + '/orders')`
 
 | Field | Description |
 | :--- | :--- |
-| `name` | Service name (alias for `serviceName` inside a `services` entry) |
+| `serviceName` | Service name, and the key the index is written under: what a sibling repo's calls are matched against, and what `carrick status` and the hosted rows name. `name` is accepted as an alias inside a `services` entry |
 | `directory` | Service root, relative to `carrick.json`. Files outside every declared directory are ignored |
 | `include` | Extra source roots to pull in for type/function resolution (e.g. shared libraries copied in at build time), relative to `carrick.json` |
 | `tsconfig` | Optional TypeScript config path, relative to `directory`. Deno services normally omit this field and use their nearest Deno manifest |

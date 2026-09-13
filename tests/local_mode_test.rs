@@ -652,12 +652,20 @@ fn the_json_matches_the_published_contract() {
     );
     assert!(unknown["boundary_note"].as_str().is_some());
 
-    // A file outside every indexed repo is an error body, and still exit 0.
-    let outside = run(
-        root,
-        &["check", "/nowhere/x.ts", "--workspace", ".", "--json"],
-    );
-    let outside: serde_json::Value = serde_json::from_str(&outside).expect("an error body");
+    // A file outside every indexed repo is an error body — and from
+    // carrick#1023 item 2, a non-zero exit, because a refusal from `check` is
+    // the absence of an answer rather than a clean one. The body is printed
+    // either way, which is what every reader of it depends on.
+    let outside = Command::new(carrick())
+        .args(["check", "/nowhere/x.ts", "--workspace", ".", "--json"])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .output()
+        .expect("carrick check");
+    assert_eq!(outside.status.code(), Some(1));
+    let outside: serde_json::Value =
+        serde_json::from_slice(&outside.stdout).expect("an error body");
     assert_eq!(outside["error"], serde_json::json!("not_in_workspace"));
 }
 
@@ -1373,6 +1381,30 @@ fn a_scan_is_reported_before_there_is_any_index_to_report() {
         "the scan is the answer when there is no index yet:\n{rendered}"
     );
 
+    // And the refusal beside it is written for THIS command: it takes no file,
+    // and it must not order the scan that is already running (carrick#1023
+    // item 1). The sentence is on stderr, so the whole output is read here.
+    let refused = Command::new(carrick())
+        .args(["status", "--workspace", "."])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .output()
+        .expect("carrick status");
+    let said = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(
+        !said.contains("for this file"),
+        "`status` takes no file:\n{said}"
+    );
+    assert!(
+        !said.contains("Run `carrick index"),
+        "and never orders the scan that is running:\n{said}"
+    );
+    assert!(
+        said.contains("the scan above is still building it"),
+        "it points at the scan it just printed:\n{said}"
+    );
+
     let text = run(root, &["status", "--workspace", ".", "--json"]);
     let body: serde_json::Value = serde_json::from_str(&text)
         .unwrap_or_else(|e| panic!("status --json was not JSON: {e}\n{text}"));
@@ -1381,5 +1413,127 @@ fn a_scan_is_reported_before_there_is_any_index_to_report() {
         body["running_scans"][0]["scan_id"],
         serde_json::json!("5089ed60"),
         "and the error body carries the scan:\n{body:#}"
+    );
+}
+
+/// `check` is the scripted read, and until carrick#1023 item 2 a refusal and a
+/// clean verdict were the same exit code, so nothing downstream could tell
+/// "no contract problems" from "no index at all". `touch` — the editor's read
+/// — still exits 0, because an edit must never fail on a missing index.
+#[test]
+#[serial]
+fn a_check_refusal_exits_non_zero_and_a_touch_refusal_does_not() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web"]);
+    let root = workspace.path();
+    let file = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+    assert!(root.join(file).is_file(), "the fixture moved");
+
+    let refused = Command::new(carrick())
+        .args(["check", file, "--workspace", ".", "--json"])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .output()
+        .expect("carrick check");
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "a check with no index refuses:\n{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("no local index for this file"),
+        "and says why on stderr:\n{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    // The body is still printed, which is what keeps the language server and
+    // the edit hook answering through a refusal (carrick#1009).
+    let body: serde_json::Value = serde_json::from_slice(&refused.stdout)
+        .unwrap_or_else(|e| panic!("check --json was not JSON: {e}"));
+    assert_eq!(body["error"], serde_json::json!("not_indexed"));
+    assert!(body["message"].as_str().is_some_and(|m| !m.is_empty()));
+
+    let touched = Command::new(carrick())
+        .args(["touch", file, "--workspace", "."])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .output()
+        .expect("carrick touch");
+    assert_eq!(
+        touched.status.code(),
+        Some(0),
+        "the editor's read never fails an edit:\n{}",
+        String::from_utf8_lossy(&touched.stderr)
+    );
+
+    // With an index, a verdict never moves the code — that is the half of the
+    // old rule that stands.
+    index(root);
+    let answered = Command::new(carrick())
+        .args(["check", file, "--workspace", "."])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .output()
+        .expect("carrick check");
+    assert_eq!(
+        answered.status.code(),
+        Some(0),
+        "an answered check exits 0 whatever it found:\n{}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+}
+
+/// A failed scan's record is the only account of what went wrong, so it is
+/// kept — but a later build that succeeded makes it history, and `carrick
+/// status` was still leading with it after a good index had landed
+/// (carrick#1023 item 13). The sweep is the paid pass's: `refresh` runs from
+/// the session-start hook, and a hook must not be the thing that erases the
+/// evidence.
+#[test]
+#[serial]
+fn a_successful_index_supersedes_the_record_of_the_scan_before_it() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web"]);
+    let root = workspace.path();
+    std::fs::write(root.join("catalog-web").join("carrick.json"), "{}\n").expect("a config");
+    let index_dir = root.join(".carrick");
+    std::fs::create_dir_all(&index_dir).expect("the index directory");
+    let failed = index_dir.join("scan-12d9106f.json");
+    let record = serde_json::json!({
+        "scan_id": "12d9106f",
+        "pid": i32::MAX,
+        "started_at": "2026-09-13T16:00:00Z",
+        "updated_at": "2026-09-13T16:00:34Z",
+        "finished_at": "2026-09-13T16:00:34Z",
+        "infer": true,
+        "workspace": root.to_string_lossy(),
+        "status": "failed",
+        "phase": "indexing catalog-web",
+        "error": "the scan of catalog-web failed",
+    });
+    std::fs::write(&failed, serde_json::to_vec_pretty(&record).unwrap()).expect("write it");
+
+    // A free pass leaves it alone: nothing it did contradicts the failure.
+    run(root, &["refresh", "--workspace", "."]);
+    assert!(
+        failed.is_file(),
+        "`refresh` runs from a hook and keeps the only account of the failure"
+    );
+    let rendered = run(root, &["status", "--workspace", "."]);
+    assert!(rendered.contains("scan 12d9106f failed"), "{rendered}");
+
+    // The paid pass wrote an index, so the failure describes a world that is
+    // gone.
+    run_mocked(root, &["index", "--workspace", "."]);
+    assert!(
+        !failed.exists(),
+        "a successful index supersedes the record before it:\n{}",
+        std::fs::read_to_string(&failed).unwrap_or_default()
+    );
+    let rendered = run(root, &["status", "--workspace", "."]);
+    assert!(
+        !rendered.contains("12d9106f"),
+        "and `status` stops leading with it:\n{rendered}"
     );
 }

@@ -52,7 +52,7 @@
         "pid": { "type": "integer", "minimum": 0 },
         "started_at": { "type": "string", "description": "RFC 3339. Elapsed time is computed from it, never stored." },
         "updated_at": { "type": "string" },
-        "infer": { "type": "boolean", "description": "Whether this is the paid pass." },
+        "infer": { "type": "boolean", "description": "Whether this scan was the paid pass. A record of what this run did, not a mode it could have been run without: `carrick index` is the inferred scan itself (carrick#1008) and it is the only command that detaches, so every record written today says true (carrick#1023 item 7)." },
         "workspace": { "type": "string" },
         "status": {
           "enum": ["running", "finished", "failed"],

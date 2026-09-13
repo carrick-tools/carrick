@@ -465,11 +465,14 @@ export async function init(argv: string[]): Promise<number> {
   // the whole workspace's row, and `carrick index` from a laptop on a branch
   // replaces it for everyone who queries it (carrick#993 row 2, carrick#1020).
   if (hostedIndex.length > 0) {
-    const outcome = await out.step("Reading the hosted index into .carrick/", () =>
-      downloadHostedIndex(plan.workspace, nativeRunner(out.quiet)),
+    // The step reports its own outcome, so the read is one line in a terminal
+    // as well as in a pipe: a spinner that stopped with its label spent a
+    // second line on the same event (carrick#1032).
+    await out.step(
+      "Reading the hosted index into .carrick/",
+      () => downloadHostedIndex(plan.workspace, nativeRunner(out.quiet)),
+      hostedReport,
     );
-    const report = hostedReport(outcome);
-    out[report.kind](report.text);
   } else {
     out.done("No index yet: your agent runs the one scan");
   }

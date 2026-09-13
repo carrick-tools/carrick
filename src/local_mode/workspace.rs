@@ -450,8 +450,15 @@ pub fn write_self_ignore(index_dir: &Path) -> std::io::Result<()> {
         // Byte-identical to `SELF_IGNORE` in `npm/carrick/src/init/repos.ts`:
         // `carrick init` writes the proposal into this directory before any
         // index exists, so either command can be the one that creates it.
-        "# Written by Carrick. Everything here is derived from your source and is\n\
-         # rebuilt by re-running `carrick index`.\n*\n",
+        //
+        // It does not name `carrick index`. That is the paid scan, meant to
+        // run once, and a repo whose index is already hosted is told not to
+        // run it at all — so a file in every such repo telling its reader to
+        // was the two halves of the flow contradicting each other
+        // (carrick#1023 item 5, carrick#1020). `refresh` is the free pass that
+        // rebuilds this directory from the source and the hosted index.
+        "# Written by Carrick. Everything here is derived from your source and the\n\
+         # hosted index, and `carrick refresh` rebuilds it.\n*\n",
     )
 }
 

@@ -18,7 +18,16 @@ pub struct ServiceDerivation {
     pub members: Vec<MemberFacts>,
     /// The exact proposal init may create with exclusive-create semantics.
     pub config: serde_json::Value,
+    /// What THIS derivation found that the reader has to act on. Printed by
+    /// `carrick init`, one line each, so anything here has to be a fact about
+    /// this workspace rather than advice that holds for every workspace.
     pub warnings: Vec<String>,
+    /// Standing advice about a proposal of this shape: true of every Deno
+    /// repo, or every workspace with more than one member, whatever this run
+    /// found. It rides in `.carrick/proposal.json` and the quickstart, and the
+    /// terminal never prints it — printed, it was a warning marker on a first
+    /// run that had raised no warning at all (carrick#1032).
+    pub notes: Vec<String>,
 }
 
 /// The manifest facts that decide application from library.
@@ -159,6 +168,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
                 members,
                 services,
                 warnings: Vec::new(),
+                notes: Vec::new(),
             });
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -325,12 +335,17 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
     }
     validate(&root, &services)?;
     let config = serde_json::json!({ "services": services });
-    let mut warnings = Vec::new();
+    // Both of these are true of every proposal of this shape and neither is
+    // something this run found, so they are notes rather than warnings: they
+    // belong to the document the agent reads and to the quickstart, not to a
+    // terminal line with a warning marker on it (carrick#1032).
+    let warnings = Vec::new();
+    let mut notes = Vec::new();
     if services.len() > 1 {
-        warnings.push("Workspace packages are proposed as services. Review service boundaries and shared source includes in carrick.json.".into());
+        notes.push("Workspace packages are proposed as services. Review service boundaries and shared source includes in carrick.json.".into());
     }
     if has_deno {
-        warnings.push("Deno services use their existing manifests and require Deno on PATH for type resolution.".into());
+        notes.push("Deno services use their existing manifests and require Deno on PATH for type resolution.".into());
     }
     let members = member_facts(&root, &services);
     Ok(ServiceDerivation {
@@ -343,6 +358,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
         services,
         config,
         warnings,
+        notes,
     })
 }
 

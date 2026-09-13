@@ -668,6 +668,17 @@ pub fn enrichment_note(
             "{}; not signed in, so the hosted index was not read.",
             boundary_note(boundary)
         ),
+        // "No model runs on this machine" is `refresh`'s sentence. A paid scan
+        // runs one here, and its hosted row can still be unreplayable
+        // afterwards — a dirty tree, which is the ordinary state of a first
+        // run — so this fell to the fallback and denied, in the output of the
+        // run that had just paid for them, the model rows in the index it was
+        // writing (carrick#1023 item 14).
+        _ if enrichment.classified_here => {
+            "candidates: classified by the model in this machine's own scan, the run that wrote \
+             this index."
+                .to_string()
+        }
         _ => boundary_note(boundary),
     };
     // Not "install the version that wrote the blob": `CACHE_VERSION` moves
@@ -807,9 +818,44 @@ mod hosted_change_tests {
                 failure: None,
                 allowance_sentence: None,
                 hosted_cache_version: Some(crate::engine::CACHE_VERSION),
+                classified_here: false,
             },
             None,
         )
+    }
+
+    /// After a paid scan the model ran HERE, so the fallback sentence — which
+    /// is `refresh`'s, and says no model runs on this machine — is false about
+    /// the rows in the index that scan just wrote. A dirty tree is the
+    /// ordinary first run and lands in exactly this state (carrick#1023
+    /// item 14).
+    #[test]
+    fn a_scan_that_classified_here_never_says_no_model_ran() {
+        let note = enrichment_note(
+            &super::super::hosted::ServiceEnrichment {
+                hosted: Some(hosted_row(Some("laptop"), None, Some(true))),
+                hosted_state: super::super::hosted::HostedState::ReadFailed,
+                remote: Some("example/api".to_string()),
+                failure: Some(
+                    "Hosted index was written from a tree with uncommitted changes".to_string(),
+                ),
+                allowance_sentence: None,
+                hosted_cache_version: Some(crate::engine::CACHE_VERSION),
+                classified_here: true,
+            },
+            None,
+        );
+        assert!(
+            !note.contains("not classified locally"),
+            "the run that classified them said they were not classified:\n{note}"
+        );
+        assert!(
+            note.contains("classified by the model in this machine's own scan"),
+            "{note}"
+        );
+        // And the hosted row's own problem is still stated: it is why the next
+        // read of this checkout cannot replay these answers.
+        assert!(note.contains("uncommitted changes"), "{note}");
     }
 
     /// A laptop row says whose laptop and whether the tree was clean, inside

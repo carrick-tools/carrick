@@ -75,8 +75,15 @@ pub struct ScanState {
     /// a duration that is wrong the moment it is written.
     pub started_at: String,
     pub updated_at: String,
-    /// Whether this is the paid pass. A reader that sees a scan running wants
-    /// to know whether it is spending money.
+    /// Whether this scan was the paid pass. A reader that sees a scan running
+    /// wants to know whether it is spending money.
+    ///
+    /// A record of what this run DID, not of a mode it could have been run
+    /// without: `--infer` is gone and `carrick index` is the inferred scan
+    /// itself (carrick#1008), and `index` is the only command that detaches,
+    /// so every record written today says true. It stays because the file is a
+    /// receipt — the one thing a killed scan leaves behind — and a receipt
+    /// that omits whether money was involved is not one (carrick#1023 item 7).
     pub infer: bool,
     pub workspace: String,
     pub status: ScanStatus,
@@ -368,6 +375,26 @@ pub fn finish(error: Option<&str>) {
 pub fn forget_finished(index_dir: &Path) {
     for state in read_all(index_dir) {
         if state.status == ScanStatus::Finished {
+            let _ = std::fs::remove_file(state_file(index_dir, &state.scan_id));
+        }
+    }
+}
+
+/// Drop every record an index that has just been written makes history.
+///
+/// A failed scan's reason is the only trace of what went wrong, so it is kept
+/// — until a later build succeeds, at which point it describes a world that no
+/// longer exists and `carrick status` was still leading with it minutes after
+/// a good index landed (carrick#1023 item 13). "Later" is the point: a record
+/// is dropped whether the scan behind it was detached or not, and whether it
+/// failed, finished or was killed.
+///
+/// A scan that is still RUNNING is never dropped, which is what keeps this
+/// build's own record — written by [`begin`], rewritten by [`finish`] after
+/// this runs — and any concurrent scan's.
+pub fn forget_superseded(index_dir: &Path) {
+    for state in read_all(index_dir) {
+        if !state.is_running() {
             let _ = std::fs::remove_file(state_file(index_dir, &state.scan_id));
         }
     }
