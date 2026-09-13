@@ -25,6 +25,7 @@ import {
   SyntaxKind,
   type FunctionDeclaration,
   type ArrowFunction,
+  type BinaryExpression,
   type FunctionExpression,
   type MethodDeclaration,
   type CallExpression,
@@ -145,6 +146,73 @@ export const MACHINERY_MEMBER_INDICATORS = new Set<string>([
 
 /** Machinery needs at least this many indicator members to be recognized. */
 const MACHINERY_INDICATOR_THRESHOLD = 3;
+
+/**
+ * True when a binary expression COMPARES rather than assigns or computes: its
+ * value is a `boolean` the operator manufactured, never a payload
+ * (carrick#1017).
+ */
+function isComparisonExpression(expr: BinaryExpression): boolean {
+  switch (expr.getOperatorToken().getKind()) {
+    case SyntaxKind.EqualsEqualsToken:
+    case SyntaxKind.EqualsEqualsEqualsToken:
+    case SyntaxKind.ExclamationEqualsToken:
+    case SyntaxKind.ExclamationEqualsEqualsToken:
+    case SyntaxKind.LessThanToken:
+    case SyntaxKind.LessThanEqualsToken:
+    case SyntaxKind.GreaterThanToken:
+    case SyntaxKind.GreaterThanEqualsToken:
+    case SyntaxKind.InstanceOfKeyword:
+    case SyntaxKind.InKeyword:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/**
+ * How deep the response-branch split (carrick#1017) follows nested
+ * conditionals. Two levels covers `a ? x : b ? y : z`; deeper nesting is a
+ * dispatch table, not a response contract.
+ */
+const RESPONSE_BRANCH_MAX_DEPTH = 2;
+
+/**
+ * The members the standard response-init object declares. An argument beside
+ * the body whose properties are all from this set is telling the platform how
+ * to send the response, not what to send (carrick#1017).
+ */
+const RESPONSE_INIT_MEMBER_NAMES = new Set<string>([
+  'status',
+  'statusText',
+  'headers',
+]);
+
+/**
+ * True when a declaration file path is runtime/library origin rather than user
+ * source: a TypeScript lib (`lib.dom.d.ts`), an installed package, or the
+ * runtime declarations Carrick itself materialises for a non-Node runtime
+ * (`.carrick/deno/<hash>/runtime.d.ts`, and the remote modules cached beside
+ * it).
+ *
+ * The third case is carrick#1017: on a Deno service the platform `Response`
+ * is declared in Carrick's own generated runtime file, which is neither a
+ * `lib.*.d.ts` nor under `node_modules`, so the machinery origin gate stayed
+ * shut and every route published the fetch `Response` wrapper as its response
+ * contract. The path is Carrick's own artefact, not a framework name.
+ *
+ * Kept in lockstep with `capture/machinery.ts`'s copy (the capture seam forbids
+ * sharing a module across it); `machinery-indicator-mirror.test.ts` guards the
+ * pair.
+ */
+export function isExternalOrigin(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, '/');
+  return (
+    normalized.includes('/node_modules/') ||
+    /\/lib\.[^/]*\.d\.ts$/.test(normalized) ||
+    normalized.includes('/.carrick/deno/')
+  );
+}
 
 /**
  * How far the response-helper recovery (carrick#631) descends through nested
@@ -813,6 +881,66 @@ export class TypeInferrer {
       }
     }
 
+    // carrick#1017: the located expression evaluates to the transport wrapper
+    // itself — `Response.json(entry)`, `new Response(JSON.stringify(entry))`,
+    // `ctx.json(entry)` all have the platform `Response` as their type, and a
+    // conditional over two of them has it on both sides. Publishing that type
+    // reports the fetch API (`headers`, `ok`, `status`, `json(): Promise<any>`)
+    // as the endpoint's response contract, and every consumer reading the real
+    // body is then told its type is missing those members. The body is in the
+    // ARGUMENT, so read it there — through the same payload rule the
+    // function-return path uses, which splits the conditional, drops the
+    // branch whose sibling options object states a >= 400 status, and joins
+    // what survives. When it recovers nothing the row stays unresolved below:
+    // no contract is published off the wrapper either way.
+    const locatedType = node.getType();
+    const locatedUnwrap = this.unwrapTypeWithConfig(
+      locatedType,
+      node,
+      extractionConfig
+    );
+    const machineryAnchor =
+      locatedUnwrap.verifiedMachinery === true ||
+      (!locatedUnwrap.wasUnwrapped &&
+        this.typeIsOrContainsResponseMachinery(
+          this.unwrapPromiseType(locatedType)
+        ));
+    if (machineryAnchor) {
+      const recovered = this.recoverPayloadFromResponseExpressions([node], false);
+      if (recovered) {
+        this.log(
+          `Response payload at ${request.file_path}:${request.line_number} is the ` +
+            "transport wrapper; recovered the body from the response call's argument"
+        );
+        const recoveredAnchor = recovered.anchorType
+          ? this.unwrapArrayLevels(recovered.anchorType)
+          : undefined;
+        const resolvedSymbol = recoveredAnchor
+          ? this.primaryTypeSymbol(recoveredAnchor.element)
+          : undefined;
+        const stated = recovered.statedTypeNode;
+        const writtenAnchor =
+          resolvedSymbol === undefined && stated
+            ? this.writtenAnchorOf(stated)
+            : undefined;
+        return this.createInferredType(
+          request,
+          recovered.typeString,
+          recovered.isExplicit,
+          this.getNodeLocation(recovered.node),
+          undefined,
+          resolvedSymbol ?? writtenAnchor?.symbol,
+          writtenAnchor ? writtenAnchor.depth : recoveredAnchor?.depth,
+          writtenAnchor?.source
+        );
+      }
+      this.log(
+        `Response payload at ${request.file_path}:${request.line_number} is the ` +
+          'transport wrapper and no branch states a body; leaving it unresolved'
+      );
+      return null;
+    }
+
     // The resolved node IS the payload subexpression in the MVP schema.
     // Transitional fallback: if a caller still supplies a bare call expression
     // (e.g., `res.json(users)`), drill to its first argument. No method-name list.
@@ -869,14 +997,16 @@ export class TypeInferrer {
       payloadNode,
       extractionConfig
     );
+
     if (unwrapResult.wasUnwrapped) {
       typeString = unwrapResult.typeString;
     } else {
       const resolved = this.unwrapPromiseType(payloadType);
-      // Same carrick#371 fail-closed guard as the function-return path: a
-      // payload that IS or CONTAINS framework machinery (a raw `Response`, a
-      // `{ response: Response; ... }` envelope) is not a contract. No rule
-      // recovered a payload, so abstain rather than emit the machinery.
+      // The carrick#371 fail-closed guard. The LOCATED expression is handled
+      // above, where a wrapper yields its body; this catches the argument the
+      // drill reached being machinery itself (`hand(request, upstream)`),
+      // which no response call carries a body for. Abstain rather than emit
+      // the machinery.
       if (this.typeIsOrContainsResponseMachinery(resolved)) {
         this.log(
           `Response payload at ${request.file_path}:${request.line_number} is or contains ` +
@@ -1364,6 +1494,30 @@ export class TypeInferrer {
       for (const expr of candidates) {
         if (expr.getStart() <= startPos) continue;
 
+        // carrick#1017: a comparison is `boolean` by construction, so it is
+        // never the payload a call yields. `const res = await fetch(url); if
+        // (res.status === 404) return null; return await res.json() as Entry`
+        // otherwise ends on the status check — the expected response type of
+        // that call was published as `boolean`, and the producer's real body
+        // was reported as not assignable to it.
+        if (Node.isBinaryExpression(expr) && isComparisonExpression(expr)) {
+          continue;
+        }
+
+        // The body a caller reads OUT of a transport response IS the payload
+        // of the call that produced it: `res.json()` on the tracked binding,
+        // with whatever `as T` the source states around it read by
+        // `extractExplicitTypeFromAncestor` below. A bare identifier never
+        // matches `expressionUsesNames` (it tests DESCENDANTS), so without
+        // this the body read is invisible to the def-use walk.
+        if (Node.isIdentifier(expr) && this.isIdentifierUsage(expr, currentNames)) {
+          const bodyRead = this.bodyReadOnReceiver(expr);
+          if (bodyRead) {
+            lastNode = bodyRead;
+            continue;
+          }
+        }
+
         if (Node.isVariableDeclaration(expr)) {
           const initializer = expr.getInitializer();
           if (
@@ -1465,6 +1619,34 @@ export class TypeInferrer {
     }
 
     return nameNode;
+  }
+
+  /**
+   * The zero-argument `.json()` body read on this identifier — `res` in
+   * `await res.json()` — or `undefined` (carrick#1017). The JSON body of an
+   * HTTP response is read exactly this way whatever produced the response, so
+   * the shape is structural, not a framework's name.
+   */
+  private bodyReadOnReceiver(identifier: Node): Node | undefined {
+    const access = identifier.getParent();
+    if (
+      !access ||
+      !Node.isPropertyAccessExpression(access) ||
+      access.getExpression() !== identifier ||
+      access.getName() !== 'json'
+    ) {
+      return undefined;
+    }
+    const call = access.getParent();
+    if (
+      !call ||
+      !Node.isCallExpression(call) ||
+      call.getExpression() !== access ||
+      call.getArguments().length > 0
+    ) {
+      return undefined;
+    }
+    return call;
   }
 
   private collectDefUseNodes(func: FunctionLike): Node[] {
@@ -2028,24 +2210,19 @@ export class TypeInferrer {
   }
 
   /**
-   * True when the symbol is declared in a TypeScript lib file (`lib.*.d.ts`) or
-   * under `node_modules` — i.e. framework/runtime machinery, not user source.
-   * Works on a bare checkout: the DOM `Response`/`Request` resolve from the
-   * bundled `lib.dom.d.ts` even with no installed dependencies.
+   * True when the symbol is declared in a TypeScript lib file (`lib.*.d.ts`),
+   * under `node_modules`, or in the runtime declarations Carrick materialises
+   * for a non-Node runtime under `.carrick/deno/` — i.e. framework/runtime
+   * machinery, not user source. Works on a bare checkout: the DOM
+   * `Response`/`Request` resolve from the bundled `lib.dom.d.ts` even with no
+   * installed dependencies.
    */
   private symbolIsLibOrExternalOrigin(symbol: TsSymbol | undefined): boolean {
     if (!symbol) {
       return false;
     }
-    const isExternalPath = (filePath: string): boolean => {
-      const normalized = filePath.replace(/\\/g, '/');
-      return (
-        normalized.includes('/node_modules/') ||
-        /\/lib\.[^/]*\.d\.ts$/.test(normalized)
-      );
-    };
     for (const decl of symbol.getDeclarations()) {
-      if (isExternalPath(decl.getSourceFile().getFilePath())) {
+      if (isExternalOrigin(decl.getSourceFile().getFilePath())) {
         return true;
       }
     }
@@ -2399,6 +2576,33 @@ export class TypeInferrer {
     anchorType?: Type;
     statedTypeNode?: Node;
   } | null {
+    return this.recoverPayloadFromResponseExpressions(
+      this.responseReturnedExpressions(func),
+      statedOnly
+    );
+  }
+
+  /**
+   * The response payload carried by a set of response-carrying expressions —
+   * a handler's return expressions, or the single expression a producer
+   * response locator resolved to (carrick#1017).
+   *
+   * Each expression is first split into its BRANCHES, so a route that answers
+   * `found ? json(entry) : json(problem, { status: 404 })` contributes both
+   * sides: the payload rule reads each one, the error branch drops out on its
+   * stated status, and what survives is joined as a union exactly as several
+   * return statements are.
+   */
+  private recoverPayloadFromResponseExpressions(
+    expressions: Node[],
+    statedOnly: boolean
+  ): {
+    typeString: string;
+    isExplicit: boolean;
+    node: Node;
+    anchorType?: Type;
+    statedTypeNode?: Node;
+  } | null {
     const candidates: Array<{
       typeString: string;
       isExplicit: boolean;
@@ -2407,7 +2611,9 @@ export class TypeInferrer {
       statedTypeNode?: Node;
     }> = [];
 
-    const returned = this.responseReturnedExpressions(func);
+    const returned = expressions.flatMap((expression) =>
+      this.expandResponseBranches(expression, 0)
+    );
     const serialisers = this.calleesProvenSerialiser(returned);
 
     for (const expression of returned) {
@@ -2592,7 +2798,9 @@ export class TypeInferrer {
    * when the compiler has one, else the callee's source text.
    */
   private calleeIdentity(call: Node): string | undefined {
-    if (!Node.isCallExpression(call)) return undefined;
+    if (!Node.isCallExpression(call) && !Node.isNewExpression(call)) {
+      return undefined;
+    }
     const callee = call.getExpression();
     const symbol = callee.getSymbol();
     if (symbol) return `symbol:${symbol.getFullyQualifiedName()}`;
@@ -2627,7 +2835,13 @@ export class TypeInferrer {
     if (depth > RESPONSE_HELPER_MAX_DEPTH) return undefined;
 
     const call = this.peelTransparentExpression(expression);
-    if (!Node.isCallExpression(call)) return undefined;
+    // A `new` of the platform response constructor carries its body exactly
+    // where a call does — `new Response(JSON.stringify(payload), { status })`
+    // is the same statement as `Response.json(payload, { status })`
+    // (carrick#1017). Both node kinds answer `getArguments()`.
+    if (!Node.isCallExpression(call) && !Node.isNewExpression(call)) {
+      return undefined;
+    }
 
     const args = call.getArguments().map((a) => this.peelTransparentExpression(a));
     if (args.length === 0) return undefined;
@@ -2637,7 +2851,13 @@ export class TypeInferrer {
     const proven = identity !== undefined && serialisers.has(identity);
     const effectiveStatedOnly = statedOnly && !proven;
 
-    for (const arg of args) {
+    for (const [index, arg] of args.entries()) {
+      // An options object BESIDE the body states how to send it, never what is
+      // sent (carrick#1017): `new Response(null, { status: 204 })` has no body
+      // at all, and reading its second argument would publish `{ status:
+      // number }` as the endpoint's contract. The first argument is the body
+      // by construction, so the rule applies only past it.
+      if (index > 0 && this.statesResponseInit(arg)) continue;
       const candidate = this.unwrapJsonStringifyArg(arg);
       if (this.nodeCarriesPayloadContract(candidate, effectiveStatedOnly)) {
         return candidate;
@@ -2720,6 +2940,41 @@ export class TypeInferrer {
   }
 
   /**
+   * True when an object literal argument is response INIT rather than a body:
+   * every property it declares is one the standard `ResponseInit` declares
+   * (`status`, `statusText`, `headers`), and it states at least one of them as
+   * init really does — a numeric status in the HTTP range, or headers.
+   *
+   * A payload that merely has a `status` member of its own (`{ status: "ok",
+   * service: "ledger" }`) declares members init does not, or states `status` as
+   * something other than an HTTP code, so it stays a payload.
+   */
+  private statesResponseInit(node: Node): boolean {
+    if (!Node.isObjectLiteralExpression(node)) return false;
+    const properties = node.getProperties();
+    if (properties.length === 0) return false;
+    let statesInit = false;
+    for (const property of properties) {
+      if (!Node.isPropertyAssignment(property)) return false;
+      const name = property.getName();
+      if (!RESPONSE_INIT_MEMBER_NAMES.has(name)) return false;
+      const initializer = property.getInitializer();
+      if (!initializer) return false;
+      if (name === 'headers') {
+        statesInit = true;
+        continue;
+      }
+      if (name === 'status' && Node.isNumericLiteral(initializer)) {
+        const value = initializer.getLiteralValue();
+        if (Number.isInteger(value) && value >= 100 && value <= 599) {
+          statesInit = true;
+        }
+      }
+    }
+    return statesInit;
+  }
+
+  /**
    * True when an argument states a >= 400 status: an options object carrying
    * `status`/`statusCode`, or a bare status code (`send(body, 404)`).
    *
@@ -2792,6 +3047,29 @@ export class TypeInferrer {
       current = current.getExpression();
     }
     return current;
+  }
+
+  /**
+   * The branches a single response expression can take — one entry for a plain
+   * expression, one per side of a conditional (carrick#1017).
+   *
+   * `return entry ? json(entry) : json({ error }, { status: 404 })` is one
+   * return statement holding two responses. Read whole, its type is the
+   * transport wrapper both sides share and the payload is lost; read per
+   * branch, each side goes through the ordinary payload rule, which is also
+   * what drops the error branch on its stated status. Nested conditionals are
+   * followed to a small depth; anything else is returned as itself.
+   */
+  private expandResponseBranches(node: Node, depth: number): Node[] {
+    if (depth > RESPONSE_BRANCH_MAX_DEPTH) return [node];
+    const expression = this.peelTransparentExpression(node);
+    if (Node.isConditionalExpression(expression)) {
+      return [
+        ...this.expandResponseBranches(expression.getWhenTrue(), depth + 1),
+        ...this.expandResponseBranches(expression.getWhenFalse(), depth + 1),
+      ];
+    }
+    return [expression];
   }
 
   /**
