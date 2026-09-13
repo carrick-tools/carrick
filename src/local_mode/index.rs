@@ -43,6 +43,9 @@ pub struct IndexOutcome {
     /// What this run paid Carrick Cloud, one entry per repo `carrick index`
     /// scanned. Empty after `refresh`, the pass that pays for nothing.
     pub spend: crate::scan_spend::RunSpend,
+    /// What the hosted read downloaded and what it reused unchanged. `None`
+    /// when no hosted metadata was read at all.
+    pub hosted_download: Option<String>,
 }
 
 /// Index every repo in the workspace, or re-index the one holding `only`.
@@ -286,6 +289,7 @@ fn run_generation(
         scanned,
         elapsed_secs: started.elapsed().as_secs_f64(),
         spend,
+        hosted_download: hosted.download_line(),
     })
 }
 

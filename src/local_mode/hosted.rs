@@ -198,11 +198,52 @@ struct Snapshot {
     projects: BTreeMap<String, Vec<CloudRepoData>>,
 }
 
+/// What one hosted read did about downloading, counted in LOCAL SERVICE ROWS —
+/// the `services` entries `resolve-repos` answered for the repos on this
+/// machine. Transient: it describes this run, so it is never persisted in the
+/// snapshot.
+///
+/// Three outcomes, and the reader has to be able to tell them apart, so all
+/// three are counted and the line states every one that happened (carrick#1012
+/// item 2). A skipped download and a failed one both leave the cached blobs in
+/// place; only the counts say which happened.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Downloads {
+    /// Rows in a project this run downloaded.
+    pub fetched: usize,
+    /// Rows in a project whose every hash matched the cached blobs, so the
+    /// project was not downloaded at all.
+    pub reused: usize,
+    /// Rows in a project whose download failed. Their cached blobs may still
+    /// be serving, but nothing about them was re-read.
+    pub unread: usize,
+}
+
+impl Downloads {
+    /// The one line a build prints about the hosted download. Every local
+    /// service row is in exactly one of the three counts, so a reader can add
+    /// them up and see nothing was hidden.
+    pub(super) fn line(&self) -> String {
+        let mut line = format!(
+            "hosted index: downloaded {} service(s), reused {} unchanged",
+            self.fetched, self.reused
+        );
+        if self.unread > 0 {
+            line.push_str(&format!(
+                ", {} not re-read (the download failed)",
+                self.unread
+            ));
+        }
+        line
+    }
+}
+
 #[derive(Default)]
 pub(super) struct HostedInput {
     snapshot: Option<Snapshot>,
     failure: Option<String>,
     remotes: BTreeMap<PathBuf, String>,
+    downloads: Option<Downloads>,
 }
 
 struct Reader {
@@ -335,7 +376,7 @@ impl Reader {
         credential: &Credential,
         repos: Vec<String>,
         old: Option<Snapshot>,
-    ) -> Result<(Snapshot, Option<String>), String> {
+    ) -> Result<(Snapshot, Option<String>, Downloads), String> {
         if repos.len() > 200 {
             return Err("Hosted reads support at most 200 local repositories per workspace".into());
         }
@@ -372,13 +413,28 @@ impl Reader {
             .collect();
         let mut projects = BTreeMap::new();
         let mut failure = None;
+        let mut downloads = Downloads::default();
         for id in ids {
+            let rows = service_rows(&resolution, &id).count();
+            // `get-cross-repo-data` answers with every repo under one project
+            // and takes no filter, so a project is the smallest thing that can
+            // be skipped. The count stays in service rows because that is what
+            // the user recognises and what `resolve-repos` gave hashes for.
+            if let Some(cached) = old.as_ref().and_then(|s| s.projects.get(&id))
+                && project_is_unchanged(&resolution, &id, cached, &requested)
+            {
+                projects.insert(id, cached.clone());
+                downloads.reused += rows;
+                continue;
+            }
             match self.project(credential, &id).await {
                 Ok(blobs) => {
                     projects.insert(id, blobs);
+                    downloads.fetched += rows;
                 }
                 Err(error) => {
                     failure = Some(error);
+                    downloads.unread += rows;
                     if let Some(blobs) = old.as_ref().and_then(|s| s.projects.get(&id)) {
                         projects.insert(id, blobs.clone());
                     }
@@ -393,8 +449,105 @@ impl Reader {
                 projects,
             },
             failure,
+            downloads,
         ))
     }
+}
+
+/// Every service row `resolve-repos` answered for one project, with the repo
+/// basename it belongs to. Only repos on this machine are in it: the response
+/// carries `services` for the repos the request named and for no others.
+fn service_rows<'a>(
+    resolution: &'a Resolution,
+    id: &'a str,
+) -> impl Iterator<Item = (String, &'a HostedService)> {
+    resolution
+        .repos
+        .iter()
+        .filter(move |repo| repo.connected && repo.project_id.as_deref() == Some(id))
+        .flat_map(|repo| {
+            let basename = repo
+                .full_name
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            repo.services
+                .iter()
+                .flatten()
+                .map(move |service| (basename.clone(), service))
+        })
+}
+
+/// Whether the blobs already cached for one project still describe every
+/// service the hosted metadata names, so this run can skip its download.
+///
+/// The stored row's `hash` IS the blob's `commit_hash` (the scanner uploads
+/// `hash: data.commit_hash`), so the two are comparable directly. Three things
+/// must all hold, and the second is the one the ticket's wording does not
+/// imply:
+///
+/// 1. Every row carries a hash. `None` means "cannot compare", never "same".
+/// 2. Every repo in the project is on this machine. `resolve-repos` answers
+///    `services` for the repos the request named, so a sibling repo that is
+///    only in the cloud has no hash here at all — its blob could have moved
+///    without anything in this response changing, and a repo that joined the
+///    project since the snapshot would be invisible in a set comparison.
+/// 3. The (repo, service, hash) rows equal the (repo, service, commit) blobs
+///    already held, so a removed service or an extra blob also downloads.
+fn project_is_unchanged(
+    resolution: &Resolution,
+    id: &str,
+    cached: &[CloudRepoData],
+    requested: &std::collections::BTreeSet<String>,
+) -> bool {
+    let Some(slug) = resolution
+        .repos
+        .iter()
+        .find(|repo| repo.connected && repo.project_id.as_deref() == Some(id))
+        .and_then(|repo| repo.project_slug.as_ref())
+    else {
+        return false;
+    };
+    let Some(membership) = resolution
+        .project_repos
+        .iter()
+        .find(|project| &project.project_slug == slug)
+    else {
+        return false;
+    };
+    if !membership
+        .repos
+        .iter()
+        .all(|repo| requested.contains(&repo.to_ascii_lowercase()))
+    {
+        return false;
+    }
+    let mut named: Vec<(String, String, String)> = Vec::new();
+    for (basename, service) in service_rows(resolution, id) {
+        let Some(hash) = service.hash.clone() else {
+            return false;
+        };
+        named.push((basename, service.service.clone(), hash));
+    }
+    // The blobs are read straight off the snapshot, never through
+    // `local_blobs`, which rewrites `repo_name` to the local directory label
+    // and would never match a basename from the hosted metadata.
+    let mut held: Vec<(String, String, String)> = cached
+        .iter()
+        .map(|blob| {
+            (
+                blob.repo_name.to_ascii_lowercase(),
+                blob.service_name
+                    .clone()
+                    .unwrap_or_else(|| blob.repo_name.clone()),
+                blob.commit_hash.clone(),
+            )
+        })
+        .collect();
+    named.sort();
+    held.sort();
+    named == held
 }
 
 /// Read only at explicit index/refresh time. A separate thread owns its Tokio
@@ -445,13 +598,14 @@ pub(super) fn refresh(workspace: &Workspace) -> HostedInput {
     .join()
     .unwrap_or_else(|_| Err("Hosted reader failed".into()));
     match result {
-        Ok((snapshot, failure)) => {
+        Ok((snapshot, failure, downloads)) => {
             if let Err(error) = persist(&cache, &snapshot) {
                 input.failure = Some(error);
             } else {
                 input.failure = failure;
             }
             input.snapshot = Some(snapshot);
+            input.downloads = Some(downloads);
         }
         Err(error) => {
             input.snapshot = if error.contains("credential workspace changed") {
@@ -493,6 +647,14 @@ fn persist(path: &Path, snapshot: &Snapshot) -> Result<(), String> {
 impl HostedInput {
     pub(super) fn checked_at(&self) -> Option<String> {
         self.snapshot.as_ref().map(|s| s.checked_at.clone())
+    }
+
+    /// What this run did about downloading, for the build to print. `None`
+    /// when no hosted read was made at all — nobody signed in, or the metadata
+    /// read itself failed, in which case no project was ever considered and a
+    /// count of zero would read as "nothing had to be fetched".
+    pub(super) fn download_line(&self) -> Option<String> {
+        self.downloads.map(|downloads| downloads.line())
     }
 
     fn repo(&self, path: &Path) -> Option<&ResolvedRepo> {
@@ -907,6 +1069,135 @@ mod tests {
         (url, handle)
     }
 
+    /// A bounded mock that answers `replies` in order and returns every
+    /// captured request. One refresh posts `resolve-repos` and then one
+    /// `get-cross-repo-data` per project it decides to download, all to this
+    /// one endpoint, so the request LOG is what proves a download was skipped:
+    /// a run that asks for more than `replies.len()` finds the listener gone
+    /// and fails, rather than quietly passing on the counts alone.
+    fn serve_sequence(
+        replies: Vec<(&str, Vec<u8>)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let replies: Vec<(String, Vec<u8>)> = replies
+            .into_iter()
+            .map(|(status, body)| (status.to_string(), body))
+            .collect();
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in replies {
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let start = std::time::Instant::now();
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((s, _)) => break s,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(start.elapsed() < Duration::from_secs(5), "no mock request");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("{e}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 4096];
+                loop {
+                    let n = socket.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(end) = request.windows(4).position(|s| s == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&request[..end]);
+                        let length: usize = header
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|n| n.trim().parse().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                socket.write_all(head.as_bytes()).unwrap();
+                socket.write_all(&body).unwrap();
+                requests.push(String::from_utf8(request).unwrap());
+            }
+            requests
+        });
+        (url, handle)
+    }
+
+    fn action(request: &str) -> serde_json::Value {
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    }
+
+    fn service_row(service: &str, hash: &str) -> serde_json::Value {
+        json!({"service":service,"hash":hash,"updated_at":null,"scanner_version":null})
+    }
+
+    /// Two connected repos in two projects: `example/api` (project `pa`, two
+    /// services) and `example/web` (project `pb`, one).
+    fn two_projects(web_hash: &str) -> serde_json::Value {
+        json!({"schema":"carrick.resolve-repos/0",
+            "workspace":{"slug":"fixture","billing_tier":"free","installed":true},
+            "allowance_sentence":null,
+            "repos":[
+                {"full_name":"example/api","connected":true,"project_id":"pa","project_slug":"sa",
+                 "services":[service_row("api","abcdef"), service_row("worker","fedcba")]},
+                {"full_name":"example/web","connected":true,"project_id":"pb","project_slug":"sb",
+                 "services":[service_row("web", web_hash)]}],
+            "project_repos":[{"project_slug":"sa","repos":["example/api"]},
+                             {"project_slug":"sb","repos":["example/web"]}]})
+    }
+
+    fn named_blob(repo: &str, service: &str, commit: &str) -> CloudRepoData {
+        let mut blob = blob();
+        blob.repo_name = repo.to_string();
+        blob.service_name = Some(service.to_string());
+        blob.commit_hash = commit.to_string();
+        blob
+    }
+
+    fn snapshot(
+        resolution: serde_json::Value,
+        projects: BTreeMap<String, Vec<CloudRepoData>>,
+    ) -> Snapshot {
+        Snapshot {
+            identity: credential("test").identity(),
+            checked_at: "old".into(),
+            resolution: Resolution::parse(resolution).unwrap(),
+            projects,
+        }
+    }
+
+    fn both_repos() -> Vec<String> {
+        vec!["example/api".into(), "example/web".into()]
+    }
+
+    fn matching_cache() -> BTreeMap<String, Vec<CloudRepoData>> {
+        BTreeMap::from([
+            (
+                "pa".to_string(),
+                vec![
+                    named_blob("api", "api", "abcdef"),
+                    named_blob("api", "worker", "fedcba"),
+                ],
+            ),
+            ("pb".to_string(), vec![named_blob("web", "web", "old-web")]),
+        ])
+    }
+
     fn reader(endpoint: String) -> Reader {
         Reader {
             client: reqwest::Client::builder()
@@ -1066,13 +1357,197 @@ mod tests {
             projects: BTreeMap::from([("p".into(), vec![blob()])]),
         };
         let (url, request) = serve("200 OK", "", serde_json::to_vec(&metadata).unwrap());
-        let (new, failure) = reader(url)
+        let (new, failure, _) = reader(url)
             .refresh(&credential("test"), vec!["example/api".into()], Some(old))
             .await
             .unwrap();
         assert!(new.projects.is_empty());
         assert!(failure.is_none());
         request.join().unwrap();
+    }
+
+    /// A project whose every service still carries the hash the cached blobs
+    /// hold is not downloaded again (carrick#1012 item 2). The download is per
+    /// project because `get-cross-repo-data` answers with a whole project and
+    /// takes no filter; the counts are in service rows, which is what the
+    /// hashes are per.
+    #[tokio::test]
+    async fn only_the_project_whose_hashes_moved_is_downloaded_again() {
+        let old = snapshot(two_projects("old-web"), matching_cache());
+        let cached = old.projects["pa"].clone();
+        let (url, requests) = serve_sequence(vec![
+            (
+                "200 OK",
+                serde_json::to_vec(&two_projects("new-web")).unwrap(),
+            ),
+            (
+                "200 OK",
+                serde_json::to_vec(
+                    &json!({"repos":[{"metadata": named_blob("web","web","new-web")}]}),
+                )
+                .unwrap(),
+            ),
+        ]);
+        let (new, failure, downloads) = reader(url)
+            .refresh(&credential("test"), both_repos(), Some(old))
+            .await
+            .unwrap();
+        assert!(failure.is_none());
+        assert_eq!(
+            downloads,
+            Downloads {
+                fetched: 1,
+                reused: 2,
+                unread: 0
+            }
+        );
+        assert_eq!(
+            downloads.line(),
+            "hosted index: downloaded 1 service(s), reused 2 unchanged"
+        );
+        let requests = requests.join().unwrap();
+        assert_eq!(requests.len(), 2, "the unchanged project was downloaded");
+        assert_eq!(
+            action(&requests[1]),
+            json!({"action":"get-cross-repo-data","project_id":"pb"})
+        );
+        // The skipped project keeps exactly the blobs it already had, and the
+        // fetched one holds what the download answered.
+        assert_eq!(
+            serde_json::to_value(&new.projects["pa"]).unwrap(),
+            serde_json::to_value(&cached).unwrap()
+        );
+        assert_eq!(new.projects["pb"][0].commit_hash, "new-web");
+    }
+
+    /// No snapshot, and a snapshot whose hashes have all moved, both download
+    /// everything — the behaviour before the skip existed.
+    #[tokio::test]
+    async fn everything_is_downloaded_with_no_snapshot_and_when_every_hash_moved() {
+        let project = |repo: &str, service: &str| {
+            serde_json::to_vec(&json!({"repos":[{"metadata": named_blob(repo, service, "x")}]}))
+                .unwrap()
+        };
+        for old in [
+            None,
+            Some(snapshot(
+                two_projects("old-web"),
+                BTreeMap::from([
+                    (
+                        "pa".to_string(),
+                        vec![
+                            named_blob("api", "api", "moved"),
+                            named_blob("api", "worker", "moved"),
+                        ],
+                    ),
+                    ("pb".to_string(), vec![named_blob("web", "web", "moved")]),
+                ]),
+            )),
+        ] {
+            let (url, requests) = serve_sequence(vec![
+                (
+                    "200 OK",
+                    serde_json::to_vec(&two_projects("new-web")).unwrap(),
+                ),
+                ("200 OK", project("api", "api")),
+                ("200 OK", project("web", "web")),
+            ]);
+            let (_, failure, downloads) = reader(url)
+                .refresh(&credential("test"), both_repos(), old)
+                .await
+                .unwrap();
+            assert!(failure.is_none());
+            assert_eq!(
+                downloads,
+                Downloads {
+                    fetched: 3,
+                    reused: 0,
+                    unread: 0
+                }
+            );
+            let requests = requests.join().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert_eq!(
+                action(&requests[1]),
+                json!({"action":"get-cross-repo-data","project_id":"pa"})
+            );
+        }
+    }
+
+    /// `resolve-repos` answers `services` for the repos the request named and
+    /// for no others, so a project holding a repo that is not on this machine
+    /// has a blob nothing here can compare. It downloads every time, even when
+    /// every hash it CAN see still matches.
+    #[tokio::test]
+    async fn a_project_holding_a_repo_that_is_not_local_is_always_downloaded() {
+        let mut metadata = two_projects("old-web");
+        metadata["project_repos"][0]["repos"] = json!(["example/api", "example/sibling"]);
+        let old = snapshot(metadata.clone(), matching_cache());
+        let (url, requests) = serve_sequence(vec![
+            ("200 OK", serde_json::to_vec(&metadata).unwrap()),
+            (
+                "200 OK",
+                serde_json::to_vec(
+                    &json!({"repos":[{"metadata": named_blob("api","api","abcdef")}]}),
+                )
+                .unwrap(),
+            ),
+        ]);
+        let (_, failure, downloads) = reader(url)
+            .refresh(&credential("test"), both_repos(), Some(old))
+            .await
+            .unwrap();
+        assert!(failure.is_none());
+        assert_eq!(
+            downloads,
+            Downloads {
+                fetched: 2,
+                reused: 1,
+                unread: 0
+            }
+        );
+        let requests = requests.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            action(&requests[1]),
+            json!({"action":"get-cross-repo-data","project_id":"pa"})
+        );
+    }
+
+    /// A skipped download and a failed one both leave the cached blobs
+    /// serving. The counts are the only thing that tells them apart, so a
+    /// failed project is counted apart from both and named in the line.
+    #[tokio::test]
+    async fn a_failed_download_is_counted_apart_from_a_skipped_one() {
+        let old = snapshot(two_projects("old-web"), matching_cache());
+        let (url, requests) = serve_sequence(vec![
+            (
+                "200 OK",
+                serde_json::to_vec(&two_projects("new-web")).unwrap(),
+            ),
+            ("500 Internal Server Error", Vec::new()),
+        ]);
+        let (new, failure, downloads) = reader(url)
+            .refresh(&credential("test"), both_repos(), Some(old))
+            .await
+            .unwrap();
+        assert!(failure.is_some_and(|failure| failure.contains("500")));
+        assert_eq!(
+            downloads,
+            Downloads {
+                fetched: 0,
+                reused: 2,
+                unread: 1
+            }
+        );
+        assert_eq!(
+            downloads.line(),
+            "hosted index: downloaded 0 service(s), reused 2 unchanged, 1 not re-read (the \
+             download failed)"
+        );
+        // The failed project keeps the copy it had; nothing about it was read.
+        assert_eq!(new.projects["pb"][0].commit_hash, "old-web");
+        assert_eq!(requests.join().unwrap().len(), 2);
     }
 
     #[test]
@@ -1089,6 +1564,7 @@ mod tests {
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
+            downloads: None,
         };
         assert_eq!(input.local_blobs(Path::new("/w/api")).len(), 1);
         input.snapshot.as_mut().unwrap().resolution.project_repos[0]
@@ -1114,6 +1590,7 @@ mod tests {
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
+            downloads: None,
         };
         let path = Path::new("/w/api");
         let blob = blob();
@@ -1159,6 +1636,7 @@ mod tests {
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
+            downloads: None,
         };
         let answer = input.uploaded(Path::new("/w/api"), &blob());
         let hosted = answer.hosted.as_ref().expect("the served row");
@@ -1183,6 +1661,7 @@ mod tests {
             snapshot: None,
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
+            downloads: None,
         };
         let mut dirty = blob();
         dirty.dirty = Some(true);

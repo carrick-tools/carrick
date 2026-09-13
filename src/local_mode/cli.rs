@@ -426,6 +426,13 @@ fn build_workspace(
         );
     }
     let outcome = super::index::run(workspace, service, infer)?;
+    // A project whose services all carry the hash the cached blobs already
+    // hold is not downloaded again, and a download that failed also leaves the
+    // cached blobs in place. Saying how many rows each of those was is what
+    // tells a skipped download apart from a failed one (carrick#1012 item 2).
+    if let Some(line) = &outcome.hosted_download {
+        eprintln!("carrick: {line}");
+    }
     print_map(&outcome);
     // Last, because it is the one line about money: what this run cost, and
     // what is left of each budget it was charged against (carrick#995). A free
