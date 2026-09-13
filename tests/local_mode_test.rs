@@ -266,6 +266,34 @@ fn local_mode_answers_and_follows_an_edit() {
         "with the compiler's own reason:\n{broken}"
     );
 
+    // The two shapes the compiler compared ride on the row (carrick#1033), so
+    // a surface states what the other side declares without opening it. The
+    // producer returns and the consumer reads, so this is the response half.
+    let broken_json = check_json(root, caller);
+    let row = broken_json["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["verdict"]["result"] == serde_json::json!("type_mismatch"))
+        .unwrap_or_else(|| panic!("a mismatched row:\n{broken_json:#}"));
+    assert_eq!(
+        row["direction"],
+        serde_json::json!("response"),
+        "the half of the contract the check compared:\n{broken_json:#}"
+    );
+    for side in ["actual_type", "expected_type"] {
+        assert!(
+            row[side].as_str().is_some_and(|text| !text.is_empty()),
+            "{side} states the printed type:\n{broken_json:#}"
+        );
+    }
+    // `touch` compares nothing, so it states neither type.
+    let touched = touch(root, caller);
+    assert!(
+        !touched.contains("actual_type") && !touched.contains("expected_type"),
+        "touch states no comparison:\n{touched}"
+    );
+
     // An additive edit changes nothing: the field goes back, a new optional
     // one appears on the producer, and both sides agree again.
     edit(&route_file, "activeCount: string", "activeCount: number");

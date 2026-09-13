@@ -272,6 +272,7 @@ fn project(
         Mode::Touch => None,
         Mode::Check => Some(verdict_for(item, &counterparts, stale, deleted, repo)),
     };
+    let typed = matches!(mode, Mode::Check) && !deleted;
 
     Item {
         kind: item.kind.as_str().to_string(),
@@ -289,6 +290,13 @@ fn project(
         evidence: item.evidence.clone(),
         counterparts,
         verdict,
+        // The two type texts belong to the comparison, so they ride with the
+        // verdict and not beside it: `touch` states neither, and a row whose
+        // producer is gone from disk states a removed producer rather than a
+        // comparison nothing can still be made (carrick#1033).
+        expected_type: typed.then(|| item.expected_type.clone()).flatten(),
+        actual_type: typed.then(|| item.actual_type.clone()).flatten(),
+        direction: typed.then(|| item.direction.clone()).flatten(),
     }
 }
 

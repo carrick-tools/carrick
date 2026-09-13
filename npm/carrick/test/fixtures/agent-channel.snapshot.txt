@@ -61,6 +61,13 @@ candidates. Candidates are not classified locally: no model runs on this machine
 ### check-silent.json :: renderPostToolUse
 (silent)
 
+### check-types.json :: renderPostToolUse
+Carrick checked user-service/src/routes/users.ts against the workspace index (user-service, indexed at 6a1b2c3).
+- user-service/src/routes/users.ts:42:3 route GET /api/users [fact, file_based_route] response is UsersResponse { users: UserV2[] }, consumer at notification-service server.ts:25 reads number. Type 'UsersResponse' is not assignable to type 'number'. Consumers: notification-service server.ts:25
+- user-service/src/routes/users.ts:71:5 call POST /api/users [fact, imported_member] request is { name: string }, producer at identity-service src/routes/users.ts:14 expects CreateUser { name: string; email: string }. Property 'email' is missing in type '{ name: string }'. Producers: identity-service src/routes/users.ts:14
+Boundary: A local index holds what the deterministic passes state: 0 candidate(s) in this service need a model and were not classified here.
+user-service at 6a1b2c3
+
 ### status-not-indexed.json :: renderSessionStart
 Carrick has no index for this workspace, so nothing in this session is checked against the other services. `carrick index --workspace <dir>` builds one.
 

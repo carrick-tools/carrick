@@ -92,6 +92,17 @@ pub struct JoinedFinding {
     /// one producer of a word is the whole point of carrick#731. `None` on a
     /// finding that does not state one.
     pub verdict_state: Option<String>,
+    /// Which half of the contract this finding is about: `request` or
+    /// `response` (carrick#1033). `None` wherever the finding states no
+    /// direction, and then neither type below is stated either.
+    pub direction: Option<String>,
+    /// The type the READING side of that direction declares, capped at
+    /// [`super::contract::MAX_TYPE_TEXT_CHARS`]. See
+    /// [`super::contract::Item::expected_type`] for which side that is.
+    pub expected_type: Option<String>,
+    /// The type the SENDING side of that direction states, capped the same
+    /// way. See [`super::contract::Item::actual_type`].
+    pub actual_type: Option<String>,
 }
 
 /// Everything the join learned, in the shape the indexer reads it.
@@ -209,18 +220,27 @@ fn project_finding(finding: &crate::findings::Finding) -> Option<JoinedFinding> 
             path,
             service,
             call_sites,
+            producer_type,
+            consumer_type,
             detail,
             verdict_state,
+            direction,
             ..
-        } => Some(JoinedFinding {
-            kind: "type_mismatch".to_string(),
-            service: service.clone(),
-            method: method.clone(),
-            path: path.clone(),
-            call_sites: call_sites.clone(),
-            detail: detail.clone(),
-            verdict_state: wire_verdict_state(*verdict_state),
-        }),
+        } => {
+            let (expected, actual) = typed_sides(*direction, producer_type, consumer_type);
+            Some(JoinedFinding {
+                kind: "type_mismatch".to_string(),
+                service: service.clone(),
+                method: method.clone(),
+                path: path.clone(),
+                call_sites: call_sites.clone(),
+                detail: detail.clone(),
+                verdict_state: wire_verdict_state(*verdict_state),
+                direction: direction.map(wire_direction),
+                expected_type: expected,
+                actual_type: actual,
+            })
+        }
         crate::findings::Finding::MethodMismatch {
             method,
             path,
@@ -239,9 +259,63 @@ fn project_finding(finding: &crate::findings::Finding) -> Option<JoinedFinding> 
             detail: format!(
                 "this call uses {method} and the producer serves {expected_method} at {path}"
             ),
+            // A wrong verb is a routing fact: no direction, and no pair of
+            // types to state for one.
+            direction: None,
+            expected_type: None,
+            actual_type: None,
         }),
         _ => None,
     }
+}
+
+/// The two type texts of a mismatch, as the direction assigns them.
+///
+/// A direction is one assignability check, and the two words name its two
+/// ends: `actual` is the SOURCE, what the sending side states, and `expected`
+/// is the TARGET, what the reading side declares. Which service is which
+/// therefore flips with the direction, which is the whole reason the field is
+/// carried:
+///
+/// * `request` — the consumer sends and the producer reads, so `actual` is the
+///   consumer's type and `expected` is the producer's declared request type.
+/// * `response` — the producer sends and the consumer reads, so `actual` is
+///   the producer's response type and `expected` is what the call site reads.
+///
+/// `None` for both wherever the finding states no direction: without it the
+/// pair cannot be assigned to the two ends, and a finding whose two strings
+/// are service labels rather than types states none (carrick#1033).
+fn typed_sides(
+    direction: Option<crate::cloud_storage::ManifestTypeKind>,
+    producer_type: &str,
+    consumer_type: &str,
+) -> (Option<String>, Option<String>) {
+    use crate::cloud_storage::ManifestTypeKind;
+    let cap = |text: &str| {
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        Some(crate::findings::truncate_chars(
+            text,
+            super::contract::MAX_TYPE_TEXT_CHARS,
+        ))
+    };
+    match direction {
+        Some(ManifestTypeKind::Request) => (cap(producer_type), cap(consumer_type)),
+        Some(ManifestTypeKind::Response) => (cap(consumer_type), cap(producer_type)),
+        None => (None, None),
+    }
+}
+
+/// The direction in the spelling the contract prints, which is the
+/// [`crate::cloud_storage::ManifestTypeKind`] wire spelling and not a second
+/// vocabulary.
+fn wire_direction(kind: crate::cloud_storage::ManifestTypeKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{kind:?}").to_lowercase())
 }
 
 /// The finding's verdict state in the spelling both contracts print.
@@ -272,5 +346,116 @@ fn project(op: &ApiEndpointDetails, role: Role) -> JoinedOperation {
         line,
         resolution_source: op.resolution_source,
         handler: op.handler_name.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cloud_storage::ManifestTypeKind;
+    use crate::findings::Finding;
+
+    fn mismatch(direction: Option<ManifestTypeKind>) -> Finding {
+        Finding::type_mismatch(
+            "GET",
+            "/api/users",
+            Some("user-service".to_string()),
+            vec!["src/server.ts:25".to_string()],
+            "UsersResponse { users: UserV2[] }",
+            "number",
+            "Type 'UsersResponse' is not assignable to type 'number'",
+        )
+        .with_direction(direction)
+    }
+
+    /// The producer SENDS a response and the consumer READS it, so the
+    /// producer's type is the actual one on this direction.
+    #[test]
+    fn a_response_mismatch_makes_the_producer_type_the_actual_one() {
+        let joined = project_finding(&mismatch(Some(ManifestTypeKind::Response)))
+            .expect("a type mismatch projects");
+        assert_eq!(joined.direction.as_deref(), Some("response"));
+        assert_eq!(
+            joined.actual_type.as_deref(),
+            Some("UsersResponse { users: UserV2[] }")
+        );
+        assert_eq!(joined.expected_type.as_deref(), Some("number"));
+    }
+
+    /// And on a request the consumer sends, so the two swap: the producer's
+    /// declared request type is what the reading side expects.
+    #[test]
+    fn a_request_mismatch_swaps_the_two_sides() {
+        let joined = project_finding(&mismatch(Some(ManifestTypeKind::Request)))
+            .expect("a type mismatch projects");
+        assert_eq!(joined.direction.as_deref(), Some("request"));
+        assert_eq!(
+            joined.expected_type.as_deref(),
+            Some("UsersResponse { users: UserV2[] }")
+        );
+        assert_eq!(joined.actual_type.as_deref(), Some("number"));
+    }
+
+    /// The SDK-mediated path raises a mismatch whose two strings are a service
+    /// name and a package member — side labels, not types. It states no
+    /// direction, and nothing may turn those labels into a pair of types.
+    #[test]
+    fn a_finding_with_no_direction_states_no_types() {
+        let joined = project_finding(&Finding::type_mismatch(
+            "POST",
+            "/v1/payments",
+            None,
+            vec!["src/checkout.ts:42".to_string()],
+            "payments-api",
+            "@fixture/ledger-sdk (payments.create)",
+            "reached through a published client",
+        ))
+        .expect("a type mismatch projects");
+        assert_eq!(joined.direction, None);
+        assert_eq!(joined.expected_type, None);
+        assert_eq!(joined.actual_type, None);
+    }
+
+    /// A resolved shape can run to thousands of characters. The cap is applied
+    /// where the row is built, with the marker that says it was cut.
+    #[test]
+    fn a_long_type_is_capped_where_the_row_is_built() {
+        let long = "A".repeat(5_000);
+        let joined = project_finding(
+            &Finding::type_mismatch(
+                "GET",
+                "/api/users",
+                None,
+                vec!["src/server.ts:25".to_string()],
+                &long,
+                "number",
+                "incompatible",
+            )
+            .with_direction(Some(ManifestTypeKind::Response)),
+        )
+        .expect("a type mismatch projects");
+        let actual = joined.actual_type.expect("the producer's type");
+        assert_eq!(
+            actual.chars().count(),
+            super::super::contract::MAX_TYPE_TEXT_CHARS
+        );
+        assert!(actual.ends_with("..."), "the cut is marked: {actual}");
+    }
+
+    /// A wrong verb is a routing fact. There is no direction to state and no
+    /// pair of types behind it.
+    #[test]
+    fn a_method_mismatch_states_neither_a_direction_nor_a_type() {
+        let joined = project_finding(&Finding::method_mismatch(
+            "GET",
+            "/api/users",
+            None,
+            vec!["src/server.ts:25".to_string()],
+            "POST",
+        ))
+        .expect("a method mismatch projects");
+        assert_eq!(joined.direction, None);
+        assert_eq!(joined.expected_type, None);
+        assert_eq!(joined.actual_type, None);
     }
 }

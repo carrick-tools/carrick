@@ -8,7 +8,9 @@ import {
   renderSessionStart,
   serviceLine,
   shortHash,
+  typedMismatchClause,
 } from "../src/render.ts";
+import type { CheckItem } from "../src/contract.ts";
 import { fixture, statusFixture } from "./helpers.ts";
 
 test("the hook context puts locations first and the boundary last", () => {
@@ -373,4 +375,117 @@ test("a session that starts while a scan is running is told so, not told there i
     ],
   });
   assert.match(done, /- scan 5089ed60 finished, paid\. The index is written\./);
+});
+
+// carrick#1033: the two shapes the compiler compared, in the line itself.
+
+test("a response mismatch names both types and the consumer that reads one", () => {
+  const context = renderPostToolUse(fixture("check-types.json")) ?? "";
+  const line = context.split("\n").find((text) => text.includes("GET /api/users"));
+  assert.ok(line);
+  assert.ok(
+    line.includes(
+      "GET /api/users [fact, file_based_route] response is UsersResponse { users: UserV2[] }, consumer at notification-service server.ts:25 reads number",
+    ),
+    line,
+  );
+  // The compiler's own reason is kept, as its own segment.
+  assert.match(line, /Type 'UsersResponse' is not assignable to type 'number'/);
+});
+
+test("a request mismatch swaps the roles and the row says it is the reader", () => {
+  const context = renderPostToolUse(fixture("check-types.json")) ?? "";
+  const line = context.split("\n").find((text) => text.includes("POST /api/users"));
+  assert.ok(line);
+  assert.ok(
+    line.includes(
+      "request is { name: string }, producer at identity-service src/routes/users.ts:14 expects CreateUser { name: string; email: string }",
+    ),
+    line,
+  );
+});
+
+test("the typed sentence is built from the direction, and names no counterpart it cannot pin", () => {
+  const response: CheckItem = {
+    kind: "route",
+    method: "GET",
+    path: "/api/users",
+    source: "fact",
+    direction: "response",
+    actual_type: "UsersResponse { users: UserV2[] }",
+    expected_type: "number",
+    verdict: { state: "resolved", result: "type_mismatch", detail: "not assignable" },
+    counterparts: [
+      { role: "consumer", service: "notification-service", file: "server.ts", line: 25 },
+    ],
+  };
+  assert.equal(
+    typedMismatchClause(response),
+    "response is UsersResponse { users: UserV2[] }, consumer at notification-service server.ts:25 reads number",
+  );
+
+  // Two consumers: the verdict belongs to the pairing the finding named, not
+  // to a consumer this row can identify, so neither is named.
+  assert.equal(
+    typedMismatchClause({
+      ...response,
+      counterparts: [
+        { role: "consumer", service: "notification-service", file: "server.ts", line: 25 },
+        { role: "consumer", service: "billing-service", file: "src/lookup.ts", line: 7 },
+      ],
+    }),
+    "response is UsersResponse { users: UserV2[] }, a consumer reads number",
+  );
+
+  // The same contract read from the consumer's own file: the producer is the
+  // sending side, and this row is the one that reads.
+  assert.equal(
+    typedMismatchClause({
+      ...response,
+      kind: "call",
+      counterparts: [
+        { role: "producer", service: "user-service", file: "src/routes/users.ts", line: 42 },
+      ],
+    }),
+    "response is UsersResponse { users: UserV2[] } from producer at user-service src/routes/users.ts:42, this call reads number",
+  );
+
+  // A request read from the route that serves it: the roles swap again.
+  assert.equal(
+    typedMismatchClause({
+      ...response,
+      direction: "request",
+      actual_type: "{ name: string }",
+      expected_type: "CreateUser",
+    }),
+    "request is { name: string } from consumer at notification-service server.ts:25, this route expects CreateUser",
+  );
+});
+
+test("a payload with no types keeps the sentence it had", () => {
+  const untyped: CheckItem = {
+    kind: "route",
+    method: "GET",
+    path: "/api/users",
+    source: "fact",
+    verdict: { state: "resolved", result: "type_mismatch", detail: "not assignable" },
+  };
+  assert.equal(typedMismatchClause(untyped), null);
+  assert.match(itemLine(untyped, "a.ts"), /type_mismatch: not assignable/);
+  // Half the fields is not enough to state a side, and neither is a verdict
+  // that says something other than "the compiler compared these two".
+  assert.equal(
+    typedMismatchClause({ ...untyped, direction: "response", actual_type: "Widget" }),
+    null,
+  );
+  assert.equal(
+    typedMismatchClause({
+      ...untyped,
+      direction: "response",
+      actual_type: "Widget",
+      expected_type: "number",
+      verdict: { state: "unresolved", result: null, detail: "a side did not resolve" },
+    }),
+    null,
+  );
 });

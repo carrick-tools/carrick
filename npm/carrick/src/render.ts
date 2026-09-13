@@ -166,6 +166,65 @@ export function stateWord(state: string | undefined): string {
 }
 
 /**
+ * The two shapes a mismatch is about, in one sentence, or null where the
+ * payload does not hold them (carrick#1033).
+ *
+ * Both surfaces print this: the LSP diagnostic and the post-edit hook line.
+ * The compiler compared two shapes during the scan, and a line that states
+ * only the outcome makes the reader open the counterpart file to learn what it
+ * expected.
+ *
+ * The sentence is built from the direction and nothing else. The direction's
+ * payload IS the actual type — the producer's response, or the consumer's
+ * request body — and the side that reads that payload is the one named with
+ * the type it declares. So the roles swap with the direction, and the row's
+ * own side decides whether the counterpart is the reader (named by service and
+ * location) or the sender (named the same way, with the row itself as the
+ * reader).
+ *
+ * A counterpart is NAMED only when exactly one of them carries the role in
+ * question. A route with two consumers takes its verdict from the first
+ * finding that names the operation, so naming one of them would state that
+ * THAT consumer reads the type — which the payload does not say. The
+ * unchanged Counterparts line lists them all.
+ */
+export function typedMismatchClause(item: CheckItem): string | null {
+  const direction = item.direction;
+  const actual = item.actual_type;
+  const expected = item.expected_type;
+  if (!actual || !expected) return null;
+  if (direction !== "request" && direction !== "response") return null;
+  // The clause replaces the result and state words, so it is used only where
+  // those words are exactly "the compiler compared these two and they differ".
+  if (item.verdict?.state !== "resolved" || item.verdict?.result !== "type_mismatch") return null;
+
+  const verb = direction === "response" ? "reads" : "expects";
+  const sender = direction === "response" ? "producer" : "consumer";
+  const reader = direction === "response" ? "consumer" : "producer";
+  const rowSide = item.kind === "route" ? "producer" : item.kind === "call" ? "consumer" : null;
+  const payload = `${direction} is ${actual}`;
+
+  const site = (role: string): string | null => {
+    const named = (item.counterparts ?? []).filter((counterpart) => counterpart.role === role);
+    if (named.length !== 1) return null;
+    const only = named[0];
+    if (!only?.file) return null;
+    const where = `${only.file}${only.line ? `:${only.line}` : ""}`;
+    return only.service ? `${only.service} ${where}` : where;
+  };
+
+  if (rowSide === reader) {
+    const from = site(sender);
+    const lead = from ? `${payload} from ${sender} at ${from}` : payload;
+    return `${lead}, this ${item.kind} ${verb} ${expected}`;
+  }
+  const at = site(reader);
+  return at
+    ? `${payload}, ${reader} at ${at} ${verb} ${expected}`
+    : `${payload}, a ${reader} ${verb} ${expected}`;
+}
+
+/**
  * What is known about the contract at this row.
  *
  * `result` is null wherever the state is the whole statement, so there is no
@@ -175,6 +234,10 @@ export function stateWord(state: string | undefined): string {
  */
 function verdictText(item: CheckItem): string {
   if (!item.verdict) return "";
+  const typed = typedMismatchClause(item);
+  // The typed sentence stands in for the result word, and the compiler's own
+  // reason follows it as its own segment rather than being lost.
+  if (typed) return ` ${typed}`;
   const { state, result, detail } = item.verdict;
   const head =
     result == null
@@ -194,6 +257,9 @@ export function itemLine(item: CheckItem, file: string | undefined): string {
   const segments = [
     `- ${where} ${item.kind}${operation ? ` ${operation}` : ""}${sourceLabel(item)}${verdictText(item)}`,
   ];
+  // The typed sentence replaced the result word and the detail with it, so the
+  // compiler's reason follows as its own segment (carrick#1033).
+  if (typedMismatchClause(item) && item.verdict?.detail) segments.push(item.verdict.detail);
   if (item.evidence) segments.push(`Read off ${item.evidence}`);
   if (counterparts.length) {
     segments.push(`${roleLabel(counterparts)}: ${counterpartText(counterparts)}`);

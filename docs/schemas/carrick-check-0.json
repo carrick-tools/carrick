@@ -132,6 +132,18 @@
         "verdict": {
           "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/verdict" }],
           "description": "Always null from touch. check fills it in where the index holds one."
+        },
+        "expected_type": {
+          "type": "string",
+          "description": "Printed type text the READING side of `direction` declares: the producer's request type on a request, what the call site reads on a response. Capped at 200 characters, with `...` where the cap cut it. Absent whenever the index does not hold it, which is never a type of unknown."
+        },
+        "actual_type": {
+          "type": "string",
+          "description": "Printed type text the SENDING side of `direction` states: what the consumer sends on a request, the producer's response type on a response. `actual` and `expected` are the source and the target of one assignability check, the same two ends the verdict's detail names when it says one type is not assignable to another. Capped and absent on the same terms as expected_type."
+        },
+        "direction": {
+          "enum": ["request", "response"],
+          "description": "Which half of the contract the two types belong to. Present only alongside them; which service holds which type flips with it."
         }
       },
       "additionalProperties": true
