@@ -1,8 +1,8 @@
 //! The laptop scan's storage: upload to the cloud, and keep a copy.
 //!
 //! `carrick index` builds the local read model by scanning each repo into a
-//! cache directory and joining the blobs back. That has always been a
-//! facts-only pass, because nothing local could ask the model. A laptop scan
+//! cache directory and joining the blobs back. `carrick refresh` does that
+//! facts-only, because nothing local could ask the model. A laptop scan
 //! can, and the index it produces is the one the cloud stores — so writing it
 //! to the cache directory at the same time removes the upload-then-download
 //! round trip entirely, and the `.carrick` index is built from the run that
@@ -30,9 +30,9 @@ use crate::cloud_storage::{
 /// a laptop scan: model analysis through the cloud, and an upload.
 ///
 /// The indexer's handoff to the scan subprocess it spawns, not a user-facing
-/// knob — `carrick index --infer` is what turns it on. Deliberately opt-in:
-/// `carrick refresh` runs from a session-start hook, and a hook that spends
-/// real money every time an editor opens is not a feature.
+/// knob — `carrick index` is what turns it on. Deliberately off for the other
+/// command: `carrick refresh` runs from a session-start hook, and a hook that
+/// spends real money every time an editor opens is not a feature.
 pub const LAPTOP_SCAN_ENV: &str = "CARRICK_LAPTOP_SCAN";
 
 /// Whether this process was asked to run as a laptop scan.

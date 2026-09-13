@@ -64,9 +64,10 @@ its own manifest says about it. That is `private`, `bin`, `main`, `exports`,
 any deployment descriptor in its directory, and the members that depend on it,
 so the application-versus-library decision is read rather than re-derived. It
 writes no `carrick.json`: your agent turns the proposal into one, so the config
-you commit is one somebody has read, and the first scan runs against it. `carrick index` is free and states
-what it can; `carrick index --infer` is the scan that asks Carrick to classify
-the rest, and it refuses to run until a `carrick.json` exists.
+you commit is one somebody has read, and the first scan runs against it.
+`carrick index` is the scan that asks Carrick to classify what the
+deterministic passes could not, and it refuses to run until a `carrick.json`
+exists. `carrick refresh` states what it can with no model at all.
 
 Workspace detection handles a repo root or immediate sibling repositories.
 An optional `carrick-workspace.json` adds paths through `repos` and removes
@@ -106,8 +107,8 @@ types in a Node process.
 | `carrick login` | Authorise a Carrick workspace in the browser, or verify `CARRICK_TOKEN` |
 | `carrick logout` | Remove the saved local credential |
 | `carrick init [--project SLUG] [--repo OWNER/REPO]` | The repo list, the project, the service proposal in `.carrick/`, the agent hooks, the MCP connection, and the prompt that writes `carrick.json` |
-| `carrick index` | Derive the workspace, apply optional repo overrides and write `.carrick/` |
-| `carrick refresh [--service X]` | Re-scan one repo, or all of them, and re-join |
+| `carrick index` | Derive the workspace, apply optional repo overrides and write `.carrick/`, with Carrick classifying what the deterministic passes could not |
+| `carrick refresh [--service X]` | Re-scan one repo, or all of them, and re-join, with no model |
 | `carrick check <file>` | What the index knows about that file, verdicts included |
 | `carrick touch <file>` | The same, without the verdicts |
 | `carrick status` | What the index holds, and how far each repo has moved since |

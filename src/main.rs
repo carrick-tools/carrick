@@ -324,7 +324,12 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    if use_local_dir && cloud_storage::laptop_scan_requested() {
+    // `CARRICK_MOCK_ALL` beats the laptop branch: the variable means "use mock
+    // storage instead of Carrick Cloud" (`--help`), and a laptop scan is the
+    // one path that would have reached the cloud with it set. Without this,
+    // no test could drive `carrick index` — which since carrick#1008 always
+    // infers — without real credentials and real spend.
+    if use_local_dir && cloud_storage::laptop_scan_requested() && !use_mock {
         // A laptop scan: the model answers through the cloud, the index is
         // uploaded, and the same payload is written to the cache directory so
         // the local read model is built from the run that produced it rather

@@ -146,7 +146,7 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
         r#"{"repos":["orders"]}"#,
     )
     .unwrap();
-    run(root, &["index", "--workspace", "."], None);
+    run(root, &["refresh", "--workspace", "."], None);
     let baseline = check(root, "orders/app.ts");
     assert_eq!(baseline["hosted_state"], "not_signed_in");
     let mut hosted = blobs(root).remove(0);
@@ -161,7 +161,7 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
     hosted["cached_guidance"]["http"]["triage_hints"] = json!("hosted guidance marker");
     hosted["cached_extraction_config"] = json!({"rules":[]});
     let original = snapshot(root, "orders", &[hosted]);
-    run(root, &["index", "--workspace", "."], Some(TOKEN));
+    run(root, &["refresh", "--workspace", "."], Some(TOKEN));
     let enriched = check(root, "orders/app.ts");
     assert_eq!(enriched["hosted_state"], "enriched", "{enriched:#}");
     assert!(
@@ -220,7 +220,7 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
         r#"{"name":"orders","version":"2.0.0","dependencies":{"@remix-run/node":"^2.0.0"}}"#,
     )
     .unwrap();
-    run(root, &["index", "--workspace", "."], Some(TOKEN));
+    run(root, &["refresh", "--workspace", "."], Some(TOKEN));
     let changed_manifest = blobs(root).remove(0);
     assert_ne!(
         changed_manifest["cached_detection"]["notes"],
@@ -241,7 +241,7 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
         if phase == 2 {
             git(&repo, &["commit", "-qm", "edit"]);
         }
-        run(root, &["index", "--workspace", "."], Some(TOKEN));
+        run(root, &["refresh", "--workspace", "."], Some(TOKEN));
         let answer = check(root, "orders/app.ts");
         assert!(
             !answer["items"]
@@ -260,7 +260,7 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
         "declare const app: any; app.get(\"/new\", () => 1);\n",
     )
     .unwrap();
-    run(root, &["index", "--workspace", "."], Some(TOKEN));
+    run(root, &["refresh", "--workspace", "."], Some(TOKEN));
     let deleted = check(root, "orders/app.ts");
     assert!(deleted["items"].as_array().unwrap().is_empty());
     assert_eq!(deleted["boundary"]["candidates_withheld_changed_files"], 1);
@@ -284,7 +284,7 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
         let mut bad = original.clone();
         bad["projects"]["project-1"][0][field] = value;
         save_snapshot(root, &bad);
-        run(root, &["index", "--workspace", "."], Some(TOKEN));
+        run(root, &["refresh", "--workspace", "."], Some(TOKEN));
         let answer = check(root, "orders/app.ts");
         assert_eq!(answer["hosted_state"], state);
         assert!(
@@ -299,13 +299,13 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
     day_one["resolution"]["repos"][0]["services"] = json!([]);
     day_one["projects"]["project-1"] = json!([]);
     save_snapshot(root, &day_one);
-    run(root, &["index", "--workspace", "."], Some(TOKEN));
+    run(root, &["refresh", "--workspace", "."], Some(TOKEN));
     assert_eq!(check(root, "orders/app.ts")["hosted_state"], "no_index_yet");
     day_one["resolution"]["repos"][0] = json!({"full_name":"example/orders","connected":false});
     day_one["resolution"]["project_repos"] = json!([]);
     day_one["projects"] = json!({});
     save_snapshot(root, &day_one);
-    run(root, &["index", "--workspace", "."], Some(TOKEN));
+    run(root, &["refresh", "--workspace", "."], Some(TOKEN));
     assert_eq!(
         check(root, "orders/app.ts")["hosted_state"],
         "not_connected"
@@ -313,7 +313,7 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
     save_snapshot(root, &original);
     run(
         root,
-        &["index", "--workspace", "."],
+        &["refresh", "--workspace", "."],
         Some("another-workspace-token"),
     );
     let switched = check(root, "orders/app.ts");
@@ -355,7 +355,7 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
         );
     }
     // Losing credentials cannot seed the prior signed-in model rows either.
-    run(root, &["index", "--workspace", "."], None);
+    run(root, &["refresh", "--workspace", "."], None);
     assert_eq!(
         check(root, "orders/app.ts")["hosted_state"],
         "not_signed_in"
@@ -404,7 +404,7 @@ fn hosted_only_counterpart_keeps_real_type_verdict_and_has_no_local_navigation()
         r#"{"repos":["catalog-web","inventory-svc"]}"#,
     )
     .unwrap();
-    run(root, &["index", "--workspace", "."], None);
+    run(root, &["refresh", "--workspace", "."], None);
     let before = check(root, "inventory-svc/src/inventory.ts");
     let data = blobs(root);
     std::fs::remove_dir_all(root.join("catalog-web")).unwrap();
@@ -414,7 +414,7 @@ fn hosted_only_counterpart_keeps_real_type_verdict_and_has_no_local_navigation()
     )
     .unwrap();
     snapshot(root, "inventory-svc", &data);
-    run(root, &["index", "--workspace", "."], Some(TOKEN));
+    run(root, &["refresh", "--workspace", "."], Some(TOKEN));
     let after = check(root, "inventory-svc/src/inventory.ts");
     assert!(!after["items"].as_array().unwrap().is_empty());
     assert_eq!(
@@ -481,7 +481,7 @@ fn hosted_only_counterpart_keeps_real_type_verdict_and_has_no_local_navigation()
         r#"{"repos":["catalog-web"]}"#,
     )
     .unwrap();
-    run(root, &["index", "--workspace", "."], Some(TOKEN));
+    run(root, &["refresh", "--workspace", "."], Some(TOKEN));
     let collision = check(root, "catalog-web/src/inventory.ts");
     assert_eq!(collision["service"], "inventory-svc");
     assert_eq!(

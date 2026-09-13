@@ -34,8 +34,12 @@ In the folder that holds your repositories:
 # Finds the repos, writes the service proposal, wires up the hooks. Runs no scan.
 carrick init
 
-# Builds the index, and rebuilds it as the code changes. No model runs here.
+# Builds the index: Carrick classifies what the deterministic passes could not.
+# This is the paid scan, and it runs once.
 carrick index
+
+# Rebuilds it from your working tree as the code changes, with no model.
+carrick refresh
 ```
 
 > **Note:** If the CLI is installed somewhere that is not on `PATH`, point the `carrick.binary` setting at it. Without a usable binary or an index, the server publishes nothing and says why in the **Carrick** output channel.

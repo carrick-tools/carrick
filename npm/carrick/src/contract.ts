@@ -23,7 +23,7 @@ export type Boundary = {
   unemitted_literal_candidates?: number;
   /** `file:line` for up to 200 of those sites, so the count can be checked. */
   unemitted_literal_sites?: string[];
-  /** Candidates no model has been asked about: what `--infer` would classify. */
+  /** Candidates no model has been asked about: what `carrick index` classifies. */
   candidates_awaiting_model?: number;
   /** Why this service's types are thin, when the scan recorded a reason. */
   type_extraction_status?: string;
@@ -187,6 +187,12 @@ export type RunningScan = {
   pid: number;
   started_at: string;
   updated_at?: string;
+  /**
+   * Whether the scan ran the model. True for `carrick index`, which always
+   * infers (carrick#1008); recorded rather than assumed, because the field
+   * states what a run DID and a reader should not have to know which command
+   * wrote it.
+   */
   infer?: boolean;
   workspace?: string;
   status: "running" | "failed";
@@ -234,7 +240,7 @@ export type ScanSpend = {
   period?: string;
 };
 
-/** What one run of `carrick index --infer` paid: one entry per repo it scanned. */
+/** What one run of `carrick index` paid: one entry per repo it scanned. */
 export type RunSpend = {
   /** RFC 3339, when the last figure in it landed. */
   updated_at?: string;

@@ -318,7 +318,7 @@ function staleText(service: StatusService): string {
 export function serviceLine(service: StatusService): string {
   const head = `- ${service.service} at ${shortHash(service.index_commit)}: ${service.routes} route(s), ${service.calls} call(s)`;
   const waiting = service.boundary?.candidates_awaiting_model;
-  const awaiting = waiting ? `, ${waiting} candidate(s) waiting for --infer` : "";
+  const awaiting = waiting ? `, ${waiting} candidate(s) waiting for \`carrick index\`` : "";
   return `${head}, changed since index: ${service.changed_since_index}${staleText(service)}${awaiting}`;
 }
 

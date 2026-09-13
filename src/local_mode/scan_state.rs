@@ -1,6 +1,6 @@
 //! A scan that outlives the shell that started it (carrick#992).
 //!
-//! `carrick index --infer` is the paid pass, and on a mid-sized monorepo it
+//! `carrick index` is the paid pass, and on a mid-sized monorepo it
 //! takes about fifteen minutes. The flow has an agent run it, and an agent's
 //! shell caps a command at two minutes by default and ten at most: the scan is
 //! killed part-way, the cloud's in-flight slot for that repo stays held until

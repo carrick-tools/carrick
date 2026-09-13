@@ -123,7 +123,7 @@ impl ScanSpend {
     }
 }
 
-/// What one run of `carrick index --infer` spent: one entry per repo scanned,
+/// What one run of `carrick index` spent: one entry per repo scanned,
 /// because each repo is its own scan with its own id and its own first-index
 /// ceiling. Written to `.carrick/last-scan.json` as each figure arrives —
 /// money is a fact at upload time, so a run killed after paying still leaves

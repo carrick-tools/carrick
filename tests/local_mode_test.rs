@@ -119,8 +119,36 @@ fn run(workspace: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("stdout was not UTF-8")
 }
 
+/// The same, with the model and the cloud mocked: what a test of `carrick
+/// index` needs, since that command always infers (carrick#1008). The variable
+/// is inherited by the scan subprocesses the indexer spawns, which is where
+/// the model would otherwise be called.
+fn run_mocked(workspace: &Path, args: &[&str]) -> String {
+    let output = Command::new(carrick())
+        .args(args)
+        .current_dir(workspace)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        .env("CARRICK_MOCK_ALL", "1")
+        .output()
+        .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
+    assert!(
+        output.status.success(),
+        "carrick {args:?} exited {:?}:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("stdout was not UTF-8")
+}
+
+/// Build the index with no model and nothing to pay.
+///
+/// `refresh`, not `index`: since carrick#1008 `carrick index` is the inferred
+/// scan and nothing else, so it asks Carrick Cloud and uploads. `refresh` is
+/// the pass these tests are about — deterministic rows from the working tree —
+/// and it is what the session-start hook runs.
 fn index(workspace: &Path) -> String {
-    run(workspace, &["index", "--workspace", "."])
+    run(workspace, &["refresh", "--workspace", "."])
 }
 
 fn touch(workspace: &Path, file: &str) -> String {
@@ -587,13 +615,13 @@ fn a_scan_states_its_progress_to_the_indexer_and_not_to_the_user() {
     let root = workspace.path();
 
     let output = Command::new(carrick())
-        .args(["index", "--workspace", "."])
+        .args(["refresh", "--workspace", "."])
         .current_dir(root)
         .env_remove("CARRICK_TOKEN")
         .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
         .output()
-        .expect("carrick index");
-    assert!(output.status.success(), "carrick index failed");
+        .expect("carrick refresh");
+    assert!(output.status.success(), "carrick refresh failed");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -796,9 +824,9 @@ fn status_attributes_a_repo_level_file_to_the_repo_and_not_to_every_service() {
     );
 }
 
-/// A free pass states what is waiting for the paid one, so `0 route(s) 0
-/// call(s)` is not the same table cell as a service with no API in it
-/// (carrick#997 item 8).
+/// A pass that ran no model states what is waiting for the paid one, so
+/// `0 route(s) 0 call(s)` is not the same table cell as a service with no API
+/// in it (carrick#997 item 8).
 #[test]
 #[serial]
 fn the_free_pass_counts_what_is_waiting_for_the_paid_one() {
@@ -808,7 +836,7 @@ fn the_free_pass_counts_what_is_waiting_for_the_paid_one() {
     let map = index(root);
     let waiting = map
         .lines()
-        .find(|line| line.contains("candidate(s) waiting for --infer"))
+        .find(|line| line.contains("candidate(s) waiting for `carrick index`"))
         .unwrap_or_else(|| panic!("no service line states what is waiting:\n{map}"));
     assert!(
         waiting.contains("route(s)") && waiting.contains("call(s)"),
@@ -817,7 +845,7 @@ fn the_free_pass_counts_what_is_waiting_for_the_paid_one() {
 
     let status = run(root, &["status", "--workspace", "."]);
     assert!(
-        status.contains("candidate(s) waiting for --infer"),
+        status.contains("candidate(s) waiting for `carrick index`"),
         "and the session answer says it too:\n{status}"
     );
 }
@@ -874,20 +902,27 @@ fn an_unknown_subcommand_is_not_read_as_a_repository_path() {
 /// The scan outlives the command that started it, and the command comes back
 /// at once with the id to watch it by (carrick#992).
 ///
-/// The shell an agent runs `carrick index --infer` through caps a command at
-/// two minutes by default and ten at most, and a first inferred scan of a
-/// mid-sized monorepo takes about fifteen. This is the free pass — the timing
-/// is what is under test, not the model — so what it proves is the shape:
-/// the parent returns, the child finishes the build on its own, its output is
-/// in the log, and the state file is gone once it is done.
+/// The shell an agent runs `carrick index` through caps a command at two
+/// minutes by default and ten at most, and a first inferred scan of a
+/// mid-sized monorepo takes about fifteen. The model is mocked here — the
+/// timing is what is under test, not the classification — so what it proves is
+/// the shape: the parent returns, the child finishes the build on its own, its
+/// output is in the log, and the state file is gone once it is done.
+///
+/// `carrick index` is the inferred scan since carrick#1008, so the two things
+/// it demands are here: a `carrick.json` in every repo, which is what its
+/// refusal checks, and `CARRICK_MOCK_ALL`, which keeps the run off the wire.
 #[test]
 #[serial]
 fn a_detached_scan_outlives_the_command_that_started_it() {
     let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
     let root = workspace.path();
+    for repo in ["catalog-web", "inventory-svc"] {
+        std::fs::write(root.join(repo).join("carrick.json"), "{}\n").expect("write a config");
+    }
 
     let started = Instant::now();
-    let stdout = run(root, &["index", "--workspace", ".", "--detach"]);
+    let stdout = run_mocked(root, &["index", "--workspace", ".", "--detach"]);
     let returned_in = started.elapsed();
 
     assert!(

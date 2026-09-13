@@ -344,7 +344,7 @@ pub struct StatusOutput {
     #[serde(default)]
     pub repos: Vec<StatusRepo>,
     /// Scans running right now, or stopped without finishing. Empty in the
-    /// ordinary case; this is what a detached `carrick index --infer` is
+    /// ordinary case; this is what a detached `carrick index` is
     /// visible through while it runs (carrick#992).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub running_scans: Vec<super::scan_state::ScanState>,
@@ -648,7 +648,7 @@ mod hosted_wire_tests {
         let text = output.render();
         assert!(text.contains("changed since index: 1"), "{text}");
         assert!(
-            text.contains("3 candidate(s) waiting for --infer"),
+            text.contains("3 candidate(s) waiting for `carrick index`"),
             "{text}"
         );
         assert!(

@@ -25,9 +25,10 @@ const EXTENSION_ID = "carrick-tools.carrick";
  * what the tool returns. It is printed here so the terminal path ends where
  * the dashboard path ends, and it states the sequence the ruling in
  * carrick-cloud#799 fixed: the agent writes a complete `carrick.json` from the
- * proposal this command derived, `carrick index` proves it for nothing, and
- * only then does the one paid scan run. Keep the two copies in step; the
- * tool's instructions, not this text, decide what gets written.
+ * proposal this command derived, `carrick refresh` proves it for nothing, and
+ * only then does the one paid scan — `carrick index`, which always infers
+ * (carrick#1008) — run. Keep the two copies in step; the tool's instructions,
+ * not this text, decide what gets written.
  *
  * One clause is this side's alone, because only this side knows it: whether
  * the workspace read found a hosted index for these repos. Where there is one,
@@ -44,19 +45,19 @@ export function agentScaffoldPrompt(hosted: boolean): string {
     "library workspace members as shared includes of the services that import " +
     "them, with the env vars and domains each service calls. Add the Carrick " +
     "section to AGENTS.md if this repo already has one. Then run `carrick " +
-    "index`, which is free and runs no model, and fix whatever it reports as " +
-    "unclassified or in no service. " +
+    "refresh`, which is free and runs no model, and fix whatever it reports " +
+    "as unclassified or in no service. " +
     (hosted
-      ? "Do not run `carrick index --infer`: this repo already has a hosted " +
-        "index, and a laptop scan from a branch replaces the CI row for " +
-        "everyone. "
+      ? "Do not run `carrick index`: it is the paid scan, this repo already " +
+        "has a hosted index, and a laptop scan from a branch replaces the CI " +
+        "row for everyone. "
       : // carrick#960/#1003: an agent's shell caps a command well below the
         // fifteen minutes a first paid scan takes, so the scan is detached and
         // the agent asks `carrick status` how it went. Mirrors the scaffold
         // tool's own wording (carrick-cloud#821).
-        "Then run `carrick index --infer --detach` once for the scan that " +
-        "builds the index, checking `carrick status` about once a minute " +
-        "until it says the scan finished, stopped or failed. ") +
+        "Then run `carrick index --detach` once for the scan that builds the " +
+        "index, checking `carrick status` about once a minute until it says " +
+        "the scan finished, stopped or failed. ") +
     "Answer the closing checklist before you open the PR."
   );
 }
@@ -488,9 +489,9 @@ export async function init(argv: string[]): Promise<number> {
   // command prints is the prompt that produces that config.
   //
   // Unless CI has already built one. The hosted index is the whole workspace's
-  // row, and `--infer` from a laptop on a branch replaces it for everyone who
-  // queries it, so where the workspace read found services this says so and
-  // names the free command instead (carrick#993 row 2).
+  // row, and `carrick index` from a laptop on a branch replaces it for
+  // everyone who queries it, so where the workspace read found services this
+  // says so and names the free command instead (carrick#993 row 2).
   if (hostedIndex.length > 0) {
     const subject =
       hostedIndex.length === requested.length && requested.length === 1
@@ -498,15 +499,15 @@ export async function init(argv: string[]): Promise<number> {
         : hostedIndex.length > 3
           ? `${hostedIndex.slice(0, 3).join(", ")} and ${hostedIndex.length - 3} more`
           : hostedIndex.join(", ");
-    say(`  ${subject} already ${hostedIndex.length === 1 ? "has" : "have"} a hosted index. Run \`carrick index\` (free); do not run`);
-    say("  `carrick index --infer`, a laptop scan from a branch replaces the CI row for");
+    say(`  ${subject} already ${hostedIndex.length === 1 ? "has" : "have"} a hosted index. Run \`carrick refresh\` (free); do not`);
+    say("  run `carrick index`, the paid scan: from a branch it replaces the CI row for");
     say(`  everyone. ${PROPOSAL_FILE} holds the services this run derived, to compare`);
     say("  with the carrick.json already committed.");
   } else {
     say(`  There is no index yet. ${PROPOSAL_FILE} holds the services this run derived;`);
     say("  an agent turns it into carrick.json, adds the CI check (which needs no secret),");
-    say("  and builds the index: `carrick index` is free and runs no model, and");
-    say("  `carrick index --infer` is the single scan that asks Carrick to classify the rest.");
+    say("  and builds the index: `carrick refresh` is free and runs no model, and");
+    say("  `carrick index` is the single scan that asks Carrick to classify the rest.");
     say("  By hand instead: `carrick templates workflow > .github/workflows/carrick.yml`, a");
     say("  carrick.json per https://docs.carrick.tools/carrick-json, then those two commands.");
   }

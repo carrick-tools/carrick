@@ -76,7 +76,7 @@
     },
     "run_spend": {
       "type": "object",
-      "description": "What the last paid scan cost: one entry per repo `carrick index --infer` scanned. Absent until one has run. `priced: false` on any entry means print nothing about money at all — one unpriced model makes every dollar figure in the month an under-count — and a null amount is \"not set\", never \"unlimited\".",
+      "description": "What the last paid scan cost: one entry per repo `carrick index` scanned. Absent until one has run. `priced: false` on any entry means print nothing about money at all — one unpriced model makes every dollar figure in the month an under-count — and a null amount is \"not set\", never \"unlimited\".",
       "required": ["scans"],
       "properties": {
         "updated_at": { "type": "string", "description": "RFC 3339, when the last figure in it landed." },

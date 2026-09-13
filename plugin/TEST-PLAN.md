@@ -130,7 +130,7 @@ echo '{"name":"probe","private":true}' > package.json
 npm install --ignore-scripts /tmp/pack/carrick-tools-cli-*.tgz /tmp/pack/carrick-<v>.tgz
 export PATH="/tmp/probe/node_modules/.bin:$PATH"
 carrick --version
-carrick index --workspace <the demo workspace>
+carrick refresh --workspace <the demo workspace>
 node <checkout>/npm/carrick/scripts/verdict-probe.mjs \
   --sidecar /tmp/probe/node_modules/carrick/sidecar
 ```
@@ -159,7 +159,7 @@ CI runs these commands against a real index.
 |---|---|---|---|
 | 2.1 | `carrick init` | asks nothing until it has an identity, then lists the repos it found, settles the project (the one they are already in, or one picked or created from the list), writes `.carrick/proposal.json` and `.claude/settings.json` and nothing else in the tree, runs no scan, and ends on the prompt that has an agent write `carrick.json` (carrick#987). Re-running adds no second hook entry | 0 |
 | 2.1b | `carrick init` with `carrick` off PATH (run the entry point by absolute path, with a PATH holding node, git and gh only) | the hook command it writes is this install's own entry point, and it says so, with `npm install -g carrick` as the way back to the short command. It also says the plugin's language server is started as a bare `carrick`, which that machine cannot resolve, so the hooks are the channel there (carrick#837, #849) | 0 |
-| 2.2 | `carrick index` | `indexed N repo(s) in X.Xs at <time>`, one line per service with route and call counts and a short commit, the counterpart link count, then each service's boundary lines. On the demo workspace this takes about 7 s for three repos (7.1 s on 0.3.48, 6.6 s on 0.3.50) | 0 |
+| 2.2 | `carrick refresh` (the pass that runs no model; `carrick index` is the paid scan of the same workspace) | `indexed N repo(s) in X.Xs at <time>`, one line per service with route and call counts and a short commit, the counterpart link count, then each service's boundary lines. On the demo workspace this takes about 7 s for three repos (7.1 s on 0.3.48, 6.6 s on 0.3.50) | 0 |
 | 2.3 | `carrick status` | one block per service: what the index holds, the commit, how far the repo has moved since, and the boundary lines | 0 |
 | 2.4 | `carrick status --json` | validates against `docs/schemas/carrick-status-0.json`; `scanner_version` is the build under test | 0 |
 | 2.5 | `carrick check <a file with a route>` | the routes and calls in that file, who is on the other side, and any verdict. On the demo workspace, checking `user-service`'s users controller names the `GET /api/users` mismatch and `notification-service server.ts:25` | 0 |
@@ -187,8 +187,8 @@ user sees when the thing they did was wrong.
 | 2.19 | Deleted file | delete an indexed file, then check it | `deleted` and `stale` are both true, the index still holds the file's rows, and each verdict becomes `not_checked` / `producer_removed` with `this file is gone and the index still serves <op> here: producer removed, N consumer(s)`. The human render leads with `this file is no longer on disk`. Deletions fire no channel of their own (E17): the next session start or the next explicit check is where this surfaces | 0 |
 | 2.20 | No file argument | `carrick check` | `carrick: \`carrick check\` needs a file path` | **2** |
 | 2.21 | Unknown option | `carrick check foo.ts --deep` | `carrick: unknown option for \`carrick check\`: --deep` | 2 |
-| 2.22 | No workspace file | `carrick index` in an empty directory | `no carrick-workspace.json found here or above`, with an example of one | 1 |
-| 2.23 | Workspace names a missing repo | add `"./nope"` to the repos list, `carrick index` | a line naming `./nope` and saying it is not indexed, and the other repos index anyway | 0 |
+| 2.22 | No workspace file | `carrick refresh` in an empty directory | `no carrick-workspace.json found here or above`, with an example of one | 1 |
+| 2.23 | Workspace names a missing repo | add `"./nope"` to the repos list, `carrick refresh` | a line naming `./nope` and saying it is not indexed, and the other repos index anyway | 0 |
 | 2.24 | Unknown hook | `carrick hook nonsense` | `carrick hook needs one of: post-edit, session-start` | 2 |
 | 2.25 | Unknown template | `carrick templates nonsense` | `carrick templates: <what went wrong>` | 2 |
 | 2.26 | Platform package missing | `carrick check foo.ts` from an install with no platform tarball | a message containing `is not installed`, not a stack trace (this one is **CI**, in `plugin.yml`) | 1 |
@@ -200,7 +200,7 @@ been wrong before:
 - **Read commands write nothing.** Note the size of `~/.carrick/logs/carrick.log.<date>`,
   run twenty `carrick check` calls, note it again. It must be identical: only
   `index` and `refresh` initialise logging (carrick#851).
-- **The log is bounded.** `CARRICK_LOG_MAX_MB=1 carrick index` on a workspace big
+- **The log is bounded.** `CARRICK_LOG_MAX_MB=1 carrick refresh` on a workspace big
   enough to exceed it must roll to `carrick.log.<date>.1`, say so on stderr, and
   keep exactly one rolled generation.
 

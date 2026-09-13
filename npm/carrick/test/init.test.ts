@@ -614,14 +614,14 @@ test("the executable CLI refuses the paid scan on an indexed repo and names the 
       result.stdout,
     );
     assert.ok(
-      result.stdout.includes("This repo already has a hosted index. Run `carrick index`"),
+      result.stdout.includes("This repo already has a hosted index. Run `carrick refresh`"),
       result.stdout,
     );
-    assert.match(result.stdout, /a laptop scan from a branch replaces the/);
+    assert.match(result.stdout, /it replaces the CI row for/);
     assert.doesNotMatch(result.stdout, /There is no index yet/);
     // Including in the prompt the run ends on, which is the copy an agent acts
     // on rather than reads.
-    assert.match(result.stdout, /Do not run `carrick index --infer`/);
+    assert.match(result.stdout, /Do not run `carrick index`/);
     assert.doesNotMatch(result.stdout, /is connected and has no hosted index yet/);
   } finally {
     fixture.cleanup();
@@ -713,22 +713,27 @@ test("the scaffold prompt names only files that seam owns, and states the sequen
     assert.ok(named.includes(".carrick/proposal.json"), prompt);
     assert.ok(named.includes("carrick.json"), prompt);
     // The free pass is in both: it is what proves the config, and it costs
-    // nothing to run against an index CI already built.
-    assert.match(prompt, /`carrick index`, which is free/);
+    // nothing to run against an index CI already built. It is `refresh` since
+    // carrick#1008, because `carrick index` is the paid scan itself.
+    assert.match(prompt, /`carrick refresh`, which is free/);
   }
   // Free pass first, one paid scan after it (carrick-cloud#799), detached and
   // then asked after: an agent's shell does not survive a fifteen-minute scan
   // (carrick#960, cloud half carrick-cloud#821).
   const fresh = agentScaffoldPrompt(false);
-  assert.match(fresh, /`carrick index --infer --detach` once/);
+  assert.match(fresh, /`carrick index --detach` once/);
   assert.match(fresh, /`carrick status`/);
-  assert.ok(fresh.indexOf("`carrick index`") < fresh.indexOf("--infer"));
+  assert.ok(fresh.indexOf("`carrick refresh`") < fresh.indexOf("`carrick index"));
+  // The removed flag is named nowhere: an agent that pastes this prompt would
+  // be told the flag is gone rather than get a scan (carrick#1008).
+  assert.doesNotMatch(fresh, /--infer/);
   // And where CI has already built the index, the paid scan is refused rather
   // than ordered: a laptop scan from a branch replaces that row for the whole
   // workspace (carrick#993 row 2).
   const hosted = agentScaffoldPrompt(true);
-  assert.match(hosted, /Do not run `carrick index --infer`/);
-  assert.doesNotMatch(hosted, /Then run `carrick index --infer` once/);
+  assert.match(hosted, /Do not run `carrick index`/);
+  assert.doesNotMatch(hosted, /--infer/);
+  assert.doesNotMatch(hosted, /Then run `carrick index` once/);
 });
 
 function recordingPrompts(

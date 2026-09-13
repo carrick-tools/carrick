@@ -22,9 +22,8 @@ change bumps it to `carrick.check/1` and both are emitted for one release.
 
 | command | reads | writes | budget |
 |---|---|---|---|
-| `carrick index --workspace <dir>` | detected local repos, optional workspace overrides, authenticated hosted indexes | `<dir>/.carrick/` | minutes, cold |
+| `carrick index --workspace <dir>` | detected local repos, optional workspace overrides, authenticated hosted indexes, and Carrick Cloud, which classifies what the deterministic passes could not | `<dir>/.carrick/`, plus `.carrick/last-scan.json` | the paid scan; minutes, cold, and it ends by saying what it cost |
 | `carrick index --detach` | the same | the same, plus `.carrick/scan-<id>.log` and `.carrick/scan-<id>.json` | returns at once |
-| `carrick index --infer` | the same, and Carrick Cloud classifies what the deterministic passes could not | the same, plus `.carrick/last-scan.json` | the paid scan; it ends by saying what it cost |
 | `carrick status [--json]` | local index, credential identity | nothing | < 300 ms |
 | `carrick touch <file> [--json]` | local index, credential identity | nothing | < 300 ms |
 | `carrick check <file> [--json]` | local index, credential identity | nothing | < 300 ms |
@@ -274,7 +273,7 @@ unclassified in this service.
 | `.carrick/build-*/` | transient per-run blobs and join result, removed when the build finishes |
 | `.carrick/scan-<id>.log` | everything a detached build printed: its banner, its per-service lines, its map, and any error. Kept after the scan ends — it is the record of a run nobody watched |
 | `.carrick/scan-<id>.json` | what that build is doing NOW: phase, service, counts, pid, when it started, and `spend` once an upload has come back with a figure. Removed when the scan finishes; left with `"status": "failed"` when it fails, and left as-is when the process is killed, which is how `carrick status` can say a scan stopped part-way |
-| `.carrick/last-scan.json` | what the last **paid** scan cost: one entry per repo `carrick index --infer` scanned, each carrying the cloud's `carrick.scan-spend/0` block. Written as each figure lands, so a run killed after paying still leaves it. Beside the index rather than in it, because a free re-index rebuilds the read model and a first paid run may be killed before there is one |
+| `.carrick/last-scan.json` | what the last **paid** scan cost: one entry per repo `carrick index` scanned, each carrying the cloud's `carrick.scan-spend/0` block. Written as each figure lands, so a run killed after paying still leaves it. Beside the index rather than in it, because `carrick refresh` rebuilds the read model from scratch and a first paid run may be killed before there is one |
 
 `index.json` is derived: deleting it and re-running `carrick index` reproduces
 it. Nothing outside `src/local_mode/` reads it, and its internal shape is not
