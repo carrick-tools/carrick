@@ -811,7 +811,8 @@ impl HostedInput {
                 result.failure = Some(format!(
                     "local service `{local}` has no hosted match; the hosted index holds \
                      [{hosted}]. `serviceName` in carrick.json is the key the index is written \
-                     under, and a scoped package name is not the name a hosted row carries."
+                     under, and a scoped package name is not one of the names these hosted rows \
+                     carry."
                 ));
                 HostedState::ReadFailed
             } else {

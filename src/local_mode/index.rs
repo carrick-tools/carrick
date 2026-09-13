@@ -482,7 +482,7 @@ fn run_scan(
     let mut head: Vec<String> = Vec::with_capacity(KEPT_LINES);
     let mut tail: VecDeque<String> = VecDeque::with_capacity(KEPT_LINES);
     // The sentences that explain the failure, wherever in the output they fell.
-    let mut causes: Vec<String> = Vec::new();
+    let mut causes: VecDeque<String> = VecDeque::with_capacity(KEPT_CAUSES);
     let mut dropped = 0usize;
     // What this scan paid, if it paid anything. It crosses on the same
     // channel as the progress, and for the same reason: this process swallows
@@ -527,8 +527,11 @@ fn run_scan(
         // JSON reader and by a log file, neither of which renders escapes
         // (carrick#1023 item 6).
         let line = strip_ansi(&line);
-        if names_a_failure(&line) && causes.len() < KEPT_CAUSES {
-            causes.push(line.clone());
+        if names_a_failure(&line) {
+            if causes.len() == KEPT_CAUSES {
+                causes.pop_front();
+            }
+            causes.push_back(line.clone());
         }
         if head.len() < KEPT_LINES {
             head.push(line);
@@ -562,7 +565,10 @@ const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How many lines of a failed child's stderr are kept from each end.
 const KEPT_LINES: usize = 12;
-/// How many lines naming a failure are lifted out of the middle.
+/// How many lines naming a failure are lifted out of the middle. The LAST
+/// twelve, not the first: a scan that prints a dozen `error` lines on its way
+/// to the one that killed it would otherwise evict exactly the line this cap
+/// exists to keep.
 const KEPT_CAUSES: usize = 12;
 /// What the Rust runtime prints when a thread dies, whatever the message is.
 const PANIC_MARKER: &str = "panicked at";
@@ -585,7 +591,7 @@ fn names_a_failure(line: &str) -> bool {
 /// them.
 fn failure_excerpt(
     head: Vec<String>,
-    causes: Vec<String>,
+    causes: VecDeque<String>,
     tail: VecDeque<String>,
     dropped: usize,
 ) -> String {
