@@ -188,7 +188,42 @@ pub struct Item {
     pub evidence: Option<String>,
     pub counterparts: Vec<Counterpart>,
     pub verdict: Option<Verdict>,
+    /// The type the READING side of [`Item::direction`] declares: the
+    /// producer's request type on a `request`, what the call site reads on a
+    /// `response`. Capped at [`MAX_TYPE_TEXT_CHARS`] characters, with `...`
+    /// where the cap cut it.
+    ///
+    /// `expected` and `actual` are the two ends of one assignability check,
+    /// the same ends the verdict's own detail names when it says one type is
+    /// "not assignable to" another: `actual` is the source, `expected` is the
+    /// target. Which service holds which flips with the direction, so a reader
+    /// pairing them must read [`Item::direction`] too (carrick#1033).
+    ///
+    /// Absent whenever the index does not hold it — nothing was compared, the
+    /// check stated no direction, or the pair's types were never resolved. An
+    /// absent field is "this run did not state it", never a type of `unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_type: Option<String>,
+    /// The type the SENDING side of [`Item::direction`] states: what the
+    /// consumer sends on a `request`, the producer's response type on a
+    /// `response`. Capped and absent on the same terms as
+    /// [`Item::expected_type`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_type: Option<String>,
+    /// Which half of the contract the two types above belong to: `request` or
+    /// `response`. The [`crate::cloud_storage::ManifestTypeKind`] spelling,
+    /// because it is the same fact the type check keyed its outcome on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
 }
+
+/// How much printed type text one item carries.
+///
+/// A resolved shape can run to thousands of characters, and the two surfaces
+/// this feeds — an LSP diagnostic and a hook line — are read in one glance. The
+/// cap is applied where the row is built, so what a reader receives is already
+/// bounded and nothing downstream has to re-truncate it.
+pub const MAX_TYPE_TEXT_CHARS: usize = 200;
 
 /// The whole answer.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -540,6 +575,9 @@ mod tests {
                     repo: Some("/repos/admin-ui".to_string()),
                 }],
                 verdict: None,
+                expected_type: None,
+                actual_type: None,
+                direction: None,
             }],
             boundary: None,
             boundary_note: super::super::NOT_CLASSIFIED_LOCALLY.to_string(),
@@ -599,6 +637,74 @@ mod hosted_wire_tests {
                 .as_object()
                 .unwrap()
                 .contains_key("remote")
+        );
+    }
+
+    /// The three carrick#1033 fields ride on the ITEM, in these exact
+    /// spellings, and a payload written before they existed still parses with
+    /// all three absent rather than empty.
+    #[test]
+    fn the_two_types_and_the_direction_are_sparse_item_fields() {
+        let bare = serde_json::to_value(super::tests::output()).unwrap();
+        for field in ["expected_type", "actual_type", "direction"] {
+            assert!(
+                bare["items"][0].get(field).is_none(),
+                "{field} is written only when the index holds it"
+            );
+        }
+
+        let mut stated = super::tests::output();
+        stated.items[0].expected_type = Some("number".to_string());
+        stated.items[0].actual_type = Some("UsersResponse { users: UserV2[] }".to_string());
+        stated.items[0].direction = Some("response".to_string());
+        let value = serde_json::to_value(&stated).unwrap();
+        assert_eq!(
+            value["items"][0]["expected_type"],
+            serde_json::json!("number")
+        );
+        assert_eq!(
+            value["items"][0]["actual_type"],
+            serde_json::json!("UsersResponse { users: UserV2[] }")
+        );
+        assert_eq!(
+            value["items"][0]["direction"],
+            serde_json::json!("response")
+        );
+
+        let round_tripped: CheckOutput = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(round_tripped).unwrap(), value);
+
+        // An item as it was written before the three fields existed.
+        let older: Item = serde_json::from_value(serde_json::json!({
+            "kind": "route",
+            "method": "GET",
+            "path": "/api/users",
+            "line": 12,
+            "col": null,
+            "source": "fact",
+            "resolution_source": null,
+            "evidence": null,
+            "counterparts": [],
+            "verdict": null
+        }))
+        .expect("an item written before the fields existed still parses");
+        assert!(older.expected_type.is_none());
+        assert!(older.actual_type.is_none());
+        assert!(older.direction.is_none());
+    }
+
+    /// The direction spelling is the type check's own
+    /// [`crate::cloud_storage::ManifestTypeKind`] wire value, not a second
+    /// vocabulary invented here.
+    #[test]
+    fn the_direction_words_are_the_type_checks_own() {
+        assert_eq!(
+            serde_json::to_value(crate::cloud_storage::ManifestTypeKind::Request).unwrap(),
+            serde_json::json!("request")
+        );
+        assert_eq!(
+            serde_json::to_value(crate::cloud_storage::ManifestTypeKind::Response).unwrap(),
+            serde_json::json!("response")
         );
     }
 

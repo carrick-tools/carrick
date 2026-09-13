@@ -54,7 +54,7 @@ import {
   type CheckResult,
   type Counterpart,
 } from "./contract.ts";
-import { boundaryFor, stateWord } from "./render.ts";
+import { boundaryFor, stateWord, typedMismatchClause } from "./render.ts";
 import { DEFAULT_SURFACES, type Surfaces } from "./surfaces.ts";
 
 export const SOURCE = "carrick";
@@ -191,6 +191,16 @@ function counterpartWhere(counterpart: Counterpart): string {
 export function messageOf(item: CheckItem): string {
   const operation = [item.method, item.path].filter(Boolean).join(" ");
   const verdict = item.verdict;
+  // The two shapes the compiler compared, when the payload holds them: a
+  // reader learns what the other side declares without opening it
+  // (carrick#1033). The compiler's own reason follows on its own line, and
+  // `code` still carries `type_mismatch` for anything keying off the word.
+  const typed = typedMismatchClause(item);
+  if (typed) {
+    const parts = [`${operation ? `${operation}: ` : ""}${typed}`];
+    if (verdict?.detail) parts.push(verdict.detail);
+    return [...parts, ...messageTail(item)].join("\n");
+  }
   // `result` is null wherever the state is the whole statement, and a result
   // whose state is not `resolved` has no compiler verdict behind it.
   const verdictWords = verdict
@@ -202,6 +212,15 @@ export function messageOf(item: CheckItem): string {
     : "";
   const head = [operation, verdictWords].filter(Boolean).join(" ");
   const parts: string[] = [verdict?.detail ? `${head}: ${verdict.detail}` : head];
+  return [...parts, ...messageTail(item)].join("\n");
+}
+
+/**
+ * Everything after the verdict: what the row is, what it was read off, and the
+ * counterpart line, which the typed sentence above leaves untouched.
+ */
+function messageTail(item: CheckItem): string[] {
+  const parts: string[] = [];
   if (isCandidate(item)) {
     const from = item.resolution_source ? ` (${item.resolution_source})` : "";
     parts.push(`Candidate row${from}, so this is a reading of the code and not a fact about it.`);
@@ -215,7 +234,7 @@ export function messageOf(item: CheckItem): string {
         .join("; ")}`,
     );
   }
-  return parts.join("\n");
+  return parts;
 }
 
 function defaultExists(target: string): boolean {

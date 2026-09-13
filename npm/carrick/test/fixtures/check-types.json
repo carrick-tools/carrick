@@ -1,0 +1,74 @@
+{
+  "schema": "carrick.check/0",
+  "file": "src/routes/users.ts",
+  "repo": "/workspace/user-service",
+  "service": "user-service",
+  "index_commit": "6a1b2c3d4e5f60718293a4b5c6d7e8f900112233",
+  "indexed_at": "2026-09-13T09:00:00Z",
+  "scanner_version": "0.3.66",
+  "changed_since_index": 0,
+  "stale": false,
+  "deleted": false,
+  "items": [
+    {
+      "kind": "route",
+      "method": "GET",
+      "path": "/api/users",
+      "line": 42,
+      "col": 3,
+      "source": "fact",
+      "resolution_source": "file_based_route",
+      "evidence": null,
+      "counterparts": [
+        {
+          "role": "consumer",
+          "service": "notification-service",
+          "file": "server.ts",
+          "line": 25,
+          "repo": "/workspace/notification-service"
+        }
+      ],
+      "verdict": {
+        "state": "resolved",
+        "result": "type_mismatch",
+        "detail": "Type 'UsersResponse' is not assignable to type 'number'"
+      },
+      "direction": "response",
+      "actual_type": "UsersResponse { users: UserV2[] }",
+      "expected_type": "number"
+    },
+    {
+      "kind": "call",
+      "method": "POST",
+      "path": "/api/users",
+      "line": 71,
+      "col": 5,
+      "source": "fact",
+      "resolution_source": "imported_member",
+      "evidence": null,
+      "counterparts": [
+        {
+          "role": "producer",
+          "service": "identity-service",
+          "file": "src/routes/users.ts",
+          "line": 14,
+          "repo": "/workspace/identity-service"
+        }
+      ],
+      "verdict": {
+        "state": "resolved",
+        "result": "type_mismatch",
+        "detail": "Property 'email' is missing in type '{ name: string }'"
+      },
+      "direction": "request",
+      "actual_type": "{ name: string }",
+      "expected_type": "CreateUser { name: string; email: string }"
+    }
+  ],
+  "boundary": {
+    "commit_hash": "6a1b2c3d4e5f60718293a4b5c6d7e8f900112233",
+    "files_attempted": 0,
+    "unemitted_literal_candidates": 0
+  },
+  "boundary_note": "A local index holds what the deterministic passes state: 0 candidate(s) in this service need a model and were not classified here."
+}

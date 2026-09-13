@@ -736,6 +736,9 @@ fn build(
         };
         let counterparts = counterparts_for(operation, &join.matches, &producers);
         let verdict = verdict_for(operation, &join.matches, &join.findings);
+        // The two type texts come off the same finding the verdict does, so a
+        // row can never state a verdict from one pair and types from another.
+        let typed = finding_for(operation, &join.findings);
         let item = IndexedItem {
             kind: match operation.role {
                 Role::Producer => ItemKind::Route,
@@ -752,6 +755,9 @@ fn build(
             evidence: evidence_for(operation),
             counterparts,
             verdict,
+            expected_type: typed.and_then(|finding| finding.expected_type.clone()),
+            actual_type: typed.and_then(|finding| finding.actual_type.clone()),
+            direction: typed.and_then(|finding| finding.direction.clone()),
         };
         repos[position]
             .files
@@ -915,10 +921,7 @@ fn verdict_for(
     // been through the alias -> display-name pass, so it says `Widget` where
     // the raw pair outcome says `Endpoint_44785e_Response_At0c682a`. Same
     // verdict, readable by whoever reads it.
-    if let Some(finding) = findings
-        .iter()
-        .find(|finding| finding_names(finding, operation))
-    {
+    if let Some(finding) = finding_for(operation, findings) {
         return Some(StoredVerdict {
             // The finding states its own verdict state (carrick#727) in the
             // same three words this contract prints, so it is carried rather
@@ -990,6 +993,19 @@ fn verdict_for(
         }
     }
     verdict
+}
+
+/// The finding this row's verdict and type texts both come from, or none.
+///
+/// One selector, used by both: a row that took its verdict from one finding
+/// and its types from another would state a pair that was never compared.
+fn finding_for<'a>(
+    operation: &JoinedOperation,
+    findings: &'a [JoinedFinding],
+) -> Option<&'a JoinedFinding> {
+    findings
+        .iter()
+        .find(|finding| finding_names(finding, operation))
 }
 
 /// Whether a finding is about THIS row: the consumer site it names, or the

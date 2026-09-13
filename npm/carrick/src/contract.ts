@@ -82,6 +82,24 @@ export type CheckItem = {
   evidence?: string | null;
   counterparts?: Counterpart[];
   verdict?: Verdict | null;
+  /**
+   * Which half of the contract the two types below belong to. Present only
+   * alongside them, and absent from `touch` entirely.
+   */
+  direction?: "request" | "response" | string;
+  /**
+   * The printed type the READING side of `direction` declares: the producer's
+   * request type on a `request`, what the call site reads on a `response`.
+   * Capped by the CLI at 200 characters.
+   */
+  expected_type?: string;
+  /**
+   * The printed type the SENDING side of `direction` states: what the consumer
+   * sends on a `request`, the producer's response type on a `response`. The
+   * two are the source and the target of one assignability check, so which
+   * service holds which flips with the direction.
+   */
+  actual_type?: string;
 };
 
 export type CheckResult = {

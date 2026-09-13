@@ -597,3 +597,46 @@ test("a client that turned diagnostics off is not sent the refusal either", () =
   );
   assert.equal(off.size, 0);
 });
+
+// carrick#1033: the diagnostic carries the two types and the direction.
+
+test("a type mismatch states both shapes and the side that reads one", () => {
+  const typed = toDiagnostics(fixture("check-types.json"), ROOT, CHECKED, {
+    exists: (target) =>
+      target === path.resolve(ROOT, "notification-service/server.ts") ||
+      target === path.resolve(ROOT, "identity-service/src/routes/users.ts"),
+  });
+  const rows = typed.get(CHECKED_ABS) ?? [];
+  const response = rows.find((row) => row.message.startsWith("GET /api/users"));
+  assert.equal(
+    response?.message.split("\n")[0],
+    "GET /api/users: response is UsersResponse { users: UserV2[] }, consumer at notification-service server.ts:25 reads number",
+  );
+  // The word a reader keys off is still on the row, as the code.
+  assert.equal(response?.code, "type_mismatch");
+  assert.equal(response?.severity, SEVERITY.error);
+  // The compiler's reason follows, and the counterpart line is unchanged.
+  assert.match(response?.message ?? "", /\nType 'UsersResponse' is not assignable to type 'number'/);
+  assert.match(
+    response?.message ?? "",
+    /\nCounterparts: consumer in notification-service, server\.ts:25/,
+  );
+
+  const request = rows.find((row) => row.message.startsWith("POST /api/users"));
+  assert.equal(
+    request?.message.split("\n")[0],
+    "POST /api/users: request is { name: string }, producer at identity-service src/routes/users.ts:14 expects CreateUser { name: string; email: string }",
+  );
+
+  // The mirrored row on the consumer's own file says the same sentence.
+  const mirrored = typed.get(path.resolve(ROOT, "notification-service/server.ts"));
+  assert.match(
+    mirrored?.[0]?.message ?? "",
+    /response is UsersResponse \{ users: UserV2\[\] \}, consumer at notification-service server\.ts:25 reads number/,
+  );
+});
+
+test("a payload with no types keeps the sentence it had", () => {
+  const rows = diagnosticsFor("check-mismatch.json").get(CHECKED_ABS) ?? [];
+  assert.match(rows[0]?.message ?? "", /^GET \/api\/users\/:id type_mismatch: /);
+});

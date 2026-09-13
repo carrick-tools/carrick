@@ -118,6 +118,17 @@ pub struct IndexedItem {
     pub evidence: Option<String>,
     pub counterparts: Vec<Counterpart>,
     pub verdict: Option<StoredVerdict>,
+    /// The two type texts and the half of the contract they belong to
+    /// (carrick#1033), as [`super::contract::Item`] publishes them. Absent on
+    /// a row with no compared pair behind it, and absent on every index
+    /// written before they existed — which is why they are `default`ed rather
+    /// than required: an existing `.carrick/index.json` still reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
 }
 
 /// One service of one repo, as the index recorded it.

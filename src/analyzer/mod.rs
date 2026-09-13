@@ -3130,6 +3130,11 @@ impl Analyzer {
                 .with_producer_provenance(producer_provenance)
                 .with_edge_source(edge_source)
                 .with_verdict_state(Some(verdict_state_for(outcome)))
+                // Which half of the contract this outcome is about
+                // (carrick#1033). The pair outcome knows it outright, so the
+                // finding carries it rather than leaving a reader to infer a
+                // direction from an alias name.
+                .with_direction(Some(outcome.type_kind))
             })
             .collect()
     }

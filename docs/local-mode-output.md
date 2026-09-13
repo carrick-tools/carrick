@@ -95,9 +95,12 @@ local source or runs a model on this machine.
       ],
       "verdict": {
         "state": "resolved",
-        "result": "compatible",
-        "detail": "request and response types compared by the compiler"
-      }
+        "result": "type_mismatch",
+        "detail": "Type 'UsersResponse' is not assignable to type 'number'"
+      },
+      "direction": "response",
+      "actual_type": "UsersResponse { users: UserV2[] }",
+      "expected_type": "number"
     }
   ],
   "boundary": {
@@ -170,6 +173,44 @@ than silently overwritten.
 | `evidence` | string \| null | one line naming what the row was read off |
 | `counterparts` | array | the other side of the contract, across every repo in the workspace |
 | `verdict` | object \| null | `null` from `touch` always; `check` fills it in |
+| `direction` | `"request"` \| `"response"` | which half of the contract the two type texts below belong to. Absent from `touch`, from a row nothing was compared for, and from a row whose producer is gone from disk |
+| `expected_type` | string | the printed type the READING side of `direction` declares |
+| `actual_type` | string | the printed type the SENDING side of `direction` states |
+
+### The two types, and which side holds which
+
+A direction is one assignability check, and the two words name its two ends:
+`actual_type` is the SOURCE — what the sending side states — and
+`expected_type` is the TARGET, what the reading side declares. They are the
+same two ends the verdict's own `detail` names when the compiler says one type
+is "not assignable to" another. Which service holds which flips with the
+direction, which is why the direction is carried rather than inferred:
+
+| `direction` | `actual_type` (source) | `expected_type` (target) |
+|---|---|---|
+| `request` | what the consumer sends | the producer's declared request type |
+| `response` | the producer's response type | what the consumer's call site reads |
+
+Both are printed type text, capped at 200 characters with `...` where the cap
+cut it, and both are absent unless the index holds them: nothing was compared,
+the check stated no direction, or the pair's types never resolved. An absent
+field is "this run did not state it", never a type of `unknown`. A mismatch
+reached through a published client package states no direction, because the
+two strings it carries are the package and the service rather than types.
+
+A surface rendering a row that holds all three states them in one sentence
+(carrick#1033) — the LSP diagnostic and the post-edit hook line both print:
+
+```
+GET /api/users: response is UsersResponse { users: UserV2[] }, consumer at notification-service server.ts:25 reads number
+```
+
+The direction's payload "is" the actual type, and the side that reads it is
+named with its location. A `request` swaps the roles, so the consumer's sent
+type leads and the producer expects. Where the row is itself the reading side,
+the sending side is named instead and the row says "this call" or "this route".
+Where the index holds no types, the sentence is the verdict's result and detail
+as before.
 
 ### `items[].counterparts[]`
 

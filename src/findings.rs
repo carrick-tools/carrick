@@ -155,6 +155,25 @@ pub enum Finding {
         edge_source: Option<EdgeSource>,
         /// How far the type layer got on this pair (cloud#599).
         verdict_state: Option<VerdictState>,
+        /// Which half of the contract this mismatch is about (carrick#1033):
+        /// the request the consumer sends, or the response the producer
+        /// returns. Carried from the pair outcome's own `type_kind`, so
+        /// nothing downstream has to read it back out of an alias name.
+        ///
+        /// `None` on a finding raised without a direction behind it — the
+        /// SDK-mediated path, whose `producer_type`/`consumer_type` are side
+        /// LABELS and not types at all ([`crate::sdk_edges`]). A reader that
+        /// pairs the two type strings with a direction must therefore require
+        /// this field, never assume a default.
+        ///
+        /// Scan-local, like [`crate::cloud_storage::TypeManifestEntry`]'s
+        /// `v1_unresolved`: the hand-rolled [`Serialize`] below deliberately
+        /// does NOT write it, because the local join reads the in-process
+        /// struct and publishing a field on the PR-result payload the cloud
+        /// reads is a payload-contract question rather than a scanner-internal
+        /// one. Adding it there is a seam change, made on purpose or not at
+        /// all.
+        direction: Option<crate::cloud_storage::ManifestTypeKind>,
     },
     /// A consumer call matched a producer path but not its method. `method`
     /// is the consumer's attempt; `expected_method` is the producer's.
@@ -282,6 +301,10 @@ impl Finding {
             producer_provenance: EndpointProvenance::default(),
             edge_source: None,
             verdict_state: None,
+            // Stated by the caller that knows the pair outcome's `type_kind`,
+            // and by nobody else: a finding whose two type strings are side
+            // labels must not read as a request or a response.
+            direction: None,
         }
     }
 
@@ -367,6 +390,18 @@ impl Finding {
             Finding::TypeMismatch { verdict_state, .. }
             | Finding::MethodMismatch { verdict_state, .. } => *verdict_state = state,
             _ => {}
+        }
+        self
+    }
+
+    /// State which half of the contract a type mismatch is about
+    /// (carrick#1033), from the pair outcome's own `type_kind`. No-op for
+    /// every other kind, and for a mismatch raised with no direction behind
+    /// it the field stays `None`, which is what keeps a pair of side labels
+    /// from reading as a pair of types.
+    pub fn with_direction(mut self, kind: Option<crate::cloud_storage::ManifestTypeKind>) -> Self {
+        if let Finding::TypeMismatch { direction, .. } = &mut self {
+            *direction = kind;
         }
         self
     }
@@ -491,6 +526,10 @@ impl Serialize for Finding {
                 producer_provenance,
                 edge_source,
                 verdict_state,
+                // Scan-local (carrick#1033): the local join reads it off the
+                // in-process finding, and this payload's shape is the cloud's
+                // as well, so it is not written here.
+                direction: _,
             } => {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
