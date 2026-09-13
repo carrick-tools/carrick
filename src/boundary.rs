@@ -308,13 +308,17 @@ impl ServiceBoundary {
     /// What a scan left for a model to classify, as a table cell — empty when
     /// there is nothing waiting, or when this blob predates the count.
     ///
-    /// The free pass reads `0 route(s) 0 call(s)` both when a service holds no
-    /// API at all and when every candidate in it is waiting for the paid scan.
-    /// This is the number that tells those two apart (carrick#997 item 8), and
-    /// the summary tables print it beside the route and call counts.
+    /// A pass that ran no model reads `0 route(s) 0 call(s)` both when a
+    /// service holds no API at all and when every candidate in it is waiting
+    /// for the paid scan. This is the number that tells those two apart
+    /// (carrick#997 item 8), and the summary tables print it beside the route
+    /// and call counts. It names the command that resolves them, which since
+    /// carrick#1008 is `carrick index` itself rather than a flag on it.
     pub fn awaiting_model(&self) -> Option<String> {
         match self.candidates_awaiting_model {
-            Some(count) if count > 0 => Some(format!("{count} candidate(s) waiting for --infer")),
+            Some(count) if count > 0 => {
+                Some(format!("{count} candidate(s) waiting for `carrick index`"))
+            }
             _ => None,
         }
     }
@@ -601,7 +605,7 @@ mod tests {
         boundary.candidates_awaiting_model = Some(8);
         assert_eq!(
             boundary.awaiting_model().as_deref(),
-            Some("8 candidate(s) waiting for --infer")
+            Some("8 candidate(s) waiting for `carrick index`")
         );
     }
 }

@@ -516,12 +516,12 @@ pub fn enrichment_note(
             hosted.commit.chars().take(7).collect::<String>()
         ),
         // The writer named here is the one the ruled first run uses
-        // (carrick-cloud#799): the user's own `carrick index --infer`, not a CI
-        // run that may be days away or may never be wired up. A CI run on main
+        // (carrick-cloud#799): the user's own `carrick index`, not a CI run
+        // that may be days away or may never be wired up. A CI run on main
         // writes the same index, and says so when it does; what this sentence
         // owes the reader is the next move available to them (carrick#997).
         (HostedState::NoIndexYet, _) => format!(
-            "{}; {remote} is connected and has no hosted index yet. Run `carrick index --infer` once to classify them.",
+            "{}; {remote} is connected and has no hosted index yet. Run `carrick index` once to classify them.",
             super::NOT_CLASSIFIED_LOCALLY
         ),
         (HostedState::NotConnected, _) => format!(

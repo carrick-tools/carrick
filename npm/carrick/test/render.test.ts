@@ -261,13 +261,13 @@ test("a service line names its own count, and what is waiting for a paid scan", 
   assert.ok(service);
   assert.match(serviceLine(service), /changed since index: 7/);
   assert.equal(
-    serviceLine(service).includes("waiting for --infer"),
+    serviceLine(service).includes("waiting for `carrick index`"),
     false,
     "a service with nothing waiting says nothing",
   );
   assert.match(
     serviceLine({ ...service, boundary: { ...service.boundary, candidates_awaiting_model: 8 } }),
-    /8 candidate\(s\) waiting for --infer$/,
+    /8 candidate\(s\) waiting for `carrick index`$/,
   );
 });
 

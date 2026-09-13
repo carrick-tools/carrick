@@ -40,8 +40,8 @@ pub struct IndexOutcome {
     pub index: LocalIndex,
     pub scanned: Vec<String>,
     pub elapsed_secs: f64,
-    /// What this run paid Carrick Cloud, one entry per repo that was scanned
-    /// with `--infer`. Empty on the free pass, which pays for nothing.
+    /// What this run paid Carrick Cloud, one entry per repo `carrick index`
+    /// scanned. Empty after `refresh`, the pass that pays for nothing.
     pub spend: crate::scan_spend::RunSpend,
 }
 

@@ -17,21 +17,22 @@ pub enum LocalCommand {
     /// Read the shared workspace/service proposal without scanning or writing.
     Derive { workspace: Option<PathBuf> },
     /// Scan every repo the workspace lists, and build the index.
+    ///
+    /// This is the inferred scan: Carrick Cloud classifies what the
+    /// deterministic passes could not, and the result is uploaded. There is no
+    /// facts-only form of it — the only product is the inferred index, and a
+    /// pass that states less has no user (carrick#1008). It is refused
+    /// outright until every repo in the workspace has a `carrick.json`,
+    /// because the one paid scan runs against a config someone has read (see
+    /// [`inference_refusal`]). `refresh` still runs no model, but it is the
+    /// session-start hook's command and no first-run copy names it
+    /// (cloud#832).
     Index {
         workspace: Option<PathBuf>,
-        /// Ask Carrick Cloud to classify what the deterministic passes could
-        /// not, and upload the result.
-        ///
-        /// Off by default and deliberately so: a local index costs nothing and
-        /// runs from a hook, and inference is paid analysis. It is refused
-        /// outright until every repo in the workspace has a `carrick.json`,
-        /// because the one paid scan runs against a config someone has read
-        /// (see [`inference_refusal`]).
-        infer: bool,
         /// Run the build in the background, and answer at once with its id.
         ///
-        /// The ruled first run has an agent run `carrick index --infer`, and a
-        /// first paid scan of a mid-sized monorepo takes about fifteen
+        /// The ruled first run has an agent run `carrick index`, and a first
+        /// paid scan of a mid-sized monorepo takes about fifteen
         /// minutes — longer than the two-minute default and the ten-minute cap
         /// of the shell an agent runs it through (carrick#992). Detached, the
         /// scan outlives that shell, its output lands in
@@ -92,7 +93,6 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     let mut workspace: Option<PathBuf> = None;
     let mut service: Option<String> = None;
     let mut json = false;
-    let mut infer = false;
     let mut detach = false;
     let mut positional: Vec<String> = Vec::new();
 
@@ -114,7 +114,17 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
                 service = Some(value.clone());
             }
             "--json" => json = true,
-            "--infer" => infer = true,
+            // Removed in carrick#1008, and refused by name for one release
+            // (carrick#1011): `carrick index` IS the inferred scan now.
+            // Accepting the flag and ignoring it would hand a scaffold that
+            // still types it a run it cannot tell apart from the old one.
+            "--infer" => {
+                return Err(
+                    "`--infer` is gone: `carrick index` is the inferred scan itself. Run \
+                     `carrick index`, with `--detach` when the shell may time out first."
+                        .to_string(),
+                );
+            }
             "--detach" => detach = true,
             "--help" | "-h" => {
                 print_help();
@@ -128,14 +138,8 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
         index += 1;
     }
 
-    // Only `index` infers. Accepting the flag elsewhere and ignoring it would
-    // let someone ask a hook-driven command to do the paid thing and believe
-    // it had.
-    if infer && name != "index" {
-        return Err(format!("unknown option for `carrick {name}`: --infer"));
-    }
-    // Same rule, same reason: a hook-driven command that accepted `--detach`
-    // and ran in the foreground anyway would be a promise nobody kept.
+    // A hook-driven command that accepted `--detach` and ran in the foreground
+    // anyway would be a promise nobody kept.
     if detach && name != "index" {
         return Err(format!("unknown option for `carrick {name}`: --detach"));
     }
@@ -155,11 +159,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             {
                 workspace = Some(PathBuf::from(first));
             }
-            Ok(LocalCommand::Index {
-                workspace,
-                infer,
-                detach,
-            })
+            Ok(LocalCommand::Index { workspace, detach })
         }
         "refresh" => Ok(LocalCommand::Refresh { service, workspace }),
         "status" => {
@@ -210,18 +210,18 @@ pub fn run(command: LocalCommand) -> i32 {
         },
         LocalCommand::Index {
             workspace,
-            infer,
             detach: true,
-        } => match start_detached(workspace.as_deref(), infer) {
+        } => match start_detached(workspace.as_deref()) {
             Ok(()) => 0,
             Err(message) => {
                 eprintln!("carrick index: {message}");
                 1
             }
         },
-        LocalCommand::Index {
-            workspace, infer, ..
-        } => match build(workspace.as_deref(), None, infer) {
+        // Always inferred: the index a developer reads is the one the model
+        // classified, and a facts-only form of this command had no user
+        // (carrick#1008). `refresh` is the pass that runs no model.
+        LocalCommand::Index { workspace, .. } => match build(workspace.as_deref(), None, true) {
             Ok(()) => 0,
             Err(message) => {
                 eprintln!("carrick index: {message}");
@@ -276,7 +276,7 @@ fn derive(root: Option<&Path>) -> Result<serde_json::Value, String> {
 /// `status`: the workspace, with no file in the question.
 ///
 /// A scan may be running while this is asked — that is the ordinary case a
-/// minute after `carrick index --infer --detach`, and the only surface that
+/// minute after `carrick index --detach`, and the only surface that
 /// can say so (carrick#992). It is reported first, and before the index is
 /// read at all: the first detached scan of a workspace is answering the very
 /// question "is anything happening", and at that moment there is no index.
@@ -347,7 +347,8 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
 /// `infer` makes each repo's scan a laptop scan: the model classifies what the
 /// deterministic passes could not, the result is uploaded, and the same
 /// payload is written to this build's cache directory so the read model comes
-/// from the run that produced it (carrick#956 §8.3).
+/// from the run that produced it (carrick#956 §8.3). `index` always infers;
+/// `refresh` never does, which is the whole difference between them.
 fn build(root: Option<&Path>, service: Option<&str>, infer: bool) -> Result<(), String> {
     let workspace = Workspace::load(&resolve_root(root)?)?;
     // Before anything is printed about a scan that is not going to happen.
@@ -441,9 +442,9 @@ fn build_workspace(
 /// The child is put in a session of its own, so that killing the shell that
 /// started it — which is what an agent's tool timeout does — does not take the
 /// scan with it. That is the whole point of the flag (carrick#992).
-fn start_detached(root: Option<&Path>, infer: bool) -> Result<(), String> {
+fn start_detached(root: Option<&Path>) -> Result<(), String> {
     let workspace = Workspace::load(&resolve_root(root)?)?;
-    if infer && let Some(refusal) = inference_refusal(&workspace.repos) {
+    if let Some(refusal) = inference_refusal(&workspace.repos) {
         return Err(refusal);
     }
     let index_dir = workspace.index_dir();
@@ -480,9 +481,6 @@ fn start_detached(root: Option<&Path>, infer: bool) -> Result<(), String> {
                 .map_err(|e| format!("could not write to {}: {e}", log.display()))?,
         )
         .stderr(handle);
-    if infer {
-        command.arg("--infer");
-    }
     detach_process(&mut command);
 
     let child = command
@@ -533,9 +531,9 @@ fn detach_process(command: &mut std::process::Command) {
     command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
 }
 
-/// Why this workspace may not be scanned with inference yet, if it may not.
+/// Why this workspace may not be indexed yet, if it may not.
 ///
-/// The inferred scan is the paid one and it is meant to run once, so it runs
+/// `carrick index` is the paid scan and it is meant to run once, so it runs
 /// against a configuration a person has read rather than one a structural pass
 /// guessed (ruling in carrick-cloud#799). `carrick init` no longer writes
 /// `carrick.json`: it derives the proposal into `.carrick/proposal.json` and
@@ -543,8 +541,11 @@ fn detach_process(command: &mut std::process::Command) {
 /// not been through that step would be scanned with its service boundaries
 /// unstated, its env vars undeclared, and no second free attempt.
 ///
-/// The free `carrick index` is unaffected: it states what it can and marks the
-/// rest unclassified, which is exactly the pass that proves a new config.
+/// The refusal names the two things that stand between this machine and the
+/// scan — the config, and the credential — and nothing else. It used to point
+/// at a facts-only pass as a rehearsal; there is no such step in the flow
+/// (carrick#1008, cloud#832), so offering one here would invent a first run
+/// that the scaffold prompt does not describe.
 fn inference_refusal(repos: &[PathBuf]) -> Option<String> {
     let missing: Vec<&PathBuf> = repos
         .iter()
@@ -561,11 +562,11 @@ fn inference_refusal(repos: &[PathBuf]) -> Option<String> {
         .join(", ");
     let rest = missing.len().saturating_sub(5);
     Some(format!(
-        "no carrick.json in {named}{}, and an inferred scan is the paid one, so it runs \
+        "no carrick.json in {named}{}, and `carrick index` is the paid scan, so it runs \
          after the config exists. `carrick init` wrote the derived services to \
          .carrick/proposal.json and printed the prompt that has an agent turn it into \
-         carrick.json; then `carrick index` states what it can for nothing, and this \
-         command is the scan that classifies the rest.",
+         carrick.json; read it back against the repo, run `carrick login` if this machine \
+         is not signed in, and run this command once.",
         if rest > 0 {
             format!(" and {rest} more")
         } else {
@@ -689,26 +690,26 @@ fn print_help() {
 
 USAGE:
     carrick derive  [--workspace <dir>] --json
-    carrick index   [--workspace <dir>] [--infer] [--detach]
+    carrick index   [--workspace <dir>] [--detach]
     carrick status  [--workspace <dir>] [--json]
     carrick touch   <file> [--workspace <dir>] [--json]
     carrick check   <file> [--workspace <dir>] [--json]
     carrick refresh [--service <name>] [--workspace <dir>]
 
     derive     Print the workspace and service proposal without writing files.
-    --infer on `index` asks Carrick Cloud to classify what the deterministic
-    passes could not and uploads the result. It is the paid scan, so it needs
-    a carrick.json in every repo and refuses without one. Off everywhere else,
-    including `refresh`, which runs from a hook.
     --detach on `index` starts the build in the background and answers at once
     with a scan id. Its output goes to <workspace>/.carrick/scan-<id>.log and
     `carrick status` names the service it is on, how far through it is and how
     long it has been running. Use it when the shell running the command has a
-    timeout shorter than the scan: a first inferred scan of a mid-sized
-    monorepo takes about fifteen minutes.
+    timeout shorter than the scan: a first scan of a mid-sized monorepo takes
+    about fifteen minutes.
 
     index      Detect repositories, apply optional workspace overrides and
-               write <dir>/.carrick/. No model runs on this machine.
+               write <dir>/.carrick/. Carrick Cloud classifies what the
+               deterministic passes could not and the result is uploaded, so
+               it is the paid scan: it needs a carrick.json in every repo,
+               which it refuses without, and a machine `carrick login` has
+               signed in.
     status     What the workspace holds: every service, the commit it was
                indexed at, how far its repo has moved since, and its boundary.
     touch      The routes and calls in one file, and their counterparts in
@@ -748,9 +749,10 @@ mod tests {
 
     /// The paid scan runs once, so it runs against a config someone has read.
     /// A repo that has not been through the scaffold step is named, and the
-    /// refusal says what to do instead of it (carrick-cloud#799).
+    /// refusal says what to do instead of it (carrick-cloud#799). Since
+    /// carrick#1008 this is `carrick index`'s own refusal, not a flag's.
     #[test]
-    fn inference_is_refused_until_every_repo_has_a_config() {
+    fn the_index_is_refused_until_every_repo_has_a_config() {
         let workspace = tempfile::tempdir().unwrap();
         let configured = workspace.path().join("api");
         let bare = workspace.path().join("web");
@@ -770,6 +772,10 @@ mod tests {
         );
         assert!(refusal.contains(".carrick/proposal.json"), "{refusal}");
         assert!(refusal.contains("carrick index"), "{refusal}");
+        // The two things that stand between this machine and the scan, and
+        // nothing else: there is no rehearsal pass in the flow (cloud#832).
+        assert!(refusal.contains("carrick login"), "{refusal}");
+        assert!(!refusal.contains("carrick refresh"), "{refusal}");
     }
 
     /// A long list of unconfigured repos is a folder someone pointed at, not a
@@ -831,30 +837,33 @@ mod tests {
             parsed,
             LocalCommand::Index {
                 workspace: Some(PathBuf::from("/w")),
-                infer: false,
                 detach: false,
             }
         );
     }
 
-    /// Inference is paid analysis, so it is asked for and never assumed. The
-    /// command that runs from a session-start hook does not take the flag at
-    /// all, which is why it is on `Index` and not on `Refresh`.
+    /// `--infer` is gone, and it is refused by name rather than ignored: a
+    /// scaffold or a transcript that still types it asked for something this
+    /// binary no longer distinguishes, and silence would read as agreement
+    /// (carrick#1008). Delete this with the flag's last release (carrick#1011).
     #[test]
-    fn inference_is_opt_in_on_index_and_unavailable_to_refresh() {
-        let parsed = parse(&args(&["index", "/w", "--infer"])).unwrap().unwrap();
-        assert_eq!(
-            parsed,
-            LocalCommand::Index {
-                workspace: Some(PathBuf::from("/w")),
-                infer: true,
-                detach: false,
-            }
-        );
-        assert_eq!(
-            parse(&args(&["refresh", "--infer"])).unwrap(),
-            Err("unknown option for `carrick refresh`: --infer".to_string())
-        );
+    fn the_removed_infer_flag_is_refused_by_name() {
+        for command in ["index", "refresh"] {
+            let error = parse(&args(&[command, "--infer"])).unwrap().unwrap_err();
+            assert!(
+                error.contains("`--infer` is gone"),
+                "the flag is named as removed, not as unknown: {error}"
+            );
+            assert!(
+                error.contains("carrick index"),
+                "and the command that replaces it is named: {error}"
+            );
+            assert!(
+                !error.contains("carrick refresh"),
+                "and no first-run copy sends anyone to the pass that runs no \
+                 model (cloud#832): {error}"
+            );
+        }
     }
 
     /// The flag the ruled first run needs, on the one command that can take
@@ -864,22 +873,16 @@ mod tests {
     #[test]
     fn a_scan_can_be_detached_from_the_shell_that_starts_it() {
         assert_eq!(
-            parse(&args(&["index", "/w", "--infer", "--detach"]))
-                .unwrap()
-                .unwrap(),
+            parse(&args(&["index", "/w", "--detach"])).unwrap().unwrap(),
             LocalCommand::Index {
                 workspace: Some(PathBuf::from("/w")),
-                infer: true,
                 detach: true,
             }
         );
-        // The free pass may be detached too: nothing about the flag is about
-        // money, it is about how long the command takes.
         assert_eq!(
             parse(&args(&["index", "--detach"])).unwrap().unwrap(),
             LocalCommand::Index {
                 workspace: None,
-                infer: false,
                 detach: true,
             }
         );

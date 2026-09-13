@@ -34,7 +34,8 @@ In the folder that holds your repositories:
 # Finds the repos, writes the service proposal, wires up the hooks. Runs no scan.
 carrick init
 
-# Builds the index, and rebuilds it as the code changes. No model runs here.
+# Builds the index: Carrick classifies what the deterministic passes could not.
+# This is the scan, and it runs once. Your agent writes carrick.json first.
 carrick index
 ```
 

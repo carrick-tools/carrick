@@ -27,7 +27,10 @@ WORKSPACE:
                first run starts with. Installed by the npm package.
     derive     Print the repos and services a folder resolves to, writing nothing.
     index      Scan every repo in the workspace and build <workspace>/.carrick/.
+               Carrick Cloud classifies what the deterministic passes could
+               not, so this is the paid scan, and the one a first run makes.
     refresh    Re-scan one service, or every repo, and re-join the index.
+               What the session-start hook runs; it asks no model.
     status     Every service the workspace holds, the commit each was indexed at,
                how far its repo has moved since, and its boundary.
     check      The routes and calls in one file, their counterparts in every
