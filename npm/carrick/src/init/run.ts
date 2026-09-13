@@ -25,7 +25,7 @@ import { connectRepos, reposAreInProject, projectAssignments } from "./connect.t
 import { downloadHostedIndex, hostedReport, nativeRunner } from "./hosted.ts";
 import { ensureProject, projectStep, SLUG } from "./projects.ts";
 import { connectMcpClients, MCP_LINE, type McpOutcome } from "./mcp.ts";
-import { hookCommand, mergeCarrickHooks } from "./settings.ts";
+import { hookCommand, mergeCarrickHooks, removeCarrickHooks } from "./settings.ts";
 import { createOutput, DOCS, type InitOutput } from "./output.ts";
 import { renderTemplate } from "../templates.ts";
 
@@ -433,7 +433,9 @@ export async function init(argv: string[]): Promise<number> {
     const settings = fs.existsSync(settingsFile) ? fs.readFileSync(settingsFile, "utf8") : null;
     const otherFile = path.join(workspace, ".claude", command.bare ? "settings.local.json" : "settings.json");
     const other = fs.existsSync(otherFile) ? fs.readFileSync(otherFile, "utf8") : null;
-    const cleaned = other === null ? null : mergeCarrickHooks(other, null);
+    // The same removal `carrick remove` runs, so a file holding no entry of
+    // ours is left byte for byte rather than reformatted on the way past.
+    const cleaned = other === null ? null : removeCarrickHooks(other);
     const hooks = mergeCarrickHooks(settings, command.command);
     // Validate both documents before migrating our entries between them.
     if (cleaned?.changed) writeIfChanged(otherFile, cleaned.body);

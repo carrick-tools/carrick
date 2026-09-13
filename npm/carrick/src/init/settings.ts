@@ -161,16 +161,37 @@ export function mergeCarrickHooks(existing: string | null, command: string | nul
   return { body, changed: body !== existing };
 }
 
+/** Whether a settings document holds an entry of ours at all. */
+function holdsCarrickHooks(base: unknown): boolean {
+  if (typeof base !== "object" || base === null) return false;
+  const hooks = (base as Record<string, unknown>)["hooks"];
+  if (typeof hooks !== "object" || hooks === null) return false;
+  for (const groups of Object.values(hooks as Record<string, unknown>)) {
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      const entries = (group as HookGroup | null)?.hooks;
+      if (Array.isArray(entries) && entries.some(isOurs)) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * The inverse of `mergeCarrickHooks`: our entries out, everything else kept.
  *
  * `carrick remove` runs this over both settings files a workspace can hold
- * (carrick#1034). It is the merge with nothing to add, named for what it does
- * so the pair is one thing to read and one thing to test: whatever `isOurs`
+ * (carrick#1034). It is the merge with nothing to add: whatever `isOurs`
  * recognises is what init wrote, and nothing else in the file moves. The file
  * itself stays — a settings file holds a user's own hooks and permissions, and
  * init was never the reason it exists.
+ *
+ * A file holding no entry of ours is returned byte for byte, and reported as
+ * unchanged. The merge would otherwise reformat it and add an empty `hooks`
+ * key, which is a rewrite of somebody else's file and a `◇ removed` line about
+ * nothing — and that file is often committed.
  */
 export function removeCarrickHooks(existing: string): MergeResult {
+  const base: unknown = existing.trim() === "" ? {} : JSON.parse(existing);
+  if (!holdsCarrickHooks(base)) return { body: existing, changed: false };
   return mergeCarrickHooks(existing, null);
 }

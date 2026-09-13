@@ -68,6 +68,26 @@ test("the hooks the writer merged in are exactly the hooks the remover takes out
   assert.equal(cleaned.changed, false);
 });
 
+test("a settings file holding no entry of ours is not touched, and not claimed", () => {
+  // Neither of these is in the format the merge writes, and one has no hooks
+  // key at all: reformatting somebody else's committed file — and printing a
+  // line saying something was removed from it — is the failure this guards.
+  const documents = [
+    '{\n    "permissions": { "allow": ["Bash(ls:*)"] }\n}',
+    '{\n    "hooks": {\n        "PostToolUse": [\n            { "hooks": [{ "type": "command", "command": "eslint --fix" }] }\n        ]\n    }\n}',
+    '{\n  "hooks": {\n    "PreToolUse": [\n      { "matcher": "Grep", "hooks": [{ "type": "command", "command": "carrickctl hook post-edit" }] }\n    ]\n  }\n}\n',
+    "{}",
+  ];
+  for (const document of documents) {
+    const outcome = removeCarrickHooks(document);
+    assert.equal(outcome.changed, false, document);
+    assert.equal(outcome.body, document, document);
+  }
+
+  // A file that is not JSON is still reported rather than replaced.
+  assert.throws(() => removeCarrickHooks("{ this is not json"));
+});
+
 test("the repo files are listed where they are, and the merged sections are named", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-remove-scan-"));
   try {
@@ -192,6 +212,13 @@ process.exit(0);
   fs.writeFileSync(path.join(workspace, ".claude", "skills", "carrick", "SKILL.md"), "# Carrick\n");
   fs.writeFileSync(path.join(workspace, "carrick.json"), "{}\n");
   fs.writeFileSync(path.join(workspace, "AGENTS.md"), "# Repo\n\n## Carrick\n\nAsk Carrick first.\n");
+  // The second settings file this workspace holds has hooks of somebody
+  // else's and none of ours, in a format the merge does not write: the run
+  // must leave it exactly as it is and say nothing about it.
+  fs.writeFileSync(
+    path.join(workspace, SETTINGS_FILES[1]!),
+    '{\n    "hooks": {\n        "PostToolUse": [\n            { "hooks": [{ "type": "command", "command": "eslint --fix" }] }\n        ]\n    }\n}',
+  );
   fs.writeFileSync(
     path.join(workspace, SETTINGS_FILES[0]!),
     mergeCarrickHooks(
@@ -245,6 +272,15 @@ test("remove takes back what init wrote, lists what it will not touch, and says 
   ]) {
     assert.ok(first.stdout.includes(line), `missing from the output: ${line}\n${first.stdout}`);
   }
+
+  // The file with none of our entries is byte for byte what it was, and no
+  // line claims anything was removed from it.
+  const untouched = path.join(state.workspace, SETTINGS_FILES[1]!);
+  assert.equal(
+    fs.readFileSync(untouched, "utf8"),
+    '{\n    "hooks": {\n        "PostToolUse": [\n            { "hooks": [{ "type": "command", "command": "eslint --fix" }] }\n        ]\n    }\n}',
+  );
+  assert.equal(first.stdout.includes(SETTINGS_FILES[1]!), false, first.stdout);
 
   // The hook pack and the permissions survive; only our entries are gone.
   const settings = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
