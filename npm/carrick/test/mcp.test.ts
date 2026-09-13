@@ -11,6 +11,7 @@ import path from "node:path";
 import {
   connectMcpClients,
   disconnectMcpClients,
+  inspectMcpClients,
   mergeServerEntry,
   removeServerEntry,
   MCP_LINE,
@@ -355,4 +356,45 @@ test("a hand-edited file that no longer parses is reported by the remover too", 
   assert.equal(removal?.state, "failed");
   assert.match(removal!.detail, /not valid JSON/);
   assert.deepEqual(written, {});
+});
+
+test("the read-only inspection states each client, and writes nothing", () => {
+  // Read-only is the whole point: `carrick doctor` runs this on a machine
+  // whose owner already suspects something, and a check that repaired what it
+  // found would be a check nobody could trust the output of (carrick#1035).
+  const { env, written, ran } = machine({
+    commands: ["claude"],
+    directories: [path.join(HOME, ".claude"), path.join(HOME, ".cursor"), path.join(HOME, ".codeium", "windsurf")],
+    files: {
+      [cursorFile]: JSON.stringify({ mcpServers: { carrick: { url: MCP_URL } } }),
+      [windsurfFile]: JSON.stringify({ mcpServers: { carrick: { serverUrl: "http://localhost:9000/mcp" } } }),
+    },
+    outputs: { "claude mcp get carrick": `carrick: ${MCP_URL} (HTTP)` },
+  });
+  assert.deepEqual(
+    inspectMcpClients(env).map((client) => [client.client, client.state]),
+    [
+      ["Claude Code", "connected"],
+      ["Cursor", "connected"],
+      ["Windsurf", "elsewhere"],
+    ],
+  );
+  assert.deepEqual(written, {});
+  assert.deepEqual(ran, ["claude mcp get carrick"]);
+});
+
+test("a client with no entry, one whose file will not parse, and one this machine does not have", () => {
+  const { env } = machine({
+    commands: ["claude"],
+    directories: [path.join(HOME, ".claude"), path.join(HOME, ".cursor")],
+    files: { [cursorFile]: "{ not json" },
+    statuses: { "claude mcp get carrick": 1 },
+  });
+  assert.deepEqual(
+    inspectMcpClients(env).map((client) => [client.client, client.state]),
+    [
+      ["Claude Code", "absent"],
+      ["Cursor", "unreadable"],
+    ],
+  );
 });

@@ -403,6 +403,91 @@ function disconnectFileClient(env: McpEnvironment, client: FileClient): McpRemov
   }
 }
 
+/** What one client's configuration says about our server (carrick#1035). */
+export type McpInspection = {
+  client: string;
+  /**
+   * `connected` — an entry naming this server's host. `elsewhere` — an entry
+   * called `carrick` pointing somewhere else, which is somebody else's and the
+   * reason a reader gets no Carrick answers in that client. `absent` — this
+   * client is on the machine and has no entry. `unreadable` — its file is not
+   * JSON, or its own command would not answer.
+   */
+  state: "connected" | "absent" | "elsewhere" | "unreadable";
+  detail: string;
+};
+
+/**
+ * What each client on this machine holds, changing nothing.
+ *
+ * The third half of the pair in this file: `connectMcpClients` writes,
+ * `disconnectMcpClients` removes, and this one only reads. Same detection (the
+ * client's own data directory), same containers, same URL gate — an entry is
+ * ours when it names `MCP_HOST`, which is what makes "connected" mean
+ * connected to Carrick rather than to a server that borrowed the name.
+ */
+export function inspectMcpClients(env: McpEnvironment = realEnvironment()): McpInspection[] {
+  const found: McpInspection[] = [];
+  if (env.onPath("claude") && env.exists(path.join(env.home, ".claude"))) {
+    const read = env.capture("claude", ["mcp", "get", MCP_NAME]);
+    if (read.status === null) {
+      found.push({ client: "Claude Code", state: "unreadable", detail: "`claude mcp get carrick` did not answer" });
+    } else if (read.status !== 0) {
+      found.push({ client: "Claude Code", state: "absent", detail: `no "${MCP_NAME}" server for this user` });
+    } else if (!read.stdout.includes(MCP_HOST)) {
+      found.push({
+        client: "Claude Code",
+        state: "elsewhere",
+        detail: `"${MCP_NAME}" there does not point at ${MCP_HOST}`,
+      });
+    } else {
+      found.push({ client: "Claude Code", state: "connected", detail: MCP_URL });
+    }
+  }
+  for (const client of FILE_CLIENTS) {
+    const directory = client.directory(env);
+    const file = client.file(env);
+    if (directory === null || file === null) continue;
+    if (!env.exists(directory) && !env.exists(file)) continue;
+    const existing = env.readFile(file);
+    if (existing === null) {
+      found.push({ client: client.name, state: "absent", detail: `no MCP configuration at ${file}` });
+      continue;
+    }
+    let document: unknown;
+    try {
+      document = existing.trim() === "" ? {} : JSON.parse(existing);
+    } catch {
+      found.push({ client: client.name, state: "unreadable", detail: `${file} is not valid JSON` });
+      continue;
+    }
+    if (!isRecord(document)) {
+      found.push({ client: client.name, state: "unreadable", detail: `${file} is not a JSON object` });
+      continue;
+    }
+    const container = (["mcpServers", "servers"] as const).find((key) => {
+      const servers = document[key];
+      return isRecord(servers) && MCP_NAME in servers;
+    });
+    if (container === undefined) {
+      found.push({ client: client.name, state: "absent", detail: `no "${MCP_NAME}" server in ${file}` });
+      continue;
+    }
+    const entry = (document[container] as Record<string, unknown>)[MCP_NAME];
+    const url = isRecord(entry) ? entryUrl(entry) : null;
+    if (!isCarrickUrl(url)) {
+      found.push({
+        client: client.name,
+        state: "elsewhere",
+        detail: `"${MCP_NAME}" in ${file} points at ${url ?? "no URL"}`,
+      });
+      continue;
+    }
+    found.push({ client: client.name, state: "connected", detail: url ?? MCP_URL });
+  }
+  return found;
+}
+
 /** Take our server out of every client this machine has. */
 export function disconnectMcpClients(env: McpEnvironment = realEnvironment()): McpRemoval[] {
   const removals: McpRemoval[] = [];
