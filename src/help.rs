@@ -35,6 +35,8 @@ WORKSPACE:
                how far its repo has moved since, and its boundary.
     check      The routes and calls in one file, their counterparts in every
                other repo, and the contract verdicts the index already holds.
+               With --recheck it re-extracts the file and re-judges it against
+               the index first, inside a ten-second budget.
     touch      The same without the verdicts, cheap enough for an editor to run
                it on every edit.
 

@@ -110,6 +110,33 @@ test("a stale file says the verdicts describe the indexed version", () => {
   assert.match(context, /3 file\(s\) in the workspace have changed since 6a1b2c3/);
 });
 
+test("a re-checked file says its verdicts came from the working tree", () => {
+  const stale = fixture("check-mismatch.json");
+  const rechecked = {
+    ...stale,
+    recheck: { ran: "extraction+types" as const, elapsed_ms: 2543 },
+  };
+  const context = renderPostToolUse(rechecked) ?? "";
+  assert.match(context, /re-computed from your working tree in 2543 ms/);
+  assert.doesNotMatch(context, /describe the indexed version/);
+});
+
+test("a re-check that missed its budget says how old the answer is", () => {
+  const stale = fixture("check-mismatch.json");
+  const degraded = {
+    ...stale,
+    recheck: {
+      ran: "none" as const,
+      elapsed_ms: 10004,
+      stale_since: "2026-09-13T22:26:26Z",
+      reason: "the re-scan ran past the budget",
+    },
+  };
+  const context = renderPostToolUse(degraded) ?? "";
+  assert.match(context, /describe the indexed version/);
+  assert.match(context, /did not finish inside its budget.*2026-09-13T22:26:26Z/);
+});
+
 test("a file with no indexed rows still carries the boundary", () => {
   // The local index holds no bare receiver and no fetch call, so an empty
   // answer without the boundary would read as "nothing crosses a service here".

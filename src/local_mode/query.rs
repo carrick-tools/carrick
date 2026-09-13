@@ -1,18 +1,23 @@
 //! `carrick touch` and `carrick check`: answer about one file, from the index.
 //!
-//! Everything here is a read. The index holds the rows, their counterparts and
-//! the verdicts the type check reached at index time; this module finds the
-//! file in it, says how far the tree has moved since, and shapes the answer
-//! into the contract. Nothing re-extracts, nothing calls out, and the only
-//! process started is `git`.
+//! The index holds the rows, their counterparts and the verdicts the type
+//! check reached at index time; this module finds the file in it, says how far
+//! the tree has moved since, and shapes the answer into the contract. Nothing
+//! here calls out, and the only process it starts is `git`.
+//!
+//! One exception, and it is asked for by name: `check --recheck` on a file the
+//! tree has moved past hands off to [`super::recheck`], which re-extracts that
+//! file's repo and re-judges it before this module shapes the answer
+//! (carrick#1036). The rows in one answer are all fresh or all indexed, and the
+//! `recheck` block is what says which.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::contract::{
-    CheckOutput, Counterpart, Item, MAX_STALE_FILES, ReadError, ReadFailure, SCHEMA, STATUS_SCHEMA,
-    StatusOutput, StatusRepo, StatusService, Verdict,
+    CheckOutput, Counterpart, Item, MAX_STALE_FILES, ReadError, ReadFailure, Recheck, SCHEMA,
+    STATUS_SCHEMA, StatusOutput, StatusRepo, StatusService, Verdict,
 };
 use super::read_model::{IndexedItem, IndexedRepo, LocalIndex};
 
@@ -25,8 +30,26 @@ pub enum Mode {
     Check,
 }
 
+/// Whether this call may re-judge a file the tree has moved past, at the cost
+/// of a scan of its repo (carrick#1036).
+///
+/// Off by default and asked for per call rather than inferred from staleness,
+/// because the language server runs `check` on every save and a file being
+/// edited is always newer than the index: the surface that wants the cost is
+/// the post-edit hook, which fires once per completed edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    Indexed,
+    Recheck,
+}
+
 /// Answer about one file.
-pub fn answer(workspace_root: &Path, file: &Path, mode: Mode) -> Result<CheckOutput, ReadFailure> {
+pub fn answer(
+    workspace_root: &Path,
+    file: &Path,
+    mode: Mode,
+    freshness: Freshness,
+) -> Result<CheckOutput, ReadFailure> {
     let index = read_index(workspace_root)?;
 
     let (repo, relative) = index
@@ -74,6 +97,30 @@ pub fn answer(workspace_root: &Path, file: &Path, mode: Mode) -> Result<CheckOut
     let stale = changed.contains(&relative);
     let deleted = !repo_root.join(&relative).exists();
 
+    // The one place the answer can stop being the index's. Only `check` asks
+    // (a `touch` states no verdict, so a fresh one would cost a scan for
+    // nothing), only for a file the tree has moved past, and never for a file
+    // that is gone — a deleted producer is already answered from the index,
+    // and there is nothing left to extract from it.
+    let recheck = match (freshness, mode, stale && !deleted) {
+        (Freshness::Recheck, Mode::Check, true) => Some(rechecked(
+            workspace_root,
+            &repo_root,
+            &relative,
+            &indexed_at,
+        )),
+        _ => None,
+    };
+    let items = match &recheck {
+        Some((Some(fresh), _)) => fresh.clone(),
+        _ => items,
+    };
+    // Rows this run computed are not "unresolved since your edit": they ARE
+    // the edit. The file is still reported as changed at the top level, which
+    // is a fact about the tree either way.
+    let rows_are_indexed = stale && !matches!(&recheck, Some((Some(_), _)));
+    let recheck = recheck.map(|(_, block)| block);
+
     let boundary = service_row.and_then(|service| service.boundary.clone());
     let enrichment = service_row
         .map(|s| s.enrichment.clone())
@@ -111,8 +158,18 @@ pub fn answer(workspace_root: &Path, file: &Path, mode: Mode) -> Result<CheckOut
         deleted,
         items: items
             .iter()
-            .map(|item| project(item, mode, stale, deleted, repo, &repo_of_service))
+            .map(|item| {
+                project(
+                    item,
+                    mode,
+                    rows_are_indexed,
+                    deleted,
+                    repo,
+                    &repo_of_service,
+                )
+            })
             .collect(),
+        recheck,
         boundary,
         boundary_note,
         boundary_lines,
@@ -241,6 +298,55 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadFailure> {
 }
 
 /// One indexed row, in the contract's shape.
+/// Re-judge one file from the working tree, and say what happened either way.
+///
+/// The rows come back only when the whole re-check finished: a run that missed
+/// its budget leaves the caller with the indexed rows and a block that says
+/// when they were computed, because half a re-check is not a fresher answer,
+/// it is an answer of unknown age (carrick#1036).
+fn rechecked(
+    workspace_root: &Path,
+    repo_root: &Path,
+    relative: &str,
+    indexed_at: &str,
+) -> (Option<Vec<IndexedItem>>, Recheck) {
+    let started = std::time::Instant::now();
+    let workspace = match super::workspace::Workspace::load(workspace_root) {
+        Ok(workspace) => workspace,
+        Err(reason) => {
+            return (
+                None,
+                Recheck {
+                    ran: super::recheck::Ran::None.as_str().to_string(),
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    stale_since: Some(indexed_at.to_string()),
+                    reason: Some(reason),
+                },
+            );
+        }
+    };
+    match super::recheck::run(&workspace, repo_root, relative) {
+        Ok(fresh) => (
+            Some(fresh.items),
+            Recheck {
+                ran: fresh.ran.as_str().to_string(),
+                elapsed_ms: fresh.elapsed.as_millis() as u64,
+                stale_since: None,
+                reason: None,
+            },
+        ),
+        Err(degraded) => (
+            None,
+            Recheck {
+                ran: super::recheck::Ran::None.as_str().to_string(),
+                elapsed_ms: degraded.elapsed.as_millis() as u64,
+                stale_since: Some(indexed_at.to_string()),
+                reason: Some(degraded.reason),
+            },
+        ),
+    }
+}
+
 fn project(
     item: &IndexedItem,
     mode: Mode,

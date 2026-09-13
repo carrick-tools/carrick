@@ -260,9 +260,73 @@ pub struct CheckOutput {
     /// terminal say the same sentence about the same number (carrick#709).
     /// The struct stays beside it for a reader that wants the numbers.
     pub boundary_lines: Vec<String>,
+    /// What a `--recheck` call did about the file having moved since the index
+    /// (carrick#1036). Absent whenever no re-check was asked for, which is
+    /// every `touch`, every language-server read, and every `check` on a file
+    /// the tree has not changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recheck: Option<Recheck>,
+}
+
+/// What the re-check behind an edit did, and how old the answer is if it did
+/// nothing.
+///
+/// The rows above are either this run's or the index's, never a mixture, and
+/// this block is the only place that says which. A reader that does not know
+/// the field treats the answer as the indexed one, which is what it was before
+/// this existed.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Recheck {
+    /// `extraction+types` — the file was re-extracted, re-joined against the
+    /// blobs the index holds, and the type check reached a verdict on at least
+    /// one of its rows. `extraction` — the same, with no type verdict reached
+    /// on any of them. `none` — the rows above are the indexed ones.
+    pub ran: String,
+    /// Wall time of the re-check, including the run that missed its budget.
+    pub elapsed_ms: u64,
+    /// When the rows above were computed, on a `none`. Absent when they are
+    /// this run's, because then the answer is now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_since: Option<String>,
+    /// Why the re-check did not run, on a `none`. One sentence, for a log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Recheck {
+    /// The line a terminal and a hook both print for this block. Keyed on
+    /// `ran`, which is the field that says whose rows these are.
+    pub fn line(&self) -> String {
+        match self.ran.as_str() {
+            "none" => format!(
+                "re-check: did not finish inside its budget ({} ms), so these verdicts are the indexed ones{}.",
+                self.elapsed_ms,
+                match self.stale_since.as_deref() {
+                    Some(since) => format!(", computed at {since}"),
+                    None => String::new(),
+                }
+            ),
+            "extraction" => format!(
+                "re-check: this file was re-extracted and re-joined from your working tree in {} ms; no type verdict bears on its rows.",
+                self.elapsed_ms
+            ),
+            _ => format!(
+                "re-check: these verdicts are from your working tree, re-extracted and type-checked in {} ms.",
+                self.elapsed_ms
+            ),
+        }
+    }
 }
 
 impl CheckOutput {
+    /// Whether the rows in this answer came from the working tree rather than
+    /// from the index.
+    pub fn rechecked(&self) -> bool {
+        self.recheck
+            .as_ref()
+            .is_some_and(|recheck| recheck.ran != "none")
+    }
+
     /// The human form: the same content in the same order, for a model reading
     /// a terminal.
     pub fn render(&self) -> String {
@@ -323,12 +387,18 @@ impl CheckOutput {
         out.push_str(&format!(
             "changed since index: {} file(s){}\n",
             self.changed_since_index,
-            if self.stale {
+            // A re-check that ran has already answered from the working tree,
+            // so the sentence that sends a reader to re-index would be false.
+            if self.stale && !self.rechecked() {
                 "; this file is one of them, so its rows are unresolved since your edit"
             } else {
                 ""
             }
         ));
+        if let Some(recheck) = &self.recheck {
+            out.push_str(&recheck.line());
+            out.push('\n');
+        }
         for line in &self.boundary_lines {
             out.push_str(line);
             out.push('\n');
@@ -585,6 +655,7 @@ mod tests {
                 "boundary (webapp): {}",
                 super::super::NOT_CLASSIFIED_LOCALLY
             )],
+            recheck: None,
         }
     }
 
@@ -599,6 +670,38 @@ mod tests {
     #[test]
     fn a_stale_file_says_so_in_the_words_a_reader_greps_for() {
         assert!(output().render().contains("unresolved since your edit"));
+    }
+
+    #[test]
+    fn a_rechecked_answer_says_the_rows_are_this_run_s() {
+        let mut fresh = output();
+        fresh.recheck = Some(Recheck {
+            ran: "extraction+types".to_string(),
+            elapsed_ms: 2543,
+            stale_since: None,
+            reason: None,
+        });
+        let text = fresh.render();
+        assert!(
+            text.contains("re-extracted and type-checked in 2543 ms"),
+            "{text}"
+        );
+        // The sentence that sends a reader to re-index would be false here.
+        assert!(!text.contains("unresolved since your edit"), "{text}");
+    }
+
+    #[test]
+    fn a_re_check_that_did_not_run_says_how_old_the_answer_is() {
+        let mut degraded = output();
+        degraded.recheck = Some(Recheck {
+            ran: "none".to_string(),
+            elapsed_ms: 10_004,
+            stale_since: Some("2026-09-13T22:26:26Z".to_string()),
+            reason: Some("the re-scan ran past the budget".to_string()),
+        });
+        let text = degraded.render();
+        assert!(text.contains("computed at 2026-09-13T22:26:26Z"), "{text}");
+        assert!(text.contains("unresolved since your edit"), "{text}");
     }
 
     #[test]
@@ -646,6 +749,22 @@ mod hosted_wire_tests {
     #[test]
     fn the_two_types_and_the_direction_are_sparse_item_fields() {
         let bare = serde_json::to_value(super::tests::output()).unwrap();
+        // The block a re-check adds rides the same rule: present when it ran,
+        // absent on every answer written before it existed (carrick#1036).
+        let mut with_recheck = serde_json::to_value(super::tests::output()).unwrap();
+        with_recheck["recheck"] =
+            serde_json::json!({"ran": "extraction+types", "elapsed_ms": 2543});
+        let parsed: CheckOutput = serde_json::from_value(with_recheck.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), with_recheck);
+        assert!(
+            !serde_json::to_value(super::tests::output())
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("recheck"),
+            "an answer with no re-check states no block at all"
+        );
+
         for field in ["expected_type", "actual_type", "direction"] {
             assert!(
                 bare["items"][0].get(field).is_none(),

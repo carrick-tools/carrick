@@ -8,7 +8,9 @@
 //!
 //! `index` and `refresh` write; `touch` and `check` only read, in well under
 //! the 300 ms an editor hook can afford, because everything they answer was
-//! computed at index time.
+//! computed at index time. The exception is `check --recheck`, which re-judges
+//! one edited file from the working tree inside a budget and still writes
+//! nothing (carrick#1036, [`recheck`]).
 //!
 //! The output contract these commands print — the `carrick.check/0` JSON and
 //! the human form beside it — is `docs/local-mode-output.md`. It is read by
@@ -23,6 +25,7 @@ pub(crate) mod index;
 mod join;
 pub(crate) mod query;
 mod read_model;
+pub(crate) mod recheck;
 pub(crate) mod scan_state;
 mod workspace;
 
@@ -39,12 +42,28 @@ pub const NO_MODEL_ENV: &str = "CARRICK_NO_MODEL";
 /// instead of printing the report. The local indexer's join phase.
 pub const JOIN_OUT_ENV: &str = "CARRICK_LOCAL_JOIN_OUT";
 
+/// Set to `1` to skip signature inference (`signature_pass`).
+///
+/// A scan pays the sidecar once per unannotated parameter and return slot in
+/// the whole repo to compose `FunctionDefinition.signature`, which serves the
+/// hosted function index and nothing a contract verdict reads. Measured on a
+/// 123-file package: 4 s of scan and 9 s of signature inference (carrick#1036).
+/// The re-check behind an edit sets this because it has ten seconds for the
+/// whole answer and reads no signature; a scan that uploads never sets it.
+pub const SKIP_SIGNATURES_ENV: &str = "CARRICK_SKIP_SIGNATURES";
+
 /// Whether this process runs without its model stage. Read from the
 /// environment rather than threaded through the pipeline because the local
 /// indexer drives the scan as a subprocess, exactly as the offline eval
 /// harness does.
 pub fn no_model() -> bool {
     std::env::var(NO_MODEL_ENV).as_deref() == Ok("1")
+}
+
+/// Whether this process composes signatures without asking the sidecar to
+/// infer the slots the source left unannotated. See [`SKIP_SIGNATURES_ENV`].
+pub fn skip_signature_inference() -> bool {
+    std::env::var(SKIP_SIGNATURES_ENV).as_deref() == Ok("1")
 }
 
 /// The guidance map a no-model run analyses with: one entry per LLM-routed

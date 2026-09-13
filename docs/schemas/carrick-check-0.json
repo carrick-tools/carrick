@@ -91,6 +91,31 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "The boundary as the CLI prints it, line by line (boundary_note first, then the counts). Print these bytes rather than re-wording the struct."
+        },
+        "recheck": { "$ref": "#/$defs/recheck" }
+      },
+      "additionalProperties": true
+    },
+    "recheck": {
+      "type": "object",
+      "description": "What `carrick check --recheck` did about the file having moved past the index (carrick#1036). Absent when no re-check was asked for. When `ran` is not `none` the items above were computed from the working tree by this call; otherwise they are the indexed ones and `stale_since` says when.",
+      "required": ["ran", "elapsed_ms"],
+      "properties": {
+        "ran": {
+          "enum": ["extraction+types", "extraction", "none"],
+          "description": "extraction+types: re-extracted, re-joined, and the type check reached a verdict on at least one row. extraction: the same with no type verdict reached. none: the items are the indexed ones."
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "description": "Wall time of the re-check, including one that missed its budget."
+        },
+        "stale_since": {
+          "type": "string",
+          "description": "RFC 3339 time the items were computed. Present only when ran is none."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why the re-check did not run. Present only when ran is none."
         }
       },
       "additionalProperties": true

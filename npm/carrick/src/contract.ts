@@ -140,6 +140,28 @@ export type CheckResult = {
    * the wording either way, and which one depends only on what the CLI sent.
    */
   boundary_lines?: string[];
+  /**
+   * What a `--recheck` call did about this file having moved past the index
+   * (carrick#1036). Absent on every read that did not ask for one, and on a
+   * `--recheck` for a file the tree has not changed: then the items are the
+   * indexed ones, which is what they always were.
+   */
+  recheck?: Recheck;
+};
+
+/** The `recheck` block of a `carrick.check/0` answer. */
+export type Recheck = {
+  /**
+   * `extraction+types` — re-extracted, re-joined, and the type check reached a
+   * verdict on at least one row. `extraction` — the same with no type verdict.
+   * `none` — the items are the indexed ones and `stale_since` says how old.
+   */
+  ran: "extraction+types" | "extraction" | "none";
+  elapsed_ms: number;
+  /** RFC 3339 time the items were computed. Only on a `none`. */
+  stale_since?: string;
+  /** Why the re-check did not run. Only on a `none`. */
+  reason?: string;
 };
 
 export const SCHEMA = "carrick.check/0";
@@ -349,6 +371,10 @@ export function parseCheckResult(stdout: string): CheckResult | null {
       (line): line is string => typeof line === "string",
     );
     if (lines.length) result.boundary_lines = lines;
+  }
+  const recheck = parsed["recheck"];
+  if (isRecord(recheck) && typeof recheck["ran"] === "string") {
+    result.recheck = recheck as unknown as Recheck;
   }
   return result;
 }

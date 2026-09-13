@@ -27,14 +27,27 @@ change bumps it to `carrick.check/1` and both are emitted for one release.
 | `carrick status [--json]` | local index, credential identity | nothing | < 300 ms |
 | `carrick touch <file> [--json]` | local index, credential identity | nothing | < 300 ms |
 | `carrick check <file> [--json]` | local index, credential identity | nothing | < 300 ms |
+| `carrick check <file> --recheck` | the same, plus this repo's working tree and the blobs already on disk | nothing outside a temp directory it deletes | 10 s budget |
 | `carrick refresh [--service <name>]` | local source and authenticated hosted indexes | `<dir>/.carrick/` | seconds |
 
 `status` answers about the workspace and takes no file; it is what a surface
-opening a session asks. `touch` and `check` never parse the file, never call a model, never call the
-cloud, and never re-extract. They read what `index` already computed. `touch`
-answers "what is on the other side of what I am editing"; `check` adds the
-contract verdicts computed at index time. Both exit 0 whatever they find:
-local mode is advisory, nothing blocks.
+opening a session asks. `touch` and `check` never call a model and never call
+the cloud. Without `--recheck` they never parse the file either: they read what
+`index` already computed. `touch` answers "what is on the other side of what I
+am editing"; `check` adds the contract verdicts. Both exit 0 whatever they
+find: local mode is advisory, nothing blocks.
+
+`carrick check --recheck` is the one read that recomputes (carrick#1036). When
+the file has changed since the index, it re-scans **that file's repo only** —
+deterministic extraction and the sidecar's type capture, no model, nothing on
+the wire — and re-runs the join over the blobs already in `.carrick/repos`
+plus the cached hosted snapshot, so the verdicts it prints are about the
+working tree rather than the tree the index was built on. It writes nothing:
+`.carrick/index.json` is untouched and the temporary generation is deleted on
+every path. The whole re-check has a budget (10 s, `CARRICK_RECHECK_BUDGET_MS`);
+past it the answer is the indexed one, and the `recheck` block below says so.
+A file the tree has not changed, a deleted file, and every `touch` are answered
+from the index as before.
 
 `index` recomputes deterministic facts from the working tree and reads hosted
 indexes using the credential stored by `carrick login` or `CARRICK_TOKEN`.
@@ -147,6 +160,25 @@ counter means this scan did not record it.
 | `boundary` | object \| null | what this service's scan could not classify (`ServiceBoundary`, `src/boundary.rs`), verbatim |
 | `boundary_note` | string | hosted provenance, replay limits or the reason enrichment is unavailable, with the counts the scan kept. Always present. |
 | `boundary_lines` | string[] | the boundary as the CLI prints it, line by line: `boundary_note` first, then the counts. A reader rendering the boundary prints these bytes rather than re-wording the struct, so a hook and a terminal say the same sentence about the same number. |
+| `recheck` | object \| absent | what a `--recheck` call did (below). Absent on every other read, which means the items are the indexed ones — the answer this document described before carrick#1036 |
+
+### `recheck`
+
+Present only when `--recheck` was passed AND the file had changed since the
+index. Absent otherwise, including on a `--recheck` call for a file the tree
+has not moved past: nothing needed re-judging, so nothing was.
+
+| field | type | meaning |
+|---|---|---|
+| `ran` | string | `extraction+types`: the file was re-extracted, re-joined against the blobs the index holds, and the type check reached a verdict on at least one of its rows. `extraction`: the same, and no type verdict bears on any of them. `none`: the items above are the indexed ones |
+| `elapsed_ms` | int | wall time of the re-check, including one that missed its budget |
+| `stale_since` | string (RFC 3339) | when the items above were computed. Present only on a `none` — otherwise the answer is now |
+| `reason` | string | why the re-check did not run, in one sentence. Present only on a `none` |
+
+The items in one answer are all fresh or all indexed, never a mixture, and this
+block is the only thing that says which. `stale` and `changed_since_index` keep
+their meaning either way: they describe the tree against the index, not the age
+of the rows.
 
 Locations come first and the boundary comes last: a reader that stops early has
 read the facts, and a reader that reads to the end knows what is missing.

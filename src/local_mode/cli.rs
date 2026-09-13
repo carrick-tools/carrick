@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use super::contract::{ErrorOutput, ReadError, ReadFailure};
-use super::query::Mode;
+use super::query::{Freshness, Mode};
 use super::workspace::Workspace;
 
 /// A local command, once its arguments have been read.
@@ -50,6 +50,10 @@ pub enum LocalCommand {
         file: PathBuf,
         workspace: Option<PathBuf>,
         json: bool,
+        /// Re-extract the file and re-judge it against the index before
+        /// answering, when the tree has moved past the index (carrick#1036).
+        /// The post-edit hook asks for this; nothing else does.
+        recheck: bool,
     },
     /// Re-scan one service (or every repo) and re-join.
     Refresh {
@@ -94,6 +98,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     let mut service: Option<String> = None;
     let mut json = false;
     let mut detach = false;
+    let mut recheck = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut index = 0;
@@ -114,6 +119,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
                 service = Some(value.clone());
             }
             "--json" => json = true,
+            "--recheck" => recheck = true,
             // Removed in carrick#1008, and refused by name for one release
             // (carrick#1011): `carrick index` IS the inferred scan now.
             // Accepting the flag and ignoring it would hand a scaffold that
@@ -142,6 +148,11 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     // anyway would be a promise nobody kept.
     if detach && name != "index" {
         return Err(format!("unknown option for `carrick {name}`: --detach"));
+    }
+    // `touch` states no verdict, so re-judging for it would buy a scan and
+    // print nothing new.
+    if recheck && name != "check" {
+        return Err(format!("unknown option for `carrick {name}`: --recheck"));
     }
 
     match name {
@@ -186,6 +197,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
                     file,
                     workspace,
                     json,
+                    recheck,
                 })
             }
         }
@@ -244,12 +256,29 @@ pub fn run(command: LocalCommand) -> i32 {
             file,
             workspace,
             json,
-        } => read(&file, workspace.as_deref(), json, Mode::Touch),
+        } => read(
+            &file,
+            workspace.as_deref(),
+            json,
+            Mode::Touch,
+            Freshness::Indexed,
+        ),
         LocalCommand::Check {
             file,
             workspace,
             json,
-        } => read(&file, workspace.as_deref(), json, Mode::Check),
+            recheck,
+        } => read(
+            &file,
+            workspace.as_deref(),
+            json,
+            Mode::Check,
+            if recheck {
+                Freshness::Recheck
+            } else {
+                Freshness::Indexed
+            },
+        ),
         LocalCommand::Status { workspace, json } => status(workspace.as_deref(), json),
     }
 }
@@ -644,7 +673,7 @@ fn print_map(outcome: &super::index::IndexOutcome) {
 }
 
 /// `touch` and `check`: answer about one file.
-fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode) -> i32 {
+fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode, freshness: Freshness) -> i32 {
     let Some(root) = super::workspace::locate(root, Some(file)) else {
         return report(
             ReadFailure::new(ReadError::NotIndexed),
@@ -652,7 +681,7 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode) -> i32 {
             super::contract::SCHEMA,
         );
     };
-    match super::query::answer(&root, file, mode) {
+    match super::query::answer(&root, file, mode, freshness) {
         Ok(output) => {
             if json {
                 match serde_json::to_string_pretty(&output) {
@@ -715,7 +744,7 @@ USAGE:
     carrick index   [--workspace <dir>] [--detach]
     carrick status  [--workspace <dir>] [--json]
     carrick touch   <file> [--workspace <dir>] [--json]
-    carrick check   <file> [--workspace <dir>] [--json]
+    carrick check   <file> [--workspace <dir>] [--json] [--recheck]
     carrick refresh [--service <name>] [--workspace <dir>]
 
     derive     Print the workspace and service proposal without writing files.
@@ -737,6 +766,12 @@ USAGE:
     touch      The routes and calls in one file, and their counterparts in
                every other repo in the workspace. Reads the index only.
     check      The same, plus the contract verdicts the index already holds.
+               --recheck re-extracts the file and re-judges it against the
+               index before answering, when the tree has moved past the index:
+               one repo is re-scanned and the join runs over blobs already on
+               disk, with no model and nothing on the wire. It has ten seconds
+               (CARRICK_RECHECK_BUDGET_MS); past that the answer is the indexed
+               one and says so.
     refresh    Re-scan one service (or every repo) and re-join.
 
 The workspace is a repository or the folder holding its sibling repositories.
@@ -848,6 +883,7 @@ mod tests {
                 file: PathBuf::from("src/app.ts"),
                 workspace: Some(PathBuf::from("/w")),
                 json: false,
+                recheck: false,
             }
         );
     }

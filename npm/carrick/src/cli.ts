@@ -73,9 +73,35 @@ async function run<T>(
   });
 }
 
-/** `carrick check <file> --json`, run from the workspace root. */
-export async function check(file: string, options: RunOptions): Promise<RunOutcome<CheckResult>> {
-  return await run(["check", file, "--json"], options, parseCheckResult);
+/**
+ * `carrick check <file> --json`, run from the workspace root.
+ *
+ * `recheck` asks the binary to re-extract the file and re-judge it against the
+ * index before answering, which costs a scan of that file's repo. It is passed
+ * by the post-edit hook and by nothing else: the language server runs this on
+ * every save, and a file being edited is always newer than the index
+ * (carrick#1036). The binary's own budget is ten seconds, so the call is given
+ * more than that before it is killed — a re-check cut off by this timeout would
+ * print nothing at all, where one cut off by its own budget still answers.
+ */
+export async function check(
+  file: string,
+  options: RunOptions & { recheck?: boolean },
+): Promise<RunOutcome<CheckResult>> {
+  const args = options.recheck ? ["check", file, "--json", "--recheck"] : ["check", file, "--json"];
+  const env = options.recheck
+    ? { ...(options.env ?? process.env), CARRICK_TIMEOUT_MS: recheckTimeoutMs(options.env) }
+    : options.env;
+  return await run(args, { ...options, env }, parseCheckResult);
+}
+
+/**
+ * The limit for a `--recheck` call: the caller's own if it set one, and
+ * otherwise long enough to outlast the binary's budget and still return inside
+ * the hook's fifteen seconds.
+ */
+export function recheckTimeoutMs(env: NodeJS.ProcessEnv = process.env): string {
+  return env["CARRICK_TIMEOUT_MS"] ?? "12000";
 }
 
 /**

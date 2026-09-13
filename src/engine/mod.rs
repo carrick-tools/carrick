@@ -222,6 +222,20 @@ fn head_sha_from_event() -> Option<String> {
         .map(str::to_string)
 }
 
+/// The sidecar the signature pass is allowed to ask, which is none at all when
+/// this run skips inference (`CARRICK_SKIP_SIGNATURES`).
+///
+/// Signatures are still composed from what the source annotates; what is
+/// dropped is the round trip that fills the slots it does not. The re-check
+/// behind an edit (carrick#1036) is the only caller that asks for this: it
+/// reads no signature and has a ten-second budget for the whole answer.
+fn signature_sidecar(sidecar: Option<&TypeSidecar>) -> Option<&TypeSidecar> {
+    if crate::local_mode::skip_signature_inference() {
+        return None;
+    }
+    sidecar
+}
+
 #[allow(dead_code)]
 pub async fn run_analysis_engine<T: CloudStorage + Sync>(
     storage: T,
@@ -1777,7 +1791,11 @@ async fn analyze_current_repo_incremental(
             crate::phase_timing::mark(crate::phase_timing::Phase::Intents);
 
             // Compose function signatures, inferring unannotated slots via sidecar.
-            populate_function_signatures(sidecar, &mut function_definitions, repo_path);
+            populate_function_signatures(
+                signature_sidecar(sidecar),
+                &mut function_definitions,
+                repo_path,
+            );
             crate::phase_timing::mark(crate::phase_timing::Phase::Signatures);
 
             let elapsed = start.elapsed();
@@ -4662,7 +4680,11 @@ async fn analyze_current_repo(
     crate::phase_timing::mark(crate::phase_timing::Phase::Intents);
 
     // 4c. Compose function signatures, inferring unannotated slots via sidecar.
-    populate_function_signatures(sidecar, &mut function_definitions, repo_path);
+    populate_function_signatures(
+        signature_sidecar(sidecar),
+        &mut function_definitions,
+        repo_path,
+    );
     crate::phase_timing::mark(crate::phase_timing::Phase::Signatures);
 
     // 4d. Deterministic protocol scans run BEFORE the graph is projected: the

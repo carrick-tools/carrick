@@ -151,6 +151,31 @@ fn index(workspace: &Path) -> String {
     run(workspace, &["refresh", "--workspace", "."])
 }
 
+/// The same as [`run`], with extra environment. What a test of the re-check
+/// needs: its budget is the one thing that decides which half of the feature
+/// runs, and a wall-clock assertion would be a flake on a loaded machine.
+fn run_with_env(workspace: &Path, args: &[&str], env: &[(&str, &str)]) -> String {
+    let mut command = Command::new(carrick());
+    command
+        .args(args)
+        .current_dir(workspace)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"));
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command
+        .output()
+        .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
+    assert!(
+        output.status.success(),
+        "carrick {args:?} exited {:?}:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("stdout was not UTF-8")
+}
+
 fn touch(workspace: &Path, file: &str) -> String {
     run(workspace, &["touch", file, "--workspace", "."])
 }
@@ -333,6 +358,203 @@ fn local_mode_answers_and_follows_an_edit() {
         Some(2),
         "with its consumers listed:\n{removed:#}"
     );
+}
+
+/// carrick#1036: an edit is judged against the index before it is committed.
+///
+/// The break here is invisible to routing — the path, the verb and the handler
+/// are untouched, only the response type moved — so nothing but a re-run of
+/// the extraction and the type check can catch it, and today's answer is the
+/// verdict that was reached before the edit.
+#[test]
+#[serial]
+fn an_edit_is_re_judged_before_the_index_catches_up() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let route = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+    let route_file = root.join(route);
+    let caller = "inventory-svc/src/inventory.ts";
+    // Generous on purpose: this binary is built without optimisation and CI is
+    // shared, so the default budget would be the thing under test rather than
+    // the re-check. What the budget DOES is proven by the degrade case below.
+    let budget = [("CARRICK_RECHECK_BUDGET_MS", "600000")];
+
+    index(root);
+    assert!(
+        check(root, route).contains("compatible"),
+        "the fixture starts compatible"
+    );
+
+    // The producer now answers with a string where the consumer reads a
+    // number. Nothing is re-indexed.
+    edit(&route_file, "activeCount: number", "activeCount: string");
+    edit(&route_file, "activeCount: 3", "activeCount: \"3\"");
+
+    let indexed = check(root, route);
+    assert!(
+        indexed.contains("compatible") && !indexed.contains("type_mismatch"),
+        "without a re-check the answer is the one computed before the edit:\n{indexed}"
+    );
+
+    let text = run_with_env(
+        root,
+        &["check", route, "--workspace", ".", "--recheck"],
+        &budget,
+    );
+    assert!(
+        text.contains("type_mismatch"),
+        "the re-check names the break the edit made:\n{text}"
+    );
+    assert!(
+        text.contains("activeCount"),
+        "with the compiler's own reason:\n{text}"
+    );
+    assert!(
+        text.contains("re-check: these verdicts are from your working tree"),
+        "and says the rows are this run's:\n{text}"
+    );
+    assert!(
+        !text.contains("unresolved since your edit"),
+        "a re-checked row is not an indexed row with a warning on it:\n{text}"
+    );
+
+    let fresh: serde_json::Value = serde_json::from_str(&run_with_env(
+        root,
+        &["check", route, "--workspace", ".", "--recheck", "--json"],
+        &budget,
+    ))
+    .expect("check --recheck --json was not JSON");
+    assert_eq!(
+        fresh["recheck"]["ran"],
+        serde_json::json!("extraction+types"),
+        "both halves ran:\n{fresh:#}"
+    );
+    assert!(
+        fresh["recheck"]["elapsed_ms"].as_u64().is_some(),
+        "with its cost stated:\n{fresh:#}"
+    );
+    assert_eq!(
+        fresh["recheck"]["stale_since"],
+        serde_json::Value::Null,
+        "a re-check that ran states no age:\n{fresh:#}"
+    );
+    let row = &fresh["items"][0];
+    assert_eq!(row["verdict"]["result"], serde_json::json!("type_mismatch"));
+    assert_eq!(row["direction"], serde_json::json!("response"));
+    // The two shapes are this run's, so the producer's half carries the string
+    // that only exists in the working tree (carrick#1033 + carrick#1036).
+    assert!(
+        row["actual_type"]
+            .as_str()
+            .is_some_and(|text| text.contains("activeCount: string")),
+        "the producer's fresh response type:\n{fresh:#}"
+    );
+    assert!(
+        row["expected_type"]
+            .as_str()
+            .is_some_and(|text| text.contains("activeCount: number")),
+        "against what the consumer still reads:\n{fresh:#}"
+    );
+    // Nothing was written: a plain `check` still answers with the verdict the
+    // index holds, which is the one from before the edit.
+    assert_eq!(
+        check_json(root, route)["items"][0]["verdict"]["result"],
+        serde_json::json!("compatible"),
+        "the re-check must not have rewritten the index"
+    );
+
+    // A file in a repo nothing changed keeps its indexed verdicts, and asks
+    // for no scan: the consumer is a file the edit never touched.
+    let untouched: serde_json::Value = serde_json::from_str(&run_with_env(
+        root,
+        &["check", caller, "--workspace", ".", "--recheck", "--json"],
+        &budget,
+    ))
+    .expect("check --recheck --json was not JSON");
+    assert_eq!(
+        untouched["recheck"],
+        serde_json::Value::Null,
+        "an unchanged file is answered from the index, with no re-check at all:\n{untouched:#}"
+    );
+    assert_eq!(
+        untouched["items"][0]["verdict"]["result"],
+        serde_json::json!("compatible"),
+        "and keeps the verdict the index holds:\n{untouched:#}"
+    );
+}
+
+/// The budget is real: past it the answer is the indexed one, said as such,
+/// and nothing is left running or lying about on disk.
+#[test]
+#[serial]
+fn a_re_check_that_cannot_finish_in_budget_degrades_instead_of_blocking() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let route = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+    let route_file = root.join(route);
+
+    index(root);
+    edit(&route_file, "activeCount: number", "activeCount: string");
+    edit(&route_file, "activeCount: 3", "activeCount: \"3\"");
+
+    let before = recheck_temp_dirs();
+    let started = Instant::now();
+    let degraded: serde_json::Value = serde_json::from_str(&run_with_env(
+        root,
+        &["check", route, "--workspace", ".", "--recheck", "--json"],
+        &[("CARRICK_RECHECK_BUDGET_MS", "1")],
+    ))
+    .expect("check --recheck --json was not JSON");
+
+    assert_eq!(
+        degraded["recheck"]["ran"],
+        serde_json::json!("none"),
+        "no half of the re-check ran:\n{degraded:#}"
+    );
+    assert!(
+        degraded["recheck"]["stale_since"].as_str().is_some(),
+        "so the answer says when it was computed:\n{degraded:#}"
+    );
+    assert!(
+        degraded["recheck"]["reason"].as_str().is_some(),
+        "and why there is no fresher one:\n{degraded:#}"
+    );
+    // The indexed rows are still served, verdict and all: a re-check that
+    // cannot run must never take the answer away.
+    assert_eq!(
+        degraded["items"][0]["verdict"]["state"],
+        serde_json::json!("resolved"),
+        "the indexed verdict stands:\n{degraded:#}"
+    );
+    assert_eq!(degraded["stale"], serde_json::json!(true));
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "a missed budget answers at once, not eventually: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        recheck_temp_dirs(),
+        before,
+        "a re-check leaves no temporary generation behind, including one it killed"
+    );
+}
+
+/// Temporary generations a re-check has left in the system temp directory.
+/// Compared before and after rather than required to be empty: another test
+/// binary may be running one of its own (carrick#592).
+fn recheck_temp_dirs() -> usize {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("carrick-recheck-")
+        })
+        .count()
 }
 
 /// The JSON is the contract in `docs/local-mode-output.md`, and the hook and
