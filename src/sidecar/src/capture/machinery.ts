@@ -149,9 +149,27 @@ function isFrameworkMachinery(checker: ts.TypeChecker, type: ts.Type): boolean {
 }
 
 /**
- * True when the symbol is declared in a TS lib file (`lib.*.d.ts`) or under
- * `node_modules`. Works on a bare checkout: the DOM `Response`/`Request`
- * resolve from the bundled `lib.dom.d.ts` even with no installed dependencies.
+ * True when a declaration file path is runtime/library origin: a TS lib
+ * (`lib.*.d.ts`), an installed package, or the runtime declarations Carrick
+ * materialises for a non-Node runtime under `.carrick/deno/` (carrick#1017 —
+ * there the platform `Response` lives in Carrick's own generated file, so
+ * without this the gate stayed shut and the wrapper was published as a
+ * contract). Lockstep mirror of `isExternalOrigin` in `type-inferrer.ts`;
+ * `machinery-indicator-mirror.test.ts` guards the pair.
+ */
+export function isExternalOrigin(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, '/');
+  return (
+    normalized.includes('/node_modules/') ||
+    /\/lib\.[^/]*\.d\.ts$/.test(normalized) ||
+    normalized.includes('/.carrick/deno/')
+  );
+}
+
+/**
+ * True when the symbol is declared in a runtime/library origin. Works on a bare
+ * checkout: the DOM `Response`/`Request` resolve from the bundled
+ * `lib.dom.d.ts` even with no installed dependencies.
  */
 function symbolIsLibOrExternalOrigin(
   checker: ts.TypeChecker,
@@ -160,15 +178,8 @@ function symbolIsLibOrExternalOrigin(
   if (!symbol) {
     return false;
   }
-  const isExternalPath = (filePath: string): boolean => {
-    const normalized = filePath.replace(/\\/g, '/');
-    return (
-      normalized.includes('/node_modules/') ||
-      /\/lib\.[^/]*\.d\.ts$/.test(normalized)
-    );
-  };
   for (const decl of symbol.getDeclarations() ?? []) {
-    if (isExternalPath(decl.getSourceFile().fileName)) {
+    if (isExternalOrigin(decl.getSourceFile().fileName)) {
       return true;
     }
   }

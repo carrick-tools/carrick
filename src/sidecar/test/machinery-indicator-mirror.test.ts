@@ -15,8 +15,14 @@
 
 import { describe, it } from 'node:test';
 import * as assert from 'node:assert';
-import { MACHINERY_MEMBER_INDICATORS as INFERRER_SET } from '../src/type-inferrer.js';
-import { MACHINERY_MEMBER_INDICATORS as CAPTURE_SET } from '../src/capture/machinery.js';
+import {
+  MACHINERY_MEMBER_INDICATORS as INFERRER_SET,
+  isExternalOrigin as inferrerIsExternalOrigin,
+} from '../src/type-inferrer.js';
+import {
+  MACHINERY_MEMBER_INDICATORS as CAPTURE_SET,
+  isExternalOrigin as captureIsExternalOrigin,
+} from '../src/capture/machinery.js';
 
 describe('carrick#371 machinery-indicator mirror stays in lockstep', () => {
   it('the two duplicated indicator sets are byte-for-byte equal', () => {
@@ -32,5 +38,37 @@ describe('carrick#371 machinery-indicator mirror stays in lockstep', () => {
 
   it('the set is non-empty (a truncated copy must not read as "in sync")', () => {
     assert.ok(INFERRER_SET.size >= 3, 'indicator set unexpectedly small');
+  });
+
+  it('the two origin gates answer the same for every origin shape', () => {
+    // The gate is the other half of the detection: indicators alone never
+    // fire. A runtime declaration Carrick materialises itself is machinery
+    // origin as surely as a lib file (carrick#1017); a user's own source,
+    // including one that merely sits under `.carrick/`, is not.
+    const cases = [
+      '/repo/node_modules/@types/node/http.d.ts',
+      '/usr/lib/node/typescript/lib/lib.dom.d.ts',
+      '/repo/.carrick/deno/a1b2c3d4/runtime.d.ts',
+      'C:\\repo\\.carrick\\deno\\a1b2c3d4\\runtime.d.ts',
+      '/repo/src/routes/orders.ts',
+      '/repo/.carrick/index.json',
+    ];
+    for (const filePath of cases) {
+      assert.strictEqual(
+        captureIsExternalOrigin(filePath),
+        inferrerIsExternalOrigin(filePath),
+        `the two origin gates disagree on ${filePath}`
+      );
+    }
+    assert.strictEqual(
+      inferrerIsExternalOrigin('/repo/.carrick/deno/a1b2c3d4/runtime.d.ts'),
+      true,
+      'the materialised runtime declarations are machinery origin'
+    );
+    assert.strictEqual(
+      inferrerIsExternalOrigin('/repo/src/routes/orders.ts'),
+      false,
+      'user source is never machinery origin'
+    );
   });
 });
