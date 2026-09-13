@@ -61,6 +61,7 @@ static ACTIVE: Mutex<Option<Active>> = Mutex::new(None);
 struct Active {
     file: PathBuf,
     state: ScanState,
+    started: Instant,
     last_write: Option<Instant>,
     last_log: Option<Instant>,
 }
@@ -248,6 +249,7 @@ pub fn begin(index_dir: &Path, scan_id: &str, workspace: &Path, infer: bool) {
         *active = Some(Active {
             file,
             state,
+            started: Instant::now(),
             last_write: None,
             last_log: None,
         });
@@ -285,11 +287,23 @@ pub fn note(phase: &str, update: Option<&Update>) {
     }
     // The log is the other half of the answer: `carrick status` says where a
     // scan is, and the log says where it has been. A line on every phase
-    // change, and a pulse inside a long one.
-    if phase_changed || due(active.last_log, LOG_GAP) {
+    // change, on the last count of a phase, and a pulse inside a long one.
+    //
+    // The last count matters because without it a phase's line stops at
+    // whatever number happened to be due — the log's final word on a service
+    // was "1 of 5 intents" for a service that finished all five. Each line
+    // carries the scan's age, so a reader tailing the log can tell a pulse
+    // from a repeat (carrick#1007 item 3).
+    let counted_out = active
+        .state
+        .progress
+        .as_ref()
+        .is_some_and(|update| update.total > 0 && update.done >= update.total);
+    if phase_changed || counted_out || due(active.last_log, LOG_GAP) {
+        let age = human_duration(now.duration_since(active.started).as_secs() as i64);
         match &active.state.progress {
-            Some(update) => eprintln!("carrick: {phase}: {}", update.render()),
-            None => eprintln!("carrick: {phase}"),
+            Some(update) => eprintln!("carrick: {age} {phase}: {}", update.render()),
+            None => eprintln!("carrick: {age} {phase}"),
         }
         active.last_log = Some(now);
     }
@@ -338,6 +352,9 @@ pub fn finish(error: Option<&str>) {
     active.state.finished_at = Some(now.clone());
     active.state.updated_at = now;
     write(&active.file, &active.state);
+    // The last line of the log, so a reader tailing it sees the end rather
+    // than a progress count that simply stopped moving.
+    eprintln!("carrick: {}", active.state.line());
     *guard = None;
 }
 

@@ -336,6 +336,7 @@ fn scan_repo(
             working: format!("indexing {label}"),
             done: format!("indexed {label}"),
         },
+        HEARTBEAT,
     )
 }
 
@@ -393,6 +394,7 @@ fn join(exe: &Path, repo: &Path, blobs: &Path, out: &Path) -> Result<LocalJoin, 
             working: "joining the workspace".to_string(),
             done: "joined the workspace".to_string(),
         },
+        HEARTBEAT,
     )?;
 
     let text = std::fs::read_to_string(out)
@@ -449,6 +451,7 @@ fn run_scan(
     mut command: Command,
     what: &str,
     reporting: Reporting,
+    heartbeat: std::time::Duration,
 ) -> Result<Option<crate::scan_spend::ScanSpend>, String> {
     command.stdout(Stdio::null()).stderr(Stdio::piped());
     let mut child = command
@@ -474,7 +477,31 @@ fn run_scan(
     // the scan's output, so a figure it does not lift out is a figure nobody
     // ever sees (carrick#995).
     let mut spend = None;
-    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+    // The child's stderr is read on a thread of its own so that this loop can
+    // wake up when the child says NOTHING. A scan's quiet stretches are its
+    // long ones — a model call, a type check — and the log's pulse used to be
+    // driven entirely by lines arriving, so it stopped exactly when a reader
+    // most needed it and the last thing it had said was a part-finished count
+    // (carrick#1007 item 3).
+    let (lines, from_child) = std::sync::mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        let line = match from_child.recv_timeout(heartbeat) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Same phase, same counts, new moment: the state file's
+                // `updated_at` moves and the log gets its pulse.
+                super::scan_state::note(&reporting.working, None);
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         if let Some(update) = crate::progress::parse(&line) {
             bar.set_message(format!("{}: {}", reporting.working, update.render()));
             super::scan_state::note(&reporting.working, Some(&update));
@@ -497,6 +524,7 @@ fn run_scan(
         }
         tail.push_back(line);
     }
+    let _ = reader.join();
     let status = child
         .wait()
         .map_err(|e| format!("could not wait for the {what}: {e}"))?;
@@ -510,6 +538,11 @@ fn run_scan(
         failure_excerpt(head, panics, tail, dropped)
     ))
 }
+
+/// How long this process waits on a silent child before saying where it is.
+/// Shorter than the log's own pulse, so the pulse decides how often a line is
+/// written and this only decides how often it is offered one.
+const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How many lines of a failed child's stderr are kept from each end.
 const KEPT_LINES: usize = 12;
@@ -1069,6 +1102,7 @@ mod tests {
                 working: "indexing api".to_string(),
                 done: "indexed api".to_string(),
             },
+            HEARTBEAT,
         )
         .unwrap();
         assert_eq!(lifted, Some(spend));
@@ -1086,6 +1120,7 @@ mod tests {
                 working: "indexing api".to_string(),
                 done: "indexed api".to_string(),
             },
+            HEARTBEAT,
         )
         .unwrap();
         assert!(lifted.is_none());
@@ -1202,6 +1237,7 @@ mod tests {
                 working: "indexing api".to_string(),
                 done: "indexed api".to_string(),
             },
+            HEARTBEAT,
         )
         .expect_err("the child exited non-zero");
 
@@ -1232,9 +1268,64 @@ mod tests {
                 working: "indexing api".to_string(),
                 done: "indexed api".to_string(),
             },
+            HEARTBEAT,
         )
         .expect_err("the child exited non-zero");
         assert!(error.ends_with("could not read carrick.json"), "{error}");
         assert!(!error.contains("not shown"), "{error}");
+    }
+
+    /// A scan's long stretches are its quiet ones — a model call, a type
+    /// check — and the log's pulse used to be driven entirely by lines
+    /// arriving from the child. So the detached log stopped moving exactly
+    /// when a reader most needed it, on a part-finished count, while `carrick
+    /// status` was reporting a different service (carrick#1007 item 3).
+    #[test]
+    fn a_silent_child_still_moves_the_scan_state() {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::scan_state::begin(dir.path(), "heartbt1", dir.path(), true);
+        let state = super::super::scan_state::state_file(dir.path(), "heartbt1");
+        let at_start = std::fs::read_to_string(&state).unwrap();
+
+        let update = crate::progress::Update {
+            service: "ledger".to_string(),
+            service_index: 2,
+            service_total: 2,
+            phase: crate::progress::Phase::Files,
+            done: 1,
+            total: 2,
+        };
+        let mut command = Command::new("sh");
+        // One count, then a silence longer than the state file's own write
+        // gap: the shape of a scan waiting on the model. Nothing arrives from
+        // the child in that window, so before this fix nothing was written in
+        // it either.
+        command.arg("-c").arg(format!(
+            "echo '@carrick-progress {}' >&2; sleep 2.5",
+            serde_json::to_string(&update).unwrap()
+        ));
+        run_scan(
+            command,
+            "scan of /repos/ledger",
+            Reporting {
+                working: "indexing ledger".to_string(),
+                done: "indexed ledger".to_string(),
+            },
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap();
+
+        let after = std::fs::read_to_string(&state).unwrap();
+        assert_ne!(at_start, after, "the state file never moved");
+        assert!(
+            !after.contains("\"phase\": \"starting\""),
+            "the pulse never replaced the starting record: {after}"
+        );
+        let read: super::super::scan_state::ScanState = serde_json::from_str(&after).unwrap();
+        assert_eq!(read.phase, "indexing ledger");
+        // The pulse states where the scan is; it must not erase where it got
+        // to, which is the only count a reader has.
+        assert_eq!(read.progress, Some(update));
+        super::super::scan_state::finish(None);
     }
 }
