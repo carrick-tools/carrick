@@ -56,11 +56,60 @@ impl ReadError {
     }
 }
 
+/// Why a read could not answer, with the exact sentence the user was given.
+///
+/// [`ReadError`] is the machine code and it is deliberately coarse: three
+/// values cover every refusal. The sentence is not. "The index could not be
+/// read" and "this index was written by carrick 0.3.58, which wrote format 2,
+/// and this build reads 3" are the same code and different answers, and until
+/// carrick#1009 the second one existed only on stderr — so the language server,
+/// which reads the JSON body, published nothing at all and the editor went
+/// quiet. Every refusal now carries its sentence on the wire.
+#[derive(Debug, Clone)]
+pub struct ReadFailure {
+    pub error: ReadError,
+    message: String,
+}
+
+impl ReadFailure {
+    /// A refusal with nothing more specific to say than its kind.
+    pub fn new(error: ReadError) -> Self {
+        Self {
+            error,
+            message: error.message().to_string(),
+        }
+    }
+
+    /// A refusal that knows more than its kind does — the sentence the code
+    /// that refused wrote, which names the file, the versions, or the move.
+    pub fn detailed(error: ReadError, message: impl Into<String>) -> Self {
+        Self {
+            error,
+            message: message.into(),
+        }
+    }
+
+    /// The one sentence every surface prints for this refusal.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl From<ReadError> for ReadFailure {
+    fn from(error: ReadError) -> Self {
+        Self::new(error)
+    }
+}
+
 /// The error body, printed to stdout so a reader parsing JSON always gets JSON.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ErrorOutput {
     pub schema: String,
     pub error: String,
+    /// The sentence, beside the code. Always present: a reader that wants to
+    /// show a human why there is no answer should never have to reconstruct
+    /// one from an enum value (carrick#1009).
+    pub message: String,
     /// A scan building the index the caller asked for, when one is running.
     /// "There is no index" and "one is being built right now" are different
     /// answers, and a reader given only the first starts a second scan
@@ -78,10 +127,11 @@ impl ErrorOutput {
     /// The schema is the one the CALLER asked under: a `status` failure is a
     /// `carrick.status/0` body, so a reader that rejects any other marker
     /// still gets an answer it can parse.
-    pub fn new(error: ReadError, schema: &str) -> Self {
+    pub fn new(failure: &ReadFailure, schema: &str) -> Self {
         Self {
             schema: schema.to_string(),
-            error: error.wire().to_string(),
+            error: failure.error.wire().to_string(),
+            message: failure.message().to_string(),
             running_scans: Vec::new(),
             last_scan: None,
         }
@@ -716,15 +766,46 @@ mod hosted_wire_tests {
                 ..Default::default()
             },
         );
-        let body = ErrorOutput::new(ReadError::NotIndexed, STATUS_SCHEMA)
+        let body = ErrorOutput::new(&ReadFailure::new(ReadError::NotIndexed), STATUS_SCHEMA)
             .with_scans(Vec::new())
             .with_last_scan(Some(spend));
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["last_scan"]["scans"][0]["repo"], "api");
         assert_eq!(json["last_scan"]["scans"][0]["spend"]["usd"], 4.32);
         // And absent entirely when there is none, rather than null.
-        let empty =
-            serde_json::to_value(ErrorOutput::new(ReadError::NotIndexed, STATUS_SCHEMA)).unwrap();
+        let empty = serde_json::to_value(ErrorOutput::new(
+            &ReadFailure::new(ReadError::NotIndexed),
+            STATUS_SCHEMA,
+        ))
+        .unwrap();
         assert!(empty.get("last_scan").is_none(), "{empty}");
+    }
+
+    /// The refusal every scanner release creates for every existing
+    /// workspace: the editor showed nothing at all because this sentence was
+    /// on stderr and the language server reads the body (carrick#1009).
+    #[test]
+    fn a_refusal_carries_its_own_sentence_on_the_wire() {
+        let detailed = ReadFailure::detailed(
+            ReadError::IndexUnreadable,
+            "/w/.carrick/index.json was written by a different scanner (index format 2, this \
+             build reads 3). Re-run `carrick index`.",
+        );
+        let json = serde_json::to_value(ErrorOutput::new(&detailed, SCHEMA)).unwrap();
+        assert_eq!(json["error"], "index_unreadable");
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("index format 2")),
+            "{json}"
+        );
+        // A refusal with nothing more specific to say still carries one, so a
+        // reader never has to reconstruct a sentence from the code.
+        let plain = serde_json::to_value(ErrorOutput::new(
+            &ReadFailure::new(ReadError::NotIndexed),
+            SCHEMA,
+        ))
+        .unwrap();
+        assert_eq!(plain["message"], ReadError::NotIndexed.message());
     }
 }

@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::contract::{ErrorOutput, ReadError};
+use super::contract::{ErrorOutput, ReadError, ReadFailure};
 use super::query::Mode;
 use super::workspace::Workspace;
 
@@ -282,7 +282,11 @@ fn derive(root: Option<&Path>) -> Result<serde_json::Value, String> {
 /// question "is anything happening", and at that moment there is no index.
 fn status(root: Option<&Path>, json: bool) -> i32 {
     let Some(root) = super::workspace::locate(root, None) else {
-        return report(ReadError::NotIndexed, json, super::contract::STATUS_SCHEMA);
+        return report(
+            ReadFailure::new(ReadError::NotIndexed),
+            json,
+            super::contract::STATUS_SCHEMA,
+        );
     };
     let index_dir = root.join(super::workspace::INDEX_DIR);
     let scans = super::scan_state::read_all(&index_dir);
@@ -302,7 +306,7 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
                     Err(e) => {
                         eprintln!("carrick: could not serialize the answer: {e}");
                         return report(
-                            ReadError::IndexUnreadable,
+                            ReadFailure::new(ReadError::IndexUnreadable),
                             json,
                             super::contract::STATUS_SCHEMA,
                         );
@@ -635,7 +639,11 @@ fn print_map(outcome: &super::index::IndexOutcome) {
 /// `touch` and `check`: answer about one file.
 fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode) -> i32 {
     let Some(root) = super::workspace::locate(root, Some(file)) else {
-        return report(ReadError::NotIndexed, json, super::contract::SCHEMA);
+        return report(
+            ReadFailure::new(ReadError::NotIndexed),
+            json,
+            super::contract::SCHEMA,
+        );
     };
     match super::query::answer(&root, file, mode) {
         Ok(output) => {
@@ -644,7 +652,11 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode) -> i32 {
                     Ok(text) => println!("{text}"),
                     Err(e) => {
                         eprintln!("carrick: could not serialize the answer: {e}");
-                        return report(ReadError::IndexUnreadable, json, super::contract::SCHEMA);
+                        return report(
+                            ReadFailure::new(ReadError::IndexUnreadable),
+                            json,
+                            super::contract::SCHEMA,
+                        );
                     }
                 }
             } else {
@@ -658,23 +670,26 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode) -> i32 {
 
 /// Say why there is no answer, in the form the caller asked for, and still
 /// exit 0.
-fn report(error: ReadError, json: bool, schema: &str) -> i32 {
-    report_with_scans(error, json, schema, Vec::new(), None)
+fn report(failure: ReadFailure, json: bool, schema: &str) -> i32 {
+    report_with_scans(failure, json, schema, Vec::new(), None)
 }
 
 /// The same, carrying any scan that is building the thing the caller asked
 /// for: "there is no index" and "one is being built right now" are different
 /// answers, and a reader that only gets the first will start a second scan.
 fn report_with_scans(
-    error: ReadError,
+    failure: ReadFailure,
     json: bool,
     schema: &str,
     scans: Vec<super::scan_state::ScanState>,
     last_scan: Option<crate::scan_spend::RunSpend>,
 ) -> i32 {
-    eprintln!("carrick: {}", error.message());
+    // One sentence, on stderr and on the wire: the surfaces that read the JSON
+    // body could not say what the terminal says until this carried it
+    // (carrick#1009).
+    eprintln!("carrick: {}", failure.message());
     if json {
-        let body = ErrorOutput::new(error, schema)
+        let body = ErrorOutput::new(&failure, schema)
             .with_scans(scans)
             .with_last_scan(last_scan);
         if let Ok(text) = serde_json::to_string(&body) {

@@ -255,10 +255,11 @@ async function checkAndPublish(absFile: string): Promise<void> {
   const started = Date.now();
   const result = await resultFor(absFile);
   if (!result) return;
-  if (result.error) {
-    log("check", relFile, "->", result.error);
-    return;
-  }
+  if (result.error) log("check", relFile, "->", result.error);
+  // A refusal goes through the same publish path as an answer: it is one
+  // Information row on line 1 saying why there is nothing, and it has to CLEAR
+  // the moment a later check succeeds, which only the merge can do
+  // (carrick#1009).
   const byFile = toDiagnostics(result, root, relFile, { surfaces, lineText: lineTextReader() });
   log(
     `check ${relFile} -> ${[...byFile.values()].reduce((n, list) => n + list.length, 0)} diagnostic(s) across ${byFile.size} file(s) in ${Date.now() - started}ms`,

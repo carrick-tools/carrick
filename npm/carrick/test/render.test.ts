@@ -297,6 +297,26 @@ test("no index gives one line and the command that builds one", () => {
   assert.match(rendered, /`carrick index --workspace <dir>` builds one\.$/);
 });
 
+test("a session start states the refusal's own sentence, not its wire code (carrick#1009)", () => {
+  // Every scanner release that moves the index format refuses every existing
+  // workspace, and `index_unreadable` alone names no move.
+  const refused = renderSessionStart({
+    schema: "carrick.status/0",
+    error: "index_unreadable",
+    message:
+      "/w/.carrick/index.json was written by a different scanner (index format 2, this build reads 3). Re-run `carrick index`.",
+    services: [],
+  });
+  assert.match(refused, /index format 2, this build reads 3/);
+  assert.match(refused, /Re-run `carrick index`/);
+
+  // With nothing more specific to say, the code is still the answer.
+  assert.match(
+    renderSessionStart({ schema: "carrick.status/0", error: "index_unreadable", services: [] }),
+    /index_unreadable/,
+  );
+});
+
 test("a short hash is seven characters, and an absent one says so", () => {
   assert.equal(shortHash("6a1b2c3d4e5f"), "6a1b2c3");
   assert.equal(shortHash(undefined), "an unknown commit");

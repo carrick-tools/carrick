@@ -222,12 +222,16 @@
     },
     "error": {
       "type": "object",
-      "required": ["schema", "error"],
+      "required": ["schema", "error", "message"],
       "properties": {
         "schema": { "const": "carrick.status/0" },
         "error": {
           "enum": ["not_indexed", "not_in_workspace", "index_unreadable"],
           "description": "Exit code is 0 anyway: a read-only command never fails a session."
+        },
+        "message": {
+          "type": "string",
+          "description": "The sentence the CLI printed for this refusal, as on carrick.check/0 (carrick#1009)."
         },
         "running_scans": {
           "type": "array",

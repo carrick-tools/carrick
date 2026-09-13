@@ -412,7 +412,25 @@ export function toDiagnostics(
   const surfaces = options.surfaces ?? DEFAULT_SURFACES;
   const lineText = options.lineText;
   const byFile = new Map<string, Diagnostic[]>();
-  if (result.error) return byFile;
+  // A refusal is an answer, and until carrick#1009 it was published as nothing
+  // at all: the CLI says which scanner wrote the index and which format this
+  // build reads, on stderr, and the editor went quiet. Every scanner release
+  // that moves the index format does this to every existing workspace, so the
+  // sentence lands on line 1 of the file the user has open. It is Information
+  // for the same reason the boundary is: it claims nothing about the code.
+  if (result.error) {
+    if (!surfaces.diagnostics) return byFile;
+    byFile.set(path.resolve(root, checkedFile), [
+      {
+        range: lineSpan(path.resolve(root, checkedFile), 1, 1, lineText),
+        severity: SEVERITY.information,
+        code: "index",
+        source: SOURCE,
+        message: `carrick: ${result.message ?? result.error}`,
+      },
+    ]);
+    return byFile;
+  }
 
   // The path the caller asked about, always: that is the document the editor
   // has open, and a diagnostic published to any other URI is invisible. The

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::contract::{
-    CheckOutput, Counterpart, Item, MAX_STALE_FILES, ReadError, SCHEMA, STATUS_SCHEMA,
+    CheckOutput, Counterpart, Item, MAX_STALE_FILES, ReadError, ReadFailure, SCHEMA, STATUS_SCHEMA,
     StatusOutput, StatusRepo, StatusService, Verdict,
 };
 use super::read_model::{IndexedItem, IndexedRepo, LocalIndex};
@@ -26,10 +26,12 @@ pub enum Mode {
 }
 
 /// Answer about one file.
-pub fn answer(workspace_root: &Path, file: &Path, mode: Mode) -> Result<CheckOutput, ReadError> {
+pub fn answer(workspace_root: &Path, file: &Path, mode: Mode) -> Result<CheckOutput, ReadFailure> {
     let index = read_index(workspace_root)?;
 
-    let (repo, relative) = index.locate_file(file).ok_or(ReadError::NotInWorkspace)?;
+    let (repo, relative) = index
+        .locate_file(file)
+        .ok_or_else(|| ReadFailure::new(ReadError::NotInWorkspace))?;
     let items = repo.files.get(&relative).cloned().unwrap_or_default();
 
     // The service is the file's own when the index holds rows for it, and
@@ -124,7 +126,7 @@ pub fn answer(workspace_root: &Path, file: &Path, mode: Mode) -> Result<CheckOut
 /// response with the file left out: every `carrick.check/0` answer is about one
 /// file, and a reader that always has one should not have to defend against a
 /// response that does not.
-pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadError> {
+pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadFailure> {
     let index = read_index(workspace_root)?;
 
     // Git is asked once per REPO, not once per service: a monorepo's services
@@ -339,22 +341,24 @@ fn verdict_for(
 }
 
 /// The read model, or why there is no answer.
-fn read_index(workspace_root: &Path) -> Result<LocalIndex, ReadError> {
+fn read_index(workspace_root: &Path) -> Result<LocalIndex, ReadFailure> {
     let index_file = workspace_root
         .join(super::workspace::INDEX_DIR)
         .join("index.json");
     if !index_file.is_file() {
-        return Err(ReadError::NotIndexed);
+        return Err(ReadFailure::new(ReadError::NotIndexed));
     }
-    let index = LocalIndex::read(&index_file).map_err(|e| {
-        eprintln!("carrick: {e}");
-        ReadError::IndexUnreadable
-    })?;
+    // Each refusal carries the sentence that names it. A format mismatch is
+    // the one every release that moves READ_MODEL_VERSION creates for every
+    // existing workspace, and "the index could not be read" is not an answer a
+    // user can act on (carrick#1009).
+    let index = LocalIndex::read(&index_file)
+        .map_err(|e| ReadFailure::detailed(ReadError::IndexUnreadable, e))?;
     if !super::hosted::can_read_index(&index) {
-        eprintln!(
-            "carrick: the hosted index belongs to a different or unavailable credential. Run carrick login and carrick index."
-        );
-        return Err(ReadError::IndexUnreadable);
+        return Err(ReadFailure::detailed(
+            ReadError::IndexUnreadable,
+            "the hosted index belongs to a different or unavailable credential. Run carrick login and carrick index.",
+        ));
     }
     Ok(index)
 }
