@@ -5069,17 +5069,25 @@ impl FileOrchestrator {
     /// Segment whitespace is trimmed and a whitespace-only path collapses to `/`:
     /// the LLM emits root routes as `"/ "` and the space otherwise survives into
     /// `full_path`, breaking matching both ways (#332).
-    /// What makes two endpoint rows the same operation: the method, the path
-    /// in its canonical form, and the dispatch case behind it.
+    /// What makes two endpoint rows in ONE FILE the same operation: the owner
+    /// the route is registered on, the method, the path in its canonical form,
+    /// and the dispatch case behind it.
     ///
-    /// The same three the cross-repo merge keys on
-    /// (`MountGraph::merge_from_repos`), so a pair this calls equal is a pair
-    /// every reader of the index would have folded anyway. The dispatch case
-    /// is load-bearing: the operations behind one body-dispatching route share
-    /// a method and a path and are not one row (carrick#831).
+    /// The last three are what the cross-repo merge keys on
+    /// (`MountGraph::merge_from_repos`), and the dispatch case is load-bearing
+    /// there: the operations behind one body-dispatching route share a method
+    /// and a path and are not one row (carrick#831).
+    ///
+    /// The owner is on the key because this runs BEFORE the mount graph, where
+    /// the merge's `full_path` does not exist yet. Two routers declared in one
+    /// file and mounted at different prefixes (`v1.get("/items")` beside
+    /// `v2.get("/items")`) hold the same local path and are two operations;
+    /// without the owner this fold would drop one of them before anything
+    /// could mount it.
     fn model_row_key(endpoint: &crate::agents::file_analyzer_agent::EndpointResult) -> String {
         format!(
-            "{}|{}{}",
+            "{}|{}|{}{}",
+            endpoint.owner_node,
             endpoint.method.to_ascii_uppercase(),
             Self::canonicalize_route_path(&endpoint.path),
             crate::dispatch::Dispatch::key_suffix(endpoint.dispatch.as_ref())
@@ -13641,6 +13649,60 @@ export { routes };
         // route's own payload, so it carries the type anchor.
         assert_eq!(result.endpoints[0].candidate_id, "happy");
         assert_eq!(stats.model_only_rows, 1);
+    }
+
+    /// Two routers declared in one file and mounted at different prefixes
+    /// hold the same LOCAL path and are two operations. The fold runs before
+    /// the mount graph, where `full_path` does not exist yet, so the owner is
+    /// what keeps them apart.
+    #[test]
+    fn two_routers_in_one_file_sharing_a_path_are_two_rows() {
+        let mut candidates = HashMap::new();
+        for id in ["v1", "v2"] {
+            let mut candidate = candidate_with_snippet(id, Some("'/items'"));
+            candidate.callee_object = format!("{id}Router");
+            candidates.insert(id.to_string(), candidate);
+        }
+
+        let route = |owner: &str, candidate_id: &str| EndpointResult {
+            handler_declaration_line: None,
+            view_module: false,
+            candidate_id: candidate_id.to_string(),
+            line_number: 12,
+            owner_node: owner.to_string(),
+            method: "GET".to_string(),
+            path: "/items".to_string(),
+            handler_name: "list".to_string(),
+            pattern_matched: ".get(".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            resolution_source: None,
+            dispatch: None,
+        };
+
+        let (result, _) = emit_and_join(
+            FileAnalysisResult {
+                endpoints: vec![route("v1Router", "v1"), route("v2Router", "v2")],
+                ..Default::default()
+            },
+            &candidates,
+            "src/routes.ts",
+        );
+        assert_eq!(
+            result
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.owner_node.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v1Router", "v2Router"],
+        );
     }
 
     /// The operations behind one body-dispatching route share a method and a

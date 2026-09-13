@@ -54,7 +54,14 @@
         "updated_at": { "type": "string" },
         "infer": { "type": "boolean", "description": "Whether this is the paid pass." },
         "workspace": { "type": "string" },
-        "status": { "enum": ["running", "failed"] },
+        "status": {
+          "enum": ["running", "finished", "failed"],
+          "description": "`finished` is written by the scan when it ends and cleared by the next build, so a caller polling until the scan is over terminates on a word rather than on the record disappearing (carrick#1007 item 4)."
+        },
+        "finished_at": {
+          "type": "string",
+          "description": "RFC 3339, when the scan ended. Absent while it is running; it is what the elapsed time is measured to."
+        },
         "phase": { "type": "string", "description": "`indexing <repo>` or `joining the workspace`." },
         "progress": {
           "type": "object",

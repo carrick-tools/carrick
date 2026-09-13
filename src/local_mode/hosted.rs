@@ -657,6 +657,19 @@ impl HostedInput {
     /// snapshot; nothing is guessed. A dirty generation carries no replayable
     /// answers by design, so it keeps the sentence that says so.
     pub(super) fn uploaded(&self, path: &Path, blob: &CloudRepoData) -> ServiceEnrichment {
+        // Unless the hosted index already described this exact commit. A scan
+        // at a commit the cloud holds is answered `already_current` and writes
+        // nothing, so the row that is being served is the older one — and it
+        // may be CI's, with a login and a source of its own. Stamping "by a
+        // laptop scan" over it would be a claim this run did not earn.
+        let previous = self.service(path, blob);
+        if previous
+            .hosted
+            .as_ref()
+            .is_some_and(|hosted| hosted.commit == blob.commit_hash)
+        {
+            return previous;
+        }
         let mut result = ServiceEnrichment {
             remote: self.remotes.get(path).cloned(),
             failure: self.failure.clone(),
@@ -1124,6 +1137,42 @@ mod tests {
         assert!(!note.contains("has no hosted index yet"), "{note}");
         assert!(note.contains("from the hosted index at abcdef"), "{note}");
         assert!(note.contains("by a laptop scan"), "{note}");
+    }
+
+    /// A scan at a commit the cloud already holds is answered
+    /// `already_current` and writes nothing, so the row being served is the
+    /// older one — possibly CI's, with a login of its own. This run did not
+    /// earn the right to stamp "by a laptop scan" over it.
+    #[test]
+    fn a_scan_that_uploaded_nothing_new_keeps_the_row_that_is_served() {
+        let mut metadata = resolution();
+        metadata["repos"][0]["services"] = json!([{
+            "service": "api", "hash": "abcdef", "updated_at": null,
+            "scanner_version": null, "source": "ci", "uploaded_by": "ci-bot", "dirty": false
+        }]);
+        let input = HostedInput {
+            snapshot: Some(Snapshot {
+                identity: "test".into(),
+                checked_at: "now".into(),
+                resolution: Resolution::parse(metadata).unwrap(),
+                projects: BTreeMap::from([("p".into(), vec![blob()])]),
+            }),
+            failure: None,
+            remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
+        };
+        let answer = input.uploaded(Path::new("/w/api"), &blob());
+        let hosted = answer.hosted.as_ref().expect("the served row");
+        assert_eq!(hosted.source.as_deref(), Some("ci"));
+        assert_eq!(hosted.uploaded_by.as_deref(), Some("ci-bot"));
+
+        // A scan at a NEW commit is this run's, and says so.
+        let mut moved = blob();
+        moved.commit_hash = "fedcba".to_string();
+        let after = input.uploaded(Path::new("/w/api"), &moved);
+        assert_eq!(
+            after.hosted.as_ref().and_then(|h| h.source.as_deref()),
+            Some("laptop")
+        );
     }
 
     /// A dirty generation carries no replayable answers by design, and saying
