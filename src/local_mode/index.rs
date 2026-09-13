@@ -137,6 +137,11 @@ fn run_generation(
         .map_err(|e| e.to_string())?;
     }
     let mut scanned = Vec::new();
+    // The repos this run scanned WITH the model and uploaded. A laptop scan
+    // that returns here has written its blob to the cloud — the tee propagates
+    // the cloud's error, so a refused upload fails the scan — and that is the
+    // one fact the pre-scan hosted snapshot cannot know (carrick#1007 item 1).
+    let mut uploaded: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     // The receipt, written as each figure lands rather than at the end: the
     // money is spent at the upload, so a run killed after paying still leaves
     // the record of it behind (carrick#995).
@@ -153,7 +158,11 @@ fn run_generation(
         // scanner in its own directory so user labels cannot overwrite a
         // retained or hosted blob in the join input.
         let scan_dir = generation.join(format!("scan-{position}"));
-        if let Some(paid) = scan_repo(&exe, repo, &scan_dir, &previous, &name, infer)? {
+        let paid = scan_repo(&exe, repo, &scan_dir, &previous, &name, infer)?;
+        if infer {
+            uploaded.insert(repo.clone());
+        }
+        if let Some(paid) = paid {
             spend.record(&name, paid);
             spend.write(&workspace.last_scan_file());
             // And into the detached build's own state file, so the one
@@ -213,7 +222,12 @@ fn run_generation(
                 .iter()
                 .find(|b| b.repo_name == repo.name && service_id(b) == service.name)
             {
-                service.enrichment = hosted.service(Path::new(&repo.path), blob);
+                let path = PathBuf::from(&repo.path);
+                service.enrichment = if uploaded.contains(&path) {
+                    hosted.uploaded(&path, blob)
+                } else {
+                    hosted.service(&path, blob)
+                };
             }
         }
         for item in repo.files.values_mut().flatten() {

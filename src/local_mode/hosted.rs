@@ -642,6 +642,53 @@ impl HostedInput {
         result
     }
 
+    /// The enrichment for a service THIS RUN scanned and uploaded.
+    ///
+    /// The snapshot every other answer here is read from was taken before the
+    /// scan ran, so on a first paid run it says the repo has no hosted index —
+    /// and kept saying it, in the completed run's own output, in `carrick
+    /// status` and in both hooks, while the index it had just written was
+    /// being served (carrick#1007 item 1). The run that uploaded is the one
+    /// thing that knows better, and it knows without asking: a laptop scan
+    /// that exits successfully has written this exact blob to the cloud (the
+    /// tee propagates the cloud's error, so a refused upload fails the scan).
+    ///
+    /// Everything stated here is read off that blob or off the pre-scan
+    /// snapshot; nothing is guessed. A dirty generation carries no replayable
+    /// answers by design, so it keeps the sentence that says so.
+    pub(super) fn uploaded(&self, path: &Path, blob: &CloudRepoData) -> ServiceEnrichment {
+        let mut result = ServiceEnrichment {
+            remote: self.remotes.get(path).cloned(),
+            failure: self.failure.clone(),
+            allowance_sentence: self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.resolution.allowance_sentence.clone()),
+            hosted_cache_version: blob.cache_version,
+            hosted: Some(HostedProvenance {
+                commit: blob.commit_hash.clone(),
+                indexed_at: blob.last_updated.to_rfc3339(),
+                scanner_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                project: self
+                    .repo(path)
+                    .and_then(|repo| repo.project_slug.clone())
+                    .unwrap_or_default(),
+                // Server-derived everywhere else, and here it is what this
+                // process did: a laptop scan, by whoever this credential is.
+                source: Some("laptop".to_string()),
+                uploaded_by: None,
+                dirty: blob.dirty,
+            }),
+            hosted_state: HostedState::Enriched,
+        };
+        if blob.dirty == Some(true) {
+            result.failure =
+                Some("Hosted index was written from a tree with uncommitted changes".into());
+            result.hosted_state = HostedState::ReadFailed;
+        }
+        result
+    }
+
     pub(super) fn remote_blobs(&self) -> Vec<(String, CloudRepoData)> {
         let Some(snapshot) = &self.snapshot else {
             return Vec::new();
@@ -1036,5 +1083,68 @@ mod tests {
             .push("another/api".into());
         assert!(input.local_blobs(Path::new("/w/api")).is_empty());
         assert!(input.remote_blobs().is_empty());
+    }
+
+    /// The first paid run's own output used to tell the user to go and run the
+    /// scan they had just finished: the snapshot behind every other answer was
+    /// read BEFORE the scan, so the repo still had no hosted services in it.
+    /// The run that uploaded states what it uploaded (carrick#1007 item 1).
+    #[test]
+    fn the_run_that_uploaded_states_the_hosted_index_it_just_wrote() {
+        let input = HostedInput {
+            snapshot: Some(Snapshot {
+                identity: "test".into(),
+                checked_at: "now".into(),
+                // No services: this repo had no hosted index when the run began.
+                resolution: Resolution::parse(resolution()).unwrap(),
+                projects: BTreeMap::new(),
+            }),
+            failure: None,
+            remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
+        };
+        let path = Path::new("/w/api");
+        let blob = blob();
+
+        let before = input.service(path, &blob);
+        assert_eq!(before.hosted_state, HostedState::NoIndexYet);
+        let stale = super::super::query::enrichment_note(&before, None);
+        assert!(stale.contains("has no hosted index yet"), "{stale}");
+
+        let after = input.uploaded(path, &blob);
+        assert_eq!(after.hosted_state, HostedState::Enriched);
+        let hosted = after.hosted.as_ref().expect("the uploaded blob is hosted");
+        assert_eq!(hosted.commit, "abcdef");
+        assert_eq!(hosted.source.as_deref(), Some("laptop"));
+        assert_eq!(hosted.project, "fixture");
+        assert_eq!(
+            hosted.scanner_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        let note = super::super::query::enrichment_note(&after, None);
+        assert!(!note.contains("has no hosted index yet"), "{note}");
+        assert!(note.contains("from the hosted index at abcdef"), "{note}");
+        assert!(note.contains("by a laptop scan"), "{note}");
+    }
+
+    /// A dirty generation carries no replayable answers by design, and saying
+    /// "uploaded, all good" over the top of that would be false.
+    #[test]
+    fn an_uploaded_dirty_generation_keeps_the_sentence_that_says_so() {
+        let input = HostedInput {
+            snapshot: None,
+            failure: None,
+            remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
+        };
+        let mut dirty = blob();
+        dirty.dirty = Some(true);
+        let after = input.uploaded(Path::new("/w/api"), &dirty);
+        assert_eq!(after.hosted_state, HostedState::ReadFailed);
+        assert!(
+            after
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("uncommitted changes")),
+            "{after:?}"
+        );
     }
 }
