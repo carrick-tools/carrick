@@ -37,9 +37,15 @@ import { renderTemplate } from "../templates.ts";
  * (carrick-cloud#832) — so the terminal names the tool and stops. The copy
  * that used to stand here was a second statement of the same instructions, and
  * two copies of a sequence drift.
+ *
+ * The argument is named because the tool's branch turns on it and turns soft
+ * without it: `repo` is what resolves the hosted rows, and with no `repo` the
+ * response keeps its default ending and tells the agent to run the scan — on a
+ * repo CI already indexes, which is the row the whole workspace reads
+ * (carrick-cloud `src/tools/scaffold.ts`, cloud#805 item 1).
  */
 export const SCAFFOLD_SENTENCE =
-  "Run the carrick scaffold tool for this repo and follow what it returns.";
+  "Run the carrick scaffold tool for this repo, passing its owner/repo as `repo`, and follow what it returns.";
 
 export type InitOptions = {
   workspace: string;
