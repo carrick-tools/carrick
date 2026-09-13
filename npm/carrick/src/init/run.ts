@@ -26,7 +26,7 @@ import { downloadHostedIndex, hostedReport, nativeRunner } from "./hosted.ts";
 import { ensureProject, projectStep, SLUG } from "./projects.ts";
 import { connectMcpClients, MCP_LINE, type McpOutcome } from "./mcp.ts";
 import { hookCommand, mergeCarrickHooks } from "./settings.ts";
-import { createOutput, docsLine, type InitOutput } from "./output.ts";
+import { createOutput, DOCS, type InitOutput } from "./output.ts";
 import { renderTemplate } from "../templates.ts";
 
 /**
@@ -116,7 +116,7 @@ function help(): string {
     "        --repo OWNER/REPO  Name the GitHub repo whose origin remote names none",
     "    -y, --yes            Take the repo list as proposed",
     "",
-    `The editor extension, the hooks, CI and a carrick.json written by hand: ${docsLine().replace(/^Docs: /, "")}`,
+    `The editor extension, the hooks, CI and a carrick.json written by hand: ${DOCS}`,
   ].join("\n");
 }
 
@@ -469,7 +469,7 @@ export async function init(argv: string[]): Promise<number> {
     out.done("No index yet: your agent runs the one scan");
   }
   out.note("Next: paste this to your agent", [SCAFFOLD_SENTENCE]);
-  out.say(docsLine());
+  out.say(`Docs: ${out.accent(DOCS)}`);
   return 0;
 }
 

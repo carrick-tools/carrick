@@ -55,6 +55,8 @@ export type InitOutput = {
   confirm(question: string): Promise<boolean>;
   /** A typed answer, for the questions whose answer is not yes or no. */
   ask(question: string): Promise<string>;
+  /** Dim a fragment, where this rendering has colour to dim it with. */
+  accent(text: string): string;
   /** Whether the work under `step` may write to the terminal itself. */
   readonly quiet: boolean;
 };
@@ -76,6 +78,10 @@ export function plainOutput(write: (text: string) => void = (text) => process.st
       write("\n");
     },
     step: async (_label, work) => await work(),
+    // No colour, ever. picocolors turns itself ON when `CI` is set, which is
+    // exactly the run whose output is captured as text, so the decision is made
+    // here from the terminal rather than by the library from the environment.
+    accent: (text) => text,
     // No terminal to ask with. `init` refuses before this can be reached
     // without `--yes`; a stdin that is a TTY under a piped stdout still gets a
     // real question rather than a silent yes.
@@ -130,6 +136,7 @@ export function interactiveOutput(): InitOutput {
       const answer = await clack.text({ message: question });
       return clack.isCancel(answer) ? "" : answer.trim();
     },
+    accent: (text) => pc.dim(text),
     quiet: true,
   };
 }
@@ -143,9 +150,4 @@ export function interactiveOutput(): InitOutput {
  */
 export function createOutput(tty: boolean = process.stdout.isTTY === true): InitOutput {
   return tty ? interactiveOutput() : plainOutput();
-}
-
-/** The closing docs line, dimmed where there is colour to dim it with. */
-export function docsLine(): string {
-  return `Docs: ${pc.dim(DOCS)}`;
 }
