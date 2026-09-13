@@ -35,11 +35,8 @@ In the folder that holds your repositories:
 carrick init
 
 # Builds the index: Carrick classifies what the deterministic passes could not.
-# This is the paid scan, and it runs once.
+# This is the scan, and it runs once. Your agent writes carrick.json first.
 carrick index
-
-# Rebuilds it from your working tree as the code changes, with no model.
-carrick refresh
 ```
 
 > **Note:** If the CLI is installed somewhere that is not on `PATH`, point the `carrick.binary` setting at it. Without a usable binary or an index, the server publishes nothing and says why in the **Carrick** output channel.

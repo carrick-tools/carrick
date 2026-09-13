@@ -24,7 +24,9 @@ pub enum LocalCommand {
     /// pass that states less has no user (carrick#1008). It is refused
     /// outright until every repo in the workspace has a `carrick.json`,
     /// because the one paid scan runs against a config someone has read (see
-    /// [`inference_refusal`]). `refresh` is the pass that runs no model.
+    /// [`inference_refusal`]). `refresh` still runs no model, but it is the
+    /// session-start hook's command and no first-run copy names it
+    /// (cloud#832).
     Index {
         workspace: Option<PathBuf>,
         /// Run the build in the background, and answer at once with its id.
@@ -119,8 +121,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             "--infer" => {
                 return Err(
                     "`--infer` is gone: `carrick index` is the inferred scan itself. Run \
-                     `carrick index` (add `--detach` when the shell may time out first), or \
-                     `carrick refresh` for the pass that runs no model."
+                     `carrick index`, with `--detach` when the shell may time out first."
                         .to_string(),
                 );
             }
@@ -540,8 +541,11 @@ fn detach_process(command: &mut std::process::Command) {
 /// not been through that step would be scanned with its service boundaries
 /// unstated, its env vars undeclared, and no second free attempt.
 ///
-/// `carrick refresh` is unaffected: it states what it can and marks the rest
-/// unclassified, which is exactly the pass that proves a new config.
+/// The refusal names the two things that stand between this machine and the
+/// scan — the config, and the credential — and nothing else. It used to point
+/// at a facts-only pass as a rehearsal; there is no such step in the flow
+/// (carrick#1008, cloud#832), so offering one here would invent a first run
+/// that the scaffold prompt does not describe.
 fn inference_refusal(repos: &[PathBuf]) -> Option<String> {
     let missing: Vec<&PathBuf> = repos
         .iter()
@@ -561,8 +565,8 @@ fn inference_refusal(repos: &[PathBuf]) -> Option<String> {
         "no carrick.json in {named}{}, and `carrick index` is the paid scan, so it runs \
          after the config exists. `carrick init` wrote the derived services to \
          .carrick/proposal.json and printed the prompt that has an agent turn it into \
-         carrick.json; `carrick refresh` states what it can for nothing in the meantime, \
-         and this command is the scan that classifies the rest.",
+         carrick.json; read it back against the repo, run `carrick login` if this machine \
+         is not signed in, and run this command once.",
         if rest > 0 {
             format!(" and {rest} more")
         } else {
@@ -703,8 +707,9 @@ USAGE:
     index      Detect repositories, apply optional workspace overrides and
                write <dir>/.carrick/. Carrick Cloud classifies what the
                deterministic passes could not and the result is uploaded, so
-               it is the paid scan: it needs a carrick.json in every repo and
-               refuses without one. `refresh` is the pass that runs no model.
+               it is the paid scan: it needs a carrick.json in every repo,
+               which it refuses without, and a machine `carrick login` has
+               signed in.
     status     What the workspace holds: every service, the commit it was
                indexed at, how far its repo has moved since, and its boundary.
     touch      The routes and calls in one file, and their counterparts in
@@ -767,6 +772,10 @@ mod tests {
         );
         assert!(refusal.contains(".carrick/proposal.json"), "{refusal}");
         assert!(refusal.contains("carrick index"), "{refusal}");
+        // The two things that stand between this machine and the scan, and
+        // nothing else: there is no rehearsal pass in the flow (cloud#832).
+        assert!(refusal.contains("carrick login"), "{refusal}");
+        assert!(!refusal.contains("carrick refresh"), "{refusal}");
     }
 
     /// A long list of unconfigured repos is a folder someone pointed at, not a
@@ -848,6 +857,11 @@ mod tests {
             assert!(
                 error.contains("carrick index"),
                 "and the command that replaces it is named: {error}"
+            );
+            assert!(
+                !error.contains("carrick refresh"),
+                "and no first-run copy sends anyone to the pass that runs no \
+                 model (cloud#832): {error}"
             );
         }
     }
