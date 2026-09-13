@@ -1081,6 +1081,9 @@ mod tests {
     /// the stream rather than into the failure tail (carrick#995).
     #[test]
     fn the_indexer_lifts_the_figure_out_of_the_scan_it_swallowed() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let spend = crate::scan_spend::ScanSpend {
             schema: crate::scan_spend::SCHEMA.to_string(),
             scan_id: "scan_01J".to_string(),
@@ -1111,6 +1114,9 @@ mod tests {
     /// A free pass reports nothing, and nothing is not a scan that cost zero.
     #[test]
     fn a_scan_that_states_no_figure_reports_none() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut command = Command::new("sh");
         command.arg("-c").arg("echo 'analysing' >&2");
         let lifted = run_scan(
@@ -1224,6 +1230,9 @@ mod tests {
     /// evicted before anyone read the failure (carrick#936).
     #[test]
     fn a_failed_scan_reports_the_panic_it_died_of_wherever_it_fell() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut command = Command::new("sh");
         command.arg("-c").arg(
             "for i in $(seq 1 20); do echo \"starting step $i\" >&2; done; \
@@ -1257,6 +1266,9 @@ mod tests {
     /// dropped and no "not shown" line appears.
     #[test]
     fn a_short_failure_is_repeated_whole() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut command = Command::new("sh");
         command
             .arg("-c")
@@ -1275,6 +1287,11 @@ mod tests {
         assert!(!error.contains("not shown"), "{error}");
     }
 
+    /// Every test that drives [`run_scan`] writes through the one process-wide
+    /// scan-state record, so two of them at once are two phases fighting over
+    /// it (carrick#592's family). They take this in turn instead.
+    static SCAN_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A scan's long stretches are its quiet ones — a model call, a type
     /// check — and the log's pulse used to be driven entirely by lines
     /// arriving from the child. So the detached log stopped moving exactly
@@ -1282,6 +1299,9 @@ mod tests {
     /// status` was reporting a different service (carrick#1007 item 3).
     #[test]
     fn a_silent_child_still_moves_the_scan_state() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().unwrap();
         super::super::scan_state::begin(dir.path(), "heartbt1", dir.path(), true);
         let state = super::super::scan_state::state_file(dir.path(), "heartbt1");
