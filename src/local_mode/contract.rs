@@ -366,7 +366,12 @@ pub struct StatusRepo {
     /// Everything in the repo that differs from the indexed commit or that git
     /// does not track, services included.
     pub changed_since_index: usize,
-    /// How many of those no service in this repo reads.
+    /// How many of those are source files no service in this repo reads.
+    ///
+    /// Source files only: a changed `carrick.json`, workflow or editor setting
+    /// holds no indexed row and cannot make the index stale, and the line this
+    /// number renders is about rows going out of date (carrick#1007 item 5).
+    /// `changed_since_index` above stays the whole repo's count.
     pub outside_every_service: usize,
     /// Up to [`MAX_STALE_FILES`] of THOSE, repo-relative.
     pub stale_files: Vec<String>,
@@ -661,9 +666,12 @@ mod hosted_wire_tests {
                 name: "monorepo".to_string(),
                 changed_since_index: 3,
                 outside_every_service: 2,
+                // Source files: the line is about rows going out of date, and
+                // a changed `carrick.json` or workflow holds none
+                // (carrick#1007 item 5).
                 stale_files: vec![
-                    "carrick.json".to_string(),
-                    ".github/workflows/x.yml".to_string(),
+                    "tools/release.ts".to_string(),
+                    "scripts/seed.ts".to_string(),
                 ],
                 stale_files_truncated: false,
             }],
@@ -705,7 +713,7 @@ mod hosted_wire_tests {
             text.contains("monorepo: 2 file(s) changed outside every service"),
             "{text}"
         );
-        assert!(text.contains("changed  carrick.json"), "{text}");
+        assert!(text.contains("changed  tools/release.ts"), "{text}");
     }
 
     /// `carrick status` repeats the last paid scan's line, because the scan

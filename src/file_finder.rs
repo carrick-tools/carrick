@@ -104,6 +104,31 @@ fn is_test_path(path: &Path, root_dir: &Path) -> bool {
     has_test_dir(path, root_dir) || has_test_suffix(path)
 }
 
+/// Whether a scan rooted at `root_dir` would read this file at all.
+///
+/// The one statement of what the scanner's input IS: the four extensions
+/// [`find_files`] collects, minus the test paths it skips. Purely a question
+/// about the path, so it answers for a file that has been deleted as readily
+/// as for one on disk.
+///
+/// It has a second caller because "has the tree moved under the index?" is the
+/// same question: a changed `carrick.json`, workflow or editor setting holds no
+/// indexed row and cannot make one stale, and counting those as drift told a
+/// user who had just finished onboarding that six files had moved under their
+/// brand-new index (carrick#1007 item 5).
+pub fn is_scanned_source(path: &Path, root_dir: &Path) -> bool {
+    let Some(extension) = path.extension() else {
+        return false;
+    };
+    if !matches!(
+        extension.to_string_lossy().to_lowercase().as_str(),
+        "js" | "ts" | "jsx" | "tsx"
+    ) {
+        return false;
+    }
+    !is_test_path(path, root_dir)
+}
+
 /// Whether any path segment BELOW the scan root matches an ignore pattern
 /// exactly. Matching whole segments (not substrings) keeps files like
 /// `src/buildkite.ts` or `lib/distances.ts` in scope, and stripping the root
@@ -217,14 +242,8 @@ pub fn find_files(dir: &str, ignore_patterns: &[&str]) -> (Vec<PathBuf>, Option<
             continue;
         }
 
-        if let Some(extension) = path.extension() {
-            let ext_str = extension.to_string_lossy().to_lowercase();
-            if matches!(ext_str.as_str(), "js" | "ts" | "jsx" | "tsx") {
-                if is_test_path(path, root_path) {
-                    continue;
-                }
-                js_ts_files.push(path.to_path_buf());
-            }
+        if is_scanned_source(path, root_path) {
+            js_ts_files.push(path.to_path_buf());
         }
     }
 
