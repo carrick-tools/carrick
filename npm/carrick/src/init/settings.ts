@@ -160,3 +160,17 @@ export function mergeCarrickHooks(existing: string | null, command: string | nul
   const body = `${JSON.stringify(merged, null, 2)}\n`;
   return { body, changed: body !== existing };
 }
+
+/**
+ * The inverse of `mergeCarrickHooks`: our entries out, everything else kept.
+ *
+ * `carrick remove` runs this over both settings files a workspace can hold
+ * (carrick#1034). It is the merge with nothing to add, named for what it does
+ * so the pair is one thing to read and one thing to test: whatever `isOurs`
+ * recognises is what init wrote, and nothing else in the file moves. The file
+ * itself stays — a settings file holds a user's own hooks and permissions, and
+ * init was never the reason it exists.
+ */
+export function removeCarrickHooks(existing: string): MergeResult {
+  return mergeCarrickHooks(existing, null);
+}
