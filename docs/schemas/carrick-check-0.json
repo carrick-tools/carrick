@@ -103,7 +103,7 @@
       "properties": {
         "ran": {
           "enum": ["extraction+types", "extraction", "none"],
-          "description": "extraction+types: re-extracted, re-joined, and the type check reached a verdict on at least one row. extraction: the same with no type verdict reached. none: the items are the indexed ones."
+          "description": "extraction+types: re-extracted, re-joined, and at least one row carries a type verdict. extraction: the same, and no row of this file carries one (nothing pairs with it, or its pairs were not both resolved). none: the items are the indexed ones."
         },
         "elapsed_ms": {
           "type": "integer",

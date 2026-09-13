@@ -47,7 +47,8 @@ working tree rather than the tree the index was built on. It writes nothing:
 every path. The whole re-check has a budget (10 s, `CARRICK_RECHECK_BUDGET_MS`);
 past it the answer is the indexed one, and the `recheck` block below says so.
 A file the tree has not changed, a deleted file, and every `touch` are answered
-from the index as before.
+from the index as before. A changed file that holds no row is re-checked like
+any other: the row it might hold now is the reason to look.
 
 `index` recomputes deterministic facts from the working tree and reads hosted
 indexes using the credential stored by `carrick login` or `CARRICK_TOKEN`.
@@ -170,7 +171,7 @@ has not moved past: nothing needed re-judging, so nothing was.
 
 | field | type | meaning |
 |---|---|---|
-| `ran` | string | `extraction+types`: the file was re-extracted, re-joined against the blobs the index holds, and the type check reached a verdict on at least one of its rows. `extraction`: the same, and no type verdict bears on any of them. `none`: the items above are the indexed ones |
+| `ran` | string | `extraction+types`: the file was re-extracted, re-joined against the blobs the index holds, and at least one of its rows carries a type verdict. `extraction`: the same, and no row of this file carries one — nothing here pairs with anything, or its pairs were not both resolved, and each row's own `verdict.detail` says which. `none`: the items above are the indexed ones |
 | `elapsed_ms` | int | wall time of the re-check, including one that missed its budget |
 | `stale_since` | string (RFC 3339) | when the items above were computed. Present only on a `none` — otherwise the answer is now |
 | `reason` | string | why the re-check did not run, in one sentence. Present only on a `none` |

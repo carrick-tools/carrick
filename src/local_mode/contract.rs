@@ -278,9 +278,11 @@ pub struct CheckOutput {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Recheck {
     /// `extraction+types` — the file was re-extracted, re-joined against the
-    /// blobs the index holds, and the type check reached a verdict on at least
-    /// one of its rows. `extraction` — the same, with no type verdict reached
-    /// on any of them. `none` — the rows above are the indexed ones.
+    /// blobs the index holds, and at least one of its rows carries a type
+    /// verdict. `extraction` — the same, and no row of this file carries one:
+    /// nothing here pairs with anything, or the pairs it has were not both
+    /// resolved. Which of those it is, is in each row's own detail. `none` —
+    /// the rows above are the indexed ones.
     pub ran: String,
     /// Wall time of the re-check, including the run that missed its budget.
     pub elapsed_ms: u64,

@@ -152,8 +152,9 @@ export type CheckResult = {
 /** The `recheck` block of a `carrick.check/0` answer. */
 export type Recheck = {
   /**
-   * `extraction+types` — re-extracted, re-joined, and the type check reached a
-   * verdict on at least one row. `extraction` — the same with no type verdict.
+   * `extraction+types` — re-extracted, re-joined, and at least one row carries
+   * a type verdict. `extraction` — the same, and no row of this file carries
+   * one: nothing pairs with it, or its pairs were not both resolved.
    * `none` — the items are the indexed ones and `stale_since` says how old.
    */
   ran: "extraction+types" | "extraction" | "none";

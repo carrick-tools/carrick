@@ -49,9 +49,10 @@ pub enum Ran {
     /// Both halves: the file was re-extracted and the type check reached a
     /// verdict on at least one of the rows it declares.
     ExtractionAndTypes,
-    /// The file was re-extracted and joined, and no type verdict came back —
-    /// nothing here has two typed sides, or the check itself could not run.
-    /// The rows are fresh; what they say about types is not a fresh comparison.
+    /// The file was re-extracted and joined, and no row of it carries a type
+    /// verdict: nothing here pairs with anything, or the pairs it has were not
+    /// both resolved. The rows are fresh either way; which of the two it is,
+    /// is in each row's own detail, because both arrive as `not_checked`.
     Extraction,
     /// Neither: the answer below is the indexed one.
     None,
