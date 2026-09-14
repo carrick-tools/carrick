@@ -664,6 +664,26 @@ pub fn enrichment_note(
             "{}; {remote} is not connected to a Carrick project.",
             super::NOT_CLASSIFIED_LOCALLY
         ),
+        // The repo may well be connected: this is the machine saying it never
+        // had a name to ask about, which read as the cloud's refusal and sent
+        // the reader to reconnect a repo that was already connected
+        // (carrick#1056). The instruction is the one that changes the next
+        // `carrick status`, which is the remote itself — `carrick init --repo`
+        // names a repo to the cloud for that run only, and nothing on this
+        // side reads it afterwards (carrick#1058).
+        (HostedState::RemoteUnnamed, _) => match &enrichment.remote {
+            Some(url) => format!(
+                "{}; could not read owner/repo from the git remote `{url}`, so the hosted index \
+                 was never asked about this repo. Give origin a URL whose path is owner/repo, \
+                 then run `carrick refresh`.",
+                super::NOT_CLASSIFIED_LOCALLY
+            ),
+            None => format!(
+                "{}; this repo has no origin remote, so the hosted index was never asked about \
+                 it. Add one whose path is owner/repo, then run `carrick refresh`.",
+                super::NOT_CLASSIFIED_LOCALLY
+            ),
+        },
         (HostedState::NotSignedIn, _) => format!(
             "{}; not signed in, so the hosted index was not read.",
             boundary_note(boundary)

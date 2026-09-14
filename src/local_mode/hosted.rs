@@ -12,7 +12,7 @@ use super::workspace::Workspace;
 use crate::cloud_storage::CloudRepoData;
 
 use crate::credentials::{API_BASE, Credential};
-use crate::git_state::{remote_name, valid_repo_name};
+use crate::git_state::{origin, valid_repo_name};
 
 const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
@@ -173,6 +173,10 @@ pub enum HostedState {
     Enriched,
     NoIndexYet,
     NotConnected,
+    /// This machine could not read `owner/repo` from the repo's git remote, so
+    /// it never asked the cloud about it. Distinct from `NotConnected`, which
+    /// is the cloud's answer about a repo it was asked about (carrick#1056).
+    RemoteUnnamed,
     #[default]
     NotSignedIn,
     VersionMismatch,
@@ -253,6 +257,12 @@ pub(super) struct HostedInput {
     snapshot: Option<Snapshot>,
     failure: Option<String>,
     remotes: BTreeMap<PathBuf, String>,
+    /// The repos of this workspace whose `origin` names no `owner/repo`, with
+    /// the remote they carry — `None` when there is no origin at all. They are
+    /// held apart from `remotes` because nothing can be asked of the cloud for
+    /// them, and a surface that said "not connected" about them was blaming
+    /// the cloud for a name this machine could not read (carrick#1056).
+    unnamed: BTreeMap<PathBuf, Option<String>>,
     downloads: Option<Downloads>,
 }
 
@@ -573,8 +583,10 @@ fn project_is_unchanged(
 /// not a degradation of it, and a caller with no snapshot answers from local
 /// counterparts alone.
 pub(super) fn cached(workspace: &Workspace) -> HostedInput {
+    let (remotes, unnamed) = origins_of(workspace);
     let mut input = HostedInput {
-        remotes: remotes_of(workspace),
+        remotes,
+        unnamed,
         ..Default::default()
     };
     let Ok(Some(credential)) = Credential::load() else {
@@ -587,8 +599,10 @@ pub(super) fn cached(workspace: &Workspace) -> HostedInput {
 /// Read only at explicit index/refresh time. A separate thread owns its Tokio
 /// runtime because the CLI dispatcher itself already runs inside Tokio.
 pub(super) fn refresh(workspace: &Workspace) -> HostedInput {
+    let (remotes, unnamed) = origins_of(workspace);
     let mut input = HostedInput {
-        remotes: remotes_of(workspace),
+        remotes,
+        unnamed,
         ..Default::default()
     };
     let credential = match Credential::load() {
@@ -635,13 +649,30 @@ pub(super) fn refresh(workspace: &Workspace) -> HostedInput {
     input
 }
 
-/// The git remote of every repo in the workspace that has one.
-fn remotes_of(workspace: &Workspace) -> BTreeMap<PathBuf, String> {
-    workspace
-        .repos
-        .iter()
-        .filter_map(|path| remote_name(path).map(|name| (path.clone(), name)))
-        .collect()
+/// What each repo of the workspace is called, split by whether this machine
+/// could read a name at all: the `owner/repo` names, and the repos that gave
+/// none with the remote they carry.
+fn origins_of(
+    workspace: &Workspace,
+) -> (BTreeMap<PathBuf, String>, BTreeMap<PathBuf, Option<String>>) {
+    let mut named = BTreeMap::new();
+    let mut unnamed = BTreeMap::new();
+    for path in &workspace.repos {
+        match origin(path) {
+            Some(origin) => match origin.name {
+                Some(name) => {
+                    named.insert(path.clone(), name);
+                }
+                None => {
+                    unnamed.insert(path.clone(), Some(origin.url));
+                }
+            },
+            None => {
+                unnamed.insert(path.clone(), None);
+            }
+        }
+    }
+    (named, unnamed)
 }
 
 /// The snapshot on disk, if it belongs to this credential and this
@@ -778,7 +809,16 @@ impl HostedInput {
         };
         result.allowance_sentence = snapshot.resolution.allowance_sentence.clone();
         let Some(repo) = self.repo(path).filter(|r| r.connected) else {
-            result.hosted_state = HostedState::NotConnected;
+            // Two different answers wear one sentence otherwise: the cloud
+            // saying it does not hold this repo, and this machine never having
+            // had a name to ask about (carrick#1056). The remote rides along
+            // so the surface can name what it read.
+            if let Some(remote) = self.unnamed.get(path) {
+                result.hosted_state = HostedState::RemoteUnnamed;
+                result.remote = remote.clone();
+            } else {
+                result.hosted_state = HostedState::NotConnected;
+            }
             return result;
         };
         let previous = self
@@ -1628,6 +1668,7 @@ mod tests {
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
+            unnamed: BTreeMap::new(),
             downloads: None,
         };
         assert_eq!(input.local_blobs(Path::new("/w/api")).len(), 1);
@@ -1654,6 +1695,7 @@ mod tests {
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
+            unnamed: BTreeMap::new(),
             downloads: None,
         };
         let path = Path::new("/w/api");
@@ -1700,6 +1742,7 @@ mod tests {
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
+            unnamed: BTreeMap::new(),
             downloads: None,
         };
         let answer = input.uploaded(Path::new("/w/api"), &blob());
@@ -1717,6 +1760,71 @@ mod tests {
         );
     }
 
+    /// The cloud's "I do not hold this repo" and the machine's "I never had a
+    /// name to ask about" are separate answers and separate sentences
+    /// (carrick#1056). Both reach the same place — no hosted rows — and only
+    /// one of them is fixed by connecting the repo.
+    #[test]
+    fn a_repo_whose_remote_names_nothing_is_not_reported_as_unconnected() {
+        let signed_in = |remotes: BTreeMap<PathBuf, String>,
+                         unnamed: BTreeMap<PathBuf, Option<String>>| {
+            HostedInput {
+                snapshot: Some(Snapshot {
+                    identity: "test".into(),
+                    checked_at: "now".into(),
+                    resolution: Resolution::parse(resolution()).unwrap(),
+                    projects: BTreeMap::new(),
+                }),
+                failure: None,
+                remotes,
+                unnamed,
+                downloads: None,
+            }
+        };
+        let path = Path::new("/w/mirror");
+
+        // A name the workspace does not hold: the cloud answered, and this is
+        // its answer.
+        let named = signed_in(
+            BTreeMap::from([(path.to_path_buf(), "other/mirror".into())]),
+            BTreeMap::new(),
+        );
+        let answer = named.service(path, &blob());
+        assert_eq!(answer.hosted_state, HostedState::NotConnected);
+        let note = super::super::query::enrichment_note(&answer, None);
+        assert!(
+            note.contains("is not connected to a Carrick project"),
+            "{note}"
+        );
+
+        // No name at all: nothing was asked, so nothing was refused.
+        let unnamed = signed_in(
+            BTreeMap::new(),
+            BTreeMap::from([(path.to_path_buf(), Some("/srv/mirrors/api".to_string()))]),
+        );
+        let answer = unnamed.service(path, &blob());
+        assert_eq!(answer.hosted_state, HostedState::RemoteUnnamed);
+        assert_eq!(answer.remote.as_deref(), Some("/srv/mirrors/api"));
+        let note = super::super::query::enrichment_note(&answer, None);
+        assert!(
+            note.contains("could not read owner/repo from the git remote `/srv/mirrors/api`"),
+            "{note}"
+        );
+        assert!(!note.contains("not connected"), "{note}");
+
+        // No origin remote at all: there is no URL to name, and the sentence
+        // says the other thing rather than printing an empty one.
+        let none = signed_in(
+            BTreeMap::new(),
+            BTreeMap::from([(path.to_path_buf(), None)]),
+        );
+        let answer = none.service(path, &blob());
+        assert_eq!(answer.hosted_state, HostedState::RemoteUnnamed);
+        assert_eq!(answer.remote, None);
+        let note = super::super::query::enrichment_note(&answer, None);
+        assert!(note.contains("has no origin remote"), "{note}");
+    }
+
     /// A dirty generation carries no replayable answers by design, and saying
     /// "uploaded, all good" over the top of that would be false.
     #[test]
@@ -1725,6 +1833,7 @@ mod tests {
             snapshot: None,
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
+            unnamed: BTreeMap::new(),
             downloads: None,
         };
         let mut dirty = blob();

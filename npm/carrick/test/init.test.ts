@@ -1200,6 +1200,12 @@ test("every hosted outcome is one line, and only an actionable one is a warning"
   const local = hostedReport({ kind: "local_only", services: 3, state: "commit_missing" });
   assert.equal(local.kind, "warn");
   assert.match(local.text, /\.carrick\/ holds 3 services as this machine read them; the commit/);
+  // The state this run can cause itself: a repo it just connected under a name
+  // the scanner cannot read back off the git remote (carrick#1056). The clause
+  // has to name the remote as the reason, not the connection.
+  const unnamed = hostedReport({ kind: "local_only", services: 1, state: "remote_unnamed" });
+  assert.match(unnamed.text, /git remote here names no owner\/repo/);
+  assert.doesNotMatch(unnamed.text, /not connected/);
   const failed = hostedReport({ kind: "failed", problem: "api has no carrick.json" });
   assert.deepEqual(failed, {
     kind: "refuse",

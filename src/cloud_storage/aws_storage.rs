@@ -967,8 +967,9 @@ impl AwsStorage {
     async fn start_scan(&self, run: &RunContext) -> Result<RunStart, StorageError> {
         let repo = run.repo_full_name.as_deref().ok_or_else(|| {
             StorageError::ConnectionError(
-                "This directory has no github.com origin remote, so Carrick cannot tell the \
-                 cloud which repository it is scanning. Add the remote, or run the scan in CI."
+                "Carrick could not read owner/repo from this directory's git origin remote, so \
+                 it cannot tell the cloud which repository it is scanning. Give origin a URL \
+                 whose path is owner/repo, or run the scan in CI."
                     .to_string(),
             )
         })?;
