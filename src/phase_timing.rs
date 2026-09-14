@@ -41,7 +41,10 @@ pub enum Phase {
     Graph,
     /// The deterministic protocol scans (GraphQL, sockets, pub/sub).
     Protocols,
-    /// Function-intent generation.
+    /// The wait for function intents left once the stages before it are done.
+    /// Intents start at discovery and run beside `Model`, `Graph` and
+    /// `Protocols` (carrick#1065), so most of their wall clock is inside
+    /// those marks; a small figure here does not mean intents did not run.
     Intents,
     /// Function-signature composition, including sidecar inference.
     Signatures,

@@ -141,19 +141,22 @@ struct Pending {
 /// Concurrent `/generate-intent` calls in flight per dependency level when
 /// `CARRICK_INTENT_CONCURRENCY` is unset.
 ///
-/// Deliberately below the shared `CARRICK_CONCURRENCY_LIMIT` (20) that file
-/// analysis runs at. Intent calls outnumber file-analysis calls by an order of
-/// magnitude on a function-dense repo — roughly one per function rather than
-/// one per file — so the same in-flight count is a far higher sustained
-/// request rate against the same backend quota, which is what produced the
-/// 429-wrapped 503s in #460.
-const DEFAULT_INTENT_CONCURRENCY: usize = 8;
+/// The same depth file analysis queues at. This was 8, on the reading that
+/// intent calls, one per function, would push a higher request rate against
+/// the backend quota (#460). A measured first index of a large monorepo said
+/// otherwise: at 8 the stage ran well under what 8 slots could carry, and the
+/// 429s it met tracked backend capacity, not the scanner's request rate, so
+/// the low depth bought no fewer 429s and cost most of the scan's wall clock
+/// (carrick#1065). The intent stage also runs beside file analysis now, and
+/// both draw on one process-wide semaphore that bounds what is in flight.
+const DEFAULT_INTENT_CONCURRENCY: usize = 20;
 
-/// In-flight `/generate-intent` calls allowed per level.
+/// In-flight `/generate-intent` calls queued per level.
 ///
-/// `CARRICK_INTENT_CONCURRENCY` overrides the default. Raising it above
-/// `CARRICK_CONCURRENCY_LIMIT` has no effect: `AgentService` holds a semaphore
-/// at that count, so it is the hard ceiling for every lambda call.
+/// `CARRICK_INTENT_CONCURRENCY` overrides the default. It is a queue depth:
+/// the process-wide semaphore behind `AgentService` (`CARRICK_CONCURRENCY_LIMIT`)
+/// caps every lambda call in flight, and file analysis draws on the same one
+/// while both stages run.
 fn intent_concurrency() -> usize {
     std::env::var("CARRICK_INTENT_CONCURRENCY")
         .ok()
@@ -469,6 +472,83 @@ pub async fn generate_function_intents(
 
     // Strip body_source — source code stays in GitHub, not AWS
     strip_body_source(function_definitions);
+}
+
+/// [`generate_function_intents`] started on a task of its own, so a service's
+/// intents are generated while the rest of its analysis runs (carrick#1065).
+///
+/// Intents need only what discovery produced (the definitions, with their
+/// bodies and resolved call edges) and the previous scan's hashes; nothing the
+/// file analyzer, the mount graph or the protocol scans compute feeds them.
+/// Waiting for the file analyzer's last file before asking for the first
+/// intent left the intent stage idle for the whole of the model stage.
+///
+/// Dropping the handle aborts the task. A service whose analysis fails part
+/// way returns early past the point that would have collected the intents,
+/// and the task must not go on calling the model for a result nobody reads.
+pub struct IntentsInFlight {
+    task: AbortOnDrop<HashMap<String, FunctionDefinition>>,
+}
+
+impl IntentsInFlight {
+    /// Start generating intents for `function_definitions` on the runtime.
+    pub fn start(
+        agent_service: AgentService,
+        mut function_definitions: HashMap<String, FunctionDefinition>,
+        prev_intents_by_hash: HashMap<String, String>,
+    ) -> Self {
+        let task = tokio::spawn(async move {
+            generate_function_intents(
+                &agent_service,
+                &mut function_definitions,
+                &prev_intents_by_hash,
+            )
+            .await;
+            function_definitions
+        });
+        Self {
+            task: AbortOnDrop(Some(task)),
+        }
+    }
+
+    /// Wait for the intents and take the definitions back, intents written and
+    /// `body_source` stripped, exactly as [`generate_function_intents`] leaves
+    /// them.
+    pub async fn finish(self) -> HashMap<String, FunctionDefinition> {
+        self.task.join().await
+    }
+}
+
+/// A spawned task that is aborted when its handle is dropped before it has
+/// been joined.
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    /// Wait for the task's value. A panic inside the task resumes here, as it
+    /// would have had the work run inline.
+    async fn join(mut self) -> T {
+        let handle = self
+            .0
+            .as_mut()
+            .expect("an AbortOnDrop is joined at most once");
+        // Awaited through `&mut` so that the handle stays in `self` while it
+        // is pending: if THIS future is dropped mid-wait, `Drop` still aborts.
+        let joined = handle.await;
+        self.0 = None;
+        match joined {
+            Ok(value) => value,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => panic!("task ended without a result: {error}"),
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
 }
 
 /// Remove body_source from all function definitions.
@@ -1190,5 +1270,68 @@ mod tests {
             "peak in-flight was {}, expected at most 3",
             peak.load(Ordering::SeqCst)
         );
+    }
+
+    /// Started on its own task, intent generation hands back the definitions
+    /// in the state the inline call left them: intents written, their hashes
+    /// recorded, bodies stripped. The previous scan covers every function, so
+    /// no lambda call is made.
+    #[tokio::test]
+    async fn intents_in_flight_return_the_definitions_the_inline_call_would() {
+        let _env = ENV_LOCK.lock().await;
+        let body = "const rate = table[region];\nreturn base * rate;";
+        let mut defs = HashMap::new();
+        defs.insert("helper".to_string(), def_with_body("helper", body));
+        let hash = compute_intent_hash(body, &[]);
+        let prev = HashMap::from([(hash.clone(), "applies a regional rate".to_string())]);
+
+        let in_flight = IntentsInFlight::start(AgentService::new(), defs, prev);
+        let defs = in_flight.finish().await;
+
+        assert_eq!(
+            defs["helper"].intent.as_deref(),
+            Some("applies a regional rate")
+        );
+        assert_eq!(
+            defs["helper"].intent_input_hash.as_deref(),
+            Some(hash.as_str())
+        );
+        assert!(defs["helper"].body_source.is_none());
+    }
+
+    /// A service whose analysis fails returns before it collects its intents;
+    /// the dropped handle must stop the task rather than let it keep calling
+    /// the model for a result nobody reads.
+    #[tokio::test]
+    async fn dropping_an_unjoined_task_aborts_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = finished.clone();
+        let task = AbortOnDrop(Some(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            flag.store(true, Ordering::SeqCst);
+        })));
+
+        // Let the task start and park in its sleep, so the drop has to stop a
+        // task that is running, not one that has never been polled.
+        tokio::task::yield_now().await;
+        drop(task);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "the task ran to completion after its handle was dropped"
+        );
+    }
+
+    /// A panic inside the task surfaces where the value is collected, as it
+    /// would have had the work run inline.
+    #[tokio::test]
+    #[should_panic(expected = "intent stage blew up")]
+    async fn a_panic_in_the_task_resumes_at_join() {
+        let task: AbortOnDrop<()> = AbortOnDrop(Some(tokio::spawn(async {
+            panic!("intent stage blew up");
+        })));
+        task.join().await;
     }
 }

@@ -10,7 +10,7 @@ use crate::cloud_storage::{
 use crate::config::Config;
 use crate::file_finder::find_service_files;
 use crate::framework_detector::{DetectionResult, FrameworkDetector};
-use crate::intent_generator::{generate_function_intents, intents_by_hash};
+use crate::intent_generator::{IntentsInFlight, intents_by_hash};
 use crate::logging;
 use crate::mount_graph::MountGraph;
 use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
@@ -1781,6 +1781,25 @@ async fn analyze_current_repo_incremental(
 
         // Get changed files via git diff
         if let Some(changed_files) = get_changed_files(repo_path, prev_commit) {
+            // Function intents need only discovery's definitions and the
+            // previous scan's hashes, so they start now and run beside
+            // detection, file analysis and the graph (carrick#1065). Started
+            // only once this branch is committed to: the fallback below runs
+            // its own discovery and would otherwise pay for intents twice.
+            //
+            // Caching is content-addressed: a `content_hash -> intent` map from
+            // the previous scan lets the generator reuse an intent whenever a
+            // function's body and its callees' intents are unchanged, without
+            // re-calling /generate-intent. A caller in an unchanged file is
+            // still refreshed when one of its callees changed (the caller's
+            // hash includes its callee intents). Incremental scans populate
+            // FunctionDefinition.intent exactly as full ones do (issue #110).
+            let intents = IntentsInFlight::start(
+                AgentService::new(),
+                function_definitions,
+                intents_by_hash(&prev.function_definitions),
+            );
+
             let prev_file_results = prev.file_results.as_ref().unwrap();
             let repo_prefix = format!("{}/", repo_path);
 
@@ -1954,21 +1973,10 @@ async fn analyze_current_repo_incremental(
             fold_graphql_transport_calls(&mut mount_graph, &protocol_extractions.graphql);
             crate::phase_timing::mark(crate::phase_timing::Phase::Protocols);
 
-            // Generate function intents (also strips body_source before upload).
-            // Run on the same path as the full analysis so incremental scans
-            // populate FunctionDefinition.intent in DDB (issue #110).
-            //
-            // Caching is content-addressed: a `content_hash -> intent` map from
-            // the previous scan lets the generator reuse an intent whenever a
-            // function's body and its callees' intents are unchanged — without
-            // re-calling /generate-intent. Unlike the old name+file seeding,
-            // this also refreshes a caller in an unchanged file when one of its
-            // callees changed (the caller's hash includes its callee intents),
-            // so cross-file staleness no longer slips through.
-            let mut function_definitions = function_definitions;
-            let prev_intents = intents_by_hash(&prev.function_definitions);
-            generate_function_intents(&agent_service, &mut function_definitions, &prev_intents)
-                .await;
+            // Collect the intents started after discovery (body_source is
+            // stripped from every definition by now). `Intents` times only the
+            // wait left at this point; the rest overlapped the stages above.
+            let mut function_definitions = intents.finish().await;
             crate::phase_timing::mark(crate::phase_timing::Phase::Intents);
 
             // Compose function signatures, inferring unannotated slots via sidecar.
@@ -2159,7 +2167,7 @@ async fn analyze_current_repo_incremental(
         config,
         packages,
         sidecar,
-        &prev_intents,
+        prev_intents,
         workspace,
     )
     .await?;
@@ -4781,7 +4789,7 @@ async fn analyze_current_repo(
     service: &Config,
     packages: &Packages,
     sidecar: Option<&TypeSidecar>,
-    prev_intents_by_hash: &HashMap<String, String>,
+    prev_intents_by_hash: HashMap<String, String>,
     workspace: &mut crate::external_call_candidates::WorkspaceScan,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     // Canonicalize repo_path for consistent path normalization between runs
@@ -4805,6 +4813,18 @@ async fn analyze_current_repo(
         function_definitions.len()
     );
     crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
+
+    // Function intents need only discovery's definitions and the previous
+    // scan's hashes, so they run beside the multi-agent analysis rather than
+    // after it (carrick#1065). Even on a full scan, intents whose content hash
+    // matches the previous scan are reused: the intent cache is
+    // content-addressed and independent of the analysis cache's validity (see
+    // the caller).
+    let intents = IntentsInFlight::start(
+        AgentService::new(),
+        function_definitions,
+        prev_intents_by_hash,
+    );
 
     // 3. Create MultiAgentOrchestrator (auth is via GitHub Actions OIDC)
     let orchestrator = MultiAgentOrchestrator::new(cm.clone());
@@ -4844,20 +4864,10 @@ async fn analyze_current_repo(
         .await?;
     crate::phase_timing::mark(crate::phase_timing::Phase::Model);
 
-    // 4b. Generate function intents using LLM
-    let mut function_definitions = function_definitions;
-    {
-        let intent_agent = AgentService::new();
-        // Even on a full scan, intents whose content hash matches the
-        // previous scan are reused — the intent cache is content-addressed
-        // and independent of the analysis cache's validity (see the caller).
-        generate_function_intents(
-            &intent_agent,
-            &mut function_definitions,
-            prev_intents_by_hash,
-        )
-        .await;
-    }
+    // 4b. Collect the function intents started after discovery. `Intents`
+    // times only the wait left at this point; the rest overlapped the model
+    // stage above.
+    let mut function_definitions = intents.finish().await;
     crate::phase_timing::mark(crate::phase_timing::Phase::Intents);
 
     // 4c. Compose function signatures, inferring unannotated slots via sidecar.
