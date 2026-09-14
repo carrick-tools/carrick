@@ -468,6 +468,21 @@ pub fn spinner(msg: &str) -> ProgressBar {
     pb
 }
 
+/// Say which item a running stage has reached, without finishing it.
+///
+/// A stage that loops over services is one spinner for the whole loop, and a
+/// thirteen-service repo spent minutes on each without saying which
+/// (carrick#1067). In a terminal that is the spinner's own label; in a pipe —
+/// which is where a detached scan's log is read — it is one `▸ <msg>` line per
+/// item, the same shape [`spinner`] emits for a stage start.
+pub fn progress(pb: &ProgressBar, msg: &str) {
+    if !is_tty() {
+        eprintln!("▸ {}", msg);
+        return;
+    }
+    pb.set_message(msg.to_string());
+}
+
 /// Finish a spinner with a success checkmark.
 pub fn finish_spinner(pb: &ProgressBar, msg: &str) {
     if !is_tty() {

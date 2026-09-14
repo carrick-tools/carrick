@@ -96,6 +96,21 @@ impl CloudStorage for LocalDirStorage {
         Ok(UploadOutcome::default())
     }
 
+    /// Read the cache file back and compare the commit it carries.
+    ///
+    /// A local write fails outright or not at all, so this never arbitrates a
+    /// lost response the way the cloud backend does — but it is the same
+    /// question, answered from the same store, and an unreadable or
+    /// unparseable file is "not at this commit" (carrick#1067).
+    async fn index_landed(&self, data: &CloudRepoData) -> Result<bool, StorageError> {
+        let path = self.cache_path(&data.repo_name, data.service_name.as_deref());
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return Ok(false);
+        };
+        Ok(serde_json::from_str::<CloudRepoData>(&content)
+            .is_ok_and(|stored| stored.commit_hash == data.commit_hash))
+    }
+
     // Cache files are keyed by (repo, service), so each service of a
     // multi-service repo persists to its own file without clobbering — same
     // property as MockStorage.

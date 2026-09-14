@@ -56,6 +56,12 @@ walkdir = "2.5.0"
 [dev-dependencies]
 tempfile = "3.0"
 serial_test = "3.0"
+# `test-util` is the one tokio feature `full` leaves out, and it is what lets a
+# test assert a wait schedule without serving it: `#[tokio::test(start_paused =
+# true)]` advances the clock past every `sleep` as soon as the runtime idles.
+# The upload's landed-check waits half a minute for a handler that may still be
+# committing (carrick#1067), and no test should.
+tokio = { version = "1", features = ["test-util"] }
 # Test-only gzip encoder, so the cloud-client test can serve a real
 # `Content-Encoding: gzip` response. Adds nothing to the dependency graph:
 # reqwest's `gzip` feature already pulls flate2 in transitively.

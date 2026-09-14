@@ -51,6 +51,39 @@ fn max_retries_for_action(action: &str) -> u32 {
     }
 }
 
+/// Whether the request behind a failure could still be running on the cloud.
+///
+/// A transport error (the gateway cut the connection, or the client's own
+/// deadline passed) and a 5xx both leave a handler that may be mid-write: the
+/// HTTP API integration ceiling is 30 s and the lambda's own is longer, so the
+/// response is lost while the write goes on (carrick#1067; on 2026-09-14 it
+/// landed 25 s after the cut). A 408 or a 429 is the edge refusing, and
+/// nothing is running behind it.
+fn handler_may_still_run(status: Option<reqwest::StatusCode>) -> bool {
+    match status {
+        Some(status) => status.is_server_error(),
+        // No status at all: the request failed in transport, having already
+        // been sent.
+        None => true,
+    }
+}
+
+/// The error a write action's caller sees when an attempt's outcome was never
+/// observed — either the budget ran out on a transient failure, or a later
+/// attempt was refused after an earlier one went unanswered.
+///
+/// Not a message: the engine answers this by asking the cloud what it holds
+/// (`CloudStorage::index_landed`) rather than by ending the run, so the two
+/// facts it needs to decide — which action, and whether anything may still be
+/// running behind it — are carried in the value (carrick#1067).
+fn uncertain_write(action: &str, message: String, handler_may_still_run: bool) -> StorageError {
+    StorageError::UncertainWrite(crate::cloud_storage::UncertainWrite {
+        action: action.to_string(),
+        handler_may_still_run,
+        message,
+    })
+}
+
 /// The error a caller sees once the retry budget is spent. On a write action
 /// the failure is ambiguous rather than final, and saying so is what stops the
 /// next reader from assuming the index is stale and forcing a re-scan.
@@ -228,6 +261,12 @@ pub struct AwsStorage {
     /// Present only on the laptop path, where it is the name every action of
     /// the run reports (see [`AwsStorage::authorized_copy`]).
     authorized_repo: std::sync::OnceLock<String>,
+    /// The full `owner/repo` this run is scanning, from the clone's remote.
+    /// Recorded on BOTH paths when the run opens, because `resolve-repos` —
+    /// the landed-check's read — names repositories that way and nothing else
+    /// in a scan does (carrick#1067). Absent on a clone with no GitHub remote,
+    /// which is the one case the check cannot be made in.
+    repo_full_name: std::sync::OnceLock<String>,
 }
 
 #[derive(Serialize)]
@@ -353,6 +392,80 @@ struct StartScanResponse {
 /// not deployed this action, and the scanner says so rather than reading a
 /// body it does not understand.
 const START_SCAN_SCHEMA: &str = "carrick.start-scan/0";
+
+/// `resolve-repos`: the landed-check's read (carrick#1067).
+///
+/// It is the one action that answers what the index HOLDS for a service —
+/// `{ service, hash }` per stored row — and it answers in scalars, so asking
+/// it after a lost write costs a DynamoDB query rather than the project's
+/// blobs. `check-or-upload` cannot answer the same question: its `exists` is
+/// cleared by a HeadObject on the `types.d.ts` the scanner itself just PUT, so
+/// on the `complete-upload` path it reads true whether or not the row moved.
+#[derive(Serialize)]
+struct ResolveReposRequest<'a> {
+    action: &'a str,
+    repos: [&'a str; 1],
+}
+
+/// The slice of the `resolve-repos` 200 body the landed-check reads. Every
+/// other field the response carries — the workspace, the allowance sentence,
+/// the project map — belongs to `carrick init`, not here.
+#[derive(Deserialize)]
+struct ResolveReposResponse {
+    schema: String,
+    #[serde(default)]
+    repos: Vec<ResolvedRepo>,
+}
+
+#[derive(Deserialize)]
+struct ResolvedRepo {
+    full_name: String,
+    /// Absent on a repo the workspace has not connected, which is not an
+    /// error here: it means the cloud holds nothing for it.
+    #[serde(default)]
+    services: Vec<ResolvedService>,
+}
+
+#[derive(Deserialize)]
+struct ResolvedService {
+    /// The cloud's service segment for the row — the sanitized slug, not the
+    /// name the scanner sent. See [`indexed_service_slug`].
+    service: String,
+    /// The commit the stored row is at. Null on a row that has never been
+    /// written, which reads as "not this commit".
+    #[serde(default)]
+    hash: Option<String>,
+}
+
+/// The tag `resolve-repos` answers under.
+const RESOLVE_REPOS_SCHEMA: &str = "carrick.resolve-repos/0";
+
+/// The service segment the cloud keys a stored row on.
+///
+/// Mirrors `sanitizeService` in carrick-cloud
+/// `lambdas/check-or-upload/keys.js`: lowercased, every run of
+/// non-alphanumerics becomes one `-`, leading and trailing `-` are dropped,
+/// and a name that leaves nothing falls back to the repository — which is what
+/// a single-service repo, sending no `service_name` at all, is stored under.
+/// Duplicated here because the landed-check has to name the row it is asking
+/// about, and `resolve-repos` reports rows under the cloud's slug rather than
+/// the scanner's name (carrick#1067).
+fn indexed_service_slug(service_name: Option<&str>, repo_basename: &str) -> String {
+    let mut slug = String::new();
+    for ch in service_name.unwrap_or_default().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let trimmed = slug.trim_matches('-');
+    if trimmed.is_empty() {
+        repo_basename.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
 
 /// Integrity fields for a payload that was staged to S3 rather than inlined.
 /// Computed once, from the same serialized bytes that are PUT.
@@ -553,6 +666,7 @@ impl AwsStorage {
             multi_service: std::sync::atomic::AtomicBool::new(false),
             force_reindex,
             authorized_repo: std::sync::OnceLock::new(),
+            repo_full_name: std::sync::OnceLock::new(),
         }
     }
 
@@ -676,8 +790,14 @@ impl AwsStorage {
     {
         let max_retries = max_retries_for_action(action);
         let mut retries = 0u32;
+        // What earlier attempts of THIS call left behind: whether one of them
+        // went unanswered, and whether a handler may still be running behind
+        // it. Together they turn a later refusal of a write action from a
+        // verdict into a question (carrick#1067).
+        let mut lost_an_attempt = false;
+        let mut may_still_run = false;
         loop {
-            let transient_error = match self
+            let (transient_error, status) = match self
                 .http_client
                 .post(&self.lambda_url)
                 .header("Authorization", format!("Bearer {}", token))
@@ -706,25 +826,38 @@ impl AwsStorage {
                                 )));
                             }
                             if !is_transient_status(status) {
-                                return Err(StorageError::ConnectionError(refusal_message(
-                                    status,
-                                    &response_text,
-                                )));
+                                let refusal = refusal_message(status, &response_text);
+                                // The incident's shape: the first attempt's
+                                // response was lost and the retry was answered
+                                // 400 in 169 ms. That 400 is about the retry,
+                                // not about the write — a duplicate arriving
+                                // while the first one is still committing is
+                                // exactly what it looks like — so it must not
+                                // read as "the upload failed" (carrick#1067).
+                                return Err(if lost_an_attempt && is_write_action(action) {
+                                    uncertain_write(action, refusal, may_still_run)
+                                } else {
+                                    StorageError::ConnectionError(refusal)
+                                });
                             }
-                            refusal_message(status, &response_text)
+                            (refusal_message(status, &response_text), Some(status))
                         }
-                        Err(e) => format!("Failed to read response: {}", e),
+                        Err(e) => (format!("Failed to read response: {}", e), Some(status)),
                     }
                 }
-                Err(e) => format!("Lambda request failed: {}", e),
+                Err(e) => (format!("Lambda request failed: {}", e), None),
             };
 
+            lost_an_attempt = true;
+            may_still_run = may_still_run || handler_may_still_run(status);
+
             if retries >= max_retries {
-                return Err(StorageError::ConnectionError(retry_exhausted_message(
-                    action,
-                    &transient_error,
-                    retries + 1,
-                )));
+                let message = retry_exhausted_message(action, &transient_error, retries + 1);
+                return Err(if is_write_action(action) {
+                    uncertain_write(action, message, may_still_run)
+                } else {
+                    StorageError::ConnectionError(message)
+                });
             }
 
             let backoff = retry_backoff(retries);
@@ -750,6 +883,11 @@ impl AwsStorage {
 
         let mut reminted = false;
         let mut retries = 0u32;
+        // As in the Bearer loop: what earlier attempts of this call left
+        // unanswered, and whether anything may still be running behind them
+        // (carrick#1067).
+        let mut lost_an_attempt = false;
+        let mut may_still_run = false;
         loop {
             // Per attempt, not once per call: the upload is the last thing a
             // scan does, and on a long scan the token minted at the start has
@@ -761,7 +899,7 @@ impl AwsStorage {
                 .await
                 .map_err(|e| StorageError::ConnectionError(e.to_string()))?;
 
-            let transient_error = match self
+            let (transient_error, status) = match self
                 .http_client
                 .post(&self.lambda_url)
                 .header("X-Carrick-OIDC", &token)
@@ -798,26 +936,36 @@ impl AwsStorage {
                             }
 
                             if !is_transient_status(status) {
-                                return Err(StorageError::ConnectionError(format!(
-                                    "Lambda returned error {}: {}",
-                                    status, response_text
-                                )));
+                                let refusal =
+                                    format!("Lambda returned error {}: {}", status, response_text);
+                                return Err(if lost_an_attempt && is_write_action(action) {
+                                    uncertain_write(action, refusal, may_still_run)
+                                } else {
+                                    StorageError::ConnectionError(refusal)
+                                });
                             }
 
-                            format!("Lambda returned {}: {}", status, response_text)
+                            (
+                                format!("Lambda returned {}: {}", status, response_text),
+                                Some(status),
+                            )
                         }
-                        Err(e) => format!("Failed to read response: {}", e),
+                        Err(e) => (format!("Failed to read response: {}", e), Some(status)),
                     }
                 }
-                Err(e) => format!("Lambda request failed: {}", e),
+                Err(e) => (format!("Lambda request failed: {}", e), None),
             };
 
+            lost_an_attempt = true;
+            may_still_run = may_still_run || handler_may_still_run(status);
+
             if retries >= max_retries {
-                return Err(StorageError::ConnectionError(retry_exhausted_message(
-                    action,
-                    &transient_error,
-                    retries + 1,
-                )));
+                let message = retry_exhausted_message(action, &transient_error, retries + 1);
+                return Err(if is_write_action(action) {
+                    uncertain_write(action, message, may_still_run)
+                } else {
+                    StorageError::ConnectionError(message)
+                });
             }
 
             let backoff = retry_backoff(retries);
@@ -1353,12 +1501,68 @@ impl CloudStorage for AwsStorage {
     }
 
     async fn begin_run(&self, run: &RunContext) -> Result<RunStart, StorageError> {
+        // The repository this run is scanning, recorded on both paths before
+        // anything is written: it is what `resolve-repos` needs to answer the
+        // landed-check, and the CI path never sends it anywhere else
+        // (carrick#1067). No request shape changes — this reads the context
+        // the run already carries.
+        if let Some(full_name) = run.repo_full_name.as_deref() {
+            let _ = self.repo_full_name.set(full_name.to_string());
+        }
         match &self.auth {
             // The CI path, unchanged: the probe's body, its response and its
             // error handling are exactly what they were.
             CloudAuth::Oidc => self.health_check().await.map(|()| RunStart::default()),
             CloudAuth::Bearer(_) => self.start_scan(run).await,
         }
+    }
+
+    /// Ask `resolve-repos` what the index holds for this service, and compare
+    /// its commit to this payload's.
+    ///
+    /// Fail-closed in every direction: no remote to name the repository, a
+    /// schema this scanner does not read, a row under no matching service slug
+    /// and a null hash all answer "not at this commit", because the caller
+    /// turns `true` into "the write landed, carry on".
+    async fn index_landed(&self, data: &CloudRepoData) -> Result<bool, StorageError> {
+        let full_name = self.repo_full_name.get().ok_or_else(|| {
+            StorageError::ConnectionError(
+                "This clone has no github.com origin remote, so Carrick cannot ask the cloud \
+                 what it holds for this repository."
+                    .to_string(),
+            )
+        })?;
+        let basename = full_name.rsplit('/').next().unwrap_or(full_name);
+        let wanted = indexed_service_slug(data.service_name.as_deref(), basename);
+
+        let request = ResolveReposRequest {
+            action: "resolve-repos",
+            repos: [full_name],
+        };
+        let response: ResolveReposResponse =
+            self.call_lambda_generic(request.action, &request).await?;
+        if response.schema != RESOLVE_REPOS_SCHEMA {
+            return Err(StorageError::ConnectionError(format!(
+                "Carrick Cloud answered resolve-repos with schema '{}'; this scanner reads {}.",
+                response.schema, RESOLVE_REPOS_SCHEMA
+            )));
+        }
+
+        let stored = response
+            .repos
+            .iter()
+            .find(|repo| repo.full_name.eq_ignore_ascii_case(full_name))
+            .and_then(|repo| {
+                repo.services
+                    .iter()
+                    .find(|service| service.service == wanted)
+            })
+            .and_then(|service| service.hash.as_deref());
+        debug!(
+            "Landed check for {}/{}: index holds {:?}, this run wrote {}",
+            full_name, wanted, stored, data.commit_hash
+        );
+        Ok(stored == Some(data.commit_hash.as_str()))
     }
 
     async fn health_check(&self) -> Result<(), StorageError> {
@@ -2570,6 +2774,173 @@ mod tests {
             "a repo that is not connected is not a credential to replace: {message}"
         );
         server.join().unwrap();
+    }
+
+    /// carrick#1067. The incident's exact shape: `store-metadata`'s first
+    /// attempt dies on the gateway's 30 s cut while the handler keeps
+    /// committing, and the one retry is answered 400 in milliseconds. That 400
+    /// is about the retry, not about the write, so it must reach the engine as
+    /// a question — with the fact that something may still be running behind
+    /// it, which is what makes the landed-check wait rather than ask once.
+    #[tokio::test]
+    async fn a_write_refused_after_a_lost_attempt_is_uncertain_rather_than_failed() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (504, "upstream request timeout".to_string()),
+                (
+                    400,
+                    serde_json::json!({ "error": "no staged payload", "code": "payload_missing" })
+                        .to_string(),
+                ),
+            ],
+            "scan_01J",
+        );
+
+        let error = storage.upload_repo_data(&blob(), true).await.unwrap_err();
+        let uncertain = error
+            .uncertain_write()
+            .unwrap_or_else(|| panic!("a lost write, got: {error}"));
+        assert_eq!(uncertain.action, "store-metadata");
+        assert!(
+            uncertain.handler_may_still_run,
+            "a 504 leaves a handler that may still be committing"
+        );
+        assert!(uncertain.message.contains("400"), "{}", uncertain.message);
+        server.join().unwrap();
+    }
+
+    /// A refusal the cloud answered on the first attempt is a decision, not a
+    /// lost response: nothing ran, there is nothing to check, and the run
+    /// reports it as the failure it is.
+    #[tokio::test]
+    async fn a_first_attempt_refusal_stays_final() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (
+                    409,
+                    serde_json::json!({ "error": "index would lose files", "code": "partial_refused" })
+                        .to_string(),
+                ),
+            ],
+            "scan_01J",
+        );
+
+        let error = storage.upload_repo_data(&blob(), true).await.unwrap_err();
+        assert!(
+            error.uncertain_write().is_none(),
+            "a 409 answered straight away is final: {error}"
+        );
+        server.join().unwrap();
+    }
+
+    /// The landed-check reads the STORED ROW's commit off `resolve-repos`, for
+    /// the one service that was being uploaded. `check-or-upload` cannot
+    /// answer this: its `exists` is cleared by a HeadObject on the
+    /// `types.d.ts` this scanner itself PUT moments earlier, so on the
+    /// `complete-upload` path it reads true whether or not the row moved.
+    #[tokio::test]
+    async fn the_landed_check_compares_the_stored_row_to_this_run() {
+        let landed = serde_json::json!({
+            "schema": "carrick.resolve-repos/0",
+            "workspace": { "slug": "acme", "billing_tier": "paid", "installed": true },
+            "allowance_sentence": null,
+            "repos": [{
+                "full_name": "example/api",
+                "connected": true,
+                "project_id": "proj_1",
+                "project_slug": "payments",
+                "services": [
+                    { "service": "api", "hash": "4f2a1c9" },
+                    { "service": "web", "hash": "0000000" }
+                ]
+            }],
+            "project_repos": []
+        })
+        .to_string();
+        let (storage, server) = bearer_storage(vec![(200, landed)]);
+        storage
+            .repo_full_name
+            .set("example/api".to_string())
+            .unwrap();
+
+        assert!(storage.index_landed(&blob()).await.unwrap());
+
+        let request = body_of(&server.join().unwrap()[0]);
+        assert_eq!(request["action"], "resolve-repos");
+        assert_eq!(request["repos"][0], "example/api");
+    }
+
+    /// Every way the check can come up short answers "not at this commit",
+    /// because the caller turns `true` into "the write landed, carry on": a
+    /// row at the previous commit, a row for another service of the same repo,
+    /// and a row that has never been written.
+    #[tokio::test]
+    async fn an_unmatched_row_reads_as_not_landed() {
+        let body = |services: serde_json::Value| {
+            serde_json::json!({
+                "schema": "carrick.resolve-repos/0",
+                "workspace": { "slug": "acme", "billing_tier": "paid", "installed": true },
+                "allowance_sentence": null,
+                "repos": [{
+                    "full_name": "example/api",
+                    "connected": true,
+                    "project_id": "proj_1",
+                    "project_slug": "payments",
+                    "services": services
+                }],
+                "project_repos": []
+            })
+            .to_string()
+        };
+        let (storage, server) = bearer_storage(vec![
+            (
+                200,
+                body(serde_json::json!([{ "service": "api", "hash": "0000000" }])),
+            ),
+            (
+                200,
+                body(serde_json::json!([{ "service": "web", "hash": "4f2a1c9" }])),
+            ),
+            (
+                200,
+                body(serde_json::json!([{ "service": "api", "hash": null }])),
+            ),
+        ]);
+        storage
+            .repo_full_name
+            .set("example/api".to_string())
+            .unwrap();
+
+        for expectation in ["an older commit", "another service", "never written"] {
+            assert!(
+                !storage.index_landed(&blob()).await.unwrap(),
+                "{expectation} is not this run's index"
+            );
+        }
+        server.join().unwrap();
+    }
+
+    /// The row is keyed on the cloud's service slug, not on the name the
+    /// scanner sends, so the check has to build the same string
+    /// `sanitizeService` does (carrick-cloud `lambdas/check-or-upload/keys.js`)
+    /// or it asks about a row that does not exist.
+    #[test]
+    fn the_indexed_service_slug_is_the_cloud_key() {
+        assert_eq!(
+            indexed_service_slug(Some("Orders API"), "api"),
+            "orders-api"
+        );
+        assert_eq!(
+            indexed_service_slug(Some("services/checkout_v2"), "api"),
+            "services-checkout-v2"
+        );
+        assert_eq!(indexed_service_slug(Some("--web--"), "api"), "web");
+        // A single-service repo sends no service name and is stored under the
+        // repository, and so is one whose name sanitizes to nothing.
+        assert_eq!(indexed_service_slug(None, "api"), "api");
+        assert_eq!(indexed_service_slug(Some("***"), "api"), "api");
     }
 
     /// The kind gate IS a credential problem, and it is the one an `mcp`

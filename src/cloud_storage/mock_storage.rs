@@ -44,6 +44,18 @@ impl CloudStorage for MockStorage {
         Ok(UploadOutcome::default())
     }
 
+    /// What the in-memory store holds, answered from the store itself: an
+    /// upload that was recorded is at the commit it was recorded with
+    /// (carrick#1067).
+    async fn index_landed(&self, data: &CloudRepoData) -> Result<bool, StorageError> {
+        let stored = self.data.lock().unwrap();
+        Ok(stored.iter().any(|entry| {
+            entry.repo_name == data.repo_name
+                && entry.service_name == data.service_name
+                && entry.commit_hash == data.commit_hash
+        }))
+    }
+
     // In-memory store keyed per uploaded entry — safe to hold many services
     // per repo, so multi-service fan-out can be exercised under CARRICK_MOCK_ALL.
     fn supports_multi_service(&self) -> bool {

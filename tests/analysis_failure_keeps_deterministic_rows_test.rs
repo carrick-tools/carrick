@@ -37,6 +37,14 @@ impl CloudStorage for StubStorage {
         self.repos.lock().unwrap().push(data.clone());
         Ok(UploadOutcome::default())
     }
+    /// Whatever this stub recorded, at the commit it recorded it with.
+    async fn index_landed(&self, data: &CloudRepoData) -> Result<bool, StorageError> {
+        Ok(self.repos.lock().unwrap().iter().any(|stored| {
+            stored.repo_name == data.repo_name
+                && stored.service_name == data.service_name
+                && stored.commit_hash == data.commit_hash
+        }))
+    }
     async fn download_all_repo_data(
         &self,
     ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError> {
