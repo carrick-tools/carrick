@@ -133,9 +133,235 @@ fn definitions_by_location(
 /// payload needs, plus the content hash to persist if the call succeeds.
 struct Pending {
     name: String,
+    /// Where the function is defined. Only orders a level into batches, so
+    /// that neighbours in one file share a request.
+    file_path: String,
     body: String,
     called_intents: Vec<String>,
     hash: String,
+}
+
+/// Most functions per `/generate-intent` request.
+///
+/// Equal to the lambda's `MAX_BATCH_FUNCTIONS` (carrick-cloud
+/// `lambdas/generate-intent/batch_prompt.ts`), which is also the batch size
+/// the intent-quality gate measured. The lambda refuses a larger batch with a
+/// 400, so a size above it would only ever reach the single-call fallback.
+const MAX_INTENT_BATCH: usize = 20;
+
+/// Body plus helper-intent characters one batch may carry before the next
+/// batch starts. Bodies are already cut to about 2,000 characters at
+/// discovery, so this binds only on helper-heavy callers, and keeps one
+/// request's prompt in the range the gate measured (a function over it goes
+/// in a batch of its own).
+const INTENT_BATCH_CHAR_BUDGET: usize = 60_000;
+
+/// Functions per `/generate-intent` request: `CARRICK_INTENT_BATCH_SIZE`,
+/// else [`MAX_INTENT_BATCH`], clamped to `1..=MAX_INTENT_BATCH`. `1` sends
+/// every function on its own, exactly the request a scanner before
+/// carrick#1064 sent.
+fn intent_batch_size() -> usize {
+    std::env::var("CARRICK_INTENT_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(MAX_INTENT_BATCH)
+        .clamp(1, MAX_INTENT_BATCH)
+}
+
+fn pending_chars(pending: &Pending) -> usize {
+    pending.body.len()
+        + pending
+            .called_intents
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+}
+
+/// One level's cache misses cut into requests: ordered by file then name, so
+/// a file's functions sit together and the cut is the same on every run, then
+/// filled up to `size` functions or [`INTENT_BATCH_CHAR_BUDGET`] characters.
+/// Names are map keys, unique by construction, so a batch never holds two
+/// functions the answer could not tell apart.
+fn batch_units(mut pending: Vec<Pending>, size: usize) -> Vec<Vec<Pending>> {
+    pending.sort_by(|a, b| {
+        (a.file_path.as_str(), a.name.as_str()).cmp(&(b.file_path.as_str(), b.name.as_str()))
+    });
+    let size = size.max(1);
+    let mut units: Vec<Vec<Pending>> = Vec::new();
+    let mut current: Vec<Pending> = Vec::new();
+    let mut chars = 0usize;
+    for item in pending {
+        let item_chars = pending_chars(&item);
+        if !current.is_empty()
+            && (current.len() >= size || chars + item_chars > INTENT_BATCH_CHAR_BUDGET)
+        {
+            units.push(std::mem::take(&mut current));
+            chars = 0;
+        }
+        chars += item_chars;
+        current.push(item);
+    }
+    if !current.is_empty() {
+        units.push(current);
+    }
+    units
+}
+
+/// The single-function request body, unchanged since before batching.
+fn single_payload(pending: &Pending) -> serde_json::Value {
+    serde_json::json!({
+        "name": pending.name,
+        "body": pending.body,
+        "called_intents": pending.called_intents,
+    })
+}
+
+/// The batched request body (carrick#1064).
+fn batch_payload(unit: &[Pending]) -> serde_json::Value {
+    serde_json::json!({
+        "functions": unit.iter().map(single_payload).collect::<Vec<_>>(),
+    })
+}
+
+/// The batched answer: the lambda's `text` is `{"intents":[{name, intent, cached}]}`.
+#[derive(serde::Deserialize)]
+struct BatchAnswer {
+    intents: Vec<BatchAnswerRow>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchAnswerRow {
+    name: String,
+    #[serde(default)]
+    intent: Option<String>,
+}
+
+/// The intents a batched answer gives, by name. A function is answered only
+/// when its name comes back exactly once with a non-null intent; one that is
+/// null, missing or repeated is left out, for the caller to send on its own.
+/// `None` when the text is not a batched answer at all.
+///
+/// The acceptance gate (trimmed, non-empty, under 500 bytes) is not applied
+/// here: an answered text goes through the same gate a single call's does.
+fn read_batch_answer(text: &str, unit: &[Pending]) -> Option<HashMap<String, String>> {
+    let answer: BatchAnswer = serde_json::from_str(text).ok()?;
+    let requested: HashSet<&str> = unit.iter().map(|p| p.name.as_str()).collect();
+    let mut seen: HashMap<String, Vec<Option<String>>> = HashMap::new();
+    for row in answer.intents {
+        if requested.contains(row.name.as_str()) {
+            seen.entry(row.name).or_default().push(row.intent);
+        }
+    }
+    Some(
+        seen.into_iter()
+            .filter_map(|(name, mut intents)| match intents.len() {
+                1 => intents.pop().flatten().map(|intent| (name, intent)),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+/// Whether a refused batch means the lambda does not take batches at all: a
+/// lambda from before carrick#1064 reads `{functions}` as a single request
+/// missing its `name`, and answers a non-retriable `validation_failed`.
+fn batch_refused_as_unsupported(error: &AgentCallError) -> bool {
+    error.code == "validation_failed" && !error.retriable
+}
+
+/// What one service's intent pass learned about batching while it ran.
+struct BatchState {
+    /// Cleared the first time the lambda refuses a batch as a request it does
+    /// not understand; every later request in the pass is a single call.
+    supported: std::sync::atomic::AtomicBool,
+    /// Functions a batch left unanswered that were sent again on their own.
+    singled: std::sync::atomic::AtomicUsize,
+}
+
+impl BatchState {
+    fn new() -> Self {
+        Self {
+            supported: std::sync::atomic::AtomicBool::new(true),
+            singled: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Describe one request's worth of functions, each result paired with its
+/// function in input order.
+///
+/// A batch whose answer does not cover a function (unreadable, cut, a name
+/// missing or repeated, a null intent) sends that function again on its own,
+/// so a mismatch costs a call and never an intent. A batch the lambda refused
+/// as unsupported sends every function on its own and stops batching for the
+/// rest of the pass. Any other failure (a spent retry chain, a budget refusal,
+/// the quota breaker) is that failure for every function in the batch, exactly
+/// as it would have been for each single call.
+async fn describe_unit<S, SFut>(
+    unit: Vec<Pending>,
+    state: &BatchState,
+    send: S,
+) -> Vec<(Pending, Result<String, AgentCallError>)>
+where
+    S: Fn(serde_json::Value) -> SFut,
+    SFut: std::future::Future<Output = Result<String, AgentCallError>>,
+{
+    use std::sync::atomic::Ordering;
+
+    let batched = unit.len() > 1 && state.supported.load(Ordering::Relaxed);
+    let answered: HashMap<String, String> = if !batched {
+        HashMap::new()
+    } else {
+        match send(batch_payload(&unit)).await {
+            Ok(text) => read_batch_answer(&text, &unit).unwrap_or_else(|| {
+                debug!(
+                    "Batched intent answer for {} function(s) was unreadable; sending each on its own",
+                    unit.len()
+                );
+                HashMap::new()
+            }),
+            Err(error) if batch_refused_as_unsupported(&error) => {
+                if state.supported.swap(false, Ordering::Relaxed) {
+                    warn!(
+                        "/generate-intent refused a batched request ({}); sending one function per request for the rest of this service",
+                        error
+                    );
+                }
+                HashMap::new()
+            }
+            Err(error) => {
+                return unit
+                    .into_iter()
+                    .map(|pending| (pending, Err(error.clone())))
+                    .collect();
+            }
+        }
+    };
+
+    let mut done: Vec<(usize, Pending, Result<String, AgentCallError>)> = Vec::new();
+    let mut again: Vec<(usize, Pending)> = Vec::new();
+    for (idx, pending) in unit.into_iter().enumerate() {
+        match answered.get(&pending.name) {
+            Some(intent) => {
+                let intent = intent.clone();
+                done.push((idx, pending, Ok(intent)));
+            }
+            None => again.push((idx, pending)),
+        }
+    }
+    if batched && !again.is_empty() {
+        state.singled.fetch_add(again.len(), Ordering::Relaxed);
+    }
+    let singles = futures::future::join_all(again.into_iter().map(|(idx, pending)| {
+        let request = send(single_payload(&pending));
+        async move { (idx, pending, request.await) }
+    }))
+    .await;
+    done.extend(singles);
+    done.sort_by_key(|(idx, _, _)| *idx);
+    done.into_iter()
+        .map(|(_, pending, result)| (pending, result))
+        .collect()
 }
 
 /// Concurrent `/generate-intent` calls in flight per dependency level when
@@ -165,41 +391,33 @@ fn intent_concurrency() -> usize {
         .max(1)
 }
 
-/// Dispatch one dependency level's calls at most `concurrency` at a time,
-/// returning each `Pending` paired with its own result **in input order**.
+/// Dispatch one dependency level's requests at most `concurrency` at a time,
+/// returning each request's output **in input order**. A request is one
+/// `Pending` or one batch of them; the output carries each `Pending` with its
+/// own result either way.
 ///
 /// Completion order under `buffer_unordered` is arbitrary — a slow call
-/// finishes after ones queued behind it. Results are therefore carried
-/// alongside the `Pending` that produced them and re-sorted by input position,
-/// so neither the fold nor any future caller can associate an intent with the
-/// wrong function, and a re-run over the same level produces the same sequence
-/// regardless of backend timing.
-async fn generate_level<F, Fut>(
-    pending: Vec<Pending>,
-    concurrency: usize,
-    call: F,
-) -> Vec<(Pending, Result<String, AgentCallError>)>
+/// finishes after ones queued behind it. Outputs are therefore carried with
+/// their input position and re-sorted by it, so neither the fold nor any
+/// future caller can associate an intent with the wrong function, and a
+/// re-run over the same level produces the same sequence regardless of
+/// backend timing.
+async fn generate_level<T, R, F, Fut>(units: Vec<T>, concurrency: usize, call: F) -> Vec<R>
 where
-    F: Fn(Pending) -> Fut,
-    Fut: std::future::Future<Output = (Pending, Result<String, AgentCallError>)>,
+    F: Fn(T) -> Fut,
+    Fut: std::future::Future<Output = R>,
 {
-    let mut results: Vec<(usize, Pending, Result<String, AgentCallError>)> =
-        futures::stream::iter(pending.into_iter().enumerate().map(|(idx, item)| {
+    let mut results: Vec<(usize, R)> =
+        futures::stream::iter(units.into_iter().enumerate().map(|(idx, item)| {
             let fut = call(item);
-            async move {
-                let (item, result) = fut.await;
-                (idx, item, result)
-            }
+            async move { (idx, fut.await) }
         }))
         .buffer_unordered(concurrency)
         .collect()
         .await;
 
-    results.sort_by_key(|(idx, _, _)| *idx);
-    results
-        .into_iter()
-        .map(|(_, item, result)| (item, result))
-        .collect()
+    results.sort_by_key(|(idx, _)| *idx);
+    results.into_iter().map(|(_, output)| output).collect()
 }
 
 /// Generate intents for every function with a non-trivial body source,
@@ -298,6 +516,8 @@ pub async fn generate_function_intents(
     // `intents` holds the resolved intent per function (reused or freshly
     // generated); `hashes` holds the content hash that produced each one, to be
     // persisted on the definition for the next scan.
+    let batch_size = intent_batch_size();
+    let batch_state = BatchState::new();
     let mut intents: HashMap<String, String> = HashMap::new();
     let mut hashes: HashMap<String, String> = HashMap::new();
     let mut reused = 0usize;
@@ -347,6 +567,7 @@ pub async fn generate_function_intents(
             } else {
                 to_generate.push(Pending {
                     name: name.clone(),
+                    file_path: def.file_path.to_string_lossy().into_owned(),
                     body: body.clone(),
                     called_intents,
                     hash,
@@ -364,19 +585,32 @@ pub async fn generate_function_intents(
         // that is thousands of simultaneous requests, and the backend answers
         // the overflow with a 429-wrapped 503 that costs those functions their
         // intents.
+        //
+        // Several functions share a request (carrick#1064): the level's misses
+        // are cut into batches of up to `intent_batch_size()`, and the queue
+        // depth now counts requests, not functions.
         let attempted = to_generate.len();
-        let outcomes = generate_level(to_generate, intent_concurrency(), |pending| async move {
-            let payload = serde_json::json!({
-                "name": pending.name,
-                "body": pending.body,
-                "called_intents": pending.called_intents,
-            });
-            let result = agent_service
-                .post_to_lambda("/generate-intent", &payload, &pending.name)
-                .await;
-            (pending, result)
-        })
-        .await;
+        let units = batch_units(to_generate, batch_size);
+        let state = &batch_state;
+        let outcomes: Vec<(Pending, Result<String, AgentCallError>)> =
+            generate_level(units, intent_concurrency(), |unit| async move {
+                describe_unit(unit, state, |payload| async move {
+                    // The mock seed only picks a canned answer in mock mode.
+                    let seed = payload
+                        .get("name")
+                        .and_then(|name| name.as_str())
+                        .unwrap_or("batch")
+                        .to_string();
+                    agent_service
+                        .post_to_lambda("/generate-intent", &payload, &seed)
+                        .await
+                })
+                .await
+            })
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
 
         let mut succeeded = 0usize;
         let mut failed = 0usize;
@@ -466,8 +700,14 @@ pub async fn generate_function_intents(
     }
 
     debug!(
-        "Intents: {} total ({} reused from content-hash cache, {} freshly generated)",
-        total, reused, generated
+        "Intents: {} total ({} reused from content-hash cache, {} freshly generated; batch size {}, {} sent again on their own after a batch left them unanswered)",
+        total,
+        reused,
+        generated,
+        batch_size,
+        batch_state
+            .singled
+            .load(std::sync::atomic::Ordering::Relaxed)
     );
 
     // Strip body_source — source code stays in GitHub, not AWS
@@ -1122,10 +1362,396 @@ mod tests {
     fn pending(name: &str) -> Pending {
         Pending {
             name: name.to_string(),
+            file_path: "test.ts".to_string(),
             body: format!("return {}();", name),
             called_intents: vec![],
             hash: format!("hash-of-{}", name),
         }
+    }
+
+    // ------------------------------------------------ batching (#1064)
+
+    fn pending_in(name: &str, file: &str) -> Pending {
+        Pending {
+            file_path: file.to_string(),
+            ..pending(name)
+        }
+    }
+
+    /// A recorded `/generate-intent` transport: every payload it was sent, and
+    /// an answer chosen by the test from that payload.
+    struct Transport {
+        sent: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl Transport {
+        fn new() -> Self {
+            Self {
+                sent: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn batches(&self) -> usize {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.get("functions").is_some())
+                .count()
+        }
+        fn singles(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .collect()
+        }
+    }
+
+    fn batch_names(payload: &serde_json::Value) -> Vec<String> {
+        payload["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn answer(rows: &[(&str, Option<&str>)]) -> String {
+        serde_json::json!({
+            "intents": rows
+                .iter()
+                .map(|(name, intent)| serde_json::json!({"name": name, "intent": intent, "cached": false}))
+                .collect::<Vec<_>>()
+        })
+        .to_string()
+    }
+
+    fn single_answer(payload: &serde_json::Value) -> Result<String, AgentCallError> {
+        Ok(format!("single for {}", payload["name"].as_str().unwrap()))
+    }
+
+    #[test]
+    fn a_level_is_cut_by_file_then_name_and_by_size() {
+        let level = vec![
+            pending_in("z", "b.ts"),
+            pending_in("b", "a.ts"),
+            pending_in("a", "b.ts"),
+            pending_in("a", "a.ts"),
+            pending_in("c", "a.ts"),
+        ];
+        let units = batch_units(level, 2);
+        let names: Vec<Vec<(String, String)>> = units
+            .iter()
+            .map(|u| {
+                u.iter()
+                    .map(|p| (p.file_path.clone(), p.name.clone()))
+                    .collect()
+            })
+            .collect();
+        let pair = |f: &str, n: &str| (f.to_string(), n.to_string());
+        assert_eq!(
+            names,
+            vec![
+                vec![pair("a.ts", "a"), pair("a.ts", "b")],
+                vec![pair("a.ts", "c"), pair("b.ts", "a")],
+                vec![pair("b.ts", "z")],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_batch_closes_at_the_character_budget() {
+        let mut big = pending("big");
+        big.body = "x".repeat(INTENT_BATCH_CHAR_BUDGET);
+        let mut helpers = pending("helpers");
+        helpers.called_intents = vec!["y".repeat(INTENT_BATCH_CHAR_BUDGET / 2); 3];
+        let level = vec![pending("a"), big, pending("c"), helpers, pending("e")];
+        let sizes: Vec<Vec<String>> = batch_units(level, 20)
+            .iter()
+            .map(|u| u.iter().map(|p| p.name.clone()).collect())
+            .collect();
+        // Sorted by name: a, big, c, e, helpers. `big` alone fills a batch, and
+        // `helpers` is over the budget on its own, so it gets a batch too.
+        assert_eq!(
+            sizes,
+            vec![
+                vec!["a".to_string()],
+                vec!["big".to_string()],
+                vec!["c".to_string(), "e".to_string()],
+                vec!["helpers".to_string()],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_batch_size_knob_is_clamped_to_what_the_lambda_takes() {
+        let _env = ENV_LOCK.lock().await;
+        let prev = std::env::var("CARRICK_INTENT_BATCH_SIZE").ok();
+        // SAFETY: serialized on ENV_LOCK and restored below.
+        unsafe { std::env::remove_var("CARRICK_INTENT_BATCH_SIZE") };
+        assert_eq!(intent_batch_size(), MAX_INTENT_BATCH);
+        unsafe { std::env::set_var("CARRICK_INTENT_BATCH_SIZE", "1") };
+        assert_eq!(intent_batch_size(), 1);
+        unsafe { std::env::set_var("CARRICK_INTENT_BATCH_SIZE", "0") };
+        assert_eq!(intent_batch_size(), 1);
+        unsafe { std::env::set_var("CARRICK_INTENT_BATCH_SIZE", "500") };
+        assert_eq!(intent_batch_size(), MAX_INTENT_BATCH);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CARRICK_INTENT_BATCH_SIZE", v),
+                None => std::env::remove_var("CARRICK_INTENT_BATCH_SIZE"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_single_request_body_is_what_it_was_before_batching() {
+        let mut p = pending("f");
+        p.called_intents = vec!["- g: does g".to_string()];
+        assert_eq!(
+            single_payload(&p),
+            serde_json::json!({"name": "f", "body": "return f();", "called_intents": ["- g: does g"]})
+        );
+        assert_eq!(
+            batch_payload(&[pending("a"), pending("b")]),
+            serde_json::json!({"functions": [
+                {"name": "a", "body": "return a();", "called_intents": []},
+                {"name": "b", "body": "return b();", "called_intents": []},
+            ]})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_batched_answer_takes_one_request() {
+        let transport = Transport::new();
+        let state = BatchState::new();
+        let unit = vec![pending("a"), pending("b"), pending("c")];
+        let out = describe_unit(unit, &state, |payload| {
+            transport.sent.lock().unwrap().push(payload.clone());
+            async move {
+                let names = batch_names(&payload);
+                let rows: Vec<(&str, Option<&str>)> = names
+                    .iter()
+                    .map(|n| (n.as_str(), Some("batched")))
+                    .collect();
+                Ok(answer(&rows))
+            }
+        })
+        .await;
+        assert_eq!(transport.batches(), 1);
+        assert!(transport.singles().is_empty());
+        let got: Vec<(&str, &str)> = out
+            .iter()
+            .map(|(p, r)| (p.name.as_str(), r.as_ref().unwrap().as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("a", "batched"), ("b", "batched"), ("c", "batched")]
+        );
+    }
+
+    /// The orchestrating rule: a batch mismatch never costs an intent. Only the
+    /// functions the answer did not cover are sent again, one at a time.
+    #[tokio::test]
+    async fn functions_a_batch_left_unanswered_are_sent_again_on_their_own() {
+        let transport = Transport::new();
+        let state = BatchState::new();
+        let unit = vec![
+            pending("ok"),
+            pending("null"),
+            pending("missing"),
+            pending("twice"),
+        ];
+        let out = describe_unit(unit, &state, |payload| {
+            transport.sent.lock().unwrap().push(payload.clone());
+            async move {
+                if payload.get("functions").is_some() {
+                    Ok(answer(&[
+                        ("ok", Some("fine")),
+                        ("null", None),
+                        ("twice", Some("one")),
+                        ("twice", Some("two")),
+                        ("stranger", Some("not asked")),
+                    ]))
+                } else {
+                    single_answer(&payload)
+                }
+            }
+        })
+        .await;
+        let mut singles = transport.singles();
+        singles.sort();
+        assert_eq!(singles, vec!["missing", "null", "twice"]);
+        assert_eq!(state.singled.load(std::sync::atomic::Ordering::Relaxed), 3);
+        let got: Vec<(&str, &str)> = out
+            .iter()
+            .map(|(p, r)| (p.name.as_str(), r.as_ref().unwrap().as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("ok", "fine"),
+                ("null", "single for null"),
+                ("missing", "single for missing"),
+                ("twice", "single for twice"),
+            ],
+            "input order, each result with its own function"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_batched_answer_sends_every_function_on_its_own() {
+        for text in [
+            "not json",
+            r#"{"intents":[{"name":"a","intent":"cut"#,
+            r#"[{"id":1,"intent":"x"}]"#,
+        ] {
+            let transport = Transport::new();
+            let state = BatchState::new();
+            let out = describe_unit(vec![pending("a"), pending("b")], &state, |payload| {
+                transport.sent.lock().unwrap().push(payload.clone());
+                let text = text.to_string();
+                async move {
+                    if payload.get("functions").is_some() {
+                        Ok(text)
+                    } else {
+                        single_answer(&payload)
+                    }
+                }
+            })
+            .await;
+            assert_eq!(transport.singles().len(), 2, "{text}");
+            assert!(out.iter().all(|(_, r)| r.is_ok()), "{text}");
+            // An unreadable answer is not a refusal: batching stays on.
+            assert!(state.supported.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
+
+    /// A lambda from before #1064 reads `{functions}` as a single request with
+    /// no name. The first refusal turns batching off for the rest of the pass,
+    /// so an old deploy costs one refused request, not one per batch.
+    #[tokio::test]
+    async fn a_lambda_that_does_not_take_batches_turns_batching_off_for_the_pass() {
+        let transport = Transport::new();
+        let state = BatchState::new();
+        let send = |payload: serde_json::Value| {
+            transport.sent.lock().unwrap().push(payload.clone());
+            async move {
+                if payload.get("functions").is_some() {
+                    Err(AgentCallError {
+                        code: "validation_failed".to_string(),
+                        message: "name (non-empty string) is required".to_string(),
+                        retriable: false,
+                    })
+                } else {
+                    single_answer(&payload)
+                }
+            }
+        };
+        let first = describe_unit(vec![pending("a"), pending("b")], &state, &send).await;
+        let second = describe_unit(vec![pending("c"), pending("d")], &state, &send).await;
+        assert_eq!(
+            transport.batches(),
+            1,
+            "the second unit must not try a batch"
+        );
+        assert_eq!(transport.singles().len(), 4);
+        assert!(first.iter().chain(second.iter()).all(|(_, r)| r.is_ok()));
+    }
+
+    /// A batch that failed the way a single call fails (retry chain spent,
+    /// budget refusal, quota breaker) fails every function in it, and is not
+    /// re-sent as singles that would meet the same wall.
+    #[tokio::test]
+    async fn a_failed_batch_fails_its_functions_without_single_calls() {
+        for (code, retriable) in [
+            ("model_error", true),
+            ("llm_disabled", false),
+            (crate::agent_service::QUOTA_ABORT_CODE, false),
+        ] {
+            let transport = Transport::new();
+            let state = BatchState::new();
+            let out = describe_unit(vec![pending("a"), pending("b")], &state, |payload| {
+                transport.sent.lock().unwrap().push(payload.clone());
+                async move {
+                    Err(AgentCallError {
+                        code: code.to_string(),
+                        message: "no".to_string(),
+                        retriable,
+                    })
+                }
+            })
+            .await;
+            assert!(transport.singles().is_empty(), "{code}");
+            assert_eq!(out.len(), 2);
+            for (_, result) in &out {
+                assert_eq!(result.as_ref().unwrap_err().code, code);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_unit_of_one_is_the_single_request() {
+        let transport = Transport::new();
+        let state = BatchState::new();
+        let out = describe_unit(vec![pending("solo")], &state, |payload| {
+            transport.sent.lock().unwrap().push(payload.clone());
+            async move { single_answer(&payload) }
+        })
+        .await;
+        assert_eq!(transport.batches(), 0);
+        assert_eq!(transport.singles(), vec!["solo"]);
+        assert_eq!(out[0].1.as_ref().unwrap(), "single for solo");
+    }
+
+    /// End to end through the mock lambda: a level of misses is described in
+    /// batched requests and every function gets its intent and its hash.
+    #[tokio::test]
+    async fn generate_function_intents_batches_a_level_through_the_mock_lambda() {
+        let _env = ENV_LOCK.lock().await;
+        let prev_mock = std::env::var("CARRICK_MOCK_ALL").ok();
+        let prev_size = std::env::var("CARRICK_INTENT_BATCH_SIZE").ok();
+        // SAFETY: serialized on ENV_LOCK and restored below.
+        unsafe {
+            std::env::set_var("CARRICK_MOCK_ALL", "1");
+            std::env::remove_var("CARRICK_INTENT_BATCH_SIZE");
+        }
+        let mut defs = HashMap::new();
+        for i in 0..45 {
+            let name = format!("fn{i}");
+            let body = format!("const v = input{i};\nreturn transform(v);");
+            defs.insert(name.clone(), def_with_body(&name, &body));
+        }
+        let before = crate::agent_service::request_counts();
+        let agent = AgentService::new();
+        generate_function_intents(&agent, &mut defs, &HashMap::new()).await;
+        let after = crate::agent_service::request_counts();
+        unsafe {
+            match prev_mock {
+                Some(v) => std::env::set_var("CARRICK_MOCK_ALL", v),
+                None => std::env::remove_var("CARRICK_MOCK_ALL"),
+            }
+            if let Some(v) = prev_size {
+                std::env::set_var("CARRICK_INTENT_BATCH_SIZE", v);
+            }
+        }
+        for def in defs.values() {
+            assert_eq!(
+                def.intent.as_deref(),
+                Some("Mock intent: function does something."),
+                "{}",
+                def.name
+            );
+            assert!(def.intent_input_hash.is_some());
+        }
+        let sent = |counts: &std::collections::BTreeMap<String, usize>| {
+            counts.get("/generate-intent").copied().unwrap_or(0)
+        };
+        // Other tests in the process may call the mock too, so read a floor:
+        // 45 functions at 20 per request is 3 requests, and never 45.
+        let delta = sent(&after) - sent(&before);
+        assert!((3..45).contains(&delta), "sent {delta} requests");
     }
 
     #[tokio::test]
@@ -1145,7 +1771,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis((total - position) * 20)).await;
                 observed.lock().unwrap().push(p.name.clone());
                 let intent = format!("intent for {}", p.name);
-                (p, Ok(intent))
+                (p, Ok::<String, AgentCallError>(intent))
             }
         })
         .await;
@@ -1259,7 +1885,7 @@ mod tests {
                 peak.fetch_max(now, Ordering::SeqCst);
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 in_flight.fetch_sub(1, Ordering::SeqCst);
-                (p, Ok("intent".to_string()))
+                (p, Ok::<String, AgentCallError>("intent".to_string()))
             }
         })
         .await;

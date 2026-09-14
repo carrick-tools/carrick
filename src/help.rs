@@ -63,6 +63,9 @@ ENVIRONMENT VARIABLES:
     CARRICK_INTENT_CONCURRENCY      Concurrent function-intent requests (default 20).
                                     Lower it if a large repo loses intents to
                                     backend overload
+    CARRICK_INTENT_BATCH_SIZE       Functions described per intent request
+                                    (default and most 20; 1 sends one function
+                                    per request)
     CARRICK_CONCURRENCY_LIMIT       Model requests in flight across a scan
                                     (default 28), shared by file analysis and
                                     function intents, which run together
