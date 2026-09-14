@@ -181,10 +181,14 @@ export function declaredServices(config: Record<string, unknown>): DeclaredServi
  */
 export function checkDeclaredPaths(repos: ConfiguredRepo[]): Line[] {
   const lines: Line[] = [];
+  // A file that exists and will not parse is not an absent one: the two states
+  // have different sentences, and printing both would be printing a false one.
+  let files = 0;
   let configs = 0;
   let checked = 0;
   for (const repo of repos) {
     if (repo.problem !== null) {
+      files += 1;
       lines.push(refuse(`${repo.label}: ${repo.problem}`));
       continue;
     }
@@ -192,6 +196,7 @@ export function checkDeclaredPaths(repos: ConfiguredRepo[]): Line[] {
       lines.push(say(`${repo.label} has no carrick.json, so nothing in it is indexed.`));
       continue;
     }
+    files += 1;
     configs += 1;
     for (const service of declaredServices(repo.config)) {
       const serviceRoot = service.directory === undefined
@@ -230,7 +235,7 @@ export function checkDeclaredPaths(repos: ConfiguredRepo[]): Line[] {
       }
     }
   }
-  if (configs === 0) {
+  if (files === 0) {
     lines.push(
       refuse(
         "No carrick.json anywhere in this workspace, so no service is declared. `carrick init` derives one for your agent to write.",

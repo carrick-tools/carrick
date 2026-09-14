@@ -112,8 +112,10 @@ test("a missing service directory, a config that is not JSON, and a workspace wi
   const gone = workspace({ "carrick.json": JSON.stringify({ serviceName: "api", directory: "api" }) });
   assert.match(checkDeclaredPaths(configuredRepos(gone))[0]!.text, /declares directory "api"/);
 
+  // A file that will not parse is not an absent one: one sentence, not two.
   const broken = workspace({ "carrick.json": "{ oops" });
   const brokenLines = checkDeclaredPaths(configuredRepos(broken));
+  assert.equal(brokenLines.length, 1, texts(brokenLines).join("\n"));
   assert.equal(brokenLines[0]!.level, "refuse");
   assert.match(brokenLines[0]!.text, /not valid JSON/);
 
