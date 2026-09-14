@@ -323,15 +323,25 @@ impl AgentService {
     /// Per-task lambda call where the lambda just needs a user_message +
     /// schema (e.g. file-analyzer). The lambda owns the system prompt.
     /// `task_path` is the API Gateway route, e.g. "/analyze-file".
+    ///
+    /// `guidance` names the guidance block the prompt embeds and says how many
+    /// of its leading bytes that block occupies, so the cloud's analysis cache
+    /// can key on the guidance's ID instead of its TEXT (carrick-cloud#871).
+    /// It is key material only: what reaches the model is `user_message` and
+    /// nothing else, and a `None` here (an offline run, a guidance answer that
+    /// carried no key) keys on the whole message exactly as before.
     pub async fn analyze_with_lambda(
         &self,
         task_path: &str,
         user_message: &str,
         response_schema: Option<serde_json::Value>,
+        guidance: Option<GuidanceRef<'_>>,
     ) -> Result<String, AgentCallError> {
         let request = LambdaRequest {
             user_message: user_message.to_string(),
             response_schema,
+            guidance_key: guidance.map(|g| g.key.to_string()),
+            guidance_prefix_bytes: guidance.map(|g| g.prefix_bytes),
         };
         self.post_to_lambda(task_path, &request, user_message).await
     }
@@ -345,6 +355,21 @@ impl AgentService {
         body: &B,
         mock_seed: &str,
     ) -> Result<String, AgentCallError> {
+        self.post_to_lambda_keyed(task_path, body, mock_seed)
+            .await
+            .map(|outcome| outcome.text)
+    }
+
+    /// As [`Self::post_to_lambda`], but keeping the envelope fields that sit
+    /// beside `text`. Only framework-guidance has one today (`guidance_key`),
+    /// and only the file analyzer needs it — every other caller wants the text
+    /// and uses the wrapper above.
+    pub async fn post_to_lambda_keyed<B: Serialize + ?Sized>(
+        &self,
+        task_path: &str,
+        body: &B,
+        mock_seed: &str,
+    ) -> Result<LambdaOutcome, AgentCallError> {
         let _permit = self.semaphore.acquire().await.map_err(|e| {
             AgentCallError::permanent(
                 "semaphore_closed",
@@ -357,7 +382,10 @@ impl AgentService {
         record_request(task_path);
 
         if env::var("CARRICK_MOCK_ALL").is_ok() {
-            return Ok(generate_mock_for_task(task_path, body, mock_seed));
+            return Ok(LambdaOutcome {
+                text: generate_mock_for_task(task_path, body, mock_seed),
+                guidance_key: None,
+            });
         }
 
         // Which credential this process holds, read per call rather than
@@ -392,7 +420,7 @@ impl AgentService {
         api_base: &str,
         path: &str,
         body: &B,
-    ) -> Result<String, AgentCallError>
+    ) -> Result<LambdaOutcome, AgentCallError>
     where
         B: Serialize + ?Sized,
     {
@@ -585,7 +613,10 @@ impl AgentService {
                     };
 
                     if status.is_success() && body.success {
-                        return Ok(body.text.unwrap_or_default());
+                        return Ok(LambdaOutcome {
+                            text: body.text.unwrap_or_default(),
+                            guidance_key: body.guidance_key,
+                        });
                     }
 
                     let err = match body.error {
@@ -667,6 +698,13 @@ struct LambdaRequest {
     user_message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_schema: Option<serde_json::Value>,
+    /// Key material for the cloud's analysis cache, never prompt content
+    /// (carrick-cloud#871). Omitted entirely when absent so the request bytes
+    /// an older cloud sees are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guidance_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guidance_prefix_bytes: Option<usize>,
 }
 
 /// Lambda response envelope. On success: `success=true, text="..."`.
@@ -680,6 +718,31 @@ struct AgentResponse {
     text: Option<String>,
     #[serde(default)]
     error: Option<AgentError>,
+    /// framework-guidance only: the id of the stored guidance entry this text
+    /// came from. Absent from every other lambda's envelope, and absent from
+    /// framework-guidance's own when its cache is disabled — hence `default`,
+    /// and hence every consumer treating `None` as "no split available"
+    /// (carrick-cloud#871).
+    #[serde(default)]
+    guidance_key: Option<String>,
+}
+
+/// What a lambda answered: the text, plus the envelope fields a caller may
+/// need beside it.
+#[derive(Debug, Clone)]
+pub struct LambdaOutcome {
+    pub text: String,
+    pub guidance_key: Option<String>,
+}
+
+/// The guidance block a file prompt embeds, as the analyzer hands it to the
+/// cloud: which stored guidance it is, and how many leading utf-8 bytes of the
+/// user message it occupies. Bytes, not characters — the cloud slices the
+/// utf-8 buffer (carrick-cloud#871).
+#[derive(Debug, Clone, Copy)]
+pub struct GuidanceRef<'a> {
+    pub key: &'a str,
+    pub prefix_bytes: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1823,6 +1886,53 @@ pub(crate) mod tests {
         }
     }
 
+    /// The two guidance fields are key material for the cloud's analysis
+    /// cache, and they are OMITTED when absent — the request bytes an older
+    /// cloud parses are then exactly the ones it parsed before
+    /// (carrick-cloud#871).
+    #[test]
+    fn the_analyze_request_carries_the_guidance_split_only_when_there_is_one() {
+        let bare = LambdaRequest {
+            user_message: "m".to_string(),
+            response_schema: None,
+            guidance_key: None,
+            guidance_prefix_bytes: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            r#"{"user_message":"m"}"#
+        );
+
+        let split = LambdaRequest {
+            user_message: "m".to_string(),
+            response_schema: None,
+            guidance_key: Some("abc".to_string()),
+            guidance_prefix_bytes: Some(12),
+        };
+        assert_eq!(
+            serde_json::to_string(&split).unwrap(),
+            r#"{"user_message":"m","guidance_key":"abc","guidance_prefix_bytes":12}"#
+        );
+    }
+
+    /// `guidance_key` rides beside `text` on the framework-guidance envelope
+    /// and is absent from every other lambda's, so its reader must treat a
+    /// missing field as "no split available" rather than as a bad response.
+    #[test]
+    fn the_envelope_reads_a_guidance_key_when_one_is_there_and_copes_when_it_is_not() {
+        let with: AgentResponse =
+            serde_json::from_str(r#"{"success":true,"text":"t","guidance_key":"abc"}"#).unwrap();
+        assert_eq!(with.guidance_key.as_deref(), Some("abc"));
+
+        let without: AgentResponse =
+            serde_json::from_str(r#"{"success":true,"text":"t"}"#).unwrap();
+        assert_eq!(without.guidance_key, None);
+
+        let null: AgentResponse =
+            serde_json::from_str(r#"{"success":true,"text":"t","guidance_key":null}"#).unwrap();
+        assert_eq!(null.guidance_key, None);
+    }
+
     #[test]
     fn quota_error_classified_by_code() {
         // Only the `rate_limited` code trips the breaker; transient overloads
@@ -2057,7 +2167,7 @@ pub(crate) mod tests {
                 &serde_json::json!({}),
             )
             .await;
-        assert_eq!(result.unwrap(), "analysed");
+        assert_eq!(result.unwrap().text, "analysed");
 
         let requests = api_server.join().unwrap();
         token_server.join().unwrap();
@@ -2134,7 +2244,7 @@ pub(crate) mod tests {
                 &serde_json::json!({}),
             )
             .await;
-        assert_eq!(result.unwrap(), "analysed");
+        assert_eq!(result.unwrap().text, "analysed");
 
         let request = &server.join().unwrap()[0];
         assert_eq!(

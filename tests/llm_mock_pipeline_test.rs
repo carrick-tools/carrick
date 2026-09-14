@@ -53,6 +53,7 @@ fn express_guidance() -> FrameworkGuidance {
         }],
         triage_hints: String::new(),
         parsing_notes: String::new(),
+        guidance_key: None,
     }
 }
 

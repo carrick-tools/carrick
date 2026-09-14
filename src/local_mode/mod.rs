@@ -85,6 +85,8 @@ pub fn offline_guidance() -> crate::agents::framework_guidance_agent::ProtocolGu
             data_fetching_patterns: Vec::new(),
             triage_hints: String::new(),
             parsing_notes: String::new(),
+            // No guidance was asked for, so there is no stored entry to name.
+            guidance_key: None,
         },
     );
     guidance

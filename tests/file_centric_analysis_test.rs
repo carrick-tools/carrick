@@ -79,6 +79,7 @@ fn create_express_guidance() -> FrameworkGuidance {
             .to_string(),
         parsing_notes: "Express routes can be chained: router.route('/path').get().post()"
             .to_string(),
+        guidance_key: None,
     }
 }
 
