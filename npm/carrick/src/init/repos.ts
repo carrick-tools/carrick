@@ -79,6 +79,33 @@ export function writeProposal(workspace: string, derived: DerivedWorkspace): str
 }
 
 /**
+ * The repositories under a workspace, as this package counts them.
+ *
+ * A workspace is one repository or a folder of them, the same two shapes
+ * `init` takes, so the scan is this directory and its immediate children that
+ * hold a `.git` — a file counts as well as a directory, because a linked
+ * worktree's `.git` is a file (carrick#975). Nothing is opened and nothing is
+ * changed; `carrick remove` and `carrick doctor` both walk this list, and one
+ * definition is what keeps the command that audits an install and the command
+ * that undoes it looking at the same repos.
+ */
+export function repoRoots(workspace: string): string[] {
+  const roots: string[] = [workspace];
+  let children: fs.Dirent[] = [];
+  try {
+    children = fs.readdirSync(workspace, { withFileTypes: true });
+  } catch {
+    children = [];
+  }
+  for (const child of children) {
+    if (!child.isDirectory() || child.name.startsWith(".")) continue;
+    const candidate = path.join(workspace, child.name);
+    if (fs.existsSync(path.join(candidate, ".git"))) roots.push(candidate);
+  }
+  return roots;
+}
+
+/**
  * What one repository on disk says it is on GitHub, and why it said nothing.
  *
  * `problem` is a clause, so a caller can put it after the path it read: it is

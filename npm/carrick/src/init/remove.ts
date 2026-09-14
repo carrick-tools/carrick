@@ -27,6 +27,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { removeCredential, credentialPath } from "../auth/credentials.ts";
 import { disconnectMcpClients, type McpRemoval } from "./mcp.ts";
+import { repoRoots } from "./repos.ts";
 import { removeCarrickHooks } from "./settings.ts";
 import { createOutput, DOCS, type InitOutput } from "./output.ts";
 
@@ -126,25 +127,11 @@ export type RepoLeftovers = {
 /**
  * Everything the scaffold left in the repositories under this workspace.
  *
- * A workspace is one repository or a folder of them, the same two shapes init
- * takes, so the scan is this directory and its immediate children that hold a
- * `.git` — a file counts as well as a directory, because a linked worktree's
- * `.git` is a file (carrick#975). Nothing here is opened unless it exists, and
- * nothing here is changed.
+ * The repositories are `repoRoots`', which `carrick doctor` reads too. Nothing
+ * here is opened unless it exists, and nothing here is changed.
  */
 export function repoLeftovers(workspace: string): RepoLeftovers {
-  const roots: string[] = [workspace];
-  let children: fs.Dirent[] = [];
-  try {
-    children = fs.readdirSync(workspace, { withFileTypes: true });
-  } catch {
-    children = [];
-  }
-  for (const child of children) {
-    if (!child.isDirectory() || child.name.startsWith(".")) continue;
-    const candidate = path.join(workspace, child.name);
-    if (fs.existsSync(path.join(candidate, ".git"))) roots.push(candidate);
-  }
+  const roots = repoRoots(workspace);
 
   const files: string[] = [];
   const sections: string[] = [];

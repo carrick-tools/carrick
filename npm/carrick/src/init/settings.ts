@@ -96,6 +96,83 @@ function isOurs(entry: unknown): boolean {
   return name === "carrick" || name === "carrick.mjs";
 }
 
+/** One hook entry of ours, as a settings file holds it. */
+export type InstalledHook = {
+  /** `PostToolUse`, `SessionStart`. */
+  event: string;
+  /** The group's matcher, absent where the group has none. */
+  matcher?: string;
+  command: string;
+  timeout?: number;
+};
+
+/**
+ * Our entries in a settings document, in the order the file holds them.
+ *
+ * The read half of the pair, for a command that audits an install rather than
+ * changing one (`carrick doctor`, carrick#1035). It exists because the merge
+ * cannot answer this question: `mergeCarrickHooks(...).changed` is false for a
+ * file that already holds the current entries AND for one that holds an entry
+ * this version no longer writes, and comparing a rewritten document to the
+ * original says nothing about which entries are there (carrick#1034).
+ *
+ * Throws on a document that is not JSON, like the merge, so a hand-edited file
+ * is reported rather than read as empty.
+ */
+export function installedCarrickHooks(existing: string): InstalledHook[] {
+  const base: unknown = existing.trim() === "" ? {} : JSON.parse(existing);
+  if (typeof base !== "object" || base === null) return [];
+  const hooks = (base as Record<string, unknown>)["hooks"];
+  if (typeof hooks !== "object" || hooks === null) return [];
+  const found: InstalledHook[] = [];
+  for (const [event, groups] of Object.entries(hooks as Record<string, unknown>)) {
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      const entries = (group as HookGroup | null)?.hooks;
+      if (!Array.isArray(entries)) continue;
+      const matcher = (group as HookGroup).matcher;
+      for (const entry of entries) {
+        if (!isOurs(entry)) continue;
+        const installed: InstalledHook = { event, command: (entry as HookEntry).command };
+        if (typeof matcher === "string") installed.matcher = matcher;
+        if (typeof (entry as HookEntry).timeout === "number") {
+          installed.timeout = (entry as HookEntry).timeout;
+        }
+        found.push(installed);
+      }
+    }
+  }
+  return found;
+}
+
+/** What `carrickHooks` writes, flattened the way `installedCarrickHooks` reads. */
+export function expectedCarrickHooks(command = "carrick"): InstalledHook[] {
+  const expected: InstalledHook[] = [];
+  for (const [event, groups] of Object.entries(carrickHooks(command))) {
+    for (const group of groups) {
+      for (const entry of group.hooks) {
+        const one: InstalledHook = { event, command: entry.command };
+        if (group.matcher !== undefined) one.matcher = group.matcher;
+        if (entry.timeout !== undefined) one.timeout = entry.timeout;
+        expected.push(one);
+      }
+    }
+  }
+  return expected;
+}
+
+/**
+ * The command an installed entry runs, without the `hook <name>` after it.
+ *
+ * `"/opt/my tools/carrick/bin/carrick.mjs" hook post-edit` gives the path with
+ * its quotes stripped, and a bare `carrick hook post-edit` gives `carrick`, so
+ * a caller can ask whether that command still resolves on this machine.
+ */
+export function hookTarget(command: string): string | null {
+  const match = HOOK_CALL.exec(command.trim());
+  return match?.[1] ?? null;
+}
+
 /** Strip our entries from one event's groups, keeping everyone else's. */
 function withoutOurs(groups: unknown): HookGroup[] {
   if (!Array.isArray(groups)) return [];

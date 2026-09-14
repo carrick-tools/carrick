@@ -125,8 +125,9 @@ function extraHelp() {
     "    --version                    the version of this package",
     "",
     "`carrick init [--project SLUG]` sets this folder up; `carrick init --help`",
-    "prints its own arguments. `carrick remove` undoes what init wrote on this",
-    "machine and lists the files the scaffold added to the repository.",
+    "prints its own arguments. `carrick doctor` re-checks that setup and exits",
+    "non-zero on anything it finds. `carrick remove` undoes what init wrote on",
+    "this machine and lists the files the scaffold added to the repository.",
     "",
   ].join("\n");
 }
@@ -168,6 +169,13 @@ switch (command) {
   case "remove": {
     const { remove } = await import("../dist/init/remove.js");
     process.exit(await remove(rest));
+  }
+  // Also this package's own: the hook, MCP and workflow halves of the check
+  // are things this package wrote, and the binary answers for the rest of it
+  // through `carrick status`.
+  case "doctor": {
+    const { doctor } = await import("../dist/init/doctor.js");
+    process.exit(await doctor(rest));
   }
   case "templates": {
     const { templates } = await import("../dist/init/run.js");

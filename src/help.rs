@@ -90,8 +90,9 @@ ENVIRONMENT VARIABLES:
 /// still be able to say where they are: `init` is where the first run starts,
 /// so "unknown command" is the wrong answer for it, and a user who reached
 /// the binary directly needs the package named rather than the name denied.
-pub const PACKAGE_COMMANDS: [&str; 7] = [
+pub const PACKAGE_COMMANDS: [&str; 8] = [
     "init",
+    "doctor",
     "remove",
     "login",
     "logout",

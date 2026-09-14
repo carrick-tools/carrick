@@ -115,6 +115,7 @@ types in a Node process.
 | `carrick login` | Authorise a Carrick workspace in the browser, or verify `CARRICK_TOKEN` |
 | `carrick logout` | Remove the saved local credential |
 | `carrick init [--project SLUG] [--repo OWNER/REPO]` | The repo list, the project, the service proposal in `.carrick/`, the agent hooks, the MCP connection, and the prompt that writes `carrick.json` |
+| `carrick doctor` | Re-check that setup: the declared paths, the CI workflow against the current template, the hooks, the MCP connection and how far the index is behind |
 | `carrick remove [--keep-login]` | Undo all of that on this machine, and list the files the scaffold added to the repository |
 | `carrick index` | Derive the workspace, apply optional repo overrides and write `.carrick/`, with Carrick classifying what the deterministic passes could not |
 | `carrick refresh [--service X]` | Re-scan one repo, or all of them, and re-join the index. What the session-start hook runs |
@@ -193,6 +194,30 @@ Claude Code session opened in a workspace still waiting for one starts
 `carrick refresh` in the background, at most once an hour
 (`CARRICK_REFRESH_COOLDOWN_MS` states another gap), so the hosted rows arrive
 without a command to remember.
+
+## Checking the setup
+
+```
+carrick doctor
+```
+
+What Carrick answers depends on decisions made once, at setup: which
+directories are services, which shared roots they include, which tsconfig
+resolves their types. The index itself is rebuilt by CI on every push to the
+default branch; the configuration is not rebuilt by anything. `carrick doctor`
+re-reads it and exits non-zero when it finds something:
+
+- every `directory`, `include` and `tsconfig` a `carrick.json` declares exists,
+- `.github/workflows/carrick.yml` still holds the current template, printed as
+  a diff of the lines it is missing (comments are not compared, and steps of
+  your own are shown but are not a finding),
+- the agent hook entries are the ones this version installs, and the command
+  they run still resolves to this package,
+- each agent client on this machine has the Carrick MCP server,
+- the hosted index answers for every service, with the local index's distance
+  from the working tree and from the default branch as notes.
+
+It writes nothing, runs no scan and costs nothing.
 
 ## Removing Carrick
 
