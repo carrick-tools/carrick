@@ -13,6 +13,7 @@
 //! the blob so every later reader can say so. Wire contract:
 //! carrick-cloud `docs/internal/reference/laptop-scan-seam.md` §8.4.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
@@ -73,6 +74,74 @@ pub fn inspect(repo_path: &str) -> GitState {
         dirty,
         at_origin_main,
     }
+}
+
+/// The paths under `repo_path` whose content on disk is the content `commit`
+/// holds for them, relative to `repo_path`.
+///
+/// The one question the incremental analysis cache asks, from both ends
+/// (carrick#1079). The reader replays a previous scan's answer for a file only
+/// when the file is in this set for that scan's commit; the writer keeps an
+/// answer only when the file is in this set for HEAD. An answer that survives
+/// both therefore describes bytes a commit names, which is what lets a dirty
+/// tree keep its cache for every file it did not touch instead of dropping all
+/// of it.
+///
+/// Built from what git tracks, minus what differs from `commit` in the working
+/// tree (`git diff <commit> --` compares the commit to the files on disk, so
+/// staged and unstaged edits both count). A file git does not track is never
+/// in the set: untracked and ignored files alike have no content any commit
+/// can vouch for, and the scanner's own walk does not read `.gitignore`.
+///
+/// Both git calls run from `repo_path` and print paths relative to it
+/// (`ls-files` does by default, `diff` with `--relative`), which is the form
+/// the cache is keyed by even when `repo_path` is a directory inside a larger
+/// repository. `-z` keeps a non-ASCII path byte-exact rather than quoted.
+///
+/// `Err` carries git's reason and means "git could not answer" (not a
+/// repository, a commit this clone does not hold, a shallow history), which is
+/// deliberately distinct from an empty set.
+pub fn unchanged_since(repo_path: &str, commit: &str) -> Result<HashSet<String>, String> {
+    // A value that is not a hex object name never reaches git's argument list,
+    // where a leading `-` would read as an option.
+    if commit.is_empty() || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("{commit:?} is not a commit id"));
+    }
+    let run = |args: &[&str]| -> Result<String, String> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        String::from_utf8(output.stdout).map_err(|e| e.to_string())
+    };
+    let paths = |text: String| -> Vec<String> {
+        text.split('\0')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let changed: HashSet<String> = paths(run(&[
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--relative",
+        "-z",
+        commit,
+        "--",
+    ])?)
+    .into_iter()
+    .collect();
+    Ok(paths(run(&["ls-files", "-z"])?)
+        .into_iter()
+        .filter(|path| !changed.contains(path))
+        .collect())
 }
 
 /// A clone's `origin` remote, and the repository it names.
@@ -244,13 +313,13 @@ pub fn warnings(state: &GitState) -> Vec<String> {
     }
     if state.dirty {
         // The cost clause is the part a laptop run cannot see for itself: an
-        // uncommitted file is analysed without a cache entry here AND again in
-        // full by the next CI scan, because the row it wrote describes a tree
-        // no commit names (carrick#993 row 17).
+        // uncommitted file keeps no cache entry, so the next scan, CI's
+        // included, asks the model about it again (carrick#993 row 17). Every
+        // file the change did not touch keeps its entry (carrick#1079).
         lines.push(
             "This tree has uncommitted changes. They will be indexed, and marked as such. \
-             Cached analysis will not be kept for them, and the next CI scan re-analyses \
-             this service in full."
+             Cached analysis will not be kept for the changed files, and the next CI scan \
+             re-analyses them."
                 .to_string(),
         );
     }
@@ -299,8 +368,8 @@ mod tests {
         assert_eq!(
             lines[1],
             "This tree has uncommitted changes. They will be indexed, and marked as such. \
-             Cached analysis will not be kept for them, and the next CI scan re-analyses \
-             this service in full."
+             Cached analysis will not be kept for the changed files, and the next CI scan \
+             re-analyses them."
         );
         assert_eq!(lines[2], LEAVE_ROUTINE_SCANS_TO_CI);
     }

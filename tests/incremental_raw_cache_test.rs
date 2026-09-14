@@ -28,6 +28,10 @@ use std::sync::{Arc, Mutex};
 /// In-memory storage with no synthetic seed repos and direct access to what
 /// was uploaded, so a test can read scan #1's payload back and mutate it
 /// before scan #2 picks it up as `previous_data`.
+///
+/// An upload replaces the stored row for its (repo, service), as the index
+/// does, so each scan's previous generation is the scan before it rather than
+/// the first one ever stored.
 #[derive(Default, Clone)]
 struct StubStorage {
     repos: Arc<Mutex<Vec<CloudRepoData>>>,
@@ -40,7 +44,11 @@ impl CloudStorage for StubStorage {
         data: &CloudRepoData,
         _final_in_run: bool,
     ) -> Result<UploadOutcome, StorageError> {
-        self.repos.lock().unwrap().push(data.clone());
+        let mut repos = self.repos.lock().unwrap();
+        repos.retain(|stored| {
+            stored.repo_name != data.repo_name || stored.service_name != data.service_name
+        });
+        repos.push(data.clone());
         Ok(UploadOutcome::default())
     }
     /// Whatever this stub recorded, at the commit it recorded it with.
@@ -456,5 +464,126 @@ async fn a_skipped_file_is_absent_from_the_cache_and_is_dispatched_once_it_raise
             .iter()
             .any(|path| path.ends_with("notes.ts")),
         "the file the model was asked about must now hold its answer: {scan_two_cached:#?}"
+    );
+}
+
+/// The same file, edited in the working tree and not committed.
+const EDITED_CANDIDATE: &str = "export async function fetchNotes(): Promise<string> {\n  \
+    const res = await fetch(\"http://localhost:9100/api/notes/archived\");\n  \
+    return res.text();\n}\n";
+
+/// Run one scan and return what it uploaded and how many files it sent to the
+/// model.
+async fn scan(storage: &StubStorage, repo_path: &Path) -> (CloudRepoData, usize) {
+    let before = carrick::scan_health::attempted_count();
+    run_analysis_engine_with_sidecar(storage.clone(), repo_path.to_str().unwrap(), None, false)
+        .await
+        .expect("scan failed");
+    (
+        latest_upload(storage),
+        carrick::scan_health::attempted_count() - before,
+    )
+}
+
+fn cached_files(data: &CloudRepoData) -> Vec<String> {
+    let mut files: Vec<String> = data
+        .file_results
+        .as_ref()
+        .map(|results| results.keys().cloned().collect())
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
+/// carrick#1079: one untracked file used to make a scan non-incremental both
+/// ways, because a dirty run uploaded no cache and a dirty previous generation
+/// was ignored. Now the untracked file is the only one sent to the model, the
+/// dirty payload keeps every answer about a committed file, and the next dirty
+/// scan replays that payload rather than starting cold.
+#[tokio::test]
+#[serial]
+async fn an_untracked_file_costs_one_dispatch_not_the_whole_cache() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (repo_path, cassette) = committed_fixture(tmp.path());
+    mock_env(&cassette);
+    let storage = StubStorage::default();
+
+    let (clean, dispatched_cold) = scan(&storage, &repo_path).await;
+    assert!(dispatched_cold > 0, "scan #1 is the cold scan");
+    assert_eq!(clean.dirty, None);
+    let committed_answers = cached_files(&clean);
+    assert!(!committed_answers.is_empty(), "scan #1 seeds the cache");
+
+    std::fs::write(repo_path.join("src/notes.ts"), ONE_CANDIDATE).unwrap();
+
+    let (dirty, dispatched_dirty) = scan(&storage, &repo_path).await;
+    assert_eq!(
+        dispatched_dirty, 1,
+        "only the untracked file goes to the model; every committed file replays its answer"
+    );
+    assert_eq!(dirty.dirty, Some(true));
+    assert_eq!(
+        cached_files(&dirty),
+        committed_answers,
+        "a dirty run keeps every answer about a committed file, and none about the untracked one"
+    );
+
+    // The previous generation is now the dirty one, and it is replayed.
+    let (_, dispatched_again) = scan(&storage, &repo_path).await;
+    assert_eq!(
+        dispatched_again, 1,
+        "a dirty previous generation still serves every committed file's answer"
+    );
+}
+
+/// The failure the old whole-cache drop existed to prevent, now prevented per
+/// file: an answer about uncommitted bytes must never be replayed.
+///
+/// `src/notes.ts` is committed and answered. It is then edited without a
+/// commit: that scan must ask the model again (a commit-to-commit diff sees no
+/// change) and must not cache the answer. Once the edit is reverted, the next
+/// scan must ask again too: had the dirty answer been cached, the file would
+/// read as unchanged since the commit and the answer about the edit would be
+/// replayed for the committed code.
+#[tokio::test]
+#[serial]
+async fn an_answer_about_an_uncommitted_edit_is_never_replayed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (repo_path, cassette) =
+        committed_fixture_with(tmp.path(), &[("src/notes.ts", ONE_CANDIDATE)]);
+    mock_env(&cassette);
+    let storage = StubStorage::default();
+
+    let (clean, _) = scan(&storage, &repo_path).await;
+    assert!(
+        cached_files(&clean)
+            .iter()
+            .any(|path| path.ends_with("notes.ts")),
+        "the committed file holds an answer: {:?}",
+        cached_files(&clean)
+    );
+
+    std::fs::write(repo_path.join("src/notes.ts"), EDITED_CANDIDATE).unwrap();
+    let (dirty, dispatched_dirty) = scan(&storage, &repo_path).await;
+    assert_eq!(
+        dispatched_dirty, 1,
+        "the edited file is changed on disk even though HEAD did not move"
+    );
+    assert_eq!(dirty.dirty, Some(true));
+    assert!(
+        !cached_files(&dirty)
+            .iter()
+            .any(|path| path.ends_with("notes.ts")),
+        "the answer about the uncommitted edit is not cached: {:?}",
+        cached_files(&dirty)
+    );
+
+    run_git(&repo_path, &["checkout", "-q", "--", "src/notes.ts"]);
+    let (reverted, dispatched_reverted) = scan(&storage, &repo_path).await;
+    assert_eq!(reverted.dirty, None, "the revert leaves a clean tree");
+    assert_eq!(
+        dispatched_reverted, 1,
+        "the reverted file has no cached answer, so it is asked about again; zero would mean \
+         the answer about the edit was replayed for the committed code"
     );
 }
