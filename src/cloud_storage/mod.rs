@@ -1161,7 +1161,7 @@ pub fn get_current_commit_hash(repo_path: &str) -> String {
         // Clear inherited git env so the repo is discovered from repo_path, not
         // an ambient GIT_DIR / GIT_WORK_TREE (e.g. a pre-commit hook or the eval
         // harness subprocess running inside a worktree) — otherwise this records
-        // the wrong repo's commit hash. Mirrors get_changed_files in the engine.
+        // the wrong repo's commit hash. Mirrors `git_state::unchanged_since`.
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")

@@ -75,8 +75,11 @@ pub(crate) mod type_compat_v2;
 /// of this is enforceable from inside this repo.
 ///
 /// Invalidation is keyed by repo-relative path: a file goes back to the model
-/// when `git diff` against the previous scan's commit names it, or when the
-/// cache holds no entry for it. Only a file the model was ASKED about has an
+/// when its content on disk is not what the previous scan's commit holds (an
+/// uncommitted edit counts, and an untracked file always does), or when the
+/// cache holds no entry for it. A dirty run keeps the entries for files that
+/// match its commit and drops only the rest (`stamp_tree_state`,
+/// carrick#1079). Only a file the model was ASKED about has an
 /// entry — a file phase 1 skipped (no candidate, unroutable protocol,
 /// unparseable) and a file whose call failed are both absent. That absence is
 /// deliberate and is what replaces the old "bump the version" escape hatch:
@@ -290,6 +293,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // `dirty` claim `start-scan` is given, and the `dirty` field stamped on
     // every payload.
     let git_state = crate::git_state::inspect(repo_path);
+    // Which files match HEAD before any of them is read, so an edit made while
+    // the scan runs cannot slip an answer about uncommitted bytes into the
+    // cache (see `stamp_tree_state`).
+    let unchanged_at_start = crate::git_state::unchanged_since(repo_path, &git_state.commit).ok();
     let run_context = crate::cloud_storage::RunContext {
         repo_full_name: crate::git_state::remote_name(std::path::Path::new(repo_path)),
         commit: git_state.commit.clone(),
@@ -427,7 +434,6 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 .iter()
                 .find(|r| r.repo_name == repo_name && r.service_name == service.service_name)
                 .cloned()
-                .map(without_dirty_analysis)
         };
 
         let analysis_started = Instant::now();
@@ -621,13 +627,27 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             );
             None
         } else {
+            // Asked again now the files have been read, per commit the
+            // payloads name (one, unless HEAD moved mid-scan), and kept only
+            // where both asks agree.
+            let mut unchanged_by_commit: HashMap<String, Option<HashSet<String>>> = HashMap::new();
             Some(
                 current_services_data
                     .iter()
                     .map(|data| {
+                        let unchanged = unchanged_by_commit
+                            .entry(data.commit_hash.clone())
+                            .or_insert_with(|| {
+                                let at_upload =
+                                    crate::git_state::unchanged_since(repo_path, &data.commit_hash)
+                                        .ok()?;
+                                let at_start = unchanged_at_start.as_ref()?;
+                                Some(at_upload.intersection(at_start).cloned().collect())
+                            });
                         stamp_tree_state(
                             strip_ast_nodes(data.clone(), storage.stages_oversized_payloads()),
                             git_state.dirty,
+                            unchanged.as_ref(),
                         )
                     })
                     .collect(),
@@ -1174,48 +1194,44 @@ where
     Ok(T::default())
 }
 
-/// The reader half of the dirty rule: a generation written from a tree that
-/// did not match its commit contributes no analysis to the next run.
-///
-/// The writer half drops `file_results` before the upload, so a blob this
-/// scanner wrote already carries none. This is the guard that does not depend
-/// on that: whatever produced the blob, its answers describe code that is not
-/// at the commit the replay keys on, and `git diff --name-only <prev> HEAD`
-/// cannot see the difference (§2.4). Everything else about the previous
-/// generation is still used — the detection and guidance caches describe the
-/// dependency set, not the edited files.
-fn without_dirty_analysis(mut previous: CloudRepoData) -> CloudRepoData {
-    if previous.dirty == Some(true) {
-        previous.file_results = None;
-    }
-    previous
-}
-
 /// Record what the tree looked like on the payload that describes it.
-///
-/// Two halves of one fact, and neither works alone.
 ///
 /// `dirty` qualifies `commit_hash`, which the blob already carries: without it
 /// the blob says "this is the index at 4f2a1c9" about a tree that was not
 /// 4f2a1c9, and every later reader of it as `previous_data` inherits the false
 /// version.
 ///
-/// Dropping `file_results` is what stops that analysis becoming permanent.
-/// The incremental cache is replayed for files `git diff --name-only
-/// <prev_commit> HEAD` says are unchanged, and that diff is commit to commit —
-/// it cannot see the working tree. So a file that was dirty when it was
-/// analysed and is later reverted reads as unchanged forever, and its analysis
-/// of code that exists in no commit is reused by every later run, CI's
-/// included. Superseding the row does not supersede that; only refusing to
-/// cache it does. The cost is one cold re-analysis of this service, and the
-/// laptop does not re-pay it because it writes its own local cache from the
-/// same run (carrick-cloud `docs/internal/reference/laptop-scan-seam.md`
-/// §2.2, §2.4).
-fn stamp_tree_state(mut payload: CloudRepoData, dirty: bool) -> CloudRepoData {
+/// `file_results` keeps only the answers about files whose bytes on disk are
+/// the bytes the commit holds (`unchanged`, from
+/// [`crate::git_state::unchanged_since`], asked before the files were read and
+/// again after). The next run replays an answer only for a file whose content
+/// still matches the previous scan's commit, so an answer about uncommitted
+/// bytes would be replayed as soon as the edit was reverted, by every later
+/// run, CI's included. Dropping exactly those answers stops that, and every
+/// file the edit did not touch keeps its answer (carrick#1079): one untracked
+/// file no longer costs a laptop the whole service's cache. A file git does
+/// not track is never in `unchanged`, so its answer is never kept either.
+///
+/// When git could not answer (`None`), a dirty tree keeps no answers, because
+/// nothing can say which ones describe the commit; a clean tree keeps them
+/// all, because the next run cannot replay them without git anyway.
+fn stamp_tree_state(
+    mut payload: CloudRepoData,
+    dirty: bool,
+    unchanged: Option<&HashSet<String>>,
+) -> CloudRepoData {
     payload.dirty = dirty.then_some(true);
-    if dirty {
-        payload.file_results = None;
-    }
+    payload.file_results = match (payload.file_results.take(), unchanged) {
+        (Some(results), Some(unchanged)) => {
+            let kept: HashMap<_, _> = results
+                .into_iter()
+                .filter(|(path, _)| unchanged.contains(path))
+                .collect();
+            (!kept.is_empty()).then_some(kept)
+        }
+        (results, None) if !dirty => results,
+        _ => None,
+    };
     payload
 }
 
@@ -1556,71 +1572,44 @@ fn enforce_payload_size_limit(data: &mut CloudRepoData, staging_available: bool)
     }
 }
 
-/// Get files changed between a base commit and HEAD.
-/// Returns relative paths matching the file discovery format.
-fn get_changed_files(repo_path: &str, base_commit: &str) -> Option<Vec<String>> {
-    if crate::local_mode::no_model() {
-        return crate::local_mode::query::changed_since(Path::new(repo_path), base_commit)
-            .map(|set| set.into_iter().collect());
-    }
-    let output = std::process::Command::new("git")
-        .args(["diff", "--name-only", base_commit, "HEAD"])
+/// The repo-relative paths whose content on disk is what `base_commit` holds,
+/// so a previous scan's answer for them still describes them.
+///
+/// Compared against the working tree, not HEAD: a file edited and not yet
+/// committed is changed here whatever `git diff <base> HEAD` says, and a file
+/// git does not track is never unchanged (carrick#1079). `None` is "git could
+/// not answer", and the caller falls back to a full analysis.
+fn reusable_paths(repo_path: &str, base_commit: &str) -> Option<HashSet<String>> {
+    let reason = match crate::git_state::unchanged_since(repo_path, base_commit) {
+        Ok(paths) => return Some(paths),
+        Err(reason) => reason,
+    };
+    // Surface this at warn level with the cause: a shallow clone
+    // (actions/checkout defaults to fetch-depth: 1) silently forces a full
+    // re-analysis — including its full LLM cost — on every run.
+    let is_shallow = std::process::Command::new("git")
+        .args(["rev-parse", "--is-shallow-repository"])
         .current_dir(repo_path)
-        // Clear git env vars so git uses repo_path for repo discovery, not an
-        // ambient GIT_DIR / GIT_WORK_TREE inherited from a parent process (e.g.
-        // when invoked from a pre-commit hook inside a git worktree).
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .output()
-        .ok()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Surface this at warn level with the cause: a shallow clone
-        // (actions/checkout defaults to fetch-depth: 1) silently forces a
-        // full re-analysis — including its full LLM cost — on every run.
-        let is_shallow = std::process::Command::new("git")
-            .args(["rev-parse", "--is-shallow-repository"])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .ok()
-            .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
-        if is_shallow {
-            warn!(
-                "Incremental mode unavailable: this is a shallow clone, so the previous \
-                 scan's commit isn't reachable for diffing. Set `fetch-depth: 0` on \
-                 actions/checkout to avoid re-analyzing every file on each run."
-            );
-        } else {
-            warn!(
-                "Incremental mode unavailable: git diff against {} failed ({}). \
-                 Falling back to full analysis.",
-                base_commit,
-                stderr.trim()
-            );
-        }
-        return None;
+        .ok()
+        .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
+    if is_shallow {
+        warn!(
+            "Incremental mode unavailable: this is a shallow clone, so the previous \
+             scan's commit isn't reachable for diffing. Set `fetch-depth: 0` on \
+             actions/checkout to avoid re-analyzing every file on each run."
+        );
+    } else {
+        warn!(
+            "Incremental mode unavailable: git diff against {} failed ({}). \
+             Falling back to full analysis.",
+            base_commit, reason
+        );
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let changed: Vec<String> = stdout
-        .lines()
-        .filter(|line| !line.is_empty())
-        .filter(|line| {
-            let ext = Path::new(line)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
-            matches!(ext, "ts" | "tsx" | "js" | "jsx")
-        })
-        .map(|line| line.to_string())
-        .collect();
-
-    Some(changed)
+    None
 }
 
 /// Hash file content for cache invalidation (package.json).
@@ -1704,8 +1693,9 @@ fn normalize_file_results_keys(
 /// Every discovered file is analysed either way: the deterministic layer runs
 /// over all of them on every scan (see `CACHE_VERSION`), and this decides only
 /// which ones cost a model call. A file is reusable when the previous scan
-/// recorded an answer for it and `git diff` against that scan's commit does not
-/// name it. A file the previous scan never recorded — new, one phase 1 skipped,
+/// recorded an answer for it and its content on disk is still what that scan's
+/// commit holds (`unchanged`, from [`reusable_paths`]). A file the previous
+/// scan never recorded — new, one phase 1 skipped,
 /// or one whose call failed — has no entry and goes back through phase 1, which
 /// dispatches it only if it raises a candidate this time. That is the whole
 /// mechanism by which a scanner improvement reaches an indexed repo: the skip
@@ -1718,10 +1708,10 @@ fn normalize_file_results_keys(
 fn reusable_model_answers(
     discovered: impl Iterator<Item = (String, String)>,
     previous: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
-    changed: &HashSet<String>,
+    unchanged: &HashSet<String>,
 ) -> HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult> {
     discovered
-        .filter(|(_, relative)| !changed.contains(relative))
+        .filter(|(_, relative)| unchanged.contains(relative))
         .filter_map(|(key, relative)| Some((key, previous.get(&relative)?.clone())))
         .collect()
 }
@@ -1779,8 +1769,8 @@ async fn analyze_current_repo_incremental(
             &prev_commit[..std::cmp::min(7, prev_commit.len())]
         );
 
-        // Get changed files via git diff
-        if let Some(changed_files) = get_changed_files(repo_path, prev_commit) {
+        // Which files still hold the content the previous scan's commit did.
+        if let Some(unchanged) = reusable_paths(repo_path, prev_commit) {
             // Function intents need only discovery's definitions and the
             // previous scan's hashes, so they start now and run beside
             // detection, file analysis and the graph (carrick#1065). Started
@@ -1815,15 +1805,12 @@ async fn analyze_current_repo_incremental(
                 }
             };
 
-            // Normalize changed files relative to repo root
-            let changed_set: HashSet<String> = changed_files.into_iter().collect();
-
             let cached_model_results = reusable_model_answers(
                 files
                     .iter()
                     .map(|f| (f.to_string_lossy().to_string(), normalize_path(f))),
                 prev_file_results,
-                &changed_set,
+                &unchanged,
             );
 
             let total_files = files.len();
@@ -2136,7 +2123,7 @@ async fn analyze_current_repo_incremental(
                     .candidates_withheld_changed_files = Some(
                     prev_file_results
                         .keys()
-                        .filter(|file| changed_set.contains(*file))
+                        .filter(|file| !unchanged.contains(*file))
                         .count(),
                 );
             }
@@ -2147,7 +2134,7 @@ async fn analyze_current_repo_incremental(
 
             return Ok(cloud_data);
         } else {
-            debug!("git diff failed, falling back to full analysis");
+            debug!("git could not compare the tree, falling back to full analysis");
         }
     }
 
@@ -5147,32 +5134,54 @@ mod tests {
         blob
     }
 
-    /// The dirty-tree ruling is warn, never refuse — so the payload is still
-    /// uploaded, and it carries the two things that make the upload honest:
-    /// the flag beside the commit it qualifies, and no analysis cache, because
-    /// a commit-to-commit diff can never tell the next run that these files
-    /// changed (§2.2, §2.4).
-    #[test]
-    fn a_dirty_tree_still_uploads_and_says_so_without_seeding_the_cache() {
-        let dirty = stamp_tree_state(bare_blob(), true);
-        assert_eq!(dirty.dirty, Some(true));
-        assert!(
-            dirty.file_results.is_none(),
-            "a dirty run must not seed the next run's incremental cache"
+    /// A second answer beside `bare_blob`'s, for the file the tests edit.
+    fn blob_with_an_edited_file() -> CloudRepoData {
+        let mut blob = bare_blob();
+        blob.file_results.as_mut().unwrap().insert(
+            "src/routes/edited.ts".to_string(),
+            crate::agents::file_analyzer_agent::FileAnalysisResult::default(),
         );
+        blob
+    }
+
+    /// The dirty-tree ruling is warn, never refuse — so the payload is still
+    /// uploaded, with the flag beside the commit it qualifies. The cache keeps
+    /// the answer about the untouched file and drops the one about the edited
+    /// file, whose answer describes bytes no commit holds (carrick#1079).
+    #[test]
+    fn a_dirty_tree_says_so_and_keeps_only_the_answers_about_committed_bytes() {
+        let unchanged = HashSet::from(["src/routes/orders.ts".to_string()]);
+        let dirty = stamp_tree_state(blob_with_an_edited_file(), true, Some(&unchanged));
+        assert_eq!(dirty.dirty, Some(true));
+        let kept: Vec<_> = dirty.file_results.as_ref().unwrap().keys().collect();
+        assert_eq!(kept, vec!["src/routes/orders.ts"]);
         // The commit is untouched: `dirty` qualifies it, it does not replace
         // it, and the cloud keys the row on it.
         assert_eq!(
             dirty.commit_hash,
             "4f2a1c9000000000000000000000000000000000"
         );
-
         let wire = serde_json::to_value(&dirty).unwrap();
         assert_eq!(wire["dirty"], true);
-        assert!(
-            wire.get("file_results").is_none(),
-            "the cache is omitted, not sent as null: {wire}"
-        );
+    }
+
+    /// When no answer survives, the cache is omitted rather than sent empty,
+    /// and when git could not say which answers describe the commit, a dirty
+    /// tree keeps none of them.
+    #[test]
+    fn a_dirty_tree_git_cannot_describe_keeps_no_answers() {
+        let nothing = HashSet::new();
+        for dirty in [
+            stamp_tree_state(blob_with_an_edited_file(), true, Some(&nothing)),
+            stamp_tree_state(blob_with_an_edited_file(), true, None),
+        ] {
+            assert!(dirty.file_results.is_none());
+            let wire = serde_json::to_value(&dirty).unwrap();
+            assert!(
+                wire.get("file_results").is_none(),
+                "the cache is omitted, not sent as null: {wire}"
+            );
+        }
     }
 
     /// A clean tree is what CI always has, and its payload must be exactly
@@ -5180,15 +5189,22 @@ mod tests {
     /// cache intact so the next run replays it.
     #[test]
     fn a_clean_tree_sends_no_dirty_key_and_keeps_its_cache() {
-        let clean = stamp_tree_state(bare_blob(), false);
-        assert_eq!(clean.dirty, None);
-        assert!(clean.file_results.is_some(), "a clean run seeds the cache");
-
-        let wire = serde_json::to_value(&clean).unwrap();
-        assert!(
-            wire.get("dirty").is_none(),
-            "a clean payload is byte-identical to a pre-field one: {wire}"
-        );
+        let everything = HashSet::from([
+            "src/routes/orders.ts".to_string(),
+            "src/routes/edited.ts".to_string(),
+        ]);
+        for clean in [
+            stamp_tree_state(blob_with_an_edited_file(), false, Some(&everything)),
+            stamp_tree_state(blob_with_an_edited_file(), false, None),
+        ] {
+            assert_eq!(clean.dirty, None);
+            assert_eq!(clean.file_results.as_ref().map(HashMap::len), Some(2));
+            let wire = serde_json::to_value(&clean).unwrap();
+            assert!(
+                wire.get("dirty").is_none(),
+                "a clean payload is byte-identical to a pre-field one: {wire}"
+            );
+        }
     }
 
     /// A blob written before the field existed reads as clean, which is what
@@ -6855,165 +6871,115 @@ mod tests {
         assert!(normalized.contains_key("src/app.ts"));
     }
 
-    #[test]
-    fn test_get_changed_files_with_real_git_repo() {
-        use std::process::Command;
-
+    /// A throwaway repository with one commit holding `files`, for the tests
+    /// that ask git about a real tree.
+    fn committed_repo(files: &[(&str, &str)]) -> (tempfile::TempDir, String) {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let repo_path = temp_dir.path().to_str().unwrap();
-
-        // Init a git repo. Clear git env vars so the commands are scoped to
-        // repo_path rather than any ambient GIT_DIR set by a parent process
-        // (e.g. a pre-commit hook running inside a git worktree).
-        Command::new("git")
-            .args(["init"])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .unwrap();
-
-        // Create initial commit with a .ts file
-        std::fs::write(temp_dir.path().join("app.ts"), "const x = 1;").unwrap();
-        std::fs::write(temp_dir.path().join("readme.md"), "# Readme").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .unwrap();
-
-        // Get the first commit hash
-        let base_hash = String::from_utf8(
-            Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(repo_path)
+        let git = |args: &[&str]| {
+            // Clear git env vars so the commands are scoped to the temp repo
+            // rather than an ambient GIT_DIR set by a parent process (e.g. a
+            // pre-commit hook running inside a git worktree).
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(temp_dir.path())
                 .env_remove("GIT_DIR")
                 .env_remove("GIT_WORK_TREE")
                 .env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
                 .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        for (relative, contents) in files {
+            let path = temp_dir.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        (temp_dir, head)
+    }
 
-        // Make changes: modify .ts, add new .tsx, modify .md (should be filtered)
-        std::fs::write(temp_dir.path().join("app.ts"), "const x = 2;").unwrap();
-        std::fs::write(
-            temp_dir.path().join("new.tsx"),
-            "export default () => <div/>;",
-        )
-        .unwrap();
-        std::fs::write(temp_dir.path().join("readme.md"), "# Updated").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(repo_path)
+    /// The reader half of carrick#1079: a file is reusable only while its
+    /// bytes on disk are the ones the previous scan's commit holds. Uncommitted
+    /// edits, staged or not, and files git does not track are all changed; a
+    /// file untouched beside them is not, so one stray file no longer costs
+    /// every other file its answer.
+    #[test]
+    fn reusable_paths_reads_the_working_tree_not_head() {
+        let (repo, base) = committed_repo(&[
+            ("src/app.ts", "const x = 1;"),
+            ("src/staged.ts", "const s = 1;"),
+            ("src/kept.ts", "const k = 1;"),
+            ("src/caf\u{e9}.ts", "const c = 1;"),
+        ]);
+        let root = repo.path();
+        std::fs::write(root.join("src/app.ts"), "const x = 2;").unwrap();
+        std::fs::write(root.join("src/staged.ts"), "const s = 2;").unwrap();
+        let add = std::process::Command::new("git")
+            .args(["add", "src/staged.ts"])
+            .current_dir(root)
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "changes"])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .unwrap();
+        assert!(add.status.success());
+        std::fs::write(root.join("src/untracked.ts"), "const u = 1;").unwrap();
 
-        // Test get_changed_files
-        let changed = get_changed_files(repo_path, &base_hash);
-        assert!(changed.is_some());
+        let unchanged = reusable_paths(root.to_str().unwrap(), &base).expect("git answers");
 
-        let changed = changed.unwrap();
-        assert!(changed.contains(&"app.ts".to_string()));
-        assert!(changed.contains(&"new.tsx".to_string()));
-        // .md file should be filtered out
-        assert!(!changed.contains(&"readme.md".to_string()));
+        assert!(unchanged.contains("src/kept.ts"), "{unchanged:?}");
+        // A non-ASCII path comes back byte-exact, not quoted.
+        assert!(unchanged.contains("src/caf\u{e9}.ts"), "{unchanged:?}");
+        for changed in ["src/app.ts", "src/staged.ts", "src/untracked.ts"] {
+            assert!(
+                !unchanged.contains(changed),
+                "{changed} differs from the commit on disk: {unchanged:?}"
+            );
+        }
+
+        // An edit reverted to the commit's bytes is unchanged again.
+        std::fs::write(root.join("src/app.ts"), "const x = 1;").unwrap();
+        let unchanged = reusable_paths(root.to_str().unwrap(), &base).unwrap();
+        assert!(unchanged.contains("src/app.ts"), "{unchanged:?}");
+    }
+
+    /// A scan rooted below the repository's top level reads paths relative to
+    /// its own root, which is how the cache keys them.
+    #[test]
+    fn reusable_paths_is_relative_to_a_root_inside_the_repository() {
+        let (repo, base) = committed_repo(&[
+            ("services/api/src/app.ts", "const x = 1;"),
+            ("services/api/src/kept.ts", "const k = 1;"),
+            ("other/elsewhere.ts", "const e = 1;"),
+        ]);
+        std::fs::write(repo.path().join("services/api/src/app.ts"), "const x = 2;").unwrap();
+        let root = repo.path().join("services/api");
+
+        let unchanged = reusable_paths(root.to_str().unwrap(), &base).unwrap();
+
+        assert_eq!(
+            unchanged,
+            HashSet::from(["src/kept.ts".to_string()]),
+            "only the service's unchanged file, keyed from the service root"
+        );
     }
 
     #[test]
-    fn test_get_changed_files_returns_none_for_invalid_commit() {
-        use std::process::Command;
-
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let repo_path = temp_dir.path().to_str().unwrap();
-
-        Command::new("git")
-            .args(["init"])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .unwrap();
-        std::fs::write(temp_dir.path().join("app.ts"), "x").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .unwrap();
-
-        // Non-existent commit hash → should return None (simulates shallow clone)
-        let result = get_changed_files(repo_path, "0000000000000000000000000000000000000000");
-        assert!(result.is_none());
+    fn reusable_paths_is_none_when_git_cannot_answer() {
+        let (repo, _) = committed_repo(&[("app.ts", "x")]);
+        let root = repo.path().to_str().unwrap();
+        // A commit this clone does not hold (what a shallow clone looks like).
+        assert!(reusable_paths(root, "0000000000000000000000000000000000000000").is_none());
+        // Not a commit id at all never reaches git.
+        assert!(reusable_paths(root, "--output=/tmp/x").is_none());
     }
 
     #[test]
@@ -7394,7 +7360,7 @@ mod tests {
     }
 
     /// The selection the incremental branch makes: previous run had A, B, C;
-    /// this run discovers A, B, D; `git diff` names B. Only A still holds a
+    /// this run discovers A, B, D; B's content moved. Only A still holds a
     /// usable model answer. C is gone, D was never asked about, and B changed —
     /// each of the other three goes to the model.
     ///
@@ -7419,9 +7385,12 @@ mod tests {
         let discovered = ["src/a.ts", "src/b.ts", "src/d.ts"]
             .into_iter()
             .map(|relative| (format!("/repo/{relative}"), relative.to_string()));
-        let changed: HashSet<String> = ["src/b.ts".to_string()].into_iter().collect();
+        // Git vouches for A and C; B changed; D is not tracked.
+        let unchanged: HashSet<String> = ["src/a.ts".to_string(), "src/c.ts".to_string()]
+            .into_iter()
+            .collect();
 
-        let reusable = reusable_model_answers(discovered, &previous, &changed);
+        let reusable = reusable_model_answers(discovered, &previous, &unchanged);
 
         assert_eq!(
             reusable.keys().collect::<Vec<_>>(),
