@@ -838,6 +838,28 @@ pub fn mount_graph_to_api_details(
     (endpoints, calls)
 }
 
+/// A write action that failed AFTER an attempt whose outcome nobody saw, so
+/// the index may or may not carry what this run computed (carrick#1067).
+///
+/// The shape of the 2026-09-14 incident: `complete-upload` ran for 57 s, the
+/// gateway cut the response at 30 s, the one retry was answered 400, and the
+/// original handler committed the write 25 s after the cut. A bare error there
+/// says "the upload failed" about a write that succeeded, which is why this is
+/// a state of its own and not a message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UncertainWrite {
+    /// The action whose response was lost: `complete-upload` or
+    /// `store-metadata`.
+    pub action: String,
+    /// The lost attempt died on a transport error or a 5xx, so the handler
+    /// behind it can still be running. Decides whether the landed-check polls
+    /// or asks once: a refusal the cloud answered promptly leaves nothing to
+    /// wait for.
+    pub handler_may_still_run: bool,
+    /// What the transport said, for the run summary.
+    pub message: String,
+}
+
 #[derive(Debug)]
 pub enum StorageError {
     ConnectionError(String),
@@ -846,6 +868,19 @@ pub enum StorageError {
     NotFound(String),
     #[allow(dead_code)]
     DatabaseError(String),
+    /// A write whose outcome is unknown rather than failed. The engine answers
+    /// it by asking the cloud what it holds, never by ending the run.
+    UncertainWrite(UncertainWrite),
+}
+
+impl StorageError {
+    /// The lost write behind this error, when that is what it is.
+    pub fn uncertain_write(&self) -> Option<&UncertainWrite> {
+        match self {
+            StorageError::UncertainWrite(write) => Some(write),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for StorageError {
@@ -855,6 +890,11 @@ impl std::fmt::Display for StorageError {
             StorageError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
             StorageError::NotFound(msg) => write!(f, "Not found: {}", msg),
             StorageError::DatabaseError(msg) => write!(f, "Database error: {}", msg),
+            StorageError::UncertainWrite(write) => write!(
+                f,
+                "Lost the response to '{}': {}",
+                write.action, write.message
+            ),
         }
     }
 }
@@ -891,6 +931,31 @@ pub trait CloudStorage {
         data: &CloudRepoData,
         final_in_run: bool,
     ) -> Result<UploadOutcome, StorageError>;
+
+    /// Whether THIS run's write of this payload reached the stored index — the
+    /// question a [`StorageError::UncertainWrite`] leaves open (carrick#1067).
+    ///
+    /// A read, and a cheap one: the engine asks it only after a write it did
+    /// not see the outcome of, and answers `true` by treating that write as
+    /// delivered. So it must be exact, and the commit alone is not exact
+    /// enough: a `--no-cache` run, or a second scan of a dirty tree, rewrites
+    /// a row that ALREADY carries this commit, and a row the previous
+    /// generation left there would confirm a write that never happened.
+    /// `written_after` is when this run's attempt began, and a row that has
+    /// not moved since is not this run's.
+    ///
+    /// `false` means "this run's index is not what the cloud holds for this
+    /// service", which includes every case the check could not settle, so an
+    /// unconfirmed write is reported rather than assumed.
+    ///
+    /// Required rather than defaulted: an `async_trait` default body forces
+    /// `Self: Sync` on every generic caller (carrick#956), and each backend
+    /// knows its own store.
+    async fn index_landed(
+        &self,
+        data: &CloudRepoData,
+        written_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError>;
 
     /// Open the run: prove connectivity, and on the laptop path claim the
     /// scan slot and resolve the project before a single model call is paid

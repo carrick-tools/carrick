@@ -4,8 +4,8 @@ use crate::agents::framework_guidance_agent::{FrameworkGuidanceAgent, ProtocolGu
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{
     CACHE_DIR_ENV, CloudRepoData, CloudStorage, INLINE_PAYLOAD_LIMIT_BYTES, ManifestRole,
-    ManifestTypeKind, ManifestTypeState, TypeDegradation, TypeManifestEntry, UploadOutcome,
-    get_current_commit_hash, mount_graph_to_api_details,
+    ManifestTypeKind, ManifestTypeState, StorageError, TypeDegradation, TypeManifestEntry,
+    UploadOutcome, get_current_commit_hash, mount_graph_to_api_details,
 };
 use crate::config::Config;
 use crate::file_finder::find_service_files;
@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use swc_common::{
@@ -831,7 +831,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 // stays fresh, then propagate the failure.
                 logging::finish_spinner_warn(&sp, "Cross-repo analysis failed");
                 if let Some(payloads) = &upload_payloads {
-                    upload_service_payloads(storage, payloads, no_cache).await?;
+                    // Whatever the upload could not confirm has already been
+                    // named in its own summary line and annotation; the error
+                    // this path returns is the analysis failure that brought it
+                    // here, which is the one worth raising (carrick#1067).
+                    upload_service_payloads(storage, payloads, no_cache).await;
                 }
                 return Err(e);
             }
@@ -905,6 +909,12 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     //     MCP `check_compatibility` tool can surface the real verdict instead of
     //     structural-matching-only. Absent for edges the check didn't evaluate,
     //     which the cloud reads as "not compared" (fail closed, #324).
+    //
+    //     A service whose index the upload could not confirm does not end the
+    //     run here: the report below is about a scan that already happened, so
+    //     it is printed, and the run exits non-zero naming them at the very end
+    //     (carrick#1067).
+    let mut unconfirmed_uploads: Vec<UnconfirmedUpload> = Vec::new();
     if let Some(mut payloads) = upload_payloads {
         crate::cloud_storage::attach_compat_verdicts(
             &mut payloads,
@@ -934,7 +944,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         for payload in &mut payloads {
             enforce_payload_size_limit(payload, staging_available);
         }
-        upload_service_payloads(storage, &payloads, no_cache).await?;
+        unconfirmed_uploads = upload_service_payloads(storage, &payloads, no_cache).await;
     }
 
     let topology = crate::findings::Topology {
@@ -998,6 +1008,12 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         if let Err(e) = storage.post_pr_result(&payload).await {
             warn!("Failed to post PR result: {}", e);
         }
+    }
+
+    // The last word of a run whose index is not what it should be. Everything
+    // above happened; this is what makes the exit code say so (carrick#1067).
+    if !unconfirmed_uploads.is_empty() {
+        return Err(unconfirmed_upload_error(&unconfirmed_uploads).into());
     }
 
     Ok(())
@@ -1203,64 +1219,163 @@ fn stamp_tree_state(mut payload: CloudRepoData, dirty: bool) -> CloudRepoData {
     payload
 }
 
-/// Upload each already-prepared service payload to the cloud index, in order.
-/// On a mid-sequence failure, reports which services made it and which didn't:
-/// uploads are keyed per (repo, service) and idempotent, so a re-run restores
-/// consistency, but until then the index is mixed-generation for this repo.
-/// A failure on the FIRST payload changed nothing at all, and says so.
+/// When to ask the cloud whether a lost write landed, after the first ask.
+///
+/// The gateway cuts a response at 30 s while the handler runs on: on
+/// 2026-09-14 the write the scanner never saw committed 25 s after the cut, so
+/// a single check a few seconds later would have reported a successful upload
+/// as lost and sent the user back for another of the day's three scans. Asking
+/// four times over half a minute costs four scalar reads and covers that
+/// window (carrick#1067).
+const LANDED_CHECK_WAITS_SECONDS: [u64; 3] = [5, 10, 15];
+
+/// One service whose index the run could not confirm.
+#[derive(Debug, Clone, PartialEq)]
+struct UnconfirmedUpload {
+    service: String,
+    reason: String,
+}
+
+/// When to ask whether a lost write landed, and how long to keep asking.
+///
+/// `None` is "don't ask": the cloud answered this one. A refusal that arrived
+/// on its own — `409 partial_refused`, a rejected credential, a 413 — is a
+/// decision about a write that never ran, and a landed-check would either
+/// repeat the refusal or read the generation this run was replacing.
+///
+/// `Some(waits)` is a write whose outcome nobody saw. Empty waits ask once,
+/// which is all there is to learn when nothing is still running behind the
+/// failure; a handler that may still be committing is asked again after each
+/// wait until it answers or the window closes.
+fn landed_check_waits(error: &StorageError) -> Option<Vec<Duration>> {
+    let write = error.uncertain_write()?;
+    Some(if write.handler_may_still_run {
+        LANDED_CHECK_WAITS_SECONDS
+            .iter()
+            .map(|seconds| Duration::from_secs(*seconds))
+            .collect()
+    } else {
+        Vec::new()
+    })
+}
+
+/// Did this service's index reach the cloud despite the error the upload
+/// returned?
+///
+/// Only the storage backend can answer, and it is asked here rather than at
+/// the call site so the waiting, the logging and the fail-closed rule live in
+/// one place. A check that itself fails answers "no": the run reports a
+/// service it could not confirm, which is true, instead of claiming one it
+/// cannot see.
+async fn upload_landed_anyway<T: CloudStorage>(
+    storage: &T,
+    payload: &CloudRepoData,
+    service: &str,
+    error: &StorageError,
+    attempted_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(waits) = landed_check_waits(error) else {
+        return false;
+    };
+    for (attempt, wait) in std::iter::once(Duration::ZERO).chain(waits).enumerate() {
+        if !wait.is_zero() {
+            debug!(
+                "Waiting {}s before re-checking whether {service}'s index landed",
+                wait.as_secs()
+            );
+            tokio::time::sleep(wait).await;
+        }
+        match storage.index_landed(payload, attempted_at).await {
+            Ok(true) => {
+                info!(
+                    "{service} is indexed at this commit after {} check(s): the write landed and \
+                     its response was lost, not the write",
+                    attempt + 1
+                );
+                return true;
+            }
+            Ok(false) => continue,
+            Err(check_error) => {
+                warn!("Could not ask the cloud what it holds for {service}: {check_error}");
+                return false;
+            }
+        }
+    }
+    false
+}
+
+/// Upload each already-prepared service payload to the cloud index, in order,
+/// and report every service whose index this run could not confirm.
+///
+/// One service's upload never ends the run (carrick#1067). A write action that
+/// fails after an attempt nobody saw the outcome of is answered by asking the
+/// cloud what it holds — the index is frequently already current, because the
+/// gateway cut a response while the handler committed — and a service that
+/// really did not land is recorded and the next one is uploaded. The run exits
+/// non-zero naming them, which is what the caller does with the returned list.
+///
+/// Uploads are keyed per (repo, service) and idempotent, so a re-run restores
+/// consistency; until then the index is mixed-generation for this repo, and
+/// the summary says so when some services landed and others did not.
 async fn upload_service_payloads<T: CloudStorage>(
     storage: &T,
     payloads: &[CloudRepoData],
     forced: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Vec<UnconfirmedUpload> {
     let sp = logging::spinner("Uploading results...");
     let mut outcomes: Vec<UploadOutcome> = Vec::with_capacity(payloads.len());
+    let mut confirmed: Vec<&str> = Vec::new();
+    let mut unconfirmed: Vec<UnconfirmedUpload> = Vec::new();
     for (i, payload) in payloads.iter().enumerate() {
+        let service = payload
+            .service_name
+            .as_deref()
+            .unwrap_or(&payload.repo_name);
+        // Which service the run is on. A thirteen-service repo spends minutes
+        // per upload, and without this the whole stage is one silent line.
+        logging::progress(
+            &sp,
+            &format!("Uploading {service} ({}/{})", i + 1, payloads.len()),
+        );
         // Only the last write action of the run releases the cloud's in-flight
         // scan slot: a multi-service repo sends N of them, and releasing on
         // the first would leave the rest of the run unprotected (§2.2).
         let final_in_run = i + 1 == payloads.len();
+        // When this write began, so a landed-check can tell the row it wrote
+        // from the one it replaced — a forced run rewrites a row that already
+        // carries this commit (carrick#1067).
+        let attempted_at = chrono::Utc::now();
         match storage.upload_repo_data(payload, final_in_run).await {
-            Ok(outcome) => outcomes.push(outcome),
+            Ok(outcome) => {
+                outcomes.push(outcome);
+                confirmed.push(service);
+            }
             Err(e) => {
-                let uploaded: Vec<&str> = payloads[..i]
-                    .iter()
-                    .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
-                    .collect();
-                let not_uploaded: Vec<&str> = payloads[i..]
-                    .iter()
-                    .map(|d| d.service_name.as_deref().unwrap_or(&d.repo_name))
-                    .collect();
-                // Only a PARTIAL upload leaves the index mixed-generation. On
-                // the first payload nothing was replaced, and the sentence
-                // read as damage that needed a re-run — a paid one — over the
-                // top of `Uploaded: []` (carrick#1023 item 4).
-                let outcome = if uploaded.is_empty() {
-                    format!(
-                        "Nothing was uploaded: [{}] did not reach the index, which still holds \
-                         what it held before this scan.",
-                        not_uploaded.join(", ")
-                    )
+                warn!("Upload of {service} failed: {e}");
+                if upload_landed_anyway(storage, payload, service, &e, attempted_at).await {
+                    confirmed.push(service);
                 } else {
-                    format!(
-                        "Uploaded: [{}]; not uploaded: [{}]. The index is mixed-generation for \
-                         this repo until a successful re-run.",
-                        uploaded.join(", "),
-                        not_uploaded.join(", ")
-                    )
-                };
-                return Err(format!("Failed to upload repo data: {e}. {outcome}").into());
+                    unconfirmed.push(UnconfirmedUpload {
+                        service: service.to_string(),
+                        reason: e.to_string(),
+                    });
+                }
             }
         }
     }
     // What the run cost, from the write action that closed it. A laptop run
     // gets one; a CI upload never does, and neither does a cloud that has not
     // deployed the field — both of which say nothing rather than zero
-    // (carrick#995).
+    // (carrick#995). A run whose last response was lost has no figure either.
     if let Some(spend) = outcomes.iter().rev().find_map(|o| o.scan_spend.as_ref()) {
         crate::scan_spend::report(spend);
     }
-    if forced_reanalysis_was_discarded(&outcomes, forced) {
+    if !unconfirmed.is_empty() {
+        let summary = unconfirmed_upload_summary(&confirmed, &unconfirmed);
+        logging::finish_spinner_warn(&sp, &summary);
+        warn!("{summary}");
+        logging::annotate(logging::Annotation::Warning, &summary);
+    } else if forced_reanalysis_was_discarded(&outcomes, forced) {
         // A scan that finished having done less than it was asked to: the
         // annotation puts it on the run summary, where someone who asked for
         // a full scan will look for the result of it.
@@ -1270,7 +1385,53 @@ async fn upload_service_payloads<T: CloudStorage>(
     } else {
         logging::finish_spinner(&sp, upload_finish_message(&outcomes));
     }
-    Ok(())
+    unconfirmed
+}
+
+/// The run summary's sentence about the services that did not reach the index.
+///
+/// Only a PARTIAL upload leaves the index mixed-generation. When nothing
+/// landed, nothing was replaced, and saying "mixed-generation" reads as damage
+/// that needs a re-run — a paid one — over the top of an index that is exactly
+/// as it was (carrick#1023 item 4).
+fn unconfirmed_upload_summary(confirmed: &[&str], unconfirmed: &[UnconfirmedUpload]) -> String {
+    let names: Vec<&str> = unconfirmed
+        .iter()
+        .map(|failed| failed.service.as_str())
+        .collect();
+    if confirmed.is_empty() {
+        format!(
+            "Nothing was uploaded: [{}] did not reach the index, which still holds what it held \
+             before this scan.",
+            names.join(", ")
+        )
+    } else {
+        format!(
+            "Uploaded: [{}]; not uploaded: [{}]. The index is mixed-generation for this repo \
+             until a successful re-run.",
+            confirmed.join(", "),
+            names.join(", ")
+        )
+    }
+}
+
+/// What the run ends with when a service's index could not be confirmed: the
+/// services, and the first thing each of them said.
+///
+/// The scan itself is finished and its report is already printed — the exit
+/// code is what carries the failure, so this is the last line rather than an
+/// abort partway through (carrick#1067).
+fn unconfirmed_upload_error(unconfirmed: &[UnconfirmedUpload]) -> String {
+    let detail: Vec<String> = unconfirmed
+        .iter()
+        .map(|failed| format!("{}: {}", failed.service, failed.reason))
+        .collect();
+    format!(
+        "{} service(s) did not upload to the index ({}). The rest of the run completed; \
+         re-run the scan to bring them up to this commit.",
+        unconfirmed.len(),
+        detail.join("; ")
+    )
 }
 
 /// What the upload spinner says once every payload has landed.
@@ -5434,6 +5595,260 @@ mod tests {
             boundary: None,
             dispatch_tables: None,
         }
+    }
+
+    /// A storage whose every answer is scripted, so the upload loop's
+    /// decisions can be driven without a cloud: what each upload returns, what
+    /// the landed-check says on each successive ask, and what was asked.
+    struct ScriptedStorage {
+        uploads: std::sync::Mutex<std::collections::VecDeque<Result<UploadOutcome, StorageError>>>,
+        landed: std::sync::Mutex<std::collections::VecDeque<Result<bool, StorageError>>>,
+        uploaded: std::sync::Mutex<Vec<String>>,
+        landed_asks: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ScriptedStorage {
+        fn new(
+            uploads: Vec<Result<UploadOutcome, StorageError>>,
+            landed: Vec<Result<bool, StorageError>>,
+        ) -> Self {
+            Self {
+                uploads: std::sync::Mutex::new(uploads.into()),
+                landed: std::sync::Mutex::new(landed.into()),
+                uploaded: std::sync::Mutex::new(Vec::new()),
+                landed_asks: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn uploaded(&self) -> Vec<String> {
+            self.uploaded.lock().unwrap().clone()
+        }
+
+        fn landed_asks(&self) -> Vec<String> {
+            self.landed_asks.lock().unwrap().clone()
+        }
+    }
+
+    fn scripted_service(data: &CloudRepoData) -> String {
+        data.service_name
+            .clone()
+            .unwrap_or_else(|| data.repo_name.clone())
+    }
+
+    #[async_trait::async_trait]
+    impl CloudStorage for ScriptedStorage {
+        async fn upload_repo_data(
+            &self,
+            data: &CloudRepoData,
+            _final_in_run: bool,
+        ) -> Result<UploadOutcome, StorageError> {
+            self.uploaded.lock().unwrap().push(scripted_service(data));
+            self.uploads
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("a scripted upload outcome")
+        }
+
+        async fn index_landed(
+            &self,
+            data: &CloudRepoData,
+            _written_after: chrono::DateTime<chrono::Utc>,
+        ) -> Result<bool, StorageError> {
+            self.landed_asks
+                .lock()
+                .unwrap()
+                .push(scripted_service(data));
+            self.landed.lock().unwrap().pop_front().unwrap_or(Ok(false))
+        }
+
+        async fn download_all_repo_data(
+            &self,
+        ) -> Result<(Vec<CloudRepoData>, HashMap<String, String>), StorageError> {
+            Ok((Vec::new(), HashMap::new()))
+        }
+
+        async fn upload_type_file(
+            &self,
+            _repo_name: &str,
+            _file_name: &str,
+            _content: &str,
+        ) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn health_check(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn upload_logs(&self, _repo: &str, _log: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn post_pr_result(
+            &self,
+            _payload: &crate::findings::PrResultPayload,
+        ) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
+
+    fn lost_write(handler_may_still_run: bool) -> StorageError {
+        StorageError::UncertainWrite(crate::cloud_storage::UncertainWrite {
+            action: "complete-upload".to_string(),
+            handler_may_still_run,
+            message: "Lambda returned 400: no staged payload".to_string(),
+        })
+    }
+
+    fn two_services() -> Vec<CloudRepoData> {
+        vec![
+            service_data("api-server", Some("orders")),
+            service_data("api-server", Some("billing")),
+        ]
+    }
+
+    /// carrick#1067. The incident: the write landed and its response did not,
+    /// so the cloud holds this commit. The run says nothing failed and goes on
+    /// to the next service, which is the whole point — the remaining services
+    /// of a thirteen-service repo used to be abandoned here.
+    #[tokio::test]
+    async fn a_lost_write_that_landed_is_not_a_failure() {
+        let storage = ScriptedStorage::new(
+            vec![Err(lost_write(false)), Ok(UploadOutcome::default())],
+            vec![Ok(true)],
+        );
+
+        let unconfirmed = upload_service_payloads(&storage, &two_services(), false).await;
+
+        assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
+        assert_eq!(storage.uploaded(), vec!["orders", "billing"]);
+        assert_eq!(storage.landed_asks(), vec!["orders"]);
+    }
+
+    /// A write that really did not land is reported — and the service after it
+    /// is still uploaded, so one failure costs one service's index rather than
+    /// the rest of the run.
+    #[tokio::test]
+    async fn a_write_that_did_not_land_is_reported_and_the_run_continues() {
+        let storage = ScriptedStorage::new(
+            vec![Err(lost_write(false)), Ok(UploadOutcome::default())],
+            vec![Ok(false)],
+        );
+
+        let unconfirmed = upload_service_payloads(&storage, &two_services(), false).await;
+
+        assert_eq!(unconfirmed.len(), 1);
+        assert_eq!(unconfirmed[0].service, "orders");
+        assert!(unconfirmed[0].reason.contains("complete-upload"));
+        assert_eq!(storage.uploaded(), vec!["orders", "billing"]);
+    }
+
+    /// A refusal the cloud answered is a decision about a write that never
+    /// ran. Asking what the index holds would either repeat the refusal or
+    /// read the generation this run was replacing, so it is not asked.
+    #[tokio::test]
+    async fn a_refusal_the_cloud_answered_is_never_re_checked() {
+        let storage = ScriptedStorage::new(
+            vec![
+                Err(StorageError::ConnectionError(
+                    "index would lose files (partial_refused, HTTP 409)".to_string(),
+                )),
+                Ok(UploadOutcome::default()),
+            ],
+            vec![],
+        );
+
+        let unconfirmed = upload_service_payloads(&storage, &two_services(), false).await;
+
+        assert_eq!(unconfirmed.len(), 1);
+        assert!(
+            storage.landed_asks().is_empty(),
+            "nothing was left running to ask about"
+        );
+        assert_eq!(storage.uploaded(), vec!["orders", "billing"]);
+    }
+
+    /// The cloud commits after the gateway has already cut the response — 25 s
+    /// after, on the 2026-09-14 incident — so one check a moment later would
+    /// report a successful upload as lost and spend one of the day's three
+    /// scans re-running it. Time is paused here: the test asserts the asking,
+    /// not the waiting.
+    #[tokio::test(start_paused = true)]
+    async fn a_handler_that_may_still_be_running_is_asked_again() {
+        let storage = ScriptedStorage::new(
+            vec![Err(lost_write(true)), Ok(UploadOutcome::default())],
+            vec![Ok(false), Ok(false), Ok(true)],
+        );
+
+        let unconfirmed = upload_service_payloads(&storage, &two_services(), false).await;
+
+        assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
+        assert_eq!(storage.landed_asks().len(), 3);
+    }
+
+    /// A check that cannot be made answers "not landed": the run reports a
+    /// service it could not confirm, which is true, rather than claiming one
+    /// it cannot see.
+    #[tokio::test]
+    async fn a_landed_check_that_fails_leaves_the_service_unconfirmed() {
+        let storage = ScriptedStorage::new(
+            vec![Err(lost_write(false))],
+            vec![Err(StorageError::ConnectionError("no remote".to_string()))],
+        );
+
+        let unconfirmed = upload_service_payloads(&storage, &two_services()[..1], false).await;
+
+        assert_eq!(unconfirmed.len(), 1);
+    }
+
+    /// Which failures are worth asking about, and for how long.
+    #[test]
+    fn only_a_lost_write_is_checked_and_only_a_live_handler_is_waited_for() {
+        assert!(
+            landed_check_waits(&StorageError::ConnectionError("409".to_string())).is_none(),
+            "an answered refusal is not a lost response"
+        );
+        assert!(
+            landed_check_waits(&lost_write(false))
+                .expect("a lost write is checked")
+                .is_empty(),
+            "nothing is still running, so one ask settles it"
+        );
+        let waits = landed_check_waits(&lost_write(true)).expect("a lost write is checked");
+        assert_eq!(waits.len(), LANDED_CHECK_WAITS_SECONDS.len());
+        assert_eq!(
+            waits.iter().map(Duration::as_secs).sum::<u64>(),
+            LANDED_CHECK_WAITS_SECONDS.iter().sum::<u64>(),
+            "the window must cover a handler that commits after the gateway cut"
+        );
+    }
+
+    /// "Mixed-generation" is about a PARTIAL upload. When nothing landed,
+    /// nothing was replaced, and the index is exactly as it was
+    /// (carrick#1023 item 4).
+    #[test]
+    fn the_summary_only_claims_damage_when_some_services_landed() {
+        let failed = vec![UnconfirmedUpload {
+            service: "orders".to_string(),
+            reason: "Lost the response to 'complete-upload'".to_string(),
+        }];
+
+        let nothing = unconfirmed_upload_summary(&[], &failed);
+        assert!(nothing.contains("Nothing was uploaded"), "{nothing}");
+        assert!(nothing.contains("still holds what it held"), "{nothing}");
+        assert!(!nothing.contains("mixed-generation"), "{nothing}");
+
+        let partial = unconfirmed_upload_summary(&["billing"], &failed);
+        assert!(partial.contains("Uploaded: [billing]"), "{partial}");
+        assert!(partial.contains("not uploaded: [orders]"), "{partial}");
+        assert!(partial.contains("mixed-generation"), "{partial}");
+
+        // The run's last word names every service and what it said.
+        let error = unconfirmed_upload_error(&failed);
+        assert!(error.contains("orders"), "{error}");
+        assert!(error.contains("complete-upload"), "{error}");
+        assert!(error.contains("re-run the scan"), "{error}");
     }
 
     /// Only a service that actually lost its types produces a finding, and it

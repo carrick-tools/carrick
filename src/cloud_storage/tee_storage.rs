@@ -76,6 +76,18 @@ impl CloudStorage for TeeStorage {
         self.cloud.begin_run(run).await
     }
 
+    /// The CLOUD side, unlike the cross-repo read below. The question is only
+    /// ever asked about a cloud write whose response was lost, and the local
+    /// copy — written first, and successfully, or this would not be running —
+    /// would answer `true` to every one of them (carrick#1067).
+    async fn index_landed(
+        &self,
+        data: &CloudRepoData,
+        written_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
+        self.cloud.index_landed(data, written_after).await
+    }
+
     fn supports_multi_service(&self) -> bool {
         self.cloud.supports_multi_service()
     }
