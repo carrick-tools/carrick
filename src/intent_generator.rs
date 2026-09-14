@@ -1312,6 +1312,9 @@ mod tests {
             flag.store(true, Ordering::SeqCst);
         })));
 
+        // Let the task start and park in its sleep, so the drop has to stop a
+        // task that is running, not one that has never been polled.
+        tokio::task::yield_now().await;
         drop(task);
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
