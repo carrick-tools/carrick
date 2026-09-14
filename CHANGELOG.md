@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.68](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.67...carrick-v0.3.68) (2026-09-14)
+
+
+### Features
+
+* **cli:** carrick doctor re-checks the setup a first run decided once ([#1054](https://github.com/carrick-tools/carrick/issues/1054)) ([6b12968](https://github.com/carrick-tools/carrick/commit/6b129682edf45c4b6e1932722c804682e4a8c95e))
+
+
+### Bug Fixes
+
+* **cli:** read owner/repo from any remote host, and say when none can be read ([#1059](https://github.com/carrick-tools/carrick/issues/1059)) ([237eadc](https://github.com/carrick-tools/carrick/commit/237eadc117abfcbb07aeb787aa7cf676c9e8e8b9))
+
 ## [0.3.67](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.66...carrick-v0.3.67) (2026-09-13)
 
 
