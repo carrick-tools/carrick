@@ -240,6 +240,44 @@ fn backoff_delay(attempt: u32, jitter: u32) -> Duration {
     half + spread
 }
 
+/// The longest `Retry-After` the scanner will honour. A hint above it is read
+/// as this, so a mistyped header on the cloud side cannot park a worker for an
+/// hour; the backoff chain's own ceiling is the natural bound.
+const RETRY_AFTER_CAP: Duration = RETRY_MAX_DELAY;
+
+/// The request header that numbers this call's attempts for the lambda
+/// (carrick-cloud#875). The lambda gives attempt 1 its full in-lambda model
+/// retry chain and every later attempt a single model try, because this loop
+/// has already waited between rounds. Without it the two loops multiplied:
+/// three lambda tries on each of seven scanner attempts, 21 model calls for one
+/// function. With it the worst case is 3 + 6 = 9.
+const ATTEMPT_HEADER: &str = "X-Carrick-Attempt";
+
+/// A `Retry-After` value in delta-seconds, the only form the cloud sends. The
+/// HTTP-date form and anything unparseable read as no hint, which leaves the
+/// ordinary backoff in charge.
+fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
+    let seconds: u64 = value?.trim().parse().ok()?;
+    Some(Duration::from_secs(seconds).min(RETRY_AFTER_CAP))
+}
+
+/// How long to wait before the next attempt: the jittered backoff, or the
+/// cloud's `Retry-After` hint when that is longer.
+///
+/// The hint is jittered too, by up to half again. A capacity dip at the model
+/// provider answers every in-flight worker at once, all with the same hint,
+/// and honouring it exactly would wake them in lockstep, which is the burst
+/// [`backoff_delay`]'s jitter exists to prevent.
+fn retry_wait(attempt: u32, jitter: u32, retry_after: Option<Duration>) -> Duration {
+    let backoff = backoff_delay(attempt, jitter);
+    let Some(hint) = retry_after else {
+        return backoff;
+    };
+    let hint = hint.min(RETRY_AFTER_CAP);
+    let spread = (hint / 2).mul_f64(f64::from(jitter) / f64::from(u32::MAX));
+    backoff.max(hint + spread)
+}
+
 /// Jitter source: the sub-second component of the wall clock. Enough entropy
 /// to decorrelate wakers that are milliseconds apart, and avoids taking a
 /// direct dependency on `rand` for a sleep length.
@@ -462,6 +500,12 @@ impl AgentService {
         // rather than something to keep retrying with the same credential.
         let mut reminted = false;
 
+        // The attempt number the lambda sees in `X-Carrick-Attempt`. Counted
+        // separately from the loop index: a re-mint re-sends without the model
+        // ever having been asked, so it must not cost the next request its
+        // full in-lambda chain.
+        let mut lambda_attempt: u32 = 1;
+
         // Retry logic for transient failures with jittered exponential
         // backoff. 7 attempts, sleeps halving-jittered around 2s, 4s, 8s, 16s,
         // 32s, 64s (see `backoff_delay`). The lambda's structured error
@@ -469,7 +513,10 @@ impl AgentService {
         // application-level errors. We additionally retry on transient
         // *gateway* errors (429/502/503/504) where the body may not
         // even be a parseable JSON envelope (API Gateway timeouts return
-        // non-envelope responses).
+        // non-envelope responses). A `Retry-After` on either kind of
+        // response is a floor under the backoff (see `retry_wait`), and each
+        // request numbers itself in `X-Carrick-Attempt` so the lambda sizes
+        // its own model retries to this loop (carrick-cloud#875).
         let max_retries = MAX_RETRIES;
         for attempt in 1..=max_retries {
             // A sibling call (any phase, any `AgentService`) may have already
@@ -502,7 +549,8 @@ impl AgentService {
                 .json(body)
                 .timeout(std::time::Duration::from_secs(60))
                 .header("X-Carrick-Scanner-Version", env!("CARGO_PKG_VERSION"))
-                .header("X-Carrick-Run-Id", crate::logging::run_id());
+                .header("X-Carrick-Run-Id", crate::logging::run_id())
+                .header(ATTEMPT_HEADER, lambda_attempt.to_string());
             request_builder = match auth {
                 RequestAuth::Oidc(_) => request_builder.header("X-Carrick-OIDC", &token),
                 RequestAuth::Bearer(_) => {
@@ -523,6 +571,13 @@ impl AgentService {
             match request_builder.send().await {
                 Ok(response) => {
                     let status = response.status();
+                    // Read before the body consumes the response.
+                    let retry_after = parse_retry_after(
+                        response
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok()),
+                    );
 
                     // Read the body as text once. Going through `.json()`
                     // discarded it, so a non-envelope response was logged as
@@ -541,6 +596,7 @@ impl AgentService {
                                     status, e, wait_time, attempt, max_retries
                                 );
                                 sleep(wait_time).await;
+                                lambda_attempt += 1;
                                 continue;
                             }
                             return Err(AgentCallError::transient(
@@ -616,7 +672,7 @@ impl AgentService {
                             // is a known transient gateway code, retry —
                             // otherwise fail fast (server-side bug).
                             if is_transient_gateway_status && attempt < max_retries {
-                                let wait_time = backoff_delay(attempt, jitter_seed());
+                                let wait_time = retry_wait(attempt, jitter_seed(), retry_after);
                                 warn!(
                                     "Gateway status {} with non-envelope body ({}): {}. Retrying in {:?} (attempt {}/{})",
                                     status,
@@ -627,6 +683,7 @@ impl AgentService {
                                     max_retries
                                 );
                                 sleep(wait_time).await;
+                                lambda_attempt += 1;
                                 continue;
                             }
                             let message = format!(
@@ -684,12 +741,16 @@ impl AgentService {
                     };
 
                     if should_retry(&call_err, attempt, max_retries) {
-                        let wait_time = backoff_delay(attempt, jitter_seed());
+                        // The cloud's Retry-After on a 503 `model_error` is
+                        // the floor: re-firing after one or two seconds lands
+                        // in the same capacity dip the lambda just gave up on.
+                        let wait_time = retry_wait(attempt, jitter_seed(), retry_after);
                         warn!(
                             "Agent error '{}' is retriable, retrying in {:?} (attempt {}/{}): {}",
                             call_err.code, wait_time, attempt, max_retries, call_err.message
                         );
                         sleep(wait_time).await;
+                        lambda_attempt += 1;
                         continue;
                     }
 
@@ -704,6 +765,7 @@ impl AgentService {
                             e, wait_time, attempt, max_retries
                         );
                         sleep(wait_time).await;
+                        lambda_attempt += 1;
                         continue;
                     }
 
@@ -2057,12 +2119,156 @@ pub(crate) mod tests {
         assert_eq!(backoff_delay(64, u32::MAX), RETRY_MAX_DELAY);
     }
 
+    #[test]
+    fn retry_after_reads_delta_seconds_and_nothing_else() {
+        assert_eq!(parse_retry_after(Some("10")), Some(Duration::from_secs(10)));
+        assert_eq!(parse_retry_after(Some(" 3 ")), Some(Duration::from_secs(3)));
+        assert_eq!(parse_retry_after(None), None);
+        assert_eq!(parse_retry_after(Some("")), None);
+        assert_eq!(parse_retry_after(Some("-1")), None);
+        assert_eq!(parse_retry_after(Some("2.5")), None);
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2015 07:28:00 GMT")),
+            None,
+            "the HTTP-date form is not something the cloud sends"
+        );
+        // A daily-cap reset hint hours away cannot park a worker for hours.
+        assert_eq!(parse_retry_after(Some("43200")), Some(RETRY_AFTER_CAP));
+    }
+
+    #[test]
+    fn retry_wait_is_the_backoff_or_the_hint_whichever_is_longer() {
+        // No hint: exactly the backoff the loop always used.
+        for attempt in 1..=MAX_RETRIES {
+            for jitter in [0, u32::MAX / 2, u32::MAX] {
+                assert_eq!(
+                    retry_wait(attempt, jitter, None),
+                    backoff_delay(attempt, jitter)
+                );
+            }
+        }
+        // A hint longer than the early backoff wins, jittered into [hint, 1.5 x hint].
+        let hint = Some(Duration::from_secs(10));
+        assert_eq!(retry_wait(1, 0, hint), Duration::from_secs(10));
+        assert_eq!(retry_wait(1, u32::MAX, hint), Duration::from_secs(15));
+        // A hint shorter than the backoff never shortens the wait.
+        assert_eq!(
+            retry_wait(6, u32::MAX, Some(Duration::from_secs(1))),
+            RETRY_MAX_DELAY
+        );
+        // An absurd hint is capped before it is jittered.
+        assert!(
+            retry_wait(1, u32::MAX, Some(Duration::from_secs(86_400))) <= RETRY_AFTER_CAP * 3 / 2
+        );
+    }
+
+    /// The loop link end to end (carrick-cloud#875): the first request says it
+    /// is attempt 1, the lambda answers a retriable `model_error` with a
+    /// `Retry-After`, the scanner waits at least that long, and the re-send
+    /// says it is attempt 2 so the lambda asks the model only once.
+    #[tokio::test]
+    async fn a_model_error_retry_honours_retry_after_and_numbers_the_attempt() {
+        let (api_base, server) = stub_server_with_headers(vec![
+            (
+                503,
+                r#"{"success":false,"error":{"code":"model_error","message":"overloaded","retriable":true}}"#
+                    .to_string(),
+                vec![("Retry-After", "3".to_string())],
+            ),
+            (
+                200,
+                r#"{"success":true,"text":"analysed"}"#.to_string(),
+                Vec::new(),
+            ),
+        ]);
+
+        let service = AgentService::new();
+        let started = std::time::Instant::now();
+        let result = service
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &api_base,
+                "/generate-intent",
+                &serde_json::json!({}),
+            )
+            .await;
+        assert_eq!(result.unwrap().text, "analysed");
+        // The first backoff alone is at most 2 s, so 3 s proves the hint was read.
+        assert!(
+            started.elapsed() >= Duration::from_secs(3),
+            "re-sent after {:?}, before the cloud's Retry-After",
+            started.elapsed()
+        );
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            header_of(&requests[0], "x-carrick-attempt").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            header_of(&requests[1], "x-carrick-attempt").as_deref(),
+            Some("2")
+        );
+    }
+
+    /// A re-mint re-sends without the model ever having been asked, so the
+    /// re-sent request is still attempt 1 and keeps the lambda's full chain.
+    #[tokio::test]
+    async fn a_remint_does_not_advance_the_attempt_the_lambda_sees() {
+        let (token_url, token_server) = stub_token_endpoint(vec![
+            crate::oidc::tests::jwt_with_exp(unix_now() + 3600),
+            crate::oidc::tests::jwt_with_exp(unix_now() + 7200),
+        ]);
+        let provider = OidcProvider::for_test(token_url, "request-token".to_string());
+        let (api_base, api_server) = stub_server(vec![
+            (401, r#"{"code":"oidc_invalid"}"#.to_string()),
+            (200, r#"{"success":true,"text":"analysed"}"#.to_string()),
+        ]);
+
+        let service = AgentService::new();
+        let result = service
+            .post_with_retry(
+                &RequestAuth::Oidc(&provider),
+                &api_base,
+                "/analyze-file",
+                &serde_json::json!({}),
+            )
+            .await;
+        assert_eq!(result.unwrap().text, "analysed");
+        token_server.join().unwrap();
+        let requests = api_server.join().unwrap();
+        assert_eq!(
+            header_of(&requests[0], "x-carrick-attempt").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            header_of(&requests[1], "x-carrick-attempt").as_deref(),
+            Some("1")
+        );
+    }
+
     /// A single-shot HTTP stub: answers each connection with the next canned
     /// response and records the request it received. Reads the whole request
     /// (headers plus `Content-Length` body) before replying, because reqwest
     /// treats a response that arrives mid-upload as a transport failure.
     pub(crate) fn stub_server(
         responses: Vec<(u16, String)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        stub_server_with_headers(
+            responses
+                .into_iter()
+                .map(|(status, body)| (status, body, Vec::new()))
+                .collect(),
+        )
+    }
+
+    /// One canned response: status, body, and extra headers.
+    pub(crate) type StubResponse = (u16, String, Vec<(&'static str, String)>);
+
+    /// [`stub_server`], with extra response headers on each canned response.
+    pub(crate) fn stub_server_with_headers(
+        responses: Vec<StubResponse>,
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -2071,7 +2277,7 @@ pub(crate) mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             let mut seen = Vec::new();
-            for (status, body) in responses {
+            for (status, body, headers) in responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut raw = Vec::new();
                 let mut buf = [0u8; 4096];
@@ -2098,10 +2304,15 @@ pub(crate) mod tests {
                     }
                 }
                 seen.push(String::from_utf8_lossy(&raw).to_string());
+                let extra: String = headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}\r\n"))
+                    .collect();
                 let response = format!(
                     "HTTP/1.1 {} X\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                     {}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                     status,
+                    extra,
                     body.len(),
                     body
                 );
