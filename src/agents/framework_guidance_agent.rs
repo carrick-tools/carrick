@@ -4,6 +4,7 @@ use crate::{
     services::type_sidecar::ExtractionConfig,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use tracing::debug;
 
@@ -80,6 +81,40 @@ pub struct FrameworkGuidance {
 
     /// Framework-specific notes that may affect parsing
     pub parsing_notes: String,
+
+    /// One id for the five guidance answers above, folded from the
+    /// `guidance_key` each `/framework-guidance` response carried
+    /// (carrick-cloud#871). The analyze-file request sends it so the cloud's
+    /// analysis cache can key on the guidance's identity instead of its text,
+    /// which is what stops a regenerated guidance block from re-analysing
+    /// every file in the repo.
+    ///
+    /// `None` whenever any of the five answers came back without a key — an
+    /// offline run, or a cloud with the guidance cache switched off. A partial
+    /// id would name guidance it does not fully describe, so there is no
+    /// halfway state: the analyzer falls back to the whole-message key.
+    ///
+    /// Skipped when absent, and defaulted on read, because this struct is
+    /// persisted in the index blob (`CloudRepoData::cached_guidance`) and a
+    /// blob written before this field must still deserialise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guidance_key: Option<String>,
+}
+
+/// Fold the per-answer guidance keys into the single id the analyze-file
+/// request carries. Order is the fixed argument order, not a sort: these are
+/// five distinct answers, and which one is which is part of what the id means.
+/// Length-delimited so concatenation is unambiguous.
+///
+/// Returns `None` if ANY answer lacked a key (see [`FrameworkGuidance`]).
+fn compose_guidance_key(keys: [Option<&str>; 5]) -> Option<String> {
+    let mut hasher = Sha256::new();
+    for key in keys {
+        let key = key?;
+        hasher.update((key.len() as u64).to_le_bytes());
+        hasher.update(key.as_bytes());
+    }
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 /// Agent that generates framework-specific patterns and guidance
@@ -156,13 +191,22 @@ impl FrameworkGuidanceAgent {
             general_task
         )?;
 
+        let guidance_key = compose_guidance_key([
+            mount_patterns.guidance_key.as_deref(),
+            endpoint_patterns.guidance_key.as_deref(),
+            middleware_patterns.guidance_key.as_deref(),
+            data_fetching_patterns.guidance_key.as_deref(),
+            general_guidance.guidance_key.as_deref(),
+        ]);
+
         let guidance = FrameworkGuidance {
-            mount_patterns,
-            endpoint_patterns,
-            middleware_patterns,
-            data_fetching_patterns,
-            triage_hints: general_guidance.triage_hints,
-            parsing_notes: general_guidance.parsing_notes,
+            mount_patterns: mount_patterns.value,
+            endpoint_patterns: endpoint_patterns.value,
+            middleware_patterns: middleware_patterns.value,
+            data_fetching_patterns: data_fetching_patterns.value,
+            triage_hints: general_guidance.value.triage_hints,
+            parsing_notes: general_guidance.value.parsing_notes,
+            guidance_key,
         };
 
         debug!("Generated guidance with:");
@@ -261,7 +305,7 @@ impl FrameworkGuidanceAgent {
         category: &str,
         framework_detection: &DetectionResult,
         protocol: Protocol,
-    ) -> Result<Vec<PatternExample>, Box<dyn std::error::Error>> {
+    ) -> Result<Keyed<Vec<PatternExample>>, Box<dyn std::error::Error>> {
         let mut body = Self::guidance_request_body(
             "patterns",
             framework_detection,
@@ -270,26 +314,29 @@ impl FrameworkGuidanceAgent {
         );
         body["category"] = serde_json::json!(category);
 
-        let response = self
+        let outcome = self
             .agent_service
-            .post_to_lambda("/framework-guidance", &body, category)
+            .post_to_lambda_keyed("/framework-guidance", &body, category)
             .await?;
 
-        let parsed: FlatPatternResponse = serde_json::from_str(&response).map_err(|e| {
+        let parsed: FlatPatternResponse = serde_json::from_str(&outcome.text).map_err(|e| {
             format!(
                 "Failed to parse {} patterns: {}. Raw response: {}",
-                category, e, response
+                category, e, outcome.text
             )
         })?;
 
-        Ok(parsed.into_pattern_examples())
+        Ok(Keyed {
+            value: parsed.into_pattern_examples(),
+            guidance_key: outcome.guidance_key,
+        })
     }
 
     async fn fetch_general_guidance(
         &self,
         framework_detection: &DetectionResult,
         protocol: Protocol,
-    ) -> Result<GeneralGuidanceResponse, Box<dyn std::error::Error>> {
+    ) -> Result<Keyed<GeneralGuidanceResponse>, Box<dyn std::error::Error>> {
         let body = Self::guidance_request_body(
             "general",
             framework_detection,
@@ -297,20 +344,31 @@ impl FrameworkGuidanceAgent {
             AgentSchemas::general_guidance_schema(),
         );
 
-        let response = self
+        let outcome = self
             .agent_service
-            .post_to_lambda("/framework-guidance", &body, "general")
+            .post_to_lambda_keyed("/framework-guidance", &body, "general")
             .await?;
 
-        let parsed: GeneralGuidanceResponse = serde_json::from_str(&response).map_err(|e| {
+        let parsed: GeneralGuidanceResponse = serde_json::from_str(&outcome.text).map_err(|e| {
             format!(
                 "Failed to parse general guidance: {}. Raw response: {}",
-                e, response
+                e, outcome.text
             )
         })?;
 
-        Ok(parsed)
+        Ok(Keyed {
+            value: parsed,
+            guidance_key: outcome.guidance_key,
+        })
     }
+}
+
+/// A parsed guidance answer beside the id of the stored entry it came from.
+/// The id never reaches a prompt: it exists so the analyze-file request can
+/// name the guidance it embedded (carrick-cloud#871).
+struct Keyed<T> {
+    value: T,
+    guidance_key: Option<String>,
 }
 
 #[cfg(test)]
@@ -336,6 +394,70 @@ mod tests {
         assert_eq!(deserialized.framework, pattern.framework);
     }
 
+    /// The id names five specific answers. Two guidance sets that used the
+    /// same five entries in different roles are not the same guidance, so they
+    /// must not share an analysis cache entry.
+    #[test]
+    fn the_composed_guidance_id_depends_on_which_answer_is_which() {
+        let a = compose_guidance_key([Some("1"), Some("2"), Some("3"), Some("4"), Some("5")]);
+        let swapped = compose_guidance_key([Some("2"), Some("1"), Some("3"), Some("4"), Some("5")]);
+        assert!(a.is_some());
+        assert_ne!(a, swapped);
+        assert_eq!(
+            a,
+            compose_guidance_key([Some("1"), Some("2"), Some("3"), Some("4"), Some("5")])
+        );
+        // Length-delimited, so a boundary shift is not a collision.
+        assert_ne!(
+            compose_guidance_key([Some("ab"), Some("c"), Some("d"), Some("e"), Some("f")]),
+            compose_guidance_key([Some("a"), Some("bc"), Some("d"), Some("e"), Some("f")])
+        );
+    }
+
+    /// A partial id would name guidance it does not fully describe, and the
+    /// cloud would serve one variant's answer for another's prompt.
+    #[test]
+    fn one_missing_answer_leaves_no_guidance_id_at_all() {
+        for i in 0..5 {
+            let mut keys = [Some("k"); 5];
+            keys[i] = None;
+            assert_eq!(compose_guidance_key(keys), None, "slot {i}");
+        }
+    }
+
+    /// `cached_guidance` rides in the index blob, so a blob written before the
+    /// id existed has to keep loading — and a guidance with no id must not add
+    /// a null field to the blobs we write.
+    #[test]
+    fn a_blob_written_before_the_guidance_id_still_loads() {
+        let old_blob = r#"{
+            "mount_patterns": [],
+            "endpoint_patterns": [],
+            "middleware_patterns": [],
+            "data_fetching_patterns": [],
+            "triage_hints": "hints",
+            "parsing_notes": "notes"
+        }"#;
+        let parsed: FrameworkGuidance = serde_json::from_str(old_blob).unwrap();
+        assert_eq!(parsed.guidance_key, None);
+        assert_eq!(parsed.triage_hints, "hints");
+
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            !json.contains("guidance_key"),
+            "an absent id must not be written into the blob: {json}"
+        );
+
+        let keyed = FrameworkGuidance {
+            guidance_key: Some("abc".to_string()),
+            ..parsed
+        };
+        let json = serde_json::to_string(&keyed).unwrap();
+        assert!(json.contains("\"guidance_key\":\"abc\""));
+        let round_tripped: FrameworkGuidance = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.guidance_key.as_deref(), Some("abc"));
+    }
+
     #[test]
     fn test_framework_guidance_serialization() {
         let guidance = FrameworkGuidance {
@@ -349,6 +471,7 @@ mod tests {
             data_fetching_patterns: vec![],
             triage_hints: "some hints".to_string(),
             parsing_notes: "some notes".to_string(),
+            guidance_key: None,
         };
 
         let json = serde_json::to_string(&guidance).unwrap();

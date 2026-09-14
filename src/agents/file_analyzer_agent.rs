@@ -14,7 +14,7 @@
 //! - Flat schema: Avoids recursion errors and ensures deterministic parsing
 
 use crate::{
-    agent_service::AgentService,
+    agent_service::{AgentService, GuidanceRef},
     agents::{framework_guidance_agent::FrameworkGuidance, schemas::AgentSchemas},
     visitor::{ImportedSymbol, SymbolKind},
 };
@@ -598,6 +598,19 @@ pub struct FileAnalysisResult {
     pub dispatch_tables: Vec<crate::dispatch::DispatchTable>,
 }
 
+/// One file's analyze-file prompt, and where its shared front block ends.
+///
+/// `guidance_prefix_bytes` counts the leading UTF-8 bytes of `text` that came
+/// from framework guidance — always from byte 0, always a whole number of
+/// characters, since the block is assembled before the body is appended. The
+/// analyzer sends it with the guidance id so the cloud can key the guidance by
+/// identity instead of by text (carrick-cloud#871). Nothing about it reaches
+/// the model: `text` is what is sent.
+struct AnalysisPrompt {
+    text: String,
+    guidance_prefix_bytes: usize,
+}
+
 /// Agent that performs file-centric analysis using framework-agnostic patterns.
 ///
 /// This agent sends the full content of a file to the LLM along with patterns
@@ -717,7 +730,7 @@ impl FileAnalyzerAgent {
             return Ok(FileAnalysisResult::default());
         }
 
-        let user_message = self.build_user_message_with_candidates(
+        let prompt = self.build_user_message_with_candidates(
             file_path,
             file_content,
             guidance,
@@ -728,6 +741,14 @@ impl FileAnalyzerAgent {
             graphql_consumer_hints,
             wrapper_context,
         );
+        let user_message = prompt.text;
+        // Present only when every guidance answer carried an id; without one
+        // the cloud keys the whole message, exactly as it did before
+        // (carrick-cloud#871).
+        let guidance_ref = guidance.guidance_key.as_deref().map(|key| GuidanceRef {
+            key,
+            prefix_bytes: prompt.guidance_prefix_bytes,
+        });
 
         debug!("=== FILE ANALYZER AGENT (AST-GATED) ===");
         debug!("Analyzing file: {}", file_path);
@@ -741,7 +762,12 @@ impl FileAnalyzerAgent {
         let schema = AgentSchemas::file_analysis_schema();
         let response = self
             .agent_service
-            .analyze_with_lambda("/analyze-file", &user_message, Some(schema.clone()))
+            .analyze_with_lambda(
+                "/analyze-file",
+                &user_message,
+                Some(schema.clone()),
+                guidance_ref,
+            )
             .await?;
 
         // Raw bodies at trace only — debug logs are persisted and uploaded,
@@ -771,7 +797,7 @@ impl FileAnalyzerAgent {
             warn!("[FileAnalyzerAgent] Suspicious fields detected in LLM output; retrying once");
             let response = self
                 .agent_service
-                .analyze_with_lambda("/analyze-file", &user_message, Some(schema))
+                .analyze_with_lambda("/analyze-file", &user_message, Some(schema), guidance_ref)
                 .await?;
 
             trace!("=== RAW FILE ANALYSIS RESPONSE ===");
@@ -1091,7 +1117,7 @@ impl FileAnalyzerAgent {
         file_path: &str,
         file_content: &str,
         guidance: &FrameworkGuidance,
-    ) -> String {
+    ) -> AnalysisPrompt {
         self.build_user_message_with_candidates(
             file_path,
             file_content,
@@ -1118,7 +1144,7 @@ impl FileAnalyzerAgent {
         graphql_producer_hints: &[String],
         graphql_consumer_hints: &[String],
         wrapper_context: &[String],
-    ) -> String {
+    ) -> AnalysisPrompt {
         let mount_patterns = self.format_patterns(&guidance.mount_patterns);
         let endpoint_patterns = self.format_patterns(&guidance.endpoint_patterns);
         let data_patterns = self.format_patterns(&guidance.data_fetching_patterns);
@@ -1284,7 +1310,14 @@ impl FileAnalyzerAgent {
             let _ = write!(numbered_content, "{:4}| {}", i + 1, line);
         }
 
-        format!(
+        // The guidance-derived front block, built on its own so the analyzer can
+        // say how many leading bytes of the message it occupies. The cloud's
+        // analysis cache keys those bytes as the guidance's ID rather than as
+        // its text, so guidance that regenerates into different words under the
+        // same id stops re-analysing every file in the repo
+        // (carrick-cloud#871). Contiguous is the whole contract: everything the
+        // guidance produced is in here, and nothing else is.
+        let guidance_block = format!(
             r#"### ACTIVE PATTERNS (Derived from Framework Guidance)
 {{
   "mount_patterns": [
@@ -1299,11 +1332,33 @@ impl FileAnalyzerAgent {
 }}
 
 ### FRAMEWORK-SPECIFIC HINTS
-{}{}{}
+{}
 ### FRAMEWORK-SPECIFIC PARSING NOTES
 These notes are generated per-scan by the framework guidance layer and describe how to correctly extract endpoints, mounts, owners, and prefixes for the exact framework(s) detected in this repo. Read them carefully — they override any generic rule in the system prompt when they conflict.
 {}
+"#,
+            mount_patterns,
+            endpoint_patterns,
+            data_patterns,
+            guidance.triage_hints,
+            guidance.parsing_notes
+        );
 
+        // Section order is load-bearing twice over. The guidance block above and
+        // the two repo-global GraphQL sections below are byte-identical across
+        // every file in a scan (one FrameworkGuidance is fetched once and
+        // reused), so keeping them as a contiguous front block — before any
+        // per-file content (candidates, imports, source) — lets Vertex's
+        // cacheable request prefix extend past the systemInstruction to cover
+        // them too. Per-file content stays last so it never breaks the prefix.
+        // Do not interleave stable and per-file sections.
+        //
+        // The GraphQL sections sit AFTER the guidance rather than inside it so
+        // the guidance bytes are one run at offset 0 (carrick-cloud#871). Both
+        // are empty strings for a repo without an SDL, so a non-GraphQL prompt
+        // is byte-for-byte what it was before the move.
+        let text = format!(
+            r#"{}{}{}
 ### CANDIDATE TARGETS (AST-Detected Hints)
 {}
 
@@ -1355,21 +1410,9 @@ For each pubsub_operation, include: topic, role, line_number, primary_type_symbo
   - COMPLETENESS: the pub/sub candidates in CANDIDATE TARGETS are an exhaustive checklist. For EVERY candidate whose pattern is a publish/subscribe call, either emit a pubsub_operations entry (resolving same-file consts and `${{name}}:event` template topics to their literal string) or skip it ONLY because it is a request/response action invocation (e.g. .call / registerActionHandler / registerMethodActionHandlers) or its topic cannot be resolved to a literal. Never omit one because the file is long or the call site is late in the file.
 
 Return ONLY the JSON object, no explanations."#,
-            // Section order is load-bearing for Vertex implicit prompt caching.
-            // The guidance blocks (patterns + triage hints + parsing notes) are
-            // byte-identical across every file in a scan (one FrameworkGuidance is
-            // fetched once and reused), so keeping them as a contiguous front block
-            // — before any per-file content (candidates, imports, source) — lets the
-            // cacheable request prefix extend past the systemInstruction to cover
-            // them too. Per-file content stays last so it never breaks the prefix.
-            // Do not interleave stable and per-file sections.
-            mount_patterns,
-            endpoint_patterns,
-            data_patterns,
-            guidance.triage_hints,
+            guidance_block,
             graphql_producers_section,
             graphql_consumers_section,
-            guidance.parsing_notes,
             candidates_section,
             candidate_contexts_section,
             imports_section,
@@ -1377,7 +1420,12 @@ Return ONLY the JSON object, no explanations."#,
             postmessage_section,
             file_path,
             numbered_content
-        )
+        );
+
+        AnalysisPrompt {
+            guidance_prefix_bytes: guidance_block.len(),
+            text,
+        }
     }
 
     /// Format pattern examples as JSON array items.
@@ -1677,6 +1725,7 @@ mod tests {
             triage_hints: "Look for router.use() for mounts, router.get/post/etc for endpoints"
                 .to_string(),
             parsing_notes: "Express uses chained methods".to_string(),
+            guidance_key: None,
         }
     }
 
@@ -2354,7 +2403,9 @@ const app = express();
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 "#;
 
-        let message = agent.build_user_message("test.ts", file_content, &guidance);
+        let message = agent
+            .build_user_message("test.ts", file_content, &guidance)
+            .text;
 
         assert!(message.contains("ACTIVE PATTERNS"));
         assert!(message.contains("mount_patterns"));
@@ -2375,7 +2426,9 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
         let agent = FileAnalyzerAgent::new(AgentService::new());
         let guidance = create_test_guidance();
 
-        let message = agent.build_user_message("test.ts", "const x = 1;", &guidance);
+        let message = agent
+            .build_user_message("test.ts", "const x = 1;", &guidance)
+            .text;
 
         assert!(message.contains(
             "- \"pubsub_operations\": array of pub/sub publish/subscribe operations found"
@@ -2425,33 +2478,37 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
         let file_content = r#"import { apiRequest } from "./GenericFunctions";
 const r = await apiRequest.call(this, "GET", "/webhooks", {});"#;
 
-        let without = agent.build_user_message_with_candidates(
-            "node.ts",
-            file_content,
-            &guidance,
-            &[],
-            &[],
-            &HashMap::new(),
-            &[],
-            &[],
-            &[],
-        );
+        let without = agent
+            .build_user_message_with_candidates(
+                "node.ts",
+                file_content,
+                &guidance,
+                &[],
+                &[],
+                &HashMap::new(),
+                &[],
+                &[],
+                &[],
+            )
+            .text;
         assert!(!without.contains("IMPORTED HTTP WRAPPER DEFINITIONS"));
 
         let wrapper = vec![
             "--- wrapper module: nodes/GenericFunctions.ts ---\nexport async function apiRequest(method, resource) { /* baseURL: `${credentials.host}/api/v1` */ }".to_string(),
         ];
-        let with = agent.build_user_message_with_candidates(
-            "node.ts",
-            file_content,
-            &guidance,
-            &[],
-            &[],
-            &HashMap::new(),
-            &[],
-            &[],
-            &wrapper,
-        );
+        let with = agent
+            .build_user_message_with_candidates(
+                "node.ts",
+                file_content,
+                &guidance,
+                &[],
+                &[],
+                &HashMap::new(),
+                &[],
+                &[],
+                &wrapper,
+            )
+            .text;
         assert!(with.contains("### IMPORTED HTTP WRAPPER DEFINITIONS"));
         assert!(with.contains("wrapper module: nodes/GenericFunctions.ts"));
         // The section sits in the per-file zone: after the import table,
@@ -2475,51 +2532,57 @@ const r = await apiRequest.call(this, "GET", "/webhooks", {});"#;
             "- Candidate span:0-10: Line 1 (span 0-10) fetch [fn: <module>] [path: '/x'] - `fetch('/x')`"
                 .to_string(),
         ];
-        let without = agent.build_user_message_with_candidates(
-            "page.tsx",
-            file_content,
-            &guidance,
-            &http_only,
-            &[],
-            &HashMap::new(),
-            &[],
-            &[],
-            &[],
-        );
+        let without = agent
+            .build_user_message_with_candidates(
+                "page.tsx",
+                file_content,
+                &guidance,
+                &http_only,
+                &[],
+                &HashMap::new(),
+                &[],
+                &[],
+                &[],
+            )
+            .text;
         assert!(!without.contains("WEB POSTMESSAGE CHANNEL"));
 
         let pm = vec![
             "- Candidate span:0-10: Line 1 (span 0-10) window.postMessage [fn: notify] [path: <path unavailable>] - `window.parent.postMessage(`"
                 .to_string(),
         ];
-        let with = agent.build_user_message_with_candidates(
-            "page.tsx",
-            file_content,
-            &guidance,
-            &pm,
-            &[],
-            &HashMap::new(),
-            &[],
-            &[],
-            &[],
-        );
+        let with = agent
+            .build_user_message_with_candidates(
+                "page.tsx",
+                file_content,
+                &guidance,
+                &pm,
+                &[],
+                &HashMap::new(),
+                &[],
+                &[],
+                &[],
+            )
+            .text;
         assert!(with.contains("### WEB POSTMESSAGE CHANNEL"));
         // Listener-shape hints gate it too.
         let listener = vec![
             "- Candidate span:0-10: Line 1 (span 0-10) window.addEventListener [fn: mount] [path: <path unavailable>] - `window.addEventListener('message', handleMessage);`"
                 .to_string(),
         ];
-        let with_listener = agent.build_user_message_with_candidates(
-            "sdk.ts",
-            file_content,
-            &guidance,
-            &listener,
-            &[],
-            &HashMap::new(),
-            &[],
-            &[],
-            &[],
-        );
+        let with_listener = agent
+            .build_user_message_with_candidates(
+                "sdk.ts",
+                file_content,
+                &guidance,
+                &listener,
+                &[],
+                &HashMap::new(),
+                &[],
+                &[],
+                &[],
+            )
+            .text;
         assert!(with_listener.contains("### WEB POSTMESSAGE CHANNEL"));
         // Per-file zone: after the import table, before the file content.
         let sec = with.find("### WEB POSTMESSAGE CHANNEL").unwrap();
@@ -2543,17 +2606,19 @@ const data = await fetch('/api/users').then(resp => resp.json());
         imported.insert("User".to_string(), named("User", "./types"));
         imported.insert("useUsers".to_string(), named("useUsers", "../hooks"));
 
-        let message = agent.build_user_message_with_candidates(
-            "test.ts",
-            file_content,
-            &guidance,
-            &candidates,
-            &candidate_contexts,
-            &imported,
-            &[],
-            &[],
-            &[],
-        );
+        let message = agent
+            .build_user_message_with_candidates(
+                "test.ts",
+                file_content,
+                &guidance,
+                &candidates,
+                &candidate_contexts,
+                &imported,
+                &[],
+                &[],
+                &[],
+            )
+            .text;
 
         assert!(message.contains("IMPORT TABLE"));
         // Grouped-by-source format: "From './types': User [named]".
@@ -2593,6 +2658,166 @@ const data = await fetch('/api/users').then(resp => resp.json());
         }
     }
 
+    // -----------------------------------------------------------------------
+    // The guidance-block split (carrick-cloud#871)
+    // -----------------------------------------------------------------------
+
+    /// Guidance whose every field is a sentinel, so a test can say exactly
+    /// which bytes of the prompt came from guidance and which did not.
+    fn sentinel_guidance() -> FrameworkGuidance {
+        FrameworkGuidance {
+            mount_patterns: vec![PatternExample {
+                pattern: "MOUNT_SENTINEL".to_string(),
+                description: "d".to_string(),
+                framework: "f".to_string(),
+            }],
+            endpoint_patterns: vec![PatternExample {
+                pattern: "ENDPOINT_SENTINEL".to_string(),
+                description: "d".to_string(),
+                framework: "f".to_string(),
+            }],
+            middleware_patterns: vec![],
+            data_fetching_patterns: vec![PatternExample {
+                pattern: "FETCH_SENTINEL".to_string(),
+                description: "d".to_string(),
+                framework: "f".to_string(),
+            }],
+            triage_hints: "TRIAGE_SENTINEL".to_string(),
+            parsing_notes: "NOTES_SENTINEL".to_string(),
+            guidance_key: Some("k".repeat(64)),
+        }
+    }
+
+    fn sentinel_prompt(
+        graphql_producer_hints: &[String],
+        guidance: &FrameworkGuidance,
+    ) -> AnalysisPrompt {
+        FileAnalyzerAgent::new(AgentService::new()).build_user_message_with_candidates(
+            "src/routes/users.ts",
+            "export const get = () => {};\n",
+            guidance,
+            &[],
+            &[],
+            &HashMap::new(),
+            graphql_producer_hints,
+            &[],
+            &[],
+        )
+    }
+
+    /// The bytes a repo without an SDL sees did not move when the GraphQL
+    /// sections did. Every stored analysis entry is keyed on this text, so one
+    /// stray newline here re-pays a full scan for every repo already indexed —
+    /// which is the cost this change exists to avoid.
+    #[test]
+    fn the_prompt_a_non_graphql_repo_sees_is_byte_for_byte_what_it_was() {
+        let prompt = sentinel_prompt(&[], &sentinel_guidance());
+        let expected = "\n### FRAMEWORK-SPECIFIC HINTS\nTRIAGE_SENTINEL\n\
+             ### FRAMEWORK-SPECIFIC PARSING NOTES\nThese notes are generated per-scan by the \
+             framework guidance layer and describe how to correctly extract endpoints, mounts, \
+             owners, and prefixes for the exact framework(s) detected in this repo. Read them \
+             carefully — they override any generic rule in the system prompt when they conflict.\n\
+             NOTES_SENTINEL\n\n### CANDIDATE TARGETS (AST-Detected Hints)\n";
+        assert!(
+            prompt.text.contains(expected),
+            "the guidance-to-candidates seam moved:\n{}",
+            prompt.text
+        );
+    }
+
+    /// What `guidance_prefix_bytes` promises the cloud: everything the
+    /// guidance produced is inside `[0, n)`, and nothing else is.
+    #[test]
+    fn the_guidance_prefix_holds_every_guidance_byte_and_no_others() {
+        let prompt = sentinel_prompt(&[], &sentinel_guidance());
+        let (block, body) = prompt.text.split_at(prompt.guidance_prefix_bytes);
+
+        assert!(block.starts_with("### ACTIVE PATTERNS (Derived from Framework Guidance)"));
+        for sentinel in [
+            "MOUNT_SENTINEL",
+            "ENDPOINT_SENTINEL",
+            "FETCH_SENTINEL",
+            "TRIAGE_SENTINEL",
+            "NOTES_SENTINEL",
+        ] {
+            assert!(
+                block.contains(sentinel),
+                "{sentinel} is not in the guidance block"
+            );
+            assert!(
+                !body.contains(sentinel),
+                "{sentinel} leaked into the per-file body"
+            );
+        }
+        assert!(
+            body.starts_with("\n### CANDIDATE TARGETS (AST-Detected Hints)"),
+            "the body should begin at the first per-file section, got:\n{body}"
+        );
+        // The per-file material has to be in the hashed body, or two different
+        // files could share one cache entry.
+        assert!(body.contains("### FILE CONTENT (Path: src/routes/users.ts)"));
+    }
+
+    /// The GraphQL sections are repo-global but not guidance, so they sit
+    /// after the block, in the hashed body: a repo whose SDL changes must miss.
+    #[test]
+    fn the_graphql_sections_sit_after_the_guidance_block_not_inside_it() {
+        let hints = vec!["query order: Order".to_string()];
+        let prompt = sentinel_prompt(&hints, &sentinel_guidance());
+        let (block, body) = prompt.text.split_at(prompt.guidance_prefix_bytes);
+
+        assert!(!block.contains("### GRAPHQL SCHEMA PRODUCERS"));
+        assert!(body.starts_with("\n### GRAPHQL SCHEMA PRODUCERS (from this repo's SDL)"));
+        assert!(body.contains("- query order: Order"));
+        // Still ahead of every per-file section, which is what the Vertex
+        // prefix cache needs.
+        let pos = |needle: &str| prompt.text.find(needle).expect(needle);
+        assert!(pos("### GRAPHQL SCHEMA PRODUCERS") < pos("### CANDIDATE TARGETS"));
+        assert!(pos("### CANDIDATE TARGETS") < pos("### FILE CONTENT"));
+        // And the guidance block itself is unchanged by their presence: the
+        // same guidance keys the same bytes whether or not the repo has an SDL.
+        let plain = sentinel_prompt(&[], &sentinel_guidance());
+        assert_eq!(block, &plain.text[..plain.guidance_prefix_bytes]);
+    }
+
+    /// The count is BYTES, and the cloud slices a utf-8 buffer at it. A
+    /// character count would cut inside a character and drag guidance bytes
+    /// into the hashed body — a silent miss for every file in the repo.
+    #[test]
+    fn the_prefix_is_a_byte_count_that_lands_on_a_character_boundary() {
+        let mut guidance = sentinel_guidance();
+        guidance.parsing_notes = "NOTES_SENTINEL: mise en œuvre, 日本語, ✅".to_string();
+        let prompt = sentinel_prompt(&[], &guidance);
+
+        assert!(
+            prompt.text.is_char_boundary(prompt.guidance_prefix_bytes),
+            "the offset must be a character boundary"
+        );
+        assert!(
+            prompt.guidance_prefix_bytes
+                > prompt.text[..prompt.guidance_prefix_bytes].chars().count(),
+            "the fixture has to contain multi-byte characters to test anything"
+        );
+        let body = &prompt.text[prompt.guidance_prefix_bytes..];
+        assert!(
+            !body.contains("日本語"),
+            "multi-byte guidance leaked into the body"
+        );
+        assert!(body.starts_with("\n### CANDIDATE TARGETS (AST-Detected Hints)"));
+    }
+
+    /// No guidance id, no split: the analyzer must not name a guidance entry
+    /// it cannot identify, and the cloud keys the whole message instead.
+    #[test]
+    fn a_guidance_answer_with_no_id_still_builds_the_same_prompt() {
+        let mut guidance = sentinel_guidance();
+        guidance.guidance_key = None;
+        let without = sentinel_prompt(&[], &guidance);
+        let with = sentinel_prompt(&[], &sentinel_guidance());
+        assert_eq!(without.text, with.text);
+        assert_eq!(without.guidance_prefix_bytes, with.guidance_prefix_bytes);
+    }
+
     #[test]
     fn build_user_message_includes_graphql_producers_when_hints_present() {
         let agent = FileAnalyzerAgent::new(AgentService::new());
@@ -2603,17 +2828,19 @@ const data = await fetch('/api/users').then(resp => resp.json());
             "mutation refundOrder: Order!".to_string(),
         ];
 
-        let message = agent.build_user_message_with_candidates(
-            "resolvers.ts",
-            file_content,
-            &guidance,
-            &[],
-            &[],
-            &HashMap::new(),
-            &hints,
-            &[],
-            &[],
-        );
+        let message = agent
+            .build_user_message_with_candidates(
+                "resolvers.ts",
+                file_content,
+                &guidance,
+                &[],
+                &[],
+                &HashMap::new(),
+                &hints,
+                &[],
+                &[],
+            )
+            .text;
 
         assert!(
             message.contains("### GRAPHQL SCHEMA PRODUCERS (from this repo's SDL)"),
@@ -2651,17 +2878,19 @@ const data = await fetch('/api/users').then(resp => resp.json());
         let guidance = create_test_guidance();
         let file_content = "const x = 1;\n";
 
-        let message = agent.build_user_message_with_candidates(
-            "plain.ts",
-            file_content,
-            &guidance,
-            &[],
-            &[],
-            &HashMap::new(),
-            &[],
-            &[],
-            &[],
-        );
+        let message = agent
+            .build_user_message_with_candidates(
+                "plain.ts",
+                file_content,
+                &guidance,
+                &[],
+                &[],
+                &HashMap::new(),
+                &[],
+                &[],
+                &[],
+            )
+            .text;
 
         assert!(
             !message.contains("GRAPHQL SCHEMA PRODUCERS"),
@@ -2705,17 +2934,19 @@ const data = await fetch('/api/users').then(resp => resp.json());
         let file_content = "export interface OrderUpdate { id: string }\n";
         let hints = vec!["subscription|orderUpdated @ lib/graphql.ts".to_string()];
 
-        let message = agent.build_user_message_with_candidates(
-            "lib/graphql.ts",
-            file_content,
-            &guidance,
-            &[],
-            &[],
-            &HashMap::new(),
-            &[],
-            &hints,
-            &[],
-        );
+        let message = agent
+            .build_user_message_with_candidates(
+                "lib/graphql.ts",
+                file_content,
+                &guidance,
+                &[],
+                &[],
+                &HashMap::new(),
+                &[],
+                &hints,
+                &[],
+            )
+            .text;
 
         assert!(
             message.contains("### GRAPHQL DOCUMENT CONSUMERS WITH NO EXPLICIT RESULT TYPE"),
@@ -2751,17 +2982,19 @@ const data = await fetch('/api/users').then(resp => resp.json());
         let guidance = create_test_guidance();
         let file_content = "const x = 1;\n";
 
-        let message = agent.build_user_message_with_candidates(
-            "plain.ts",
-            file_content,
-            &guidance,
-            &[],
-            &[],
-            &HashMap::new(),
-            &[],
-            &[],
-            &[],
-        );
+        let message = agent
+            .build_user_message_with_candidates(
+                "plain.ts",
+                file_content,
+                &guidance,
+                &[],
+                &[],
+                &HashMap::new(),
+                &[],
+                &[],
+                &[],
+            )
+            .text;
 
         assert!(
             !message.contains("GRAPHQL DOCUMENT CONSUMERS"),
