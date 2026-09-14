@@ -15,10 +15,12 @@ producing service defines the contract, and if two definitions disagree,
 the producer's definition wins. Load the Carrick tools now so they are ready at that
 moment.
 
-**Inside this repo, grep and read are faster — use them.** One exception:
-before writing any new helper, parser, validator, or domain function, run
-`search_by_intent` with a plain-English description of the behaviour.
-Grep can prove a name is absent; it can never prove the behaviour is.
+**Read the file you are editing. For anything that lives elsewhere in the
+workspace (a helper, an endpoint, a consumer, a type), ask Carrick first,
+then grep to confirm a location.** Run `search_by_intent` before writing
+any helper, parser, validator, or domain function, even when you are sure
+it is new. Grep can prove a name is absent; it can never prove the
+behaviour is.
 
 Then, before you write new code, state one line naming what you asked and
 what came back:
