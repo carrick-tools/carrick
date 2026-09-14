@@ -82,6 +82,14 @@ use swc_ecma_ast::{
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::{debug, warn};
 
+/// File-analyzer calls this stage queues at once.
+///
+/// A queue depth, not a rate cap: the cap on requests in flight is the
+/// process-wide semaphore behind `AgentService` (`CARRICK_CONCURRENCY_LIMIT`),
+/// which this stage shares with the intent stage running beside it
+/// (carrick#1065).
+pub const FILE_ANALYSIS_QUEUE_DEPTH: usize = 20;
+
 /// Complete result of file-centric analysis
 #[derive(Debug)]
 pub struct FileCentricAnalysisResult {
@@ -2185,16 +2193,12 @@ impl FileOrchestrator {
             );
         }
 
-        // PHASE 2 (concurrent, I/O-bound): dispatch the LLM calls. `AgentService` owns a
-        // semaphore (CARRICK_CONCURRENCY_LIMIT, default 20) that enforces the real rate cap,
-        // so we eagerly buffer up to that many in-flight requests. Completion order does not
-        // affect the result: stats are counts and `file_results` is a map, so the aggregate
-        // is deterministic regardless of which call finishes first.
-        let concurrency = std::env::var("CARRICK_CONCURRENCY_LIMIT")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(20)
-            .max(1);
+        // PHASE 2 (concurrent, I/O-bound): dispatch the LLM calls, queueing up to
+        // FILE_ANALYSIS_QUEUE_DEPTH for the process-wide semaphore that caps what is in
+        // flight. Completion order does not affect the result: stats are counts and
+        // `file_results` is a map, so the aggregate is deterministic regardless of which
+        // call finishes first.
+        let concurrency = FILE_ANALYSIS_QUEUE_DEPTH;
 
         // Files whose model answer is already in hand. The deterministic layer
         // above ran over them like every other file; only the call is skipped.

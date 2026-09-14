@@ -60,10 +60,12 @@ ENVIRONMENT VARIABLES:
                                     not under it
     CARRICK_MOCK_ALL                Use mock storage instead of Carrick Cloud
     CARRICK_API_ENDPOINT            API endpoint for the carrick service (build-time)
-    CARRICK_INTENT_CONCURRENCY      Concurrent function-intent requests (default 8).
+    CARRICK_INTENT_CONCURRENCY      Concurrent function-intent requests (default 20).
                                     Lower it if a large repo loses intents to
-                                    backend overload; capped by
-                                    CARRICK_CONCURRENCY_LIMIT
+                                    backend overload
+    CARRICK_CONCURRENCY_LIMIT       Model requests in flight across a scan
+                                    (default 28), shared by file analysis and
+                                    function intents, which run together
     CARRICK_ALLOW_PARTIAL_ANALYSIS  Upload and exit 0 even when files were not
                                     analysed. Off by default: a run that lost
                                     analyzer results is reported and fails,

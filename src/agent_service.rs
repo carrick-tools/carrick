@@ -289,6 +289,43 @@ enum RequestAuth<'a> {
     Bearer(String),
 }
 
+/// Lambda calls in flight across the whole process when
+/// `CARRICK_CONCURRENCY_LIMIT` is unset.
+///
+/// Sized for two stages at once. A service's file analysis queues up to
+/// [`crate::agents::file_orchestrator::FILE_ANALYSIS_QUEUE_DEPTH`] calls and its
+/// function intents up to `DEFAULT_INTENT_CONCURRENCY`, and the intent stage
+/// now starts at discovery instead of after the last file (carrick#1065). At
+/// 20 the intents would only get the slots file analysis left free, which
+/// during its burst is none; 28 lets both stages progress while keeping the
+/// burst against the model backend well under the sum of the two queues.
+const DEFAULT_CONCURRENCY_LIMIT: usize = 28;
+
+/// `CARRICK_CONCURRENCY_LIMIT`, or [`DEFAULT_CONCURRENCY_LIMIT`]: the ceiling
+/// on lambda calls in flight across the process. The per-stage queue depths
+/// only say how eagerly a stage queues work; this is what bounds the requests
+/// on the wire.
+fn concurrency_limit() -> usize {
+    env::var("CARRICK_CONCURRENCY_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CONCURRENCY_LIMIT)
+        .max(1)
+}
+
+/// The one semaphore every `AgentService` draws its permits from.
+///
+/// Process-global for the same reason as [`RATE_LIMITED`]: a scan constructs
+/// several `AgentService` instances (detection, file analysis, intents), and
+/// with a semaphore per instance two stages running side by side would put
+/// the SUM of their limits on the wire. The limit is read once, on first use.
+fn global_semaphore() -> Arc<Semaphore> {
+    static SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(concurrency_limit())))
+        .clone()
+}
+
 /// Reusable service for making Agent API calls
 #[derive(Debug, Clone)]
 pub struct AgentService {
@@ -299,12 +336,6 @@ pub struct AgentService {
 impl AgentService {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        // Limit concurrent requests to avoid rate limits
-        // Paid tier allows higher limits, but let's be safe with 20 concurrent requests
-        let concurrency_limit = env::var("CARRICK_CONCURRENCY_LIMIT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(20);
         let use_system_proxy = env::var("CARRICK_USE_SYSTEM_PROXY").is_ok();
         let mut client_builder = Client::builder();
         if !use_system_proxy {
@@ -316,7 +347,7 @@ impl AgentService {
 
         Self {
             client,
-            semaphore: Arc::new(Semaphore::new(concurrency_limit)),
+            semaphore: global_semaphore(),
         }
     }
 
@@ -1884,6 +1915,16 @@ pub(crate) mod tests {
             message: "boom".to_string(),
             retriable: true,
         }
+    }
+
+    /// File analysis and intents run side by side on separately constructed
+    /// services (carrick#1065); the cap on calls in flight holds only if every
+    /// instance draws on the same permits.
+    #[test]
+    fn every_agent_service_shares_one_semaphore() {
+        let detection = AgentService::new();
+        let intents = AgentService::new();
+        assert!(Arc::ptr_eq(&detection.semaphore, &intents.semaphore));
     }
 
     /// The two guidance fields are key material for the cloud's analysis
