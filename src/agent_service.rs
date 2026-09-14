@@ -357,6 +357,11 @@ fn concurrency_limit() -> usize {
 /// several `AgentService` instances (detection, file analysis, intents), and
 /// with a semaphore per instance two stages running side by side would put
 /// the SUM of their limits on the wire. The limit is read once, on first use.
+///
+/// A permit covers one HTTP attempt, not a whole call: a call asleep between
+/// retries holds none and queues for one again when it wakes (carrick#1077).
+/// So the cap bounds requests on the wire, and the calls waiting out a
+/// backoff are bounded separately, by the stage queue depths.
 fn global_semaphore() -> Arc<Semaphore> {
     static SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
     SEMAPHORE
@@ -439,15 +444,9 @@ impl AgentService {
         body: &B,
         mock_seed: &str,
     ) -> Result<LambdaOutcome, AgentCallError> {
-        let _permit = self.semaphore.acquire().await.map_err(|e| {
-            AgentCallError::permanent(
-                "semaphore_closed",
-                format!("Failed to acquire semaphore permit: {}", e),
-            )
-        })?;
-
-        // Counted here, before the mock short-circuit and after the semaphore:
-        // this is every request the scan would put on the wire.
+        // Counted here, before the mock short-circuit: this is every request
+        // the scan would put on the wire. The concurrency permit is taken per
+        // HTTP attempt inside `post_with_retry`, so an offline run takes none.
         record_request(task_path);
 
         if env::var("CARRICK_MOCK_ALL").is_ok() {
@@ -543,6 +542,19 @@ impl AgentService {
                 RequestAuth::Bearer(token) => token.clone(),
             };
 
+            // One slot per HTTP attempt, not per call (carrick#1077). The
+            // permit covers the send and the body read, and is dropped before
+            // every retry sleep: a call waiting out a 10-15 s `Retry-After`
+            // is not a request on the wire, so it must not idle a slot another
+            // call could use. It re-queues for a slot when it wakes. Taken
+            // after the token read, so minting a token holds no slot either.
+            let permit = self.semaphore.acquire().await.map_err(|e| {
+                AgentCallError::permanent(
+                    "semaphore_closed",
+                    format!("Failed to acquire semaphore permit: {}", e),
+                )
+            })?;
+
             let mut request_builder = self
                 .client
                 .post(&endpoint)
@@ -595,6 +607,7 @@ impl AgentService {
                                     "Failed to read agent proxy response ({}): {}. Retrying in {:?} (attempt {}/{})",
                                     status, e, wait_time, attempt, max_retries
                                 );
+                                drop(permit);
                                 sleep(wait_time).await;
                                 lambda_attempt += 1;
                                 continue;
@@ -655,6 +668,9 @@ impl AgentService {
                             status,
                             body_excerpt(&response_text)
                         );
+                        // Minting is a round trip to the token endpoint, not
+                        // to the cloud, so it holds no slot.
+                        drop(permit);
                         provider.remint(&token).await.map_err(|e| {
                             AgentCallError::permanent("oidc_unavailable", e.to_string())
                         })?;
@@ -682,6 +698,7 @@ impl AgentService {
                                     attempt,
                                     max_retries
                                 );
+                                drop(permit);
                                 sleep(wait_time).await;
                                 lambda_attempt += 1;
                                 continue;
@@ -749,6 +766,7 @@ impl AgentService {
                             "Agent error '{}' is retriable, retrying in {:?} (attempt {}/{}): {}",
                             call_err.code, wait_time, attempt, max_retries, call_err.message
                         );
+                        drop(permit);
                         sleep(wait_time).await;
                         lambda_attempt += 1;
                         continue;
@@ -764,6 +782,7 @@ impl AgentService {
                             "Agent proxy network error: {}, retrying in {:?} (attempt {}/{})",
                             e, wait_time, attempt, max_retries
                         );
+                        drop(permit);
                         sleep(wait_time).await;
                         lambda_attempt += 1;
                         continue;
@@ -2210,6 +2229,97 @@ pub(crate) mod tests {
             header_of(&requests[1], "x-carrick-attempt").as_deref(),
             Some("2")
         );
+    }
+
+    /// A call waiting out a retry holds no concurrency slot (carrick#1077).
+    /// With ONE slot, call A is refused with `Retry-After: 3` and sleeps; call
+    /// B, started after A was refused, must get the slot and finish during
+    /// A's sleep instead of queueing behind it. The stub answers connections
+    /// in arrival order, so B receiving the second response proves B's request
+    /// went out before A's retry.
+    #[tokio::test]
+    async fn a_call_asleep_between_retries_frees_its_concurrency_slot() {
+        let (api_base, server) = stub_server_with_headers(vec![
+            (
+                503,
+                r#"{"success":false,"error":{"code":"model_error","message":"overloaded","retriable":true}}"#
+                    .to_string(),
+                vec![("Retry-After", "3".to_string())],
+            ),
+            (
+                200,
+                r#"{"success":true,"text":"second"}"#.to_string(),
+                Vec::new(),
+            ),
+            (
+                200,
+                r#"{"success":true,"text":"third"}"#.to_string(),
+                Vec::new(),
+            ),
+        ]);
+
+        let semaphore = Arc::new(Semaphore::new(1));
+        let service = AgentService {
+            client: Client::builder().no_proxy().build().unwrap(),
+            semaphore: semaphore.clone(),
+        };
+        let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
+        let body = serde_json::json!({});
+
+        let call_a = service.post_with_retry(&auth, &api_base, "/analyze-file", &body);
+        let call_b = async {
+            // Long enough for A's first attempt to be refused, far short of
+            // its 3 s wait.
+            sleep(Duration::from_millis(500)).await;
+            let started = std::time::Instant::now();
+            let outcome = service
+                .post_with_retry(&auth, &api_base, "/analyze-file", &body)
+                .await;
+            (outcome, started.elapsed())
+        };
+        let (a, (b, b_elapsed)) = tokio::join!(call_a, call_b);
+
+        assert_eq!(b.unwrap().text, "second", "B queued behind A's retry sleep");
+        assert!(
+            b_elapsed < Duration::from_secs(2),
+            "B waited {b_elapsed:?} for a slot held by a sleeping call"
+        );
+        assert_eq!(a.unwrap().text, "third");
+        assert_eq!(server.join().unwrap().len(), 3);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    /// The other half of the same contract: an attempt does wait for a slot.
+    /// With the only permit held elsewhere the request must not go out; once
+    /// it is released, it does.
+    #[tokio::test]
+    async fn an_attempt_waits_for_a_free_concurrency_slot() {
+        let (api_base, server) = stub_server(vec![(
+            200,
+            r#"{"success":true,"text":"analysed"}"#.to_string(),
+        )]);
+        let semaphore = Arc::new(Semaphore::new(1));
+        let service = AgentService {
+            client: Client::builder().no_proxy().build().unwrap(),
+            semaphore: semaphore.clone(),
+        };
+        let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
+        let body = serde_json::json!({});
+
+        let held = semaphore.clone().acquire_owned().await.unwrap();
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(300),
+            service.post_with_retry(&auth, &api_base, "/analyze-file", &body),
+        )
+        .await;
+        assert!(blocked.is_err(), "sent a request without a free slot");
+
+        drop(held);
+        let result = service
+            .post_with_retry(&auth, &api_base, "/analyze-file", &body)
+            .await;
+        assert_eq!(result.unwrap().text, "analysed");
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     /// A re-mint re-sends without the model ever having been asked, so the
