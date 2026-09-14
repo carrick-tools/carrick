@@ -166,6 +166,11 @@ function stateClause(state: string): string {
       return "the hosted index has not landed yet";
     case "not_connected":
       return "these repos are not connected to a Carrick project";
+    // Said of a repo this run may well have just connected: the scanner
+    // derives the name again from the git remote, and an origin whose path is
+    // not owner/repo names nothing to derive (carrick#1056).
+    case "remote_unnamed":
+      return "the git remote here names no owner/repo, so the hosted index was not asked for";
     case "not_signed_in":
       return "this machine is not signed in, so the hosted index was not read";
     default:

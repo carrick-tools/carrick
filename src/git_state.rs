@@ -75,14 +75,21 @@ pub fn inspect(repo_path: &str) -> GitState {
     }
 }
 
-/// `owner/repo` from this clone's `origin` remote, or `None` when it has none
-/// or the remote is not a github.com URL.
-///
-/// The only identity a laptop can offer the cloud: CI derives it from the
-/// signed OIDC claims instead, and never calls this. The hosted index reader
-/// resolves the same name the same way, which is what makes a repo the CLI
-/// sees the repo the cloud answers about, so there is one copy of it.
-pub fn remote_name(repo: &Path) -> Option<String> {
+/// A clone's `origin` remote, and the repository it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    /// The remote as git holds it, with any credentials taken out: a remote
+    /// can carry a token in its userinfo half, and this string is printed to
+    /// the reader and stored in the local index.
+    pub url: String,
+    /// `owner/repo`, or `None` when the remote names no such path. The reason
+    /// travels with the answer so a surface can say which of the two it is
+    /// (carrick#991, carrick#1056).
+    pub name: Option<String>,
+}
+
+/// This clone's `origin` remote, or `None` when it has none.
+pub fn origin(repo: &Path) -> Option<Origin> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -96,24 +103,102 @@ pub fn remote_name(repo: &Path) -> Option<String> {
         return None;
     }
     let url = String::from_utf8(output.stdout).ok()?;
-    parse_remote(url.trim())
+    let url = url.trim();
+    Some(Origin {
+        name: parse_remote(url),
+        url: without_credentials(url),
+    })
 }
 
-/// `owner/repo` from a remote URL in any of the forms git writes.
+/// `owner/repo` from this clone's `origin` remote, or `None` when it has none
+/// or the remote names no `owner/repo` path.
+///
+/// The only identity a laptop can offer the cloud: CI derives it from the
+/// signed OIDC claims instead, and never calls this. The hosted index reader
+/// resolves the same name the same way, which is what makes a repo the CLI
+/// sees the repo the cloud answers about, so there is one copy of it.
+pub fn remote_name(repo: &Path) -> Option<String> {
+    origin(repo)?.name
+}
+
+/// `owner/repo` from a remote URL in any of the forms git writes, whatever
+/// host it names.
+///
+/// The host is not a gate. A machine with two GitHub accounts writes its
+/// remotes through a per-account ssh alias — `git@github.com-personal:owner/repo`,
+/// a name only that user's `~/.ssh/config` can resolve — and that is an
+/// ordinary GitHub repository. Refusing it left a repo the cloud had just
+/// connected reading as "not connected to a Carrick project" on the machine
+/// that connected it (carrick#1056). Whether the cloud knows a name is the
+/// cloud's answer: `resolve-repos` returns nothing for a name outside the
+/// workspace and `start-scan` refuses a repo this holder may not write, so
+/// this reads the name and decides nothing else.
 pub fn parse_remote(remote: &str) -> Option<String> {
-    let name = if let Some(name) = remote.strip_prefix("git@github.com:") {
-        name.strip_suffix(".git").unwrap_or(name).to_string()
-    } else {
+    let remote = remote.trim();
+    let path = if has_scheme(remote) {
+        // Parsed rather than split so a port, a userinfo half or an escape
+        // cannot be read as part of the path.
         let url = reqwest::Url::parse(remote).ok()?;
-        if !url.host_str()?.eq_ignore_ascii_case("github.com")
-            || !matches!(url.scheme(), "https" | "ssh")
-        {
+        // A URL naming no host names no repository host: `file:///tmp/api`.
+        if url.host_str().is_none_or(str::is_empty) {
             return None;
         }
-        let name = url.path().strip_prefix('/')?;
-        name.strip_suffix(".git").unwrap_or(name).to_string()
+        url.path().to_string()
+    } else {
+        // The scp spelling `[user@]host:owner/repo`, which is not a URL. The
+        // user half is optional and never read — git writes an alias with no
+        // user as `github.com-personal:owner/repo`.
+        let after_user = remote.split_once('@').map_or(remote, |(_, rest)| rest);
+        let (host, path) = after_user.split_once(':')?;
+        if host.is_empty() || host.contains('/') {
+            return None;
+        }
+        path.to_string()
     };
+    // The last two segments, so a host that nests groups names its repository
+    // rather than nothing. A `.git` suffix is git's, not part of the name.
+    let mut segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let repo = segments.pop()?;
+    let owner = segments.pop()?;
+    let name = format!("{owner}/{}", repo.strip_suffix(".git").unwrap_or(repo));
     valid_repo_name(&name).then_some(name)
+}
+
+/// Whether a remote is written in a URL form (`scheme://…`) rather than the
+/// scp one. Told apart by the `//`, not by whether a URL parser accepts it: a
+/// host alias with no user (`github.com-personal:owner/repo`) parses as a URL
+/// whose scheme is the host, and would otherwise be read as neither form.
+fn has_scheme(remote: &str) -> bool {
+    let Some((scheme, _)) = remote.split_once("://") else {
+        return false;
+    };
+    scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+}
+
+/// A remote with its userinfo removed, for printing.
+///
+/// A URL-form remote can carry a token (`https://x-access-token:TOKEN@host/…`),
+/// and the one remote this module prints is the one it could not read a name
+/// from — which includes a credential-carrying URL with no repository path.
+fn without_credentials(remote: &str) -> String {
+    if !has_scheme(remote) {
+        return remote.to_string();
+    }
+    let Ok(mut url) = reqwest::Url::parse(remote) else {
+        return remote.to_string();
+    };
+    if url.username().is_empty() && url.password().is_none() {
+        return remote.to_string();
+    }
+    if url.set_username("").is_err() || url.set_password(None).is_err() {
+        // A URL that cannot hold a username cannot be stripped of one, and
+        // printing it as it stands would print the credential.
+        return "a remote carrying credentials".to_string();
+    }
+    url.to_string()
 }
 
 /// Whether a string is a `owner/repo` name and nothing else — no path escape,
@@ -305,18 +390,120 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Every form git writes, read for the name and nothing else.
+    ///
+    /// The host is deliberately not a gate (carrick#1056): an ssh alias is a
+    /// GitHub repository under a name only the user's ssh config resolves, and
+    /// a name the workspace does not hold is refused by the cloud, which is
+    /// the only side that can know. This is where the Rust reader differs from
+    /// `repoIdentity` in the npm package, which resolves the alias through
+    /// `ssh -G` because it decides what to OFFER the cloud.
     #[test]
-    fn remote_normalization_matches_npm_init_url_forms() {
+    fn a_remote_names_its_repo_in_every_form_git_writes() {
         for (remote, expected) in [
             ("git@github.com:example/api.git", Some("example/api")),
+            // The ticket's remote: a per-account ssh alias.
+            (
+                "git@github.com-personal:example/api.git",
+                Some("example/api"),
+            ),
+            // The same alias as git writes it when the config names no user.
+            ("github.com-personal:example/api.git", Some("example/api")),
             ("https://GitHub.COM/example/api.git", Some("example/api")),
             ("ssh://git@GitHub.COM/example/api.git", Some("example/api")),
-            ("https://github.com/example/api/", None),
-            ("https://github.com.evil.test/example/api", None),
+            (
+                "git+ssh://git@github.com/example/api.git",
+                Some("example/api"),
+            ),
+            // A trailing slash is git's spelling, not a missing name.
+            ("https://github.com/example/api/", Some("example/api")),
+            // Another host entirely: it parses, and the cloud decides whether
+            // it is a repository this workspace holds.
+            ("https://gitlab.com/example/api.git", Some("example/api")),
+            ("git@gitlab.com:group/sub/api.git", Some("sub/api")),
+            // A credential in the URL is not part of the name.
+            (
+                "https://x-access-token:secret@github.com/example/api.git",
+                Some("example/api"),
+            ),
+            // No `owner/repo` path to read.
             ("/tmp/api", None),
+            ("https://github.com/example", None),
+            ("git@github.com:api.git", None),
+            ("file:///tmp/example/api.git", None),
+            ("", None),
         ] {
             assert_eq!(parse_remote(remote).as_deref(), expected, "{remote}");
         }
+    }
+
+    /// The remote is printed when no name could be read from it, and a remote
+    /// can carry a token. The redaction happens in the reader, before anything
+    /// stores it.
+    #[test]
+    fn a_printed_remote_carries_no_credentials() {
+        assert_eq!(
+            without_credentials("https://x-access-token:secret@github.com/example"),
+            "https://github.com/example"
+        );
+        assert!(!without_credentials("https://user:pw@host.test/").contains("pw"));
+        // Nothing to strip: the string is returned exactly as git wrote it,
+        // not as a URL parser would rewrite it.
+        assert_eq!(
+            without_credentials("git@github.com-personal:example/api.git"),
+            "git@github.com-personal:example/api.git"
+        );
+        assert_eq!(
+            without_credentials("https://github.com/example/api.git"),
+            "https://github.com/example/api.git"
+        );
+    }
+
+    /// The reader answers with the remote beside the name, so a surface can
+    /// say "this remote names no repository" rather than "not connected".
+    #[test]
+    fn origin_reports_the_remote_it_could_not_name() {
+        let dir = std::env::temp_dir().join(format!("carrick-git-origin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        // No origin at all: nothing to report.
+        assert_eq!(origin(&dir), None);
+        assert_eq!(remote_name(&dir), None);
+
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com-personal:example/api.git",
+        ]);
+        assert_eq!(
+            origin(&dir),
+            Some(Origin {
+                url: "git@github.com-personal:example/api.git".to_string(),
+                name: Some("example/api".to_string()),
+            })
+        );
+
+        git(&["remote", "set-url", "origin", "/srv/mirrors/api"]);
+        assert_eq!(
+            origin(&dir),
+            Some(Origin {
+                url: "/srv/mirrors/api".to_string(),
+                name: None,
+            })
+        );
+        assert_eq!(remote_name(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A path that is not a git repository answers with the default rather

@@ -32,7 +32,7 @@
           "additionalProperties": true
         },
         "hosted_state": {
-          "enum": ["enriched", "no_index_yet", "not_connected", "not_signed_in", "version_mismatch", "commit_missing", "read_failed"]
+          "enum": ["enriched", "no_index_yet", "not_connected", "remote_unnamed", "not_signed_in", "version_mismatch", "commit_missing", "read_failed"]
         },
         "schema": { "const": "carrick.check/0" },
         "file": {

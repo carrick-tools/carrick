@@ -199,6 +199,7 @@ export type StatusService = {
     | "enriched"
     | "no_index_yet"
     | "not_connected"
+    | "remote_unnamed"
     | "not_signed_in"
     | "version_mismatch"
     | "commit_missing"
