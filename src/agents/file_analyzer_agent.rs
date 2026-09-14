@@ -678,20 +678,11 @@ impl FileAnalyzerAgent {
     /// Eval-harness diagnostics (off in normal runs). When `CARRICK_EVAL_DUMP_DIR`
     /// is set, write the file-analyzer's input (`request_user_message` — which
     /// embeds the framework guidance + candidates the model received) and its
-    /// `raw_response` to `<dir>/<file>.attemptN.json`. This makes prompt-hardening
+    /// `raw_response` to `<dir>/<file>.json`. This makes prompt-hardening
     /// evidence-driven: we read what the model actually emitted (owner_node,
     /// mount_path, whether the endpoint was extracted at all) rather than guess.
-    /// `retry_reason` is `None` on attempt 1 and names the trigger on attempt 2
-    /// (currently always `"suspicious_fields"`), so attempt pairs are
-    /// distinguishable in the dumps and harness runs can measure how often the
-    /// retry fires and what it changes.
-    fn dump_eval_artifact(
-        file_path: &str,
-        attempt: u8,
-        user_message: &str,
-        response: &str,
-        retry_reason: Option<&str>,
-    ) {
+    /// One request per file, so one dump per file.
+    fn dump_eval_artifact(file_path: &str, user_message: &str, response: &str) {
         let Ok(dir) = std::env::var("CARRICK_EVAL_DUMP_DIR") else {
             return;
         };
@@ -702,13 +693,11 @@ impl FileAnalyzerAgent {
         let stem = file_path.replace(['/', '\\'], "_");
         let payload = serde_json::json!({
             "file_path": file_path,
-            "attempt": attempt,
-            "retry_reason": retry_reason,
             "request_user_message": user_message,
             "raw_response": response,
         });
         if let Ok(s) = serde_json::to_string_pretty(&payload) {
-            let _ = std::fs::write(dir.join(format!("{stem}.attempt{attempt}.json")), s);
+            let _ = std::fs::write(dir.join(format!("{stem}.json")), s);
         }
     }
 
@@ -762,12 +751,7 @@ impl FileAnalyzerAgent {
         let schema = AgentSchemas::file_analysis_schema();
         let response = self
             .agent_service
-            .analyze_with_lambda(
-                "/analyze-file",
-                &user_message,
-                Some(schema.clone()),
-                guidance_ref,
-            )
+            .analyze_with_lambda("/analyze-file", &user_message, Some(schema), guidance_ref)
             .await?;
 
         // Raw bodies at trace only — debug logs are persisted and uploaded,
@@ -781,7 +765,7 @@ impl FileAnalyzerAgent {
         // capture mode), persist the analyzer's input (the guidance/candidates it
         // received) and raw output so prompt-hardening can be driven by what the
         // model actually emitted, not by guesswork. Off unless the env is set.
-        Self::dump_eval_artifact(file_path, 1, &user_message, &response, None);
+        Self::dump_eval_artifact(file_path, &user_message, &response);
 
         let mut result: FileAnalysisResult = serde_json::from_str(&response).map_err(|e| {
             format!(
@@ -790,47 +774,17 @@ impl FileAnalyzerAgent {
             )
         })?;
 
-        // Sanitize LLM response: Gemini sometimes returns "+null" as a string instead of null
-        let needs_retry = Self::sanitize_result(&mut result);
-        let initial_result = result.clone();
-        if needs_retry {
-            warn!("[FileAnalyzerAgent] Suspicious fields detected in LLM output; retrying once");
-            let response = self
-                .agent_service
-                .analyze_with_lambda("/analyze-file", &user_message, Some(schema), guidance_ref)
-                .await?;
-
-            trace!("=== RAW FILE ANALYSIS RESPONSE ===");
-            trace!("{}", response);
-            trace!("=== END RAW RESPONSE ===");
-            debug!("File analysis retry response: {} chars", response.len());
-            Self::dump_eval_artifact(
-                file_path,
-                2,
-                &user_message,
-                &response,
-                Some("suspicious_fields"),
+        // Sanitize LLM response: Gemini sometimes returns "+null" as a string
+        // instead of null. There is no retry when it drops a field
+        // (carrick#1071): the cloud caches every parseable answer under the
+        // request's key before returning it, so re-sending the same request is
+        // a guaranteed hit that returns these same bytes. The sanitised result
+        // is the answer.
+        if Self::sanitize_result(&mut result) {
+            warn!(
+                "[FileAnalyzerAgent] Dropped suspicious fields from the model's answer for {}; not retried, a re-send would replay the cached answer",
+                file_path
             );
-
-            let mut retry_result: FileAnalysisResult =
-                serde_json::from_str(&response).map_err(|e| {
-                    format!(
-                        "Failed to parse file analysis response: {}. Raw response: {}",
-                        e, response
-                    )
-                })?;
-
-            Self::sanitize_result(&mut retry_result);
-            let chosen = Self::choose_best_result(initial_result, retry_result);
-
-            debug!(
-                "File analysis complete: {} mounts, {} endpoints, {} data_calls",
-                chosen.mounts.len(),
-                chosen.endpoints.len(),
-                chosen.data_calls.len()
-            );
-
-            return Ok(chosen);
         }
 
         debug!(
@@ -843,36 +797,9 @@ impl FileAnalyzerAgent {
         Ok(result)
     }
 
-    /// Count every top-level result section, so the best-of selection sees a
-    /// difference in ANY of them. The previous version only counted the three
-    /// HTTP sections, so a retry that lost graphql/pubsub/consumer-locate
-    /// findings could still tie on the HTTP counts and be selected, silently
-    /// dropping those findings.
-    fn result_score(result: &FileAnalysisResult) -> usize {
-        result.mounts.len()
-            + result.endpoints.len()
-            + result.data_calls.len()
-            + result.graphql_operations.len()
-            + result.pubsub_operations.len()
-            + result.graphql_consumer_locates.len()
-    }
-
-    fn choose_best_result(
-        initial: FileAnalysisResult,
-        retry: FileAnalysisResult,
-    ) -> FileAnalysisResult {
-        let initial_score = Self::result_score(&initial);
-        let retry_score = Self::result_score(&retry);
-
-        if retry_score >= initial_score {
-            retry
-        } else {
-            warn!("[FileAnalyzerAgent] Retry produced fewer findings; keeping original result");
-            initial
-        }
-    }
-
-    /// Sanitize the LLM response to fix common issues like "+null" strings
+    /// Sanitize the LLM response to fix common issues like "+null" strings.
+    /// Returns whether a suspicious value (not merely a null placeholder) was
+    /// dropped, so the caller can say so.
     fn sanitize_result(result: &mut FileAnalysisResult) -> bool {
         // Helper to check if a string represents null. Covers the placeholder /
         // null-like literals the model intermittently emits ("null", "+null",
@@ -988,7 +915,7 @@ impl FileAnalyzerAgent {
             suspicious
         }
 
-        let mut needs_retry = false;
+        let mut dropped_suspicious = false;
 
         // Sanitize endpoints
         for endpoint in &mut result.endpoints {
@@ -1012,7 +939,7 @@ impl FileAnalyzerAgent {
             }
             normalize_optional_string(&mut endpoint.primary_type_symbol);
             if normalize_import_source(&mut endpoint.type_import_source) {
-                needs_retry = true;
+                dropped_suspicious = true;
             }
             if let Some(ref symbol) = endpoint.primary_type_symbol
                 && !is_valid_identifier(symbol)
@@ -1034,7 +961,7 @@ impl FileAnalyzerAgent {
             }
             normalize_optional_string(&mut data_call.primary_type_symbol);
             if normalize_import_source(&mut data_call.type_import_source) {
-                needs_retry = true;
+                dropped_suspicious = true;
             }
             if let Some(ref symbol) = data_call.primary_type_symbol
                 && !is_valid_identifier(symbol)
@@ -1059,7 +986,7 @@ impl FileAnalyzerAgent {
             }
             normalize_optional_string(&mut op.primary_type_symbol);
             if normalize_import_source(&mut op.type_import_source) {
-                needs_retry = true;
+                dropped_suspicious = true;
             }
             if let Some(ref symbol) = op.primary_type_symbol
                 && !is_valid_identifier(symbol)
@@ -1101,7 +1028,7 @@ impl FileAnalyzerAgent {
             true
         });
 
-        needs_retry
+        dropped_suspicious
     }
 
     // The system prompt for the Carrick Static Analysis Engine lives in
@@ -1883,8 +1810,8 @@ mod tests {
             dispatch_tables: Vec::new(),
         };
 
-        let needs_retry = FileAnalyzerAgent::sanitize_result(&mut result);
-        assert!(needs_retry);
+        let dropped_suspicious = FileAnalyzerAgent::sanitize_result(&mut result);
+        assert!(dropped_suspicious);
 
         let endpoint = &result.endpoints[0];
         assert!(endpoint.primary_type_symbol.is_none());
@@ -2191,176 +2118,6 @@ mod tests {
             assert_eq!(result.pubsub_operations[0].primary_type_symbol, None);
             assert_eq!(result.pubsub_operations[0].broker, None);
         }
-    }
-
-    #[test]
-    fn test_choose_best_result_prefers_richer_output() {
-        let initial = FileAnalysisResult {
-            graphql_consumer_locates: vec![],
-            mounts: vec![MountResult {
-                line_number: 1,
-                parent_node: "app".to_string(),
-                child_node: "router".to_string(),
-                mount_path: "/api".to_string(),
-                import_source: None,
-                pattern_matched: "app.use".to_string(),
-            }],
-            endpoints: vec![EndpointResult {
-                handler_declaration_line: None,
-                view_module: false,
-                candidate_id: "span:130-180".to_string(),
-                line_number: 2,
-                owner_node: "router".to_string(),
-                method: "GET".to_string(),
-                path: "/users".to_string(),
-                handler_name: "handler".to_string(),
-                pattern_matched: ".get(".to_string(),
-                call_expression_span_start: None,
-                call_expression_span_end: None,
-                payload_expression_text: None,
-                payload_expression_line: None,
-                response_expression_text: None,
-                response_expression_line: None,
-                emission_style: None,
-                primary_type_symbol: None,
-                type_import_source: None,
-                resolution_source: None,
-                dispatch: None,
-            }],
-            data_calls: vec![DataCallResult {
-                call_kind: None,
-                candidate_id: "span:190-240".to_string(),
-                line_number: 3,
-                target: "/users".to_string(),
-                method: Some("GET".to_string()),
-                pattern_matched: "fetch(".to_string(),
-                call_expression_span_start: None,
-                call_expression_span_end: None,
-                call_expression_text: None,
-                call_expression_line: None,
-                payload_expression_text: None,
-                payload_expression_line: None,
-                primary_type_symbol: None,
-                type_import_source: None,
-
-                loopback_default_url: None,
-                base: None,
-                consumers_not_resolved: None,
-                resolution_source: None,
-                dispatch: None,
-            }],
-            graphql_operations: vec![],
-            pubsub_operations: vec![],
-            dispatch_tables: Vec::new(),
-        };
-
-        let retry = FileAnalysisResult {
-            graphql_consumer_locates: vec![],
-            mounts: vec![],
-            endpoints: vec![],
-            data_calls: vec![],
-            graphql_operations: vec![],
-            pubsub_operations: vec![],
-            dispatch_tables: Vec::new(),
-        };
-
-        let chosen = FileAnalyzerAgent::choose_best_result(initial.clone(), retry);
-        assert_eq!(chosen.mounts.len(), initial.mounts.len());
-        assert_eq!(chosen.endpoints.len(), initial.endpoints.len());
-        assert_eq!(chosen.data_calls.len(), initial.data_calls.len());
-    }
-
-    /// A resolver linkage as the model emits it for a gateway resolver file.
-    fn test_graphql_op(field: &str) -> GraphqlOperation {
-        serde_json::from_str(&format!(
-            r#"{{"kind":"query","field":"{field}","resolver_function":"resolve","resolver_line":38,"primary_type_symbol":null,"type_import_source":null}}"#
-        ))
-        .unwrap()
-    }
-
-    fn test_pubsub_op(topic: &str) -> PubsubOperation {
-        serde_json::from_str(&format!(
-            r#"{{"topic":"{topic}","role":"publisher","line_number":1}}"#
-        ))
-        .unwrap()
-    }
-
-    fn test_data_call(target: &str) -> DataCallResult {
-        DataCallResult {
-            call_kind: None,
-            candidate_id: "span:190-240".to_string(),
-            line_number: 3,
-            target: target.to_string(),
-            method: Some("GET".to_string()),
-            pattern_matched: "fetch(".to_string(),
-            call_expression_span_start: None,
-            call_expression_span_end: None,
-            call_expression_text: None,
-            call_expression_line: None,
-            payload_expression_text: None,
-            payload_expression_line: None,
-            primary_type_symbol: None,
-            type_import_source: None,
-            loopback_default_url: None,
-            base: None,
-            consumers_not_resolved: None,
-            resolution_source: None,
-            dispatch: None,
-        }
-    }
-
-    #[test]
-    fn test_result_score_counts_all_six_sections() {
-        let consumer_locate: GraphqlConsumerLocate = serde_json::from_str(
-            r#"{"kind":"query","field":"order","result_type_symbol":"Order","result_type_source":null}"#,
-        )
-        .unwrap();
-        let result = FileAnalysisResult {
-            data_calls: vec![test_data_call("/users")],
-            graphql_operations: vec![test_graphql_op("order"), test_graphql_op("orders")],
-            pubsub_operations: vec![test_pubsub_op("jobs.created")],
-            graphql_consumer_locates: vec![consumer_locate],
-            ..Default::default()
-        };
-        // 1 data call + 2 graphql ops + 1 pubsub op + 1 consumer locate.
-        assert_eq!(FileAnalyzerAgent::result_score(&result), 5);
-    }
-
-    #[test]
-    fn test_choose_best_result_counts_non_http_sections() {
-        // The retry ties on the three HTTP sections but lost the graphql and
-        // pubsub findings the original had. Before result_score counted all
-        // six sections, this tie selected the retry and silently dropped them.
-        let initial = FileAnalysisResult {
-            data_calls: vec![test_data_call("/users")],
-            graphql_operations: vec![test_graphql_op("order")],
-            pubsub_operations: vec![test_pubsub_op("jobs.created")],
-            ..Default::default()
-        };
-        let retry = FileAnalysisResult {
-            data_calls: vec![test_data_call("/users")],
-            ..Default::default()
-        };
-        let chosen = FileAnalyzerAgent::choose_best_result(initial, retry);
-        assert_eq!(chosen.graphql_operations.len(), 1);
-        assert_eq!(chosen.pubsub_operations.len(), 1);
-    }
-
-    #[test]
-    fn test_choose_best_result_retry_recovering_graphql_section_wins() {
-        // The retry recovered graphql findings the original lacked; the fixed
-        // score sees the difference and selects the retry.
-        let initial = FileAnalysisResult {
-            data_calls: vec![test_data_call("/users")],
-            ..Default::default()
-        };
-        let retry = FileAnalysisResult {
-            data_calls: vec![test_data_call("/users")],
-            graphql_operations: vec![test_graphql_op("order")],
-            ..Default::default()
-        };
-        let chosen = FileAnalyzerAgent::choose_best_result(initial, retry);
-        assert_eq!(chosen.graphql_operations.len(), 1);
     }
 
     #[test]
