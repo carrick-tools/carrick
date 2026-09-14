@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.69](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.68...carrick-v0.3.69) (2026-09-14)
+
+
+### Bug Fixes
+
+* **upload:** a lost write asks the cloud what it holds instead of ending the run ([#1068](https://github.com/carrick-tools/carrick/issues/1068)) ([aad60ee](https://github.com/carrick-tools/carrick/commit/aad60ee12867685bb29bcda2e30e2c47e50af683))
+
+
+### Documentation
+
+* **agents:** retire the grep-is-faster paragraph for the Carrick-first wording ([#1061](https://github.com/carrick-tools/carrick/issues/1061)) ([fa13cc9](https://github.com/carrick-tools/carrick/commit/fa13cc98c73402312e5cb01e7531cf4ecea21f41))
+
 ## [0.3.68](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.67...carrick-v0.3.68) (2026-09-14)
 
 
