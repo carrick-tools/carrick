@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.67](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.66...carrick-v0.3.67) (2026-09-13)
+
+
+### Features
+
+* **cli:** carrick remove, the inverse of init on this machine ([#1044](https://github.com/carrick-tools/carrick/issues/1044)) ([402a5b3](https://github.com/carrick-tools/carrick/commit/402a5b36010fa2b52b53fe997f035beddd70553a))
+* **local-mode:** carry the two types and the direction on a check item ([#1040](https://github.com/carrick-tools/carrick/issues/1040)) ([895ac76](https://github.com/carrick-tools/carrick/commit/895ac760d30cfde35d1b5f4463ad3fc93a7d3c7d))
+* **local-mode:** re-judge an edited file against the index before it is committed ([#1050](https://github.com/carrick-tools/carrick/issues/1050)) ([094cd68](https://github.com/carrick-tools/carrick/commit/094cd68ec86accfc111c717e2248fa5f80803cc1))
+
+
+### Bug Fixes
+
+* **cli:** one line for init's hosted read, and the post-scan output batch ([#1051](https://github.com/carrick-tools/carrick/issues/1051)) ([4291ca9](https://github.com/carrick-tools/carrick/commit/4291ca9ef3ea4dc961265712f2f4f2260d89dc89))
+* **cloud-storage:** upload a laptop index under the repo the scan was authorised for ([#1038](https://github.com/carrick-tools/carrick/issues/1038)) ([89a52c3](https://github.com/carrick-tools/carrick/commit/89a52c3c428021d140f78c1b42fa8e0ba03ea966))
+
+
+### Performance
+
+* **local-mode:** skip the hosted download of a project nothing changed in ([#1045](https://github.com/carrick-tools/carrick/issues/1045)) ([68b6955](https://github.com/carrick-tools/carrick/commit/68b6955714279eb30d952973758b7ca21ffaa09b))
+
 ## [0.3.66](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.65...carrick-v0.3.66) (2026-09-13)
 
 
