@@ -1272,6 +1272,7 @@ async fn upload_landed_anyway<T: CloudStorage>(
     payload: &CloudRepoData,
     service: &str,
     error: &StorageError,
+    attempted_at: chrono::DateTime<chrono::Utc>,
 ) -> bool {
     let Some(waits) = landed_check_waits(error) else {
         return false;
@@ -1284,7 +1285,7 @@ async fn upload_landed_anyway<T: CloudStorage>(
             );
             tokio::time::sleep(wait).await;
         }
-        match storage.index_landed(payload).await {
+        match storage.index_landed(payload, attempted_at).await {
             Ok(true) => {
                 info!(
                     "{service} is indexed at this commit after {} check(s): the write landed and \
@@ -1340,6 +1341,10 @@ async fn upload_service_payloads<T: CloudStorage>(
         // scan slot: a multi-service repo sends N of them, and releasing on
         // the first would leave the rest of the run unprotected (§2.2).
         let final_in_run = i + 1 == payloads.len();
+        // When this write began, so a landed-check can tell the row it wrote
+        // from the one it replaced — a forced run rewrites a row that already
+        // carries this commit (carrick#1067).
+        let attempted_at = chrono::Utc::now();
         match storage.upload_repo_data(payload, final_in_run).await {
             Ok(outcome) => {
                 outcomes.push(outcome);
@@ -1347,7 +1352,7 @@ async fn upload_service_payloads<T: CloudStorage>(
             }
             Err(e) => {
                 warn!("Upload of {service} failed: {e}");
-                if upload_landed_anyway(storage, payload, service, &e).await {
+                if upload_landed_anyway(storage, payload, service, &e, attempted_at).await {
                     confirmed.push(service);
                 } else {
                     unconfirmed.push(UnconfirmedUpload {
@@ -5645,7 +5650,11 @@ mod tests {
                 .expect("a scripted upload outcome")
         }
 
-        async fn index_landed(&self, data: &CloudRepoData) -> Result<bool, StorageError> {
+        async fn index_landed(
+            &self,
+            data: &CloudRepoData,
+            _written_after: chrono::DateTime<chrono::Utc>,
+        ) -> Result<bool, StorageError> {
             self.landed_asks
                 .lock()
                 .unwrap()

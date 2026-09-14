@@ -38,7 +38,11 @@ impl CloudStorage for StubStorage {
         Ok(UploadOutcome::default())
     }
     /// Whatever this stub recorded, at the commit it recorded it with.
-    async fn index_landed(&self, data: &CloudRepoData) -> Result<bool, StorageError> {
+    async fn index_landed(
+        &self,
+        data: &CloudRepoData,
+        _written_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
         Ok(self.repos.lock().unwrap().iter().any(|stored| {
             stored.repo_name == data.repo_name
                 && stored.service_name == data.service_name

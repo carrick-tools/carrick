@@ -98,11 +98,16 @@ impl CloudStorage for LocalDirStorage {
 
     /// Read the cache file back and compare the commit it carries.
     ///
-    /// A local write fails outright or not at all, so this never arbitrates a
-    /// lost response the way the cloud backend does — but it is the same
-    /// question, answered from the same store, and an unreadable or
-    /// unparseable file is "not at this commit" (carrick#1067).
-    async fn index_landed(&self, data: &CloudRepoData) -> Result<bool, StorageError> {
+    /// A local write fails outright or not at all — there is no lost response
+    /// to arbitrate here and nothing that could have written this file but
+    /// this run — so `written_after` has nothing to separate and the commit is
+    /// the whole question. An unreadable or unparseable file is "not at this
+    /// commit" (carrick#1067).
+    async fn index_landed(
+        &self,
+        data: &CloudRepoData,
+        _written_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
         let path = self.cache_path(&data.repo_name, data.service_name.as_deref());
         let Ok(content) = std::fs::read_to_string(&path) else {
             return Ok(false);

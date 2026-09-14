@@ -45,9 +45,14 @@ impl CloudStorage for MockStorage {
     }
 
     /// What the in-memory store holds, answered from the store itself: an
-    /// upload that was recorded is at the commit it was recorded with
-    /// (carrick#1067).
-    async fn index_landed(&self, data: &CloudRepoData) -> Result<bool, StorageError> {
+    /// upload that was recorded is at the commit it was recorded with, and
+    /// only this process ever recorded it, so there is no earlier generation
+    /// for `written_after` to exclude (carrick#1067).
+    async fn index_landed(
+        &self,
+        data: &CloudRepoData,
+        _written_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
         let stored = self.data.lock().unwrap();
         Ok(stored.iter().any(|entry| {
             entry.repo_name == data.repo_name

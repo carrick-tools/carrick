@@ -435,10 +435,38 @@ struct ResolvedService {
     /// written, which reads as "not this commit".
     #[serde(default)]
     hash: Option<String>,
+    /// When the cloud last wrote the row, by the cloud's clock. What separates
+    /// this run's write from the generation it replaced at the same commit.
+    #[serde(default)]
+    updated_at: Option<String>,
 }
 
 /// The tag `resolve-repos` answers under.
 const RESOLVE_REPOS_SCHEMA: &str = "carrick.resolve-repos/0";
+
+/// How much clock disagreement between this machine and the cloud the
+/// landed-check tolerates.
+///
+/// `written_after` is read from the local clock and `updated_at` from the
+/// cloud's, so the comparison is only as good as the two agree. A minute is
+/// generous for an NTP-synced machine and still far shorter than a scan, which
+/// is what bounds the cost of being wrong: a clock running fast makes a landed
+/// write read as unconfirmed (a re-run, safe), and a clock running slow can
+/// only confirm a PREVIOUS write to the same row made inside this window.
+const LANDED_CLOCK_TOLERANCE_SECONDS: i64 = 60;
+
+/// Did the stored row move while this run was writing it?
+///
+/// `updated_at` is RFC 3339 (`new Date().toISOString()` on the cloud side).
+/// Anything else is unreadable and answers no, like every other gap in the
+/// check.
+fn row_moved_since(updated_at: &str, written_after: chrono::DateTime<chrono::Utc>) -> bool {
+    let Ok(updated) = chrono::DateTime::parse_from_rfc3339(updated_at) else {
+        return false;
+    };
+    updated.with_timezone(&chrono::Utc)
+        >= written_after - chrono::Duration::seconds(LANDED_CLOCK_TOLERANCE_SECONDS)
+}
 
 /// The service segment the cloud keys a stored row on.
 ///
@@ -1517,14 +1545,26 @@ impl CloudStorage for AwsStorage {
         }
     }
 
-    /// Ask `resolve-repos` what the index holds for this service, and compare
-    /// its commit to this payload's.
+    /// Ask `resolve-repos` what the index holds for this service: this run's
+    /// commit, on a row that moved while this run was writing it.
+    ///
+    /// Both halves are load-bearing. The commit alone confirms a row a
+    /// PREVIOUS generation left at the same hash, which is the ordinary state
+    /// of a `--no-cache` run or a second scan of a dirty tree — exactly the
+    /// write this check is asked about. `updated_at` is the server's own
+    /// stamp on the row ([`crate::cloud_storage`] laptop-scan seam; the write
+    /// handlers set it to `new Date().toISOString()`).
     ///
     /// Fail-closed in every direction: no remote to name the repository, a
-    /// schema this scanner does not read, a row under no matching service slug
-    /// and a null hash all answer "not at this commit", because the caller
-    /// turns `true` into "the write landed, carry on".
-    async fn index_landed(&self, data: &CloudRepoData) -> Result<bool, StorageError> {
+    /// schema this scanner does not read, a row under no matching service
+    /// slug, a null or unreadable hash or timestamp, and a row that has not
+    /// moved all answer "not this run's", because the caller turns `true` into
+    /// "the write landed, carry on".
+    async fn index_landed(
+        &self,
+        data: &CloudRepoData,
+        written_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
         let full_name = self.repo_full_name.get().ok_or_else(|| {
             StorageError::ConnectionError(
                 "This clone has no github.com origin remote, so Carrick cannot ask the cloud \
@@ -1556,13 +1596,23 @@ impl CloudStorage for AwsStorage {
                 repo.services
                     .iter()
                     .find(|service| service.service == wanted)
-            })
-            .and_then(|service| service.hash.as_deref());
+            });
+        let at_this_commit = stored
+            .and_then(|service| service.hash.as_deref())
+            .is_some_and(|hash| hash == data.commit_hash);
+        let moved = stored
+            .and_then(|service| service.updated_at.as_deref())
+            .is_some_and(|updated_at| row_moved_since(updated_at, written_after));
         debug!(
-            "Landed check for {}/{}: index holds {:?}, this run wrote {}",
-            full_name, wanted, stored, data.commit_hash
+            "Landed check for {}/{}: index holds {:?} updated {:?}, this run wrote {} from {}",
+            full_name,
+            wanted,
+            stored.and_then(|service| service.hash.as_deref()),
+            stored.and_then(|service| service.updated_at.as_deref()),
+            data.commit_hash,
+            written_after.to_rfc3339()
         );
-        Ok(stored == Some(data.commit_hash.as_str()))
+        Ok(at_this_commit && moved)
     }
 
     async fn health_check(&self) -> Result<(), StorageError> {
@@ -2835,14 +2885,9 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// The landed-check reads the STORED ROW's commit off `resolve-repos`, for
-    /// the one service that was being uploaded. `check-or-upload` cannot
-    /// answer this: its `exists` is cleared by a HeadObject on the
-    /// `types.d.ts` this scanner itself PUT moments earlier, so on the
-    /// `complete-upload` path it reads true whether or not the row moved.
-    #[tokio::test]
-    async fn the_landed_check_compares_the_stored_row_to_this_run() {
-        let landed = serde_json::json!({
+    /// One `resolve-repos` body, with whatever service rows the case needs.
+    fn resolved_repos(services: serde_json::Value) -> String {
+        serde_json::json!({
             "schema": "carrick.resolve-repos/0",
             "workspace": { "slug": "acme", "billing_tier": "paid", "installed": true },
             "allowance_sentence": null,
@@ -2851,25 +2896,84 @@ mod tests {
                 "connected": true,
                 "project_id": "proj_1",
                 "project_slug": "payments",
-                "services": [
-                    { "service": "api", "hash": "4f2a1c9" },
-                    { "service": "web", "hash": "0000000" }
-                ]
+                "services": services
             }],
             "project_repos": []
         })
-        .to_string();
+        .to_string()
+    }
+
+    /// When a write this check is asked about began.
+    fn written_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+    }
+
+    /// The landed-check reads the STORED ROW's commit off `resolve-repos`, for
+    /// the one service that was being uploaded. `check-or-upload` cannot
+    /// answer this: its `exists` is cleared by a HeadObject on the
+    /// `types.d.ts` this scanner itself PUT moments earlier, so on the
+    /// `complete-upload` path it reads true whether or not the row moved.
+    #[tokio::test]
+    async fn the_landed_check_compares_the_stored_row_to_this_run() {
+        let landed = resolved_repos(serde_json::json!([
+            { "service": "api", "hash": "4f2a1c9", "updated_at": chrono::Utc::now().to_rfc3339() },
+            { "service": "web", "hash": "0000000", "updated_at": chrono::Utc::now().to_rfc3339() }
+        ]));
         let (storage, server) = bearer_storage(vec![(200, landed)]);
         storage
             .repo_full_name
             .set("example/api".to_string())
             .unwrap();
 
-        assert!(storage.index_landed(&blob()).await.unwrap());
+        assert!(storage.index_landed(&blob(), written_now()).await.unwrap());
 
         let request = body_of(&server.join().unwrap()[0]);
         assert_eq!(request["action"], "resolve-repos");
         assert_eq!(request["repos"][0], "example/api");
+    }
+
+    /// A row already at this commit is not evidence on its own. A `--no-cache`
+    /// run, and every second scan of a dirty tree, rewrites a row that already
+    /// carries this hash — so a write whose response was lost would be
+    /// confirmed by the generation it was replacing. The row has to have moved
+    /// while this run was writing it.
+    #[tokio::test]
+    async fn a_row_that_did_not_move_is_the_previous_generation() {
+        let stale = chrono::Utc::now() - chrono::Duration::hours(3);
+        let (storage, server) = bearer_storage(vec![
+            (
+                200,
+                resolved_repos(serde_json::json!([
+                    { "service": "api", "hash": "4f2a1c9", "updated_at": stale.to_rfc3339() }
+                ])),
+            ),
+            // A row the cloud answered with no timestamp settles nothing
+            // either, and unreadable is the same as absent.
+            (
+                200,
+                resolved_repos(serde_json::json!([
+                    { "service": "api", "hash": "4f2a1c9", "updated_at": null }
+                ])),
+            ),
+            (
+                200,
+                resolved_repos(serde_json::json!([
+                    { "service": "api", "hash": "4f2a1c9", "updated_at": "last Tuesday" }
+                ])),
+            ),
+        ]);
+        storage
+            .repo_full_name
+            .set("example/api".to_string())
+            .unwrap();
+
+        for case in ["a stale row", "no timestamp", "an unreadable timestamp"] {
+            assert!(
+                !storage.index_landed(&blob(), written_now()).await.unwrap(),
+                "{case} does not confirm this run's write"
+            );
+        }
+        server.join().unwrap();
     }
 
     /// Every way the check can come up short answers "not at this commit",
@@ -2878,34 +2982,25 @@ mod tests {
     /// and a row that has never been written.
     #[tokio::test]
     async fn an_unmatched_row_reads_as_not_landed() {
-        let body = |services: serde_json::Value| {
-            serde_json::json!({
-                "schema": "carrick.resolve-repos/0",
-                "workspace": { "slug": "acme", "billing_tier": "paid", "installed": true },
-                "allowance_sentence": null,
-                "repos": [{
-                    "full_name": "example/api",
-                    "connected": true,
-                    "project_id": "proj_1",
-                    "project_slug": "payments",
-                    "services": services
-                }],
-                "project_repos": []
-            })
-            .to_string()
-        };
+        let now = chrono::Utc::now().to_rfc3339();
         let (storage, server) = bearer_storage(vec![
             (
                 200,
-                body(serde_json::json!([{ "service": "api", "hash": "0000000" }])),
+                resolved_repos(
+                    serde_json::json!([{ "service": "api", "hash": "0000000", "updated_at": now }]),
+                ),
             ),
             (
                 200,
-                body(serde_json::json!([{ "service": "web", "hash": "4f2a1c9" }])),
+                resolved_repos(
+                    serde_json::json!([{ "service": "web", "hash": "4f2a1c9", "updated_at": now }]),
+                ),
             ),
             (
                 200,
-                body(serde_json::json!([{ "service": "api", "hash": null }])),
+                resolved_repos(
+                    serde_json::json!([{ "service": "api", "hash": null, "updated_at": now }]),
+                ),
             ),
         ]);
         storage
@@ -2915,7 +3010,7 @@ mod tests {
 
         for expectation in ["an older commit", "another service", "never written"] {
             assert!(
-                !storage.index_landed(&blob()).await.unwrap(),
+                !storage.index_landed(&blob(), written_now()).await.unwrap(),
                 "{expectation} is not this run's index"
             );
         }

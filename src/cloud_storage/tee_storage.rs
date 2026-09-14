@@ -80,8 +80,12 @@ impl CloudStorage for TeeStorage {
     /// ever asked about a cloud write whose response was lost, and the local
     /// copy — written first, and successfully, or this would not be running —
     /// would answer `true` to every one of them (carrick#1067).
-    async fn index_landed(&self, data: &CloudRepoData) -> Result<bool, StorageError> {
-        self.cloud.index_landed(data).await
+    async fn index_landed(
+        &self,
+        data: &CloudRepoData,
+        written_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
+        self.cloud.index_landed(data, written_after).await
     }
 
     fn supports_multi_service(&self) -> bool {

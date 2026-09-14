@@ -932,21 +932,30 @@ pub trait CloudStorage {
         final_in_run: bool,
     ) -> Result<UploadOutcome, StorageError>;
 
-    /// Whether the stored index for this payload's (repo, service) is at this
-    /// payload's commit — the question a [`StorageError::UncertainWrite`]
-    /// leaves open (carrick#1067).
+    /// Whether THIS run's write of this payload reached the stored index — the
+    /// question a [`StorageError::UncertainWrite`] leaves open (carrick#1067).
     ///
     /// A read, and a cheap one: the engine asks it only after a write it did
     /// not see the outcome of, and answers `true` by treating that write as
-    /// delivered. So it must be exact about the STORED ROW and nothing else.
-    /// `false` means "this commit is not what the cloud holds for this
+    /// delivered. So it must be exact, and the commit alone is not exact
+    /// enough: a `--no-cache` run, or a second scan of a dirty tree, rewrites
+    /// a row that ALREADY carries this commit, and a row the previous
+    /// generation left there would confirm a write that never happened.
+    /// `written_after` is when this run's attempt began, and a row that has
+    /// not moved since is not this run's.
+    ///
+    /// `false` means "this run's index is not what the cloud holds for this
     /// service", which includes every case the check could not settle, so an
     /// unconfirmed write is reported rather than assumed.
     ///
     /// Required rather than defaulted: an `async_trait` default body forces
     /// `Self: Sync` on every generic caller (carrick#956), and each backend
     /// knows its own store.
-    async fn index_landed(&self, data: &CloudRepoData) -> Result<bool, StorageError>;
+    async fn index_landed(
+        &self,
+        data: &CloudRepoData,
+        written_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError>;
 
     /// Open the run: prove connectivity, and on the laptop path claim the
     /// scan slot and resolve the project before a single model call is paid
