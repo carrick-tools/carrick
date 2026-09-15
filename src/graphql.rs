@@ -120,6 +120,33 @@ pub struct GraphqlOp {
     /// (`calls[].schema_binding`). `None` for producers and before
     /// attribution runs.
     pub schema_binding: Option<SchemaBinding>,
+    /// PRODUCER-only: the root field's argument list as the SDL declares it
+    /// (carrick#1158), the request half of the operation's contract. `None`
+    /// for a field with no arguments and for every consumer.
+    pub arguments: Option<SdlArguments>,
+}
+
+/// A schema root field's arguments, printed from the SDL (carrick#1158).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdlArguments {
+    /// The field and its argument list, as SDL:
+    /// `createInvoice(input: CreateInvoiceInput!, dryRun: Boolean = false)`.
+    pub signature: String,
+    /// The named types the arguments reference, list and non-null markers
+    /// stripped, in argument order and deduplicated.
+    pub named_types: Vec<String>,
+}
+
+/// An `input`, `enum` or `scalar` declaration an argument list can reference,
+/// printed from the SDL it is declared in (carrick#1158).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdlInputDeclaration {
+    /// The declaration as SDL, descriptions included.
+    pub text: String,
+    /// Whether this is an `input` object, the kind a request type is named by.
+    pub input_object: bool,
+    /// The named types an `input` object's fields reference, in field order.
+    pub references: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -128,6 +155,11 @@ pub struct GraphqlExtraction {
     pub producers: Vec<GraphqlOp>,
     /// Top-level fields of executable documents this service sends.
     pub consumers: Vec<GraphqlOp>,
+    /// Every `input`, `enum` and `scalar` declaration in the schemas this
+    /// service reads, by name, so an argument list declared in one SDL file
+    /// can be printed with the input types another file declares. First
+    /// declaration wins.
+    pub input_declarations: BTreeMap<String, SdlInputDeclaration>,
 }
 
 impl GraphqlExtraction {
@@ -138,6 +170,9 @@ impl GraphqlExtraction {
     fn merge(&mut self, other: GraphqlExtraction) {
         self.producers.extend(other.producers);
         self.consumers.extend(other.consumers);
+        for (name, declaration) in other.input_declarations {
+            self.input_declarations.entry(name).or_insert(declaration);
+        }
     }
 }
 
@@ -367,9 +402,14 @@ pub fn scan_repo(
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;
         };
-        extraction
-            .producers
-            .extend(extract_from_document_text(&content, path, 1).producers);
+        let declared = extract_from_document_text(&content, path, 1);
+        extraction.producers.extend(declared.producers);
+        for (name, declaration) in declared.input_declarations {
+            extraction
+                .input_declarations
+                .entry(name)
+                .or_insert(declaration);
+        }
     }
     for path in graphql_files_under(scan_roots) {
         if !seen_sdl.insert(path.clone()) {
@@ -1166,9 +1206,17 @@ pub fn extract_from_document_text(
                     has_type_system_definitions = true;
                     (&ext.name, &ext.fields)
                 }
-                Definition::TypeDefinition(_)
-                | Definition::TypeExtension(_)
-                | Definition::DirectiveDefinition(_) => {
+                Definition::TypeDefinition(other) => {
+                    has_type_system_definitions = true;
+                    if let Some((name, declaration)) = input_declaration(other) {
+                        extraction
+                            .input_declarations
+                            .entry(name)
+                            .or_insert(declaration);
+                    }
+                    continue;
+                }
+                Definition::TypeExtension(_) | Definition::DirectiveDefinition(_) => {
                     has_type_system_definitions = true;
                     continue;
                 }
@@ -1202,6 +1250,7 @@ pub fn extract_from_document_text(
                     consumer_located_type_symbol: None,
                     consumer_located_type_source: None,
                     schema_binding: None,
+                    arguments: sdl_arguments(field),
                 });
             }
         }
@@ -1269,12 +1318,130 @@ pub fn extract_from_document_text(
                     consumer_located_type_symbol: None,
                     consumer_located_type_source: None,
                     schema_binding: None,
+                    arguments: None,
                 });
             }
         }
     }
 
     extraction
+}
+
+/// A root field's argument list, or `None` when it declares no argument.
+fn sdl_arguments(field: &graphql_parser::schema::Field<'_, String>) -> Option<SdlArguments> {
+    if field.arguments.is_empty() {
+        return None;
+    }
+    let arguments: Vec<String> = field
+        .arguments
+        .iter()
+        .map(|argument| {
+            let mut text = format!(
+                "{}: {}",
+                argument.name,
+                render_sdl_type(&argument.value_type)
+            );
+            if let Some(default) = &argument.default_value {
+                text.push_str(&format!(" = {default}"));
+            }
+            text
+        })
+        .collect();
+    let mut named_types: Vec<String> = Vec::new();
+    for argument in &field.arguments {
+        let name = sdl_named_type(&argument.value_type);
+        if !named_types.iter().any(|seen| seen == name) {
+            named_types.push(name.to_string());
+        }
+    }
+    Some(SdlArguments {
+        signature: format!("{}({})", field.name, arguments.join(", ")),
+        named_types,
+    })
+}
+
+/// The declaration a request can reference, for the three kinds an argument
+/// can name: `input`, `enum` and `scalar`. Output types cannot be arguments.
+fn input_declaration(
+    definition: &graphql_parser::schema::TypeDefinition<'_, String>,
+) -> Option<(String, SdlInputDeclaration)> {
+    use graphql_parser::schema::TypeDefinition;
+    let (name, input_object, references) = match definition {
+        TypeDefinition::InputObject(input) => (
+            input.name.clone(),
+            true,
+            input
+                .fields
+                .iter()
+                .map(|field| sdl_named_type(&field.value_type).to_string())
+                .collect(),
+        ),
+        TypeDefinition::Enum(enumeration) => (enumeration.name.clone(), false, Vec::new()),
+        TypeDefinition::Scalar(scalar) => (scalar.name.clone(), false, Vec::new()),
+        _ => return None,
+    };
+    Some((
+        name,
+        SdlInputDeclaration {
+            text: definition.to_string().trim().to_string(),
+            input_object,
+            references,
+        },
+    ))
+}
+
+/// The named type inside a type expression: `[Order!]!` -> `Order`.
+fn sdl_named_type<'t>(ty: &'t graphql_parser::schema::Type<'_, String>) -> &'t str {
+    use graphql_parser::schema::Type;
+    match ty {
+        Type::NamedType(name) => name,
+        Type::ListType(inner) | Type::NonNullType(inner) => sdl_named_type(inner),
+    }
+}
+
+/// A producer's request contract, printed from the SDL (carrick#1158): the
+/// field's argument list, then every `input`, `enum` and `scalar` declaration
+/// it reaches through its arguments and their input fields, in the order they
+/// are first reached. Built-in scalars and types no schema this service reads
+/// declares are named in the list and not printed.
+///
+/// The second element is the type an agent names this request by: the one
+/// `input` object the arguments reference directly, when there is exactly one
+/// (`createInvoice(input: CreateInvoiceInput!)` -> `CreateInvoiceInput`).
+pub fn request_definition(
+    arguments: &SdlArguments,
+    declarations: &BTreeMap<String, SdlInputDeclaration>,
+) -> (String, Option<String>) {
+    let mut reached: Vec<&str> = Vec::new();
+    let mut queue: std::collections::VecDeque<&str> =
+        arguments.named_types.iter().map(String::as_str).collect();
+    while let Some(name) = queue.pop_front() {
+        if reached.contains(&name) {
+            continue;
+        }
+        let Some(declaration) = declarations.get(name) else {
+            continue;
+        };
+        reached.push(name);
+        queue.extend(declaration.references.iter().map(String::as_str));
+    }
+
+    let mut definition = arguments.signature.clone();
+    for name in &reached {
+        definition.push_str("\n\n");
+        definition.push_str(&declarations[*name].text);
+    }
+
+    let direct_inputs: Vec<&String> = arguments
+        .named_types
+        .iter()
+        .filter(|name| declarations.get(*name).is_some_and(|d| d.input_object))
+        .collect();
+    let symbol = match direct_inputs.as_slice() {
+        [only] => Some((*only).clone()),
+        _ => None,
+    };
+    (definition, symbol)
 }
 
 /// Render an SDL field type to its canonical GraphQL type expression
@@ -1767,6 +1934,98 @@ mod tests {
                 "query order: Order".to_string(),
                 "query orders: [Order!]!".to_string(),
             ]
+        );
+    }
+
+    /// A root field's arguments are the request half of its contract
+    /// (carrick#1158): the signature as SDL, then every input, enum and scalar
+    /// declaration the arguments reach, including ones another SDL file of the
+    /// same service declares. Built-in scalars are named, never printed.
+    #[test]
+    fn sdl_arguments_print_the_request_with_the_input_types_they_reach() {
+        let operations = r#"
+            type Mutation {
+              createInvoice(input: CreateInvoiceInput!, dryRun: Boolean = false): Invoice!
+            }
+            type Query {
+              invoice(id: ID!): Invoice
+              invoices(filter: InvoiceFilter, first: Int, after: String): [Invoice!]!
+              health: String!
+            }
+        "#;
+        let inputs = r#"
+            "A new invoice."
+            input CreateInvoiceInput {
+              customerId: ID!
+              lines: [InvoiceLineInput!]!
+              currency: Currency = EUR
+            }
+            input InvoiceLineInput { sku: String!, amount: Money! }
+            input InvoiceFilter { status: InvoiceStatus }
+            enum Currency { EUR USD }
+            enum InvoiceStatus { DRAFT PAID }
+            scalar Money
+        "#;
+        let mut extraction = extract_from_document_text(operations, Path::new("ops.graphql"), 1);
+        extraction.merge(extract_from_document_text(
+            inputs,
+            Path::new("inputs.graphql"),
+            1,
+        ));
+
+        let producer = |field: &str| {
+            extraction
+                .producers
+                .iter()
+                .find(|op| op.key.graphql_field() == Some(field))
+                .unwrap_or_else(|| panic!("no producer {field}"))
+        };
+        assert_eq!(producer("health").arguments, None);
+
+        let create = producer("createInvoice").arguments.as_ref().unwrap();
+        assert_eq!(
+            create.signature,
+            "createInvoice(input: CreateInvoiceInput!, dryRun: Boolean = false)"
+        );
+        let (definition, symbol) = request_definition(create, &extraction.input_declarations);
+        assert_eq!(symbol.as_deref(), Some("CreateInvoiceInput"));
+        let blocks: Vec<&str> = definition.split("\n\n").collect();
+        assert_eq!(
+            blocks[0],
+            "createInvoice(input: CreateInvoiceInput!, dryRun: Boolean = false)"
+        );
+        assert!(
+            blocks[1].contains("input CreateInvoiceInput {")
+                && blocks[1].contains("lines: [InvoiceLineInput!]!")
+                && blocks[1].contains("A new invoice."),
+            "got: {definition}"
+        );
+        assert!(
+            blocks[2].starts_with("input InvoiceLineInput {"),
+            "got: {definition}"
+        );
+        assert!(
+            blocks[3].starts_with("enum Currency {"),
+            "got: {definition}"
+        );
+        assert_eq!(blocks[4], "scalar Money");
+        assert_eq!(blocks.len(), 5, "got: {definition}");
+
+        // One input object among several arguments still names the request.
+        let listing = producer("invoices").arguments.as_ref().unwrap();
+        let (definition, symbol) = request_definition(listing, &extraction.input_declarations);
+        assert_eq!(symbol.as_deref(), Some("InvoiceFilter"));
+        assert!(
+            definition.contains("enum InvoiceStatus"),
+            "got: {definition}"
+        );
+
+        // Only built-in scalars: the signature is the whole request, and no
+        // input type names it.
+        let single = producer("invoice").arguments.as_ref().unwrap();
+        assert_eq!(
+            request_definition(single, &extraction.input_declarations),
+            ("invoice(id: ID!)".to_string(), None)
         );
     }
 

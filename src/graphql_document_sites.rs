@@ -365,6 +365,7 @@ fn site_consumer(key: OperationKey, file: &Path, line: u32) -> GraphqlOp {
         consumer_located_type_source: None,
         // Set by attribution, which runs after these rows are placed.
         schema_binding: None,
+        arguments: None,
     }
 }
 
