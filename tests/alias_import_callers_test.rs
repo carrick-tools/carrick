@@ -12,6 +12,10 @@
 //! 3 of its 6 callers (only the relative controls) and `queueCourierPickup` had
 //! 0 of 1, in both variants. Every alias row below FAILS on that binary.
 //!
+//! The singleton rows (carrick#1147) FAIL on the 0.3.72 binary in both
+//! variants, the relative control included: an imported module-scope instance
+//! resolved to nothing whatever its specifier.
+//!
 //! The Node twin also imports `queueCourierPickup` through `~/`, an alias set
 //! only in `vite.config.ts`. No config the scanner reads declares it, so that
 //! call must record no edge AND be reported on stderr. The answer key is the
@@ -152,6 +156,13 @@ fn assert_answer_key(scan: &Scan) {
     assert_eq!(
         scan.callers_of("DeliveryService.plan"),
         set(&["get_lockers__id_plan_handler"])
+    );
+    // An exported singleton (`export const notifier = new LockerNotifier()`)
+    // whose class is imported into the module that constructs it, called
+    // through a relative import and through the alias (carrick#1147).
+    assert_eq!(
+        scan.callers_of("LockerNotifier.notifyReady"),
+        set(&["announcePickupReady", "announceReturnReady"])
     );
 }
 
