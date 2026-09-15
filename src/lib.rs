@@ -31,6 +31,7 @@ pub mod intent_generator;
 pub mod local_http_wrapper;
 pub mod local_mode;
 pub mod logging;
+pub mod module_aliases;
 pub mod mount_graph;
 pub mod multi_agent_orchestrator;
 pub mod new_url_target;

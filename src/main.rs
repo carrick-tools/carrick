@@ -31,6 +31,7 @@ mod intent_generator;
 mod local_http_wrapper;
 mod local_mode;
 mod logging;
+mod module_aliases;
 mod mount_graph;
 mod multi_agent_orchestrator;
 mod new_url_target;

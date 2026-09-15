@@ -1,0 +1,4 @@
+{
+  // Root Deno workspace.
+  "workspace": ["./apps/lockers"]
+}

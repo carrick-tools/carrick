@@ -1,0 +1,15 @@
+{
+  // Shared compiler options for every app. `paths` lives here, one `extends`
+  // hop away from the config that governs the service's files, and its
+  // targets resolve against the `baseUrl` this file declares.
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./apps/lockers/src/*"],
+    },
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+  },
+}

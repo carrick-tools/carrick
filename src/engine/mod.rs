@@ -4010,6 +4010,52 @@ fn run_capture_for_service(
 }
 
 /// Discover files and extract symbols for MultiAgentOrchestrator
+/// How many unresolved alias specifiers the report names before it truncates.
+const MAX_NAMED_UNRESOLVED_SPECIFIERS: usize = 5;
+
+/// State the imports the call graph could not follow (carrick#1104), so a
+/// caller missing from `get_callers` has a line saying why. Deterministic and
+/// repeatable, so it is a logged limit rather than a `scan_health` loss: a
+/// repo that aliases through its bundler would otherwise be permanently red.
+fn report_unresolved_imports(
+    unresolved: &crate::call_graph::UnresolvedImports,
+    unfollowed_extends: &[String],
+) {
+    if !unresolved.aliases.is_empty() {
+        let imports: usize = unresolved.aliases.values().sum();
+        let mut ranked: Vec<(&String, &usize)> = unresolved.aliases.iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let named: Vec<&str> = ranked
+            .iter()
+            .take(MAX_NAMED_UNRESOLVED_SPECIFIERS)
+            .map(|(specifier, _)| specifier.as_str())
+            .collect();
+        info!(
+            "Call graph: {} import(s) through {} aliased specifier(s) resolved to no file, so those calls record no caller edge. No tsconfig, package.json or Deno config declares the alias; one set only in bundler or build code is not read (carrick#1104): {}{}",
+            imports,
+            unresolved.aliases.len(),
+            named.join(", "),
+            if ranked.len() > named.len() {
+                ", ..."
+            } else {
+                ""
+            }
+        );
+    }
+    if unresolved.undeclared_packages > 0 {
+        debug!(
+            "Call graph: {} import(s) name a package no manifest declares (runtime builtins included), so those calls record no edge",
+            unresolved.undeclared_packages
+        );
+    }
+    if !unfollowed_extends.is_empty() {
+        info!(
+            "Call graph: tsconfig `extends` named no config on disk, so aliases it would inherit are not read: {}",
+            unfollowed_extends.join(", ")
+        );
+    }
+}
+
 fn discover_files_and_symbols(
     repo_path: &str,
     service: &Config,
@@ -4120,15 +4166,37 @@ fn discover_files_and_symbols(
     //
     // The walk above is scoped to ONE service, so the manifest index is what
     // lets a call into a sibling workspace package resolve at all (carrick#776).
+    // It also reads the aliases the repo's config declares, so a call imported
+    // through `@/` resolves (carrick#1104). Call edges feed no analyzer input,
+    // which is why only this index reads them; see
+    // `docs/reference/module-resolution.md`.
     let repo_root = std::path::Path::new(repo_path);
-    let workspace = crate::workspace_resolver::WorkspaceIndex::build(repo_root);
-    crate::call_graph::resolve_call_edges(
+    // A Deno config named as the service's `tsconfig` selects Deno, whose
+    // import maps are read from the tree anyway.
+    let service_tsconfig = service
+        .tsconfig
+        .as_deref()
+        .map(std::path::Path::new)
+        .filter(|config| {
+            !config
+                .file_name()
+                .is_some_and(|name| name == "deno.json" || name == "deno.jsonc")
+        });
+    let service_dir = crate::workspace_resolver::normalize(std::path::Path::new(
+        service.directory.as_deref().unwrap_or(""),
+    ));
+    let workspace = crate::workspace_resolver::WorkspaceIndex::build_with_aliases(
+        repo_root,
+        service_tsconfig.map(|config| (service_dir.as_path(), config)),
+    );
+    let unresolved = crate::call_graph::resolve_call_edges(
         &mut all_function_definitions,
         &per_file_calls,
         &keys,
         &workspace,
         repo_root,
     );
+    report_unresolved_imports(&unresolved, &workspace.unfollowed_extends());
 
     debug!(
         "Extracted {} import facts and {} function definitions from {} files",

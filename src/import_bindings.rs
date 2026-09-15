@@ -23,9 +23,15 @@
 //! and `export * from` — until it reaches the module that declares the
 //! binding. Purely structural: no framework knowledge, no naming heuristics.
 //!
-//! Non-relative specifiers (packages, tsconfig path aliases) are out of scope
-//! and resolve to `None`, because reaching them needs the sidecar's tsconfig
-//! knowledge; the caller falls back to its previous behaviour there.
+//! A resolver built by [`BindingResolver::new`] follows relative specifiers
+//! only, and a non-relative one (a package, a path alias) resolves to `None`;
+//! the caller falls back to its previous behaviour there. One built by
+//! [`BindingResolver::with_workspace`] resolves every hop through
+//! [`WorkspaceIndex::resolve_module_path`], so a barrel that re-exports
+//! through `@/` or a workspace package name is followed too (carrick#1104).
+//! The call graph uses that one. The mount and wrapper passes that build
+//! analyzer inputs stay on `new` until carrick#474, because following more
+//! hops there changes what the model is asked.
 //!
 //! One published form names no binding at all: `export * as queues from
 //! "./queues.js"` publishes a name standing for a whole MODULE. It is carried
@@ -37,6 +43,7 @@
 
 use crate::agents::file_orchestrator::FileOrchestrator;
 use crate::parser::parse_file;
+use crate::workspace_resolver::WorkspaceIndex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swc_common::{
@@ -106,6 +113,9 @@ pub struct BindingResolver {
     source_map: Lrc<SourceMap>,
     handler: Handler,
     exports: HashMap<PathBuf, ModuleExports>,
+    /// The module resolver every hop goes through, when the resolver was built
+    /// with one. `None` follows relative specifiers only.
+    workspace: Option<WorkspaceIndex>,
 }
 
 impl Default for BindingResolver {
@@ -125,6 +135,25 @@ impl BindingResolver {
             source_map,
             handler,
             exports: HashMap::new(),
+            workspace: None,
+        }
+    }
+
+    /// A resolver whose hops resolve through `workspace`: relative specifiers
+    /// exactly as [`BindingResolver::new`] resolves them, and aliases and
+    /// workspace package names as well.
+    pub fn with_workspace(workspace: WorkspaceIndex) -> Self {
+        Self {
+            workspace: Some(workspace),
+            ..Self::new()
+        }
+    }
+
+    /// The module one hop names.
+    fn resolve_module(&self, importer: &Path, specifier: &str) -> Option<PathBuf> {
+        match &self.workspace {
+            Some(workspace) => workspace.resolve_module_path(importer, specifier),
+            None => FileOrchestrator::resolve_relative_import(importer, specifier),
         }
     }
 
@@ -144,7 +173,7 @@ impl BindingResolver {
         specifier: &str,
         local_binding: &str,
     ) -> Option<ResolvedBinding> {
-        let target = FileOrchestrator::resolve_relative_import(importer, specifier)?;
+        let target = self.resolve_module(importer, specifier)?;
         if local_binding != DEFAULT_EXPORT
             && let Some(found) = self.follow(&target, local_binding)
         {
@@ -178,7 +207,7 @@ impl BindingResolver {
         specifier: &str,
         exported_name: &str,
     ) -> Option<PathBuf> {
-        let target = FileOrchestrator::resolve_relative_import(importer, specifier)?;
+        let target = self.resolve_module(importer, specifier)?;
         let mut visited: HashSet<PathBuf> = HashSet::new();
         visited.insert(target.clone());
         self.follow_type(target, exported_name.to_string(), 0, &mut visited)
@@ -197,7 +226,7 @@ impl BindingResolver {
         let exports = self.exports_of(&file)?;
 
         if let Some((specifier, upstream)) = exports.type_forwarded.get(&export_name).cloned() {
-            let next = FileOrchestrator::resolve_relative_import(&file, &specifier)?;
+            let next = self.resolve_module(&file, &specifier)?;
             if !visited.insert(next.clone()) {
                 return None; // circular re-export
             }
@@ -210,7 +239,7 @@ impl BindingResolver {
 
         // A plain `export * from "./m"` republishes types as well as values.
         for specifier in exports.stars.clone() {
-            let Some(next) = FileOrchestrator::resolve_relative_import(&file, &specifier) else {
+            let Some(next) = self.resolve_module(&file, &specifier) else {
                 continue;
             };
             if !visited.insert(next.clone()) {
@@ -266,7 +295,7 @@ impl BindingResolver {
         names.extend(exports.forwarded.keys().cloned());
         names.extend(exports.namespaces.keys().cloned());
         for specifier in exports.stars.clone() {
-            let Some(next) = FileOrchestrator::resolve_relative_import(&file, &specifier) else {
+            let Some(next) = self.resolve_module(&file, &specifier) else {
                 continue;
             };
             if !visited.insert(next.clone()) {
@@ -302,7 +331,7 @@ impl BindingResolver {
 
         // `export { x as y } from "./m"` — the binding lives one hop away.
         if let Some((specifier, upstream_name)) = exports.forwarded.get(&export_name).cloned() {
-            let next = FileOrchestrator::resolve_relative_import(&file, &specifier)?;
+            let next = self.resolve_module(&file, &specifier)?;
             if !visited.insert(next.clone()) {
                 return None; // circular re-export
             }
@@ -318,8 +347,7 @@ impl BindingResolver {
         // but never its default, so a default lookup stops here.
         if export_name != DEFAULT_EXPORT {
             for specifier in exports.stars.clone() {
-                let Some(next) = FileOrchestrator::resolve_relative_import(&file, &specifier)
-                else {
+                let Some(next) = self.resolve_module(&file, &specifier) else {
                     continue;
                 };
                 if !visited.insert(next.clone()) {
@@ -369,12 +397,12 @@ impl BindingResolver {
 
         // Declared here: `export * as ns from "./m"`.
         if let Some(specifier) = exports.namespaces.get(&export_name).cloned() {
-            return FileOrchestrator::resolve_relative_import(&file, &specifier);
+            return self.resolve_module(&file, &specifier);
         }
 
         // `export { ns as alias } from "./m"` forwards the binding one hop.
         if let Some((specifier, upstream)) = exports.forwarded.get(&export_name).cloned() {
-            let next = FileOrchestrator::resolve_relative_import(&file, &specifier)?;
+            let next = self.resolve_module(&file, &specifier)?;
             if !visited.insert(next.clone()) {
                 return None; // circular re-export
             }
@@ -388,7 +416,7 @@ impl BindingResolver {
         }
 
         for specifier in exports.stars.clone() {
-            let Some(next) = FileOrchestrator::resolve_relative_import(&file, &specifier) else {
+            let Some(next) = self.resolve_module(&file, &specifier) else {
                 continue;
             };
             if !visited.insert(next.clone()) {

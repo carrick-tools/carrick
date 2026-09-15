@@ -1,0 +1,9 @@
+{
+  "name": "@acme/lockers",
+  "exports": "./src/main.ts",
+  "imports": {
+    // Service-local alias, the Deno trailing-slash prefix form.
+    "@/": "./src/",
+    "hono": "npm:hono@^4.6.0"
+  }
+}

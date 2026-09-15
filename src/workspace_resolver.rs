@@ -13,18 +13,30 @@
 //! one service's `package.json` therefore answers "external?" with "no" for
 //! most real wrappers.
 //!
-//! This is not a Node resolver. Conditions, `browser` fields, `paths` from
-//! tsconfig, and `node_modules` lookups are all out of scope: the scan needs to
-//! know which SOURCE file in this repo a specifier names, and the candidate
-//! list below is what the repo's own layout proves. A workspace member's
-//! `exports` map is read, because for a package that publishes subpaths it is
-//! the only statement anywhere of which file `@scope/core/v3` names — but it is
-//! read as a set of spellings of one module, not as a condition algorithm
+//! This is not a Node resolver. Conditions, `browser` fields, and
+//! `node_modules` lookups are all out of scope: the scan needs to know which
+//! SOURCE file in this repo a specifier names, and the candidate list below is
+//! what the repo's own layout proves. A workspace member's `exports` map is
+//! read, because for a package that publishes subpaths it is the only statement
+//! anywhere of which file `@scope/core/v3` names — but it is read as a set of
+//! spellings of one module, not as a condition algorithm
 //! ([`WorkspaceIndex::resolve_exports`]).
+//!
+//! An index built by [`WorkspaceIndex::build_with_aliases`] also reads the
+//! aliases the repo's config declares (tsconfig `paths`/`baseUrl`, package.json
+//! `imports`, Deno import maps) and resolves `@/x` through them
+//! ([`crate::module_aliases`], carrick#1104). [`WorkspaceIndex::build`] does
+//! not: the analyzer-input path still uses it, and resolving more specifiers
+//! there would change what the model is asked (carrick#474). How the two are
+//! meant to converge is in `docs/reference/module-resolution.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
+use crate::agents::file_orchestrator::FileOrchestrator;
+use crate::module_aliases::{
+    AliasTarget, ModuleAliases, TS_CONFIG_NAMES, collect_string_leaves, match_pattern,
+};
 use crate::packages::{MANIFEST_SKIP_DIRS, deno_workspace_manifest_paths, read_manifest};
 
 /// Source extensions a specifier may resolve to, in the order they are tried.
@@ -76,11 +88,18 @@ struct InternalPackage {
 #[derive(Debug, Clone)]
 pub struct WorkspaceIndex {
     repo_root: PathBuf,
+    /// `repo_root` canonicalized, so an importer spelled through a resolved
+    /// symlink still maps to its repo-relative path.
+    canonical_root: PathBuf,
     /// Every package name any manifest declares as a runtime dependency, minus
     /// the workspace's own package names.
     external_packages: BTreeSet<String>,
     /// Workspace package name -> its directory.
     internal_packages: BTreeMap<String, InternalPackage>,
+    /// The aliases the repo's config declares. `None` for an index built by
+    /// [`WorkspaceIndex::build`], whose answers feed analyzer inputs and are
+    /// pinned until carrick#474 moves them.
+    aliases: Option<ModuleAliases>,
 }
 
 impl WorkspaceIndex {
@@ -95,11 +114,34 @@ impl WorkspaceIndex {
     /// declared as a runtime dependency by the package that holds the wrapper,
     /// even when the root manifest also lists it as a dev dependency.
     pub fn build(repo_root: &Path) -> Self {
+        Self::build_inner(repo_root, None)
+    }
+
+    /// [`WorkspaceIndex::build`], plus the aliases the repo's config files
+    /// declare (carrick#1104). `service_tsconfig` is the service directory and
+    /// the `tsconfig` its `carrick.json` entry names, both relative to the
+    /// repo root; it governs every file under that directory in place of the
+    /// nearest config.
+    ///
+    /// Used by the call graph, whose edges feed no analyzer input. The
+    /// analyzer-input path keeps [`WorkspaceIndex::build`] until carrick#474.
+    pub fn build_with_aliases(repo_root: &Path, service_tsconfig: Option<(&Path, &Path)>) -> Self {
+        Self::build_inner(repo_root, Some(service_tsconfig))
+    }
+
+    fn build_inner(repo_root: &Path, aliases: Option<Option<(&Path, &Path)>>) -> Self {
         let mut declared: BTreeSet<String> = BTreeSet::new();
         let mut internal_names: BTreeSet<String> = BTreeSet::new();
         let mut internal_packages: BTreeMap<String, InternalPackage> = BTreeMap::new();
 
-        for manifest in manifest_paths(repo_root) {
+        let mut names: Vec<&str> = vec!["package.json"];
+        if aliases.is_some() {
+            names.extend(["deno.json", "deno.jsonc"]);
+            names.extend(TS_CONFIG_NAMES);
+        }
+        let tree = tree_files(repo_root, &names);
+
+        for manifest in manifest_paths(repo_root, &tree) {
             let Ok(facts) = read_manifest(&manifest) else {
                 continue;
             };
@@ -139,11 +181,81 @@ impl WorkspaceIndex {
             declared.remove(name);
         }
 
+        let aliases = aliases.map(|service_tsconfig| {
+            let configs: Vec<PathBuf> = tree
+                .iter()
+                .filter_map(|path| path.strip_prefix(repo_root).ok().map(Path::to_path_buf))
+                .collect();
+            let package_dirs: BTreeMap<String, PathBuf> = internal_packages
+                .iter()
+                .map(|(name, package)| (name.clone(), package.dir.clone()))
+                .collect();
+            ModuleAliases::build(repo_root, &configs, &package_dirs, service_tsconfig)
+        });
+
         WorkspaceIndex {
             repo_root: repo_root.to_path_buf(),
+            canonical_root: repo_root
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf()),
             external_packages: declared,
             internal_packages,
+            aliases,
         }
+    }
+
+    /// `extends` values an alias-reading index could not follow to a config
+    /// on disk, sorted. Empty for an index built without aliases.
+    pub fn unfollowed_extends(&self) -> Vec<String> {
+        self.aliases
+            .as_ref()
+            .map(|aliases| aliases.unfollowed_extends().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The source file `specifier` names as written in `importer`, as the
+    /// path the call graph keys files by: canonical when that stays inside
+    /// the repo, else the plain join.
+    ///
+    /// The one module resolver the call-edge passes share (carrick#1104). A
+    /// relative specifier goes through
+    /// [`FileOrchestrator::resolve_relative_import`], so every relative answer
+    /// is the one it always was; anything else goes through
+    /// [`WorkspaceIndex::resolve`], which is where aliases and package names
+    /// are read. `importer` may be absolute or repo-relative.
+    pub fn resolve_module_path(&self, importer: &Path, specifier: &str) -> Option<PathBuf> {
+        if let Some(target) = FileOrchestrator::resolve_relative_import(importer, specifier) {
+            return Some(target);
+        }
+        match self.resolve(importer, specifier) {
+            Resolution::Internal(relative) => self.source_path(&relative),
+            _ => None,
+        }
+    }
+
+    /// A repo-relative file as the call graph keys it. A package directory
+    /// that is itself a symlink out of the tree canonicalizes to a path the
+    /// cloud boundary cannot strip the repo root from, and an absolute path in
+    /// the blob is a locator nothing can invert; the plain join is under the
+    /// root by construction.
+    pub fn source_path(&self, relative: &Path) -> Option<PathBuf> {
+        let target = self.repo_root.join(relative);
+        match target.canonicalize() {
+            Ok(canonical) if canonical.starts_with(&self.repo_root) => Some(canonical),
+            _ => target.is_file().then_some(target),
+        }
+    }
+
+    /// `path` relative to the repo root, whether it was given absolute (as
+    /// walked, or canonicalized) or already relative.
+    fn repo_relative(&self, path: &Path) -> PathBuf {
+        if path.is_relative() {
+            return path.to_path_buf();
+        }
+        path.strip_prefix(&self.repo_root)
+            .or_else(|_| path.strip_prefix(&self.canonical_root))
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| path.to_path_buf())
     }
 
     /// Whether the repo declares any workspace member at all. No members means
@@ -161,10 +273,14 @@ impl WorkspaceIndex {
 
     /// Resolve `specifier` as written in `from_file` (repo-relative).
     ///
-    /// Relative first, then workspace members, then the external universe:
-    /// a workspace member shadows an external package of the same name, which
-    /// is what the `internal_names` subtraction in [`WorkspaceIndex::build`]
-    /// already decided.
+    /// Relative first, then the aliases the repo's config declares (only in an
+    /// index built with them), then workspace members, then the external
+    /// universe: a workspace member shadows an external package of the same
+    /// name, which is what the `internal_names` subtraction in
+    /// [`WorkspaceIndex::build`] already decided. An alias is tried before
+    /// package names because that is the order the compiler and Deno apply
+    /// them in: `paths` and an import map are consulted before any package
+    /// lookup.
     pub fn resolve(&self, from_file: &Path, specifier: &str) -> Resolution {
         if specifier.starts_with("./") || specifier.starts_with("../") {
             let base = match from_file.parent() {
@@ -175,6 +291,10 @@ impl WorkspaceIndex {
                 Some(file) => Resolution::Internal(file),
                 None => Resolution::Unresolved,
             };
+        }
+
+        if let Some(file) = self.resolve_alias(from_file, specifier) {
+            return Resolution::Internal(file);
         }
 
         if let Some(name) = longest_match(specifier, self.internal_packages.keys()) {
@@ -208,6 +328,22 @@ impl WorkspaceIndex {
         }
     }
 
+    /// The file the repo's config aliases `specifier` to, when the index reads
+    /// aliases and one names an existing source file.
+    fn resolve_alias(&self, from_file: &Path, specifier: &str) -> Option<PathBuf> {
+        let aliases = self.aliases.as_ref()?;
+        let from_file = self.repo_relative(from_file);
+        aliases
+            .resolve(&from_file, specifier)
+            .into_iter()
+            .find_map(|target| match target {
+                AliasTarget::Paths(candidates) => candidates
+                    .iter()
+                    .find_map(|candidate| self.resolve_file(candidate)),
+                AliasTarget::Leaves { dir, leaves } => self.pick_source_leaf(&dir, leaves),
+            })
+    }
+
     /// The source file a manifest's `exports` field names for one specifier
     /// key (`"."` for the package itself, `"./v3"` for a subpath).
     ///
@@ -228,22 +364,32 @@ impl WorkspaceIndex {
     ///   `dist` exists alongside the source and would otherwise win on sort
     ///   order; the source is what the scan reads.
     ///
-    /// Wildcard keys (`"./*"`) are not expanded: the specifier that matched
-    /// them names a file the pattern computes, and the fallback path below
-    /// (the subpath as a directory under the package root) already covers the
-    /// layouts where that file is where the specifier says it is.
+    /// Wildcard keys (`"./*": "./src/*.ts"`) are expanded only in an index
+    /// that reads aliases, where the pattern is applied the way Node applies
+    /// it ([`crate::module_aliases::match_pattern`]). The manifest-only index
+    /// keeps its earlier answer, the fallback below (the subpath as a
+    /// directory under the package root), because its answers are analyzer
+    /// input (carrick#474).
     fn resolve_exports(&self, package: &InternalPackage, key: &str) -> Option<PathBuf> {
         let exports = package.exports.as_ref()?;
-        let entry = match exports {
+        let (entry, substitution) = match exports {
             // `"exports": "./index.js"` — the whole field is the "." entry.
-            serde_json::Value::String(_) if key == "." => exports,
+            serde_json::Value::String(_) if key == "." => (exports, None),
             serde_json::Value::Object(map) => {
                 if map.keys().any(|k| k.starts_with('.')) {
-                    map.get(key)?
+                    match map.get(key) {
+                        Some(entry) => (entry, None),
+                        None if self.aliases.is_some() => {
+                            let (pattern, captured) =
+                                match_pattern(map.keys().map(String::as_str), key)?;
+                            (&map[pattern], Some(captured))
+                        }
+                        None => return None,
+                    }
                 } else if key == "." {
                     // A conditions object with no subpath keys IS the "."
                     // entry (`"exports": { "import": "./index.js" }`).
-                    exports
+                    (exports, None)
                 } else {
                     return None;
                 }
@@ -251,17 +397,30 @@ impl WorkspaceIndex {
             _ => return None,
         };
 
-        let mut leaves: Vec<&str> = Vec::new();
+        let mut leaves: Vec<String> = Vec::new();
         collect_string_leaves(entry, 0, &mut leaves);
+        if let Some(captured) = substitution {
+            leaves = leaves
+                .into_iter()
+                .map(|leaf| leaf.replace('*', &captured))
+                .collect();
+        }
+        self.pick_source_leaf(&package.dir, leaves)
+    }
+
+    /// One module's spellings under `dir`, reduced to the source file: sorted
+    /// so the answer is a property of the config, declaration files dropped,
+    /// and a TypeScript hit preferred over build output.
+    fn pick_source_leaf(&self, dir: &Path, mut leaves: Vec<String>) -> Option<PathBuf> {
         leaves.sort_unstable();
         leaves.dedup();
 
         let mut fallback: Option<PathBuf> = None;
-        for leaf in leaves {
+        for leaf in &leaves {
             if is_declaration_file(leaf) {
                 continue;
             }
-            let Some(file) = self.resolve_file(&normalize(&package.dir.join(leaf))) else {
+            let Some(file) = self.resolve_file(&normalize(&dir.join(leaf))) else {
                 continue;
             };
             if file
@@ -338,30 +497,6 @@ impl WorkspaceIndex {
     }
 }
 
-/// Every string leaf under an `exports` entry, in document order. Conditions
-/// nest (`{ import: { types: "…", default: "…" } }`), so the walk is recursive,
-/// bounded by a depth no real manifest reaches.
-fn collect_string_leaves<'a>(value: &'a serde_json::Value, depth: usize, out: &mut Vec<&'a str>) {
-    const MAX_CONDITION_DEPTH: usize = 8;
-    if depth > MAX_CONDITION_DEPTH {
-        return;
-    }
-    match value {
-        serde_json::Value::String(s) => out.push(s.as_str()),
-        serde_json::Value::Object(map) => {
-            for nested in map.values() {
-                collect_string_leaves(nested, depth + 1, out);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for nested in items {
-                collect_string_leaves(nested, depth + 1, out);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// A TypeScript declaration file: shape without behaviour.
 fn is_declaration_file(path: &str) -> bool {
     [".d.ts", ".d.mts", ".d.cts"]
@@ -369,12 +504,11 @@ fn is_declaration_file(path: &str) -> bool {
         .any(|suffix| path.ends_with(suffix))
 }
 
-/// Every package or Deno manifest under `repo_root`, sorted, skipping dependency installs
-/// and build output. Sorted so the duplicate-name tiebreak in
-/// [`WorkspaceIndex::build`] sees a stable sequence whatever the filesystem
-/// hands back.
-fn manifest_paths(repo_root: &Path) -> Vec<PathBuf> {
-    let walker = walkdir::WalkDir::new(repo_root)
+/// Every file under `repo_root` named one of `names`, in walk order, skipping
+/// dependency installs and build output. One walk serves the manifests and,
+/// for an alias-reading index, the config files beside them.
+fn tree_files(repo_root: &Path, names: &[&str]) -> Vec<PathBuf> {
+    walkdir::WalkDir::new(repo_root)
         .sort_by_file_name()
         .follow_links(true)
         .into_iter()
@@ -384,11 +518,24 @@ fn manifest_paths(repo_root: &Path) -> Vec<PathBuf> {
                     && e.file_name()
                         .to_str()
                         .is_some_and(|n| MANIFEST_SKIP_DIRS.contains(&n)))
-        });
-    let mut manifests: Vec<PathBuf> = walker
+        })
         .flatten()
-        .filter(|e| e.file_type().is_file() && e.file_name() == "package.json")
+        .filter(|e| {
+            e.file_type().is_file() && e.file_name().to_str().is_some_and(|n| names.contains(&n))
+        })
         .map(|e| e.path().to_path_buf())
+        .collect()
+}
+
+/// Every package or Deno manifest under `repo_root`, sorted. `tree` is the
+/// walk from [`tree_files`]. Sorted so the duplicate-name tiebreak in
+/// [`WorkspaceIndex::build`] sees a stable sequence whatever the filesystem
+/// hands back.
+fn manifest_paths(repo_root: &Path, tree: &[PathBuf]) -> Vec<PathBuf> {
+    let mut manifests: Vec<PathBuf> = tree
+        .iter()
+        .filter(|path| path.file_name().is_some_and(|n| n == "package.json"))
+        .cloned()
         .collect();
     match deno_workspace_manifest_paths(repo_root) {
         Ok(deno_manifests) => manifests.extend(deno_manifests),
@@ -714,6 +861,297 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(repo.path().join("package.json"), r#"{"name":"bare"}"#).unwrap();
         assert!(!WorkspaceIndex::build(repo.path()).has_external_packages());
+    }
+
+    /// Write `(relative path, contents)` pairs under a fresh repo root.
+    fn tree(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        for (path, contents) in files {
+            let path = repo.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        repo
+    }
+
+    fn aliased(repo: &tempfile::TempDir, from: &str, specifier: &str) -> Resolution {
+        WorkspaceIndex::build_with_aliases(repo.path(), None).resolve(Path::new(from), specifier)
+    }
+
+    fn internal(path: &str) -> Resolution {
+        Resolution::Internal(PathBuf::from(path))
+    }
+
+    /// The analyzer-input index never reads aliases (carrick#474): the same
+    /// tree answers differently only through `build_with_aliases`.
+    #[test]
+    fn the_manifest_only_index_reads_no_alias() {
+        let repo = tree(&[
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#,
+            ),
+            ("deno.json", r#"{"imports":{"$/":"./src/"}}"#),
+            (
+                "package.json",
+                r##"{"name":"app","imports":{"#db":"./src/db.ts"}}"##,
+            ),
+            ("src/db.ts", "export const db = 1;"),
+        ]);
+        let manifest_only = WorkspaceIndex::build(repo.path());
+        for specifier in ["@/db", "$/db.ts", "#db"] {
+            assert_eq!(
+                manifest_only.resolve(Path::new("src/app.ts"), specifier),
+                Resolution::Unresolved
+            );
+            assert_eq!(
+                aliased(&repo, "src/app.ts", specifier),
+                internal("src/db.ts")
+            );
+        }
+    }
+
+    /// `paths` inherited through `extends` resolves against the `baseUrl` the
+    /// base declares, relative to the base's own directory.
+    #[test]
+    fn tsconfig_paths_inherited_through_extends_resolve_against_the_base_url() {
+        let repo = tree(&[
+            (
+                "tsconfig.base.json",
+                "{\n  // comments and trailing commas are valid tsconfig\n  \"compilerOptions\": {\"baseUrl\": \".\", \"paths\": {\"@/*\": [\"apps/api/src/*\"],},},\n}",
+            ),
+            (
+                "apps/api/tsconfig.json",
+                r#"{"extends":"../../tsconfig.base.json"}"#,
+            ),
+            ("apps/api/src/slots/availability.ts", "export const a = 1;"),
+        ]);
+        assert_eq!(
+            aliased(
+                &repo,
+                "apps/api/src/deliveries/plan.ts",
+                "@/slots/availability"
+            ),
+            internal("apps/api/src/slots/availability.ts")
+        );
+    }
+
+    /// With no `baseUrl` anywhere, `paths` targets resolve against the config
+    /// that declared `paths`, not the one that extends it.
+    #[test]
+    fn paths_without_base_url_resolve_against_the_declaring_config() {
+        let repo = tree(&[
+            (
+                "config/tsconfig.paths.json",
+                r#"{"compilerOptions":{"paths":{"@lib/*":["../lib/*"]}}}"#,
+            ),
+            (
+                "apps/api/tsconfig.json",
+                r#"{"extends":"../../config/tsconfig.paths"}"#,
+            ),
+            ("lib/clock.ts", "export const now = 1;"),
+        ]);
+        assert_eq!(
+            aliased(&repo, "apps/api/src/x.ts", "@lib/clock"),
+            internal("lib/clock.ts")
+        );
+    }
+
+    /// A nearer layer's `paths` replaces the inherited map whole, and a later
+    /// `extends` entry overrides an earlier one.
+    #[test]
+    fn nearer_paths_replace_inherited_paths_and_later_extends_win() {
+        let repo = tree(&[
+            (
+                "a.json",
+                r#"{"compilerOptions":{"paths":{"@a/*":["./from-a/*"],"@x/*":["./from-a/*"]}}}"#,
+            ),
+            (
+                "b.json",
+                r#"{"compilerOptions":{"paths":{"@x/*":["./from-b/*"]}}}"#,
+            ),
+            ("tsconfig.json", r#"{"extends":["./a.json","./b.json"]}"#),
+            ("from-a/m.ts", ""),
+            ("from-b/m.ts", ""),
+        ]);
+        assert_eq!(aliased(&repo, "src/x.ts", "@x/m"), internal("from-b/m.ts"));
+        assert_eq!(aliased(&repo, "src/x.ts", "@a/m"), Resolution::Unresolved);
+    }
+
+    /// `extends` naming a workspace package reads the config that package
+    /// holds; one naming nothing on disk is reported.
+    #[test]
+    fn extends_through_a_workspace_package_and_an_unfollowed_extends_is_reported() {
+        let repo = tree(&[
+            (
+                "packages/tsconfig/package.json",
+                r#"{"name":"@acme/tsconfig"}"#,
+            ),
+            (
+                "packages/tsconfig/base.json",
+                r#"{"compilerOptions":{"baseUrl":"../..","paths":{"@shared/*":["packages/shared/src/*"]}}}"#,
+            ),
+            (
+                "apps/api/tsconfig.json",
+                r#"{"extends":["@acme/tsconfig/base.json","@missing/config"]}"#,
+            ),
+            ("packages/shared/src/money.ts", ""),
+        ]);
+        let index = WorkspaceIndex::build_with_aliases(repo.path(), None);
+        assert_eq!(
+            index.resolve(Path::new("apps/api/src/x.ts"), "@shared/money"),
+            internal("packages/shared/src/money.ts")
+        );
+        assert_eq!(
+            index.unfollowed_extends(),
+            vec!["@missing/config".to_string()]
+        );
+    }
+
+    /// The nearest config governs; a jsconfig serves where no tsconfig sits;
+    /// a service's named tsconfig overrides the nearest for its files.
+    #[test]
+    fn the_governing_config_is_the_nearest_unless_the_service_names_one() {
+        let repo = tree(&[
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions":{"paths":{"@/*":["./root/*"]}}}"#,
+            ),
+            (
+                "web/jsconfig.json",
+                r#"{"compilerOptions":{"baseUrl":"src"}}"#,
+            ),
+            (
+                "api/tsconfig.app.json",
+                r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#,
+            ),
+            ("root/m.ts", ""),
+            ("web/src/utils/m.js", ""),
+            ("api/src/m.ts", ""),
+        ]);
+        assert_eq!(aliased(&repo, "lib/x.ts", "@/m"), internal("root/m.ts"));
+        // A nearer config with no `paths` governs: the root map does not leak in.
+        assert_eq!(
+            aliased(&repo, "web/src/x.js", "@/m"),
+            Resolution::Unresolved
+        );
+        assert_eq!(
+            aliased(&repo, "web/src/x.js", "utils/m"),
+            internal("web/src/utils/m.js")
+        );
+        let service = WorkspaceIndex::build_with_aliases(
+            repo.path(),
+            Some((Path::new("api"), Path::new("tsconfig.app.json"))),
+        );
+        assert_eq!(
+            service.resolve(Path::new("api/src/x.ts"), "@/m"),
+            internal("api/src/m.ts")
+        );
+    }
+
+    /// package.json `imports`: exact and pattern keys, conditions preferring
+    /// the TypeScript source, decided by the nearest package.json alone.
+    #[test]
+    fn package_imports_resolve_from_the_nearest_manifest() {
+        let repo = tree(&[
+            (
+                "apps/api/package.json",
+                r##"{"name":"api","imports":{"#db":{"types":"./dist/db.d.ts","default":"./dist/db.js","source":"./src/db.ts"},"#queues/*":"./src/queues/*.ts","#vendor":"left-pad"}}"##,
+            ),
+            ("apps/api/src/nested/package.json", r#"{"name":"nested"}"#),
+            ("apps/api/src/db.ts", ""),
+            ("apps/api/dist/db.js", ""),
+            ("apps/api/src/queues/pickup.ts", ""),
+        ]);
+        assert_eq!(
+            aliased(&repo, "apps/api/src/x.ts", "#db"),
+            internal("apps/api/src/db.ts")
+        );
+        assert_eq!(
+            aliased(&repo, "apps/api/src/x.ts", "#queues/pickup"),
+            internal("apps/api/src/queues/pickup.ts")
+        );
+        assert_eq!(
+            aliased(&repo, "apps/api/src/x.ts", "#vendor"),
+            Resolution::Unresolved
+        );
+        // The nearer manifest declares no `imports`, so nothing is inherited.
+        assert_eq!(
+            aliased(&repo, "apps/api/src/nested/x.ts", "#db"),
+            Resolution::Unresolved
+        );
+    }
+
+    /// Deno import maps: a member's map before the root's, `scopes` before
+    /// `imports`, a registry target decides without naming a file, and an
+    /// external `importMap` resolves against its own directory.
+    #[test]
+    fn deno_import_maps_apply_by_scope() {
+        let repo = tree(&[
+            (
+                "deno.jsonc",
+                r#"{ // root
+                "workspace": ["./apps/api"],
+                "imports": {"@/": "./shared/", "@db": "./shared/db.ts", "hono": "npm:hono@^4"},
+                "scopes": {"./apps/api/legacy/": {"@db": "./shared/legacy-db.ts"}}
+            }"#,
+            ),
+            (
+                "apps/api/deno.json",
+                r#"{"name":"@acme/api","importMap":"./maps/import_map.json"}"#,
+            ),
+            (
+                "apps/api/maps/import_map.json",
+                r#"{"imports":{"@/":"../src/"}}"#,
+            ),
+            ("shared/db.ts", ""),
+            ("shared/legacy-db.ts", ""),
+            ("shared/clock.ts", ""),
+            ("apps/api/src/clock.ts", ""),
+            ("hono.ts", ""),
+        ]);
+        assert_eq!(
+            aliased(&repo, "apps/api/src/x.ts", "@/clock.ts"),
+            internal("apps/api/src/clock.ts")
+        );
+        assert_eq!(
+            aliased(&repo, "tools/x.ts", "@/clock.ts"),
+            internal("shared/clock.ts")
+        );
+        assert_eq!(
+            aliased(&repo, "apps/api/src/x.ts", "@db"),
+            internal("shared/db.ts")
+        );
+        assert_eq!(
+            aliased(&repo, "apps/api/legacy/x.ts", "@db"),
+            internal("shared/legacy-db.ts")
+        );
+        // The key maps to a registry package, so the root `hono.ts` is not it.
+        assert!(matches!(
+            aliased(&repo, "tools/x.ts", "hono"),
+            Resolution::External { .. }
+        ));
+    }
+
+    /// A wildcard `exports` key is expanded in the alias-reading index only.
+    #[test]
+    fn wildcard_exports_expand_only_in_the_alias_reading_index() {
+        let repo = tree(&[
+            (
+                "packages/ui/package.json",
+                r#"{"name":"@acme/ui","exports":{"./*":"./src/components/*.ts"}}"#,
+            ),
+            ("packages/ui/src/components/button.ts", ""),
+        ]);
+        assert_eq!(
+            aliased(&repo, "apps/web/x.ts", "@acme/ui/button"),
+            internal("packages/ui/src/components/button.ts")
+        );
+        assert_eq!(
+            WorkspaceIndex::build(repo.path())
+                .resolve(Path::new("apps/web/x.ts"), "@acme/ui/button"),
+            Resolution::Unresolved
+        );
     }
 
     #[test]
