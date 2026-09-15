@@ -174,10 +174,11 @@ const FILE_FILTER: &str = "info,carrick=debug";
 ///    `/api/users` without a list of directory names. A route whose first
 ///    segment happens to be a root entry (`/home`, `/dev`) loses its prefix
 ///    too, which costs a debug line some detail and never leaks a name.
-/// 4. The account name, as a whole token between any two non-alphanumeric
-///    characters, becomes `<user>`. That is the backstop for a directory a
+/// 4. The account name, as a whole token (letters, digits and `_`, bounded by
+///    anything else), becomes `<user>`. That is the backstop for a directory a
 ///    tool derived from the home path with `/` turned into `-`, which rule 2
-///    cannot see because it is not the home path.
+///    cannot see because it is not the home path. Not applied on CI, where the
+///    account (`runner`, `root`) names no developer and is an ordinary word.
 ///
 /// Windows drive paths are not recognised by rule 3; rules 2 and 4 still
 /// apply to them.
@@ -214,15 +215,20 @@ impl Redaction {
         let repos = repo_path
             .map(|repo| spellings_of(Path::new(repo)))
             .unwrap_or_default();
-        let mut accounts: Vec<String> = home
-            .as_deref()
-            .and_then(Path::file_name)
-            .map(|name| name.to_string_lossy().into_owned())
-            .into_iter()
-            .collect();
-        for variable in ["USER", "LOGNAME", "USERNAME"] {
-            if let Ok(name) = std::env::var(variable) {
-                accounts.push(name);
+        // A CI runner's account (`runner`, `root` in a container) names no
+        // developer, and as a token it is an ordinary word: "the repo root"
+        // would ship as "the repo <user>". Rules 2 and 3 still apply there.
+        let mut accounts: Vec<String> = Vec::new();
+        if std::env::var_os("CI").is_none() {
+            accounts.extend(
+                home.as_deref()
+                    .and_then(Path::file_name)
+                    .map(|name| name.to_string_lossy().into_owned()),
+            );
+            for variable in ["USER", "LOGNAME", "USERNAME"] {
+                if let Ok(name) = std::env::var(variable) {
+                    accounts.push(name);
+                }
             }
         }
         let root_entries: Vec<String> = std::fs::read_dir("/")
@@ -349,8 +355,11 @@ impl Redaction {
             while let Some(at) = rest.find(account.as_str()) {
                 let before = rest[..at].chars().next_back();
                 let after = rest[at + account.len()..].chars().next();
-                let whole = before.is_none_or(|c| !c.is_alphanumeric())
-                    && after.is_none_or(|c| !c.is_alphanumeric());
+                // `_` is part of a token, so `runner_os=Linux` in the run
+                // preamble is not read as the account `runner`.
+                let part_of_token = |c: char| c.is_alphanumeric() || c == '_';
+                let whole = before.is_none_or(|c| !part_of_token(c))
+                    && after.is_none_or(|c| !part_of_token(c));
                 out.push_str(&rest[..at]);
                 out.push_str(if whole { USER_MARK } else { account });
                 rest = &rest[at + account.len()..];
@@ -1223,6 +1232,37 @@ mod tests {
         assert_eq!(
             redaction.line("reading the adapter for canada").as_deref(),
             Some("reading the adapter for canada")
+        );
+        // An underscore joins a token: a field name that starts with the
+        // account is not the account.
+        let runner = Redaction::new(&[], &[], &["runner".to_string()], &[]);
+        assert_eq!(
+            runner.line("runner_os=Linux user=runner").as_deref(),
+            Some("runner_os=Linux user=<user>")
+        );
+    }
+
+    /// On CI the account names no developer and is an ordinary word, so the
+    /// run's own redaction states no account at all.
+    #[test]
+    #[serial_test::serial]
+    fn a_ci_run_redacts_no_account_name() {
+        let previous = std::env::var_os("CI");
+        // SAFETY: a `#[serial]` test, and the variable is restored below.
+        unsafe { std::env::set_var("CI", "true") };
+        let on_ci = Redaction::for_run(None);
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("CI", value),
+                None => std::env::remove_var("CI"),
+            }
+        }
+        assert!(on_ci.accounts.is_empty(), "{on_ci:?}");
+        assert_eq!(
+            on_ci
+                .line("Discovered 3 file(s) under the repo root")
+                .as_deref(),
+            Some("Discovered 3 file(s) under the repo root")
         );
     }
 
