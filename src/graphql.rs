@@ -10,10 +10,12 @@
 //! false positive.
 //!
 //! Out of scope by design: Relay compiled artifacts and persisted-query
-//! manifests (no document in source), and code-first schemas
-//! (Pothos/TypeGraphQL/Nexus) unless an emitted `schema.graphql` is
-//! committed — the formatter suggests committing one when GraphQL libraries
-//! are detected but no operations were extracted.
+//! manifests (no document in source). A code-first schema (root fields built
+//! by calls, e.g. Pothos/TypeGraphQL/Nexus) states no SDL in source; its
+//! printed schema is read when the service names it in `graphqlSchemas`
+//! (carrick#1099, [`resolve_declared_schemas`]), and the scan report hints at
+//! that setting when a GraphQL-using server indexes no schema fields
+//! ([`service_notices`]).
 
 use crate::operation::{GraphqlOperationKind, OperationKey};
 use crate::parser::parse_file;
@@ -149,7 +151,12 @@ impl GraphqlProducerHints {
     /// each producer field as a hint line. `scan_roots` are retained for the
     /// co-location check in the don't-skip routing.
     pub fn collect(scan_roots: Vec<PathBuf>, service_files: &[PathBuf]) -> Self {
-        let extraction = scan_repo(&scan_roots, service_files);
+        // Declared schemas (`graphqlSchemas`) are deliberately NOT in the hint
+        // list: the hints are part of every analysed file's prompt, so adding
+        // them would re-ask the model for the whole service the first time the
+        // setting appears, and the setting is meant to take effect on a free
+        // rescan. Their producer rows come from `scan_repo` in the engine.
+        let extraction = scan_repo(&scan_roots, &[], service_files);
         let lines = extraction
             .producers
             .iter()
@@ -222,7 +229,7 @@ impl GraphqlConsumerHints {
     /// matched an explicit generic) needs no hint — there is nothing left to
     /// locate.
     pub fn collect(scan_roots: Vec<PathBuf>, service_files: &[PathBuf]) -> Self {
-        let extraction = scan_repo(&scan_roots, service_files);
+        let extraction = scan_repo(&scan_roots, &[], service_files);
         let mut lines = Vec::new();
         let mut files = std::collections::HashSet::new();
         for op in &extraction.consumers {
@@ -281,12 +288,35 @@ const SKIP_DIRS: &[&str] = &[
 /// `include` roots), NOT the whole monorepo. Walking the repo root here would
 /// attribute a sibling package's schema to every service in the monorepo (#242):
 /// `orders-pkg` would be credited with `gateway`'s `query order` producer.
-pub fn scan_repo(scan_roots: &[PathBuf], service_files: &[PathBuf]) -> GraphqlExtraction {
+///
+/// `declared_schemas` are the files the service names in `graphqlSchemas`
+/// (resolved by [`resolve_declared_schemas`]). They are read wherever they
+/// sit, including build folders the walk skips and another service's
+/// directory, and only their PRODUCERS are kept: the setting declares what the
+/// service serves, so an executable document in one is not a call this service
+/// makes. They go first, so a declared file that also sits under a scan root
+/// is read once, as a declaration.
+pub fn scan_repo(
+    scan_roots: &[PathBuf],
+    declared_schemas: &[PathBuf],
+    service_files: &[PathBuf],
+) -> GraphqlExtraction {
     let mut extraction = GraphqlExtraction::default();
 
     // Overlapping roots (a service `include` that overlaps its `directory`) must
     // not extract the same schema twice, so dedup SDL paths across roots.
     let mut seen_sdl: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for path in declared_schemas {
+        if !seen_sdl.insert(path.clone()) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        extraction
+            .producers
+            .extend(extract_from_document_text(&content, path, 1).producers);
+    }
     for root in scan_roots {
         for entry in WalkDir::new(root)
             .sort_by_file_name()
@@ -337,6 +367,176 @@ pub fn scan_repo(scan_roots: &[PathBuf], service_files: &[PathBuf]) -> GraphqlEx
         "GraphQL extraction complete"
     );
     extraction
+}
+
+/// What a service's `graphqlSchemas` entries resolved to (carrick#1099).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeclaredSchemas {
+    /// Every file an entry matched, sorted and deduplicated, joined onto the
+    /// repository root.
+    pub files: Vec<PathBuf>,
+    /// One sentence per entry or file that declares nothing: an entry that is
+    /// not a repository path or not a valid glob, an entry that matches no
+    /// file, and a matched file that defines no root operation field. The scan
+    /// report prints each one, so a declaration that does nothing is never
+    /// silent.
+    pub problems: Vec<String>,
+}
+
+/// Resolve a service's `graphqlSchemas` entries against the repository root.
+///
+/// Each entry is a path relative to the root (where `carrick.json` sits) or a
+/// glob (`apps/api/dist/**/*.graphql`). Nothing is skipped: the setting exists
+/// for the printed schema in a build folder or another app's directory, which
+/// the service's own SDL walk does not read. A matched file is parsed here as
+/// well, so a file that is not a schema, or defines no Query, Mutation or
+/// Subscription field, is reported rather than quietly adding nothing.
+pub fn resolve_declared_schemas(repo_root: &Path, patterns: &[String]) -> DeclaredSchemas {
+    let mut declared = DeclaredSchemas::default();
+    let mut files = std::collections::BTreeSet::new();
+    let options = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+    for raw in patterns {
+        let entry = raw.trim().trim_start_matches("./");
+        let relative = Path::new(entry);
+        if entry.is_empty()
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            declared.problems.push(format!(
+                "`graphqlSchemas` entry '{raw}' is not a path inside the repository, so nothing \
+                 was read for it"
+            ));
+            continue;
+        }
+        // Checked on its own first, so an error position counts from the
+        // entry the user wrote rather than from the checkout path.
+        if let Err(error) = glob::Pattern::new(entry) {
+            declared.problems.push(format!(
+                "`graphqlSchemas` entry '{raw}' is not a valid glob ({error}), so nothing was \
+                 read for it"
+            ));
+            continue;
+        }
+        // The root is escaped so a checkout path containing glob syntax (`[`,
+        // `*`) cannot become a pattern that silently matches nothing.
+        let pattern = format!(
+            "{}/{}",
+            glob::Pattern::escape(&repo_root.to_string_lossy()),
+            entry
+        );
+        // An escaped root joined to an entry that compiled above is a valid
+        // pattern, so the error arm cannot be reached.
+        let matches: Vec<PathBuf> = glob::glob_with(&pattern, options)
+            .map(|paths| {
+                paths
+                    .filter_map(Result::ok)
+                    .filter(|path| path.is_file())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if matches.is_empty() {
+            declared.problems.push(format!(
+                "`graphqlSchemas` entry '{raw}' matches no file in this repository, so the \
+                 operations it declares are not indexed"
+            ));
+            continue;
+        }
+        files.extend(matches);
+    }
+    for file in &files {
+        let shown = file.strip_prefix(repo_root).unwrap_or(file).display();
+        match std::fs::read_to_string(file) {
+            Ok(content) => {
+                if extract_from_document_text(&content, file, 1)
+                    .producers
+                    .is_empty()
+                {
+                    declared.problems.push(format!(
+                        "`graphqlSchemas` file '{shown}' defines no Query, Mutation or \
+                         Subscription field, so it adds no operations"
+                    ));
+                }
+            }
+            Err(error) => declared.problems.push(format!(
+                "`graphqlSchemas` file '{shown}' could not be read ({error}), so it adds no \
+                 operations"
+            )),
+        }
+    }
+    declared.files = files.into_iter().collect();
+    declared
+}
+
+/// What the scan report says about one service's GraphQL schema coverage.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphqlNotices {
+    /// A `graphqlSchemas` declaration that did nothing. Printed as a warning.
+    pub warnings: Vec<String>,
+    /// The code-first hint: a service that uses GraphQL and serves routes but
+    /// indexes no schema field and declares no schema file.
+    pub hints: Vec<String>,
+}
+
+/// The facts [`service_notices`] decides from, gathered by the engine once a
+/// service's rows are built.
+#[derive(Debug, Clone, Copy)]
+pub struct GraphqlServiceFacts<'a> {
+    /// The service name as the report prints it.
+    pub service: &'a str,
+    /// Whether the service's config has any `graphqlSchemas` entry.
+    pub declares_schemas: bool,
+    /// What those entries resolved to.
+    pub declared: &'a DeclaredSchemas,
+    /// GraphQL producer rows the service indexed, from any source.
+    pub producers: usize,
+    /// Whether the service indexed at least one HTTP route. A GraphQL server is
+    /// served on one, and a client-only app (whose GraphQL library is just as
+    /// present) usually serves none, so this keeps the hint off the clients.
+    pub serves_http: bool,
+    /// GraphQL libraries the service depends on or was detected using.
+    pub graphql_libraries: &'a [String],
+}
+
+/// Decide the per-service GraphQL lines for the scan report (carrick#1099).
+///
+/// The hint is gated on THIS service having no producer row, not on the scan
+/// having no GraphQL row at all: a code-first server that also sends documents
+/// to someone else's GraphQL API has consumer rows and still indexes none of
+/// the operations it serves.
+pub fn service_notices(facts: GraphqlServiceFacts<'_>) -> GraphqlNotices {
+    let mut notices = GraphqlNotices::default();
+    for problem in &facts.declared.problems {
+        notices
+            .warnings
+            .push(format!("Service '{}': {problem}", facts.service));
+    }
+    if !facts.declares_schemas
+        && facts.producers == 0
+        && facts.serves_http
+        && !facts.graphql_libraries.is_empty()
+    {
+        let mut libraries: Vec<&str> = facts.graphql_libraries.iter().map(String::as_str).collect();
+        libraries.sort_unstable();
+        libraries.dedup();
+        let libraries = libraries
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        notices.hints.push(format!(
+            "Service '{}' uses GraphQL ({libraries}) and serves HTTP routes, but indexes no \
+             GraphQL schema fields. If its schema is built in code, name the printed SDL file \
+             in `graphqlSchemas` for this service in carrick.json.",
+            facts.service
+        ));
+    }
+    notices
 }
 
 /// Extract operations from raw GraphQL text. Tries SDL first (producers),
@@ -904,7 +1104,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("schema.graphql"), "type Query { item: String }").unwrap();
         }
-        let extraction = scan_repo(&[repo.path().to_path_buf()], &[]);
+        let extraction = scan_repo(&[repo.path().to_path_buf()], &[], &[]);
         assert_eq!(extraction.producers.len(), 1);
         assert_eq!(
             extraction.producers[0].file_path,
@@ -1592,8 +1792,8 @@ export const typeDefs = gql`
         let a_root = base.join("packages/a");
         let b_root = base.join("packages/b");
         let no_files: &[PathBuf] = &[];
-        let scoped_a = scan_repo(std::slice::from_ref(&a_root), no_files);
-        let scoped_b = scan_repo(std::slice::from_ref(&b_root), no_files);
+        let scoped_a = scan_repo(std::slice::from_ref(&a_root), &[], no_files);
+        let scoped_b = scan_repo(std::slice::from_ref(&b_root), &[], no_files);
         std::fs::remove_dir_all(&base).ok();
 
         assert_eq!(
@@ -1606,5 +1806,173 @@ export const typeDefs = gql`
             "package b must NOT be credited with sibling a's schema, got {:?}",
             keys(&scoped_b.producers)
         );
+    }
+
+    /// carrick#1099: a printed schema in a skipped build folder is invisible to
+    /// the service walk and read when declared; only its producers count, and a
+    /// declared file under a scan root is read once.
+    #[test]
+    fn declared_schema_is_read_under_a_skipped_folder_and_keeps_producers_only() {
+        let repo = tempfile::tempdir().unwrap();
+        let service = repo.path().join("api");
+        let printed = repo.path().join("web/dist");
+        std::fs::create_dir_all(&service).unwrap();
+        std::fs::create_dir_all(&printed).unwrap();
+        std::fs::write(
+            printed.join("schema.graphql"),
+            "type Query { widgets: [String!]! }\ntype Mutation { dispose(id: ID!): Boolean! }",
+        )
+        .unwrap();
+        std::fs::write(service.join("ops.graphql"), "type Query { local: String }").unwrap();
+        std::fs::write(service.join("doc.graphql"), "query Remote { remote }").unwrap();
+        let roots = [service.clone()];
+
+        let undeclared = scan_repo(&roots, &[], &[]);
+        assert_eq!(keys(&undeclared.producers), vec!["graphql|query|local"]);
+        assert_eq!(keys(&undeclared.consumers), vec!["graphql|query|remote"]);
+
+        let declared = resolve_declared_schemas(
+            repo.path(),
+            &[
+                "web/dist/*.graphql".to_string(),
+                "api/ops.graphql".to_string(),
+                "api/doc.graphql".to_string(),
+            ],
+        );
+        // A declared executable document states no served field, and says so.
+        assert_eq!(
+            declared.problems,
+            vec![
+                "`graphqlSchemas` file 'api/doc.graphql' defines no Query, Mutation or \
+                 Subscription field, so it adds no operations"
+                    .to_string()
+            ]
+        );
+        let extraction = scan_repo(&roots, &declared.files, &[]);
+        // Declared files are read first and once: the root walk neither
+        // duplicates `local` nor turns the declared document into a call.
+        assert!(extraction.consumers.is_empty());
+        assert_eq!(
+            keys(&extraction.producers),
+            vec![
+                "graphql|mutation|dispose",
+                "graphql|query|local",
+                "graphql|query|widgets"
+            ]
+        );
+        assert_eq!(
+            extraction
+                .producers
+                .iter()
+                .find(|op| op.key.canonical() == "graphql|query|widgets")
+                .unwrap()
+                .file_path,
+            printed.join("schema.graphql")
+        );
+    }
+
+    #[test]
+    fn declared_schemas_report_every_entry_that_declares_nothing() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("dist")).unwrap();
+        std::fs::write(
+            repo.path().join("dist/types.graphql"),
+            "type Widget { id: ID! }",
+        )
+        .unwrap();
+
+        let declared = resolve_declared_schemas(
+            repo.path(),
+            &[
+                "missing/schema.graphql".to_string(),
+                "../outside.graphql".to_string(),
+                "/abs/schema.graphql".to_string(),
+                "dist/[.graphql".to_string(),
+                "dist/*.graphql".to_string(),
+            ],
+        );
+        assert_eq!(declared.files, vec![repo.path().join("dist/types.graphql")]);
+        assert_eq!(
+            declared.problems,
+            vec![
+                "`graphqlSchemas` entry 'missing/schema.graphql' matches no file in this \
+                 repository, so the operations it declares are not indexed"
+                    .to_string(),
+                "`graphqlSchemas` entry '../outside.graphql' is not a path inside the repository, \
+                 so nothing was read for it"
+                    .to_string(),
+                "`graphqlSchemas` entry '/abs/schema.graphql' is not a path inside the \
+                 repository, so nothing was read for it"
+                    .to_string(),
+                "`graphqlSchemas` entry 'dist/[.graphql' is not a valid glob (Pattern syntax \
+                 error near position 5: invalid range pattern), so nothing was read for it"
+                    .to_string(),
+                "`graphqlSchemas` file 'dist/types.graphql' defines no Query, Mutation or \
+                 Subscription field, so it adds no operations"
+                    .to_string(),
+            ]
+        );
+    }
+
+    fn facts<'a>(
+        declared: &'a DeclaredSchemas,
+        libraries: &'a [String],
+    ) -> GraphqlServiceFacts<'a> {
+        GraphqlServiceFacts {
+            service: "api",
+            declares_schemas: false,
+            declared,
+            producers: 0,
+            serves_http: true,
+            graphql_libraries: libraries,
+        }
+    }
+
+    #[test]
+    fn the_code_first_hint_needs_a_graphql_server_with_no_producer_and_no_setting() {
+        let none = DeclaredSchemas::default();
+        let libraries = vec!["graphql".to_string()];
+
+        let hinted = service_notices(facts(&none, &libraries));
+        assert!(hinted.warnings.is_empty());
+        assert_eq!(
+            hinted.hints,
+            vec![
+                "Service 'api' uses GraphQL (`graphql`) and serves HTTP routes, but indexes no \
+                 GraphQL schema fields. If its schema is built in code, name the printed SDL \
+                 file in `graphqlSchemas` for this service in carrick.json."
+                    .to_string()
+            ]
+        );
+
+        let with_producer = GraphqlServiceFacts {
+            producers: 1,
+            ..facts(&none, &libraries)
+        };
+        let client_only = GraphqlServiceFacts {
+            serves_http: false,
+            ..facts(&none, &libraries)
+        };
+        let declaring = GraphqlServiceFacts {
+            declares_schemas: true,
+            ..facts(&none, &libraries)
+        };
+        for quiet in [with_producer, client_only, declaring, facts(&none, &[])] {
+            assert_eq!(service_notices(quiet), GraphqlNotices::default());
+        }
+
+        let broken = DeclaredSchemas {
+            files: vec![],
+            problems: vec!["`graphqlSchemas` entry 'x' matches no file".to_string()],
+        };
+        let warned = service_notices(GraphqlServiceFacts {
+            declares_schemas: true,
+            ..facts(&broken, &libraries)
+        });
+        assert_eq!(
+            warned.warnings,
+            vec!["Service 'api': `graphqlSchemas` entry 'x' matches no file".to_string()]
+        );
+        assert!(warned.hints.is_empty());
     }
 }

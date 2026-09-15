@@ -1,0 +1,15 @@
+type Mutation {
+  createWidget(name: String!): Widget!
+  disposeWidget(id: ID!): Boolean!
+}
+
+type Query {
+  health: String!
+  widget(id: ID!): Widget
+  widgets: [Widget!]!
+}
+
+type Widget {
+  id: ID!
+  name: String!
+}

@@ -1,0 +1,13 @@
+{
+  "services": [
+    {
+      "serviceName": "widgets-api",
+      "directory": "apps/api",
+      "graphqlSchemas": ["apps/web/dist/**/*.graphql"]
+    },
+    {
+      "serviceName": "widgets-web",
+      "directory": "apps/web"
+    }
+  ]
+}

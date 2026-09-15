@@ -14,7 +14,7 @@ fn scan_repo_extracts_schema_and_documents() {
     let root = fixture_root();
     let service_files = vec![root.join("src/client.ts")];
 
-    let extraction = scan_repo(std::slice::from_ref(&root), &service_files);
+    let extraction = scan_repo(std::slice::from_ref(&root), &[], &service_files);
 
     let mut producers: Vec<String> = extraction
         .producers

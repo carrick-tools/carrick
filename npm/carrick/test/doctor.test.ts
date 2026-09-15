@@ -108,6 +108,32 @@ test("every kind of path a config can declare and not have is named", () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("a declared GraphQL schema is found through its glob, even under a build folder, and a missing one is named", () => {
+  const root = workspace({
+    "carrick.json": JSON.stringify({
+      services: [
+        {
+          serviceName: "api",
+          directory: "api",
+          graphqlSchemas: ["web/dist/**/*.graphql", "api/schema.graphql"],
+        },
+        { serviceName: "web", directory: "web" },
+      ],
+    }),
+    "api/src/index.ts": "export {};\n",
+    "web/index.ts": "export {};\n",
+    "web/dist/graphql/schema.graphql": "type Query { widgets: [String!]! }\n",
+  });
+  const lines = checkDeclaredPaths(configuredRepos(root));
+  assert.equal(findingCount(lines), 1, texts(lines).join("\n"));
+  assert.ok(
+    lines.some((line) => line.text.includes('declares graphqlSchemas "api/schema.graphql", which matches no file')),
+    texts(lines).join("\n"),
+  );
+  assert.ok(!lines.some((line) => line.text.includes("web/dist/**/*.graphql")));
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test("a missing service directory, a config that is not JSON, and a workspace with no config at all", () => {
   const gone = workspace({ "carrick.json": JSON.stringify({ serviceName: "api", directory: "api" }) });
   assert.match(checkDeclaredPaths(configuredRepos(gone))[0]!.text, /declares directory "api"/);
@@ -141,15 +167,15 @@ test("a sibling repo with no carrick.json is reported as a fact, not as a findin
 
 test("the services a config declares, flat and as an array", () => {
   assert.deepEqual(declaredServices({ serviceName: "api", directory: "src", include: ["shared"] }), [
-    { name: "api", include: ["shared"], directory: "src" },
+    { name: "api", include: ["shared"], graphqlSchemas: [], directory: "src" },
   ]);
   // `services` wins over its sibling flat fields, as `Config::load_services` does.
   assert.deepEqual(
     declaredServices({ serviceName: "ignored", services: [{ name: "api", directory: "api" }] }),
-    [{ name: "api", include: [], directory: "api" }],
+    [{ name: "api", include: [], graphqlSchemas: [], directory: "api" }],
   );
   // A service with nothing to place is one service at the repo root.
-  assert.deepEqual(declaredServices({ internalEnvVars: ["API_URL"] }), [{ name: "service 1", include: [] }]);
+  assert.deepEqual(declaredServices({ internalEnvVars: ["API_URL"] }), [{ name: "service 1", include: [], graphqlSchemas: [] }]);
 });
 
 test("comments and blank lines are not drift", () => {

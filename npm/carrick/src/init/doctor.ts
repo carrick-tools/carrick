@@ -137,13 +137,15 @@ type DeclaredService = {
   directory?: string;
   tsconfig?: string;
   include: string[];
+  /** Printed GraphQL SDL files (paths or globs) the service serves (carrick#1099). */
+  graphqlSchemas: string[];
 };
 
 /**
  * The services a config declares: the `services` array, or the file itself.
  *
  * The same resolution as `Config::load_services` in src/config.rs, for the
- * three fields that name a path. When `services` is present its sibling flat
+ * four fields that name a path. When `services` is present its sibling flat
  * fields are ignored, which is the rule the scanner applies too.
  */
 export function declaredServices(config: Record<string, unknown>): DeclaredService[] {
@@ -158,15 +160,18 @@ export function declaredServices(config: Record<string, unknown>): DeclaredServi
     const directory = typeof entry["directory"] === "string" ? entry["directory"] : undefined;
     const service: DeclaredService = {
       name: typeof named === "string" && named !== "" ? named : (directory ?? `service ${index + 1}`),
-      include: Array.isArray(entry["include"])
-        ? (entry["include"] as unknown[]).filter((value): value is string => typeof value === "string")
-        : [],
+      include: strings(entry["include"]),
+      graphqlSchemas: strings(entry["graphqlSchemas"]),
     };
     if (directory !== undefined) service.directory = directory;
     if (typeof entry["tsconfig"] === "string") service.tsconfig = entry["tsconfig"];
     services.push(service);
   }
   return services;
+}
+
+function strings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
 /**
@@ -223,6 +228,18 @@ export function checkDeclaredPaths(repos: ConfiguredRepo[]): Line[] {
           );
         }
       }
+      // Relative to the repository root like `include`, and globs allowed:
+      // the scanner's `graphql::resolve_declared_schemas` reads the same way.
+      for (const schema of service.graphqlSchemas) {
+        checked += 1;
+        if (!matchesAFile(repo.root, schema)) {
+          lines.push(
+            refuse(
+              `${repo.label}: service "${service.name}" declares graphqlSchemas "${schema}", which matches no file in this repo. None of the GraphQL operations it declares are indexed.`,
+            ),
+          );
+        }
+      }
       if (service.tsconfig !== undefined) {
         checked += 1;
         const tsconfig = path.resolve(serviceRoot, service.tsconfig);
@@ -261,6 +278,17 @@ function isDirectory(target: string): boolean {
 function isFile(target: string): boolean {
   try {
     return fs.statSync(target).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a repository-relative path or glob names at least one file. */
+function matchesAFile(root: string, pattern: string): boolean {
+  const entry = pattern.trim().replace(/^\.\//, "");
+  if (entry === "" || path.isAbsolute(entry) || entry.split(/[\\/]/).includes("..")) return false;
+  try {
+    return fs.globSync(entry, { cwd: root }).some((match) => isFile(path.join(root, match)));
   } catch {
     return false;
   }

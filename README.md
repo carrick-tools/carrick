@@ -241,6 +241,7 @@ When Carrick sees a call like `fetch(process.env.ORDER_SERVICE_URL + '/orders')`
 | `directory` | Service root, relative to `carrick.json`. Files outside every declared directory are ignored |
 | `include` | Extra source roots to pull in for type/function resolution (e.g. shared libraries copied in at build time), relative to `carrick.json` |
 | `tsconfig` | Optional TypeScript config path, relative to `directory`. Deno services normally omit this field and use their nearest Deno manifest |
+| `graphqlSchemas` | Printed GraphQL SDL files that define the operations this service serves, relative to `carrick.json`; globs allowed. See [Code-first GraphQL schemas](#code-first-graphql-schemas) |
 
 Alongside `services`, the optional top-level `includes` map declares classification for a shared source root once. See [Declaring a shared root once](#declaring-a-shared-root-once).
 
@@ -266,6 +267,26 @@ Each key is a source root spelled as a service names it in its `include` (a lead
 Every service whose `include` lists that root inherits those declarations, unioned with its own. A service keeps everything it declares itself, and a name declared in both places appears once. A service that does not include the root inherits nothing.
 
 A key that no service lists in its `include` fails the scan rather than doing nothing, so a mistyped root is reported instead of leaving the calls unclassified.
+
+#### Code-first GraphQL schemas
+
+Carrick reads a GraphQL server's operations from SDL: `.graphql`/`.gql` files under the service's own directory and `gql` template literals. A schema built in code (Pothos, TypeGraphQL, Nexus) has no SDL in source, so its queries and mutations are not indexed until the service names the printed schema:
+
+```json
+{
+  "services": [
+    {
+      "serviceName": "api",
+      "directory": "apps/api",
+      "graphqlSchemas": ["apps/api/dist/schema.graphql"]
+    }
+  ]
+}
+```
+
+Each entry is a path relative to `carrick.json`, or a glob such as `packages/schema/generated/*.graphql`. The file can sit anywhere in the repository, including a build folder like `dist/` or another app's directory, as long as it is committed. Every `Query`, `Mutation` and `Subscription` field it defines is indexed as an operation that this service serves. A flat single-service `carrick.json` accepts the field at the top level.
+
+An entry that matches no file, or a file that defines no root field, is reported as a warning in the scan output. When a service depends on a GraphQL library and serves HTTP routes but indexes no GraphQL schema fields, the scan output suggests this setting.
 
 ## How it works
 
