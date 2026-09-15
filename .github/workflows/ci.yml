@@ -10,72 +10,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Test Suite
+  # The Rust tests run as three shards on three runners. Before this split one
+  # job ran every target in series and took fourteen minutes, of which the
+  # `local_mode_test` binary alone was 2.4 min, three scan-driving binaries
+  # another 1.5, and the sidecar's own unit tests five (see `sidecar` below).
+  # Each shard pays its own compile (about two minutes with the cache warm),
+  # which is the price of the wall clock: the slowest shard, not the sum,
+  # is what a PR waits on.
+  #
+  # Every tests/*.rs is named by exactly one shard; the "wired into CI" step
+  # in rust-unit greps this file and fails on one that is not.
+  rust-unit:
+    name: Rust unit and fast integration
     runs-on: ubuntu-latest
+    env:
+      # Line tables keep panic locations and backtraces readable; full
+      # debuginfo is what a debugger wants, and nothing here attaches one.
+      # Cuts the compile and the link of ~45 test binaries.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-test-setup
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Run library tests
+        run: cargo test --lib --verbose
 
-      - name: Cache dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-          cache: "npm"
-          cache-dependency-path: |
-            examples/express-single/package.json
-            tests/fixtures/imported-routers/package.json
-            tests/fixtures/fastify-api/package.json
-            tests/fixtures/koa-api/package.json
-            src/sidecar/package-lock.json
-
-      - name: Install Deno for type and dependency preparation tests
-        uses: denoland/setup-deno@v2
-        with:
-          deno-version: "2.9.4"
-
-      - name: Install test dependencies
-        run: |
-          cd examples/express-single && npm install
-          cd ../../tests/fixtures/imported-routers && npm install
-          cd ../fastify-api && npm install
-          cd ../koa-api && npm install
-
-      - name: Build sidecar
-        run: cd src/sidecar && npm ci && npm run build
-
-      - name: Run output contract tests
-        run: cargo test --test output_contract_test --verbose
-
-      - name: Run MockStorage tests
-        run: cargo test --test mock_storage_test --verbose
-
-      - name: Run dependency analysis tests
-        run: cargo test --test dependency_analysis_test --verbose
-
-      - name: Run integration tests
-        run: cargo test --test integration_test --verbose
-
-      - name: Run file-centric analysis tests
-        run: cargo test --test file_centric_analysis_test --verbose
-
-      - name: Run sidecar integration tests
-        run: cargo test --test sidecar_integration_test --verbose
+      - name: Run carrick-match tests
+        run: cargo test -p carrick-match --verbose
 
       # Timing assertions on the readiness budget: its own step so the waits
       # are not competing with another test binary for the machine. Needs node
@@ -84,72 +45,53 @@ jobs:
       - name: Run sidecar readiness timing tests
         run: cargo test --test sidecar_readiness_test --verbose
 
-      - name: Run URL alias matching tests
-        run: cargo test --test url_alias_matching_test --verbose
-
-      - name: Run cassette hard gate
-        run: cargo test --test llm_cassette_hard_gate_test --verbose
-
-      - name: Run xrepo harness test
-        run: cargo test --test xrepo_harness_test --verbose
-
-      # An absolute third-party URL keeps its origin on the match key whether
-      # or not the host was declared (carrick-cloud#656). Spawns the binary
-      # over a cassetted fixture; no model call and no network.
-      - name: Run undeclared external host test
-        run: cargo test --test undeclared_external_host_test --verbose
-
-      # Cross-repo scorer math only. Default `cargo test` skips the #[ignore]d
-      # live scorer + mock smoke (both spawn the binary / cost money), so this is
-      # cheap, deterministic, and never triggers a scan. The live scorer runs via
-      # eval-xrepo.yml (workflow_dispatch), NOT here.
-      - name: Run cross-repo scorer unit tests
-        run: cargo test --test eval_xrepo --verbose
-
-      # The Action's dependency-install step (carrick#706). Shells out to
-      # scripts/install-scanned-deps.sh over the action-install fixtures; the
-      # installing case uses a `file:` dependency, so it needs no registry.
-      - name: Run Action dependency-install tests
-        run: cargo test --test action_install_test --verbose
-
       # Fixture- and mock-driven; no live LLM, no env beyond what they set
       # themselves. route_request_anchor_test and span_locator_units_test need
-      # the sidecar built above.
-      - name: Run fixture-driven extraction tests
+      # the sidecar built above. eval_xrepo is the cross-repo scorer math only:
+      # default `cargo test` skips its #[ignore]d live scorer + mock smoke (both
+      # spawn the binary / cost money); the live scorer runs via eval-xrepo.yml
+      # (workflow_dispatch), NOT here. action_install_test is the Action's
+      # dependency-install step (carrick#706), which uses a `file:` dependency
+      # and so needs no registry.
+      - name: Run fast integration tests
         run: >-
           cargo test --verbose
+          --test action_install_test
           --test analysis_failure_keeps_deterministic_rows_test
-          --test deterministic_emission_test
+          --test dependency_analysis_test
           --test env_var_template_call_segment_test
-          --test env_var_whole_url_test
+          --test eval_xrepo
           --test extraction_config_test
           --test file_based_routing_test
+          --test file_centric_analysis_test
           --test framework_coverage_test
           --test graphql_extraction_test
-          --test imported_request_member_test
           --test incremental_raw_cache_test
           --test intent_incremental_test
           --test literal_base_url_test
           --test llm_mock_pipeline_test
-          --test local_mode_test
           --test log_value_guard_test
-          --test hosted_enrichment_test
+          --test mock_storage_test
           --test new_url_target_test
           --test object_export_surface_test
+          --test output_contract_test
           --test receiver_type_classification_test
           --test route_request_anchor_test
           --test service_derivation_test
+          --test sidecar_integration_test
           --test socket_class_field_test
           --test socket_extraction_test
           --test socket_namespace_test
           --test socket_type_alias_test
           --test span_locator_units_test
+          --test url_alias_matching_test
           --test workspace_member_callers_test
           --test workspace_package_client_test
           --test wrapper_dispatch_test
 
-      # Every tests/*.rs must be run by a step above or be listed here with a
-      # reason. Nine of twenty were silently local-only before this step.
+      # Every tests/*.rs must be run by a step in one of the Rust shards or be
+      # listed here with a reason. Nine of twenty were silently local-only
+      # before this step.
       - name: Every integration test is wired into CI
         run: |
           excluded="eval_tier_a"  # eval harness; needs CARRICK_API_ENDPOINT, skips without it
@@ -164,25 +106,91 @@ jobs:
           done
           exit $missing
 
-      - name: Run sidecar unit tests
-        run: cd src/sidecar && npm test
+  # The binaries that drive whole scans through the sidecar over fixture
+  # repos: seconds to minutes each, and the reason the single job was slow.
+  # llm_cassette_hard_gate_test is the frozen-LLM-input golden;
+  # undeclared_external_host_test pins the match key of an absolute
+  # third-party URL (carrick-cloud#656); neither makes a model call.
+  rust-scan:
+    name: Rust scan integration
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-test-setup
 
-      # After the sidecar build: this test spawns the real binary over the
-      # pubsub-wrapper-monorepo fixture (cassette-mocked LLM, real sidecar), so
-      # the sidecar's dist + node_modules must exist.
-      - name: Run pub/sub wrapper type-capture test
-        run: cargo test --test pubsub_wrapper_type_capture_test --verbose
+      - name: Run scan-driving integration tests
+        run: >-
+          cargo test --verbose
+          --test deterministic_emission_test
+          --test env_var_whole_url_test
+          --test hosted_enrichment_test
+          --test imported_request_member_test
+          --test integration_test
+          --test llm_cassette_hard_gate_test
+          --test pubsub_wrapper_type_capture_test
+          --test undeclared_external_host_test
+          --test xrepo_harness_test
 
-      # Deno config/runtime transitions are covered by service_derivation_test
-      # above; the removed unsupported-project guard no longer has binary tests.
-      - name: Run library tests
-        run: cargo test --lib --verbose
+  # local_mode_test on its own: at 2.4 minutes it is the longest single
+  # binary, and pairing it with anything puts that on the critical path.
+  rust-local-mode:
+    name: Rust local mode
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-test-setup
 
-      # Workspace members are NOT covered by the steps above: this is a
-      # non-virtual workspace, so plain `cargo test` invocations only run the
-      # root package. Every member crate needs its own explicit step.
-      - name: Run carrick-match tests
-        run: cargo test -p carrick-match --verbose
+      - name: Run local mode tests
+        run: cargo test --verbose --test local_mode_test
+
+  # The type sidecar's own unit tests, no Rust. Two shards: four files run
+  # real package managers, Deno and tsc over fixture projects (the Deno
+  # resolution test alone is two minutes), the other fifty-odd are quick.
+  # Without `--experimental-test-coverage`: the coverage report went to the
+  # job log where nobody read it, and instrumenting every file made the
+  # suite three times slower (349 s against 114 s, measured on the same
+  # machine). `npm run test:coverage` still produces it on demand.
+  sidecar:
+    name: Sidecar tests (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [heavy, rest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: src/sidecar/package-lock.json
+
+      - name: Install Deno for the Deno project resolution tests
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: "2.9.4"
+
+      - name: Build sidecar
+        run: cd src/sidecar && npm ci && npm run build
+
+      - name: Run sidecar tests
+        working-directory: src/sidecar
+        run: |
+          heavy='deno-project|check-v2-corpus|capture-v2-installed-pin|sidecar\.test\.js'
+          if [ "${{ matrix.shard }}" = "heavy" ]; then
+            files=$(ls dist/test/*.test.js | grep -E "dist/test/($heavy)")
+          else
+            files=$(ls dist/test/*.test.js | grep -v -E "dist/test/($heavy)")
+          fi
+          echo "$files" | tr ' ' '\n'
+          # shellcheck disable=SC2086
+          node --test $files
 
   wasm-match:
     name: carrick-match wasm smoke
@@ -289,9 +297,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build
-        run: cargo build --verbose
-
+      # Release only. The debug build is what every Rust test shard already
+      # compiles; repeating it here doubled this job for nothing.
       - name: Build release
         run: cargo build --release --verbose
 
@@ -391,8 +398,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # A prebuilt binary: `cargo install cargo-audit` compiled it from source
+      # on every run, three and a half minutes for a tool that changes weekly.
       - name: Install cargo-audit
-        run: cargo install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
       - name: Run security audit
         run: cargo audit

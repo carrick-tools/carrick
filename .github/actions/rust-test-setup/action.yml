@@ -1,0 +1,58 @@
+name: Rust test setup
+description: >-
+  Everything a Rust test job needs before `cargo test`: toolchain, the cargo
+  cache, Node and Deno, the fixture dependencies, and a built type sidecar.
+  One action rather than a copy per job so the three test shards in ci.yml
+  cannot drift apart.
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    # Keyed apart from the lint/build caches: the test jobs compile with
+    # `CARGO_PROFILE_DEV_DEBUG=line-tables-only` (ci.yml), and a target
+    # directory built with full debuginfo is a full rebuild under that
+    # profile, which the once-per-lockfile save would then never replace.
+    - name: Cache dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-test-ltd-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-test-ltd-
+
+    - name: Install Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "24"
+        cache: "npm"
+        cache-dependency-path: |
+          examples/express-single/package.json
+          tests/fixtures/imported-routers/package.json
+          tests/fixtures/fastify-api/package.json
+          tests/fixtures/koa-api/package.json
+          src/sidecar/package-lock.json
+
+    - name: Install Deno for type and dependency preparation tests
+      uses: denoland/setup-deno@v2
+      with:
+        deno-version: "2.9.4"
+
+    - name: Install test dependencies
+      shell: bash
+      run: |
+        cd examples/express-single && npm install
+        cd ../../tests/fixtures/imported-routers && npm install
+        cd ../fastify-api && npm install
+        cd ../koa-api && npm install
+
+    - name: Build sidecar
+      shell: bash
+      run: cd src/sidecar && npm ci && npm run build
