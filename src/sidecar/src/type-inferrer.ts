@@ -49,7 +49,7 @@ import type {
   TypeProvenance,
 } from './types.js';
 import { validateInferRequestItem } from './validators.js';
-import { expandTypeStructural } from './type-structural-expander.js';
+import { expandTypeStructural, type MemberOverrides } from './type-structural-expander.js';
 
 /**
  * TS/lib globals and primitives that must never be emitted as a deterministic
@@ -4308,13 +4308,23 @@ export class TypeInferrer {
    * sends (`schemaInputType`), and a schema that declares no input member reads
    * its output instead, which is the whole of what is knowable about it.
    *
-   * One input shape cannot be published as it stands: a member whose input is
-   * `any`/`unknown` where the output is concrete, which is what a coercion
-   * declares (it accepts any value and parses it into, say, a number). A top
-   * type in a published contract disqualifies the whole row downstream, so the
-   * reading publishes the OUTPUT for that schema and records each such member
-   * as `coerced_input` provenance, rather than abstaining on a schema whose
-   * parsed shape is fully known.
+   * The input is decided member by member (carrick#1105). A member whose input
+   * is `any`/`unknown` where the output is concrete is what a coercion declares
+   * (it accepts any value and parses it into, say, a number). A top type in a
+   * published contract disqualifies the whole row downstream, so THAT member
+   * prints its output type, keeps the input key's optionality, and is recorded
+   * as `coerced_input` provenance. Every other member keeps its input, so a
+   * defaulted key beside a coerced one stays optional to send.
+   *
+   * Limits, each logged where it bites:
+   *  - the position walk is bounded (`walkTypePositions`), so a top type below
+   *    the bound is not compared and prints as the input declares it;
+   *  - a coerced position that cannot be substituted (its output is absent or
+   *    differs across union branches, or the printer cannot reach it inside a
+   *    tuple, behind a cycle or past the expansion depth) makes the row fall
+   *    back to the whole parsed output with every coerced member labelled. That
+   *    was the answer before the per-member reading, and it never publishes an
+   *    `unknown`.
    */
   private schemaContract(
     value: Node,
@@ -4358,38 +4368,119 @@ export class TypeInferrer {
       return text ? { text } : null;
     }
 
-    const inputTop = this.topTypePositions(input, node);
-    if (output && inputTop.size > 0) {
-      const outputTop = this.topTypePositions(output, node);
-      const coerced = [...inputTop.entries()]
-        .filter(([position]) => !outputTop.has(position))
-        .sort(([a], [b]) => a.localeCompare(b));
-      if (coerced.length > 0) {
-        const text = this.structuralTextFromType(output, node);
-        if (!text) {
-          return null;
-        }
-        this.log(
-          `Route schema entry at ${where} accepts any value at ` +
-            `${coerced.map(([position]) => position || '<root>').join(', ')} on input; ` +
-            'publishing its parsed output and recording the coercion'
-        );
-        return {
-          text,
-          provenance: coerced.map(([position, kind]) => ({
-            path: position,
-            kind,
-            reason: 'coerced_input',
-            detail:
-              `the schema accepts any value here and coerces it, so the published type ` +
-              `is what parsing produces, not a limit on what a caller may send`,
-          })),
-        };
-      }
+    const inputTop = this.topTypePositions(input, node, where);
+    const outputTop =
+      output && inputTop.size > 0 ? this.topTypePositions(output, node, where) : undefined;
+    const coerced = outputTop
+      ? [...inputTop.entries()]
+          .filter(([position]) => !outputTop.has(position))
+          .sort(([a], [b]) => a.localeCompare(b))
+      : [];
+
+    if (!output || coerced.length === 0) {
+      const text = this.structuralTextFromType(input, node);
+      return text ? { text } : null;
     }
 
-    const text = this.structuralTextFromType(input, node);
-    return text ? { text } : null;
+    const positions = coerced.map(([position]) => position || '<root>').join(', ');
+    const provenance: TypeProvenance[] = coerced.map(([position, kind]) => ({
+      path: position,
+      kind,
+      reason: 'coerced_input',
+      detail:
+        `the schema accepts any value here and coerces it, so the published type ` +
+        `is what parsing produces, not a limit on what a caller may send`,
+    }));
+
+    const text = this.inputWithCoercedMembers(
+      input,
+      output,
+      coerced.map(([position]) => position),
+      node,
+      where
+    );
+    if (text) {
+      this.log(
+        `Route schema entry at ${where} accepts any value at ${positions} on input; ` +
+          'publishing the parsed type there and the input everywhere else'
+      );
+      return { text, provenance };
+    }
+
+    const whole = this.structuralTextFromType(output, node);
+    if (!whole) {
+      return null;
+    }
+    this.log(
+      `Route schema entry at ${where} accepts any value at ${positions} on input, and not ` +
+        'every one could be substituted member by member; publishing its whole parsed output'
+    );
+    return { text: whole, provenance };
+  }
+
+  /**
+   * Print a schema's input with each coerced position replaced by the output's
+   * type at that position (carrick#1105). Null when any position cannot be
+   * substituted: its output is missing or differs across union branches, or
+   * the printer never reached it. A partial substitution would publish an
+   * `unknown`, so it is not an answer.
+   */
+  private inputWithCoercedMembers(
+    input: Type,
+    output: Type,
+    coerced: string[],
+    at: Node,
+    where: string
+  ): string | null {
+    const wanted = new Set(coerced);
+    const types = new Map<string, Type>();
+    const ambiguous = new Set<string>();
+    this.walkTypePositions(output, at, where, (type, position, unionPart) => {
+      // A union's parts share its position; the union itself is the type there.
+      if (wanted.has(position) && !unionPart) {
+        const seen = types.get(position);
+        if (!seen) {
+          types.set(position, type);
+        } else if (seen.compilerType !== type.compilerType) {
+          ambiguous.add(position);
+        }
+      }
+      return true;
+    });
+    for (const position of ambiguous) {
+      types.delete(position);
+    }
+    const missing = coerced.filter((position) => !types.has(position));
+    if (missing.length > 0) {
+      this.log(
+        `Route schema entry at ${where}: no single parsed type at ` +
+          `${missing.map((position) => position || '<root>').join(', ')} to substitute ` +
+          'for the coerced input'
+      );
+      return null;
+    }
+
+    const root = types.get('');
+    if (root) {
+      return this.structuralTextFromType(root, at);
+    }
+
+    const overrides: MemberOverrides = { types, applied: new Set(), at };
+    let text: string;
+    try {
+      text = expandTypeStructural(this.unwrapPromiseType(input), new Set(), 0, overrides);
+    } catch {
+      return null;
+    }
+    const unreached = coerced.filter((position) => !overrides.applied.has(position));
+    if (unreached.length > 0) {
+      this.log(
+        `Route schema entry at ${where}: the printer did not reach coerced ` +
+          `${unreached.join(', ')} (tuple, cycle or depth bound)`
+      );
+      return null;
+    }
+    return this.isUselessType(text) ? null : text;
   }
 
   /**
@@ -4398,23 +4489,51 @@ export class TypeInferrer {
    * `sub.field`, `items<0>` for an array element). Union and intersection
    * members share their parent's position, so `unknown | undefined` on an
    * optional key reads as `unknown` there.
-   *
-   * Bounded and cycle-safe: it only has to tell a schema's input apart from its
-   * output, so a subtree past the bound is simply not compared.
    */
-  private topTypePositions(root: Type, at: Node): Map<string, 'any' | 'unknown'> {
-    const MAX_DEPTH = 8;
-    const MAX_VISITED = 512;
+  private topTypePositions(
+    root: Type,
+    at: Node,
+    where: string
+  ): Map<string, 'any' | 'unknown'> {
     const found = new Map<string, 'any' | 'unknown'>();
-    const onPath = new Set<ts.Type>();
-    let visited = 0;
-
-    const walk = (type: Type, position: string, depth: number): void => {
-      if (depth > MAX_DEPTH || visited > MAX_VISITED) {
-        return;
-      }
+    this.walkTypePositions(root, at, where, (type, position) => {
       if (type.isAny() || type.isUnknown()) {
         found.set(position, type.isAny() ? 'any' : 'unknown');
+        return false;
+      }
+      return true;
+    });
+    return found;
+  }
+
+  /**
+   * Visit every member position of `root`, in the notation `topTypePositions`
+   * documents. `visit` returns false to stop descending below a position;
+   * `unionPart` is true when the type is a union or intersection part visited
+   * at its parent's position. Callables are not descended into.
+   *
+   * Bounded and cycle-safe. It only has to tell a schema's input apart from its
+   * output, so a subtree past the bound is not compared, and that is logged:
+   * a coercion below the bound prints as its input declares it.
+   */
+  private walkTypePositions(
+    root: Type,
+    at: Node,
+    where: string,
+    visit: (type: Type, position: string, unionPart: boolean) => boolean
+  ): void {
+    const MAX_DEPTH = 8;
+    const MAX_VISITED = 512;
+    const onPath = new Set<ts.Type>();
+    let visited = 0;
+    let bounded = false;
+
+    const walk = (type: Type, position: string, depth: number, unionPart: boolean): void => {
+      if (depth > MAX_DEPTH || visited > MAX_VISITED) {
+        bounded = true;
+        return;
+      }
+      if (!visit(type, position, unionPart)) {
         return;
       }
       const compilerType = type.compilerType;
@@ -4431,14 +4550,14 @@ export class TypeInferrer {
             : undefined;
         if (parts) {
           for (const part of parts) {
-            walk(part, position, depth + 1);
+            walk(part, position, depth + 1, true);
           }
           return;
         }
         if (type.isArray()) {
           const element = type.getArrayElementType();
           if (element) {
-            walk(element, `${position}<0>`, depth + 1);
+            walk(element, `${position}<0>`, depth + 1, false);
           }
           return;
         }
@@ -4453,15 +4572,26 @@ export class TypeInferrer {
             continue;
           }
           const name = property.getName();
-          walk(propertyType, position === '' ? name : `${position}.${name}`, depth + 1);
+          walk(
+            propertyType,
+            position === '' ? name : `${position}.${name}`,
+            depth + 1,
+            false
+          );
         }
       } finally {
         onPath.delete(compilerType);
       }
     };
 
-    walk(root, '', 0);
-    return found;
+    walk(root, '', 0, false);
+    if (bounded) {
+      this.log(
+        `Schema type at ${where} is deeper or wider than the position walk bound ` +
+          `(depth ${MAX_DEPTH}, ${MAX_VISITED} members); members past it are not ` +
+          'compared for coercion'
+      );
+    }
   }
 
   /**

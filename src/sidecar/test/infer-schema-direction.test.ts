@@ -16,9 +16,12 @@
  *     `~standard.types.input` first, then `_input`, and only a schema with
  *     neither publishes its output;
  *  2. a response bound to the same schema keeps the output;
- *  3. when the input carries `unknown` where the output does not (a coercion
- *     accepts any value), the row publishes the output and records the member
- *     as `coerced_input` in `any_provenance`, rather than abstaining.
+ *  3. a member whose input is `unknown` where the output is concrete (a
+ *     coercion accepts any value) publishes its OUTPUT type and is recorded as
+ *     `coerced_input` in `any_provenance`, rather than abstaining. The decision
+ *     is per member (carrick#1105): every other member keeps its input, so a
+ *     defaulted key beside a coerced one stays optional, and the key's own
+ *     optionality always comes from the input.
  *
  * The fake `schema-lib` exposes both members, and `standard-lib` exposes only
  * `~standard`, so each read order is exercised on its own.
@@ -167,13 +170,76 @@ describe('schema direction: requests read the input, responses the output', () =
     const inferred = await requestBySpan("router.post('/page'", 'Page');
     assert.ok(inferred, 'a coerced body must still resolve, not abstain');
     const type = inferred.type_string;
-    assert.match(type, /page\s*:\s*number/, `coerced key must read as the output in: ${type}`);
+    // `page` is defaulted AND coerced: optional to send (the input's key),
+    // typed as what parsing produces (the output's member).
+    assert.match(type, /page\s*\?\s*:\s*number\s*;/, `coerced key must read as the output, optional as the input in: ${type}`);
     assert.match(type, /label\s*:\s*string/, `plain key missing from: ${type}`);
     assert.doesNotMatch(type, /\bunknown\b/, `the unknown input must not be published: ${type}`);
     assert.deepStrictEqual(
       (inferred.any_provenance ?? []).map(({ path: p, kind, reason }) => ({ path: p, kind, reason })),
       [{ path: 'page', kind: 'unknown', reason: 'coerced_input' }],
       `coerced member must be labelled: ${JSON.stringify(inferred.any_provenance)}`
+    );
+  });
+
+  it('a coerced member beside a defaulted one: each member keeps its own direction', async () => {
+    const inferred = await requestBySpan("router.post('/mixed'", 'Mixed');
+    assert.ok(inferred, 'a mixed body must resolve');
+    const type = inferred.type_string;
+    assert.match(type, /page\s*:\s*number\s*;/, `coerced key must read as the output in: ${type}`);
+    assert.match(type, /theme\s*\?\s*:\s*string\s*;/, `defaulted key must stay optional beside a coerced one in: ${type}`);
+    assert.match(type, /label\s*:\s*string\s*;/, `plain key missing from: ${type}`);
+    assert.doesNotMatch(type, /\bunknown\b/, `the unknown input must not be published: ${type}`);
+    assert.deepStrictEqual(
+      (inferred.any_provenance ?? []).map(({ path: p, kind, reason }) => ({ path: p, kind, reason })),
+      [{ path: 'page', kind: 'unknown', reason: 'coerced_input' }],
+      `only the coerced member is labelled: ${JSON.stringify(inferred.any_provenance)}`
+    );
+  });
+
+  it('coerced and defaulted members inside nested objects and arrays keep their own directions', async () => {
+    const inferred = await requestBySpan("router.post('/nested'", 'Nested');
+    assert.ok(inferred, 'a nested body must resolve');
+    const type = inferred.type_string;
+    assert.match(
+      type,
+      /filter\s*:\s*\{\s*limit\s*:\s*number\s*;\s*sort\s*\?\s*:\s*string\s*;\s*\}/,
+      `nested object must mix output and input members in: ${type}`
+    );
+    assert.match(type, /ids\s*:\s*number\[\]/, `coerced array element must read as the output in: ${type}`);
+    assert.match(
+      type,
+      /lines\s*:\s*\{\s*qty\s*:\s*number\s*;\s*note\s*\?\s*:\s*string\s*;\s*\}\[\]/,
+      `array of objects must mix output and input members in: ${type}`
+    );
+    assert.match(type, /label\s*\?\s*:\s*string\s*;/, `defaulted top-level key must stay optional in: ${type}`);
+    assert.match(type, /offset\s*\?\s*:\s*number\s*;/, `optional coerced key must read as the output in: ${type}`);
+    assert.doesNotMatch(type, /\bunknown\b/, `no unknown input may be published: ${type}`);
+    assert.deepStrictEqual(
+      (inferred.any_provenance ?? []).map(({ path: p, kind, reason }) => ({ path: p, kind, reason })),
+      [
+        { path: 'filter.limit', kind: 'unknown', reason: 'coerced_input' },
+        { path: 'ids<0>', kind: 'unknown', reason: 'coerced_input' },
+        { path: 'lines<0>.qty', kind: 'unknown', reason: 'coerced_input' },
+        { path: 'offset', kind: 'unknown', reason: 'coerced_input' },
+      ],
+      `each coerced position is labelled: ${JSON.stringify(inferred.any_provenance)}`
+    );
+  });
+
+  it('a coerced position the printer cannot reach falls back to the whole parsed output, labelled', async () => {
+    // A tuple is printed by name, so its coerced element cannot be substituted
+    // member by member. Publishing the input there would publish `unknown`.
+    const inferred = await requestBySpan("router.post('/pair'", 'Pair');
+    assert.ok(inferred, 'a body with an unreachable coercion must still resolve');
+    const type = inferred.type_string;
+    assert.match(type, /point\s*:\s*\[number,\s*string\]/, `tuple must read as the output in: ${type}`);
+    assert.match(type, /unit\s*:\s*string/, `whole-output fallback expected in: ${type}`);
+    assert.doesNotMatch(type, /\bunknown\b/, `the unknown input must not be published: ${type}`);
+    assert.deepStrictEqual(
+      (inferred.any_provenance ?? []).map(({ path: p, kind, reason }) => ({ path: p, kind, reason })),
+      [{ path: 'point.0', kind: 'unknown', reason: 'coerced_input' }],
+      `the coerced element is labelled: ${JSON.stringify(inferred.any_provenance)}`
     );
   });
 
