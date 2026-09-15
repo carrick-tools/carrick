@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.3.71](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.70...carrick-v0.3.71) (2026-09-15)
+
+
+### Features
+
+* **agent:** adapt model-request concurrency per route and pace the gateway rate ([#1119](https://github.com/carrick-tools/carrick/issues/1119)) ([6023df3](https://github.com/carrick-tools/carrick/commit/6023df3fabe499ab38b79fadba8f6b2b9d2d8d9b))
+* **engine:** report a laptop run that dies before start-scan ([#1096](https://github.com/carrick-tools/carrick/issues/1096)) ([#1111](https://github.com/carrick-tools/carrick/issues/1111)) ([b9514da](https://github.com/carrick-tools/carrick/commit/b9514dacacafcce14fc240e60cdc499d40d90b42))
+* **graphql:** declare a code-first service's printed schema in graphqlSchemas ([#1114](https://github.com/carrick-tools/carrick/issues/1114)) ([dc3dcba](https://github.com/carrick-tools/carrick/commit/dc3dcbaa86f85f314a9ed9651a0b0e61cede7cfa)), closes [#1099](https://github.com/carrick-tools/carrick/issues/1099)
+* laptop run log and fail marker, run-id headers, install id on the MCP config (carrick[#1063](https://github.com/carrick-tools/carrick/issues/1063), [#1052](https://github.com/carrick-tools/carrick/issues/1052), cloud[#872](https://github.com/carrick-tools/carrick/issues/872), cloud[#890](https://github.com/carrick-tools/carrick/issues/890)) ([#1094](https://github.com/carrick-tools/carrick/issues/1094)) ([4019185](https://github.com/carrick-tools/carrick/commit/4019185a665444ef389f7b186fb410f89ddadacc))
+
+
+### Bug Fixes
+
+* **agent:** sit out the cloud's analysis_in_flight wait without cutting the limit or spending an attempt ([#1131](https://github.com/carrick-tools/carrick/issues/1131)) ([#1137](https://github.com/carrick-tools/carrick/issues/1137)) ([64b23f5](https://github.com/carrick-tools/carrick/commit/64b23f5d4ef3c5cc81c0780ad17c4cc36599c1cd))
+* **call-graph:** resolve path-alias imports through the repo's config ([#1104](https://github.com/carrick-tools/carrick/issues/1104)) ([#1107](https://github.com/carrick-tools/carrick/issues/1107)) ([923ee2f](https://github.com/carrick-tools/carrick/commit/923ee2f6f090fcdf8d59c888552875cd8e2e6207))
+* **engine:** close a laptop scan with pending services on its final write, naming them, when the cloud reads the list ([#1130](https://github.com/carrick-tools/carrick/issues/1130)) ([0a699aa](https://github.com/carrick-tools/carrick/commit/0a699aa71fa94843026f11b7b38b864a0573fe11))
+* **engine:** finish a scan when one model call is exhausted, retry what it owes, land the rest ([#1124](https://github.com/carrick-tools/carrick/issues/1124)) ([#1125](https://github.com/carrick-tools/carrick/issues/1125)) ([297a196](https://github.com/carrick-tools/carrick/commit/297a1961680a6e333ca107dec71a910be21da28f))
+* **engine:** one run-wide retry budget, and keep a detection when only its guidance fails ([#1126](https://github.com/carrick-tools/carrick/issues/1126)) ([#1129](https://github.com/carrick-tools/carrick/issues/1129)) ([b600525](https://github.com/carrick-tools/carrick/commit/b600525264f9ff36c3ddf6f2b973efea04042faf))
+* **engine:** pass the run's redaction to the pending-analysis fail reason ([#1127](https://github.com/carrick-tools/carrick/issues/1127)) ([6b07eeb](https://github.com/carrick-tools/carrick/commit/6b07eeb5a2ae1b604ddbf9aac3d9952f3bf7b1e0))
+* **engine:** say why a run log was not uploaded, and stop the local join claiming it was ([#1097](https://github.com/carrick-tools/carrick/issues/1097)) ([e8e0dda](https://github.com/carrick-tools/carrick/commit/e8e0ddad74e3d0258ff404af51eada30930145e8)), closes [#1063](https://github.com/carrick-tools/carrick/issues/1063)
+* **git-state:** a tree whose only changes are the Carrick scaffold is not dirty ([#1117](https://github.com/carrick-tools/carrick/issues/1117)) ([#1118](https://github.com/carrick-tools/carrick/issues/1118)) ([c204fc9](https://github.com/carrick-tools/carrick/commit/c204fc9a29e5295c9d75610b33748771039973f1))
+* **intents:** defer callers of a failed callee and describe a shared function once ([#1080](https://github.com/carrick-tools/carrick/issues/1080)) ([#1113](https://github.com/carrick-tools/carrick/issues/1113)) ([a5400b6](https://github.com/carrick-tools/carrick/commit/a5400b62e05a554656ffc747c07c1af190940cbd))
+* **logging:** a scan logs to a file of its own, and uploads only that file ([#1133](https://github.com/carrick-tools/carrick/issues/1133)) ([#1136](https://github.com/carrick-tools/carrick/issues/1136)) ([c0d0627](https://github.com/carrick-tools/carrick/commit/c0d06278c8ac24218d0b1d38c39616464cc50437))
+* **logging:** redact the repo root, machine paths and the account name from uploaded logs ([#1098](https://github.com/carrick-tools/carrick/issues/1098)) ([#1116](https://github.com/carrick-tools/carrick/issues/1116)) ([1b44e88](https://github.com/carrick-tools/carrick/commit/1b44e88c0c8920d50457c91ac6cb27f565b32a88))
+* **npm:** run the binary CARRICK_BIN names for every scanner command ([#1100](https://github.com/carrick-tools/carrick/issues/1100)) ([#1112](https://github.com/carrick-tools/carrick/issues/1112)) ([f92cf20](https://github.com/carrick-tools/carrick/commit/f92cf20506bbe6199fc8d6390492ee22c3908c40))
+* **sidecar:** decide a coerced request schema member by member, not for the whole row ([#1110](https://github.com/carrick-tools/carrick/issues/1110)) ([0a85fd7](https://github.com/carrick-tools/carrick/commit/0a85fd731fd62be1dd67c4fe4d4a533cd8fc787f))
+* **sidecar:** request rows read a validation schema's input type, not its parsed output ([#1106](https://github.com/carrick-tools/carrick/issues/1106)) ([e953f5d](https://github.com/carrick-tools/carrick/commit/e953f5d933303d973439030a61fe950ed63db4ce)), closes [#1101](https://github.com/carrick-tools/carrick/issues/1101)
+* **status:** a foreground carrick index records its scan, and a Ctrl-C closes the record ([#1132](https://github.com/carrick-tools/carrick/issues/1132)) ([#1135](https://github.com/carrick-tools/carrick/issues/1135)) ([9c61a3f](https://github.com/carrick-tools/carrick/commit/9c61a3f959b8f257c5ebfdcd7dcc34eca64e547c))
+* **status:** one line per scan in user terms; slow-down and retry lines reach carrick index ([#1103](https://github.com/carrick-tools/carrick/issues/1103), [#1122](https://github.com/carrick-tools/carrick/issues/1122)) ([#1123](https://github.com/carrick-tools/carrick/issues/1123)) ([574b1d1](https://github.com/carrick-tools/carrick/commit/574b1d130c2894a3a03a7e507dc2c30a50217290))
+
+
+### Performance
+
+* **engine:** discover a service once when the scan falls back to a full analysis ([#1108](https://github.com/carrick-tools/carrick/issues/1108)) ([#1120](https://github.com/carrick-tools/carrick/issues/1120)) ([b786aa0](https://github.com/carrick-tools/carrick/commit/b786aa0e0c9f59a5b0e36b7b8232c0310953e950))
+
+
+### CI/CD
+
+* **plugin:** install npm/carrick with npm install, not npm ci ([#1092](https://github.com/carrick-tools/carrick/issues/1092)) ([770bfbb](https://github.com/carrick-tools/carrick/commit/770bfbb0d922c5c4bab83378f4f8f81fed362105)), closes [#906](https://github.com/carrick-tools/carrick/issues/906) [#914](https://github.com/carrick-tools/carrick/issues/914)
+* shard the Rust tests across three runners and drop coverage from the sidecar suite ([#1095](https://github.com/carrick-tools/carrick/issues/1095)) ([19a01e7](https://github.com/carrick-tools/carrick/commit/19a01e7bc18f51305b7134ae7748a565515197eb))
+
 ## [0.3.70](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.69...carrick-v0.3.70) (2026-09-15)
 
 
