@@ -49,6 +49,7 @@ use swc_ecma_visit::VisitWith;
 pub mod durability;
 pub(crate) mod served_paths;
 pub(crate) mod type_compat_v2;
+pub(crate) mod upload_boundary;
 
 /// Current cache format version.
 ///
@@ -371,6 +372,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     no_cache: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let should_upload = should_upload_data();
+    // What every upload of this run passes through last (carrick#1204).
+    let boundary = upload_boundary::UploadBoundary::for_scan(repo_path);
     debug!(upload = should_upload, "Running Carrick in CI mode");
     // The run's one ceiling on waiting out a refusing model (carrick#1126).
     crate::retry_budget::reset();
@@ -573,7 +576,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                             git_state.dirty,
                             unchanged_at_start.as_ref(),
                         );
-                        upload_service_payloads(storage, &payloads, no_cache, false).await;
+                        upload_service_payloads(storage, &payloads, no_cache, false, &boundary)
+                            .await;
                     }
                 }
                 return Err(error);
@@ -1006,28 +1010,29 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
 
     crate::scan_stage::enter(crate::scan_stage::Stage::CrossRepoCheck);
     let sp = logging::spinner("Running cross-repo analysis...");
-    let analyzer =
-        match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar).await {
-            Ok(analyzer) => analyzer,
-            Err(e) => {
-                // Cross-repo analysis (which is what runs the type check) failed. Close
-                // the spinner with a warning first so the upload's own spinner
-                // and log lines don't interleave with an unfinished one in
-                // non-TTY CI logs, then preserve the prior behavior where the
-                // per-repo index upload happened BEFORE cross-repo analysis:
-                // still upload this run's data — verdict-less — so the index
-                // stays fresh, then propagate the failure.
-                logging::finish_spinner_warn(&sp, "Cross-repo analysis failed");
-                if let Some(payloads) = &upload_payloads {
-                    // Whatever the upload could not confirm has already been
-                    // named in its own summary line and annotation; the error
-                    // this path returns is the analysis failure that brought it
-                    // here, which is the one worth raising (carrick#1067).
-                    upload_service_payloads(storage, payloads, no_cache, !incomplete).await;
-                }
-                return Err(e);
+    let analyzer = match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar)
+        .await
+    {
+        Ok(analyzer) => analyzer,
+        Err(e) => {
+            // Cross-repo analysis (which is what runs the type check) failed. Close
+            // the spinner with a warning first so the upload's own spinner
+            // and log lines don't interleave with an unfinished one in
+            // non-TTY CI logs, then preserve the prior behavior where the
+            // per-repo index upload happened BEFORE cross-repo analysis:
+            // still upload this run's data — verdict-less — so the index
+            // stays fresh, then propagate the failure.
+            logging::finish_spinner_warn(&sp, "Cross-repo analysis failed");
+            if let Some(payloads) = &upload_payloads {
+                // Whatever the upload could not confirm has already been
+                // named in its own summary line and annotation; the error
+                // this path returns is the analysis failure that brought it
+                // here, which is the one worth raising (carrick#1067).
+                upload_service_payloads(storage, payloads, no_cache, !incomplete, &boundary).await;
             }
-        };
+            return Err(e);
+        }
+    };
     logging::finish_spinner(&sp, "Cross-repo analysis complete");
 
     let mut results = analyzer.get_results();
@@ -1152,7 +1157,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             first_index_open.is_empty() || storage.name_pending_on_final_write(&first_index_open);
         closed_by_final_write = closes_run && !payloads.is_empty();
         unconfirmed_uploads =
-            upload_service_payloads(storage, &payloads, no_cache, closes_run).await;
+            upload_service_payloads(storage, &payloads, no_cache, closes_run, &boundary).await;
     }
 
     let topology = crate::findings::Topology {
@@ -1867,6 +1872,7 @@ async fn upload_service_payloads<T: CloudStorage>(
     // Whether the last write closes the scan. False when the run leaves a
     // service incomplete, which is closed by its fail marker instead.
     closes_run: bool,
+    boundary: &upload_boundary::UploadBoundary,
 ) -> Vec<UnconfirmedUpload> {
     crate::scan_stage::enter(crate::scan_stage::Stage::Upload);
     let sp = logging::spinner("Uploading results...");
@@ -1892,7 +1898,12 @@ async fn upload_service_payloads<T: CloudStorage>(
         // from the one it replaced — a forced run rewrites a row that already
         // carries this commit (carrick#1067).
         let attempted_at = chrono::Utc::now();
-        match storage.upload_repo_data(payload, final_in_run).await {
+        // Defence in depth for machine paths (carrick#1204): whatever an
+        // upstream pass left holding the checkout root or home goes up as a
+        // placeholder. The payload in memory is not touched.
+        let scrubbed = boundary.scrub(payload, service);
+        let outgoing = scrubbed.as_ref().unwrap_or(payload);
+        match storage.upload_repo_data(outgoing, final_in_run).await {
             Ok(outcome) => {
                 outcomes.push(outcome);
                 confirmed.push(service);
@@ -6852,6 +6863,8 @@ mod tests {
         uploads: std::sync::Mutex<std::collections::VecDeque<Result<UploadOutcome, StorageError>>>,
         landed: std::sync::Mutex<std::collections::VecDeque<Result<bool, StorageError>>>,
         uploaded: std::sync::Mutex<Vec<String>>,
+        /// The serialized body of each upload, as the wire would carry it.
+        uploaded_bodies: std::sync::Mutex<Vec<String>>,
         landed_asks: std::sync::Mutex<Vec<String>>,
     }
 
@@ -6864,12 +6877,17 @@ mod tests {
                 uploads: std::sync::Mutex::new(uploads.into()),
                 landed: std::sync::Mutex::new(landed.into()),
                 uploaded: std::sync::Mutex::new(Vec::new()),
+                uploaded_bodies: std::sync::Mutex::new(Vec::new()),
                 landed_asks: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         fn uploaded(&self) -> Vec<String> {
             self.uploaded.lock().unwrap().clone()
+        }
+
+        fn uploaded_bodies(&self) -> Vec<String> {
+            self.uploaded_bodies.lock().unwrap().clone()
         }
 
         fn landed_asks(&self) -> Vec<String> {
@@ -6891,6 +6909,10 @@ mod tests {
             _final_in_run: bool,
         ) -> Result<UploadOutcome, StorageError> {
             self.uploaded.lock().unwrap().push(scripted_service(data));
+            self.uploaded_bodies
+                .lock()
+                .unwrap()
+                .push(serde_json::to_string(data).expect("payload serializes"));
             self.uploads
                 .lock()
                 .unwrap()
@@ -6949,6 +6971,62 @@ mod tests {
         })
     }
 
+    /// A boundary with no machine prefixes: the upload tests that are about
+    /// delivery, not paths.
+    fn no_boundary() -> upload_boundary::UploadBoundary {
+        upload_boundary::UploadBoundary::new("", None)
+    }
+
+    /// carrick#1204. A stub file an upstream pass left holding the checkout
+    /// root and the home directory goes up with placeholders, the upload is
+    /// not refused, and the payload the run keeps in memory is untouched.
+    #[tokio::test]
+    async fn the_upload_boundary_scrubs_a_machine_path_an_upstream_pass_missed() {
+        let root = "/home/user/work/acme-app";
+        let home = "/home/user";
+        let mut leaking = service_data("acme-app", Some("orders"));
+        leaking.capture_stub = Some(crate::cloud_storage::CaptureStubArtifact {
+            artifact_version: 1,
+            package_name: "@carrick/orders".to_string(),
+            ts_version: "5.8.2".to_string(),
+            bare_checkout: false,
+            files: std::collections::BTreeMap::from([(
+                "types/surface.d.ts".to_string(),
+                format!(
+                    "export type A = import(\"{root}/node_modules/.store/kit@1.0.0/node_modules/kit/index\").T;\n\
+                     export type B = import(\"{home}/.cache/runtime/npm/registry.example.org/kit/1.0.0/index\").T;\n"
+                ),
+            )]),
+        });
+        let payloads = vec![leaking];
+        let storage = ScriptedStorage::new(vec![Ok(UploadOutcome::default())], vec![]);
+
+        let unconfirmed = upload_service_payloads(
+            &storage,
+            &payloads,
+            false,
+            true,
+            &upload_boundary::UploadBoundary::new(root, Some(home)),
+        )
+        .await;
+
+        assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
+        let bodies = storage.uploaded_bodies();
+        assert_eq!(bodies.len(), 1, "the upload is never refused");
+        assert!(
+            !bodies[0].contains(home),
+            "uploaded body holds a machine path: {}",
+            bodies[0]
+        );
+        assert!(bodies[0].contains("<checkout>/node_modules/.store/kit@1.0.0"));
+        assert!(bodies[0].contains("<home>/.cache/runtime/npm"));
+        let kept = &payloads[0].capture_stub.as_ref().unwrap().files["types/surface.d.ts"];
+        assert!(
+            kept.contains(root),
+            "the in-memory payload is not rewritten"
+        );
+    }
+
     fn two_services() -> Vec<CloudRepoData> {
         vec![
             service_data("api-server", Some("orders")),
@@ -6967,7 +7045,8 @@ mod tests {
             vec![Ok(true)],
         );
 
-        let unconfirmed = upload_service_payloads(&storage, &two_services(), false, true).await;
+        let unconfirmed =
+            upload_service_payloads(&storage, &two_services(), false, true, &no_boundary()).await;
 
         assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
         assert_eq!(storage.uploaded(), vec!["orders", "billing"]);
@@ -6984,7 +7063,8 @@ mod tests {
             vec![Ok(false)],
         );
 
-        let unconfirmed = upload_service_payloads(&storage, &two_services(), false, true).await;
+        let unconfirmed =
+            upload_service_payloads(&storage, &two_services(), false, true, &no_boundary()).await;
 
         assert_eq!(unconfirmed.len(), 1);
         assert_eq!(unconfirmed[0].service, "orders");
@@ -7007,7 +7087,8 @@ mod tests {
             vec![],
         );
 
-        let unconfirmed = upload_service_payloads(&storage, &two_services(), false, true).await;
+        let unconfirmed =
+            upload_service_payloads(&storage, &two_services(), false, true, &no_boundary()).await;
 
         assert_eq!(unconfirmed.len(), 1);
         assert!(
@@ -7029,7 +7110,8 @@ mod tests {
             vec![Ok(false), Ok(false), Ok(true)],
         );
 
-        let unconfirmed = upload_service_payloads(&storage, &two_services(), false, true).await;
+        let unconfirmed =
+            upload_service_payloads(&storage, &two_services(), false, true, &no_boundary()).await;
 
         assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
         assert_eq!(storage.landed_asks().len(), 3);
@@ -7046,7 +7128,8 @@ mod tests {
         );
 
         let unconfirmed =
-            upload_service_payloads(&storage, &two_services()[..1], false, true).await;
+            upload_service_payloads(&storage, &two_services()[..1], false, true, &no_boundary())
+                .await;
 
         assert_eq!(unconfirmed.len(), 1);
     }
@@ -7495,6 +7578,17 @@ mod tests {
                         "types/surface.d.ts".to_string(),
                         STUB_SURFACE.to_string(),
                     ),
+                    (
+                        // A path the capture's rewrite did not recognise slips
+                        // through (carrick#1204): only the upload boundary
+                        // stands between it and the index.
+                        "types/slipped.d.ts".to_string(),
+                        format!(
+                            "export type Slipped = import(\"{}\").T | import(\"{}\").U;\n",
+                            abs("node_modules/.unknown-layout/kit/index"),
+                            cached("kit/1.0.0")
+                        ),
+                    ),
                 ]),
             }),
             external_call_candidates: Some(vec![ExternalCallCandidate {
@@ -7596,20 +7690,49 @@ mod tests {
         // The pass never edits a compiled declaration file, byte for byte.
         assert_eq!(stub.files["types/surface.d.ts"], STUB_SURFACE);
 
-        // Then the exhaustive sweep over the serialized payload, every stub
-        // file included.
-        let json = serde_json::to_value(&data).expect("payload serializes");
-        let mut offenders: Vec<String> = Vec::new();
-        walk_json_strings(&json, &mut |s| {
-            if s.contains(repo_path) || s.contains(home) {
-                offenders.push(s.to_string());
-            }
-        });
+        let offenders_in = |payload: &CloudRepoData| {
+            let json = serde_json::to_value(payload).expect("payload serializes");
+            let mut offenders: Vec<String> = Vec::new();
+            walk_json_strings(&json, &mut |s| {
+                if s.contains(repo_path) || s.contains(home) {
+                    offenders.push(s.to_string());
+                }
+            });
+            offenders
+        };
+        // The served-text pass alone leaves exactly the slipped stub file, so
+        // it is the upload boundary below that makes the sweep pass.
+        let after_relativize = offenders_in(&data);
+        assert_eq!(after_relativize.len(), 1, "{after_relativize:?}");
+        assert!(after_relativize[0].starts_with("export type Slipped"));
+
+        // Then the upload boundary, and the exhaustive sweep over what it
+        // hands the upload: every string and key, every stub file included.
+        let outgoing = upload_boundary::UploadBoundary::new(repo_path, Some(home))
+            .scrub(&data, "acme-app")
+            .expect("the boundary rewrites the slipped file");
+        let offenders = offenders_in(&outgoing);
         assert!(
             offenders.is_empty(),
             "uploaded payload still carries absolute paths: {:?}",
             offenders
         );
+        let outgoing_stub = outgoing.capture_stub.as_ref().expect("capture stub");
+        assert_eq!(
+            outgoing_stub.files["types/slipped.d.ts"],
+            "export type Slipped = import(\"<checkout>/node_modules/.unknown-layout/kit/index\").T \
+             | import(\"<home>/.cache/runtime/npm/registry.npmjs.org/kit/1.0.0/dist/types\").U;\n"
+        );
+        assert_eq!(
+            outgoing_stub.files["types/surface.d.ts"], STUB_SURFACE,
+            "a file with no machine path is uploaded as it is"
+        );
+        // The boundary rebuilt the payload from its own wire format; nothing
+        // else in it moved.
+        let mut expected = serde_json::to_value(&data).unwrap();
+        expected["capture_stub"]["files"]["types/slipped.d.ts"] =
+            serde_json::Value::String(outgoing_stub.files["types/slipped.d.ts"].clone());
+        assert_eq!(serde_json::to_value(&outgoing).unwrap(), expected);
     }
 
     /// Visit every string in a JSON value, keys included: an absolute path can
