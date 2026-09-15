@@ -227,7 +227,9 @@ pub(crate) fn text_is_bare_top_type(text: &str) -> bool {
 /// Root `any_provenance` reasons with which the inferrer DECIDED a payload has
 /// no contract, as opposed to failing to see one. `no_success_payload`: every
 /// response the route's handler sends is an error or a redirect (carrick#1161).
-const DECIDED_ABSTAIN_REASONS: &[&str] = &["no_success_payload"];
+/// `no_request_body`: the located request read is a validated non-body part
+/// (carrick#1166).
+const DECIDED_ABSTAIN_REASONS: &[&str] = &["no_success_payload", "no_request_body"];
 
 /// True when an inference answered a bare top type because the inferrer read
 /// the use site and decided nothing there is a contract.
