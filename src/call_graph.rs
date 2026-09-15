@@ -1589,6 +1589,31 @@ mod tests {
         assert_eq!(defs["outer"].calls[0].call_site_line, 4);
     }
 
+    /// A call written in a parameter default runs as part of the function, so
+    /// the function owns it, not the file's module-scope row (carrick#1159).
+    #[test]
+    fn parameter_default_calls_belong_to_their_function() {
+        let (_dir, defs) = scan(&[(
+            "app.ts",
+            "function target() {}\n\
+             export function declared(value = target()) { return value; }\n\
+             export const arrow = (value = target()) => value;\n\
+             export class Service {\n\
+               method({ value } = { value: target() }) { return value; }\n\
+             }\n",
+        )]);
+        for owner in ["declared", "arrow", "Service.method"] {
+            assert_eq!(callee_names(&defs, owner), vec!["target"], "{owner}");
+        }
+        assert!(
+            !defs
+                .keys()
+                .any(|key| key.starts_with(crate::visitor::MODULE_SCOPE_KEY)),
+            "no call is left at module scope: {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn separate_same_line_calls_keep_both_owners() {
         let (_dir, defs) = scan(&[(

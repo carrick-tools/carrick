@@ -354,7 +354,14 @@ impl WorkspaceScan {
 
 impl Built {
     fn for_repo(repo_root: &Path) -> Self {
-        let index = WorkspaceIndex::build(repo_root);
+        // The resolver that reads the repo's aliases (tsconfig `paths`, Deno
+        // import maps, package.json `imports`): a client reached through
+        // `@generated-db/client.ts` is otherwise an unresolved specifier and
+        // owns nothing (carrick#1159). These rows feed no analyzer input, so
+        // the manifest-only index pinned by carrick#474 does not apply. The
+        // pass is repo-wide, so each file reads its nearest config rather
+        // than a service's `tsconfig` override.
+        let index = WorkspaceIndex::build_with_aliases(repo_root, None);
         if !index.has_external_packages() {
             return Self {
                 repo_root: repo_root.to_path_buf(),
@@ -1837,26 +1844,42 @@ impl FactCollector<'_> {
             // alias below reduces it to the class binding plus a call, and a
             // call on a class evaluates to that class's instance field map.
 
-            if let Some(chain) = self.chain_of(init) {
-                self.facts.aliases.push(AliasFact {
-                    local,
-                    value: chain,
-                });
+            // `const c = enabled ? new Client() : null` holds the client on
+            // one branch, so every branch contributes, exactly as a returned
+            // value's branches do: the branch with no chain adds nothing, and
+            // two branches naming different packages disagree (carrick#1159).
+            for branch in value_branches(init) {
+                if let Some(chain) = self.chain_of(branch) {
+                    self.facts.aliases.push(AliasFact {
+                        local: local.clone(),
+                        value: chain,
+                    });
+                }
             }
             return;
         }
 
         // `const { transport } = await getContext()` is the same chain as
         // `getContext().transport`, one step longer.
-        if let Pat::Object(pattern) = &declarator.name
-            && let Some(chain) = self.chain_of(init)
-        {
-            for (property, local) in destructured_properties(pattern) {
-                self.facts.aliases.push(AliasFact {
-                    local,
-                    value: chain.extended(Step::Prop(property)),
-                });
+        if let Pat::Object(pattern) = &declarator.name {
+            let chains: Vec<Chain> = value_branches(init)
+                .into_iter()
+                .filter_map(|branch| self.chain_of(branch))
+                .collect();
+            for chain in chains {
+                self.collect_destructured_aliases(pattern, &chain);
             }
+        }
+    }
+
+    /// `const { a, b: c } = <chain>`: each bound name aliases the chain plus
+    /// the property it reads.
+    fn collect_destructured_aliases(&mut self, pattern: &ObjectPat, chain: &Chain) {
+        for (property, local) in destructured_properties(pattern) {
+            self.facts.aliases.push(AliasFact {
+                local,
+                value: chain.extended(Step::Prop(property)),
+            });
         }
     }
 
@@ -2346,6 +2369,93 @@ mod tests {
     use crate::file_finder::find_service_files;
 
     const IGNORE_PATTERNS: &[&str] = &crate::packages::MANIFEST_SKIP_DIRS;
+
+    /// Two ways a Deno workspace hid its SDK clients (carrick#1159). The
+    /// service's import map aliases a generated client directory
+    /// (`@generated-db/`), which only the alias-reading resolver follows. A
+    /// member package declares its vendor SDK in its own `imports` and exports
+    /// the client from a ternary (`enabled ? new Client() : null`), whose
+    /// branches a declarator did not take apart. Both calls must become rows.
+    #[test]
+    fn deno_import_map_aliases_and_ternary_clients_reach_sdk_rows() {
+        let repo = tempfile::tempdir().unwrap();
+        let write = |path: &str, text: &str| {
+            let path = repo.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "deno.jsonc",
+            r#"{
+                // the root map points every member at the metrics package
+                "workspace": ["./apps/api", "./packages/metrics"],
+                "imports": { "@acme/metrics": "./packages/metrics/mod.ts" }
+            }"#,
+        );
+        write(
+            "packages/metrics/deno.json",
+            r#"{ "name": "@acme/metrics", "exports": { ".": "./mod.ts" },
+                 "imports": { "metrics-sdk": "npm:metrics-sdk@^5.0.0" } }"#,
+        );
+        write(
+            "packages/metrics/config.ts",
+            "export default { ENABLED: true, KEY: 'k', HOST: 'h' };\n",
+        );
+        write(
+            "packages/metrics/src/types.ts",
+            "import type { MetricsClient } from 'metrics-sdk';\n\
+             export type MetricsLike = MetricsClient | null;\n",
+        );
+        write(
+            "packages/metrics/mod.ts",
+            "import { MetricsClient } from 'metrics-sdk';\n\
+             import config from './config.ts';\n\
+             import type { MetricsLike } from './src/types.ts';\n\
+             export const metrics: MetricsLike = config.ENABLED && config.KEY\n\
+               ? new MetricsClient(config.KEY, { host: config.HOST })\n\
+               : null;\n",
+        );
+        write(
+            "apps/api/deno.json",
+            r#"{ "name": "@acme/api",
+                 "imports": { "db-sdk": "npm:db-sdk@^7.0.0",
+                              "@generated-db/": "./src/db/generated/client/" } }"#,
+        );
+        write(
+            "apps/api/src/db/generated/client/client.ts",
+            "import { DbClient } from 'db-sdk';\n\
+             export const db = new DbClient();\n",
+        );
+        write(
+            "apps/api/src/handler.ts",
+            "import { metrics } from '@acme/metrics';\n\
+             import { db } from '@generated-db/client.ts';\n\
+             export async function handle() {\n\
+               metrics.capture('handled');\n\
+               return db.account.findMany();\n\
+             }\n",
+        );
+
+        let service = Config {
+            directory: Some("apps/api".to_string()),
+            ..Default::default()
+        };
+        let (files, _) =
+            find_service_files(&repo.path().to_string_lossy(), &service, IGNORE_PATTERNS);
+        let rows = WorkspaceScan::new().rows_for_service(&files, repo.path());
+        let mut handler: Vec<(usize, String)> = rows
+            .iter()
+            .filter(|row| row.file == "apps/api/src/handler.ts")
+            .map(|row| (row.line, row.package.clone()))
+            .collect();
+        handler.sort();
+        assert_eq!(
+            handler,
+            vec![(4, "metrics-sdk".to_string()), (5, "db-sdk".to_string())],
+            "all rows: {:?}",
+            triples(&rows)
+        );
+    }
 
     #[test]
     fn vite_artifacts_are_excluded_from_workspace_candidates() {
