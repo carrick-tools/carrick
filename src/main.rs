@@ -150,7 +150,7 @@ async fn main() {
                 if !command.writes() {
                     std::process::exit(local_mode::cli::run(command));
                 }
-                logging::init(false);
+                logging::init(false, logging::LogSink::Daily);
                 std::process::exit(run_build(command).await);
             }
             Err(message) => {
@@ -166,7 +166,9 @@ async fn main() {
     }
 
     let args = CliArgs::parse();
-    logging::init(args.verbose);
+    // The scan uploads its log, so its lines go to a file of its own rather
+    // than the day's shared one (carrick#1133).
+    logging::init(args.verbose, logging::LogSink::Run);
     let repo_path = args.repo_path.clone();
 
     // A signal ends the run where it stands. The analysis future is dropped
