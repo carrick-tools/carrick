@@ -467,6 +467,17 @@ impl Visit for LexicalReceivers {
         self.record_call(&call.callee, call.span);
         call.visit_children_with(self);
     }
+
+    /// `<Foo.Bar />` is recorded as a member call on `Foo` (carrick#1149), so
+    /// its receiver binding is looked up exactly as `Foo.Bar()`'s is.
+    fn visit_jsx_opening_element(&mut self, element: &JSXOpeningElement) {
+        if let JSXElementName::JSXMemberExpr(member) = &element.name
+            && let JSXObject::Ident(object) = &member.obj
+        {
+            self.calls.insert(element.span, object.to_id());
+        }
+        element.visit_children_with(self);
+    }
 }
 
 /// Most retrieval tokens one function may contribute (see
@@ -735,6 +746,59 @@ impl CalleeCollector<'_> {
             _ => {}
         }
     }
+
+    /// Record the component a JSX element renders (carrick#1149). Compiled,
+    /// `<Foo />` IS a call that passes `Foo` to the JSX factory, and `Foo`
+    /// runs when it renders, so "who renders `Foo`" is the same question as
+    /// "who calls `Foo`" and is answered from the same edge.
+    ///
+    /// The compiler decides which element names are components: a name that
+    /// starts with a lowercase letter or contains `-` is an intrinsic element
+    /// (`<div>`, `<my-widget>`) and names no binding at all, and a namespaced
+    /// name (`<svg:rect>`) is always intrinsic. A member name (`<Foo.Bar />`,
+    /// `<this.Row />`) is always a value, whatever its case, and takes the
+    /// same two shapes a member call does. A deeper chain (`<a.b.C />`) is
+    /// dropped for the same reason `a.b.c()` is.
+    fn record_jsx(&mut self, name: &JSXElementName, span: swc_common::Span) {
+        let line = self.line(span);
+        let (name, shape) = match name {
+            JSXElementName::Ident(ident) => {
+                if is_intrinsic_jsx_name(&ident.sym) {
+                    return;
+                }
+                (ident.sym.to_string(), CalleeShape::Bare)
+            }
+            JSXElementName::JSXMemberExpr(member) => {
+                let JSXObject::Ident(object) = &member.obj else {
+                    return;
+                };
+                let shape = if &*object.sym == "this" {
+                    let Some(class) = self.enclosing_class.clone() else {
+                        return;
+                    };
+                    CalleeShape::ThisMember(class)
+                } else {
+                    CalleeShape::Member(object.sym.to_string())
+                };
+                (member.prop.sym.to_string(), shape)
+            }
+            JSXElementName::JSXNamespacedName(_) => return,
+        };
+        self.out.push(CalleeRef {
+            name,
+            shape,
+            line,
+            span,
+            receiver: ReceiverBinding::default(),
+        });
+    }
+}
+
+/// The TypeScript compiler's test for an intrinsic JSX element name
+/// (`isIntrinsicJsxName`): a lowercase ASCII first letter, or a `-` anywhere.
+/// Such a tag names a host element, never a binding in scope.
+fn is_intrinsic_jsx_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_lowercase()) || name.contains('-')
 }
 
 impl Visit for CalleeCollector<'_> {
@@ -749,6 +813,13 @@ impl Visit for CalleeCollector<'_> {
     fn visit_opt_call(&mut self, call: &OptCall) {
         self.record(&call.callee, call.span);
         call.visit_children_with(self);
+    }
+
+    /// `<Foo />` and `<Foo.Bar>…</Foo.Bar>`: one render, recorded once from
+    /// the opening element (a closing tag repeats the name, not the render).
+    fn visit_jsx_opening_element(&mut self, element: &JSXOpeningElement) {
+        self.record_jsx(&element.name, element.span);
+        element.visit_children_with(self);
     }
 
     fn visit_class(&mut self, class: &Class) {

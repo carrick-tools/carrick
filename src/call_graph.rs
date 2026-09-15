@@ -2420,6 +2420,97 @@ mod tests {
         drop(dir);
     }
 
+    /// A JSX element renders the component its name binds, so it is recorded
+    /// as a call to it (carrick#1149): imported by name or by default, used
+    /// self-closing or with children, from a function component, an arrow
+    /// component, a class method, and module scope.
+    #[test]
+    fn a_jsx_element_is_a_call_to_the_component_it_renders() {
+        let (dir, defs) = scan(&[
+            (
+                "src/components/Badge.tsx",
+                "export function Badge(props: { label: string }) {\n  return <span>{props.label}</span>;\n}\n",
+            ),
+            (
+                "src/components/Panel.tsx",
+                "export default function Panel(props: { children: unknown }) {\n  return <section>{props.children}</section>;\n}\n",
+            ),
+            (
+                "src/pages/Home.tsx",
+                "import { Badge } from \"../components/Badge\";\n\
+                 import Panel from \"../components/Panel\";\n\
+                 export function Home() {\n  return (\n    <Panel>\n      <Badge label=\"home\" />\n    </Panel>\n  );\n}\n",
+            ),
+            (
+                "src/pages/About.tsx",
+                "import { Badge } from \"../components/Badge\";\n\
+                 export const About = () => <Badge label=\"about\" />;\n",
+            ),
+            (
+                "src/pages/Legacy.tsx",
+                "import { Badge } from \"../components/Badge\";\n\
+                 export class Legacy {\n  render() {\n    return <Badge label=\"legacy\" />;\n  }\n}\n",
+            ),
+            (
+                "src/main.tsx",
+                "import { Home } from \"./pages/Home\";\n\
+                 import { mount } from \"renderer\";\n\
+                 mount(<Home />);\n",
+            ),
+        ]);
+
+        assert_eq!(callee_names(&defs, "Home"), ["Badge", "Panel"]);
+        assert_eq!(defs["Home"].calls[1].call_site_line, 5);
+        assert!(callee_files(&defs, "Home")[0].ends_with("src/components/Badge.tsx"));
+        assert_eq!(callee_names(&defs, "About"), ["Badge"]);
+        assert_eq!(callee_names(&defs, "Legacy.render"), ["Badge"]);
+        assert_eq!(callee_names(&defs, "<module>@src/main.tsx"), ["Home"]);
+        drop(dir);
+    }
+
+    /// `<Card.Header />` resolves like `Card.Header()`: through a namespace
+    /// import, a local object of components, and `this` in a class.
+    #[test]
+    fn a_jsx_member_element_resolves_like_a_member_call() {
+        let (dir, defs) = scan(&[
+            (
+                "src/card.tsx",
+                "export function Header() {\n  return <h1 />;\n}\n",
+            ),
+            (
+                "src/page.tsx",
+                "import * as Card from \"./card\";\n\
+                 export const Layout = {\n  Sidebar() {\n    return <nav />;\n  },\n};\n\
+                 export function Page() {\n  return (\n    <main>\n      <Card.Header />\n      <Layout.Sidebar />\n    </main>\n  );\n}\n\
+                 export class Table {\n  Row() {\n    return <tr />;\n  }\n  render() {\n    return <this.Row />;\n  }\n}\n",
+            ),
+        ]);
+
+        assert_eq!(callee_names(&defs, "Page"), ["Header", "Layout.Sidebar"]);
+        assert_eq!(callee_names(&defs, "Table.render"), ["Table.Row"]);
+        drop(dir);
+    }
+
+    /// An intrinsic element names no binding, whatever is in scope under the
+    /// same name: `<header>` is the host element even beside a function called
+    /// `header`, and so is a custom element with a `-`. A namespaced name and
+    /// a component that resolves to nothing record no edge either.
+    #[test]
+    fn an_intrinsic_jsx_element_is_never_a_call() {
+        let (dir, defs) = scan(&[(
+            "src/shell.jsx",
+            "function header() {\n  return null;\n}\n\
+             export function Shell() {\n  return (\n    <div>\n      <header />\n      <my-widget />\n      <svg:rect />\n      <Unknown />\n    </div>\n  );\n}\n",
+        )]);
+
+        assert!(
+            callee_names(&defs, "Shell").is_empty(),
+            "{:?}",
+            callee_names(&defs, "Shell")
+        );
+        drop(dir);
+    }
+
     /// The file is the owner of LAST resort. A call inside a function belongs
     /// to that function and must not be recorded twice, and a file whose calls
     /// all have a function around them gets no row of its own.
