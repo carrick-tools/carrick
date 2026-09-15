@@ -14,6 +14,8 @@ import type {
 } from './api.js';
 import { printTypeForDestination } from './node-builder.js';
 import { typeIsOrContainsMachinery } from './machinery.js';
+import type { UnresolvedAtAnchor } from './deep-walk.js';
+import { unresolvedAtAnchor } from './unresolved.js';
 
 export interface ResolvedAnchor {
   request: CaptureAnchorRequest;
@@ -43,6 +45,14 @@ export interface ResolvedAnchor {
    * backfillable; the reason rides `self_check_detail` instead.
    */
   abstainReason?: string;
+  /**
+   * carrick#1164: member paths the SOURCE program could not resolve, and the
+   * unresolved imports the anchor's file reaches. Printed into the surface
+   * those members read `any`, like an author's `any`; the self-check uses this
+   * to label them `unresolved_import` instead of `declared`. Absent when the
+   * anchor's type holds no unresolved placeholder.
+   */
+  unresolved?: UnresolvedAtAnchor;
 }
 
 /** Repo-root-relative source file -> extensionless specifier from entryDir. */
@@ -167,10 +177,20 @@ export function resolveAnchor(
       );
     }
 
+    const arrayDepth = Math.max(0, request.array_depth ?? 0);
+    const declared = checker.getDeclaredTypeOfSymbol(resolvedExport);
+    const unresolved = unresolvedAtAnchor(
+      program,
+      sourceFile,
+      declared,
+      resolvedExport.declarations?.[0] ?? sourceFile,
+      '<0>'.repeat(arrayDepth)
+    );
     return {
       request,
       aliasText: `import('${spec}').${request.symbol_name}${arraySuffix}`,
       serialization: 'emitted',
+      ...(unresolved ? { unresolved } : {}),
     };
   }
 
@@ -201,10 +221,18 @@ export function resolveAnchor(
       // Type parameters erase to their constraint/unknown under ReturnType<>.
       return demote(`handler '${request.symbol_name}' is generic`);
     }
+    const returned = callSignatures[0].getReturnType();
+    const unresolved = unresolvedAtAnchor(
+      program,
+      sourceFile,
+      checker.getAwaitedType(returned) ?? returned,
+      declaration ?? sourceFile
+    );
     return {
       request,
       aliasText: `Awaited<ReturnType<typeof import('${spec}').${request.symbol_name}>>`,
       serialization: 'emitted',
+      ...(unresolved ? { unresolved } : {}),
     };
   }
 
@@ -362,11 +390,13 @@ function finishInferAnchor(
   if (!printed.text) {
     return demote(printed.failure ?? 'node builder print failed');
   }
+  const unresolved = unresolvedAtAnchor(program, sourceFile, type, located);
   return {
     request,
     aliasText: printed.text,
     serialization: 'node_builder',
     ...(reaimNote ? { reaimNote } : {}),
+    ...(unresolved ? { unresolved } : {}),
   };
 }
 
