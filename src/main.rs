@@ -97,6 +97,12 @@ impl CliArgs {
                     Self::print_help();
                     std::process::exit(0);
                 }
+                // What the npm shim asks an overridden binary before it runs
+                // it, so the run says which build it was (carrick#1100).
+                "--version" | "-V" => {
+                    println!("carrick {}", env!("CARGO_PKG_VERSION"));
+                    std::process::exit(0);
+                }
                 "--verbose" | "-v" => {
                     verbose = true;
                 }

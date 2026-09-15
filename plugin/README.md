@@ -188,8 +188,7 @@ What the Problems panel is allowed to hold, per check:
 
 | Variable | Default | What it does |
 |---|---|---|
-| `CARRICK_BIN` | the binary in this install | The scanner to run |
-| `CARRICK_NATIVE_BINARY` | the platform package's | Scanner binary the CLI resolves to |
+| `CARRICK_BIN` | the platform package's binary | The scanner every command runs; a run through an override names the file and its version on stderr |
 | `CARRICK_CHANNEL` | decided by the install | `hook`, `lsp`, or `off` |
 | `CARRICK_TIMEOUT_MS` | `5000` | Time limit for one CLI call |
 | `CARRICK_LOG` | unset | File to append the server and hook log to |

@@ -47,6 +47,7 @@ WORKSPACE:
 OPTIONS:
     -h, --help     Print this help message
     -v, --verbose  Enable verbose (debug-level) terminal output
+    -V, --version  Print the scanner version
     --no-cache     Skip incremental cache and run a full analysis
 
 ENVIRONMENT VARIABLES:

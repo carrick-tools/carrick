@@ -257,7 +257,7 @@ process.exit(0);
     PATH: `${bin}${path.delimiter}${process.env["PATH"] ?? ""}`,
   };
   delete env["CARRICK_TOKEN"];
-  delete env["CARRICK_NATIVE_BINARY"];
+  delete env["CARRICK_BIN"];
   delete env["CI"];
   return { root, home, workspace, env, log };
 }

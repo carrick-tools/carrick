@@ -45,12 +45,15 @@ const [command, ...rest] = argv;
 
 /** Run the scanner binary, streaming its output and answering with its code. */
 async function runNative(args) {
-  const { resolveNativeBinary, nativeEnv } = await import("../dist/native.js");
+  const { resolveNativeBinary, nativeEnv, overrideLine } = await import("../dist/native.js");
   const lookup = resolveNativeBinary();
   if (!lookup.binary) {
     process.stderr.write(`carrick: ${lookup.problem}\n`);
     process.exit(1);
   }
+  // On stderr, so a `--json` answer on stdout stays parseable.
+  const override = overrideLine(lookup);
+  if (override) process.stderr.write(`${override}\n`);
   const child = spawn(lookup.binary, args, {
     stdio: "inherit",
     env: nativeEnv(),
