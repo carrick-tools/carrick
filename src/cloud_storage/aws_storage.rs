@@ -1634,6 +1634,12 @@ impl CloudStorage for AwsStorage {
     /// Laptop credential only: a CI run is visible in its own Actions log and
     /// its OIDC identity is not a user the cloud could alert about. And never
     /// from a storage that opened a scan, which says `scan-failed` instead.
+    ///
+    /// That last gate is a guard on this instance, not the one production
+    /// relies on: `main` reports through a freshly built storage whose slot is
+    /// always empty, so the exclusivity with `scan-failed` is decided there,
+    /// from the process-global slot `start-scan` sets
+    /// ([`crate::credentials::scan_id`]).
     async fn report_preflight_failed(&self, repo: Option<&str>, stage: &str, reason: &str) {
         let CloudAuth::Bearer(token) = &self.auth else {
             return;
