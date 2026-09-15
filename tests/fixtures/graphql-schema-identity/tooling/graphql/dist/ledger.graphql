@@ -1,0 +1,21 @@
+type Query {
+  balance: Money!
+  statements: [Statement!]!
+  viewer: Holder
+}
+
+type Mutation {
+  transferFunds(amount: Int!): Statement!
+}
+
+type Money {
+  amount: Int!
+}
+
+type Statement {
+  id: ID!
+}
+
+type Holder {
+  id: ID!
+}
