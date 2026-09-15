@@ -13,20 +13,26 @@
 //! says what the scan is doing now: one JSON object, rewritten as the phases
 //! and counts move, read back by `carrick status`.
 //!
+//! A scan run in the foreground keeps the same file. A user who starts
+//! `carrick index` in one terminal and asks `carrick status` in another was
+//! told there was no index and to run the command that was already running
+//! (carrick#1132); the file is what lets the second terminal see the first.
+//!
 //! Two rules the shape enforces:
 //!
 //! * **The file is evidence of a process, and it outlives it by one build.** It
 //!   exists while a scan runs and is rewritten when one ends: `finished` with
-//!   the time it took, or `failed` with the reason. A file whose pid is gone
-//!   while it still says `running` is a scan that was killed — which is the
-//!   case this ticket exists for, and the one state a reader most needs named.
-//!   A finished record is cleared by the next build, not by the scan that
-//!   wrote it: the scaffold tells an agent to poll `carrick status` until it
-//!   says finished, and a record removed at the end of the scan means that
-//!   sentence is never printed (carrick#1007 item 4).
-//! * **Nothing here is on the path of a scan that is not detached.** Every
-//!   writer is a no-op until [`begin`] has been called, which happens only in
-//!   a child that was handed [`SCAN_ID_ENV`].
+//!   the time it took, or `failed` with the reason — an interrupted one
+//!   included. A file whose pid is gone while it still says `running` is a
+//!   scan that was killed without a chance to say so, and the one state a
+//!   reader most needs named. A finished record is cleared by the next build,
+//!   not by the scan that wrote it: the scaffold tells an agent to poll
+//!   `carrick status` until it says finished, and a record removed at the end
+//!   of the scan means that sentence is never printed (carrick#1007 item 4).
+//! * **Nothing here is on the path of a build that pays for nothing.** Every
+//!   writer is a no-op until [`begin`] has been called, which only `carrick
+//!   index` does; `refresh`, the session-start hook's command, leaves no
+//!   record.
 //!
 //! What a run PAID is recorded here too, because a detached scan's output goes
 //! to its log and a killed one leaves nothing else behind (carrick#995). It is
@@ -40,10 +46,6 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::progress::Update;
-
-/// Set on the detached child, so it knows to keep this file and which id to
-/// keep it under. Internal, like [`crate::progress::PROGRESS_ENV`].
-pub const SCAN_ID_ENV: &str = "CARRICK_SCAN_ID";
 
 /// How often the state file is rewritten while a phase ticks. The updates
 /// themselves are already throttled to five a second; a scan that runs for
@@ -66,7 +68,7 @@ struct Active {
     last_log: Option<Instant>,
 }
 
-/// What a detached scan is doing, as `carrick status` reads it back.
+/// What a scan is doing, as `carrick status` reads it back.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ScanState {
     pub scan_id: String,
@@ -80,8 +82,8 @@ pub struct ScanState {
     ///
     /// A record of what this run DID, not of a mode it could have been run
     /// without: `--infer` is gone and `carrick index` is the inferred scan
-    /// itself (carrick#1008), and `index` is the only command that detaches,
-    /// so every record written today says true. It stays because the file is a
+    /// itself (carrick#1008), and `index` is the only command that records a
+    /// scan, so every record written today says true. It stays because the file is a
     /// receipt — the one thing a killed scan leaves behind — and a receipt
     /// that omits whether money was involved is not one (carrick#1023 item 7).
     pub infer: bool,
@@ -281,7 +283,10 @@ impl ScanState {
 /// naming every id: three re-runs refused because a scan was still in flight
 /// are one fact, and each printed whole was a screen of the same sentence
 /// (carrick#1103). The log directory is named once, at the end, for the
-/// reader who wants more than the sentence.
+/// reader who wants more than the sentence — and only when one of these scans
+/// has a log there: a scan run in the foreground printed to its terminal, and
+/// pointing at a file it never wrote sends the reader to nothing
+/// (carrick#1132).
 pub fn status_lines(scans: &[ScanState], index_dir: &Path) -> Vec<String> {
     if scans.is_empty() {
         return Vec::new();
@@ -315,10 +320,15 @@ pub fn status_lines(scans: &[ScanState], index_dir: &Path) -> Vec<String> {
         lines.push(line);
         index += 1 + same.len();
     }
-    lines.push(format!(
-        "Each scan's full output is in {}.",
-        log_file(index_dir, "<id>").display()
-    ));
+    if scans
+        .iter()
+        .any(|scan| log_file(index_dir, &scan.scan_id).is_file())
+    {
+        lines.push(format!(
+            "Each scan's full output is in {}.",
+            log_file(index_dir, "<id>").display()
+        ));
+    }
     lines
 }
 
@@ -341,7 +351,21 @@ pub fn log_file(index_dir: &Path, scan_id: &str) -> PathBuf {
     index_dir.join(format!("scan-{scan_id}.log"))
 }
 
-/// Start recording. Called once, in the child a `--detach` parent started.
+/// The id a scan is recorded under: the head of this run's id.
+///
+/// The run id is already the key that joins a build's own logs to the cloud's,
+/// and a detached child inherits it from the parent that printed the id, so
+/// the scan id is not a second identifier for one run and needs no channel of
+/// its own to reach the child.
+pub fn scan_id() -> String {
+    crate::logging::run_id().chars().take(8).collect()
+}
+
+/// Start recording. Called once, by `carrick index`, detached or not.
+///
+/// The directory is created here: a first index run in the foreground reaches
+/// this before anything else has made `.carrick`, and a record that could not
+/// be written is the silence carrick#1132 was about.
 pub fn begin(index_dir: &Path, scan_id: &str, workspace: &Path, infer: bool) {
     let now = timestamp();
     let state = ScanState {
@@ -359,6 +383,7 @@ pub fn begin(index_dir: &Path, scan_id: &str, workspace: &Path, infer: bool) {
         error: None,
         spend: None,
     };
+    let _ = std::fs::create_dir_all(index_dir);
     let file = state_file(index_dir, scan_id);
     write(&file, &state);
     if let Ok(mut active) = ACTIVE.lock() {
@@ -372,7 +397,7 @@ pub fn begin(index_dir: &Path, scan_id: &str, workspace: &Path, infer: bool) {
     }
 }
 
-/// Say what the build is doing now. A no-op in a scan nobody detached.
+/// Say what the build is doing now. A no-op in a build that records no scan.
 ///
 /// `update` is the count inside the phase, when the phase reports one. The
 /// same call carries both, because a phase with no counts yet must still
@@ -421,8 +446,8 @@ pub fn note(phase: &str, update: Option<&Update>) {
     if phase_changed || counted_out || due(active.last_log, LOG_GAP) {
         let age = human_duration(now.duration_since(active.started).as_secs() as i64);
         match &active.state.progress {
-            Some(update) => eprintln!("carrick: {age} {phase}: {}", update.render()),
-            None => eprintln!("carrick: {age} {phase}"),
+            Some(update) => log_line(&format!("carrick: {age} {phase}: {}", update.render())),
+            None => log_line(&format!("carrick: {age} {phase}")),
         }
         active.last_log = Some(now);
     }
@@ -430,8 +455,8 @@ pub fn note(phase: &str, update: Option<&Update>) {
 
 /// Record why the scan is slow, as the scan said it (carrick#1122): into the
 /// state `carrick status` reads, and as a line in the log, at once rather than
-/// at the next pulse. A no-op in a scan nobody detached. The next phase clears
-/// it, because a busy model in one repo's scan says nothing about the next.
+/// at the next pulse. A no-op in a build that records no scan. The next phase
+/// clears it, because a busy model in one repo's scan says nothing about the next.
 pub fn notice(text: &str) {
     let Ok(mut guard) = ACTIVE.lock() else {
         return;
@@ -445,11 +470,23 @@ pub fn notice(text: &str) {
     let now = Instant::now();
     active.last_write = Some(now);
     let age = human_duration(now.duration_since(active.started).as_secs() as i64);
-    eprintln!("carrick: {age} {text}");
+    log_line(&format!("carrick: {age} {text}"));
 }
 
-/// Record what this scan has paid so far. A no-op in a scan nobody detached,
-/// like every other writer here.
+/// A line for whoever reads this scan's output as text: a detached scan's log,
+/// or the output an agent's shell captured from a foreground one.
+///
+/// Not a terminal. There the spinner is already saying the same thing, and a
+/// line printed under it every fifteen seconds tears the bar it is drawing —
+/// the same split `logging::spinner` makes for its own lines.
+fn log_line(line: &str) {
+    if !crate::logging::is_tty() {
+        eprintln!("{line}");
+    }
+}
+
+/// Record what this scan has paid so far. A no-op in a build that records no
+/// scan, like every other writer here.
 ///
 /// Written on the spot rather than at the end: a scan that is killed after an
 /// upload has already spent the money, and this file is what it leaves behind.
@@ -493,8 +530,41 @@ pub fn finish(error: Option<&str>) {
     write(&active.file, &active.state);
     // The last line of the log, so a reader tailing it sees the end rather
     // than a progress count that simply stopped moving.
-    eprintln!("carrick: {}", active.state.line());
+    log_line(&format!("carrick: {}", active.state.line()));
     *guard = None;
+}
+
+/// The scan was ended by a signal, and the record says so before the process
+/// goes (carrick#1132).
+///
+/// Without it a Ctrl-C left `running` with a dead pid, which `carrick status`
+/// can only call "stopped without finishing". The signal is the reason, and so
+/// is what the scan had already paid for: a multi-repo build uploads each repo
+/// as it finishes it, and the money for those is spent.
+pub fn interrupted(signal: &str) {
+    let reason = {
+        let Ok(guard) = ACTIVE.lock() else {
+            return;
+        };
+        let Some(active) = guard.as_ref() else {
+            return;
+        };
+        interruption_reason(signal, active.state.spend.as_ref())
+    };
+    finish(Some(&reason));
+}
+
+/// The sentence an interrupted scan's record leads with.
+fn interruption_reason(signal: &str, spend: Option<&crate::scan_spend::RunSpend>) -> String {
+    match spend.map(|spend| spend.scans.len()) {
+        Some(paid) if paid > 0 => format!(
+            "interrupted by {signal}, after uploading {paid} repo(s) and paying for them; run \
+             the command again."
+        ),
+        _ => {
+            format!("interrupted by {signal} before anything was uploaded; run the command again.")
+        }
+    }
 }
 
 /// Drop the records of scans that ended well, at the start of a build.
@@ -712,7 +782,14 @@ mod tests {
             older,
         ];
 
-        let lines = status_lines(&scans, Path::new("/repos/.carrick"));
+        // The running scan was detached, so its log is on disk.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            log_file(dir.path(), "runs0001"),
+            "carrick: 10m00s indexing\n",
+        )
+        .unwrap();
+        let lines = status_lines(&scans, dir.path());
 
         assert_eq!(lines.len(), 4, "{lines:#?}");
         assert!(
@@ -738,7 +815,10 @@ mod tests {
         );
         assert_eq!(
             lines[3],
-            "Each scan's full output is in /repos/.carrick/scan-<id>.log."
+            format!(
+                "Each scan's full output is in {}.",
+                dir.path().join("scan-<id>.log").display()
+            )
         );
         for internal in [
             "TeeStorage",
@@ -769,8 +849,57 @@ mod tests {
             &[slow, slower, refused("fast0001", 3000, "something else")],
             Path::new("/w/.carrick"),
         );
-        assert_eq!(lines.len(), 4, "{lines:#?}");
+        assert_eq!(lines.len(), 3, "{lines:#?}");
         assert!(status_lines(&[], Path::new("/w/.carrick")).is_empty());
+    }
+
+    /// A scan run in the foreground printed to its own terminal and has no log
+    /// in `.carrick`, so `status` names the scan and points at no file
+    /// (carrick#1132).
+    #[test]
+    fn a_foreground_scan_is_named_without_a_log_it_never_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = state(ScanStatus::Running, std::process::id());
+        let lines = status_lines(&[running], dir.path());
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(
+            lines[0].starts_with("scan 5089ed60 running for "),
+            "{lines:#?}"
+        );
+    }
+
+    /// An interrupted scan says what ended it, and whether it had already
+    /// paid for anything before it did (carrick#1132).
+    #[test]
+    fn an_interrupted_scan_names_the_signal_and_what_it_paid() {
+        let nothing = interruption_reason("SIGINT", None);
+        assert_eq!(
+            nothing,
+            "interrupted by SIGINT before anything was uploaded; run the command again."
+        );
+        let mut spend = crate::scan_spend::RunSpend::default();
+        spend.record(
+            "api",
+            crate::scan_spend::ScanSpend {
+                schema: crate::scan_spend::SCHEMA.to_string(),
+                priced: true,
+                usd: Some(4.32),
+                ..Default::default()
+            },
+        );
+        let paid = interruption_reason("SIGTERM", Some(&spend));
+        assert_eq!(
+            paid,
+            "interrupted by SIGTERM, after uploading 1 repo(s) and paying for them; run the \
+             command again."
+        );
+        let mut failed = state(ScanStatus::Failed, std::process::id());
+        failed.error = Some(paid);
+        assert!(
+            failed.line().ends_with("interrupted by SIGTERM, after uploading 1 repo(s) and paying for them; run the command again."),
+            "{}",
+            failed.line()
+        );
     }
 
     /// A detached run's output goes to its log, so what it paid is kept here

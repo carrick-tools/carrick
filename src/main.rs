@@ -147,10 +147,11 @@ async fn main() {
                 // every edit an editor makes: a run banner, a log file and a
                 // spinner are all noise in a hook's output, and the errors
                 // they can raise are printed directly.
-                if command.writes() {
-                    logging::init(false);
+                if !command.writes() {
+                    std::process::exit(local_mode::cli::run(command));
                 }
-                std::process::exit(local_mode::cli::run(command));
+                logging::init(false);
+                std::process::exit(run_build(command).await);
             }
             Err(message) => {
                 eprintln!("carrick: {message}");
@@ -220,6 +221,28 @@ async fn main() {
         // without waiting on a request about it.
         report_failure_before_scan(&repo_path, e.as_ref()).await;
         std::process::exit(1);
+    }
+}
+
+/// `index` and `refresh`, raced against a signal.
+///
+/// A build records the scan it runs, and a Ctrl-C used to end it with that
+/// record still saying `running` — which `carrick status` could only call
+/// "stopped without finishing" (carrick#1132). The build is synchronous, so it
+/// runs on a blocking thread while this one listens; the listener is installed
+/// before the build starts, for the reason the scan path gives. The scans the
+/// build drives share its process group and hear the same Ctrl-C, and each
+/// reports its own interruption to the cloud.
+async fn run_build(command: local_mode::cli::LocalCommand) -> i32 {
+    let mut shutdown = ShutdownListener::install();
+    let build = tokio::task::spawn_blocking(move || local_mode::cli::run(command));
+    tokio::select! {
+        biased;
+        signal = shutdown.recv() => {
+            local_mode::cli::interrupted(signal.name());
+            signal.exit_code()
+        }
+        code = build => code.unwrap_or(1),
     }
 }
 

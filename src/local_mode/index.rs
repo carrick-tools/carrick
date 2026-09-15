@@ -1696,4 +1696,40 @@ mod tests {
         assert_eq!(read.progress, Some(update));
         super::super::scan_state::finish(None);
     }
+
+    /// A first `carrick index` in the foreground records its scan before
+    /// anything has made `.carrick`, and an interrupted one leaves a failed
+    /// record naming the signal rather than `running` with a dead pid
+    /// (carrick#1132).
+    #[test]
+    fn a_first_foreground_scan_is_recorded_and_an_interrupted_one_says_why() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let workspace = tempfile::tempdir().unwrap();
+        let index_dir = workspace.path().join(".carrick");
+        assert!(!index_dir.exists());
+
+        super::super::scan_state::begin(&index_dir, "fground1", workspace.path(), true);
+        let running = super::super::scan_state::read_all(&index_dir);
+        assert_eq!(running.len(), 1, "no record was written: {running:?}");
+        assert!(running[0].is_running(), "{running:?}");
+
+        super::super::scan_state::interrupted("SIGINT");
+        let ended = super::super::scan_state::read_all(&index_dir);
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        assert_eq!(
+            ended[0].status,
+            super::super::scan_state::ScanStatus::Failed,
+            "{ended:?}"
+        );
+        assert_eq!(
+            ended[0].reason(),
+            Some("interrupted by SIGINT before anything was uploaded; run the command again.")
+        );
+        assert!(ended[0].finished_at.is_some(), "{ended:?}");
+        // The record is closed: a second signal writes nothing over it.
+        super::super::scan_state::interrupted("SIGTERM");
+        assert_eq!(super::super::scan_state::read_all(&index_dir), ended);
+    }
 }

@@ -726,7 +726,7 @@ pub fn get_log_file_path() -> Option<std::path::PathBuf> {
 /// True when stderr is attached to a terminal (TTY). False under CI redirects
 /// like `./carrick . > analysis.log 2>&1`, where indicatif renders nothing
 /// and the user sees a long silent gap between stage transitions.
-fn is_tty() -> bool {
+pub fn is_tty() -> bool {
     std::io::stderr().is_terminal()
 }
 

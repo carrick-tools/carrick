@@ -402,14 +402,19 @@ fn build(root: Option<&Path>, service: Option<&str>, infer: bool) -> Result<(), 
     if infer && let Some(refusal) = inference_refusal(&workspace.repos) {
         return Err(refusal);
     }
-    // A detached build records where it is, so `carrick status` can answer for
+    // The paid build records where it is, so `carrick status` can answer for
     // it and a scan that is killed leaves evidence rather than silence
-    // (carrick#992). Nothing is recorded in a build nobody detached.
-    let detached = std::env::var(super::scan_state::SCAN_ID_ENV)
-        .ok()
-        .filter(|id| !id.trim().is_empty());
-    if let Some(scan_id) = &detached {
-        super::scan_state::begin(&workspace.index_dir(), scan_id, &workspace.root, infer);
+    // (carrick#992). Detached or not: a user who runs `carrick index` in one
+    // terminal and asks `carrick status` in another was told to start the
+    // scan that was already running (carrick#1132). `refresh` records nothing;
+    // it is the session-start hook's build and pays for nothing.
+    if infer {
+        super::scan_state::begin(
+            &workspace.index_dir(),
+            &super::scan_state::scan_id(),
+            &workspace.root,
+            infer,
+        );
     }
     let outcome = build_workspace(&workspace, service, infer);
     // An index has just been written, so every record of a scan that is over
@@ -424,10 +429,18 @@ fn build(root: Option<&Path>, service: Option<&str>, infer: bool) -> Result<(), 
     if infer && outcome.is_ok() {
         super::scan_state::forget_superseded(&workspace.index_dir());
     }
-    if detached.is_some() {
+    if infer {
         super::scan_state::finish(outcome.as_ref().err().map(String::as_str));
     }
     outcome
+}
+
+/// A signal is ending the build this process is running: close its scan
+/// record with the signal as the reason (carrick#1132). The listener is the
+/// binary's, beside the scan path's own; a build that records no scan has
+/// nothing to close.
+pub fn interrupted(signal: &str) {
+    super::scan_state::interrupted(signal);
 }
 
 /// Where a build acts, before anything is loaded from it.
@@ -518,10 +531,9 @@ fn start_detached(root: Option<&Path>) -> Result<(), String> {
     super::workspace::write_self_ignore(&index_dir)
         .map_err(|e| format!("could not write the .carrick/.gitignore: {e}"))?;
 
-    // The run id is already the key that joins this build's own logs to the
-    // cloud's; its head is short enough to type and unique enough to name a
-    // file by, so the scan id is not a second identifier for one run.
-    let scan_id: String = crate::logging::run_id().chars().take(8).collect();
+    // The child inherits this run's id below, and records itself under its
+    // head, so the id printed here is the one `carrick status` will name.
+    let scan_id = super::scan_state::scan_id();
     let log = super::scan_state::log_file(&index_dir, &scan_id);
     let handle = std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
     let exe = std::env::current_exe()
@@ -532,9 +544,9 @@ fn start_detached(root: Option<&Path>) -> Result<(), String> {
         .arg("index")
         .arg("--workspace")
         .arg(&workspace.root)
-        .env(super::scan_state::SCAN_ID_ENV, &scan_id)
         // One run id across the parent, the detached build and every scan it
-        // drives, and the log says which of them is writing (carrick#997).
+        // drives, and the log says which of them is writing (carrick#997). It
+        // is also what the child's scan id is taken from.
         .env(crate::logging::RUN_ID_ENV, crate::logging::run_id())
         .env(
             crate::logging::RUN_PHASE_ENV,
