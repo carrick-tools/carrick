@@ -76,6 +76,15 @@ impl CloudStorage for TeeStorage {
         self.cloud.begin_run(run).await
     }
 
+    /// The local copy only: the cloud already serves this generation, and the
+    /// local read model is built from this run's blobs, so a service the run
+    /// held back would otherwise vanish from it.
+    fn keep_served_generation(&self, data: &CloudRepoData) {
+        if let Err(error) = self.local.write_cache_file(data) {
+            tracing::warn!("Could not keep the served generation locally: {error}");
+        }
+    }
+
     /// The CLOUD side, unlike the cross-repo read below. The question is only
     /// ever asked about a cloud write whose response was lost, and the local
     /// copy — written first, and successfully, or this would not be running —

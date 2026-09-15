@@ -67,8 +67,17 @@ const MAX_NAMED_FILES: usize = 10;
 struct Registry {
     /// Files dispatched to the analyzer across every service in this run.
     attempted: usize,
-    /// One entry per file the analyzer never answered for: (path, reason code).
-    lost: Vec<(String, String)>,
+    /// One entry per file the analyzer never answered for.
+    lost: Vec<LostFile>,
+    /// The service the engine is analysing now. Every loss is recorded
+    /// against it, because the run lands, holds back and retries services one
+    /// at a time and each of those decisions is about ONE service's losses.
+    /// The engine analyses services sequentially, so one slot is exact.
+    current: Scope,
+    /// Function intents that failed after their retries, per service. Not a
+    /// reason to hold a service back (a missing intent never was), only a
+    /// reason to retry it before the run ends.
+    intents_failed: Vec<(Scope, usize)>,
     /// One entry per file the model was deliberately not asked about, because
     /// a budget refused the call. Not a loss the scan can fix by re-running,
     /// and not a reason to fail: the file keeps its deterministic rows and its
@@ -80,6 +89,33 @@ struct Registry {
     types_unavailable: Vec<(String, String)>,
 }
 
+/// Which service a loss belongs to: its `service_name`, or `None` for a repo
+/// scanned as one unnamed service. The same key `CloudRepoData::service_name`
+/// carries, so a payload finds its own losses without a label mapping.
+type Scope = Option<String>;
+
+/// One file the analyzer never answered for.
+struct LostFile {
+    scope: Scope,
+    path: String,
+    reason: String,
+}
+
+/// What one service still owes the model at a point in the run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServiceLosses {
+    /// Files dispatched to the analyzer that got no answer.
+    pub files: usize,
+    /// Function intents that failed after their retries.
+    pub intents: usize,
+}
+
+impl ServiceLosses {
+    pub fn is_empty(&self) -> bool {
+        self.files == 0 && self.intents == 0
+    }
+}
+
 impl Registry {
     /// Adds a service's dispatched file count to the total.
     fn record_files_attempted(&mut self, count: usize) {
@@ -88,7 +124,58 @@ impl Registry {
 
     /// Records that `path` has no analysis, and why.
     fn record_unanalysed_file(&mut self, path: &str, reason: &str) {
-        self.lost.push((path.to_string(), reason.to_string()));
+        self.lost.push(LostFile {
+            scope: self.current.clone(),
+            path: path.to_string(),
+            reason: reason.to_string(),
+        });
+    }
+
+    /// Records that `count` intents of the current service failed.
+    fn record_intents_failed(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let scope = self.current.clone();
+        match self.intents_failed.iter_mut().find(|(s, _)| *s == scope) {
+            Some((_, total)) => *total += count,
+            None => self.intents_failed.push((scope, count)),
+        }
+    }
+
+    fn service_losses(&self, scope: &Scope) -> ServiceLosses {
+        ServiceLosses {
+            files: self.lost.iter().filter(|l| l.scope == *scope).count(),
+            intents: self
+                .intents_failed
+                .iter()
+                .filter(|(s, _)| s == scope)
+                .map(|(_, n)| *n)
+                .sum(),
+        }
+    }
+
+    /// Drop what one service lost, ahead of analysing it again.
+    ///
+    /// Its lost files leave `attempted` too: the retry dispatches exactly
+    /// those files again and counts them again, and a file asked about twice
+    /// is still one file of the run.
+    fn forget_service_losses(&mut self, scope: &Scope) {
+        let before = self.lost.len();
+        self.lost.retain(|l| l.scope != *scope);
+        self.attempted = self.attempted.saturating_sub(before - self.lost.len());
+        self.intents_failed.retain(|(s, _)| s != scope);
+    }
+
+    fn unanalysed_files_for(&self, scope: &Scope) -> Vec<crate::cloud_storage::UnanalysedFile> {
+        self.lost
+            .iter()
+            .filter(|l| l.scope == *scope)
+            .map(|l| crate::cloud_storage::UnanalysedFile {
+                path: l.path.clone(),
+                reason: l.reason.clone(),
+            })
+            .collect()
     }
 
     /// Records that the model was not asked about `path`, on purpose.
@@ -178,8 +265,8 @@ impl Registry {
         }
 
         let mut by_reason: BTreeMap<&str, usize> = BTreeMap::new();
-        for (_, reason) in &self.lost {
-            *by_reason.entry(reason.as_str()).or_default() += 1;
+        for lost in &self.lost {
+            *by_reason.entry(lost.reason.as_str()).or_default() += 1;
         }
         let mut reasons: Vec<(&str, usize)> = by_reason.into_iter().collect();
         reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
@@ -189,7 +276,7 @@ impl Registry {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let mut paths: Vec<&str> = self.lost.iter().map(|(path, _)| path.as_str()).collect();
+        let mut paths: Vec<&str> = self.lost.iter().map(|l| l.path.as_str()).collect();
         paths.sort_unstable();
         let named = paths
             .iter()
@@ -317,23 +404,53 @@ pub fn not_refreshed_line() -> Option<String> {
         .not_refreshed_line()
 }
 
-/// The files this run lost, in the shape the upload reports them.
+/// The files ONE service lost, in the shape its upload reports them.
 ///
 /// Only the second category: a file the model was asked about and did not
 /// answer for. A file a budget refused is never here, so the cloud's
 /// first-scan partial rule is never asked to accept a partial index that is
 /// only partial because the organisation is out of allowance.
-pub fn unanalysed_files() -> Vec<crate::cloud_storage::UnanalysedFile> {
+///
+/// Scoped to the service because the cloud applies its partial rule to the
+/// row the write lands on: a run-wide list made a clean service's write carry
+/// a sibling's losses, and once both had rows the clean one was refused
+/// `409 partial_refused` for files it never held.
+pub fn unanalysed_files_for(service: Option<&str>) -> Vec<crate::cloud_storage::UnanalysedFile> {
     registry()
         .lock()
         .expect("scan health lock")
-        .lost
-        .iter()
-        .map(|(path, reason)| crate::cloud_storage::UnanalysedFile {
-            path: path.clone(),
-            reason: reason.clone(),
-        })
-        .collect()
+        .unanalysed_files_for(&service.map(str::to_string))
+}
+
+/// Name the service every loss recorded from now on belongs to.
+pub fn enter_service(service: Option<&str>) {
+    registry().lock().expect("scan health lock").current = service.map(str::to_string);
+}
+
+/// Records that `count` of the current service's function intents failed
+/// after their retries.
+pub fn record_intents_failed(count: usize) {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .record_intents_failed(count);
+}
+
+/// What `service` still owes the model.
+pub fn service_losses(service: Option<&str>) -> ServiceLosses {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .service_losses(&service.map(str::to_string))
+}
+
+/// Forget what `service` lost, because it is about to be analysed again and
+/// will record whatever it loses a second time.
+pub fn forget_service_losses(service: Option<&str>) {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .forget_service_losses(&service.map(str::to_string));
 }
 
 /// Whether [`ALLOW_PARTIAL_ENV`] is set for this run.
@@ -390,13 +507,6 @@ pub fn should_fail_on_missing_types(fatal: bool, allow_missing: bool) -> bool {
     fatal && !allow_missing
 }
 
-/// Whether the run must fail. Pure, so the policy is testable without touching
-/// the process environment: any lost file fails the run unless the operator
-/// asked for a partial result.
-pub fn should_fail_run(lost: usize, allow_partial: bool) -> bool {
-    lost > 0 && !allow_partial
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,7 +547,7 @@ mod tests {
 
         assert_eq!(registry.lost_file_count(), 0);
         assert!(registry.summary_line().is_none(), "nothing was lost");
-        assert!(!should_fail_run(registry.lost_file_count(), false));
+        assert!(registry.service_losses(&None).is_empty());
 
         let line = registry.not_refreshed_line().expect("the run says so");
         assert!(
@@ -465,7 +575,7 @@ mod tests {
         registry.record_files_attempted(2);
         registry.record_unanalysed_file("src/a.ts", &analysis_failure_reason(&failed));
         assert_eq!(registry.lost_file_count(), 1);
-        assert!(should_fail_run(registry.lost_file_count(), false));
+        assert_eq!(registry.service_losses(&None).files, 1);
         assert!(registry.not_refreshed_line().is_none());
         assert!(registry.summary_line().unwrap().contains("model_error"));
     }
@@ -499,12 +609,13 @@ mod tests {
         let mut run = run();
         run.record_files_attempted(120);
         assert_eq!(run.summary_line(), None);
-        assert!(!should_fail_run(run.lost_file_count(), false));
+        assert!(run.service_losses(&None).is_empty());
     }
 
-    /// The regression: one lost file must reach the summary AND the exit code.
+    /// The regression: one lost file must reach the summary AND its service's
+    /// owed work, which is what holds a service with an index back (#461).
     #[test]
-    fn a_lost_file_is_named_and_fails_the_run() {
+    fn a_lost_file_is_named_and_owed_by_its_service() {
         let mut run = run();
         run.record_files_attempted(3);
         run.record_unanalysed_file("src/routes/orders.ts", "gateway_error");
@@ -520,9 +631,39 @@ mod tests {
             summary.contains("src/routes/orders.ts"),
             "summary: {summary}"
         );
-        assert!(should_fail_run(run.lost_file_count(), false));
-        // Only an explicit opt-in keeps such a run green.
-        assert!(!should_fail_run(run.lost_file_count(), true));
+        assert_eq!(run.service_losses(&None).files, 1);
+    }
+
+    /// Losses belong to the service being analysed when they happen, so one
+    /// service's upload carries its own unanalysed files and a retry of it
+    /// forgets only its own.
+    #[test]
+    fn losses_are_scoped_to_the_service_that_had_them() {
+        let api = Some("api".to_string());
+        let billing = Some("billing".to_string());
+        let mut run = run();
+        run.current = api.clone();
+        run.record_files_attempted(4);
+        run.record_unanalysed_file("api/src/a.ts", "model_error");
+        run.current = billing.clone();
+        run.record_files_attempted(2);
+        run.record_unanalysed_file("billing/src/b.ts", "gateway_error");
+        run.record_intents_failed(3);
+
+        assert_eq!(run.service_losses(&api).files, 1);
+        assert_eq!(run.service_losses(&api).intents, 0);
+        assert_eq!(run.service_losses(&billing).intents, 3);
+        let api_files = run.unanalysed_files_for(&api);
+        assert_eq!(api_files.len(), 1);
+        assert_eq!(api_files[0].path, "api/src/a.ts");
+
+        run.forget_service_losses(&billing);
+        assert!(run.service_losses(&billing).is_empty());
+        assert_eq!(run.service_losses(&api).files, 1);
+        assert_eq!(run.lost_file_count(), 1);
+        // The forgotten file leaves the attempted count, because the retry
+        // dispatches and counts it again.
+        assert_eq!(run.attempted, 5);
     }
 
     /// Reasons are grouped and ordered by how many files each cost, so the

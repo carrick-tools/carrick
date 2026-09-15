@@ -43,6 +43,28 @@ fn trip_rate_limit() {
     RATE_LIMITED.store(true, Ordering::Relaxed);
 }
 
+/// Close the breaker again, for the one moment a scan deliberately gives the
+/// backend another chance: the engine's single retry of the work a run still
+/// owes, which starts only after it has waited (see `engine::durability`). A
+/// quota that has not refilled trips it again on the first call, and every
+/// other call fails fast as before.
+pub fn reset_rate_limit() {
+    RATE_LIMITED.store(false, Ordering::Relaxed);
+}
+
+/// Calls this process failed fast because the breaker was open, or that
+/// tripped it.
+///
+/// A file or an intent that ends this way is not counted as lost (it was
+/// never attempted), so the count is what tells the engine that a service
+/// analysed while the breaker was open has model work it did not do.
+static QUOTA_ABORTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many calls have failed on the quota breaker so far this process.
+pub fn quota_abort_count() -> usize {
+    QUOTA_ABORTS.load(Ordering::Relaxed)
+}
+
 /// How many requests this scan has issued to each cloud route.
 ///
 /// Process-global for the same reason the breaker above is: a scan builds
@@ -120,14 +142,17 @@ pub const QUOTA_ABORT_CODE: &str = "quota_exhausted";
 pub const LLM_DISABLED_CODE: &str = "llm_disabled";
 
 /// The error returned for an individual call once the breaker is open. Scoped
-/// to what's true at the call level (this call fails fast); the engine turns a
-/// tripped breaker into a fatal, no-upload abort via [`rate_limit_tripped`].
+/// to what's true at the call level (this call fails fast); the engine holds
+/// back every service a failed-fast call belonged to (see
+/// [`quota_abort_count`]) and lands the rest.
 fn rate_limit_abort_error() -> AgentCallError {
+    QUOTA_ABORTS.fetch_add(1, Ordering::Relaxed);
     AgentCallError {
         code: QUOTA_ABORT_CODE.to_string(),
         message: "Carrick Cloud LLM quota exhausted; failing fast. This is a rate/quota \
                   limit on the analysis backend, not a problem with the scanned code. The \
-                  scan will stop before uploading; re-run after the quota resets."
+                  services this reaches are held back and named at the end of the scan; \
+                  re-run after the quota resets."
             .to_string(),
         retriable: false,
     }
@@ -205,6 +230,55 @@ const MAX_RETRIES: u32 = 7;
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 /// Ceiling on a single backoff sleep (reached at attempt 6: 2→4→8→16→32→64s).
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(64);
+/// Ceiling on a single sleep for a [`RetryPolicy::PATIENT`] call.
+const PATIENT_RETRY_MAX_DELAY: Duration = Duration::from_secs(120);
+
+/// How long one call keeps trying before it gives up.
+///
+/// Two policies, because the cost of giving up is not the same for every call.
+/// A file analysis or an intent that fails costs one file or one function, and
+/// the run carries on without it, so seven attempts over about two minutes is
+/// the right amount of patience against a backend that may stay down. A call
+/// the rest of a service depends on — framework detection, and the guidance
+/// built from it — costs the whole service when it fails, and the failure it
+/// usually meets is a shared model quota that refills within minutes
+/// (2026-09-15: one detection call, seven `model_error` answers over 106 s,
+/// and a seven-service first index aborted). A refused call costs nothing, so
+/// those calls wait far longer before the engine defers the service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Attempts in total, the first included.
+    max_attempts: u32,
+    /// Ceiling on one sleep, and on the `Retry-After` hint honoured.
+    max_delay: Duration,
+    /// Ceiling on the sleeps added together. A retry whose wait would cross it
+    /// is not made.
+    wait_budget: Duration,
+}
+
+impl RetryPolicy {
+    /// Every per-file and per-function call.
+    pub const STANDARD: Self = Self {
+        max_attempts: MAX_RETRIES,
+        max_delay: RETRY_MAX_DELAY,
+        // Never the binding limit: the attempts run out first (~126 s at most).
+        wait_budget: Duration::from_secs(3600),
+    };
+
+    /// A call a whole service depends on: exponential with jitter, sleeps of
+    /// up to two minutes, and up to ten minutes of sleeping before it fails.
+    pub const PATIENT: Self = Self {
+        max_attempts: 32,
+        max_delay: PATIENT_RETRY_MAX_DELAY,
+        wait_budget: Duration::from_secs(600),
+    };
+
+    /// Whether a failed attempt `attempt` may be followed by a sleep of `next`
+    /// after `waited` has already been slept on this call.
+    fn permits(&self, attempt: u32, waited: Duration, next: Duration) -> bool {
+        attempt < self.max_attempts && waited + next <= self.wait_budget
+    }
+}
 
 /// Whether a failed call should consume a backoff attempt.
 ///
@@ -234,19 +308,26 @@ fn should_retry(err: &AgentCallError, attempt: u32, max_retries: u32) -> bool {
 ///
 /// Pure so it can be tested: `jitter` is any value in `0..=u32::MAX`, supplied
 /// by [`jitter_seed`] at the call site.
+#[cfg(test)]
 fn backoff_delay(attempt: u32, jitter: u32) -> Duration {
+    backoff_delay_within(attempt, jitter, RETRY_MAX_DELAY)
+}
+
+/// [`backoff_delay`] under a policy's own ceiling.
+fn backoff_delay_within(attempt: u32, jitter: u32, max_delay: Duration) -> Duration {
     let exponential = RETRY_BASE_DELAY
         .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1)))
-        .min(RETRY_MAX_DELAY);
+        .min(max_delay);
     let half = exponential / 2;
     let spread = half.mul_f64(f64::from(jitter) / f64::from(u32::MAX));
     half + spread
 }
 
-/// The longest `Retry-After` the scanner will honour. A hint above it is read
+/// The longest `Retry-After` the scanner will read. A hint above it is read
 /// as this, so a mistyped header on the cloud side cannot park a worker for an
-/// hour; the backoff chain's own ceiling is the natural bound.
-const RETRY_AFTER_CAP: Duration = RETRY_MAX_DELAY;
+/// hour. Each policy then caps the hint again at its own sleep ceiling, so a
+/// per-file call still honours no more than [`RETRY_MAX_DELAY`].
+const RETRY_AFTER_CAP: Duration = PATIENT_RETRY_MAX_DELAY;
 
 /// The request header that numbers this call's attempts for the lambda
 /// (carrick-cloud#875). The lambda gives attempt 1 its full in-lambda model
@@ -271,12 +352,23 @@ fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
 /// provider answers every in-flight worker at once, all with the same hint,
 /// and honouring it exactly would wake them in lockstep, which is the burst
 /// [`backoff_delay`]'s jitter exists to prevent.
+#[cfg(test)]
 fn retry_wait(attempt: u32, jitter: u32, retry_after: Option<Duration>) -> Duration {
-    let backoff = backoff_delay(attempt, jitter);
+    retry_wait_within(attempt, jitter, retry_after, RETRY_MAX_DELAY)
+}
+
+/// [`retry_wait`] under a policy's own ceiling.
+fn retry_wait_within(
+    attempt: u32,
+    jitter: u32,
+    retry_after: Option<Duration>,
+    max_delay: Duration,
+) -> Duration {
+    let backoff = backoff_delay_within(attempt, jitter, max_delay);
     let Some(hint) = retry_after else {
         return backoff;
     };
-    let hint = hint.min(RETRY_AFTER_CAP);
+    let hint = hint.min(max_delay);
     let spread = (hint / 2).mul_f64(f64::from(jitter) / f64::from(u32::MAX));
     backoff.max(hint + spread)
 }
@@ -417,6 +509,7 @@ pub struct AgentService {
     semaphore: Arc<Semaphore>,
     limits: Arc<RouteLimits>,
     pacer: Arc<RatePacer>,
+    retry: RetryPolicy,
 }
 
 impl AgentService {
@@ -436,7 +529,14 @@ impl AgentService {
             semaphore: global_semaphore(),
             limits: global_route_limits(),
             pacer: global_pacer(),
+            retry: RetryPolicy::STANDARD,
         }
+    }
+
+    /// The same service, retrying under `policy` (see [`RetryPolicy`]).
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry = policy;
+        self
     }
 
     /// Per-task lambda call where the lambda just needs a user_message +
@@ -495,6 +595,9 @@ impl AgentService {
         record_request(task_path);
 
         if env::var("CARRICK_MOCK_ALL").is_ok() {
+            if let Some(error) = take_mock_failure(task_path, body) {
+                return Err(error);
+            }
             return Ok(LambdaOutcome {
                 text: generate_mock_for_task(task_path, body, mock_seed),
                 guidance_key: None,
@@ -561,7 +664,10 @@ impl AgentService {
         // response is a floor under the backoff (see `retry_wait`), and each
         // request numbers itself in `X-Carrick-Attempt` so the lambda sizes
         // its own model retries to this loop (carrick-cloud#875).
-        let max_retries = MAX_RETRIES;
+        let policy = self.retry;
+        let max_retries = policy.max_attempts;
+        // What this call has slept so far, against the policy's wait budget.
+        let mut waited = Duration::ZERO;
         let route_limit = self.limits.for_route(path);
         for attempt in 1..=max_retries {
             // A sibling call (any phase, any `AgentService`) may have already
@@ -662,8 +768,9 @@ impl AgentService {
                         Err(e) => {
                             // The response never arrived in full: transport, not
                             // application, so it is retriable by definition.
-                            if attempt < max_retries {
-                                let wait_time = backoff_delay(attempt, jitter_seed());
+                            let wait_time =
+                                backoff_delay_within(attempt, jitter_seed(), policy.max_delay);
+                            if policy.permits(attempt, waited, wait_time) {
                                 warn!(
                                     "Failed to read agent proxy response ({}): {}. Retrying in {:?} (attempt {}/{})",
                                     status, e, wait_time, attempt, max_retries
@@ -671,6 +778,7 @@ impl AgentService {
                                 drop(permit);
                                 drop(route_slot);
                                 sleep(wait_time).await;
+                                waited += wait_time;
                                 lambda_attempt += 1;
                                 continue;
                             }
@@ -750,8 +858,15 @@ impl AgentService {
                             // Body wasn't a parseable envelope. If the status
                             // is a known transient gateway code, retry —
                             // otherwise fail fast (server-side bug).
-                            if is_transient_gateway_status && attempt < max_retries {
-                                let wait_time = retry_wait(attempt, jitter_seed(), retry_after);
+                            let wait_time = retry_wait_within(
+                                attempt,
+                                jitter_seed(),
+                                retry_after,
+                                policy.max_delay,
+                            );
+                            if is_transient_gateway_status
+                                && policy.permits(attempt, waited, wait_time)
+                            {
                                 let line = format!(
                                     "Gateway status {} with non-envelope body ({}): {}. Retrying in {:?} (attempt {}/{})",
                                     status,
@@ -782,6 +897,7 @@ impl AgentService {
                                     lambda_attempt += 1;
                                 }
                                 sleep(wait_time).await;
+                                waited += wait_time;
                                 continue;
                             }
                             // Out of attempts: the throttle still says the
@@ -834,7 +950,7 @@ impl AgentService {
                     if is_quota_error(&err) {
                         trip_rate_limit();
                         warn!(
-                            "Backend LLM quota exhausted ({}); tripping circuit breaker — remaining calls fail fast and the scan aborts before upload",
+                            "Backend LLM quota exhausted ({}); tripping circuit breaker — remaining calls fail fast, and the services they belong to are held back and retried once before the scan ends",
                             err.message
                         );
                         return Err(rate_limit_abort_error());
@@ -846,11 +962,14 @@ impl AgentService {
                         retriable: err.retriable,
                     };
 
-                    if should_retry(&call_err, attempt, max_retries) {
-                        // The cloud's Retry-After on a 503 `model_error` is
-                        // the floor: re-firing after one or two seconds lands
-                        // in the same capacity dip the lambda just gave up on.
-                        let wait_time = retry_wait(attempt, jitter_seed(), retry_after);
+                    // The cloud's Retry-After on a 503 `model_error` is the
+                    // floor: re-firing after one or two seconds lands in the
+                    // same capacity dip the lambda just gave up on.
+                    let wait_time =
+                        retry_wait_within(attempt, jitter_seed(), retry_after, policy.max_delay);
+                    if should_retry(&call_err, attempt, max_retries)
+                        && policy.permits(attempt, waited, wait_time)
+                    {
                         let line = format!(
                             "Agent error '{}' is retriable, retrying in {:?} (attempt {}/{}): {}",
                             call_err.code, wait_time, attempt, max_retries, call_err.message
@@ -866,6 +985,7 @@ impl AgentService {
                             drop(route_slot);
                         }
                         sleep(wait_time).await;
+                        waited += wait_time;
                         lambda_attempt += 1;
                         continue;
                     }
@@ -880,8 +1000,8 @@ impl AgentService {
                 }
                 Err(e) => {
                     // Bare network failure (no response received) — retriable by definition.
-                    if attempt < max_retries {
-                        let wait_time = backoff_delay(attempt, jitter_seed());
+                    let wait_time = backoff_delay_within(attempt, jitter_seed(), policy.max_delay);
+                    if policy.permits(attempt, waited, wait_time) {
                         warn!(
                             "Agent proxy network error: {}, retrying in {:?} (attempt {}/{})",
                             e, wait_time, attempt, max_retries
@@ -889,6 +1009,7 @@ impl AgentService {
                         drop(permit);
                         drop(route_slot);
                         sleep(wait_time).await;
+                        waited += wait_time;
                         lambda_attempt += 1;
                         continue;
                     }
@@ -906,6 +1027,52 @@ impl AgentService {
             "Maximum retry attempts exceeded".to_string(),
         ))
     }
+}
+
+/// A failure an offline run answers instead of the mock response, for the
+/// tests that prove a scan survives a call the cloud never answered.
+struct MockFailure {
+    task_path: String,
+    body_contains: String,
+    remaining: usize,
+}
+
+fn mock_failures() -> &'static Mutex<Vec<MockFailure>> {
+    static FAILURES: OnceLock<Mutex<Vec<MockFailure>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Make the next `times` offline calls to `task_path` whose serialized body
+/// contains `body_contains` fail the way a call whose retries were spent on an
+/// overloaded model fails: `model_error`, `retriable: true`.
+///
+/// Honoured only under `CARRICK_MOCK_ALL`, where nothing reaches the cloud,
+/// and matched on the body so a test can fail one service's call and not its
+/// siblings' (framework detection is the same route for every service). The
+/// retry loop is not run: the error is what that loop returns once it is spent.
+#[allow(dead_code)] // Called by tests/ through the library, never by the binary.
+pub fn inject_mock_failure(task_path: &str, body_contains: &str, times: usize) {
+    mock_failures().lock().unwrap().push(MockFailure {
+        task_path: task_path.to_string(),
+        body_contains: body_contains.to_string(),
+        remaining: times,
+    });
+}
+
+fn take_mock_failure<B: Serialize + ?Sized>(task_path: &str, body: &B) -> Option<AgentCallError> {
+    let mut failures = mock_failures().lock().unwrap();
+    if failures.is_empty() {
+        return None;
+    }
+    let serialized = serde_json::to_string(body).unwrap_or_default();
+    let failure = failures.iter_mut().find(|f| {
+        f.remaining > 0 && f.task_path == task_path && serialized.contains(&f.body_contains)
+    })?;
+    failure.remaining -= 1;
+    Some(AgentCallError::transient(
+        "model_error",
+        "Gemini overloaded; retries exhausted (injected offline failure)".to_string(),
+    ))
 }
 
 /// Request body for per-task lambda endpoints (e.g. /analyze-file).
@@ -2165,6 +2332,7 @@ pub(crate) mod tests {
             semaphore: Arc::new(Semaphore::new(permits)),
             limits: Arc::new(RouteLimits::new(route_max)),
             pacer: Arc::new(RatePacer::new()),
+            retry: RetryPolicy::STANDARD,
         }
     }
 
@@ -2347,6 +2515,47 @@ pub(crate) mod tests {
         );
         // A daily-cap reset hint hours away cannot park a worker for hours.
         assert_eq!(parse_retry_after(Some("43200")), Some(RETRY_AFTER_CAP));
+    }
+
+    /// Walk a policy's worst case: every attempt answered retriable with the
+    /// longest jitter, and return (attempts made, seconds slept).
+    fn worst_case(policy: RetryPolicy, retry_after: Option<Duration>) -> (u32, Duration) {
+        let mut waited = Duration::ZERO;
+        let mut attempt = 1;
+        loop {
+            let next = retry_wait_within(attempt, u32::MAX, retry_after, policy.max_delay);
+            if !policy.permits(attempt, waited, next) {
+                return (attempt, waited);
+            }
+            waited += next;
+            attempt += 1;
+        }
+    }
+
+    /// The per-file policy is the seven attempts it always was; the patient
+    /// one, for the calls a whole service depends on, sleeps for up to ten
+    /// minutes and never longer, whatever the cloud's hint says.
+    #[test]
+    fn a_service_level_call_waits_minutes_and_a_file_call_does_not() {
+        let (attempts, waited) = worst_case(RetryPolicy::STANDARD, None);
+        assert_eq!(attempts, MAX_RETRIES);
+        assert!(waited <= Duration::from_secs(130), "{waited:?}");
+
+        let (attempts, waited) = worst_case(RetryPolicy::PATIENT, None);
+        assert!(attempts > MAX_RETRIES, "{attempts}");
+        assert!(waited > Duration::from_secs(450), "{waited:?}");
+        assert!(waited <= Duration::from_secs(600), "{waited:?}");
+
+        // A long Retry-After is honoured up to the policy's own ceiling, and
+        // the budget still bounds the total.
+        let hint = Some(Duration::from_secs(300));
+        assert!(
+            retry_wait_within(1, 0, hint, RetryPolicy::PATIENT.max_delay)
+                <= PATIENT_RETRY_MAX_DELAY * 3 / 2
+        );
+        assert!(retry_wait_within(1, 0, hint, RETRY_MAX_DELAY) <= RETRY_MAX_DELAY * 3 / 2);
+        let (_, waited) = worst_case(RetryPolicy::PATIENT, hint);
+        assert!(waited <= Duration::from_secs(600), "{waited:?}");
     }
 
     #[test]

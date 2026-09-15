@@ -820,6 +820,9 @@ async fn describe_functions<S, SFut>(
                 String::new()
             }
         );
+        // Counted against the service being analysed, so the engine can give
+        // it one more try before the run ends.
+        crate::scan_health::record_intents_failed(failed);
         if failed > 0 || aborted > 0 {
             warn!("{}", summary);
         } else {

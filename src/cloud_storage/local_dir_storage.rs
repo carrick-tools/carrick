@@ -69,15 +69,9 @@ impl LocalDirStorage {
             .collect();
         self.cache_dir.join(format!("{safe}.json"))
     }
-}
 
-#[async_trait]
-impl CloudStorage for LocalDirStorage {
-    async fn upload_repo_data(
-        &self,
-        data: &CloudRepoData,
-        _final_in_run: bool,
-    ) -> Result<UploadOutcome, StorageError> {
+    /// Write `data` to its cache file.
+    pub(crate) fn write_cache_file(&self, data: &CloudRepoData) -> Result<(), StorageError> {
         let path = self.cache_path(&data.repo_name, data.service_name.as_deref());
         debug!(
             "LOCAL: Uploading repo data for {} (service: {:?}) -> {}",
@@ -89,7 +83,18 @@ impl CloudStorage for LocalDirStorage {
             .map_err(|e| StorageError::SerializationError(e.to_string()))?;
         std::fs::write(&path, json).map_err(|e| {
             StorageError::ConnectionError(format!("Failed to write {}: {e}", path.display()))
-        })?;
+        })
+    }
+}
+
+#[async_trait]
+impl CloudStorage for LocalDirStorage {
+    async fn upload_repo_data(
+        &self,
+        data: &CloudRepoData,
+        _final_in_run: bool,
+    ) -> Result<UploadOutcome, StorageError> {
+        self.write_cache_file(data)?;
         // The cache file is rewritten unconditionally — there is no freshness
         // check to short-circuit on — and nothing here is metered, so there is
         // no spend to report either.

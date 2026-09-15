@@ -23,7 +23,7 @@ mod mock_storage;
 pub use mock_storage::MockStorage;
 mod aws_storage;
 pub use aws_storage::AwsStorage;
-pub(crate) use aws_storage::INLINE_PAYLOAD_LIMIT_BYTES;
+pub(crate) use aws_storage::{INLINE_PAYLOAD_LIMIT_BYTES, indexed_service_slug};
 mod local_dir_storage;
 mod tee_storage;
 pub use local_dir_storage::{CACHE_DIR_ENV, ISOLATE_ENV, LocalDirStorage};
@@ -972,6 +972,17 @@ pub trait CloudStorage {
     async fn begin_run(&self, _run: &RunContext) -> Result<RunStart, StorageError> {
         self.health_check().await.map(|()| RunStart::default())
     }
+
+    /// Keep `data`, the generation the index already serves for a service this
+    /// run held back, wherever this backend builds a read model from the
+    /// run's own writes.
+    ///
+    /// Only the laptop's storage has such a place: `carrick index` builds the
+    /// `.carrick` index from the blobs the scan wrote, and a held-back service
+    /// writes none. Everywhere else the index itself is the read model and
+    /// already holds it, so the default does nothing. Not async, so the
+    /// default body puts no `Sync` bound on generic callers (carrick#956).
+    fn keep_served_generation(&self, _data: &CloudRepoData) {}
 
     /// Whether this backend can store more than one service per git repo
     /// without collision. The production index keys on

@@ -16,15 +16,14 @@ use crate::{
     agents::{
         file_analyzer_agent::FileAnalysisResult,
         file_orchestrator::{FileCentricAnalysisResult, FileOrchestrator, ProcessingStats},
-        framework_guidance_agent::{FrameworkGuidanceAgent, ProtocolGuidance},
+        framework_guidance_agent::ProtocolGuidance,
     },
-    framework_detector::{DetectionResult, FrameworkDetector},
+    framework_detector::DetectionResult,
     mount_graph::MountGraph,
     packages::Packages,
     url_normalizer::UrlNormalizer,
-    visitor::ImportedSymbol,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use swc_common::{SourceMap, sync::Lrc};
 use tracing::debug;
 
@@ -71,8 +70,8 @@ impl MultiAgentOrchestrator {
     /// Run the complete multi-agent analysis workflow using AST-Gated File-Centric approach.
     ///
     /// ## Workflow:
-    /// 1. **Framework Detection** - Identify frameworks from packages and imports
-    /// 2. **Framework Guidance** - Generate patterns for detected frameworks
+    /// 1. **Framework Detection** and 2. **Framework Guidance** arrive settled
+    ///    in `setup` (see `engine::model_setup`)
     /// 3. **AST-Gated Analysis** - For each file:
     ///    - Run SWC Scanner to find candidates
     ///    - If no candidates → SKIP (zero LLM cost)
@@ -83,10 +82,9 @@ impl MultiAgentOrchestrator {
         &self,
         files: Vec<std::path::PathBuf>,
         packages: &Packages,
-        // Every distinct import fact the service's files state, ordered and
-        // deduplicated: the framework-detect body is built from it and must
-        // not vary with walk order (carrick#954).
-        import_facts: &BTreeSet<ImportedSymbol>,
+        // What the engine settled for this service's model stages: the
+        // detection and guidance to analyse with, or a deferral.
+        setup: &crate::engine::ModelSetup,
         // Root for file-based route derivation: the SERVICE directory when
         // carrick.json declares one, else the repo root (see
         // `engine::service_scan_root`).
@@ -103,46 +101,21 @@ impl MultiAgentOrchestrator {
     ) -> Result<MultiAgentAnalysisResult, Box<dyn std::error::Error>> {
         debug!("Starting AST-Gated File-Centric analysis...");
 
-        // Stage 0: Framework Detection
-        //
-        // Both model stages below are skipped in local mode (carrick#708):
-        // detection and guidance are prompt inputs, and a run with no model to
-        // prompt states an empty inventory rather than an invented one. The
-        // deterministic layer reads the declared dependencies for the routing
-        // conventions it needs, so the facts a file states outright survive
-        // the skip.
-        debug!("=== Stage 0: Framework Detection ===");
-        let framework_detection = if crate::local_mode::no_model() {
-            debug!("Local mode: skipping framework detection (no model)");
-            DetectionResult::default()
-        } else {
-            let framework_detector = FrameworkDetector::new(self.agent_service.clone());
-            framework_detector
-                .detect_frameworks_and_libraries(packages, import_facts)
-                .await?
-        };
-
+        // Stages 0 and 1 (framework detection, then guidance) are the engine's
+        // (`engine::model_setup`): it is the one place that decides whether a
+        // service's model analysis runs at all, and a failure there defers the
+        // service rather than ending the run. What reaches here is the setup
+        // it settled on.
+        let framework_detection = setup.detection.clone();
+        let framework_guidance = setup.guidance.clone();
         debug!("Detected frameworks: {:?}", framework_detection.frameworks);
         debug!(
             "Detected data fetchers: {:?}",
             framework_detection.data_fetchers
         );
-
-        // Stage 1: Framework Guidance Generation
-        debug!("=== Stage 1: Framework Guidance Generation ===");
-        let framework_guidance = if crate::local_mode::no_model() {
-            debug!("Local mode: skipping framework guidance (no model)");
-            crate::local_mode::offline_guidance()
-        } else {
-            let framework_guidance_agent = FrameworkGuidanceAgent::new(self.agent_service.clone());
-            framework_guidance_agent
-                .generate_for_active_protocols(&framework_detection)
-                .await?
-        };
-
         for (protocol, guidance) in &framework_guidance {
             debug!(
-                "Generated {:?} guidance with {} mount patterns, {} endpoint patterns, {} data fetching patterns",
+                "Using {:?} guidance with {} mount patterns, {} endpoint patterns, {} data fetching patterns",
                 protocol,
                 guidance.mount_patterns.len(),
                 guidance.endpoint_patterns.len(),
@@ -152,7 +125,8 @@ impl MultiAgentOrchestrator {
 
         // Stage 2: AST-Gated File-Centric Analysis
         debug!("=== Stage 2: AST-Gated File-Centric Analysis ===");
-        let file_orchestrator = FileOrchestrator::new(self.agent_service.clone());
+        let file_orchestrator = FileOrchestrator::new(self.agent_service.clone())
+            .deferring_model(setup.deferred.is_some());
         let file_centric_result = file_orchestrator
             .analyze_files(
                 &files,

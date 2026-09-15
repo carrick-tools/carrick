@@ -489,6 +489,10 @@ fn run_scan(
     // the scan's output, so a figure it does not lift out is a figure nobody
     // ever sees (carrick#995).
     let mut spend = None;
+    // What the scan still owes, when it landed some services and left others
+    // pending. A scan in that state exits 0, so its output would otherwise be
+    // dropped with the rest, and this is the sentence that says to re-run.
+    let mut pending: Vec<String> = Vec::new();
     // The child's stderr is read on a thread of its own so that this loop can
     // wake up when the child says NOTHING. A scan's quiet stretches are its
     // long ones — a model call, a type check — and the log's pulse used to be
@@ -523,6 +527,10 @@ fn run_scan(
             spend = Some(reported);
             continue;
         }
+        if let Some(statement) = crate::progress::parse_pending(&line) {
+            pending.push(statement);
+            continue;
+        }
         // Kept clean from here on: what this loop keeps is read back by a
         // JSON reader and by a log file, neither of which renders escapes
         // (carrick#1023 item 6).
@@ -548,7 +556,14 @@ fn run_scan(
         .wait()
         .map_err(|e| format!("could not wait for the {what}: {e}"))?;
     if status.success() {
-        crate::logging::finish_spinner(&bar, &reporting.done);
+        if pending.is_empty() {
+            crate::logging::finish_spinner(&bar, &reporting.done);
+        } else {
+            crate::logging::finish_spinner_warn(&bar, &reporting.done);
+            for statement in &pending {
+                eprintln!("carrick: {statement}");
+            }
+        }
         return Ok(spend);
     }
     bar.finish_and_clear();

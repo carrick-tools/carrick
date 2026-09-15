@@ -124,6 +124,9 @@ fn mock_env(cassette: &Path) {
         // upload. Without this the engine aborts before the upload — which is
         // the behaviour this test leaves untouched.
         std::env::set_var(carrick::scan_health::ALLOW_PARTIAL_ENV, "1");
+        // The loss is permanent (the cassette is not JSON), so the retry the
+        // run gives it at the end fails again; it need not wait to find out.
+        std::env::set_var(carrick::engine::durability::RETRY_DELAY_ENV, "0");
         std::env::remove_var("GITHUB_EVENT_NAME");
         std::env::remove_var("GITHUB_REF");
     }
