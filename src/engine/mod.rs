@@ -9959,6 +9959,61 @@ mod tests {
         assert_eq!(mount_graph.data_calls.len(), 1);
     }
 
+    /// carrick#1134: a document written against a schema no service serves is
+    /// not a call, and its file's transport call is folded all the same, so
+    /// the vendor POST does not come back as an HTTP call once the document is
+    /// gone.
+    #[test]
+    fn settle_drops_external_documents_and_still_folds_their_transport() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("vendor")).unwrap();
+        std::fs::write(
+            repo.path().join("vendor/schema.graphql"),
+            "type Query { balance: Int }",
+        )
+        .unwrap();
+        let catalogue = crate::graphql::SchemaCatalogue::build(
+            repo.path(),
+            &[crate::graphql::ServedSchemaSources {
+                roots: vec![repo.path().join("src")],
+                declared: vec![],
+            }],
+        );
+        let mut mount_graph = MountGraph::new();
+        mount_graph.data_calls = vec![
+            transport_call("${LEDGER_URL}/graphql", "src/gql.ts:25"),
+            transport_call("${ORDERS_API}/orders", "src/orders.ts:12"),
+        ];
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![],
+            consumers: vec![graphql_consumer_op_at(
+                crate::operation::GraphqlOperationKind::Query,
+                "balance",
+                "src/gql.ts",
+                None,
+            )],
+        };
+
+        settle_graphql_documents(
+            &mut graphql,
+            &mut mount_graph,
+            &Config::default(),
+            &catalogue,
+        );
+
+        assert!(
+            graphql.consumers.is_empty(),
+            "the external document is not a call"
+        );
+        let targets: Vec<&str> = mount_graph
+            .data_calls
+            .iter()
+            .map(|c| c.target_url.as_str())
+            .collect();
+        assert_eq!(targets, vec!["${ORDERS_API}/orders"]);
+        assert_eq!(catalogue.notices().len(), 1);
+    }
+
     /// Variant of `graphql_consumer_op` with a caller-chosen `kind` and
     /// `file_path`, for the #268 per-file/per-kind join tests: the consumer
     /// locate merge is keyed on `(file_path, kind, field)`, so exercising

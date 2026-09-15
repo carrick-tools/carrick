@@ -218,8 +218,11 @@ fn documents_are_indexed_as_calls_only_when_their_schema_is_served_here() {
         scan.stdout
     );
 
-    // Both transports are folded into their documents, the external one
-    // included: the vendor POST must not come back as an HTTP call.
+    // Neither transport comes back as an HTTP call. Here both calls name their
+    // document binding, so the #361 repair rewrites them to the operation key
+    // and they never reach the graph; the fold-before-drop ordering for a
+    // transport that does reach it is pinned by the engine unit test
+    // `settle_drops_external_documents_and_still_folds_their_transport`.
     let http_calls = scan.rows("storefront", "calls", "http");
     assert!(
         !http_calls
