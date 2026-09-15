@@ -167,7 +167,42 @@ async fn main() {
     logging::init(args.verbose);
     let repo_path = args.repo_path.clone();
 
-    if let Err(e) = run_analysis(args).await {
+    // A signal ends the run where it stands. The analysis future is dropped
+    // with everything it owns — the sidecar's `Drop` stops its process — and
+    // then the cloud is told, so an interrupted laptop scan releases its slot
+    // at once instead of refusing the re-run for the slot's TTL.
+    //
+    // The listeners are installed before the analysis starts, not when the
+    // race first polls them: the scan's opening stretch (service resolution,
+    // the sidecar's readiness wait) runs without yielding, and a signal that
+    // lands before a handler exists takes the default action and reports
+    // nothing. `biased` so a signal that is already pending wins the next poll.
+    //
+    // The signal arm only names the signal. Reporting and exiting happen after
+    // the `select!` has finished, because the losing future is dropped only
+    // then: a `process::exit` inside the arm would skip that drop, leaving the
+    // sidecar process running and in-flight intent tasks still calling the
+    // model while the report is sent.
+    let mut shutdown = ShutdownListener::install();
+    let raced = tokio::select! {
+        biased;
+        signal = shutdown.recv() => Err(signal),
+        result = run_analysis(args) => Ok(result),
+    };
+    let finished = match raced {
+        Ok(result) => result,
+        Err(signal) => {
+            error!(
+                "Scan interrupted by {} during {}",
+                signal.name(),
+                scan_stage::current().as_str()
+            );
+            report_interruption(&repo_path).await;
+            std::process::exit(signal.exit_code());
+        }
+    };
+
+    if let Err(e) = finished {
         // The stage is in the line a user pastes. The same token goes to the
         // cloud as the fail marker's `stage` (carrick#1063), so a terminal and
         // a dashboard name the same thing, and a run that could reach neither
@@ -210,6 +245,141 @@ async fn report_failure_before_scan(repo_path: &str, error: &dyn std::error::Err
                 .await
         }
         Err(e) => debug!("No pre-scan failure report: {e}"),
+    }
+}
+
+/// A signal that ends a scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shutdown {
+    Interrupt,
+    Terminate,
+}
+
+impl Shutdown {
+    fn name(self) -> &'static str {
+        match self {
+            Shutdown::Interrupt => "SIGINT",
+            Shutdown::Terminate => "SIGTERM",
+        }
+    }
+
+    /// 128 plus the signal number, the code a shell reports for a process a
+    /// signal ended, so a caller reading the status sees the same thing it
+    /// would have without the handler.
+    fn exit_code(self) -> i32 {
+        match self {
+            Shutdown::Interrupt => 130,
+            Shutdown::Terminate => 143,
+        }
+    }
+}
+
+/// SIGINT and SIGTERM, listened for from the moment [`Self::install`] runs.
+struct ShutdownListener {
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownListener {
+    /// Register both handlers now. A signal that cannot be listened for is
+    /// left with its default action.
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Self {
+                interrupt: signal(SignalKind::interrupt()).ok(),
+                terminate: signal(SignalKind::terminate()).ok(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
+    }
+
+    /// The next signal. Never resolves when neither could be listened for.
+    async fn recv(&mut self) -> Shutdown {
+        #[cfg(unix)]
+        {
+            async fn next(stream: Option<&mut tokio::signal::unix::Signal>) {
+                match stream {
+                    Some(stream) => {
+                        stream.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            }
+            tokio::select! {
+                () = next(self.interrupt.as_mut()) => Shutdown::Interrupt,
+                () = next(self.terminate.as_mut()) => Shutdown::Terminate,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => Shutdown::Interrupt,
+                Err(_) => std::future::pending().await,
+            }
+        }
+    }
+}
+
+/// The reason an interrupted run reports, on either failure event.
+const INTERRUPTED_REASON: &str = "interrupted";
+
+/// Which event an interrupted run sends.
+#[derive(Debug, PartialEq, Eq)]
+enum InterruptionReport {
+    /// A run that never reaches the cloud tells nobody.
+    Nothing,
+    /// `start-scan` opened a scan: mark it, which releases its slot.
+    ScanFailed,
+    /// The run stopped before a scan was opened (carrick#1096).
+    PreflightFailed,
+}
+
+fn interruption_report(scan_opened: bool, reaches_cloud: bool) -> InterruptionReport {
+    match (reaches_cloud, scan_opened) {
+        (false, _) => InterruptionReport::Nothing,
+        (true, true) => InterruptionReport::ScanFailed,
+        (true, false) => InterruptionReport::PreflightFailed,
+    }
+}
+
+/// Tell the cloud this run was interrupted, best effort, in the stage it was
+/// in: `scan-failed` when a scan was open, `preflight-failed` before that.
+async fn report_interruption(repo_path: &str) {
+    let reaches_cloud = run_reaches_cloud(
+        env::var(cloud_storage::CACHE_DIR_ENV).is_ok(),
+        cloud_storage::laptop_scan_requested(),
+        env::var("CARRICK_MOCK_ALL").is_ok(),
+    );
+    let scan_id = credentials::scan_id();
+    let report = interruption_report(scan_id.is_some(), reaches_cloud);
+    if report == InterruptionReport::Nothing {
+        return;
+    }
+    let storage = match AwsStorage::new(false) {
+        Ok(storage) => storage,
+        Err(e) => {
+            debug!("No interruption report: {e}");
+            return;
+        }
+    };
+    let stage = scan_stage::current();
+    match (report, scan_id) {
+        (InterruptionReport::ScanFailed, Some(scan_id)) => {
+            storage
+                .report_scan_failed_for(scan_id, stage.as_str(), INTERRUPTED_REASON)
+                .await
+        }
+        _ => {
+            let error = std::io::Error::other(INTERRUPTED_REASON);
+            engine::report_preflight_failure(&storage, repo_path, stage, &error).await
+        }
     }
 }
 
@@ -612,6 +782,27 @@ mod tests {
         assert!(!should_report_preflight(true, true));
         assert!(!should_report_preflight(false, false));
         assert!(!should_report_preflight(true, false));
+    }
+
+    /// An interrupted run sends one event, and which one depends on whether a
+    /// scan was open: `scan-failed` releases the slot `start-scan` claimed, and
+    /// a run stopped before that has only `preflight-failed` to say it with.
+    #[test]
+    fn an_interrupted_run_reports_on_the_event_its_stage_allows() {
+        assert_eq!(
+            interruption_report(true, true),
+            InterruptionReport::ScanFailed
+        );
+        assert_eq!(
+            interruption_report(false, true),
+            InterruptionReport::PreflightFailed
+        );
+        assert_eq!(
+            interruption_report(true, false),
+            InterruptionReport::Nothing
+        );
+        assert_eq!(Shutdown::Interrupt.exit_code(), 130);
+        assert_eq!(Shutdown::Terminate.exit_code(), 143);
     }
 
     /// A mistyped command is answered as a command, and the answer names the

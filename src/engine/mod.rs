@@ -1,6 +1,6 @@
-use crate::agent_service::AgentService;
+use crate::agent_service::{AgentService, RetryPolicy};
 use crate::agents::file_orchestrator::FileOrchestrator;
-use crate::agents::framework_guidance_agent::{FrameworkGuidanceAgent, ProtocolGuidance};
+use crate::agents::framework_guidance_agent::FrameworkGuidanceAgent;
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{
     CACHE_DIR_ENV, CloudRepoData, CloudStorage, INLINE_PAYLOAD_LIMIT_BYTES, ManifestRole,
@@ -30,6 +30,8 @@ use crate::type_manifest::{
 use crate::url_normalizer::UrlNormalizer;
 use crate::utils::get_repository_name;
 use crate::visitor::{FunctionDefinition, FunctionDefinitionExtractor, ImportSymbolExtractor};
+pub use durability::ModelSetup;
+use durability::ServiceAnalysis;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
@@ -44,6 +46,7 @@ use swc_common::{
 };
 use swc_ecma_visit::VisitWith;
 
+pub mod durability;
 pub(crate) mod type_compat_v2;
 
 /// Current cache format version.
@@ -488,107 +491,129 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
 
     // 4. Analyze each service (incremental per service where possible).
     let sp = logging::spinner("Analyzing repository...");
-    let mut current_services_data = Vec::with_capacity(services.len());
     // One workspace pass for the whole scan. Every service asks it the same
     // question about the same tree, and rebuilding it per service was the
     // largest fixed cost in the analysis phase (carrick#767).
     let mut workspace_scan = crate::external_call_candidates::WorkspaceScan::new();
     // One intent memo for the whole scan, so a function several services hold
-    // is described once (carrick#1080).
+    // is described once (carrick#1080). The retry below reads it too.
     let run_intents = RunIntentMemo::default();
+    let scan = ServiceScan {
+        repo_path,
+        sidecar,
+        total: services.len(),
+        run_intents: &run_intents,
+    };
+    // Where each service's previous generation is read from: the laptop's
+    // hosted snapshot when the indexer handed one in, otherwise the download.
+    let previous_generations = local_previous.as_ref().unwrap_or(&all_repo_data);
+    let upload_blocked = multi_service && !storage.supports_multi_service();
+    let mut runs: Vec<ServiceRun> = Vec::with_capacity(services.len());
     for (index, service) in services.iter().enumerate() {
-        // One line per service, at info, before the work starts. A scan of a
-        // large monorepo spends most of its wall clock inside this loop, and
-        // without a mark per iteration a stall is a silence with nothing to
-        // attribute it to: the 0.3.42 incident cost sixteen minutes between
-        // two unrelated log lines, and reading which service it was in took
-        // the whole investigation (carrick#748).
-        let label = service.service_name.as_deref().unwrap_or("(root)");
-        info!(
-            "Analyzing service {} ({}/{})",
-            label,
-            index + 1,
-            services.len()
-        );
-        // The same fact, for a parent process that is rendering a line rather
-        // than reading a log (carrick#955).
-        crate::progress::service_started(label, index + 1, services.len());
-        let service_started = Instant::now();
-
-        let packages = load_packages_for_service(repo_path, service)?;
-        let packages_took = service_started.elapsed();
-
-        // Scope the sidecar's type extraction to this service's directory/tsconfig.
-        let sidecar_started = Instant::now();
-        scope_sidecar_to_service(sidecar, repo_path, service);
-        let sidecar_took = sidecar_started.elapsed();
-
         // Incremental cache is per service: match on repo + service name so
         // editing one service does not invalidate the others.
         let previous_data = if no_cache {
             None
         } else {
-            local_previous
-                .as_ref()
-                .unwrap_or(&all_repo_data)
-                .iter()
-                .find(|r| r.repo_name == repo_name && r.service_name == service.service_name)
-                .cloned()
+            previous_generation(previous_generations, &repo_name, service)
         };
-
-        let analysis_started = Instant::now();
-        let requests_before = crate::agent_service::request_counts();
-        crate::phase_timing::start_service();
-        let data = analyze_current_repo_incremental(
-            repo_path,
-            service,
-            &packages,
-            sidecar,
-            previous_data.as_ref(),
-            &mut workspace_scan,
-            &run_intents,
-        )
-        .await?;
-
-        // `analysis` used to be the whole phase and nothing said what was in
-        // it (carrick#767). The breakdown after the colon adds up to it, and
-        // the request counts say how many round trips this service made —
-        // which is what distinguishes work that grew from waiting that grew.
-        let phases = crate::phase_timing::take_line().unwrap_or_else(|| "not recorded".to_string());
-        let requests = crate::agent_service::requests_between(
-            &requests_before,
-            &crate::agent_service::request_counts(),
-        );
-        info!(
-            "Analyzed service {} in {:.1}s (packages {:.1}s, sidecar {:.1}s, analysis {:.1}s: \
-             {}; requests {})",
-            label,
-            service_started.elapsed().as_secs_f64(),
-            packages_took.as_secs_f64(),
-            sidecar_took.as_secs_f64(),
-            analysis_started.elapsed().as_secs_f64(),
-            phases,
-            requests,
-        );
-
-        if data.bundled_types.is_some() {
-            debug!(
-                "Type resolution ({}): {} bundled types, {} manifest entries",
-                data.service_name.as_deref().unwrap_or(&repo_name),
-                data.bundled_types
-                    .as_ref()
-                    .map(|s| s.lines().count())
-                    .unwrap_or(0),
-                data.type_manifest.as_ref().map(|v| v.len()).unwrap_or(0)
-            );
+        match scan
+            .analyze(index, service, previous_data.as_ref(), &mut workspace_scan)
+            .await
+        {
+            Ok(run) => runs.push(run),
+            Err(error) => {
+                // Not a model failure — those defer, they do not reach here —
+                // so something this run cannot work around. The services that
+                // finished owe nothing, and they land before the run ends, so
+                // the next scan replays them instead of paying for them again.
+                // Verdict-less, as on the cross-repo failure path below, and
+                // without closing the scan: the fail marker the caller sends
+                // releases the slot and does not call this a finished index.
+                logging::finish_spinner_warn(&sp, "Analysis stopped");
+                if should_upload && !upload_blocked {
+                    let finished: Vec<&CloudRepoData> = runs
+                        .iter()
+                        .filter(|run| run.owed.is_empty())
+                        .map(|run| &run.data)
+                        .collect();
+                    if !finished.is_empty() {
+                        warn!(
+                            "Analysis stopped at service {}/{}; landing the {} service(s) that \
+                             finished before it",
+                            index + 1,
+                            services.len(),
+                            finished.len()
+                        );
+                        let payloads = upload_payloads_for(
+                            storage,
+                            repo_path,
+                            &finished,
+                            git_state.dirty,
+                            unchanged_at_start.as_ref(),
+                        );
+                        upload_service_payloads(storage, &payloads, no_cache, false).await;
+                    }
+                }
+                return Err(error);
+            }
         }
-
-        current_services_data.push(data);
     }
 
-    // Decided here, while every service's rows and dependency facts are still
-    // in hand, and printed with the report (carrick#1099).
-    let graphql_notices = graphql_schema_notices(repo_path, &services, &current_services_data);
+    // 4b. The work the run still owes gets one more try before it ends: a
+    // deferred service's detection, the files and intents the model did not
+    // answer for, the calls the quota breaker stopped. After minutes, not
+    // seconds, because what usually causes all of them is a shared model
+    // quota that refills on that scale.
+    let retrying: Vec<usize> = runs
+        .iter()
+        .enumerate()
+        .filter(|(_, run)| run.owed.worth_retrying())
+        .map(|(index, _)| index)
+        .collect();
+    if !retrying.is_empty() && !crate::local_mode::no_model() {
+        let delay = durability::retry_delay(
+            retrying
+                .iter()
+                .any(|index| runs[*index].owed.thins_the_index()),
+        );
+        let names: Vec<String> = retrying
+            .iter()
+            .map(|index| format!("{} ({})", runs[*index].label, runs[*index].owed.describe()))
+            .collect();
+        logging::progress(
+            &sp,
+            &format!(
+                "{} service(s) still owe model work: {}. Retrying them once in {}s",
+                retrying.len(),
+                names.join(", "),
+                delay.as_secs()
+            ),
+        );
+        tokio::time::sleep(delay).await;
+        // The breaker never re-closes on its own inside a scan. After a wait
+        // this long it is worth one more call to find out; a quota that has
+        // not refilled trips it again at once.
+        crate::agent_service::reset_rate_limit();
+        for index in retrying {
+            let service = &services[index];
+            // Whatever this service lost is recorded again if it is lost again.
+            crate::scan_health::forget_service_losses(service.service_name.as_deref());
+            // Its own blob from a minute ago is the previous generation: every
+            // answer it holds replays, and only what it lacks is asked for.
+            let this_run = runs[index].data.clone();
+            match scan
+                .analyze(index, service, Some(&this_run), &mut workspace_scan)
+                .await
+            {
+                Ok(run) => runs[index] = run,
+                Err(error) => {
+                    warn!("Retrying service {} failed: {error}", runs[index].label);
+                    runs[index].owed.retry_error = Some(error.to_string());
+                }
+            }
+        }
+    }
 
     // What the analysis actually achieved decides what the spinner is allowed
     // to claim. A run that lost files to failed analyzer calls indexed less
@@ -613,7 +638,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     if let Some(ref types_lost) = types_lost {
         headline.push_str(&format!("; {}", types_lost));
     }
-    if lost_files > 0 || types_lost.is_some() {
+    let owing = runs.iter().filter(|run| !run.owed.is_empty()).count();
+    if owing > 0 {
+        headline.push_str(&format!("; {owing} service(s) pending model analysis"));
+    }
+    if lost_files > 0 || types_lost.is_some() || owing > 0 {
         logging::finish_spinner_warn(&sp, &headline);
     } else {
         logging::finish_spinner(&sp, &headline);
@@ -629,87 +658,95 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         );
     }
 
-    // If the LLM quota was exhausted at any point during analysis, the per-call
-    // circuit breaker tripped and the remaining files/functions failed fast — so
-    // the results above are partial. Abort before uploading (or producing any
-    // cross-repo/PR output) so a quota-degraded scan can't overwrite the existing
-    // index with a half-empty one. (Run-log upload still happens in the caller.)
-    //
-    // Checked before the lost-file gate below because it is the more specific
-    // cause: the files that failed before the breaker tripped are recorded
-    // there too, and "the backend is out of quota" is the useful sentence.
-    if crate::agent_service::rate_limit_tripped() {
-        return Err(
-            "Carrick Cloud LLM quota was exhausted mid-scan; the analysis is \
-                    incomplete, so aborting before upload to avoid overwriting the existing \
-                    index with partial results. Re-run after the quota resets."
-                .into(),
-        );
-    }
-
-    // A file the cloud never answered for reaches the results above with only
-    // what the deterministic layer stated about it — the rows it resolved
-    // before the call went out — and without anything only the model can say.
-    // Uploading that overwrites a good index with a thinner one and says
-    // nothing, which is how a service went from 11 indexed endpoints to 4 while
-    // the run reported success (#461). Same shape as the quota abort above:
-    // stop before the upload, so the index stays stale rather than becoming
-    // wrong, and fail the run so CI says so. The lost files are absent from the
-    // incremental cache, so the next run re-analyses exactly them.
-    //
-    // `CARRICK_ALLOW_PARTIAL_ANALYSIS` is the deliberate opt-out for someone
-    // who wants the partial index anyway; the loss is reported either way.
-
     // A budget that refused to answer is not a loss: the model was never
     // asked, so there is nothing to re-run and nothing to protect the index
-    // from. Reported on its own line, and it never reaches the gate below
-    // (carrick#555).
+    // from. Reported on its own line (carrick#555).
     if let Some(line) = crate::scan_health::not_refreshed_line() {
         warn!("{line}");
         logging::annotate(logging::Annotation::Warning, &line);
     }
-
     if let Some(summary) = crate::scan_health::summary_line() {
-        let allow_partial = crate::scan_health::allow_partial_from_env();
-        // On a first index the cloud, not this gate, decides whether a partial
-        // upload is acceptable: there is no index to protect yet, and the
-        // alternative is a repo that can never produce its first one because
-        // one file failed. `start-scan` says which services already have rows,
-        // and an empty list means none do. The cloud re-checks at upload time
-        // and is authoritative, because a CI run may have landed meanwhile
-        // (§4). The CI path never reaches this branch — `indexed_services` is
-        // `None` there, because the question was never asked.
-        let first_index = run_start
-            .indexed_services
-            .as_deref()
-            .is_some_and(<[String]>::is_empty);
-        if first_index {
+        warn!("{summary}");
+    }
+
+    // 4c. Which services land, decided one service at a time.
+    //
+    // A service that owes model work and already has an index is held back,
+    // so the index stays stale rather than becoming thinner (#461): this used
+    // to be one run-wide gate that aborted every service's upload for one
+    // service's lost file, and a run-wide abort on a tripped quota breaker.
+    // A service with no index yet lands whatever it holds — there is nothing
+    // to protect, and on the laptop path the cloud's partial rule decides
+    // with the service's own unanalysed-file list. The lost files are absent
+    // from the cache, so the next run re-analyses exactly them.
+    //
+    // `CARRICK_ALLOW_PARTIAL_ANALYSIS` still lands a held-back service; the
+    // loss is reported either way.
+    let allow_partial = crate::scan_health::allow_partial_from_env();
+    let laptop = run_start.is_laptop();
+    let authorized_basename = run_context
+        .repo_full_name
+        .as_deref()
+        .and_then(|full| full.rsplit('/').next())
+        .unwrap_or(&repo_name)
+        .to_string();
+    for run in &mut runs {
+        let has_index = match run_start.indexed_services.as_deref() {
+            Some(indexed) => {
+                let slug = crate::cloud_storage::indexed_service_slug(
+                    run.data.service_name.as_deref(),
+                    &authorized_basename,
+                );
+                indexed.contains(&slug)
+            }
+            // CI asks nobody. What it downloaded is what the index holds.
+            None => all_repo_data.iter().any(|repo| {
+                repo.repo_name == repo_name && repo.service_name == run.data.service_name
+            }),
+        };
+        run.held_back = durability::holds_back(&run.owed, has_index, laptop, allow_partial);
+        if run.held_back {
             warn!(
-                "{}. This repo has no index yet, so the upload carries the list and the cloud \
-                 decides whether to accept it.",
-                summary
-            );
-        } else if crate::scan_health::should_fail_run(lost_files, allow_partial) {
-            return Err(format!(
-                "{}. Aborting before upload so the existing index is not overwritten with \
-                 partial results. Re-run to index the missing files, or set {} to upload \
-                 this run anyway.",
-                summary,
-                crate::scan_health::ALLOW_PARTIAL_ENV
-            )
-            .into());
-        } else {
-            // The only way past the gate with files lost, other than a first
-            // index, is the opt-out — so this line names it. An `else` and not
-            // a fall-through: it used to be one, and the first-index branch
-            // above would then have claimed a flag nobody set.
-            warn!(
-                "{}. Continuing anyway: {} is set",
-                summary,
+                "Not uploading {}: it already has an index and this run still owes it model \
+                 work ({}), so uploading would replace that index with a thinner one. Set {} to \
+                 upload it anyway.",
+                run.label,
+                run.owed.describe(),
                 crate::scan_health::ALLOW_PARTIAL_ENV
             );
         }
     }
+    // Whether this run leaves a service short of a complete index. A missing
+    // function description alone does not: it never held an index back.
+    let incomplete = runs.iter().any(|run| run.owed.thins_the_index());
+
+    // The data every later stage reads: the join, the PR delta, the eval
+    // projection. A held-back service is represented by the generation the
+    // index still serves, when there is one, so the join is computed against
+    // what consumers will actually read.
+    let current_services_data: Vec<CloudRepoData> = runs
+        .iter()
+        .map(|run| {
+            if !run.held_back {
+                return run.data.clone();
+            }
+            match previous_generations.iter().find(|repo| {
+                repo.repo_name == repo_name && repo.service_name == run.data.service_name
+            }) {
+                Some(served) => {
+                    if should_upload {
+                        storage.keep_served_generation(served);
+                    }
+                    served.clone()
+                }
+                None => run.data.clone(),
+            }
+        })
+        .collect();
+    // Decided here, while every service's rows and dependency facts are still
+    // in hand, and printed with the report (carrick#1099). Index for index
+    // with `services`, as `current_services_data` is.
+    let graphql_notices = graphql_schema_notices(repo_path, &services, &current_services_data);
 
     // 5. Prepare each service's upload payload, but DEFER the actual upload
     //    until after cross-repo analysis (step 6) so every payload can carry the
@@ -724,7 +761,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     //    (PR/branch mode, or an unsupported multi-service repo).
     crate::scan_stage::enter(crate::scan_stage::Stage::BlobBuild);
     let upload_payloads: Option<Vec<CloudRepoData>> = if should_upload {
-        if multi_service && !storage.supports_multi_service() {
+        if upload_blocked {
             warn!(
                 "Skipping index upload: {} services declared but the cloud key has no \
                  service discriminator yet, so uploads would overwrite each other. \
@@ -733,31 +770,18 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             );
             None
         } else {
-            // Asked again now the files have been read, per commit the
-            // payloads name (one, unless HEAD moved mid-scan), and kept only
-            // where both asks agree.
-            let mut unchanged_by_commit: HashMap<String, Option<HashSet<String>>> = HashMap::new();
-            Some(
-                current_services_data
-                    .iter()
-                    .map(|data| {
-                        let unchanged = unchanged_by_commit
-                            .entry(data.commit_hash.clone())
-                            .or_insert_with(|| {
-                                let at_upload =
-                                    crate::git_state::unchanged_since(repo_path, &data.commit_hash)
-                                        .ok()?;
-                                let at_start = unchanged_at_start.as_ref()?;
-                                Some(at_upload.intersection(at_start).cloned().collect())
-                            });
-                        stamp_tree_state(
-                            strip_ast_nodes(data.clone(), storage.stages_oversized_payloads()),
-                            git_state.dirty,
-                            unchanged.as_ref(),
-                        )
-                    })
-                    .collect(),
-            )
+            let landing: Vec<&CloudRepoData> = runs
+                .iter()
+                .filter(|run| !run.held_back)
+                .map(|run| &run.data)
+                .collect();
+            Some(upload_payloads_for(
+                storage,
+                repo_path,
+                &landing,
+                git_state.dirty,
+                unchanged_at_start.as_ref(),
+            ))
         }
     } else {
         debug!("Skipping upload (PR/branch mode)");
@@ -962,7 +986,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                     // named in its own summary line and annotation; the error
                     // this path returns is the analysis failure that brought it
                     // here, which is the one worth raising (carrick#1067).
-                    upload_service_payloads(storage, payloads, no_cache).await;
+                    upload_service_payloads(storage, payloads, no_cache, !incomplete).await;
                 }
                 return Err(e);
             }
@@ -1071,7 +1095,13 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         for payload in &mut payloads {
             enforce_payload_size_limit(payload, staging_available);
         }
-        unconfirmed_uploads = upload_service_payloads(storage, &payloads, no_cache).await;
+        // A run that leaves a service incomplete does not close its scan with
+        // the last write: the cloud stamps a repo's first index finished on
+        // that write, and the re-run that fills the service in would then be
+        // metered as an ordinary scan (carrick-cloud#892). The fail marker
+        // after the summary closes it instead.
+        unconfirmed_uploads =
+            upload_service_payloads(storage, &payloads, no_cache, !incomplete).await;
     }
 
     let topology = crate::findings::Topology {
@@ -1138,6 +1168,53 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         }
     }
 
+    // What the run still owes, said last, where it is read. Only a service
+    // whose owed work thins its index
+    // changes how the run ends; a missing function description is listed and
+    // nothing more.
+    let owed: Vec<(String, durability::OwedWork)> = runs
+        .iter()
+        .filter(|run| !run.owed.is_empty())
+        .map(|run| (run.label.clone(), run.owed.clone()))
+        .collect();
+    if !owed.is_empty() {
+        let complete: Vec<String> = runs
+            .iter()
+            .filter(|run| run.owed.is_empty())
+            .map(|run| run.label.clone())
+            .collect();
+        let summary = durability::pending_summary(&complete, &owed, laptop);
+        warn!("{summary}");
+        logging::annotate(logging::Annotation::Warning, &summary);
+        crate::progress::report_pending(&summary);
+    }
+    if incomplete && should_upload {
+        let reason: Vec<String> = owed
+            .iter()
+            .filter(|(_, work)| work.thins_the_index())
+            .map(|(service, work)| format!("{service} ({})", work.describe()))
+            .collect();
+        let reason = format!("pending model analysis: {}", reason.join(", "));
+        // The laptop's scan is closed here rather than by its last write (see
+        // step 6b): the marker releases the slot and leaves the repo's first
+        // index open. The run itself succeeded at everything it could do, so
+        // it exits 0 and the local index is built from what landed.
+        storage
+            .report_scan_failed(crate::scan_stage::current().as_str(), &fail_reason(&reason))
+            .await;
+        // CI has no slot and no local index. Its exit code is the only place
+        // a stale service can show, as it was when one lost file failed the
+        // whole run; now the rest of the run has landed first. The partial
+        // opt-in keeps such a run green, as it always did.
+        if !laptop && !allow_partial {
+            return Err(format!(
+                "{}. The other services were uploaded.",
+                reason[..1].to_uppercase() + &reason[1..]
+            )
+            .into());
+        }
+    }
+
     // The last word of a run whose index is not what it should be. Everything
     // above happened; this is what makes the exit code say so (carrick#1067).
     if !unconfirmed_uploads.is_empty() {
@@ -1145,6 +1222,170 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     }
 
     Ok(())
+}
+
+/// Where one scan's services are analysed from: the pieces every service, and
+/// every retry of one, reads the same.
+struct ServiceScan<'a> {
+    repo_path: &'a str,
+    sidecar: Option<&'a TypeSidecar>,
+    total: usize,
+    run_intents: &'a RunIntentMemo,
+}
+
+/// One service's analysis in this run, and what it still owes.
+struct ServiceRun {
+    /// The name every log line and the summary use for it.
+    label: String,
+    data: CloudRepoData,
+    owed: durability::OwedWork,
+    /// Decided once every service has been analysed (step 4c).
+    held_back: bool,
+}
+
+impl ServiceScan<'_> {
+    /// Analyse one service and read back what it owes the model.
+    ///
+    /// `Err` is a failure that is not the model's: a manifest that cannot be
+    /// read, a tree that cannot be walked. Every model failure is inside the
+    /// returned [`durability::OwedWork`].
+    async fn analyze(
+        &self,
+        index: usize,
+        service: &Config,
+        previous_data: Option<&CloudRepoData>,
+        workspace: &mut crate::external_call_candidates::WorkspaceScan,
+    ) -> Result<ServiceRun, Box<dyn std::error::Error>> {
+        // One line per service, at info, before the work starts. A scan of a
+        // large monorepo spends most of its wall clock inside this loop, and
+        // without a mark per iteration a stall is a silence with nothing to
+        // attribute it to: the 0.3.42 incident cost sixteen minutes between
+        // two unrelated log lines, and reading which service it was in took
+        // the whole investigation (carrick#748).
+        let label = service.service_name.as_deref().unwrap_or("(root)");
+        info!("Analyzing service {} ({}/{})", label, index + 1, self.total);
+        // The same fact, for a parent process that is rendering a line rather
+        // than reading a log (carrick#955).
+        crate::progress::service_started(label, index + 1, self.total);
+        // Every loss from here on is this service's.
+        crate::scan_health::enter_service(service.service_name.as_deref());
+        let quota_aborts_before = crate::agent_service::quota_abort_count();
+        let service_started = Instant::now();
+
+        let packages = load_packages_for_service(self.repo_path, service)?;
+        let packages_took = service_started.elapsed();
+
+        // Scope the sidecar's type extraction to this service's directory/tsconfig.
+        let sidecar_started = Instant::now();
+        scope_sidecar_to_service(self.sidecar, self.repo_path, service);
+        let sidecar_took = sidecar_started.elapsed();
+
+        let analysis_started = Instant::now();
+        let requests_before = crate::agent_service::request_counts();
+        crate::phase_timing::start_service();
+        let analysis = analyze_current_repo_incremental(
+            self.repo_path,
+            service,
+            &packages,
+            self.sidecar,
+            previous_data,
+            workspace,
+            self.run_intents,
+        )
+        .await?;
+
+        // `analysis` used to be the whole phase and nothing said what was in
+        // it (carrick#767). The breakdown after the colon adds up to it, and
+        // the request counts say how many round trips this service made —
+        // which is what distinguishes work that grew from waiting that grew.
+        let phases = crate::phase_timing::take_line().unwrap_or_else(|| "not recorded".to_string());
+        let requests = crate::agent_service::requests_between(
+            &requests_before,
+            &crate::agent_service::request_counts(),
+        );
+        info!(
+            "Analyzed service {} in {:.1}s (packages {:.1}s, sidecar {:.1}s, analysis {:.1}s: \
+             {}; requests {})",
+            label,
+            service_started.elapsed().as_secs_f64(),
+            packages_took.as_secs_f64(),
+            sidecar_took.as_secs_f64(),
+            analysis_started.elapsed().as_secs_f64(),
+            phases,
+            requests,
+        );
+
+        let data = analysis.data;
+        if data.bundled_types.is_some() {
+            debug!(
+                "Type resolution ({}): {} bundled types, {} manifest entries",
+                data.service_name.as_deref().unwrap_or(&data.repo_name),
+                data.bundled_types
+                    .as_ref()
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0),
+                data.type_manifest.as_ref().map(|v| v.len()).unwrap_or(0)
+            );
+        }
+
+        let owed = durability::OwedWork {
+            deferred: analysis.deferred,
+            losses: crate::scan_health::service_losses(service.service_name.as_deref()),
+            quota_aborts: crate::agent_service::quota_abort_count() - quota_aborts_before,
+            retry_error: None,
+        };
+        Ok(ServiceRun {
+            label: label.to_string(),
+            data,
+            owed,
+            held_back: false,
+        })
+    }
+}
+
+/// The previous generation of `service` among `generations`, for the
+/// incremental cache.
+fn previous_generation(
+    generations: &[CloudRepoData],
+    repo_name: &str,
+    service: &Config,
+) -> Option<CloudRepoData> {
+    generations
+        .iter()
+        .find(|r| r.repo_name == repo_name && r.service_name == service.service_name)
+        .cloned()
+}
+
+/// The upload payloads for `services`, stripped and stamped with the state
+/// of the tree they describe.
+fn upload_payloads_for<T: CloudStorage>(
+    storage: &T,
+    repo_path: &str,
+    services: &[&CloudRepoData],
+    dirty: bool,
+    unchanged_at_start: Option<&HashSet<String>>,
+) -> Vec<CloudRepoData> {
+    // Asked again now the files have been read, per commit the payloads name
+    // (one, unless HEAD moved mid-scan), and kept only where both asks agree.
+    let mut unchanged_by_commit: HashMap<String, Option<HashSet<String>>> = HashMap::new();
+    services
+        .iter()
+        .map(|data| {
+            let unchanged = unchanged_by_commit
+                .entry(data.commit_hash.clone())
+                .or_insert_with(|| {
+                    let at_upload =
+                        crate::git_state::unchanged_since(repo_path, &data.commit_hash).ok()?;
+                    let at_start = unchanged_at_start?;
+                    Some(at_upload.intersection(at_start).cloned().collect())
+                });
+            stamp_tree_state(
+                strip_ast_nodes((*data).clone(), storage.stages_oversized_payloads()),
+                dirty,
+                unchanged.as_ref(),
+            )
+        })
+        .collect()
 }
 
 /// Print each local service's boundary as the closing lines of the run.
@@ -1563,6 +1804,9 @@ async fn upload_service_payloads<T: CloudStorage>(
     storage: &T,
     payloads: &[CloudRepoData],
     forced: bool,
+    // Whether the last write closes the scan. False when the run leaves a
+    // service incomplete, which is closed by its fail marker instead.
+    closes_run: bool,
 ) -> Vec<UnconfirmedUpload> {
     crate::scan_stage::enter(crate::scan_stage::Stage::Upload);
     let sp = logging::spinner("Uploading results...");
@@ -1583,7 +1827,7 @@ async fn upload_service_payloads<T: CloudStorage>(
         // Only the last write action of the run releases the cloud's in-flight
         // scan slot: a multi-service repo sends N of them, and releasing on
         // the first would leave the rest of the run unprotected (§2.2).
-        let final_in_run = i + 1 == payloads.len();
+        let final_in_run = closes_run && i + 1 == payloads.len();
         // When this write began, so a landed-check can tell the row it wrote
         // from the one it replaced — a forced run rewrites a row that already
         // carries this commit (carrick#1067).
@@ -1952,7 +2196,7 @@ async fn analyze_current_repo_incremental(
     previous_data: Option<&CloudRepoData>,
     workspace: &mut crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
-) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
+) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
     let start = Instant::now();
 
     // Canonicalize repo_path for consistent path normalization between runs
@@ -2064,10 +2308,12 @@ async fn analyze_current_repo_incremental(
             let pkg_changed = prev.package_json_hash.as_deref() != Some(&current_pkg_hash);
 
             // Get framework detection, guidance, and extraction config
-            // (cached or fresh — all three share the package_json_hash gate)
-            let (detection, guidance, extraction_config) = if crate::local_mode::no_model() {
+            // (cached or fresh — all three share the package_json_hash gate).
+            // A fresh ask that fails defers this service's model analysis
+            // instead of ending the run (see `model_setup`).
+            let setup = if crate::local_mode::no_model() {
                 if !pkg_changed {
-                    (
+                    ModelSetup::ready(
                         prev.cached_detection.clone().unwrap_or_default(),
                         prev.cached_guidance
                             .clone()
@@ -2075,7 +2321,7 @@ async fn analyze_current_repo_incremental(
                         prev.cached_extraction_config.clone(),
                     )
                 } else {
-                    (
+                    ModelSetup::ready(
                         DetectionResult::default(),
                         crate::local_mode::offline_guidance(),
                         None,
@@ -2093,13 +2339,15 @@ async fn analyze_current_repo_incremental(
                             generate_extraction_config(&agent, det, packages).await
                         }
                     };
-                    (det.clone(), guid.clone(), extraction)
+                    ModelSetup::ready(det.clone(), guid.clone(), extraction)
                 } else {
-                    run_framework_detection_and_guidance(packages, &all_import_facts).await?
+                    // No cached detection: a first scan's cache entry, or the
+                    // service a previous scan deferred. Asked again here.
+                    model_setup(packages, &all_import_facts).await
                 }
             } else {
                 debug!("package.json changed, re-running framework detection");
-                run_framework_detection_and_guidance(packages, &all_import_facts).await?
+                model_setup(packages, &all_import_facts).await
             };
 
             // What this scan actually dispatches is decided per file inside the
@@ -2107,7 +2355,8 @@ async fn analyze_current_repo_incremental(
             // model only if phase 1 raises a candidate for it — and it logs the
             // dispatched and replayed counts once it knows them.
             let agent_service = AgentService::new();
-            let file_orchestrator = FileOrchestrator::new(agent_service.clone());
+            let file_orchestrator = FileOrchestrator::new(agent_service.clone())
+                .deferring_model(setup.deferred.is_some());
 
             // Stage B2: GraphQL producer field-list from the service's SDL,
             // derived deterministically so the file-analyzer can emit
@@ -2141,8 +2390,8 @@ async fn analyze_current_repo_incremental(
                 .analyze_files(
                     &files,
                     &cached_model_results,
-                    &guidance,
-                    &detection,
+                    &setup.guidance,
+                    &setup.detection,
                     &service_root,
                     Path::new(repo_path),
                     &packages.declared_dependency_names(),
@@ -2255,9 +2504,11 @@ async fn analyze_current_repo_incremental(
                 debug!("Dispatch tables stamped onto function rows: {stamped}");
             }
             cloud_data.file_results = Some(raw_model_results);
-            cloud_data.cached_detection = Some(detection.clone());
-            cloud_data.cached_guidance = Some(guidance);
-            cloud_data.cached_extraction_config = extraction_config.clone();
+            // A deferred service caches no detection, guidance or extraction
+            // config: their absence is what makes the next scan ask for them
+            // again, and every file it could not send keeps no answer, so that
+            // scan dispatches exactly those.
+            setup.stamp_cache(&mut cloud_data);
             cloud_data.package_json_hash = Some(current_pkg_hash);
             cloud_data.cache_version = Some(CACHE_VERSION);
 
@@ -2311,7 +2562,7 @@ async fn analyze_current_repo_incremental(
                 &file_orchestrator,
                 &merged_results,
                 repo_path,
-                extraction_config.as_ref(),
+                setup.extraction_config.as_ref(),
                 &mount_graph,
                 config,
                 &protocol_requests,
@@ -2365,7 +2616,10 @@ async fn analyze_current_repo_incremental(
             // phases add up to `analysis` rather than falling short of it.
             crate::phase_timing::mark(crate::phase_timing::Phase::Other);
 
-            return Ok(cloud_data);
+            return Ok(ServiceAnalysis {
+                data: cloud_data,
+                deferred: setup.deferred,
+            });
         } else {
             debug!("git could not compare the tree, falling back to full analysis");
         }
@@ -2385,7 +2639,7 @@ async fn analyze_current_repo_incremental(
     // Discovery above already parsed every file, resolved the call edges and
     // walked the manifests; the full analysis reads the same result rather
     // than running all of it a second time (carrick#1108).
-    let cloud_data = analyze_current_repo(
+    let analysis = analyze_current_repo(
         repo_path,
         config,
         packages,
@@ -2406,39 +2660,54 @@ async fn analyze_current_repo_incremental(
     let elapsed = start.elapsed();
     debug!("Full analysis complete in {:.1}s", elapsed.as_secs_f64());
 
-    Ok(cloud_data)
+    Ok(analysis)
 }
 
 /// Run framework detection, per-protocol guidance generation, and
 /// extraction-config generation (machinery-unwrap rules). All three are
 /// cached together under the package_json_hash gate.
-async fn run_framework_detection_and_guidance(
+///
+/// Never fails. Detection and guidance are single calls a whole service
+/// depends on, so they retry under [`RetryPolicy::PATIENT`]; when even that is
+/// spent, the service's model analysis is DEFERRED rather than the run ended:
+/// its files are analysed facts-only, none of it is cached as the model's
+/// answer, and the engine names it at the end and asks again (2026-09-15: one
+/// exhausted detection call aborted a seven-service first index after four
+/// services were done).
+///
+/// A deferred service is never analysed under a stand-in guidance. The
+/// analyzer's cache key names the guidance it embedded, so answers bought
+/// under a placeholder would be paid for again the moment the real guidance
+/// arrived.
+async fn model_setup(
     packages: &Packages,
     import_facts: &BTreeSet<crate::visitor::ImportedSymbol>,
-) -> Result<
-    (
-        DetectionResult,
-        ProtocolGuidance,
-        Option<crate::services::type_sidecar::ExtractionConfig>,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> ModelSetup {
     crate::scan_stage::enter(crate::scan_stage::Stage::FrameworkDetect);
-    let agent_service = AgentService::new();
-    let framework_detector = FrameworkDetector::new(agent_service.clone());
-    let detection = framework_detector
+    let patient = AgentService::new().with_retry_policy(RetryPolicy::PATIENT);
+    let detection = match FrameworkDetector::new(patient.clone())
         .detect_frameworks_and_libraries(packages, import_facts)
-        .await?;
+        .await
+    {
+        Ok(detection) => detection,
+        Err(error) => return ModelSetup::deferred("framework detection", error.as_ref()),
+    };
 
-    let guidance_agent = FrameworkGuidanceAgent::new(agent_service);
+    let guidance_agent = FrameworkGuidanceAgent::new(patient);
+    // The extraction config is non-fatal and asked under the ordinary policy:
+    // a service that goes without it keeps machinery types wrapped, which is
+    // not worth ten minutes of waiting.
+    let extraction_agent = FrameworkGuidanceAgent::new(AgentService::new());
     // Guidance and extraction config both depend only on detection — run
     // them concurrently instead of paying a lone extra lambda round-trip.
     let (guidance, extraction_config) = tokio::join!(
         guidance_agent.generate_for_active_protocols(&detection),
-        generate_extraction_config(&guidance_agent, &detection, packages),
+        generate_extraction_config(&extraction_agent, &detection, packages),
     );
-
-    Ok((detection, guidance?, extraction_config))
+    match guidance {
+        Ok(guidance) => ModelSetup::ready(detection, guidance, extraction_config),
+        Err(error) => ModelSetup::deferred("framework guidance", error.as_ref()),
+    }
 }
 
 /// Generate machinery-unwrap rules via the cloud's extraction_config task.
@@ -5121,7 +5390,7 @@ async fn analyze_current_repo(
     previous_intents: PreviousIntents,
     workspace: &mut crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
-) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
+) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
     debug!("Running multi-agent analysis on: {}", repo_path);
 
     let config = service;
@@ -5173,6 +5442,19 @@ async fn analyze_current_repo(
         &files,
     );
 
+    // 3b. Settle the model stages for this service: detection and guidance
+    // (or a deferral), plus the extraction config. Local mode asks nothing.
+    let setup = if crate::local_mode::no_model() {
+        debug!("Local mode: skipping framework detection and guidance (no model)");
+        ModelSetup::ready(
+            DetectionResult::default(),
+            crate::local_mode::offline_guidance(),
+            None,
+        )
+    } else {
+        model_setup(packages, &all_import_facts).await
+    };
+
     // 4. Run the complete multi-agent analysis
     let normalizer = UrlNormalizer::new(config);
     let service_root = service_scan_root(repo_path, config);
@@ -5181,7 +5463,7 @@ async fn analyze_current_repo(
         .run_complete_analysis(
             files.clone(),
             packages,
-            &all_import_facts,
+            &setup,
             &service_root.to_string_lossy(),
             Path::new(repo_path),
             &graphql_producer_hints,
@@ -5279,14 +5561,7 @@ async fn analyze_current_repo(
     let agent_service = AgentService::new();
     let file_orchestrator = FileOrchestrator::new(agent_service.clone());
 
-    let guidance_agent = FrameworkGuidanceAgent::new(agent_service);
-    let extraction_config = generate_extraction_config(
-        &guidance_agent,
-        &analysis_result.framework_detection,
-        packages,
-    )
-    .await;
-    cloud_data.cached_extraction_config = extraction_config.clone();
+    let extraction_config = setup.extraction_config.clone();
 
     // Socket payload anchors and GraphQL consumer result-type anchors both
     // resolve through the same sidecar bundle path as HTTP explicit symbols
@@ -5367,8 +5642,9 @@ async fn analyze_current_repo(
         );
         debug!("Dispatch tables stamped onto function rows: {stamped}");
     }
-    cloud_data.cached_detection = Some(analysis_result.framework_detection.clone());
-    cloud_data.cached_guidance = Some(analysis_result.framework_guidance.clone());
+    // Detection, guidance and extraction config, or none of them for a
+    // deferred service (see the incremental branch).
+    setup.stamp_cache(&mut cloud_data);
     cloud_data.cache_version = Some(CACHE_VERSION);
     // Same workspace-wide hash the incremental gate compares against.
     cloud_data.package_json_hash = Some(hash_workspace_package_jsons(packages, repo_path)?);
@@ -5393,7 +5669,10 @@ async fn analyze_current_repo(
     ));
     crate::phase_timing::mark(crate::phase_timing::Phase::Other);
 
-    Ok(cloud_data)
+    Ok(ServiceAnalysis {
+        data: cloud_data,
+        deferred: setup.deferred,
+    })
 }
 
 async fn build_cross_repo_analyzer(
@@ -6294,7 +6573,7 @@ mod tests {
             vec![Ok(true)],
         );
 
-        let unconfirmed = upload_service_payloads(&storage, &two_services(), false).await;
+        let unconfirmed = upload_service_payloads(&storage, &two_services(), false, true).await;
 
         assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
         assert_eq!(storage.uploaded(), vec!["orders", "billing"]);
@@ -6311,7 +6590,7 @@ mod tests {
             vec![Ok(false)],
         );
 
-        let unconfirmed = upload_service_payloads(&storage, &two_services(), false).await;
+        let unconfirmed = upload_service_payloads(&storage, &two_services(), false, true).await;
 
         assert_eq!(unconfirmed.len(), 1);
         assert_eq!(unconfirmed[0].service, "orders");
@@ -6334,7 +6613,7 @@ mod tests {
             vec![],
         );
 
-        let unconfirmed = upload_service_payloads(&storage, &two_services(), false).await;
+        let unconfirmed = upload_service_payloads(&storage, &two_services(), false, true).await;
 
         assert_eq!(unconfirmed.len(), 1);
         assert!(
@@ -6356,7 +6635,7 @@ mod tests {
             vec![Ok(false), Ok(false), Ok(true)],
         );
 
-        let unconfirmed = upload_service_payloads(&storage, &two_services(), false).await;
+        let unconfirmed = upload_service_payloads(&storage, &two_services(), false, true).await;
 
         assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
         assert_eq!(storage.landed_asks().len(), 3);
@@ -6372,7 +6651,8 @@ mod tests {
             vec![Err(StorageError::ConnectionError("no remote".to_string()))],
         );
 
-        let unconfirmed = upload_service_payloads(&storage, &two_services()[..1], false).await;
+        let unconfirmed =
+            upload_service_payloads(&storage, &two_services()[..1], false, true).await;
 
         assert_eq!(unconfirmed.len(), 1);
     }

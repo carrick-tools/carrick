@@ -498,7 +498,7 @@ fn row_moved_since(updated_at: &str, written_after: chrono::DateTime<chrono::Utc
 /// Duplicated here because the landed-check has to name the row it is asking
 /// about, and `resolve-repos` reports rows under the cloud's slug rather than
 /// the scanner's name (carrick#1067).
-fn indexed_service_slug(service_name: Option<&str>, repo_basename: &str) -> String {
+pub(crate) fn indexed_service_slug(service_name: Option<&str>, repo_basename: &str) -> String {
     let mut slug = String::new();
     for ch in service_name.unwrap_or_default().chars() {
         if ch.is_ascii_alphanumeric() {
@@ -788,11 +788,14 @@ impl AwsStorage {
     /// the upload, so a CI body is byte-for-byte what it was, and a CI caller
     /// that set `CARRICK_ALLOW_PARTIAL_ANALYSIS` must not be answered with
     /// the laptop rule's `409 partial_refused`.
-    fn unanalysed_files(&self) -> Option<Vec<UnanalysedFile>> {
+    ///
+    /// Only the files of the service this payload is: the cloud's partial rule
+    /// is decided per row (see [`crate::scan_health::unanalysed_files_for`]).
+    fn unanalysed_files(&self, data: &CloudRepoData) -> Option<Vec<UnanalysedFile>> {
         if !self.auth.is_bearer() {
             return None;
         }
-        let lost = crate::scan_health::unanalysed_files();
+        let lost = crate::scan_health::unanalysed_files_for(data.service_name.as_deref());
         (!lost.is_empty()).then_some(lost)
     }
 
@@ -1145,7 +1148,7 @@ impl AwsStorage {
             payload_size: staged.map(|s| s.size),
             force_reindex: self.forces_reindex().then_some(true),
             scan_id: self.scan_id(),
-            unanalysed_files: self.unanalysed_files(),
+            unanalysed_files: self.unanalysed_files(data),
             scan_final: final_in_run.then_some(true),
         };
 
@@ -1214,6 +1217,37 @@ impl AwsStorage {
             allowance_sentence: response.allowance_sentence,
             indexed_services: Some(response.indexed_services),
         })
+    }
+
+    /// `scan-failed` for the scan `scan_id` names, whether or not this
+    /// instance opened it.
+    ///
+    /// The trait method reads the id this storage's own `start-scan` set. An
+    /// interrupted run has no storage left to ask — the signal dropped the
+    /// engine with it — so `main` builds a fresh one and passes the id the
+    /// process-global slot kept ([`crate::credentials::scan_id`]).
+    pub async fn report_scan_failed_for(&self, scan_id: &str, stage: &str, reason: &str) {
+        let CloudAuth::Bearer(token) = &self.auth else {
+            return;
+        };
+
+        #[derive(Serialize)]
+        struct ScanFailedRequest<'a> {
+            action: &'a str,
+            scan_id: &'a str,
+            stage: &'a str,
+            reason: &'a str,
+        }
+
+        let request = ScanFailedRequest {
+            action: "scan-failed",
+            scan_id,
+            stage,
+            reason,
+        };
+
+        self.post_failure_once(token, request.action, &request)
+            .await;
     }
 
     /// Send one failure event, once, and say what happened at debug only.
@@ -1366,7 +1400,7 @@ impl CloudStorage for AwsStorage {
                     payload_size: staged.as_ref().map(|s| s.size),
                     force_reindex: self.forces_reindex().then_some(true),
                     scan_id: self.scan_id(),
-                    unanalysed_files: self.unanalysed_files(),
+                    unanalysed_files: self.unanalysed_files(data),
                     scan_final: final_in_run.then_some(true),
                 };
 
@@ -1592,30 +1626,10 @@ impl CloudStorage for AwsStorage {
     /// when the OS kills the process — a SIGKILL, an OOM, a closed lid — which
     /// is exactly the case the cloud's own slot TTL still has to cover.
     async fn report_scan_failed(&self, stage: &str, reason: &str) {
-        let CloudAuth::Bearer(token) = &self.auth else {
-            return;
-        };
         let Some(scan_id) = self.scan_id() else {
             return;
         };
-
-        #[derive(Serialize)]
-        struct ScanFailedRequest<'a> {
-            action: &'a str,
-            scan_id: &'a str,
-            stage: &'a str,
-            reason: &'a str,
-        }
-
-        let request = ScanFailedRequest {
-            action: "scan-failed",
-            scan_id: &scan_id,
-            stage,
-            reason,
-        };
-
-        self.post_failure_once(token, request.action, &request)
-            .await;
+        self.report_scan_failed_for(&scan_id, stage, reason).await;
     }
 
     /// Tell the cloud this run died before `start-scan` opened a scan
@@ -2798,7 +2812,7 @@ mod tests {
     #[test]
     fn the_unanalysed_list_is_never_sent_on_the_ci_path() {
         let ci = AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Oidc, false);
-        assert!(ci.unanalysed_files().is_none());
+        assert!(ci.unanalysed_files(&blob()).is_none());
         assert!(ci.scan_id().is_none());
         assert!(ci.uploads_run_logs());
     }

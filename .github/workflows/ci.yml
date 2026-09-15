@@ -80,6 +80,7 @@ jobs:
           --test output_contract_test
           --test receiver_type_classification_test
           --test route_request_anchor_test
+          --test scan_durability_test
           --test service_derivation_test
           --test sidecar_integration_test
           --test socket_class_field_test

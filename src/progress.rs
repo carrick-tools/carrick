@@ -143,6 +143,29 @@ pub fn tick(phase: Phase, done: usize, total: usize) {
     }
 }
 
+/// The line prefix for a scan's closing statement of the work it still owes.
+const PENDING_MARKER: &str = "@carrick-pending ";
+
+/// State, for the parent, which services this scan left pending and what
+/// re-running does (the engine's summary line, verbatim).
+///
+/// The indexer swallows a scan's output and shows it only when the scan
+/// fails, and a scan that lands six services and defers a seventh does not
+/// fail — so without this the one sentence the user needs never reaches them.
+pub fn report_pending(summary: &str) {
+    if !enabled() {
+        return;
+    }
+    eprintln!("{PENDING_MARKER}{}", summary.replace('\n', " "));
+}
+
+/// Read a pending statement out of a line of a scan's stderr.
+pub fn parse_pending(line: &str) -> Option<String> {
+    line.trim_start()
+        .strip_prefix(PENDING_MARKER)
+        .map(str::to_string)
+}
+
 /// Read one update out of a line of a scan's stderr, if that is what it is.
 pub fn parse(line: &str) -> Option<Update> {
     let payload = line.trim_start().strip_prefix(MARKER)?;

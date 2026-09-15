@@ -70,11 +70,11 @@ ENVIRONMENT VARIABLES:
     CARRICK_CONCURRENCY_LIMIT       Model requests in flight across a scan
                                     (default 28), shared by file analysis and
                                     function intents, which run together
-    CARRICK_ALLOW_PARTIAL_ANALYSIS  Upload and exit 0 even when files were not
-                                    analysed. Off by default: a run that lost
-                                    analyzer results is reported and fails,
-                                    rather than overwriting the index with a
-                                    thinner one
+    CARRICK_ALLOW_PARTIAL_ANALYSIS  Upload every service and exit 0 even when
+                                    some still owe model analysis. Off by
+                                    default: such a service keeps its existing
+                                    index instead of a thinner one, the rest
+                                    upload, and a CI run names it and fails
     CARRICK_SIDECAR_DIR             Directory holding the type sidecar's
                                     dist/src/index.js. Set by the npm package,
                                     where the binary and the sidecar install

@@ -801,6 +801,11 @@ struct MountBinding {
 pub struct FileOrchestrator {
     file_analyzer: FileAnalyzerAgent,
     swc_scanner: SwcScanner,
+    /// This service's model analysis is deferred: its framework detection or
+    /// guidance could not be had, so no file is sent to the model under a
+    /// guidance that is not the service's own. Same posture as local mode, for
+    /// one service rather than the whole process.
+    model_deferred: bool,
 }
 
 /// What the model had to say about one file, once every source of an answer
@@ -936,7 +941,19 @@ impl FileOrchestrator {
         Self {
             file_analyzer: FileAnalyzerAgent::new(agent_service),
             swc_scanner: SwcScanner::new(),
+            model_deferred: false,
         }
+    }
+
+    /// The same orchestrator, sending no file to the model.
+    ///
+    /// For a service whose detection or guidance failed: its files keep the
+    /// rows the deterministic layer resolves, nothing about them is recorded
+    /// as lost, and nothing is cached as the model's answer, so the next scan
+    /// dispatches exactly the files this one could not.
+    pub fn deferring_model(mut self, deferred: bool) -> Self {
+        self.model_deferred = deferred;
+        self
     }
 
     /// Run AST-gated file-centric analysis on all provided files.
@@ -2216,7 +2233,7 @@ impl FileOrchestrator {
         // model said nothing about this file" and freeze the skip for as long
         // as the cache lives (#478).
         let (to_dispatch, not_asked): (Vec<PendingFile>, Vec<PendingFile>) =
-            if crate::local_mode::no_model() {
+            if crate::local_mode::no_model() || self.model_deferred {
                 (Vec::new(), to_dispatch)
             } else {
                 (to_dispatch, Vec::new())
