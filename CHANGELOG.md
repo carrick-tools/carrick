@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.72](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.71...carrick-v0.3.72) (2026-09-15)
+
+
+### Bug Fixes
+
+* **release:** make the npm publish job safe to re-run, and wait out npm's processing queue ([#1141](https://github.com/carrick-tools/carrick/issues/1141)) ([30bd354](https://github.com/carrick-tools/carrick/commit/30bd354547b2c1c5508d14ed17b2d56e42c16ace)), closes [#1140](https://github.com/carrick-tools/carrick/issues/1140)
+
 ## [0.3.71](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.70...carrick-v0.3.71) (2026-09-15)
 
 
