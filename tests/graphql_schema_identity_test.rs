@@ -27,6 +27,8 @@
 //! | `ledger.gql` | `balance`, `statements`, `transferFunds` | external | none |
 //! | `overview.gql` | `products` (catalog), `balance` (ledger) | unresolved | none |
 //! | `viewer.gql` | `viewer` (both), no transport | unresolved | none |
+//! | `nested.gql` | `product` (it also selects `legacySku`, which `Product` no longer has) | served | one |
+//! | `retired.gql` | none (`discontinuedQuery` is in no schema) | no local schema | one |
 //! | `account.ts` | `viewer` (both), base `CATALOG_URL` internal | served | one |
 //! | `holder.ts` | `viewer` (both), base `LEDGER_URL` external | external | none |
 
@@ -211,6 +213,15 @@ fn documents_are_indexed_as_calls_only_when_their_schema_is_served_here() {
             // In no schema at all: still a call, so a field the server removed
             // reads as a missing operation.
             ("query|retiredListing", catalog_doc),
+            // A nested field the schema dropped does not change which schema
+            // the document is written against.
+            ("query|product", "apps/web/src/graphql/nested.gql"),
+            // A root field no schema holds: its server may be elsewhere, so it
+            // stays a call and reads as a missing operation.
+            (
+                "query|discontinuedQuery",
+                "apps/web/src/graphql/retired.gql"
+            ),
             ("query|viewer", "apps/web/src/account.ts"),
         ]),
         "only documents attributed to the served schema, or read through an internal base, \

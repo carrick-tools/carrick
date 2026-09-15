@@ -2528,6 +2528,56 @@ export const typeDefs = gql`
         );
     }
 
+    /// A document that selects a nested field the served schema removed still
+    /// holds that schema's root field, so it stays the served schema's and its
+    /// operation stays a call. Attribution reads root fields only.
+    #[test]
+    fn a_removed_nested_field_keeps_the_document_with_its_schema() {
+        let catalogue = two_schema_catalogue();
+        let mut extraction = documents(&[("nested.gql", "query A { products { id legacySku } }")]);
+        let attribution = catalogue.attribute(&extraction, |_| TransportOrigin::Unknown);
+
+        assert_eq!(
+            identity_of(&attribution, &extraction, "nested.gql"),
+            &DocumentIdentity::Served
+        );
+        let summary = attribution.apply(&mut extraction);
+        assert!(summary.is_empty());
+        assert_eq!(keys(&extraction.consumers), vec!["graphql|query|products"]);
+    }
+
+    /// A document whose only root field no schema holds (the served schema
+    /// removed it, and no external schema declares it) is never dropped: it
+    /// has no local identity, stays a call, and reads as a missing operation.
+    /// The same holds whether or not the repository also holds an external
+    /// schema.
+    #[test]
+    fn a_removed_root_field_stays_a_call() {
+        let served_only = SchemaCatalogue {
+            schemas: vec![known(
+                "tools/dist/catalog.graphql",
+                SchemaOrigin::Served,
+                "type Query { products: [String] }",
+            )],
+            tally: Default::default(),
+        };
+        for catalogue in [served_only, two_schema_catalogue()] {
+            let mut extraction = documents(&[("retired.gql", "query A { retiredListing }")]);
+            let attribution = catalogue.attribute(&extraction, |_| TransportOrigin::Unknown);
+
+            assert_eq!(
+                identity_of(&attribution, &extraction, "retired.gql"),
+                &DocumentIdentity::NoLocalSchema
+            );
+            let summary = attribution.apply(&mut extraction);
+            assert!(summary.is_empty(), "nothing is dropped or counted");
+            assert_eq!(
+                keys(&extraction.consumers),
+                vec!["graphql|query|retiredListing"]
+            );
+        }
+    }
+
     #[test]
     fn a_shared_field_is_settled_by_the_transport_or_left_unresolved() {
         let catalogue = two_schema_catalogue();

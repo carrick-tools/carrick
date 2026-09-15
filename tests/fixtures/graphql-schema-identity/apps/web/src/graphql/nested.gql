@@ -1,0 +1,6 @@
+query ProductDetails {
+  product(id: "1") {
+    id
+    legacySku
+  }
+}
