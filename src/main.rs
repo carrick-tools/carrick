@@ -159,6 +159,7 @@ async fn main() {
 
     let args = CliArgs::parse();
     logging::init(args.verbose);
+    let repo_path = args.repo_path.clone();
 
     if let Err(e) = run_analysis(args).await {
         // The stage is in the line a user pastes. The same token goes to the
@@ -170,8 +171,54 @@ async fn main() {
             scan_stage::current().as_str(),
             e
         );
+        // After the line, not before it: the user reads why the run stopped
+        // without waiting on a request about it.
+        report_failure_before_scan(&repo_path, e.as_ref()).await;
         std::process::exit(1);
     }
+}
+
+/// Tell the cloud about a laptop run that died before `start-scan` opened a
+/// scan (carrick#1096), and nothing else.
+///
+/// A run that opened one has already sent `scan-failed` from the engine, so
+/// the process-global slot `start-scan` sets is what keeps the two events
+/// exclusive: one failure, one event. The storage is built only when this run
+/// would have reached the cloud at all, because building it reads the
+/// credential on disk — a `CARRICK_MOCK_ALL` or offline-harness run that
+/// fails on a bad path must not report to production. A run whose credential
+/// is itself the problem has nothing to authenticate the report with and
+/// sends nothing; the OIDC path sends nothing by the storage's own gate.
+async fn report_failure_before_scan(repo_path: &str, error: &dyn std::error::Error) {
+    let reaches_cloud = run_reaches_cloud(
+        env::var(cloud_storage::CACHE_DIR_ENV).is_ok(),
+        cloud_storage::laptop_scan_requested(),
+        env::var("CARRICK_MOCK_ALL").is_ok(),
+    );
+    if !should_report_preflight(credentials::scan_id().is_some(), reaches_cloud) {
+        return;
+    }
+    match AwsStorage::new(false) {
+        Ok(storage) => {
+            engine::report_preflight_failure(&storage, repo_path, scan_stage::current(), error)
+                .await
+        }
+        Err(e) => debug!("No pre-scan failure report: {e}"),
+    }
+}
+
+/// Whether a run with these settings talks to Carrick Cloud: the same
+/// precedence the storage selection in [`run_analysis`] applies, where
+/// `CARRICK_MOCK_ALL` beats everything and an offline cache directory is the
+/// cloud only when a laptop scan was asked for.
+fn run_reaches_cloud(use_local_dir: bool, laptop_scan: bool, use_mock: bool) -> bool {
+    !use_mock && (!use_local_dir || laptop_scan)
+}
+
+/// A pre-scan failure event is sent only by a run that reaches the cloud and
+/// never opened a scan; an opened scan reports through `scan-failed`.
+fn should_report_preflight(scan_opened: bool, reaches_cloud: bool) -> bool {
+    reaches_cloud && !scan_opened
 }
 
 /// A first argument that is neither a command nor a path, and what to say
@@ -213,6 +260,12 @@ fn unknown_command(argv: &[String]) -> Option<String> {
 }
 
 async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Everything before the engine is preflight: the path, the services, the
+    // runtime they need, the sidecar, and the storage. Said here rather than
+    // left at `unknown`, so a run that stops at a missing runtime names the
+    // stage it stopped in to the terminal and to the cloud (carrick#1096).
+    scan_stage::enter(scan_stage::Stage::Preflight);
+
     // Validate the scan target up front. A nonexistent path would otherwise
     // walk zero files and "succeed" with an empty analysis.
     if !Path::new(&args.repo_path).is_dir() {
@@ -524,6 +577,35 @@ mod tests {
         assert!(cli.verbose);
         assert!(cli.no_cache);
         assert_eq!(cli.repo_path, "/my/repo");
+    }
+
+    /// Only a run that talks to the cloud reports a pre-scan failure
+    /// (carrick#1096): `CARRICK_MOCK_ALL` and the offline harness never do, so
+    /// a test that expects a bad path to fail cannot post to production.
+    #[test]
+    fn only_a_run_that_reaches_the_cloud_reports_a_pre_scan_failure() {
+        // (local cache dir, laptop scan, mock) -> reaches the cloud
+        assert!(run_reaches_cloud(false, false, false), "plain `carrick .`");
+        assert!(
+            run_reaches_cloud(true, true, false),
+            "`carrick index` child"
+        );
+        assert!(!run_reaches_cloud(true, false, false), "offline harness");
+        assert!(!run_reaches_cloud(false, false, true), "mock");
+        assert!(
+            !run_reaches_cloud(true, true, true),
+            "mock beats the laptop scan"
+        );
+    }
+
+    /// A run whose `start-scan` succeeded posts no pre-scan event: the engine
+    /// already sent `scan-failed`, and one failure is one event.
+    #[test]
+    fn a_run_that_opened_a_scan_posts_no_pre_scan_event() {
+        assert!(should_report_preflight(false, true));
+        assert!(!should_report_preflight(true, true));
+        assert!(!should_report_preflight(false, false));
+        assert!(!should_report_preflight(true, false));
     }
 
     /// A mistyped command is answered as a command, and the answer names the

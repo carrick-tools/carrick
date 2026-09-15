@@ -242,6 +242,9 @@ fn deno_missing_runtime_fails_before_cloud_or_type_startup() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_carrick"))
         .arg(dir.path())
         .env("PATH", "")
+        // A laptop run that fails before start-scan reports it to the cloud
+        // (carrick#1096); the mock keeps a test's failure off the wire.
+        .env("CARRICK_MOCK_ALL", "1")
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -304,6 +307,7 @@ fn unsupported_deno_version_fails_before_analysis() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_carrick"))
         .arg(dir.path())
         .env("PATH", dir.path().join("bin"))
+        .env("CARRICK_MOCK_ALL", "1")
         .output()
         .unwrap();
     let text = format!(

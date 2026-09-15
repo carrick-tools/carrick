@@ -135,6 +135,12 @@ impl CloudStorage for TeeStorage {
         self.cloud.report_scan_failed(stage, reason).await;
     }
 
+    async fn report_preflight_failed(&self, repo: Option<&str>, stage: &str, reason: &str) {
+        self.cloud
+            .report_preflight_failed(repo, stage, reason)
+            .await;
+    }
+
     async fn post_pr_result(
         &self,
         payload: &crate::findings::PrResultPayload,

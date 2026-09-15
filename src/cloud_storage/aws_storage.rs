@@ -1216,6 +1216,41 @@ impl AwsStorage {
         })
     }
 
+    /// Send one failure event, once, and say what happened at debug only.
+    ///
+    /// Shared by `scan-failed` and `preflight-failed`: both describe a run
+    /// that is already failing, so neither may retry, wait long, or print a
+    /// second failure — a 4xx from a cloud that predates the action, a 5xx and
+    /// a dead network all end here as one debug line.
+    async fn post_failure_once<B: Serialize + ?Sized>(&self, token: &str, action: &str, body: &B) {
+        let sent = self
+            .http_client
+            .post(&self.lambda_url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header(RUN_ID_HEADER, crate::logging::run_id())
+            .header(SCANNER_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
+            .timeout(SCAN_FAILED_TIMEOUT)
+            .json(body)
+            .send()
+            .await;
+
+        match sent {
+            Ok(response) if response.status().is_success() => {
+                debug!(action = %action, "Reported this run's failure to Carrick Cloud");
+            }
+            Ok(response) => {
+                debug!(
+                    action = %action,
+                    status = %response.status(),
+                    "Carrick Cloud did not record this run's failure"
+                );
+            }
+            Err(e) => {
+                debug!(action = %action, "Could not report this run's failure: {e}");
+            }
+        }
+    }
+
     /// Stage an oversized serialized CloudRepoData to the presigned URL from
     /// check-or-upload (carrick#486). Errors clearly when the deployed cloud
     /// doesn't mint staging URLs yet, since the inline fallback is guaranteed
@@ -1579,34 +1614,60 @@ impl CloudStorage for AwsStorage {
             reason,
         };
 
-        let sent = self
-            .http_client
-            .post(&self.lambda_url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header(RUN_ID_HEADER, crate::logging::run_id())
-            .header(SCANNER_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
-            .timeout(SCAN_FAILED_TIMEOUT)
-            .json(&request)
-            .send()
+        self.post_failure_once(token, request.action, &request)
             .await;
+    }
 
-        // Debug on every outcome, including the refusals. A cloud deployed
-        // before `scan-failed` existed answers 4xx, and a run that has already
-        // failed must not print a second failure about its own bookkeeping.
-        match sent {
-            Ok(response) if response.status().is_success() => {
-                debug!(scan_id = %scan_id, stage = %stage, "Reported this scan as failed");
-            }
-            Ok(response) => {
-                debug!(
-                    status = %response.status(),
-                    "Carrick Cloud did not record this scan as failed"
-                );
-            }
-            Err(e) => {
-                debug!("Could not report this scan as failed: {e}");
-            }
+    /// Tell the cloud this run died before `start-scan` opened a scan
+    /// (carrick#1096).
+    ///
+    /// Wire contract: the check-or-upload envelope,
+    /// `{ action: "preflight-failed", run_id, repo, stage, reason,
+    /// scanner_version }`, Bearer auth, 202 on accept. `repo` is sent as
+    /// `null` when the origin names none, never omitted.
+    ///
+    /// Exactly the fail marker's delivery: one attempt, the same short
+    /// timeout, and every refusal read at debug. A cloud deployed before this
+    /// action existed answers 404, and a run that stopped at a missing
+    /// runtime must not add a second error about its own bookkeeping.
+    ///
+    /// Laptop credential only: a CI run is visible in its own Actions log and
+    /// its OIDC identity is not a user the cloud could alert about. And never
+    /// from a storage that opened a scan, which says `scan-failed` instead.
+    ///
+    /// That last gate is a guard on this instance, not the one production
+    /// relies on: `main` reports through a freshly built storage whose slot is
+    /// always empty, so the exclusivity with `scan-failed` is decided there,
+    /// from the process-global slot `start-scan` sets
+    /// ([`crate::credentials::scan_id`]).
+    async fn report_preflight_failed(&self, repo: Option<&str>, stage: &str, reason: &str) {
+        let CloudAuth::Bearer(token) = &self.auth else {
+            return;
+        };
+        if self.scan_id().is_some() {
+            return;
         }
+
+        #[derive(Serialize)]
+        struct PreflightFailedRequest<'a> {
+            action: &'a str,
+            run_id: &'a str,
+            repo: Option<&'a str>,
+            stage: &'a str,
+            reason: &'a str,
+            scanner_version: &'a str,
+        }
+
+        let request = PreflightFailedRequest {
+            action: "preflight-failed",
+            run_id: crate::logging::run_id(),
+            repo,
+            stage,
+            reason,
+            scanner_version: env!("CARGO_PKG_VERSION"),
+        };
+        self.post_failure_once(token, request.action, &request)
+            .await;
     }
 
     async fn post_pr_result(
@@ -2604,6 +2665,99 @@ mod tests {
         let unopened =
             AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Bearer("t".into()), false);
         unopened.report_scan_failed("discovery", "no remote").await;
+    }
+
+    /// The pre-scan failure event's wire shape (carrick#1096): the
+    /// check-or-upload envelope with `preflight-failed`, this run's id, the
+    /// repo as `null` when the origin named none, the stage, the reason and
+    /// the scanner version, under the laptop credential and the run headers.
+    #[tokio::test]
+    async fn a_laptop_run_that_never_opened_a_scan_reports_its_failure_once() {
+        let (storage, server) = bearer_storage(vec![(202, r#"{"ok":true}"#.to_string())]);
+
+        storage
+            .report_preflight_failed(
+                None,
+                "preflight",
+                "Deno is required to scan ~/api/deno.json.",
+            )
+            .await;
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        let body = body_of(&requests[0]);
+        assert_eq!(body["action"], "preflight-failed");
+        assert_eq!(body["run_id"], crate::logging::run_id());
+        assert!(body["repo"].is_null(), "{body}");
+        assert!(body.as_object().unwrap().contains_key("repo"), "{body}");
+        assert_eq!(body["stage"], "preflight");
+        assert_eq!(body["reason"], "Deno is required to scan ~/api/deno.json.");
+        assert_eq!(body["scanner_version"], env!("CARGO_PKG_VERSION"));
+        assert!(body.get("scan_id").is_none(), "{body}");
+        assert!(
+            has_header(&requests[0], "authorization", "Bearer carrick_sk_live_test"),
+            "{}",
+            requests[0]
+        );
+        assert_eq!(
+            header_of(&requests[0], RUN_ID_HEADER).as_deref(),
+            Some(crate::logging::run_id())
+        );
+        assert_eq!(
+            header_of(&requests[0], SCANNER_VERSION_HEADER).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// A cloud without the action answers 404, another refusal answers 403,
+    /// and a failing cloud answers 500: each is one attempt, swallowed. The
+    /// call returns `()`, so there is no path by which it could change the
+    /// run's exit code; what this pins is that nothing retries.
+    #[tokio::test]
+    async fn a_refused_pre_scan_report_is_swallowed_and_never_retried() {
+        for status in [404u16, 403, 500] {
+            let (storage, server) =
+                bearer_storage(vec![(status, r#"{"message":"no"}"#.to_string())]);
+            storage
+                .report_preflight_failed(Some("example/api"), "preflight", "no runtime")
+                .await;
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 1, "{status} was retried");
+            assert_eq!(body_of(&requests[0])["repo"], "example/api");
+        }
+    }
+
+    /// Never from CI, and never from a storage that opened a scan: that run
+    /// says `scan-failed`, and a second event for one death would alert twice.
+    /// Asserted as silence on a listening server: after both calls the test
+    /// sends one request of its own, and that probe must be the only request
+    /// the server saw.
+    #[tokio::test]
+    async fn a_ci_run_or_an_opened_scan_sends_no_pre_scan_report() {
+        let (base, server) = crate::agent_service::tests::stub_server(vec![(200, String::new())]);
+        let url = format!("{base}/types/check-or-upload");
+
+        let ci = AwsStorage::for_test(&url, CloudAuth::Oidc, false);
+        ci.report_preflight_failed(Some("example/api"), "preflight", "whatever")
+            .await;
+
+        let opened = AwsStorage::for_test(&url, CloudAuth::Bearer("t".into()), false);
+        opened.scan_id.set("scan_01J".to_string()).unwrap();
+        opened
+            .report_preflight_failed(Some("example/api"), "upload", "whatever")
+            .await;
+
+        http_client_builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("{base}/probe"))
+            .send()
+            .await
+            .unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].starts_with("GET /probe"), "{}", requests[0]);
     }
 
     /// A laptop run's log now ships, and it carries the scan it belongs to —

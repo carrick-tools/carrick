@@ -27,8 +27,14 @@ use std::sync::atomic::{AtomicU8, Ordering};
 /// marker is a marker that never arrives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
-    /// Before the pipeline: resolving services, opening the run with the
-    /// cloud, downloading what the project already holds.
+    /// Before the pipeline starts: the scan target, its services, the
+    /// runtime they need, the type sidecar coming up, and the storage and
+    /// credential the run will use. A failure here opens no scan, so it
+    /// reaches the cloud as `preflight-failed` rather than as a fail marker
+    /// (carrick#1096).
+    Preflight,
+    /// The pipeline's first stage: opening the run with the cloud and
+    /// downloading what the project already holds.
     Discovery,
     /// Framework detection and the guidance that follows from it.
     FrameworkDetect,
@@ -57,6 +63,7 @@ impl Stage {
     /// The wire token. snake_case, at most 64 bytes.
     pub fn as_str(self) -> &'static str {
         match self {
+            Stage::Preflight => "preflight",
             Stage::Discovery => "discovery",
             Stage::FrameworkDetect => "framework_detect",
             Stage::FileAnalysis => "file_analysis",
@@ -72,7 +79,8 @@ impl Stage {
     }
 
     /// Every stage, for the tests that hold the set to its contract.
-    const ALL: [Stage; 11] = [
+    const ALL: [Stage; 12] = [
+        Stage::Preflight,
         Stage::Discovery,
         Stage::FrameworkDetect,
         Stage::FileAnalysis,
@@ -103,7 +111,7 @@ impl Stage {
 
 /// The stage this process is in. Starts at `unknown`, which is the truth
 /// before the first `enter`.
-static CURRENT: AtomicU8 = AtomicU8::new(10);
+static CURRENT: AtomicU8 = AtomicU8::new(11);
 
 /// Say the scan has reached `stage`. Later calls replace earlier ones: a run
 /// moves forward and the marker wants the last stage it reached, not the
@@ -169,7 +177,7 @@ mod tests {
     /// it is written as a literal because `code()` is not const.
     #[test]
     fn the_atomic_starts_at_unknown() {
-        assert_eq!(Stage::Unknown.code(), 10);
-        assert_eq!(Stage::from_code(10), Stage::Unknown);
+        assert_eq!(Stage::Unknown.code(), 11);
+        assert_eq!(Stage::from_code(11), Stage::Unknown);
     }
 }

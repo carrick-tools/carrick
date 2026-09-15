@@ -7,12 +7,18 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use tracing::debug;
 
+/// `(repo, stage, reason)`, as one pre-scan failure was reported.
+type PreflightFailure = (Option<String>, String, String);
+
 pub struct MockStorage {
     data: Mutex<Vec<CloudRepoData>>,
     type_files: Mutex<HashMap<String, String>>,
     /// Every `(stage, reason)` this storage was asked to mark, so a test can
     /// read back what a failing run reported (carrick#1063).
     scan_failures: Mutex<Vec<(String, String)>>,
+    /// Every `(repo, stage, reason)` a run that never opened a scan reported
+    /// (carrick#1096).
+    preflight_failures: Mutex<Vec<PreflightFailure>>,
     /// Every run log this storage was handed, as the redaction left it.
     logs: Mutex<Vec<String>>,
 }
@@ -29,6 +35,7 @@ impl MockStorage {
             data: Mutex::new(Vec::new()),
             type_files: Mutex::new(HashMap::new()),
             scan_failures: Mutex::new(Vec::new()),
+            preflight_failures: Mutex::new(Vec::new()),
             logs: Mutex::new(Vec::new()),
         }
     }
@@ -41,6 +48,13 @@ impl MockStorage {
     #[cfg(test)]
     pub fn scan_failures(&self) -> Vec<(String, String)> {
         self.scan_failures.lock().unwrap().clone()
+    }
+
+    /// The pre-scan failures reported against this storage, in order.
+    /// Test-only, for the same reason.
+    #[cfg(test)]
+    pub fn preflight_failures(&self) -> Vec<PreflightFailure> {
+        self.preflight_failures.lock().unwrap().clone()
     }
 
     /// The run logs this storage was handed, in order, as the redaction left
@@ -247,6 +261,15 @@ impl CloudStorage for MockStorage {
             .lock()
             .unwrap()
             .push((stage.to_string(), reason.to_string()));
+    }
+
+    async fn report_preflight_failed(&self, repo: Option<&str>, stage: &str, reason: &str) {
+        debug!("MOCK: Recording pre-scan failure in {}", stage);
+        self.preflight_failures.lock().unwrap().push((
+            repo.map(str::to_string),
+            stage.to_string(),
+            reason.to_string(),
+        ));
     }
 }
 
