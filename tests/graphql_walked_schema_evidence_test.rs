@@ -12,7 +12,12 @@
 //!   `src/vendor/`, a document against it and a document against
 //!   `ledger-api`'s `accounts`;
 //! - `ops-console`, settled after `wallet-web`, has a document against the
-//!   vendor schema.
+//!   vendor schema;
+//! - `storefront-gateway` serves an ordinary REST route and has a copy of a
+//!   third-party payouts API's schema in `src/vendor/` with a document against
+//!   it. Any HTTP route still counts as evidence, so the copy is served: a
+//!   known limit, pinned here until a GraphQL-server signal replaces the route
+//!   leg (carrick#1213).
 //!
 //! The cassettes answer the route and the resolver; every other row is
 //! deterministic.
@@ -25,6 +30,7 @@
 //! | `directory-api` | `people` (resolver evidence) | none |
 //! | `wallet-web` | none: the vendor copy is not served | `accounts` only; `balance` is a call to an external API |
 //! | `ops-console` | none | none: `statements` is a call to an external API |
+//! | `storefront-gateway` | `payouts` (route evidence, the known limit) | `payouts` |
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -157,6 +163,22 @@ fn a_vendor_schema_in_a_client_directory_is_not_that_clients_producers() {
     assert!(
         scan.graphql_rows("ops-console", "calls").is_empty(),
         "a later service reads the vendor copy as external too"
+    );
+    // Known limit (carrick#1213): a backend-for-frontend's REST route is
+    // evidence, so the vendor copy in its tree is served and its document
+    // reads as a call into this repository. Flip both to empty/external when
+    // the route leg is replaced by a GraphQL-server signal.
+    assert_eq!(
+        scan.graphql_rows("storefront-gateway", "endpoints"),
+        rows(&[(
+            "query|payouts",
+            "apps/gateway/src/vendor/payouts-schema.graphql"
+        )]),
+        "today any HTTP route serves the schema a service's walk finds"
+    );
+    assert_eq!(
+        scan.graphql_rows("storefront-gateway", "calls"),
+        rows(&[("query|payouts", "apps/gateway/src/graphql/payouts.gql")]),
     );
     assert!(
         scan.stdout.contains(

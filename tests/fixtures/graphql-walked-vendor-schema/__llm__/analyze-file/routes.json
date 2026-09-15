@@ -1,0 +1,21 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:5",
+      "line_number": 5,
+      "owner_node": "app",
+      "method": "GET",
+      "path": "/session",
+      "handler_name": "anonymous",
+      "pattern_matched": ".get(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": "{ signedIn: true }",
+      "response_expression_line": 5,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "data_calls": []
+}

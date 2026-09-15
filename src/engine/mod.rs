@@ -3000,7 +3000,10 @@ fn settle_graphql_documents(
     // that it serves a schema at all (carrick#1189): it declares one, it serves
     // HTTP routes, or the model joined a resolver or backing type to a field.
     // A client app with a vendor schema copied into its tree has none of
-    // these.
+    // these. Any HTTP route is broader than a GraphQL server (a backend-for-
+    // frontend with a vendor copy has one), but it keeps an SDL-first server's
+    // own fields when its resolver join was dropped; carrick#1213 replaces it
+    // with a detected GraphQL-server signal.
     let serves_schema = !service.graphql_schemas.is_empty()
         || !mount_graph.endpoints.is_empty()
         || graphql
