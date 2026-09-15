@@ -579,6 +579,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         current_services_data.push(data);
     }
 
+    // Decided here, while every service's rows and dependency facts are still
+    // in hand, and printed with the report (carrick#1099).
+    let graphql_notices = graphql_schema_notices(repo_path, &services, &current_services_data);
+
     // What the analysis actually achieved decides what the spinner is allowed
     // to claim. A run that lost files to failed analyzer calls indexed less
     // than it was asked to, and a tick next to "Analyzed" is the first half of
@@ -1111,6 +1115,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // The last lines of the run: what it could not classify (carrick#705). An
     // answer that ends without its boundary reads as a complete one.
     print_boundaries(&boundaries);
+    print_graphql_notices(&graphql_notices);
 
     if let Some(payload) = pr_result {
         // The payload as the cloud receives it. The terminal report renders the
@@ -1149,6 +1154,81 @@ fn print_boundaries(boundaries: &[(String, crate::boundary::ServiceBoundary)]) {
         for line in boundary.lines(service) {
             println!("{line}");
         }
+    }
+}
+
+/// Each service's GraphQL schema lines for the report (carrick#1099): what a
+/// `graphqlSchemas` declaration failed to declare, and the code-first hint for
+/// a service that uses GraphQL, serves routes, and indexes no schema field.
+///
+/// `services` and `data` are the scan loop's, index for index. The GraphQL
+/// libraries are the service's own declared dependencies plus what framework
+/// detection reported, both passed through the one existing GraphQL library
+/// filter, so the dependency half keeps the hint deterministic when detection
+/// is cached or missing.
+fn graphql_schema_notices(
+    repo_path: &str,
+    services: &[Config],
+    data: &[CloudRepoData],
+) -> crate::graphql::GraphqlNotices {
+    let mut notices = crate::graphql::GraphqlNotices::default();
+    for (service, data) in services.iter().zip(data) {
+        let declared = crate::graphql::resolve_declared_schemas(
+            Path::new(repo_path),
+            &service.graphql_schemas,
+        );
+        let protocol_count = |protocol: crate::operation::Protocol| {
+            data.endpoints
+                .iter()
+                .filter(|endpoint| endpoint.key.protocol() == protocol)
+                .count()
+        };
+        let mut names: Vec<String> = Vec::new();
+        if let Some(packages) = &data.packages {
+            for manifest in &packages.package_jsons {
+                names.extend(manifest.dependencies.keys().cloned());
+                names.extend(manifest.dev_dependencies.keys().cloned());
+                names.extend(manifest.peer_dependencies.keys().cloned());
+            }
+        }
+        if let Some(detection) = &data.cached_detection {
+            names.extend(detection.frameworks.iter().cloned());
+            names.extend(detection.data_fetchers.iter().cloned());
+        }
+        let graphql_libraries = crate::analyzer::filter_graphql_libraries(&names);
+        let label = service
+            .service_name
+            .as_deref()
+            .or(data.service_name.as_deref())
+            .unwrap_or(&data.repo_name);
+        let service_notices =
+            crate::graphql::service_notices(crate::graphql::GraphqlServiceFacts {
+                service: label,
+                declares_schemas: !service.graphql_schemas.is_empty(),
+                declared: &declared,
+                producers: protocol_count(crate::operation::Protocol::Graphql),
+                serves_http: protocol_count(crate::operation::Protocol::Http) > 0,
+                graphql_libraries: &graphql_libraries,
+            });
+        notices.warnings.extend(service_notices.warnings);
+        notices.hints.extend(service_notices.hints);
+    }
+    notices
+}
+
+/// The report's GraphQL schema lines. A declaration that did nothing is a
+/// warning, on the Actions step as well; the hint is a plain line.
+fn print_graphql_notices(notices: &crate::graphql::GraphqlNotices) {
+    if notices.warnings.is_empty() && notices.hints.is_empty() {
+        return;
+    }
+    println!("\nGraphQL schemas");
+    for warning in &notices.warnings {
+        println!("  {warning}");
+        logging::annotate(logging::Annotation::Warning, warning);
+    }
+    for hint in &notices.hints {
+        println!("  {hint}");
     }
 }
 
@@ -2429,7 +2509,12 @@ fn scan_protocol_extractions(
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
 ) -> ProtocolExtractions {
     let scan_roots = service_graphql_roots(repo_path, service);
-    let mut graphql = crate::graphql::scan_repo(&scan_roots, files);
+    // The printed schemas the service declares it serves (carrick#1099). What
+    // they failed to declare is reported once the run's rows are built
+    // (`graphql_schema_notices`); here only the files matter.
+    let declared =
+        crate::graphql::resolve_declared_schemas(Path::new(repo_path), &service.graphql_schemas);
+    let mut graphql = crate::graphql::scan_repo(&scan_roots, &declared.files, files);
     merge_graphql_resolver_locations(&mut graphql, file_results);
     merge_graphql_consumer_locations(&mut graphql, file_results);
     let sockets = crate::socket_io::scan_files(files);

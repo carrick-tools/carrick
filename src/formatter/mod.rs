@@ -743,8 +743,10 @@ fn format_verified_section(verified: &[crate::analyzer::VerifiedEndpointEntry]) 
 /// Render a banner when GraphQL libraries are detected but no operations
 /// could be extracted. GraphQL extraction is parse-based (SDL files,
 /// `gql` template literals); code-first schemas and Relay compiled
-/// artifacts produce nothing statically, so the banner suggests committing
-/// an emitted schema instead of staying silent about the coverage gap.
+/// artifacts produce nothing statically, so the banner names the
+/// `graphqlSchemas` setting (carrick#1099) instead of staying silent about
+/// the coverage gap. The per-service form of this, which also fires for a
+/// server that has consumer rows, is the engine's `graphql_schema_notices`.
 fn format_graphql_banner(graphql_libraries: &[String], operations_indexed: bool) -> String {
     if graphql_libraries.is_empty() || operations_indexed {
         return String::new();
@@ -758,7 +760,7 @@ fn format_graphql_banner(graphql_libraries: &[String], operations_indexed: bool)
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "> [!NOTE]\n> **GraphQL detected** ({}), but no schema or operation documents were found. Carrick extracts GraphQL contracts from SDL (`.graphql`/`.gql` files, `gql` template literals). If your schema is code-first (Pothos, TypeGraphQL, Nexus), commit the emitted `schema.graphql` to index it. Relay compiled artifacts and persisted queries are out of scope.\n\n",
+        "> [!NOTE]\n> **GraphQL detected** ({}), but no schema or operation documents were found. Carrick extracts GraphQL contracts from SDL (`.graphql`/`.gql` files, `gql` template literals). If your schema is code-first (Pothos, TypeGraphQL, Nexus), name its printed SDL file in the serving service's `graphqlSchemas` in carrick.json. Relay compiled artifacts and persisted queries are out of scope.\n\n",
         lib_list,
     )
 }

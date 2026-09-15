@@ -30,6 +30,24 @@ pub struct Config {
     /// Relative to the `carrick.json` location.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
+    /// Printed GraphQL SDL files that define the operations this service
+    /// SERVES (carrick#1099), relative to the `carrick.json` location; glob
+    /// patterns are allowed. The declaration for a code-first schema, whose
+    /// root fields exist only as builder calls: its printed schema usually
+    /// sits in a build folder or under another app's directory, which the
+    /// service's own SDL walk never reaches. Every root field those files
+    /// define becomes a producer row of THIS service. A pattern that matches
+    /// no file is reported by the scan (`graphql::resolve_declared_schemas`),
+    /// never silently ignored.
+    ///
+    /// Skipped when empty so a config without one serializes byte-identically
+    /// into the blob's `config_json`.
+    #[serde(
+        default,
+        rename = "graphqlSchemas",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub graphql_schemas: Vec<String>,
     #[serde(default)]
     #[serde(rename = "internalEnvVars")]
     pub internal_env_vars: HashSet<String>,
@@ -804,5 +822,34 @@ mod tests {
         let services = Config::load_services(vec![path]).unwrap();
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].service_name, Some("flat".to_string()));
+    }
+
+    /// carrick#1099: `graphqlSchemas` is per service, and a service without
+    /// one serializes into `config_json` exactly as it did before the field.
+    #[test]
+    fn test_graphql_schemas_are_per_service_and_absent_when_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carrick.json");
+        std::fs::write(
+            &path,
+            r#"{ "services": [
+                { "serviceName": "api", "directory": "api",
+                  "graphqlSchemas": ["web/dist/**/*.graphql"] },
+                { "serviceName": "web", "directory": "web" }
+            ] }"#,
+        )
+        .unwrap();
+
+        let services = Config::load_services(vec![path]).unwrap();
+        assert_eq!(services[0].graphql_schemas, vec!["web/dist/**/*.graphql"]);
+        assert!(services[1].graphql_schemas.is_empty());
+
+        let declaring = serde_json::to_value(&services[0]).unwrap();
+        assert_eq!(
+            declaring["graphqlSchemas"],
+            serde_json::json!(["web/dist/**/*.graphql"])
+        );
+        let plain = serde_json::to_value(&services[1]).unwrap();
+        assert!(plain.get("graphqlSchemas").is_none(), "{plain}");
     }
 }
