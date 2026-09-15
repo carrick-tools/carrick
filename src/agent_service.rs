@@ -9,6 +9,9 @@ use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, warn};
 
+mod limiter;
+use limiter::{RatePacer, RouteLimits};
+
 /// Process-global circuit breaker for backend LLM quota exhaustion.
 ///
 /// A scan runs as a single process, and every lambda call it makes draws on
@@ -369,11 +372,51 @@ fn global_semaphore() -> Arc<Semaphore> {
         .clone()
 }
 
+/// The adaptive limit per cloud route, inside the process-wide cap
+/// (carrick-cloud#869). Each route starts at [`concurrency_limit`], halves
+/// when the cloud refuses a request for capacity and climbs back by one after
+/// a run of successes; see `limiter.rs`. Process-global for the same reason as
+/// the semaphore: a busy model is busy for every `AgentService` that asks it.
+fn global_route_limits() -> Arc<RouteLimits> {
+    static LIMITS: OnceLock<Arc<RouteLimits>> = OnceLock::new();
+    LIMITS
+        .get_or_init(|| Arc::new(RouteLimits::new(concurrency_limit())))
+        .clone()
+}
+
+/// The request rate across every route, paced to the gateway throttle
+/// (carrick-cloud#869). Unpaced until a gateway 429; see `limiter.rs`.
+fn global_pacer() -> Arc<RatePacer> {
+    static PACER: OnceLock<Arc<RatePacer>> = OnceLock::new();
+    PACER.get_or_init(|| Arc::new(RatePacer::new())).clone()
+}
+
+/// Whether a retriable error ENVELOPE says the route's model is out of
+/// capacity. The lambda answers 503 `model_error` with a `Retry-After` when
+/// the model's own retries ran out, and that is per model, so it cuts the
+/// route's concurrency. A 429 envelope never reaches here (`rate_limited`
+/// trips the breaker first), and anything else retriable says nothing about
+/// capacity.
+fn is_model_busy(status: u16, retry_after: Option<Duration>) -> bool {
+    status == 503 || retry_after.is_some()
+}
+
+/// Whether a response with NO envelope is the API Gateway's throttle. The
+/// gateway answers 429 before any lambda runs, for every route alike, so it is
+/// a request-rate signal for the pacer and not a verdict on any model. A
+/// non-envelope 502/503/504 may be a lambda timeout, which says nothing about
+/// either.
+fn is_gateway_throttle(status: u16) -> bool {
+    status == 429
+}
+
 /// Reusable service for making Agent API calls
 #[derive(Debug, Clone)]
 pub struct AgentService {
     client: Client,
     semaphore: Arc<Semaphore>,
+    limits: Arc<RouteLimits>,
+    pacer: Arc<RatePacer>,
 }
 
 impl AgentService {
@@ -391,6 +434,8 @@ impl AgentService {
         Self {
             client,
             semaphore: global_semaphore(),
+            limits: global_route_limits(),
+            pacer: global_pacer(),
         }
     }
 
@@ -517,6 +562,7 @@ impl AgentService {
         // request numbers itself in `X-Carrick-Attempt` so the lambda sizes
         // its own model retries to this loop (carrick-cloud#875).
         let max_retries = MAX_RETRIES;
+        let route_limit = self.limits.for_route(path);
         for attempt in 1..=max_retries {
             // A sibling call (any phase, any `AgentService`) may have already
             // hit the backend quota wall. Re-checked each attempt so a worker
@@ -548,12 +594,27 @@ impl AgentService {
             // is not a request on the wire, so it must not idle a slot another
             // call could use. It re-queues for a slot when it wakes. Taken
             // after the token read, so minting a token holds no slot either.
+            //
+            // Two slots, in this order: the route's adaptive one, then the
+            // process-wide one. The other order would idle a process-wide
+            // slot while this attempt queues behind a busy route. Each slot
+            // is released at the same points; the route slot also carries the
+            // attempt's verdict back to its limit (carrick-cloud#869).
+            let route_slot = route_limit.acquire().await;
             let permit = self.semaphore.acquire().await.map_err(|e| {
                 AgentCallError::permanent(
                     "semaphore_closed",
                     format!("Failed to acquire semaphore permit: {}", e),
                 )
             })?;
+
+            // Paced last, holding both slots, so the reserved time is the
+            // time the request goes. A wait here is the throttle working, not
+            // a retry sleep: while the gateway is rate-limiting the scan, the
+            // rate is what bounds the stage, and the slots are not idle so
+            // much as queued behind it.
+            let reservation = self.pacer.reserve();
+            tokio::time::sleep_until(reservation.at).await;
 
             let mut request_builder = self
                 .client
@@ -608,6 +669,7 @@ impl AgentService {
                                     status, e, wait_time, attempt, max_retries
                                 );
                                 drop(permit);
+                                drop(route_slot);
                                 sleep(wait_time).await;
                                 lambda_attempt += 1;
                                 continue;
@@ -671,6 +733,7 @@ impl AgentService {
                         // Minting is a round trip to the token endpoint, not
                         // to the cloud, so it holds no slot.
                         drop(permit);
+                        drop(route_slot);
                         provider.remint(&token).await.map_err(|e| {
                             AgentCallError::permanent("oidc_unavailable", e.to_string())
                         })?;
@@ -689,7 +752,7 @@ impl AgentService {
                             // otherwise fail fast (server-side bug).
                             if is_transient_gateway_status && attempt < max_retries {
                                 let wait_time = retry_wait(attempt, jitter_seed(), retry_after);
-                                warn!(
+                                let line = format!(
                                     "Gateway status {} with non-envelope body ({}): {}. Retrying in {:?} (attempt {}/{})",
                                     status,
                                     e,
@@ -699,8 +762,26 @@ impl AgentService {
                                     max_retries
                                 );
                                 drop(permit);
+                                drop(route_slot);
+                                if is_gateway_throttle(status.as_u16()) {
+                                    // The terminal hears about the throttle
+                                    // once, from the pacer; each 429 is
+                                    // file-log detail.
+                                    debug!("{line}");
+                                    self.pacer.throttled(reservation.epoch);
+                                    // The gateway refused before any lambda
+                                    // ran, so the model was never asked: the
+                                    // re-send keeps its attempt number and
+                                    // the lambda's full chain, as a re-mint
+                                    // does (carrick-cloud#875).
+                                } else {
+                                    // A 502/503/504 may be a lambda that timed
+                                    // out mid-call, so the model may have been
+                                    // asked.
+                                    warn!("{line}");
+                                    lambda_attempt += 1;
+                                }
                                 sleep(wait_time).await;
-                                lambda_attempt += 1;
                                 continue;
                             }
                             let message = format!(
@@ -718,6 +799,9 @@ impl AgentService {
                     };
 
                     if status.is_success() && body.success {
+                        drop(permit);
+                        route_slot.succeeded();
+                        self.pacer.admitted();
                         return Ok(LambdaOutcome {
                             text: body.text.unwrap_or_default(),
                             guidance_key: body.guidance_key,
@@ -762,11 +846,20 @@ impl AgentService {
                         // the floor: re-firing after one or two seconds lands
                         // in the same capacity dip the lambda just gave up on.
                         let wait_time = retry_wait(attempt, jitter_seed(), retry_after);
-                        warn!(
+                        let line = format!(
                             "Agent error '{}' is retriable, retrying in {:?} (attempt {}/{}): {}",
                             call_err.code, wait_time, attempt, max_retries, call_err.message
                         );
                         drop(permit);
+                        if is_model_busy(status.as_u16(), retry_after) {
+                            // One aggregated terminal line comes from the
+                            // limiter; each refusal is file-log detail.
+                            debug!("{line}");
+                            route_slot.overloaded();
+                        } else {
+                            warn!("{line}");
+                            drop(route_slot);
+                        }
                         sleep(wait_time).await;
                         lambda_attempt += 1;
                         continue;
@@ -783,6 +876,7 @@ impl AgentService {
                             e, wait_time, attempt, max_retries
                         );
                         drop(permit);
+                        drop(route_slot);
                         sleep(wait_time).await;
                         lambda_attempt += 1;
                         continue;
@@ -2033,6 +2127,68 @@ pub(crate) mod tests {
         let detection = AgentService::new();
         let intents = AgentService::new();
         assert!(Arc::ptr_eq(&detection.semaphore, &intents.semaphore));
+        // A busy model is busy for every service that asks it, so the
+        // adaptive limits are shared the same way.
+        assert!(Arc::ptr_eq(&detection.limits, &intents.limits));
+        // The gateway throttle is one rate for every route.
+        assert!(Arc::ptr_eq(&detection.pacer, &intents.pacer));
+    }
+
+    #[test]
+    fn a_busy_model_and_a_gateway_throttle_are_told_apart() {
+        // Envelope: the model's own capacity.
+        assert!(is_model_busy(503, None));
+        assert!(is_model_busy(500, Some(Duration::from_secs(10))));
+        assert!(!is_model_busy(500, None));
+        assert!(!is_model_busy(502, None));
+        // No envelope: only a 429 is the gateway's rate throttle. A 502/503/
+        // 504 may be a lambda timeout and says nothing about rate.
+        assert!(is_gateway_throttle(429));
+        assert!(!is_gateway_throttle(503));
+        assert!(!is_gateway_throttle(504));
+    }
+
+    fn service_with(permits: usize, route_max: usize) -> AgentService {
+        AgentService {
+            client: Client::builder().no_proxy().build().unwrap(),
+            semaphore: Arc::new(Semaphore::new(permits)),
+            limits: Arc::new(RouteLimits::new(route_max)),
+            pacer: Arc::new(RatePacer::new()),
+        }
+    }
+
+    /// A gateway 429 is refused before any lambda runs, so the model was never
+    /// asked: the re-send must still say attempt 1, or the lambda would give
+    /// it a single model try instead of its full chain.
+    #[tokio::test]
+    async fn a_gateway_throttle_does_not_advance_the_attempt_the_lambda_sees() {
+        let (api_base, server) = stub_server(vec![
+            (429, r#"{"message":"Too Many Requests"}"#.to_string()),
+            (200, r#"{"success":true,"text":"analysed"}"#.to_string()),
+        ]);
+        let service = service_with(4, 4);
+        let result = service
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &api_base,
+                "/generate-intent",
+                &serde_json::json!({}),
+            )
+            .await;
+        assert_eq!(result.unwrap().text, "analysed");
+        let requests = server.join().unwrap();
+        for request in &requests {
+            assert_eq!(
+                header_of(request, "x-carrick-attempt").as_deref(),
+                Some("1")
+            );
+        }
+        assert!(service.pacer.rate().is_some(), "the throttle did not pace");
+        assert_eq!(
+            service.limits.for_route("/generate-intent").limit(),
+            4,
+            "a gateway throttle cut the route's concurrency"
+        );
     }
 
     /// The two guidance fields are key material for the cloud's analysis
@@ -2285,11 +2441,8 @@ pub(crate) mod tests {
             ),
         ]);
 
-        let semaphore = Arc::new(Semaphore::new(1));
-        let service = AgentService {
-            client: Client::builder().no_proxy().build().unwrap(),
-            semaphore: semaphore.clone(),
-        };
+        let service = service_with(1, 1);
+        let semaphore = service.semaphore.clone();
         let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
         let body = serde_json::json!({});
 
@@ -2325,11 +2478,8 @@ pub(crate) mod tests {
             200,
             r#"{"success":true,"text":"analysed"}"#.to_string(),
         )]);
-        let semaphore = Arc::new(Semaphore::new(1));
-        let service = AgentService {
-            client: Client::builder().no_proxy().build().unwrap(),
-            semaphore: semaphore.clone(),
-        };
+        let service = service_with(1, 1);
+        let semaphore = service.semaphore.clone();
         let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
         let body = serde_json::json!({});
 
@@ -2347,6 +2497,333 @@ pub(crate) mod tests {
             .await;
         assert_eq!(result.unwrap().text, "analysed");
         assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    /// A concurrent HTTP stub: every connection runs on its own task and is
+    /// answered by `respond`, given the full request text. The sequential
+    /// [`stub_server`] cannot see concurrency or rate, which is what the
+    /// limiter and the pacer respond to.
+    async fn concurrent_stub<F, Fut>(respond: F) -> String
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = StubResponse> + Send,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let respond = Arc::new(respond);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let respond = Arc::clone(&respond);
+                tokio::spawn(async move {
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let Ok(n) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        raw.extend_from_slice(&buf[..n]);
+                        if n == 0 {
+                            break;
+                        }
+                        let text = String::from_utf8_lossy(&raw).to_string();
+                        let Some(header_end) = text.find("\r\n\r\n") else {
+                            continue;
+                        };
+                        let content_length = header_of(&text[..header_end], "content-length")
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if raw.len() >= header_end + 4 + content_length {
+                            break;
+                        }
+                    }
+                    let (status, body, headers) =
+                        respond(String::from_utf8_lossy(&raw).to_string()).await;
+                    let extra: String = headers
+                        .iter()
+                        .map(|(name, value)| format!("{name}: {value}\r\n"))
+                        .collect();
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                         {extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    /// What the busy mock lambda saw.
+    #[derive(Default)]
+    struct BusyLambdaCounts {
+        /// Requests above the threshold, answered 503 `model_error`.
+        refused: std::sync::atomic::AtomicUsize,
+        /// The highest `X-Carrick-Attempt` any request carried.
+        highest_attempt: std::sync::atomic::AtomicUsize,
+    }
+
+    /// A lambda whose model has room for `threshold` requests at once: each
+    /// request it serves takes `hold`, and a request that arrives while
+    /// `threshold` are already being served is refused at once with a 503
+    /// `model_error` and `Retry-After: 1`, the shape the cloud sends when its
+    /// own model retries ran out. The threshold is shared so a test can lift
+    /// it mid-run.
+    async fn busy_lambda(
+        threshold: Arc<std::sync::atomic::AtomicUsize>,
+        hold: Duration,
+    ) -> (String, Arc<BusyLambdaCounts>) {
+        use std::sync::atomic::AtomicUsize;
+
+        let counts = Arc::new(BusyLambdaCounts::default());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::clone(&counts);
+        let base = concurrent_stub(move |request| {
+            let counts = Arc::clone(&shared);
+            let in_flight = Arc::clone(&in_flight);
+            let threshold = Arc::clone(&threshold);
+            async move {
+                let attempt = header_of(&request, "x-carrick-attempt")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                counts.highest_attempt.fetch_max(attempt, Ordering::SeqCst);
+
+                let serving = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                if serving > threshold.load(Ordering::SeqCst) {
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    counts.refused.fetch_add(1, Ordering::SeqCst);
+                    return (
+                        503,
+                        r#"{"success":false,"error":{"code":"model_error","message":"model busy","retriable":true}}"#
+                            .to_string(),
+                        vec![("Retry-After", "1".to_string())],
+                    );
+                }
+                tokio::time::sleep(hold).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                (
+                    200,
+                    r#"{"success":true,"text":"analysed"}"#.to_string(),
+                    Vec::new(),
+                )
+            }
+        })
+        .await;
+        (base, counts)
+    }
+
+    /// An API Gateway stage throttle in front of instant cached answers: a
+    /// token bucket holding `burst` requests and refilling `per_second`. A
+    /// request that finds it empty gets the gateway's own 429, whose body is
+    /// JSON but not an envelope. `lifted` turns the throttle off mid-test.
+    async fn throttling_gateway(
+        burst: f64,
+        per_second: f64,
+        lifted: Arc<AtomicBool>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::AtomicUsize;
+
+        let throttled = Arc::new(AtomicUsize::new(0));
+        let bucket = Arc::new(Mutex::new((burst, std::time::Instant::now())));
+        let shared = Arc::clone(&throttled);
+        let base = concurrent_stub(move |_request| {
+            let throttled = Arc::clone(&shared);
+            let bucket = Arc::clone(&bucket);
+            let lifted = Arc::clone(&lifted);
+            async move {
+                let admitted = lifted.load(Ordering::SeqCst) || {
+                    let mut bucket = bucket.lock().unwrap();
+                    let now = std::time::Instant::now();
+                    let refill = now.duration_since(bucket.1).as_secs_f64() * per_second;
+                    *bucket = ((bucket.0 + refill).min(burst), now);
+                    if bucket.0 >= 1.0 {
+                        bucket.0 -= 1.0;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if admitted {
+                    (
+                        200,
+                        r#"{"success":true,"text":"cached"}"#.to_string(),
+                        Vec::new(),
+                    )
+                } else {
+                    throttled.fetch_add(1, Ordering::SeqCst);
+                    (
+                        429,
+                        r#"{"message":"Too Many Requests"}"#.to_string(),
+                        Vec::new(),
+                    )
+                }
+            }
+        })
+        .await;
+        (base, throttled)
+    }
+
+    /// The gateway half of carrick-cloud#869. Cached answers come back at
+    /// once, so the concurrency cap does not bound the rate, and 150 calls at
+    /// a cap of 28 run straight into a throttle of 20 burst / 50 a second.
+    /// The pacer must set a rate the gateway can take, every call must finish,
+    /// and the route's concurrency must be left alone, because the model was
+    /// never the problem. Once the throttle lifts, the rate climbs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_gateway_throttle_paces_every_route_and_the_pace_recovers() {
+        const CAP: usize = 28;
+        const CALLS: usize = 150;
+        const RECOVERY_CALLS: usize = 100;
+        const PER_SECOND: f64 = 50.0;
+
+        let lifted = Arc::new(AtomicBool::new(false));
+        let (api_base, throttled) = throttling_gateway(20.0, PER_SECOND, Arc::clone(&lifted)).await;
+        let service = service_with(CAP, CAP);
+        let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
+        let body = serde_json::json!({});
+        let run =
+            |n: usize| {
+                let service = &service;
+                let auth = &auth;
+                let body = &body;
+                let api_base = &api_base;
+                futures::future::join_all((0..n).map(move |_| {
+                    service.post_with_retry(auth, api_base, "/generate-intent", body)
+                }))
+            };
+
+        let started = std::time::Instant::now();
+        let busy = run(CALLS).await;
+        let busy_elapsed = started.elapsed();
+        let failed = busy.iter().filter(|r| r.is_err()).count();
+        let throttles = throttled.load(Ordering::SeqCst);
+        let paced_at = service.pacer.rate();
+        let route_limit = service.limits.for_route("/generate-intent").limit();
+
+        lifted.store(true, Ordering::SeqCst);
+        let recovery = run(RECOVERY_CALLS).await;
+        let recovered_at = service.pacer.rate();
+
+        eprintln!(
+            "gateway phase: {CALLS} calls at cap {CAP} against 20 burst / {PER_SECOND}/s; \
+             {throttles} throttled, {failed} failed calls, paced at {paced_at:?}/s, route \
+             limit {route_limit}, {busy_elapsed:?}. recovery: {RECOVERY_CALLS} calls, paced at \
+             {recovered_at:?}/s"
+        );
+
+        assert_eq!(failed, 0, "a call exhausted its retries: {busy:?}");
+        let paced_at = paced_at.expect("the throttle never set a pace");
+        assert!(
+            f64::from(paced_at) <= PER_SECOND * 1.5,
+            "paced at {paced_at}/s against a {PER_SECOND}/s throttle"
+        );
+        assert!(
+            throttles <= 60,
+            "{throttles} throttles for {CALLS} calls: the pace did not hold the rate down"
+        );
+        assert_eq!(
+            route_limit, CAP,
+            "a gateway throttle cut the route's concurrency"
+        );
+        assert!(recovery.iter().all(|r| r.is_ok()));
+        assert!(
+            recovered_at.expect("pace vanished") > paced_at,
+            "the pace did not climb once the gateway let requests through"
+        );
+    }
+
+    /// carrick-cloud#869 end to end, against a mock lambda that refuses every
+    /// request above four at once. Sixty calls start together under a route
+    /// limit of sixteen, which is the case the fixed cap got wrong: each
+    /// refusal frees a slot for the next queued call to be refused too.
+    ///
+    /// The limit must fall below the threshold, every call must finish inside
+    /// its attempt budget, and once the model has room again the limit must
+    /// climb back to its maximum. The counts are printed for the PR note.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_busy_model_slows_its_route_below_the_threshold_and_recovers() {
+        use std::sync::atomic::AtomicUsize;
+        const MAX: usize = 16;
+        const THRESHOLD: usize = 4;
+        const CALLS: usize = 60;
+        const RECOVERY_CALLS: usize = 150;
+
+        let threshold = Arc::new(AtomicUsize::new(THRESHOLD));
+        let (api_base, counts) =
+            busy_lambda(Arc::clone(&threshold), Duration::from_millis(100)).await;
+        let service = service_with(MAX, MAX);
+        let limit = service.limits.for_route("/analyze-file");
+
+        // The lowest the limit went, sampled while the calls run.
+        let lowest = Arc::new(AtomicUsize::new(MAX));
+        let sampler = tokio::spawn({
+            let limit = Arc::clone(&limit);
+            let lowest = Arc::clone(&lowest);
+            async move {
+                loop {
+                    lowest.fetch_min(limit.limit(), Ordering::SeqCst);
+                    sleep(Duration::from_millis(5)).await;
+                }
+            }
+        });
+
+        let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
+        let body = serde_json::json!({});
+        let run = |n: usize| {
+            let service = &service;
+            let auth = &auth;
+            let body = &body;
+            let api_base = &api_base;
+            futures::future::join_all(
+                (0..n).map(move |_| service.post_with_retry(auth, api_base, "/analyze-file", body)),
+            )
+        };
+
+        let started = std::time::Instant::now();
+        let busy = run(CALLS).await;
+        let busy_elapsed = started.elapsed();
+        let failed = busy.iter().filter(|r| r.is_err()).count();
+        let refused = counts.refused.load(Ordering::SeqCst);
+        let highest_attempt = counts.highest_attempt.load(Ordering::SeqCst);
+        let lowest_limit = lowest.load(Ordering::SeqCst);
+        let limit_after_busy = limit.limit();
+
+        threshold.store(usize::MAX, Ordering::SeqCst);
+        let recovery = run(RECOVERY_CALLS).await;
+        sampler.abort();
+        let recovered_limit = limit.limit();
+
+        eprintln!(
+            "busy phase: {CALLS} calls, limit {MAX} -> lowest {lowest_limit} (threshold \
+             {THRESHOLD}), ended at {limit_after_busy}; {refused} refusals, {failed} failed \
+             calls, highest attempt {highest_attempt}, {busy_elapsed:?}. recovery: \
+             {RECOVERY_CALLS} calls, limit back to {recovered_limit}"
+        );
+
+        assert_eq!(failed, 0, "a call exhausted its retries: {busy:?}");
+        assert!(
+            lowest_limit < THRESHOLD,
+            "the limit never fell below the model's threshold: lowest {lowest_limit}"
+        );
+        assert!(
+            highest_attempt <= 4,
+            "a call needed attempt {highest_attempt} of {MAX_RETRIES}"
+        );
+        assert!(
+            refused <= 40,
+            "{refused} refusals for {CALLS} calls: the limit did not hold the load off"
+        );
+        assert!(recovery.iter().all(|r| r.is_ok()));
+        assert_eq!(
+            recovered_limit, MAX,
+            "the limit did not climb back once the model had room"
+        );
     }
 
     /// A re-mint re-sends without the model ever having been asked, so the
