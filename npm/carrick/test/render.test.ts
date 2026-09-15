@@ -372,20 +372,34 @@ test("a session that starts while a scan is running is told so, not told there i
         infer: true,
         phase: "indexing gateway",
         progress: { service: "gateway", phase: "files", done: 118, total: 240 },
+        notice: "model busy: slowing analyze-file to 4 requests at a time",
       },
     ],
   });
   assert.match(building, /^Carrick has no index for this workspace yet, and a scan is building one\./);
-  assert.match(building, /- scan 5089ed60 is running: indexing gateway, 118 of 240 files/);
+  // Why it is slow rides beside the counts (carrick#1122).
+  assert.match(
+    building,
+    /- scan 5089ed60 is running: indexing gateway, 118 of 240 files \(model busy: slowing analyze-file to 4 requests at a time\)\./,
+  );
   assert.match(building, /\.carrick\/scan-5089ed60\.log/);
 
   const withIndex = renderSessionStart({
     ...statusFixture("status-workspace.json"),
     running_scans: [
-      { scan_id: "abc12345", pid: 1, started_at: "2026-09-12T10:00:00Z", status: "failed", error: "the scan of /repos/api failed" },
+      {
+        scan_id: "abc12345",
+        pid: 1,
+        started_at: "2026-09-12T10:00:00Z",
+        status: "failed",
+        error: "the scan of api failed: A scan of acme/api is already running.\nUsing TeeStorage (laptop scan)\n... 12 line(s) not shown ...",
+      },
     ],
   });
-  assert.match(withIndex, /- scan abc12345 failed: the scan of \/repos\/api failed/);
+  // The reason the error leads with, and none of the log excerpt after it
+  // (carrick#1103).
+  assert.match(withIndex, /- scan abc12345 failed: the scan of api failed: A scan of acme\/api is already running\.$/m);
+  assert.doesNotMatch(withIndex, /TeeStorage|not shown/);
 
   // The word the scaffold's poll loop waits for (carrick#1007 item 4).
   const done = renderSessionStart({

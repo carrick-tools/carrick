@@ -335,7 +335,7 @@ fn scan_repo(
     let command = scan_command(exe, repo, blobs, previous, infer);
     run_scan(
         command,
-        &format!("scan of {}", repo.display()),
+        &format!("scan of {label}"),
         Reporting {
             working: format!("indexing {label}"),
             done: format!("indexed {label}"),
@@ -493,6 +493,15 @@ fn run_scan(
     // pending. A scan in that state exits 0, so its output would otherwise be
     // dropped with the rest, and this is the sentence that says to re-run.
     let mut pending: Vec<String> = Vec::new();
+    // Why the scan failed, in the one sentence it states on the same channel.
+    // It leads the error, so every reader that shows a failure in one line
+    // (`carrick status`, the SessionStart hook) shows that sentence rather
+    // than the first line of the scan's log (carrick#1103).
+    let mut failure: Option<crate::progress::Failure> = None;
+    // The last count and the last notice, so either one arriving redraws the
+    // bar with both.
+    let mut last_update: Option<crate::progress::Update> = None;
+    let mut notice: Option<String> = None;
     // The child's stderr is read on a thread of its own so that this loop can
     // wake up when the child says NOTHING. A scan's quiet stretches are its
     // long ones — a model call, a type check — and the log's pulse used to be
@@ -519,8 +528,25 @@ fn run_scan(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if let Some(update) = crate::progress::parse(&line) {
-            bar.set_message(format!("{}: {}", reporting.working, update.render()));
+            bar.set_message(bar_message(
+                &reporting.working,
+                Some(&update),
+                notice.as_deref(),
+            ));
             super::scan_state::note(&reporting.working, Some(&update));
+            last_update = Some(update);
+            continue;
+        }
+        // Why the scan is slow, said by the scan (carrick#1122). It rides
+        // beside the counts until the next one replaces it.
+        if let Some(text) = crate::progress::parse_notice(&line) {
+            bar.set_message(bar_message(
+                &reporting.working,
+                last_update.as_ref(),
+                Some(&text),
+            ));
+            super::scan_state::notice(&text);
+            notice = Some(text);
             continue;
         }
         if let Some(reported) = crate::scan_spend::parse(&line) {
@@ -529,6 +555,10 @@ fn run_scan(
         }
         if let Some(statement) = crate::progress::parse_pending(&line) {
             pending.push(statement);
+            continue;
+        }
+        if let Some(stated) = crate::progress::parse_failure(&line) {
+            failure = Some(stated);
             continue;
         }
         // Kept clean from here on: what this loop keeps is read back by a
@@ -567,10 +597,31 @@ fn run_scan(
         return Ok(spend);
     }
     bar.finish_and_clear();
+    let reason = match failure {
+        Some(failure) => failure.reason,
+        None => format!("it exited ({status}) without saying why"),
+    };
     Err(format!(
-        "the {what} failed:\n{}",
+        "the {what} failed: {reason}\n{}",
         failure_excerpt(head, causes, tail, dropped)
     ))
+}
+
+/// The spinner's message: the phase, its counts, and why it is slow when the
+/// scan has said.
+fn bar_message(
+    working: &str,
+    update: Option<&crate::progress::Update>,
+    notice: Option<&str>,
+) -> String {
+    let mut message = working.to_string();
+    if let Some(update) = update {
+        message.push_str(&format!(": {}", update.render()));
+    }
+    if let Some(notice) = notice {
+        message.push_str(&format!(" ({notice})"));
+    }
+    message
 }
 
 /// How long this process waits on a silent child before saying where it is.
@@ -1440,6 +1491,123 @@ mod tests {
             "an OSC title runs to its terminator, not to the end of the line"
         );
         assert_eq!(strip_ansi("plain"), "plain", "text is left alone");
+    }
+
+    /// The bar carries what the scan said about why it is slow beside its
+    /// counts, and a notice before any count still shows (carrick#1122).
+    #[test]
+    fn the_bar_shows_why_the_scan_is_slow() {
+        let update = crate::progress::Update {
+            service: "api".to_string(),
+            service_index: 1,
+            service_total: 1,
+            phase: crate::progress::Phase::Files,
+            done: 40,
+            total: 120,
+        };
+        assert_eq!(
+            bar_message(
+                "indexing api",
+                Some(&update),
+                Some("model busy: slowing analyze-file to 4 requests at a time")
+            ),
+            "indexing api: 40 of 120 files (model busy: slowing analyze-file to 4 requests at a time)"
+        );
+        assert_eq!(
+            bar_message(
+                "indexing api",
+                None,
+                Some("gateway busy: pacing model requests to 5 a second")
+            ),
+            "indexing api (gateway busy: pacing model requests to 5 a second)"
+        );
+        assert_eq!(
+            bar_message("indexing api", Some(&update), None),
+            "indexing api: 40 of 120 files"
+        );
+    }
+
+    /// A notice line from the child is lifted out of the stream, not kept in a
+    /// failure's excerpt as log text.
+    #[test]
+    fn a_notice_from_the_child_is_not_part_of_the_excerpt() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            "echo '@carrick-notice {\"text\":\"model busy: slowing analyze-file to 4 requests at a time\"}' >&2; \
+             echo 'plain log line' >&2; exit 1",
+        );
+        let error = run_scan(
+            command,
+            "scan of api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+            HEARTBEAT,
+        )
+        .expect_err("the child exited non-zero");
+        assert!(!error.contains("@carrick-notice"), "{error}");
+        assert!(error.contains("plain log line"), "{error}");
+    }
+
+    /// The sentence a failing scan states on the progress channel leads the
+    /// error, ahead of its log, and the marker line itself is not part of the
+    /// excerpt (carrick#1103).
+    #[test]
+    fn a_failed_scan_leads_with_the_reason_it_stated() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            "echo 'Using TeeStorage (laptop scan: cloud upload + local cache)' >&2; \
+             echo '@carrick-failure {\"stage\":\"discovery\",\"reason\":\"A scan of acme/api is already running.\"}' >&2; \
+             exit 1",
+        );
+        let error = run_scan(
+            command,
+            "scan of api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+            HEARTBEAT,
+        )
+        .expect_err("the child exited non-zero");
+        assert_eq!(
+            error.lines().next(),
+            Some("the scan of api failed: A scan of acme/api is already running.")
+        );
+        assert!(
+            error.contains("TeeStorage"),
+            "the excerpt is kept for --json: {error}"
+        );
+        assert!(!error.contains("@carrick-failure"), "{error}");
+
+        // A scan that dies without stating a reason still leads with a sentence.
+        let mut silent = Command::new("sh");
+        silent
+            .arg("-c")
+            .arg("echo 'thread main panicked at x' >&2; exit 101");
+        let error = run_scan(
+            silent,
+            "scan of api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+            HEARTBEAT,
+        )
+        .expect_err("the child exited non-zero");
+        let first = error.lines().next().unwrap_or_default();
+        assert!(
+            first.starts_with("the scan of api failed: it exited ("),
+            "{error}"
+        );
+        assert!(first.ends_with(") without saying why"), "{error}");
     }
 
     /// A failure short enough to state in full is stated in full: nothing is

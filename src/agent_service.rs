@@ -3,8 +3,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, warn};
@@ -63,6 +64,51 @@ static QUOTA_ABORTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 /// How many calls have failed on the quota breaker so far this process.
 pub fn quota_abort_count() -> usize {
     QUOTA_ABORTS.load(Ordering::Relaxed)
+}
+
+/// How many HTTP attempts this process has retried, across every call.
+static RETRIES: AtomicU64 = AtomicU64::new(0);
+
+/// When the terminal was last told about them.
+static RETRIES_ANNOUNCED: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// How long the terminal's retry line stays quiet after it has spoken.
+const RETRY_ANNOUNCE_GAP: Duration = Duration::from_secs(30);
+
+/// Count one retry, and say so on the terminal when it is due.
+///
+/// Each attempt's own line goes to the file log under
+/// [`crate::logging::RETRY_TARGET`], which the terminal does not show: a scan
+/// printed dozens of them, in transport terms a user cannot act on
+/// (carrick#1103). The terminal gets this one line instead, on the first retry
+/// and then at most every [`RETRY_ANNOUNCE_GAP`], with the running count.
+///
+/// Counted only for the retries the limiter does not already announce: a
+/// model-busy refusal or a gateway throttle is stated once by the limiter's
+/// own line (carrick#1119), so this covers a failed response read, a gateway
+/// 5xx, a network error and a retriable error that is not the model being
+/// busy.
+fn note_retry() {
+    let count = RETRIES.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = Instant::now();
+    let Ok(mut last) = RETRIES_ANNOUNCED.lock() else {
+        return;
+    };
+    if retry_announcement_due(*last, now) {
+        *last = Some(now);
+        crate::progress::announce(&retry_line(count));
+    }
+}
+
+/// The aggregated retry line.
+pub(crate) fn retry_line(count: u64) -> String {
+    format!("Carrick Cloud did not answer, retrying ({count} so far)")
+}
+
+/// Whether the terminal's retry line is due: the first time, then once the
+/// gap has passed.
+fn retry_announcement_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.duration_since(last) >= RETRY_ANNOUNCE_GAP)
 }
 
 /// How many requests this scan has issued to each cloud route.
@@ -771,7 +817,9 @@ impl AgentService {
                             let wait_time =
                                 backoff_delay_within(attempt, jitter_seed(), policy.max_delay);
                             if policy.permits(attempt, waited, wait_time) {
+                                note_retry();
                                 warn!(
+                                    target: crate::logging::RETRY_TARGET,
                                     "Failed to read agent proxy response ({}): {}. Retrying in {:?} (attempt {}/{})",
                                     status, e, wait_time, attempt, max_retries
                                 );
@@ -892,8 +940,10 @@ impl AgentService {
                                 } else {
                                     // A 502/503/504 may be a lambda that timed
                                     // out mid-call, so the model may have been
-                                    // asked.
-                                    warn!("{line}");
+                                    // asked. Each attempt is file-log detail
+                                    // too, with one counted terminal line.
+                                    note_retry();
+                                    warn!(target: crate::logging::RETRY_TARGET, "{line}");
                                     lambda_attempt += 1;
                                 }
                                 sleep(wait_time).await;
@@ -981,7 +1031,8 @@ impl AgentService {
                             debug!("{line}");
                             route_slot.overloaded();
                         } else {
-                            warn!("{line}");
+                            note_retry();
+                            warn!(target: crate::logging::RETRY_TARGET, "{line}");
                             drop(route_slot);
                         }
                         sleep(wait_time).await;
@@ -1002,7 +1053,9 @@ impl AgentService {
                     // Bare network failure (no response received) — retriable by definition.
                     let wait_time = backoff_delay_within(attempt, jitter_seed(), policy.max_delay);
                     if policy.permits(attempt, waited, wait_time) {
+                        note_retry();
                         warn!(
+                            target: crate::logging::RETRY_TARGET,
                             "Agent proxy network error: {}, retrying in {:?} (attempt {}/{})",
                             e, wait_time, attempt, max_retries
                         );
@@ -2288,6 +2341,22 @@ fn find_matching_bracket(s: &str) -> Option<usize> {
 pub(crate) mod tests {
     use super::*;
     use serial_test::serial;
+
+    /// The terminal hears about retries on the first one and then once per
+    /// gap, however many attempts happen in between (carrick#1103).
+    #[test]
+    fn the_retry_line_is_due_first_and_then_once_per_gap() {
+        let start = Instant::now();
+        assert!(retry_announcement_due(None, start));
+        assert!(!retry_announcement_due(
+            Some(start),
+            start + Duration::from_secs(5)
+        ));
+        assert!(retry_announcement_due(
+            Some(start),
+            start + RETRY_ANNOUNCE_GAP
+        ));
+    }
 
     fn err_with_code(code: &str) -> AgentError {
         AgentError {

@@ -525,8 +525,9 @@ impl StatusOutput {
         let mut out = String::new();
         // First, because it is the only line about right now: everything below
         // it describes the index as it was when the last build finished.
-        for scan in &self.running_scans {
-            out.push_str(&scan.line());
+        let index_dir = std::path::Path::new(&self.workspace).join(super::workspace::INDEX_DIR);
+        for line in super::scan_state::status_lines(&self.running_scans, &index_dir) {
+            out.push_str(&line);
             out.push('\n');
         }
         if !self.running_scans.is_empty() {

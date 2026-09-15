@@ -410,12 +410,17 @@ export function runningScanLine(scan: RunningScan): string {
     : "";
   const where = scan.phase ? `: ${scan.phase}` : "";
   if (scan.status === "failed") {
-    return `- scan ${scan.scan_id} failed${scan.error ? `: ${scan.error}` : ""}`;
+    // The error's first line is the reason; the lines after it are an excerpt
+    // of the scan's own log, which is for the log's reader, not a session
+    // start (carrick#1103).
+    const reason = scan.error?.split("\n").find((line) => line.trim())?.trim();
+    return `- scan ${scan.scan_id} failed${reason ? `: ${reason}` : ""}`;
   }
   if (scan.status === "finished") {
     return `- scan ${scan.scan_id} finished${scan.infer ? ", paid" : ""}. The index is written.`;
   }
-  return `- scan ${scan.scan_id} is running${where}${counts}. Its output is in .carrick/scan-${scan.scan_id}.log`;
+  const slow = scan.notice ? ` (${scan.notice})` : "";
+  return `- scan ${scan.scan_id} is running${where}${counts}${slow}. Its output is in .carrick/scan-${scan.scan_id}.log`;
 }
 
 /**

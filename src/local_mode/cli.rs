@@ -359,8 +359,8 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
             // stdout: one line of prose in front of it is an unparseable
             // answer.
             if !json {
-                for scan in &scans {
-                    println!("{}", scan.line());
+                for line in super::scan_state::status_lines(&scans, &index_dir) {
+                    println!("{line}");
                 }
                 for line in last_scan
                     .iter()

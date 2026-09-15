@@ -212,6 +212,9 @@ async fn main() {
             scan_stage::current().as_str(),
             e
         );
+        // The same reason, for a parent that runs this scan and reports it in
+        // one sentence rather than as this process's log (carrick#1103).
+        progress::failed(scan_stage::current().as_str(), &e.to_string());
         // After the line, not before it: the user reads why the run stopped
         // without waiting on a request about it.
         report_failure_before_scan(&repo_path, e.as_ref()).await;

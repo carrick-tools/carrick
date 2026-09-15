@@ -56,11 +56,7 @@ pub fn run_id() -> &'static str {
 ///    created the file layer is skipped and only the terminal layer is active
 ///    — in that case the run preamble only reaches stderr.
 pub fn init(verbose: bool) {
-    let terminal_filter = if verbose {
-        EnvFilter::new("debug")
-    } else {
-        EnvFilter::new("info")
-    };
+    let terminal_filter = EnvFilter::new(terminal_filter(verbose));
 
     let terminal_layer = fmt::layer()
         .with_writer(std::io::stderr)
@@ -146,6 +142,26 @@ pub fn init(verbose: bool) {
 /// counts, timings and code identifiers. The terminal layer is unchanged; it
 /// has its own filter and shows `info` (or `debug` with `--verbose`).
 const FILE_FILTER: &str = "info,carrick=debug";
+
+/// The target every per-attempt retry line is logged under.
+///
+/// One line per attempt is what a log file is for and what a terminal is not:
+/// a scan under model pressure printed dozens of them, each naming transport
+/// details (`Gateway status 429 with non-envelope body ...`) a package user
+/// cannot act on (carrick#1103). The file keeps them at the level they were
+/// logged at; the terminal gets one aggregated line instead
+/// ([`crate::agent_service`]'s retry count), and `--verbose` shows them again.
+pub const RETRY_TARGET: &str = "carrick::retry";
+
+/// What the terminal layer shows: `info` (or `debug` with `--verbose`),
+/// without the per-attempt retry lines unless verbose.
+fn terminal_filter(verbose: bool) -> String {
+    if verbose {
+        "debug".to_string()
+    } else {
+        format!("info,{RETRY_TARGET}=off")
+    }
+}
 
 /// What a line may carry off the machine, and how it is rewritten until it
 /// carries nothing else (carrick#1063, carrick#1098).
@@ -1110,6 +1126,50 @@ mod tests {
         assert!(log.contains("theirs at info"), "{log}");
         assert!(!log.contains("theirs at debug"), "{log}");
         assert!(!log.contains("theirs too"), "{log}");
+    }
+
+    /// A per-attempt retry line reaches the file at warn and never the
+    /// terminal, unless the run is verbose (carrick#1103).
+    #[test]
+    fn retry_lines_go_to_the_file_and_not_the_terminal() {
+        let terminal = Shared::default();
+        let verbose_terminal = Shared::default();
+        let file = Shared::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .with_writer(terminal.clone())
+                    .with_ansi(false)
+                    .with_filter(EnvFilter::new(terminal_filter(false))),
+            )
+            .with(
+                fmt::layer()
+                    .with_writer(verbose_terminal.clone())
+                    .with_ansi(false)
+                    .with_filter(EnvFilter::new(terminal_filter(true))),
+            )
+            .with(
+                fmt::layer()
+                    .with_writer(file.clone())
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_filter(EnvFilter::new(FILE_FILTER)),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: RETRY_TARGET, "Gateway status 429, attempt 2/5");
+            tracing::info!(target: "carrick::agent_service", "Carrick Cloud did not answer, retrying (1 so far)");
+        });
+
+        let terminal = terminal.text();
+        assert!(!terminal.contains("attempt 2/5"), "{terminal}");
+        assert!(terminal.contains("retrying (1 so far)"), "{terminal}");
+        assert!(verbose_terminal.text().contains("attempt 2/5"));
+        let file = file.text();
+        assert!(
+            file.contains("WARN") && file.contains("attempt 2/5"),
+            "{file}"
+        );
     }
 
     /// A writer the test can read back.

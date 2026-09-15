@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// The lowest a route's limit falls. One would serialise a whole stage behind
 /// its slowest request; two keeps a stage moving while putting almost nothing
@@ -155,11 +155,11 @@ impl AdaptiveLimit {
             "model requests: limit raised after a run of successes"
         );
         if limit == self.max {
-            info!(
+            crate::progress::announce(&format!(
                 "model capacity back: {} at {} requests at a time",
                 route_label(&self.route),
                 limit
-            );
+            ));
         }
         // The limit rose on top of whatever release follows, so more than one
         // waiter may now fit; the ones that do not go back to waiting.
@@ -197,11 +197,13 @@ impl AdaptiveLimit {
             "model requests: limit cut after a capacity refusal"
         );
         if announce {
-            info!(
+            // Announced rather than only logged, so a scan the indexer runs
+            // as a child still reaches the person watching it (carrick#1122).
+            crate::progress::announce(&format!(
                 "model busy: slowing {} to {} requests at a time",
                 route_label(&self.route),
                 after
-            );
+            ));
         }
     }
 }
@@ -417,7 +419,9 @@ impl RatePacer {
             "model requests: pace cut after a gateway throttle"
         );
         if announce {
-            info!("gateway busy: pacing model requests to {after} a second");
+            crate::progress::announce(&format!(
+                "gateway busy: pacing model requests to {after} a second"
+            ));
         }
     }
 }
