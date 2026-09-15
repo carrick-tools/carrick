@@ -161,26 +161,65 @@ pub struct GraphqlProducerHints {
     /// The service's SDL scan roots (its `directory` + `include` roots),
     /// used to gate the don't-skip routing to schema-co-located files.
     pub scan_roots: Vec<PathBuf>,
+    /// One line per root field of the schemas the service names in
+    /// `graphqlSchemas` that `lines` does not already hold, in the same
+    /// format. Given only to the files that build a schema in code
+    /// ([`Self::schema_builder_lines`], carrick#1157).
+    pub declared_lines: Vec<String>,
 }
 
 impl GraphqlProducerHints {
     /// Build the producer hint context for a service: run the (cheap,
     /// deterministic) SDL scan over `scan_roots` + `service_files` and format
     /// each producer field as a hint line. `scan_roots` are retained for the
-    /// co-location check in the don't-skip routing.
-    pub fn collect(scan_roots: Vec<PathBuf>, service_files: &[PathBuf]) -> Self {
+    /// co-location check in the don't-skip routing. `declared_schemas` are
+    /// the files the service's `graphqlSchemas` resolved to.
+    pub fn collect(
+        scan_roots: Vec<PathBuf>,
+        declared_schemas: &[PathBuf],
+        service_files: &[PathBuf],
+    ) -> Self {
         // Declared schemas (`graphqlSchemas`) are deliberately NOT in the hint
         // list: the hints are part of every analysed file's prompt, so adding
         // them would re-ask the model for the whole service the first time the
         // setting appears, and the setting is meant to take effect on a free
-        // rescan. Their producer rows come from `scan_repo` in the engine.
+        // rescan. Their producer rows come from `scan_repo` in the engine, and
+        // their lines reach only the files that build the schema in code.
         let extraction = scan_repo(&scan_roots, &[], service_files);
-        let lines = extraction
+        let lines: Vec<String> = extraction
             .producers
             .iter()
             .filter_map(Self::format_producer)
             .collect();
-        Self { lines, scan_roots }
+        let mut seen: HashSet<String> = lines.iter().cloned().collect();
+        let declared_lines = scan_repo(&[], declared_schemas, &[])
+            .producers
+            .iter()
+            .filter_map(Self::format_producer)
+            .filter(|line| seen.insert(line.clone()))
+            .collect();
+        Self {
+            lines,
+            scan_roots,
+            declared_lines,
+        }
+    }
+
+    /// Whether the service has any schema field a resolver could be linked
+    /// to, walked or declared.
+    pub fn has_schema_fields(&self) -> bool {
+        !self.lines.is_empty() || !self.declared_lines.is_empty()
+    }
+
+    /// The field list for a file that builds the schema in code: the walked
+    /// fields, then the declared ones. A code-first schema's fields are
+    /// usually only in a printed schema the service declares.
+    pub fn schema_builder_lines(&self) -> Vec<String> {
+        self.lines
+            .iter()
+            .chain(&self.declared_lines)
+            .cloned()
+            .collect()
     }
 
     /// Format a single producer op as `"{kind} {field}: {sdl_type}"`
@@ -1659,6 +1698,7 @@ mod tests {
         let hints = GraphqlProducerHints {
             lines: vec!["query order: Order".to_string()],
             scan_roots: vec![PathBuf::from("/repo/services/orders")],
+            declared_lines: vec![],
         };
         assert!(hints.file_within_scan_roots(Path::new("/repo/services/orders/src/resolvers.ts")));
         assert!(!hints.file_within_scan_roots(Path::new("/repo/services/billing/src/handlers.ts")));
@@ -1688,7 +1728,7 @@ mod tests {
         )
         .unwrap();
 
-        let hints = GraphqlProducerHints::collect(vec![dir.clone()], &[]);
+        let hints = GraphqlProducerHints::collect(vec![dir.clone()], &[], &[]);
         assert_eq!(hints.lines, vec!["query order: Order".to_string()]);
         assert!(!hints.is_empty());
         assert!(hints.file_within_scan_roots(&dir.join("resolvers.ts")));
@@ -1696,10 +1736,55 @@ mod tests {
         // A scan root with no SDL produces no hints (the no-op path).
         let empty_root = dir.join("nested-empty");
         std::fs::create_dir_all(&empty_root).unwrap();
-        let empty = GraphqlProducerHints::collect(vec![empty_root], &[]);
+        let empty = GraphqlProducerHints::collect(vec![empty_root], &[], &[]);
         assert!(empty.is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// carrick#1157: a declared schema's fields stay out of the lines every
+    /// file gets, and reach the schema-builder list once each, after the
+    /// walked fields.
+    #[test]
+    fn declared_schema_fields_reach_only_the_schema_builder_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("api");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("schema.graphql"),
+            "type Order { id: ID! }\ntype Query { order(id: ID!): Order }\n",
+        )
+        .unwrap();
+        let printed = tmp.path().join("printed.graphql");
+        std::fs::write(
+            &printed,
+            "type Order { id: ID! }\ntype Query {\n  order(id: ID!): Order\n  orders: [Order!]!\n}\ntype Mutation { cancelOrder(id: ID!): Boolean! }\n",
+        )
+        .unwrap();
+
+        let hints = GraphqlProducerHints::collect(vec![root], &[printed], &[]);
+
+        assert_eq!(hints.lines, vec!["query order: Order".to_string()]);
+        assert_eq!(
+            hints.schema_builder_lines(),
+            vec![
+                "query order: Order".to_string(),
+                "query orders: [Order!]!".to_string(),
+                "mutation cancelOrder: Boolean!".to_string(),
+            ]
+        );
+        assert!(hints.has_schema_fields());
+
+        let declared_only = GraphqlProducerHints::collect(
+            vec![tmp.path().join("missing")],
+            &[tmp.path().join("printed.graphql")],
+            &[],
+        );
+        assert!(
+            declared_only.is_empty(),
+            "no walked field reaches every file"
+        );
+        assert!(declared_only.has_schema_fields());
     }
 
     /// Document consumers carry no SDL type, so their anchor is left unset (the

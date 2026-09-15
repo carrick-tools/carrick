@@ -1340,6 +1340,17 @@ impl FileOrchestrator {
         // work list of files that actually need an LLM call. Zero-cost skips are recorded here.
         let mut pending: Vec<PendingFile> = Vec::new();
         let mut deferred_zero_candidates: Vec<DeferredZeroCandidate> = Vec::new();
+        // carrick#1157: which files build a GraphQL schema in code, read only
+        // when the service has schema fields a resolver could be linked to and
+        // detection named packages to trace values to. Aliases resolve here:
+        // nothing cached was keyed on this reading before it existed.
+        let mut schema_builder_reader = (graphql_producer_hints.has_schema_fields()
+            && !framework_detection.data_fetchers.is_empty())
+        .then(|| {
+            crate::graphql_schema_builder::PackageValueReader::new(Some(
+                WorkspaceIndex::build_with_aliases(repo_root, None),
+            ))
+        });
         // Route tables that bind a path to an imported handler (#580 part b).
         // Collected here, where the file's content is already in hand, and
         // resolved after the whole pass: the endpoints belong to the CONTROLLER
@@ -1570,6 +1581,34 @@ impl FileOrchestrator {
             let is_graphql_consumer_file = !graphql_consumer_hints.is_empty()
                 && graphql_consumer_hints.file_has_hint(file_path);
 
+            // GraphQL schema built in code (carrick#1157): a module that adds
+            // fields to a schema builder calls through a value that came out of
+            // a detected package, usually imported from the module that
+            // created it, and often exports nothing and raises no candidate.
+            // Rescued, and given the declared schema's fields as well as the
+            // walked ones, so the model can link a field to where it is
+            // resolved. Detection decides which packages count; no library is
+            // named here.
+            let is_graphql_schema_builder_file =
+                schema_builder_reader.as_mut().is_some_and(|reader| {
+                    crate::swc_scanner::parse_standalone_module(file_path, &content).is_some_and(
+                        |(_, module)| {
+                            reader.calls_package_value_at_module_scope(
+                                file_path,
+                                &module,
+                                &framework_detection.data_fetchers,
+                            )
+                        },
+                    )
+                });
+            if is_graphql_schema_builder_file {
+                debug!(
+                    "GraphQL schema-builder file, given the declared schema fields: {} [{} HTTP candidate(s)]",
+                    path_str,
+                    http_candidates.len()
+                );
+            }
+
             // STEP 2: Check Relevance - if there are no candidates for a routed
             // protocol, SKIP the (expensive) LLM call. File-based route and
             // route-descriptor endpoints are still recorded: they're derived
@@ -1618,6 +1657,13 @@ impl FileOrchestrator {
                     // file content to emit `graphql_operations`.
                     debug!(
                         "Routed GraphQL resolver file (no HTTP candidates): {}",
+                        path_str
+                    );
+                } else if is_graphql_schema_builder_file {
+                    // Fall through with empty HTTP candidates: the producer
+                    // section lists the schema's fields (carrick#1157).
+                    debug!(
+                        "Routed GraphQL schema-builder file (no HTTP candidates): {}",
                         path_str
                     );
                 } else if is_graphql_consumer_file {
@@ -1703,7 +1749,11 @@ impl FileOrchestrator {
                 route_endpoints,
                 descriptor_endpoints,
                 decorator_endpoints,
-                graphql_producer_hints: graphql_producer_hints.lines.clone(),
+                graphql_producer_hints: if is_graphql_schema_builder_file {
+                    graphql_producer_hints.schema_builder_lines()
+                } else {
+                    graphql_producer_hints.lines.clone()
+                },
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: Vec::new(),
                 wrapper_request_shape: None,
