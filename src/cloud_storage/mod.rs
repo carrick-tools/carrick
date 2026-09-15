@@ -984,6 +984,27 @@ pub trait CloudStorage {
     /// default body puts no `Sync` bound on generic callers (carrick#956).
     fn keep_served_generation(&self, _data: &CloudRepoData) {}
 
+    /// Ask the run's final write (the one [`Self::upload_repo_data`] gets with
+    /// `final_in_run`) to name the services this run leaves pending, and say
+    /// whether it will.
+    ///
+    /// A laptop scan's final write closes the scan, and the cloud stamps the
+    /// repo's first index complete on it. A run that still owes some services
+    /// their model analysis must not be stamped, or the re-run that fills them
+    /// in is metered under the monthly pool instead of the first-index ceiling
+    /// (carrick-cloud#892). `true` means this backend will carry
+    /// `pending_services` on that write and the cloud said at `start-scan` it
+    /// reads them. `false` means the caller must not mark any write final and
+    /// closes the scan with [`Self::report_scan_failed`] instead, which frees
+    /// the slot and stamps nothing.
+    ///
+    /// The default is `false`: only a laptop run against a cloud that answered
+    /// `accepts_pending_services` has a first index to keep open. Not async,
+    /// so the default puts no `Sync` bound on generic callers (carrick#956).
+    fn name_pending_on_final_write(&self, _pending_services: &[String]) -> bool {
+        false
+    }
+
     /// Whether this backend can store more than one service per git repo
     /// without collision. The production index keys on
     /// (workspace, project, repo) only — no service discriminator — so real

@@ -287,6 +287,16 @@ pub struct AwsStorage {
     /// in a scan does (carrick#1067). Absent on a clone with no GitHub remote,
     /// which is the one case the check cannot be made in.
     repo_full_name: std::sync::OnceLock<String>,
+    /// `start-scan` answered `accepts_pending_services`: the cloud reads
+    /// `pending_services` on the final write and leaves a first index open when
+    /// it is non-empty (carrick-cloud#892). False on the CI path and on a cloud
+    /// that predates the flag, where the engine closes a partial run with
+    /// `scan-failed` instead.
+    accepts_pending_services: std::sync::atomic::AtomicBool,
+    /// The services this run leaves pending, set by the engine before the
+    /// uploads through [`CloudStorage::name_pending_on_final_write`] and sent
+    /// only on the write marked final.
+    pending_services: std::sync::Mutex<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -370,6 +380,15 @@ struct LambdaRequest {
     /// only this one carries it; absent, the slot falls to its TTL.
     #[serde(skip_serializing_if = "Option::is_none")]
     scan_final: Option<bool>,
+    /// The services this run left without their model analysis after its
+    /// in-run retry, on the write carrying `scan_final` and nowhere else
+    /// (carrick-cloud#892). A non-empty list closes the run but leaves the
+    /// repo's first index open, so the re-run stays on the first-index
+    /// ceiling. Sent only when `start-scan` answered
+    /// `accepts_pending_services`: a cloud without it would ignore the list and
+    /// stamp the first index done on this very write. Omitted when empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_services: Option<Vec<String>>,
 }
 
 /// `start-scan`: the first thing a laptop run does, before a single model
@@ -406,6 +425,11 @@ struct StartScanResponse {
     multi_service: bool,
     #[serde(default)]
     allowance_sentence: Option<String>,
+    /// The final write may name pending services (carrick-cloud#892). Additive
+    /// on the `/0` tag; absent on every cloud deployed before it, which is
+    /// what the default reads as.
+    #[serde(default)]
+    accepts_pending_services: bool,
 }
 
 /// The tag `start-scan` must answer under. Anything else is a cloud that has
@@ -712,6 +736,8 @@ impl AwsStorage {
             scan_id: std::sync::OnceLock::new(),
             dirty: std::sync::atomic::AtomicBool::new(false),
             multi_service: std::sync::atomic::AtomicBool::new(false),
+            accepts_pending_services: std::sync::atomic::AtomicBool::new(false),
+            pending_services: std::sync::Mutex::new(Vec::new()),
             force_reindex,
             authorized_repo: std::sync::OnceLock::new(),
             repo_full_name: std::sync::OnceLock::new(),
@@ -744,6 +770,21 @@ impl AwsStorage {
     /// where the field is omitted entirely.
     fn scan_id(&self) -> Option<String> {
         self.scan_id.get().cloned()
+    }
+
+    /// The pending list for a write action: the engine's list on the final
+    /// write when it is non-empty, `None` everywhere else. The engine only
+    /// sets one after [`CloudStorage::name_pending_on_final_write`] said this
+    /// cloud reads it.
+    fn pending_services_on(&self, final_in_run: bool) -> Option<Vec<String>> {
+        if !final_in_run {
+            return None;
+        }
+        let pending = self
+            .pending_services
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (!pending.is_empty()).then(|| pending.clone())
     }
 
     /// A copy of `data` under the repository name this run was authorised to
@@ -1150,6 +1191,7 @@ impl AwsStorage {
             scan_id: self.scan_id(),
             unanalysed_files: self.unanalysed_files(data),
             scan_final: final_in_run.then_some(true),
+            pending_services: self.pending_services_on(final_in_run),
         };
 
         let response: WriteActionResponse = self.call_lambda(&request).await?;
@@ -1193,6 +1235,10 @@ impl AwsStorage {
         }
         self.multi_service
             .store(response.multi_service, std::sync::atomic::Ordering::Relaxed);
+        self.accepts_pending_services.store(
+            response.accepts_pending_services,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.dirty
             .store(run.dirty, std::sync::atomic::Ordering::Relaxed);
         // `set` rather than an assignment: one run opens one scan, and a
@@ -1366,6 +1412,7 @@ impl CloudStorage for AwsStorage {
             // check.
             unanalysed_files: None,
             scan_final: None,
+            pending_services: None,
         };
 
         let lambda_response: LambdaResponse = self.call_lambda(&check_request).await?;
@@ -1402,6 +1449,7 @@ impl CloudStorage for AwsStorage {
                     scan_id: self.scan_id(),
                     unanalysed_files: self.unanalysed_files(data),
                     scan_final: final_in_run.then_some(true),
+                    pending_services: self.pending_services_on(final_in_run),
                 };
 
                 let complete_response: WriteActionResponse =
@@ -1455,6 +1503,7 @@ impl CloudStorage for AwsStorage {
             scan_id: None,
             unanalysed_files: None,
             scan_final: None,
+            pending_services: None,
         };
 
         let lambda_response: LambdaResponse = self.call_lambda(&request).await?;
@@ -1813,6 +1862,7 @@ impl CloudStorage for AwsStorage {
             scan_id: None,
             unanalysed_files: None,
             scan_final: None,
+            pending_services: None,
         };
 
         match self.call_lambda::<LambdaResponse>(&request).await {
@@ -1831,6 +1881,24 @@ impl CloudStorage for AwsStorage {
             }
             Err(e) => Err(e),
         }
+    }
+
+    fn name_pending_on_final_write(&self, pending_services: &[String]) -> bool {
+        // Read the flag, never guess it: a cloud that did not answer it stamps
+        // a first index done on the final write, and nothing unstamps it. A
+        // run with no scan (CI) has no first index to keep open.
+        if self.scan_id.get().is_none()
+            || !self
+                .accepts_pending_services
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        *self
+            .pending_services
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = pending_services.to_vec();
+        true
     }
 
     fn supports_multi_service(&self) -> bool {
@@ -1902,6 +1970,7 @@ mod tests {
             scan_id: None,
             unanalysed_files: None,
             scan_final: None,
+            pending_services: None,
         };
         let json = serde_json::to_string(&bare).unwrap();
         assert!(!json.contains("wantsPayloadUrl"));
@@ -1999,6 +2068,7 @@ mod tests {
             scan_id: None,
             unanalysed_files: None,
             scan_final: None,
+            pending_services: None,
         };
         let json = serde_json::to_string(&inline).unwrap();
         assert!(!json.contains("payloadSha256"));
@@ -2040,6 +2110,7 @@ mod tests {
             scan_id: None,
             unanalysed_files: None,
             scan_final: None,
+            pending_services: None,
         };
         let json = serde_json::to_string(&cached).unwrap();
         assert!(
@@ -2512,9 +2583,15 @@ mod tests {
             scan_id: None,
             unanalysed_files: None,
             scan_final: None,
+            pending_services: None,
         };
         let json = serde_json::to_string(&ci).unwrap();
-        for field in ["scan_id", "unanalysed_files", "scan_final"] {
+        for field in [
+            "scan_id",
+            "unanalysed_files",
+            "scan_final",
+            "pending_services",
+        ] {
             assert!(!json.contains(field), "{field} must be omitted: {json}");
         }
 
@@ -2525,11 +2602,13 @@ mod tests {
                 reason: "model_error".to_string(),
             }]),
             scan_final: Some(true),
+            pending_services: Some(vec!["billing".to_string()]),
             ..ci
         };
         let v = serde_json::to_value(&laptop).unwrap();
         assert_eq!(v["scan_id"], "scan_01J");
         assert_eq!(v["scan_final"], true);
+        assert_eq!(v["pending_services"], serde_json::json!(["billing"]));
         assert_eq!(v["unanalysed_files"][0]["path"], "src/a.ts");
         assert_eq!(v["unanalysed_files"][0]["reason"], "model_error");
     }
@@ -3066,6 +3145,90 @@ mod tests {
     /// A service that is not the last one in the run must not release the
     /// slot: the rest of the run would then be unprotected, and a second
     /// laptop could start scanning the same repo halfway through this one.
+    fn start_scan_ok(accepts_pending_services: Option<bool>) -> (u16, String) {
+        let mut body = serde_json::json!({
+            "schema": "carrick.start-scan/0",
+            "scan_id": "scan_01J",
+            "project_id": "proj_1",
+            "project_slug": "payments",
+            "indexed_services": [],
+            "multi_service": true,
+            "allowance_sentence": null
+        });
+        if let Some(flag) = accepts_pending_services {
+            body["accepts_pending_services"] = serde_json::json!(flag);
+        }
+        (200, body.to_string())
+    }
+
+    /// carrick-cloud#892: a cloud that said at `start-scan` it reads the list
+    /// gets the run's pending services on the final write, and only there.
+    #[tokio::test]
+    async fn a_cloud_that_reads_pending_services_gets_them_on_the_final_write_only() {
+        let (storage, server) = bearer_storage(vec![
+            start_scan_ok(Some(true)),
+            check_ok(),
+            (200, serde_json::json!({ "success": true }).to_string()),
+            check_ok(),
+            (200, serde_json::json!({ "success": true }).to_string()),
+        ]);
+        storage.begin_run(&run_context(false)).await.unwrap();
+        assert!(storage.name_pending_on_final_write(&["billing".to_string()]));
+
+        storage.upload_repo_data(&blob(), false).await.unwrap();
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        let first = body_of(&requests[2]);
+        assert!(
+            first.get("pending_services").is_none(),
+            "a write that does not close the run names nothing: {first}"
+        );
+        let last = body_of(&requests[4]);
+        assert_eq!(last["scan_final"], true);
+        assert_eq!(last["pending_services"], serde_json::json!(["billing"]));
+    }
+
+    /// The near miss that keeps a partial first index open on a cloud deployed
+    /// before the flag: that cloud stamps the first index done on the final
+    /// write whatever the write says, so the storage refuses to carry the list
+    /// and the engine closes the run with `scan-failed` instead. An explicit
+    /// `false` reads the same as absent.
+    #[tokio::test]
+    async fn a_cloud_that_does_not_answer_the_flag_is_never_sent_pending_services() {
+        for flag in [None, Some(false)] {
+            let (storage, server) = bearer_storage(vec![
+                start_scan_ok(flag),
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ]);
+            storage.begin_run(&run_context(false)).await.unwrap();
+            assert!(!storage.name_pending_on_final_write(&["billing".to_string()]));
+
+            storage.upload_repo_data(&blob(), true).await.unwrap();
+
+            let last = body_of(&server.join().unwrap()[2]);
+            assert_eq!(last["scan_final"], true);
+            assert!(last.get("pending_services").is_none(), "{flag:?}: {last}");
+        }
+    }
+
+    /// An empty list is a complete run: no field is sent, and the cloud stamps.
+    #[tokio::test]
+    async fn an_empty_pending_list_sends_no_field() {
+        let (storage, server) = bearer_storage(vec![
+            start_scan_ok(Some(true)),
+            check_ok(),
+            (200, serde_json::json!({ "success": true }).to_string()),
+        ]);
+        storage.begin_run(&run_context(false)).await.unwrap();
+        assert!(storage.name_pending_on_final_write(&[]));
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+        let last = body_of(&server.join().unwrap()[2]);
+        assert!(last.get("pending_services").is_none(), "{last}");
+    }
+
     #[tokio::test]
     async fn a_write_that_is_not_the_last_leaves_the_slot_held() {
         let (storage, server) = bearer_storage_in_scan(

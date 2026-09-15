@@ -1083,6 +1083,16 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     //     it is printed, and the run exits non-zero naming them at the very end
     //     (carrick#1067).
     let mut unconfirmed_uploads: Vec<UnconfirmedUpload> = Vec::new();
+    // The services left pending, the same set `incomplete` reads, and whether
+    // this run's last write closed the scan (carrick-cloud#892). A budget
+    // refusal is in it: a first index whose ceiling is spent stays open, so a
+    // raised per-workspace ceiling still governs its re-run.
+    let first_index_open: Vec<String> = runs
+        .iter()
+        .filter(|run| run.owed.thins_the_index())
+        .map(|run| run.label.clone())
+        .collect();
+    let mut closed_by_final_write = false;
     if let Some(mut payloads) = upload_payloads {
         crate::cloud_storage::attach_compat_verdicts(
             &mut payloads,
@@ -1112,13 +1122,17 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         for payload in &mut payloads {
             enforce_payload_size_limit(payload, staging_available);
         }
-        // A run that leaves a service incomplete does not close its scan with
-        // the last write: the cloud stamps a repo's first index finished on
-        // that write, and the re-run that fills the service in would then be
-        // metered as an ordinary scan (carrick-cloud#892). The fail marker
-        // after the summary closes it instead.
+        // The cloud stamps a repo's first index finished on the write that
+        // closes the scan, and the re-run that fills a pending service in
+        // would then be metered as an ordinary scan (carrick-cloud#892). So a
+        // run that leaves one pending closes with its last write only when
+        // that write can name them to a cloud that reads the list; otherwise
+        // no write is final and the fail marker after the summary closes it.
+        let closes_run =
+            first_index_open.is_empty() || storage.name_pending_on_final_write(&first_index_open);
+        closed_by_final_write = closes_run && !payloads.is_empty();
         unconfirmed_uploads =
-            upload_service_payloads(storage, &payloads, no_cache, !incomplete).await;
+            upload_service_payloads(storage, &payloads, no_cache, closes_run).await;
     }
 
     let topology = crate::findings::Topology {
@@ -1212,16 +1226,20 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             .map(|(service, work)| format!("{service} ({})", work.describe()))
             .collect();
         let reason = format!("pending model analysis: {}", reason.join(", "));
-        // The laptop's scan is closed here rather than by its last write (see
-        // step 6b): the marker releases the slot and leaves the repo's first
-        // index open. The run itself succeeded at everything it could do, so
-        // it exits 0 and the local index is built from what landed.
-        storage
-            .report_scan_failed(
-                crate::scan_stage::current().as_str(),
-                &fail_reason(&reason, &logging::Redaction::for_run(Some(repo_path))),
-            )
-            .await;
+        // A laptop scan whose last write could not close it (see step 6b: a
+        // cloud that does not read `pending_services`, or nothing left to
+        // upload) is closed here: the marker releases the slot and leaves the
+        // repo's first index open. Either way the run succeeded at everything
+        // it could do, so it exits 0 and the local index is built from what
+        // landed.
+        if !closed_by_final_write {
+            storage
+                .report_scan_failed(
+                    crate::scan_stage::current().as_str(),
+                    &fail_reason(&reason, &logging::Redaction::for_run(Some(repo_path))),
+                )
+                .await;
+        }
         // CI has no slot and no local index. Its exit code is the only place
         // a stale service can show, as it was when one lost file failed the
         // whole run; now the rest of the run has landed first. The partial
