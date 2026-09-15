@@ -365,6 +365,7 @@ pub(crate) fn derive_capture_anchors(
                 alias: alias.to_string(),
                 type_text: (*text).to_string(),
                 anchor_origin: AnchorOrigin::DeterministicInfer,
+                source_file: Some(repo_relative(&request.file_path, repo_root)),
             });
             continue;
         }
@@ -375,6 +376,8 @@ pub(crate) fn derive_capture_anchors(
                 alias: alias.to_string(),
                 type_text: "unknown".to_string(),
                 anchor_origin: AnchorOrigin::DeterministicInfer,
+                // `unknown` names nothing, so no file needs to join the program.
+                source_file: None,
             });
             continue;
         }
@@ -418,6 +421,7 @@ pub(crate) fn derive_capture_anchors(
             alias: alias.clone(),
             type_text: type_text.clone(),
             anchor_origin: AnchorOrigin::LlmSymbol,
+            source_file: None,
         });
     }
 
@@ -646,6 +650,7 @@ pub(crate) fn backfill_anchors(
                     alias: alias.to_string(),
                     type_text: texts[alias].clone(),
                     anchor_origin: AnchorOrigin::AnchorBackfill,
+                    source_file: anchor.source_file().map(str::to_string),
                 }
             } else {
                 anchor.clone()
@@ -1983,10 +1988,14 @@ mod tests {
                 alias,
                 type_text,
                 anchor_origin,
+                source_file,
             } => {
                 assert_eq!(alias, "Pub_Resolved");
                 assert_eq!(type_text, "{ time: string; item: string; }");
                 assert_eq!(*anchor_origin, AnchorOrigin::DeterministicInfer);
+                // #1165: the file the text was printed from rides along, so
+                // the capture's program declares the names the text prints.
+                assert_eq!(source_file.as_deref(), Some("src/bus.ts"));
             }
             other => panic!(
                 "expected literal anchor from inferred text, got {:?}",
@@ -2024,6 +2033,8 @@ mod tests {
             capture_failure_reason: failure.map(str::to_string),
             top_type_at_self_check: failure.is_some(),
             any_provenance: Vec::new(),
+            dangling_specifiers: Vec::new(),
+            undeclared_names: Vec::new(),
         }
     }
 
@@ -2051,6 +2062,7 @@ mod tests {
                 alias: "D_literal_demoted".to_string(),
                 type_text: "{ ok: boolean }".to_string(),
                 anchor_origin: AnchorOrigin::DeterministicInfer,
+                source_file: None,
             },
         ];
         let records = vec![
@@ -2098,10 +2110,16 @@ mod tests {
                 alias,
                 type_text,
                 anchor_origin,
+                source_file,
             } => {
                 assert_eq!(alias, "A_demoted");
                 assert_eq!(type_text, "{ id: string; read: boolean; }");
                 assert_eq!(*anchor_origin, AnchorOrigin::AnchorBackfill);
+                assert_eq!(
+                    source_file.as_deref(),
+                    Some("src/routes.ts"),
+                    "the backfill keeps the replaced anchor's file"
+                );
             }
             other => panic!("demoted alias must become a backfill literal, got {other:?}"),
         }
@@ -3002,6 +3020,7 @@ mod tests {
                 alias: consumer_alias.clone(),
                 type_text: "{ status: string }".to_string(),
                 anchor_origin: AnchorOrigin::LlmSymbol,
+                source_file: None,
             }],
             &HashMap::new(),
             None,

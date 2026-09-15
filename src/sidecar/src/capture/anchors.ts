@@ -12,7 +12,7 @@ import type {
   InferAnchorRequest,
   SymbolAnchorRequest,
 } from './api.js';
-import { printTypeForDestination } from './node-builder.js';
+import { printTypeForDestination, undeclaredNamesIn } from './node-builder.js';
 import { typeIsOrContainsMachinery } from './machinery.js';
 import type { UnresolvedAtAnchor } from './deep-walk.js';
 import { unresolvedAtAnchor } from './unresolved.js';
@@ -45,6 +45,12 @@ export interface ResolvedAnchor {
    * backfillable; the reason rides `self_check_detail` instead.
    */
   abstainReason?: string;
+  /**
+   * carrick#1165: identifiers the alias text names (a literal anchor's text
+   * or a node-builder print) that nothing in the producer's program declares.
+   * Recorded on the capture record as `undeclared_names`.
+   */
+  undeclaredNames?: string[];
   /**
    * carrick#1164: member paths the SOURCE program could not resolve, and the
    * unresolved imports the anchor's file reaches. Printed into the surface
@@ -118,6 +124,15 @@ export function resolveAnchor(
     const siblingSpec = bareIdentifier
       ? args.siblingSymbolSpecs?.get(text)
       : undefined;
+    // carrick#1165: literal text is printed elsewhere (the v1 walk) and can
+    // name a type by a bare identifier that nothing in the program declares
+    // (a generated model that was never generated). The stub then self-checks
+    // such a name as an error placeholder, which no walk flags. A name a
+    // sibling symbol anchor imports is resolved by that import.
+    const undeclaredNames =
+      siblingSpec || !args.placeholder
+        ? []
+        : undeclaredNamesInText(text, program, args.placeholder);
     return {
       request,
       aliasText: siblingSpec ? `import('${siblingSpec}').${text}` : text,
@@ -127,6 +142,7 @@ export function resolveAnchor(
       // them at this tier so the legacy dependence stays measurable and
       // ratchetable. Demotions are distinguished by failureReason.
       serialization: 'structural_fallback',
+      ...(undeclaredNames.length > 0 ? { undeclaredNames } : {}),
     };
   }
 
@@ -400,8 +416,26 @@ function finishInferAnchor(
     aliasText: printed.text,
     serialization: 'node_builder',
     ...(reaimNote ? { reaimNote } : {}),
+    ...(printed.undeclaredNames ? { undeclaredNames: printed.undeclaredNames } : {}),
     ...(unresolved ? { unresolved } : {}),
   };
+}
+
+/** `undeclaredNamesIn` over type text rather than a built node. */
+function undeclaredNamesInText(
+  text: string,
+  program: ts.Program,
+  destination: ts.Node
+): string[] {
+  const parsed = ts.createSourceFile(
+    'literal-anchor.ts',
+    `type __LiteralAnchor = ${text};`,
+    ts.ScriptTarget.Latest,
+    true
+  );
+  const statement = parsed.statements[0];
+  if (!statement || !ts.isTypeAliasDeclaration(statement)) return [];
+  return undeclaredNamesIn(statement.type, program, destination);
 }
 
 /**

@@ -4974,7 +4974,8 @@ fn resolve_per_endpoint_definitions(
     // the ones whose `type_state` is Unknown and therefore print no definition
     // at all: "no type here, and here is why" is the answer a reader needs, and
     // it is exactly the entry the definition resolution below skips.
-    stamp_capture_provenance(manifest, stub_dir);
+    let records = read_capture_records(stub_dir);
+    stamp_capture_provenance(manifest, &records);
 
     let aliases = aliases_to_resolve(manifest);
 
@@ -4989,7 +4990,7 @@ fn resolve_per_endpoint_definitions(
 
     match sidecar.resolve_definitions(&stub_dir.to_string_lossy(), &aliases) {
         Ok(resolved) => {
-            let count = apply_resolved_definitions(manifest, resolved);
+            let count = apply_resolved_definitions(manifest, resolved, &records);
             debug!("Resolved {} type definition(s)", count);
         }
         Err(e) => {
@@ -5040,6 +5041,13 @@ fn aliases_to_resolve(manifest: &[TypeManifestEntry]) -> Vec<String> {
 ///    non-answer is not worth publishing whoever asked for it, and the readers
 ///    that count typed operations count `resolved_definition.is_some()`
 ///    (carrick#852).
+///
+///    Nor is an answer whose capture record says it names something that does
+///    not resolve (carrick#1165): an identifier nothing declares, a declaration
+///    whose own import is missing, or a top type with no pinned external to
+///    heal it. Those print as a confident name (`Row`,
+///    `Shape<Options>`) where the truth is that the stub cannot say what the
+///    name is, and publishing them counts the operation typed.
 ///  - **does it settle the state?** Only a shape with no disqualifying top type
 ///    anywhere in it, the same notion the check phase uses. That promotion is
 ///    scoped to entries the v1 side abstained on; `type_state` reflecting the
@@ -5050,6 +5058,7 @@ fn aliases_to_resolve(manifest: &[TypeManifestEntry]) -> Vec<String> {
 fn apply_resolved_definitions(
     manifest: &mut [TypeManifestEntry],
     resolved: Vec<crate::services::type_sidecar::ResolvedDefinitionResult>,
+    records: &HashMap<String, crate::services::type_sidecar::CaptureAliasRecord>,
 ) -> usize {
     let lookup: HashMap<String, _> = resolved
         .into_iter()
@@ -5079,6 +5088,16 @@ fn apply_resolved_definitions(
         {
             continue;
         }
+        if let Some(reason) = records
+            .get(&entry.type_alias)
+            .and_then(|record| record.unpublishable_reason())
+        {
+            debug!(
+                "Not publishing the capture's answer for {}: {reason}",
+                entry.type_alias
+            );
+            continue;
+        }
 
         entry.resolved_definition = Some(r.definition.clone());
         entry.expanded_definition = Some(r.expanded.clone());
@@ -5093,18 +5112,19 @@ fn apply_resolved_definitions(
     lookup.len()
 }
 
-/// Join the capture self-check's `any`/`unknown` findings onto the manifest.
+/// The capture's per-alias records, keyed by alias.
 ///
 /// The stub's own `carrick-manifest.json` is the record of what the emitted
-/// declaration tree actually says, which is what the index publishes — so it is
-/// the right source for "which fields of this endpoint's type are `any`".
-/// Non-fatal throughout: no manifest, unreadable manifest, or an alias with no
-/// record all leave the entry as it was. Absence is never a claim of
-/// cleanliness.
-fn stamp_capture_provenance(manifest: &mut [TypeManifestEntry], stub_dir: &Path) {
+/// declaration tree actually says, which is what the index publishes. Non-fatal
+/// throughout: no manifest or an unreadable one reads as no records, and every
+/// reader treats an alias with no record as "the capture said nothing", never
+/// as a claim of cleanliness.
+fn read_capture_records(
+    stub_dir: &Path,
+) -> HashMap<String, crate::services::type_sidecar::CaptureAliasRecord> {
     let path = stub_dir.join(CAPTURE_MANIFEST_FILE);
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return;
+        return HashMap::new();
     };
     #[derive(serde::Deserialize)]
     struct StubManifest {
@@ -5116,15 +5136,24 @@ fn stamp_capture_provenance(manifest: &mut [TypeManifestEntry], stub_dir: &Path)
             "capture manifest at {} could not be parsed for provenance",
             path.display()
         );
-        return;
+        return HashMap::new();
     };
-    let by_alias: HashMap<&str, &crate::services::type_sidecar::CaptureAliasRecord> = parsed
+    parsed
         .aliases
-        .iter()
-        .map(|record| (record.alias.as_str(), record))
-        .collect();
+        .into_iter()
+        .map(|record| (record.alias.clone(), record))
+        .collect()
+}
+
+/// Join the capture self-check's `any`/`unknown` findings onto the manifest:
+/// the capture record is the right source for "which fields of this endpoint's
+/// type are `any`". An alias with no record leaves its entry as it was.
+fn stamp_capture_provenance(
+    manifest: &mut [TypeManifestEntry],
+    records: &HashMap<String, crate::services::type_sidecar::CaptureAliasRecord>,
+) {
     for entry in manifest.iter_mut() {
-        let Some(record) = by_alias.get(entry.type_alias.as_str()) else {
+        let Some(record) = records.get(&entry.type_alias) else {
             continue;
         };
         if record.any_provenance.is_empty() {
@@ -5520,7 +5549,15 @@ fn enrich_manifest_with_type_resolution(
         // capture is the layer that resolves what v1 could not). An alias the
         // bundle says NOTHING about is a different fact: no v1 request was ever
         // built for it, so there is nothing for it to have abstained from.
-        entry.v1_unresolved = dts_trivially_unknown(&entry.type_alias);
+        //
+        // A v1 answer that is itself a bare `any`/`unknown` is the same
+        // abstention without the marker (carrick#1165): it describes nothing,
+        // so the capture is asked too, and its shape is published if it has
+        // one.
+        entry.v1_unresolved = dts_trivially_unknown(&entry.type_alias)
+            || resolved_types
+                .get(&entry.type_alias)
+                .is_some_and(|(type_string, _)| type_compat_v2::text_is_bare_top_type(type_string));
 
         // Fill the deterministic anchor ONLY when the LLM left it unset, so the
         // ops where the model already emitted a correct symbol (POST /payments,
@@ -9493,7 +9530,7 @@ mod tests {
 
         let mut manifest = vec![consumer_entry("OrderView"), consumer_entry("Untouched")];
         assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
-        stamp_capture_provenance(&mut manifest, dir.path());
+        stamp_capture_provenance(&mut manifest, &read_capture_records(dir.path()));
 
         assert_eq!(manifest[0].any_provenance.len(), 1);
         assert_eq!(manifest[0].any_provenance[0].path, "meta");
@@ -9827,6 +9864,7 @@ mod tests {
         let count = apply_resolved_definitions(
             &mut manifest,
             vec![captured("OrderView", "{ bulkActionId: string; }")],
+            &HashMap::new(),
         );
 
         assert_eq!(count, 1);
@@ -9844,7 +9882,11 @@ mod tests {
         let mut manifest = vec![consumer_entry("OrderView")];
         manifest[0].v1_unresolved = true;
 
-        apply_resolved_definitions(&mut manifest, vec![captured("OrderView", "any")]);
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured("OrderView", "any")],
+            &HashMap::new(),
+        );
 
         assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
         assert_eq!(
@@ -9866,7 +9908,11 @@ mod tests {
         manifest[0].is_explicit = false;
         assert!(!manifest[0].v1_unresolved, "v1 answered for this one");
 
-        apply_resolved_definitions(&mut manifest, vec![captured("OrderView", "unknown")]);
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured("OrderView", "unknown")],
+            &HashMap::new(),
+        );
 
         assert_eq!(
             manifest[0].resolved_definition, None,
@@ -9892,6 +9938,7 @@ mod tests {
         apply_resolved_definitions(
             &mut manifest,
             vec![captured("OrderView", "{ id: string; payload: any; }")],
+            &HashMap::new(),
         );
 
         assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
@@ -9913,6 +9960,7 @@ mod tests {
         apply_resolved_definitions(
             &mut manifest,
             vec![captured("OrderView", "{ id: string; }")],
+            &HashMap::new(),
         );
 
         assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
@@ -9920,6 +9968,185 @@ mod tests {
             manifest[0].resolved_definition.as_deref(),
             Some("{ id: string; }")
         );
+    }
+
+    // ---- carrick#1165: answers that name what does not resolve -------------
+
+    /// A capture record as the sidecar writes it, read through the same
+    /// function the scan uses, so the wire shape of the new fields is covered.
+    fn records_from(
+        records: serde_json::Value,
+    ) -> HashMap<String, crate::services::type_sidecar::CaptureAliasRecord> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("carrick-manifest.json"),
+            serde_json::json!({ "aliases": records }).to_string(),
+        )
+        .expect("write manifest");
+        read_capture_records(dir.path())
+    }
+
+    fn record_json(alias: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut record = serde_json::json!({
+            "alias": alias,
+            "anchor_kind": "infer",
+            "source_file": "lib/api.ts",
+            "anchor_origin": "deterministic-infer",
+            "serialization": "node_builder",
+            "self_check": "ok",
+            "top_type_at_self_check": false
+        });
+        for (key, value) in extra.as_object().expect("object").iter() {
+            record[key] = value.clone();
+        }
+        record
+    }
+
+    fn answered_entry() -> TypeManifestEntry {
+        let mut entry = consumer_entry("OrderView");
+        entry.type_state = ManifestTypeState::Implicit;
+        entry
+    }
+
+    /// A shape that names an identifier nothing declares reads as a type and
+    /// is not one: the reader cannot resolve `ParcelRow`, and the boundary
+    /// counted the operation typed.
+    #[test]
+    fn an_answer_naming_an_undeclared_identifier_is_not_published() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({ "undeclared_names": ["ParcelRow"] }),
+        )]));
+        let mut manifest = vec![answered_entry()];
+
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured("OrderView", "{ id: string; parcel: ParcelRow; }")],
+            &records,
+        );
+
+        assert_eq!(manifest[0].resolved_definition, None);
+        assert_eq!(manifest[0].expanded_definition, None);
+    }
+
+    /// An answer whose declaration imports a module the checkout does not
+    /// have prints the missing module's names (`Shape<Options>`, a builder's
+    /// field reference over `any`) with nothing behind them.
+    #[test]
+    fn an_answer_whose_declaration_imports_a_missing_module_is_not_published() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({
+                "self_check": "decayed_internal",
+                "dangling_specifiers": ["./generated/client"]
+            }),
+        )]));
+        let mut manifest = vec![answered_entry()];
+
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured("OrderView", "Shape<Options>")],
+            &records,
+        );
+
+        assert_eq!(manifest[0].resolved_definition, None);
+    }
+
+    /// A top type with nothing to heal it is not published under a name; one a
+    /// pinned external explains is, because the check phase installs the pin
+    /// and the name then means something.
+    #[test]
+    fn a_top_type_answer_is_published_only_when_a_pinned_external_explains_it() {
+        let records = records_from(serde_json::json!([
+            record_json(
+                "OrderView",
+                serde_json::json!({
+                    "self_check": "decayed_internal",
+                    "top_type_at_self_check": true
+                }),
+            ),
+            record_json(
+                "Healable",
+                serde_json::json!({
+                    "self_check": "allowlisted_external",
+                    "top_type_at_self_check": true
+                }),
+            ),
+        ]));
+        let mut healable = answered_entry();
+        healable.type_alias = "Healable".to_string();
+        let mut manifest = vec![answered_entry(), healable];
+
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![
+                captured("OrderView", "ParcelRow"),
+                captured("Healable", "import(\"kit\").Context"),
+            ],
+            &records,
+        );
+
+        assert_eq!(manifest[0].resolved_definition, None);
+        assert_eq!(
+            manifest[1].expanded_definition.as_deref(),
+            Some("import(\"kit\").Context")
+        );
+    }
+
+    /// A record without the new fields (a stub written before them) publishes
+    /// exactly as before.
+    #[test]
+    fn a_record_without_the_new_fields_publishes_as_before() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({}),
+        )]));
+        let mut manifest = vec![answered_entry()];
+
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured("OrderView", "{ id: string; }")],
+            &records,
+        );
+
+        assert_eq!(
+            manifest[0].expanded_definition.as_deref(),
+            Some("{ id: string; }")
+        );
+    }
+
+    /// A v1 answer that is a bare `any` describes nothing, the same abstention
+    /// as the marked placeholder. The capture is asked, and its shape is
+    /// published; with `any` members inside, it does not settle the state.
+    #[test]
+    fn a_bare_any_v1_answer_asks_the_capture() {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        let mut resolution = empty_resolution();
+        let mut inferred = inferred_with_symbol("OrderView");
+        inferred.type_string = "any".to_string();
+        inferred.primary_type_symbol = None;
+        resolution.inferred_types.push(inferred);
+
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+        assert!(manifest[0].v1_unresolved, "a bare `any` is an abstention");
+        assert_eq!(aliases_to_resolve(&manifest), vec!["OrderView".to_string()]);
+
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured(
+                "OrderView",
+                "{ id: any; status: \"open\" | \"done\"; }",
+            )],
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            manifest[0].expanded_definition.as_deref(),
+            Some("{ id: any; status: \"open\" | \"done\"; }")
+        );
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
     }
 
     // ---- #245 Phase 1: protocol op manifest entries -------------------------
