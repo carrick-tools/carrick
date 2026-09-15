@@ -1200,7 +1200,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         // index open. The run itself succeeded at everything it could do, so
         // it exits 0 and the local index is built from what landed.
         storage
-            .report_scan_failed(crate::scan_stage::current().as_str(), &fail_reason(&reason))
+            .report_scan_failed(
+                crate::scan_stage::current().as_str(),
+                &fail_reason(&reason, &logging::Redaction::for_run(Some(repo_path))),
+            )
             .await;
         // CI has no slot and no local index. Its exit code is the only place
         // a stale service can show, as it was when one lost file failed the
