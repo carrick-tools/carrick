@@ -1045,6 +1045,24 @@ pub struct FunctionDefinitionExtractor {
     current_class_collisions: HashSet<String>,
     /// Members whose AST accessibility prevents callers outside the class hierarchy.
     inaccessible_members: HashSet<String>,
+    /// Call-argument closures indexed under a provisional key while the file
+    /// is walked. [`Self::finalize_callback_rows`] decides which of them keep
+    /// a row and what that row is keyed by (carrick#58).
+    callbacks: Vec<CallbackRow>,
+}
+
+/// One call-argument closure awaiting
+/// [`FunctionDefinitionExtractor::finalize_callback_rows`].
+struct CallbackRow {
+    /// The key the closure is indexed under until the file is finished. It
+    /// holds a NUL, so no source name and no final key can equal it.
+    provisional: String,
+    /// The name derived from the call (`get_users_handler`, `map_handler`).
+    name: String,
+    span: swc_common::Span,
+    /// The call's first argument is a string or template literal: the call
+    /// states an address for this closure (a route path, an event name).
+    addressed: bool,
 }
 
 impl FunctionDefinitionExtractor {
@@ -1062,7 +1080,108 @@ impl FunctionDefinitionExtractor {
             current_class: None,
             current_class_collisions: HashSet::new(),
             inaccessible_members: HashSet::new(),
+            callbacks: Vec::new(),
         }
+    }
+
+    /// Decide which call-argument closures keep a definition row, and key the
+    /// ones that do (carrick#58).
+    ///
+    /// A closure passed to a call keeps a row when no other indexed function
+    /// encloses it, or when the call states an address for it (a string or
+    /// template first argument: a route path, an event name). Every other
+    /// closure, such as the `.map`, `.then` or `.filter` callback inside a
+    /// function that already has a row, is part of that function's body, and
+    /// its row is removed here, before [`Self::finalize_call_owners`] runs.
+    /// The enclosing function's walk already collected the closure's calls, so
+    /// the fold hands them to the innermost row that remains, exactly as it
+    /// does for any closure without a row (carrick#931).
+    ///
+    /// A surviving closure is keyed by its derived name when no other closure
+    /// in the file derives that name and no declared function holds it, by
+    /// `name:line` otherwise, and by `name:line:column` when two such closures
+    /// also share a line. Before this the first closure in AST order took the
+    /// name and every later one lost its row, so a file's second `get_handler`
+    /// was not indexed. The row's `name` is the derived name in every case.
+    fn finalize_callback_rows(&mut self) {
+        let callbacks = std::mem::take(&mut self.callbacks);
+        let spans: Vec<(swc_common::Span, &str)> = self
+            .function_definitions
+            .iter()
+            .map(|(key, definition)| (definition.node_type.span(), key.as_str()))
+            .filter(|(span, _)| !span.is_dummy())
+            .collect();
+        let enclosed = |callback: &CallbackRow| {
+            spans.iter().any(|(span, key)| {
+                *key != callback.provisional
+                    && *span != callback.span
+                    && span.lo <= callback.span.lo
+                    && callback.span.hi <= span.hi
+            })
+        };
+        let (kept, dropped): (Vec<CallbackRow>, Vec<CallbackRow>) = callbacks
+            .into_iter()
+            .partition(|callback| callback.addressed || !enclosed(callback));
+        for callback in &dropped {
+            self.function_definitions.remove(&callback.provisional);
+            self.callee_refs.remove(&callback.provisional);
+        }
+
+        let lines: Vec<u32> = kept.iter().map(|c| self.line_number(c.span)).collect();
+        let mut by_name: HashMap<&str, usize> = HashMap::new();
+        let mut by_line: HashMap<(&str, u32), usize> = HashMap::new();
+        for (callback, line) in kept.iter().zip(&lines) {
+            *by_name.entry(callback.name.as_str()).or_default() += 1;
+            *by_line.entry((callback.name.as_str(), *line)).or_default() += 1;
+        }
+        let mut renames = Vec::with_capacity(kept.len());
+        for (callback, line) in kept.iter().zip(&lines) {
+            let name = callback.name.as_str();
+            let key = if by_name[name] == 1 && !self.function_definitions.contains_key(name) {
+                name.to_string()
+            } else if by_line[&(name, *line)] == 1 {
+                format!("{name}:{line}")
+            } else {
+                let column = self.source_map.lookup_char_pos(callback.span.lo).col.0 + 1;
+                format!("{name}:{line}:{column}")
+            };
+            renames.push((callback.provisional.clone(), key));
+        }
+        for (provisional, key) in renames {
+            if let Some(definition) = self.function_definitions.remove(&provisional) {
+                self.function_definitions.insert(key.clone(), definition);
+            }
+            if let Some(refs) = self.callee_refs.remove(&provisional) {
+                self.callee_refs.insert(key, refs);
+            }
+        }
+    }
+
+    /// Index one closure passed as a call argument under a provisional key;
+    /// [`Self::finalize_callback_rows`] settles whether it keeps the row.
+    fn record_callback(&mut self, name: String, addressed: bool, closure: &Expr) {
+        let span = match closure {
+            Expr::Arrow(arrow) => arrow.span,
+            Expr::Fn(fn_expr) => fn_expr.function.span,
+            _ => return,
+        };
+        let provisional = format!("{name}\u{0}{}", span.lo.0);
+        match closure {
+            Expr::Arrow(arrow) => self.insert_arrow_definition(provisional.clone(), arrow),
+            Expr::Fn(fn_expr) => {
+                self.insert_method_definition(provisional.clone(), &fn_expr.function)
+            }
+            _ => return,
+        }
+        if let Some(definition) = self.function_definitions.get_mut(&provisional) {
+            definition.name = name.clone();
+        }
+        self.callbacks.push(CallbackRow {
+            provisional,
+            name,
+            span,
+            addressed,
+        });
     }
 
     /// Each exact call site belongs to its smallest enclosing indexed
@@ -2010,6 +2129,7 @@ impl Visit for FunctionDefinitionExtractor {
     /// a call that belongs to no function still has an owner (carrick#965).
     fn visit_module(&mut self, module: &Module) {
         module.visit_children_with(self);
+        self.finalize_callback_rows();
         self.record_module_scope_callees(module);
         self.finalize_call_owners();
         self.prune_empty_module_scope();
@@ -2127,96 +2247,19 @@ impl Visit for FunctionDefinitionExtractor {
     }
 
     /// Capture anonymous closures passed as arguments to method calls.
-    /// e.g. `app.get("/users", async (req, res) => { ... })` → name: "GET_users_handler"
+    /// e.g. `app.get("/users", async (req, res) => { ... })` → name: "get_users_handler"
     /// e.g. `emitter.on("data", (chunk) => { ... })` → name: "on_data_handler"
+    ///
+    /// Every such closure is recorded here. Which of them keep a row, and under
+    /// which key, is decided once the whole file is known
+    /// ([`Self::finalize_callback_rows`], carrick#58).
     fn visit_call_expr(&mut self, call: &CallExpr) {
         if let Some((method_name, first_str_arg)) = extract_call_context(call) {
-            // Look for function/arrow arguments (skip the first string arg)
+            let addressed = first_str_arg.is_some();
             for arg in &call.args {
-                match &*arg.expr {
-                    Expr::Arrow(arrow) => {
-                        let synthetic_name =
-                            derive_handler_name(&method_name, first_str_arg.as_deref());
-                        // Don't overwrite named functions already captured
-                        if !self.function_definitions.contains_key(&synthetic_name) {
-                            let tokens = self.record_arrow_callees(&synthetic_name, arrow);
-                            let arguments = self.extract_arrow_arguments(&arrow.params);
-                            let body_source = self.extract_source(arrow.span);
-                            let line_number = self.line_number(arrow.span);
-                            let end_line = self.end_line(arrow.span);
-                            let return_type = arrow
-                                .return_type
-                                .as_ref()
-                                .and_then(|t| self.type_ann_to_string(t));
-                            self.function_definitions.insert(
-                                synthetic_name.clone(),
-                                FunctionDefinition {
-                                    name: synthetic_name,
-                                    file_path: self.current_file_path.clone(),
-                                    node_type: FunctionNodeType::ArrowFunction(Box::new(
-                                        arrow.clone(),
-                                    )),
-                                    arguments,
-                                    body_source,
-                                    is_exported: false,
-                                    line_number,
-                                    end_line,
-                                    intent: None,
-                                    calls: vec![],
-                                    tokens,
-                                    return_is_explicit: return_type.is_some(),
-                                    return_type,
-                                    signature: None,
-                                    intent_input_hash: None,
-                                    dispatch_table: None,
-                                },
-                            );
-                        }
-                    }
-                    Expr::Fn(fn_expr) => {
-                        let synthetic_name =
-                            derive_handler_name(&method_name, first_str_arg.as_deref());
-                        if !self.function_definitions.contains_key(&synthetic_name) {
-                            let tokens = self.record_fn_callees(&synthetic_name, &fn_expr.function);
-                            let arguments = self.extract_arguments(&fn_expr.function.params);
-                            let body_source = fn_expr
-                                .function
-                                .body
-                                .as_ref()
-                                .and_then(|b| self.extract_source(b.span));
-                            let line_number = self.line_number(fn_expr.function.span);
-                            let end_line = self.end_line(fn_expr.function.span);
-                            let return_type = fn_expr
-                                .function
-                                .return_type
-                                .as_ref()
-                                .and_then(|t| self.type_ann_to_string(t));
-                            self.function_definitions.insert(
-                                synthetic_name.clone(),
-                                FunctionDefinition {
-                                    name: synthetic_name,
-                                    file_path: self.current_file_path.clone(),
-                                    node_type: FunctionNodeType::FunctionExpression(Box::new(
-                                        fn_expr.clone(),
-                                    )),
-                                    arguments,
-                                    body_source,
-                                    is_exported: false,
-                                    line_number,
-                                    end_line,
-                                    intent: None,
-                                    calls: vec![],
-                                    tokens,
-                                    return_is_explicit: return_type.is_some(),
-                                    return_type,
-                                    signature: None,
-                                    intent_input_hash: None,
-                                    dispatch_table: None,
-                                },
-                            );
-                        }
-                    }
-                    _ => {}
+                if matches!(&*arg.expr, Expr::Arrow(_) | Expr::Fn(_)) {
+                    let name = derive_handler_name(&method_name, first_str_arg.as_deref());
+                    self.record_callback(name, addressed, &arg.expr);
                 }
             }
         }
@@ -2686,6 +2729,90 @@ second`): void {}
             .get("get_health_handler")
             .expect("should capture handler");
         assert!(def.line_number > 0);
+    }
+
+    /// Two closures that derive one name both keep a row, keyed by line, and
+    /// both rows still carry the derived name (carrick#58). Before, the first
+    /// in AST order took the name and the second had no row at all.
+    #[test]
+    fn same_named_top_level_callbacks_are_keyed_by_line() {
+        let defs = extract(
+            "router.get(HEALTH_PATH, () => 'ok');\n\
+             router.get(STATUS_PATH, () => 'up');\n\
+             router.post(\"/orders\", () => 'made');\n",
+        );
+        let mut keys: Vec<&str> = defs
+            .keys()
+            .map(String::as_str)
+            .filter(|key| *key != MODULE_SCOPE_KEY)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["get_handler:1", "get_handler:2", "post_orders_handler"]
+        );
+        assert_eq!(defs["get_handler:1"].name, "get_handler");
+        assert_eq!(defs["get_handler:2"].name, "get_handler");
+        assert_eq!(defs["get_handler:2"].line_number, 2);
+    }
+
+    /// Same name on the same line: the column separates them.
+    #[test]
+    fn same_named_callbacks_on_one_line_are_keyed_by_column() {
+        let defs = extract("register(() => 1); register(() => 2);\n");
+        let mut keys: Vec<&str> = defs
+            .keys()
+            .map(String::as_str)
+            .filter(|key| *key != MODULE_SCOPE_KEY)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["register_handler:1:10", "register_handler:1:29"]);
+    }
+
+    /// A declared function that holds the derived name keeps it; the closure
+    /// takes the line-qualified key instead of overwriting or disappearing.
+    #[test]
+    fn a_declared_function_keeps_a_name_a_callback_derives() {
+        let defs = extract(
+            "function use_handler() { return 1; }\n\
+             app.use(() => 2);\n",
+        );
+        assert!(matches!(
+            defs["use_handler"].node_type,
+            FunctionNodeType::FunctionDeclaration(_)
+        ));
+        assert_eq!(defs["use_handler:2"].name, "use_handler");
+    }
+
+    /// Inside a function that has a row, an unaddressed callback is part of
+    /// that function's body and has no row of its own; an addressed one (a
+    /// route or an event registered inside a setup function) keeps its row
+    /// (carrick#58).
+    #[test]
+    fn nested_callbacks_keep_a_row_only_when_the_call_addresses_them() {
+        let defs = extract(
+            "export function registerRoutes(app) {\n\
+               app.get(\"/items\", async (req, res) => {\n\
+                 const rows = await load();\n\
+                 res.json(rows.map((row) => row.id).filter(function (id) { return id; }));\n\
+               });\n\
+               [1, 2].forEach((n) => n);\n\
+             }\n\
+             export class Store {\n\
+               all() { return this.rows.then((rows) => rows.length); }\n\
+             }\n",
+        );
+        let mut keys: Vec<&str> = defs
+            .keys()
+            .map(String::as_str)
+            .filter(|key| *key != MODULE_SCOPE_KEY)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["Store.all", "get_items_handler", "registerRoutes"],
+            "map/filter/forEach/then callbacks have no rows"
+        );
     }
 
     #[test]

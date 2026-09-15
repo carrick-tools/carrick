@@ -133,11 +133,14 @@ fn assert_answer_key(scan: &Scan) {
             // Relative controls, resolved before the fix too.
             "ReservationService.reserve",
             "auditLocker",
-            "transaction_handler@apps/lockers/src/slots/reservation.service.ts",
+            // The call inside the `db.transaction(async (tx) => …)` callback
+            // belongs to the method around it: an unaddressed callback inside
+            // an indexed function has no row of its own (carrick#58).
+            "ReservationService.reserveInTransaction",
             // Through the alias.
             "DeliveryService.plan",
             "acceptReturn",
-            "transaction_handler@apps/lockers/src/deliveries/delivery.service.ts",
+            "DeliveryService.confirm",
         ])
     );
     assert_eq!(
