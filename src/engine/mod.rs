@@ -264,7 +264,7 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage + Sync>(
     // log is up to five megabytes, and a run that is already failing may not
     // get to finish both.
     if let Err(error) = &result {
-        report_scan_failure(&storage, error.as_ref()).await;
+        report_scan_failure(&storage, repo_path, error.as_ref()).await;
     }
     upload_run_logs(&storage, repo_path).await;
     result
@@ -282,10 +282,15 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage + Sync>(
 /// Only a run that ends through this function can say anything at all. A
 /// process the OS kills — SIGKILL, the OOM killer, a laptop lid — sends
 /// nothing, and the cloud's slot TTL is what covers that.
-async fn report_scan_failure<T: CloudStorage + Sync>(storage: &T, error: &dyn std::error::Error) {
+async fn report_scan_failure<T: CloudStorage + Sync>(
+    storage: &T,
+    repo_path: &str,
+    error: &dyn std::error::Error,
+) {
     let stage = crate::scan_stage::current();
+    let redaction = logging::Redaction::for_run(Some(repo_path));
     storage
-        .report_scan_failed(stage.as_str(), &fail_reason(&error.to_string()))
+        .report_scan_failed(stage.as_str(), &fail_reason(&error.to_string(), &redaction))
         .await;
 }
 
@@ -308,7 +313,10 @@ pub async fn report_preflight_failure<T: CloudStorage + Sync>(
         .report_preflight_failed(
             repo.as_deref(),
             stage.as_str(),
-            &fail_reason(&error.to_string()),
+            &fail_reason(
+                &error.to_string(),
+                &logging::Redaction::for_run(Some(repo_path)),
+            ),
         )
         .await;
 }
@@ -327,13 +335,12 @@ pub async fn report_preflight_failure<T: CloudStorage + Sync>(
 /// rather than panicking on the way out of a run that is already failing.
 /// The cut is marked, so a truncated reason does not read as a complete
 /// sentence that happens to stop.
-fn fail_reason(error: &str) -> String {
+fn fail_reason(error: &str, redaction: &logging::Redaction) -> String {
     const ELLIPSIS: &str = "...";
     const WITHHELD: &str = "(the error named a credential, so its text was not sent)";
-    let home = logging::home_for_redaction();
     let kept: Vec<String> = error
         .lines()
-        .filter_map(|line| logging::redact_log_line(line, home.as_deref()))
+        .filter_map(|line| redaction.line(line))
         .collect();
     let redacted = if kept.is_empty() && !error.is_empty() {
         WITHHELD.to_string()
@@ -1314,11 +1321,13 @@ async fn upload_run_logs<T: CloudStorage>(storage: &T, repo_path: &str) {
     // in UTF-8), so the resulting `log_content.len()` may exceed the original
     // raw byte count when the file contains non-UTF-8 noise. Close enough for
     // a logged size hint.
-    // What leaves the machine is not what is on it (carrick#1063): the home
-    // directory becomes `~`, and any line naming a credential is dropped.
+    // What leaves the machine is not what is on it (carrick#1063, #1098): the
+    // repo, the home directory, other machine paths and the account name are
+    // rewritten, and any line naming a credential is dropped.
     // Done here rather than in the writer so the local copy stays complete for
     // whoever is debugging with it.
-    let log_content = logging::redact_log(&String::from_utf8_lossy(&buf));
+    let log_content =
+        logging::Redaction::for_run(Some(repo_path)).log(&String::from_utf8_lossy(&buf));
     let repo_name = get_repository_name(repo_path);
     match storage.upload_logs(&repo_name, &log_content).await {
         Ok(()) => {
@@ -5840,19 +5849,23 @@ mod tests {
     /// (carrick#1063).
     #[test]
     fn a_fail_reason_is_redacted_and_bounded() {
-        let short = super::fail_reason("Carrick Cloud did not open this scan: already running");
+        let short = super::fail_reason(
+            "Carrick Cloud did not open this scan: already running",
+            &crate::logging::Redaction::default(),
+        );
         assert_eq!(
             short,
             "Carrick Cloud did not open this scan: already running"
         );
 
-        let long = super::fail_reason(&"e".repeat(2_000));
+        let long = super::fail_reason(&"e".repeat(2_000), &crate::logging::Redaction::default());
         assert_eq!(long.chars().count(), super::FAIL_REASON_LIMIT);
         assert!(long.ends_with("..."), "a cut reason says it was cut");
 
         // Cut on a character boundary, not a byte one: a run that is already
         // failing must not end in a panic on the way out.
-        let multibyte = super::fail_reason(&"é".repeat(2_000));
+        let multibyte =
+            super::fail_reason(&"é".repeat(2_000), &crate::logging::Redaction::default());
         assert_eq!(multibyte.chars().count(), super::FAIL_REASON_LIMIT);
     }
 
@@ -5868,7 +5881,7 @@ mod tests {
 
         let error: Box<dyn std::error::Error> =
             "Carrick Cloud LLM quota was exhausted mid-scan".into();
-        super::report_scan_failure(&storage, error.as_ref()).await;
+        super::report_scan_failure(&storage, ".", error.as_ref()).await;
 
         assert_eq!(
             storage.scan_failures(),
@@ -5930,8 +5943,11 @@ mod tests {
         let (repo_name, stage, reason) = &reported[0];
         assert_eq!(repo_name, &None, "a checkout with no origin names no repo");
         assert_eq!(stage, "preflight");
+        // The service sits at the root of the repo being scanned, which the
+        // redaction names `<repo>` (carrick#1098), so neither the home nor
+        // the checkout's own path is in the reason.
         assert!(
-            reason.starts_with("Deno is required to scan ~/work/api/")
+            reason.starts_with("Deno is required to scan <repo>/")
                 && reason.contains("deno.json. Install or upgrade to Deno"),
             "{reason}"
         );
@@ -5950,10 +5966,16 @@ mod tests {
     /// log; a reason that was nothing but such lines still says the run died.
     #[test]
     fn a_fail_reason_never_carries_a_credential_line() {
-        let mixed = super::fail_reason("start-scan refused\nAuthorization: Bearer carrick_sk_x");
+        let mixed = super::fail_reason(
+            "start-scan refused\nAuthorization: Bearer carrick_sk_x",
+            &crate::logging::Redaction::default(),
+        );
         assert_eq!(mixed, "start-scan refused");
 
-        let only = super::fail_reason("token carrick_sk_live_abc was rejected");
+        let only = super::fail_reason(
+            "token carrick_sk_live_abc was rejected",
+            &crate::logging::Redaction::default(),
+        );
         assert!(!only.contains("carrick_sk_"), "{only}");
         assert!(only.contains("named a credential"), "{only}");
     }
@@ -5968,14 +5990,17 @@ mod tests {
     #[serial_test::serial]
     async fn an_uploaded_run_log_carries_no_home_and_no_credential() {
         let home = tempfile::tempdir().expect("temp home");
+        // A checkout outside the home directory (carrick#1098).
+        let repo = tempfile::tempdir().expect("temp repo");
         let logs = home.path().join(".carrick").join("logs");
         std::fs::create_dir_all(&logs).expect("log dir");
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
         std::fs::write(
             logs.join(format!("carrick.log.{day}")),
             format!(
-                "reading {}/work/api/src/index.ts\n  Authorization: Bearer secret\nanalysed 12 files\n",
-                home.path().display()
+                "reading {}/work/api/src/index.ts\n  Authorization: Bearer secret\nanalysed 12 files\nparsing {}/src/a.ts\n",
+                home.path().display(),
+                repo.path().display()
             ),
         )
         .expect("seed log");
@@ -5984,7 +6009,7 @@ mod tests {
         // SAFETY: a `#[serial]` test, and the variable is restored below.
         unsafe { std::env::set_var("HOME", home.path()) };
         let storage = crate::cloud_storage::MockStorage::new();
-        upload_run_logs(&storage, ".").await;
+        upload_run_logs(&storage, &repo.path().to_string_lossy()).await;
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("HOME", value),
@@ -5999,6 +6024,7 @@ mod tests {
         assert!(log.contains("analysed 12 files"), "{log}");
         assert!(!log.contains("Authorization"), "{log}");
         assert!(!log.contains(&home.path().display().to_string()), "{log}");
+        assert!(log.contains("parsing <repo>/src/a.ts"), "{log}");
     }
 
     /// A refusal that is simply a cloud without the action deployed is not a

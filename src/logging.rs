@@ -147,65 +147,257 @@ pub fn init(verbose: bool) {
 /// has its own filter and shows `info` (or `debug` with `--verbose`).
 const FILE_FILTER: &str = "info,carrick=debug";
 
-/// Rewrite one log line for upload, or drop it.
-///
-/// Two rules, and both are about what a line may carry off the machine
-/// (carrick#1063):
-///
-/// 1. The user's home directory becomes `~`. A laptop's paths carry the
-///    account name and often the employer's directory layout, and none of it
-///    identifies a run — the repo and the scanner version already do.
-/// 2. A line naming a credential goes entirely. `Authorization` is the header
-///    this scanner sends, `X-Amz-Signature` rides every presigned URL it is
-///    handed, and `carrick_sk_` is the literal prefix of the credential
-///    itself. None of these are logged today; the rule is what keeps a line
-///    added later from shipping one before anyone notices.
-///
-/// Whole lines rather than a surgical edit: a line naming a credential is a
-/// line whose value is already suspect, and a debug log is never worth
-/// deciding that question on.
-pub fn redact_log_line(line: &str, home: Option<&str>) -> Option<String> {
-    const SECRET_MARKERS: [&str; 3] = ["Authorization", "X-Amz-Signature", "carrick_sk_"];
-    if SECRET_MARKERS.iter().any(|marker| line.contains(marker)) {
-        return None;
-    }
-    Some(redact_home_in(line, home))
-}
-
-/// The home directory this process runs under, as the path spelling a log line
-/// would carry. `None` when there is no home to redact, which is most of CI.
-pub fn home_for_redaction() -> Option<String> {
-    // `dirs::home_dir` is what `log_dir` already resolves the log directory
-    // with, so the spelling this replaces is the spelling that gets written.
-    let home = dirs::home_dir()?;
-    let home = home.to_str()?.trim_end_matches('/').to_string();
-    // `/` as a home would turn every absolute path into `~...`, and a one-
-    // character home is not a home worth hiding.
-    (home.len() > 1).then_some(home)
-}
-
-/// Replace `home` with `~` wherever it appears in `text`.
+/// What a line may carry off the machine, and how it is rewritten until it
+/// carries nothing else (carrick#1063, carrick#1098).
 ///
 /// Shared by the run-log upload and the fail marker's `reason`, so a failure
-/// and the log that explains it redact the same way.
-pub fn redact_home_in(text: &str, home: Option<&str>) -> String {
-    match home {
-        Some(home) if !home.is_empty() => text.replace(home, "~"),
-        _ => text.to_string(),
+/// and the log that explains it redact the same way. Built once per run: the
+/// spellings below cost a `canonicalize` and a directory read each, and a log
+/// is millions of lines.
+///
+/// The rules, in the order a line meets them:
+///
+/// 1. A line naming a credential goes entirely. `Authorization` is the header
+///    this scanner sends, `X-Amz-Signature` rides every presigned URL it is
+///    handed, and `carrick_sk_` is the literal prefix of the credential
+///    itself. Whole lines rather than a surgical edit: a line naming a
+///    credential is a line whose value is already suspect.
+/// 2. The scanned repo's root becomes `<repo>` and the home directory `~`, in
+///    every spelling this machine gives them: as the process holds them and
+///    as `canonicalize` resolves them, because a symlinked or firmlinked home
+///    is written the second way by everything that canonicalises a path.
+///    Longest first, so a repo under the home keeps its repo-relative form.
+/// 3. Any other absolute path on this machine keeps its last component and
+///    loses the rest: `/private/tmp/x/api/src/a.ts` becomes `<path>/a.ts`. A
+///    path is "on this machine" when its first segment is an entry of the
+///    filesystem root, which is what tells `/tmp/...` from a route such as
+///    `/api/users` without a list of directory names. A route whose first
+///    segment happens to be a root entry (`/home`, `/dev`) loses its prefix
+///    too, which costs a debug line some detail and never leaks a name.
+/// 4. The account name, as a whole token (letters, digits and `_`, bounded by
+///    anything else), becomes `<user>`. That is the backstop for a directory a
+///    tool derived from the home path with `/` turned into `-`, which rule 2
+///    cannot see because it is not the home path. Not applied on CI, where the
+///    account (`runner`, `root`) names no developer and is an ordinary word.
+///
+/// Windows drive paths are not recognised by rule 3; rules 2 and 4 still
+/// apply to them.
+#[derive(Debug, Clone, Default)]
+pub struct Redaction {
+    /// Literal spellings and what each becomes, longest first.
+    spellings: Vec<(String, &'static str)>,
+    /// Account names, each at least two characters long.
+    accounts: Vec<String>,
+    /// The names directly under `/` on this machine.
+    root_entries: std::collections::BTreeSet<String>,
+}
+
+const REPO_MARK: &str = "<repo>";
+const HOME_MARK: &str = "~";
+const PATH_MARK: &str = "<path>";
+const USER_MARK: &str = "<user>";
+
+impl Redaction {
+    /// The redaction for this run on this machine, with `repo_path` as the
+    /// scanned repo when there is one.
+    pub fn for_run(repo_path: Option<&str>) -> Self {
+        let spellings_of = |path: &Path| -> Vec<String> {
+            let mut spellings = vec![path.to_string_lossy().into_owned()];
+            if let Ok(canonical) = std::fs::canonicalize(path) {
+                spellings.push(canonical.to_string_lossy().into_owned());
+            }
+            spellings
+        };
+        // `dirs::home_dir` is what `log_dir` already resolves the log
+        // directory with, so the spelling this replaces is the one written.
+        let home = dirs::home_dir();
+        let homes = home.as_deref().map(spellings_of).unwrap_or_default();
+        let repos = repo_path
+            .map(|repo| spellings_of(Path::new(repo)))
+            .unwrap_or_default();
+        // A CI runner's account (`runner`, `root` in a container) names no
+        // developer, and as a token it is an ordinary word: "the repo root"
+        // would ship as "the repo <user>". Rules 2 and 3 still apply there.
+        let mut accounts: Vec<String> = Vec::new();
+        if std::env::var_os("CI").is_none() {
+            accounts.extend(
+                home.as_deref()
+                    .and_then(Path::file_name)
+                    .map(|name| name.to_string_lossy().into_owned()),
+            );
+            for variable in ["USER", "LOGNAME", "USERNAME"] {
+                if let Ok(name) = std::env::var(variable) {
+                    accounts.push(name);
+                }
+            }
+        }
+        let root_entries: Vec<String> = std::fs::read_dir("/")
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self::new(&repos, &homes, &accounts, &root_entries)
+    }
+
+    /// The same, from facts a test can state.
+    pub fn new(
+        repos: &[String],
+        homes: &[String],
+        accounts: &[String],
+        root_entries: &[String],
+    ) -> Self {
+        let mut spellings: Vec<(String, &'static str)> = Vec::new();
+        for (paths, mark) in [(repos, REPO_MARK), (homes, HOME_MARK)] {
+            for path in paths {
+                let path = path.trim_end_matches('/');
+                // `/` as a home would turn every absolute path into `~...`,
+                // and a one-character path is not one worth hiding.
+                if path.len() > 1 && !spellings.iter().any(|(known, _)| known == path) {
+                    spellings.push((path.to_string(), mark));
+                }
+            }
+        }
+        spellings.sort_by_key(|(spelling, _)| std::cmp::Reverse(spelling.len()));
+        let mut kept_accounts: Vec<String> = Vec::new();
+        for account in accounts {
+            let account = account.trim();
+            if account.chars().count() >= 2
+                && account
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || "._-".contains(c))
+                && !kept_accounts.iter().any(|known| known == account)
+            {
+                kept_accounts.push(account.to_string());
+            }
+        }
+        Self {
+            spellings,
+            accounts: kept_accounts,
+            root_entries: root_entries
+                .iter()
+                .filter(|name| !name.is_empty())
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Rewrite one log line for upload, or drop it.
+    pub fn line(&self, line: &str) -> Option<String> {
+        const SECRET_MARKERS: [&str; 3] = ["Authorization", "X-Amz-Signature", "carrick_sk_"];
+        if SECRET_MARKERS.iter().any(|marker| line.contains(marker)) {
+            return None;
+        }
+        let mut text = line.to_string();
+        for (spelling, mark) in &self.spellings {
+            text = replace_path_prefix(&text, spelling, mark);
+        }
+        let text = self.redact_machine_paths(&text);
+        Some(self.redact_accounts(&text))
+    }
+
+    /// [`Redaction::line`] over a whole log slice, dropping the lines it drops.
+    pub fn log(&self, content: &str) -> String {
+        let mut out = String::with_capacity(content.len());
+        for line in content.lines() {
+            if let Some(kept) = self.line(line) {
+                out.push_str(&kept);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Rule 3: an absolute path whose first segment is a root entry keeps
+    /// only its last component.
+    fn redact_machine_paths(&self, text: &str) -> String {
+        if self.root_entries.is_empty() {
+            return text.to_string();
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while i < chars.len() {
+            let starts_path = chars[i] == '/'
+                && (i == 0 || !is_path_char(chars[i - 1]))
+                && chars.get(i + 1).is_some_and(|c| *c != '/');
+            if starts_path {
+                let end = (i..chars.len())
+                    .find(|&j| ends_path(chars[j]))
+                    .unwrap_or(chars.len());
+                let token: String = chars[i..end].iter().collect();
+                let first = token[1..].split('/').next().unwrap_or_default();
+                if self.root_entries.contains(first) {
+                    let last = token.trim_end_matches('/').rsplit('/').next();
+                    out.push_str(PATH_MARK);
+                    if let Some(last) = last.filter(|last| *last != first) {
+                        out.push('/');
+                        out.push_str(last);
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        out
+    }
+
+    /// Rule 4: the account name as a whole alphanumeric token.
+    fn redact_accounts(&self, text: &str) -> String {
+        let mut text = text.to_string();
+        for account in &self.accounts {
+            let mut out = String::with_capacity(text.len());
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find(account.as_str()) {
+                let before = rest[..at].chars().next_back();
+                let after = rest[at + account.len()..].chars().next();
+                // `_` is part of a token, so `runner_os=Linux` in the run
+                // preamble is not read as the account `runner`.
+                let part_of_token = |c: char| c.is_alphanumeric() || c == '_';
+                let whole = before.is_none_or(|c| !part_of_token(c))
+                    && after.is_none_or(|c| !part_of_token(c));
+                out.push_str(&rest[..at]);
+                out.push_str(if whole { USER_MARK } else { account });
+                rest = &rest[at + account.len()..];
+            }
+            out.push_str(rest);
+            text = out;
+        }
+        text
     }
 }
 
-/// [`redact_log_line`] over a whole log slice, dropping the lines it drops.
-pub fn redact_log(content: &str) -> String {
-    let home = home_for_redaction();
-    let mut out = String::with_capacity(content.len());
-    for line in content.lines() {
-        if let Some(kept) = redact_log_line(line, home.as_deref()) {
-            out.push_str(&kept);
-            out.push('\n');
-        }
+/// Replace `path` with `mark` wherever it appears as a whole path: followed by
+/// a separator or by anything that is not part of a file name, so `/home/ada`
+/// is not replaced inside `/home/adam`.
+fn replace_path_prefix(text: &str, path: &str, mark: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(path) {
+        let after = rest[at + path.len()..].chars().next();
+        let whole = after.is_none_or(|c| c == '/' || !is_path_char(c));
+        out.push_str(&rest[..at]);
+        out.push_str(if whole { mark } else { path });
+        rest = &rest[at + path.len()..];
     }
+    out.push_str(rest);
     out
+}
+
+/// A character a file name or a path spelling can carry, for telling where a
+/// path starts. `<` and `>` count, so a mark already written is never read as
+/// the start of a new path.
+fn is_path_char(c: char) -> bool {
+    c.is_alphanumeric() || "._-~/<>@+%".contains(c)
+}
+
+/// Where an absolute path in a log line ends.
+fn ends_path(c: char) -> bool {
+    c.is_whitespace() || "\"'`,;:)]}>|".contains(c)
 }
 
 /// Bytes one debug log file may hold.
@@ -954,22 +1146,142 @@ mod tests {
     /// person.
     #[test]
     fn the_home_directory_becomes_a_tilde() {
+        let redaction = ada(&[]);
         assert_eq!(
-            redact_log_line(
-                "  reading /Users/ada/work/payments-api/src/index.ts",
-                Some("/Users/ada")
-            )
-            .as_deref(),
+            redaction
+                .line("  reading /Users/ada/work/payments-api/src/index.ts")
+                .as_deref(),
             Some("  reading ~/work/payments-api/src/index.ts")
         );
-        // Several times on one line, and in the middle of a longer word-shaped
-        // path, because that is how a log writes them.
+        // Several times on one line, because that is how a log writes them,
+        // and not inside a longer name that merely starts the same way.
         assert_eq!(
-            redact_home_in("/home/ada/a -> /home/ada/b", Some("/home/ada")),
-            "~/a -> ~/b"
+            redaction.line("/Users/ada/a -> /Users/ada/b").as_deref(),
+            Some("~/a -> ~/b")
         );
+        assert_eq!(redaction.line("/Users/adam/a").as_deref(), Some("<path>/a"));
         // Nothing to redact against is not an error; the line ships as it is.
-        assert_eq!(redact_home_in("/home/ada/a", None), "/home/ada/a");
+        assert_eq!(
+            Redaction::default().line("/Users/ada/a").as_deref(),
+            Some("/Users/ada/a")
+        );
+    }
+
+    /// The machine facts the redaction tests state: an account called `ada`,
+    /// her home in both of the spellings macOS gives it, and a root directory
+    /// with the entries a Mac has.
+    fn ada(repos: &[&str]) -> Redaction {
+        let owned = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        Redaction::new(
+            &owned(repos),
+            &owned(&["/Users/ada", "/System/Volumes/Data/Users/ada"]),
+            &owned(&["ada"]),
+            &owned(&["Users", "System", "private", "tmp", "var", "Volumes", "opt"]),
+        )
+    }
+
+    /// carrick#1098: a checkout outside the home directory, under a directory
+    /// a tool derived from the home path, shipped the account name on every
+    /// line that named a file in it.
+    #[test]
+    fn a_checkout_outside_home_names_neither_the_account_nor_the_machine() {
+        let repo = "/private/tmp/claude-501/-Users-ada-Repositories-carrick/scratch/api";
+        let redaction = ada(&[repo]);
+        let line = format!(
+            "Failed to parse {repo}/src/index.ts: Expected ';' (see also \
+             /private/tmp/claude-501/-Users-ada-Repositories-carrick/other/x.ts:12:3)"
+        );
+        let redacted = redaction.line(&line).expect("kept");
+        assert_eq!(
+            redacted,
+            "Failed to parse <repo>/src/index.ts: Expected ';' (see also <path>/x.ts:12:3)"
+        );
+        assert!(!redacted.contains("ada"), "{redacted}");
+    }
+
+    /// A home reached through its canonical spelling is still the home, and a
+    /// repo under it keeps its repo-relative form rather than a home-relative
+    /// one.
+    #[test]
+    fn every_spelling_of_the_home_and_the_repo_is_redacted_longest_first() {
+        let redaction = ada(&["/Users/ada/work/api"]);
+        assert_eq!(
+            redaction
+                .line("tsconfig at /System/Volumes/Data/Users/ada/.config/x.json")
+                .as_deref(),
+            Some("tsconfig at ~/.config/x.json")
+        );
+        assert_eq!(
+            redaction
+                .line("reading /Users/ada/work/api/src/a.ts")
+                .as_deref(),
+            Some("reading <repo>/src/a.ts")
+        );
+    }
+
+    /// The account name goes wherever it is a whole token, and nowhere else.
+    #[test]
+    fn the_account_name_is_redacted_as_a_token_and_only_as_one() {
+        let redaction = ada(&[]);
+        assert_eq!(
+            redaction
+                .line("cache key -Users-ada-Repositories-carrick user=ada")
+                .as_deref(),
+            Some("cache key -Users-<user>-Repositories-carrick user=<user>")
+        );
+        assert_eq!(
+            redaction.line("reading the adapter for canada").as_deref(),
+            Some("reading the adapter for canada")
+        );
+        // An underscore joins a token: a field name that starts with the
+        // account is not the account.
+        let runner = Redaction::new(&[], &[], &["runner".to_string()], &[]);
+        assert_eq!(
+            runner.line("runner_os=Linux user=runner").as_deref(),
+            Some("runner_os=Linux user=<user>")
+        );
+    }
+
+    /// On CI the account names no developer and is an ordinary word, so the
+    /// run's own redaction states no account at all.
+    #[test]
+    #[serial_test::serial]
+    fn a_ci_run_redacts_no_account_name() {
+        let previous = std::env::var_os("CI");
+        // SAFETY: a `#[serial]` test, and the variable is restored below.
+        unsafe { std::env::set_var("CI", "true") };
+        let on_ci = Redaction::for_run(None);
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("CI", value),
+                None => std::env::remove_var("CI"),
+            }
+        }
+        assert!(on_ci.accounts.is_empty(), "{on_ci:?}");
+        assert_eq!(
+            on_ci
+                .line("Discovered 3 file(s) under the repo root")
+                .as_deref(),
+            Some("Discovered 3 file(s) under the repo root")
+        );
+    }
+
+    /// A route, a URL and a relative path are not machine paths: their first
+    /// segment is not an entry of the filesystem root.
+    #[test]
+    fn routes_urls_and_relative_paths_are_left_alone() {
+        let redaction = ada(&[]);
+        for line in [
+            "GET /api/users/:id matched POST /orders",
+            "calling https://api.carrick.tools/mcp",
+            "reading src/tmp/a.ts and ./tmp/b.ts",
+        ] {
+            assert_eq!(redaction.line(line).as_deref(), Some(line), "{line}");
+        }
+        assert_eq!(
+            redaction.line("wrote /var/folders/x/T/out.json").as_deref(),
+            Some("wrote <path>/out.json")
+        );
     }
 
     /// A line naming a credential does not leave the machine, whichever of the
@@ -982,20 +1294,16 @@ mod tests {
             "  DEBUG presigned PUT https://b.s3/k?X-Amz-Signature=deadbeef",
             "  DEBUG credential carrick_sk_live_9f2 loaded",
         ] {
-            assert_eq!(
-                redact_log_line(line, Some("/home/ada")),
-                None,
-                "not dropped: {line}"
-            );
+            assert_eq!(ada(&[]).line(line), None, "not dropped: {line}");
         }
     }
 
-    /// The two rules over a slice: the credential line goes, the rest keeps
-    /// its order and loses its home directory.
+    /// The rules over a slice: the credential line goes, the rest keeps its
+    /// order and loses its home directory.
     #[test]
     fn redacting_a_slice_drops_lines_and_rewrites_the_rest() {
-        let redacted = redact_log("first line\n  Authorization: Bearer abc\nlast line\n");
-        assert_eq!(redacted, "first line\nlast line\n");
+        let redacted = ada(&[]).log("first /Users/ada/a\n  Authorization: Bearer abc\nlast line\n");
+        assert_eq!(redacted, "first ~/a\nlast line\n");
     }
 
     fn log_files(dir: &Path) -> Vec<String> {
