@@ -7144,12 +7144,17 @@ mod tests {
     /// root or the home directory, anywhere in it: printed TypeScript embeds
     /// both mid-string (`import("/abs/path").Name`), and a package store or a
     /// runtime cache under home is the account name on a served row
-    /// (carrick#1160). The one exemption is the capture stub's declaration
-    /// files, which are compiled again at check time and deliberately left
-    /// untouched by the pass (see `relativize_cloud_paths`); the test asserts
-    /// that exemption holds rather than assuming it.
+    /// (carrick#1160). The sweep covers every file of the capture stub too.
+    /// The pass leaves the stub's declaration files byte-identical, because
+    /// they are compiled again at check time (see `relativize_cloud_paths`);
+    /// the capture itself writes them without absolute specifiers
+    /// (carrick#1174, guarded behaviourally by the sidecar's
+    /// `capture-v2-installed-package-specifier` test). This test fails if the
+    /// payload's stub carries a path, or if the pass starts editing it.
     #[test]
     fn relativize_cloud_paths_leaves_no_absolute_path_in_the_payload() {
+        const STUB_SURFACE: &str = "import type { Order } from \"./src/types/order\";\n\
+            export type Endpoint_Response = { order: Order; ctx: import(\"web-kit\").Context };\n";
         use crate::external_call_candidates::{CallMechanism, ExternalCallCandidate};
         use crate::mount_graph::{DataFetchingCall, GraphNode, NodeType, ResolvedEndpoint};
         use crate::packages::PackageInfo;
@@ -7387,8 +7392,10 @@ mod tests {
                         .to_string(),
                     ),
                     (
+                        // What the capture emits since carrick#1174: an in-tree
+                        // relative specifier and a bare package specifier.
                         "types/surface.d.ts".to_string(),
-                        format!("export type Endpoint_Response = import(\"{}\").Order;\n", abs("src/types/order")),
+                        STUB_SURFACE.to_string(),
                     ),
                 ]),
             }),
@@ -7488,21 +7495,12 @@ mod tests {
             "source file not in program: packages/utils/id.ts"
         );
         assert_eq!(record["aliases"][0]["source_file"], "@/features/types");
-        // The compiled tree is exempt, byte for byte.
-        assert_eq!(
-            stub.files["types/surface.d.ts"],
-            format!(
-                "export type Endpoint_Response = import(\"{}\").Order;\n",
-                abs("src/types/order")
-            )
-        );
+        // The pass never edits a compiled declaration file, byte for byte.
+        assert_eq!(stub.files["types/surface.d.ts"], STUB_SURFACE);
 
-        // Then the exhaustive sweep over the serialized payload.
-        let mut sweep = data.clone();
-        if let Some(stub) = sweep.capture_stub.as_mut() {
-            stub.files.retain(|name, _| !name.ends_with(".d.ts"));
-        }
-        let json = serde_json::to_value(&sweep).expect("payload serializes");
+        // Then the exhaustive sweep over the serialized payload, every stub
+        // file included.
+        let json = serde_json::to_value(&data).expect("payload serializes");
         let mut offenders: Vec<String> = Vec::new();
         walk_json_strings(&json, &mut |s| {
             if s.contains(repo_path) || s.contains(home) {
