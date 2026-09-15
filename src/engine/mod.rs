@@ -5943,8 +5943,11 @@ mod tests {
         let (repo_name, stage, reason) = &reported[0];
         assert_eq!(repo_name, &None, "a checkout with no origin names no repo");
         assert_eq!(stage, "preflight");
+        // The service sits at the root of the repo being scanned, which the
+        // redaction names `<repo>` (carrick#1098), so neither the home nor
+        // the checkout's own path is in the reason.
         assert!(
-            reason.starts_with("Deno is required to scan ~/work/api/")
+            reason.starts_with("Deno is required to scan <repo>/")
                 && reason.contains("deno.json. Install or upgrade to Deno"),
             "{reason}"
         );
