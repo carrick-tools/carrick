@@ -58,8 +58,9 @@ fn compute_intent_hash(body: &str, called_intents: &[String]) -> String {
 ///
 /// `by_key` is each function's previous intent by definition key, for a
 /// function this run defers (carrick#1080): one whose callee got no intent is
-/// not keyed at all, and keeps what it had. The row's `name` must match as
-/// well, so a key reused by a different function never lends it an intent.
+/// not keyed at all, and keeps what it had. The key is the whole identity: a
+/// name two files define is keyed with its repo-relative path (#582), so a
+/// key names the same symbol on both scans.
 #[derive(Debug, Clone, Default)]
 pub struct PreviousIntents {
     by_hash: HashMap<String, String>,
@@ -68,7 +69,6 @@ pub struct PreviousIntents {
 
 #[derive(Debug, Clone)]
 struct PreviousIntent {
-    name: String,
     intent: String,
     hash: Option<String>,
 }
@@ -87,7 +87,6 @@ impl PreviousIntents {
             previous.by_key.insert(
                 key.clone(),
                 PreviousIntent {
-                    name: def.name.clone(),
                     intent: intent.clone(),
                     hash: def.intent_input_hash.clone(),
                 },
@@ -101,10 +100,10 @@ impl PreviousIntents {
         self.by_hash.get(hash).map(String::as_str)
     }
 
-    /// The previous intent of the function at `key`, when that row was the
-    /// same function by name, with the hash that produced it if it has one.
-    fn for_function(&self, key: &str, name: &str) -> Option<&PreviousIntent> {
-        self.by_key.get(key).filter(|prev| prev.name == name)
+    /// The previous intent of the function at `key`, with the hash that
+    /// produced it if it has one.
+    fn for_function(&self, key: &str) -> Option<&PreviousIntent> {
+        self.by_key.get(key)
     }
 }
 
@@ -852,7 +851,7 @@ async fn describe_functions<S, SFut>(
         let Some(def) = function_definitions.get_mut(name) else {
             continue;
         };
-        if let Some(prev) = previous.for_function(name, &def.name) {
+        if let Some(prev) = previous.for_function(name) {
             def.intent = Some(prev.intent.clone());
             def.intent_input_hash = prev.hash.clone();
             kept += 1;
@@ -1319,16 +1318,14 @@ mod tests {
         assert_eq!(previous.by_hash.len(), 1);
         assert_eq!(previous.for_hash("abc123"), Some("does the thing"));
 
-        // By function, an intent is kept with or without its hash, and only
-        // for the same function by name.
+        // By function, an intent is kept with or without its hash.
         assert_eq!(previous.by_key.len(), 2);
-        let complete = previous.for_function("complete", "f").unwrap();
+        let complete = previous.for_function("complete").unwrap();
         assert_eq!(complete.hash.as_deref(), Some("abc123"));
-        let no_hash = previous.for_function("no_hash", "f").unwrap();
+        let no_hash = previous.for_function("no_hash").unwrap();
         assert_eq!(no_hash.intent, "does another thing");
         assert!(no_hash.hash.is_none());
-        assert!(previous.for_function("complete", "g").is_none());
-        assert!(previous.for_function("no_intent", "f").is_none());
+        assert!(previous.for_function("no_intent").is_none());
     }
 
     /// Env vars are process-global and tests run in parallel: every test in
