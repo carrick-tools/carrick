@@ -1178,33 +1178,43 @@ impl FileAnalyzerAgent {
             )
         };
 
-        // Imported HTTP wrapper definitions (#369 — cross-file wrapper-site
-        // resolution): same-repo modules this file imports whose exported
-        // functions perform the actual HTTP request. Without their source the
-        // model cannot know a call like `apiRequest("GET", "/things")` is an
-        // outbound HTTP call, or what base path the wrapper prepends. Empty
-        // for files with no such imports, contributing zero bytes so every
-        // existing prompt stays byte-for-byte identical (cache-safe).
+        // Imported request declarations (#369, carrick#1146): the declarations
+        // in other same-repo modules that this file's own calls reach, with the
+        // helpers they call and the bindings they read, as the scanner read
+        // them off the AST (`crate::binding_facts`). Without them the model
+        // cannot know `ordersApi.get(id)` is an outbound HTTP call, or what
+        // path and base it builds. The header keeps its name: the analyzer's
+        // system prompt refers to this section by it. Empty for files that
+        // call no such declaration, contributing zero bytes so every other
+        // prompt stays byte-for-byte identical (cache-safe).
         let wrapper_context_section = if wrapper_context.is_empty() {
             String::new()
         } else {
             format!(
-                "\n### IMPORTED HTTP WRAPPER DEFINITIONS (same-repo modules imported by this file)\n\
-                 The source below defines HTTP request wrapper function(s) that live in OTHER \
-                 files of this repo and are IMPORTED by the file being analyzed. A call in THIS \
-                 file to one of these imported wrappers (directly, or via `.call(...)`/`.apply(...)`) \
-                 is a real outbound HTTP data call happening at that call site. For each such call \
-                 site, emit a data_call whose method and target are RESOLVED through the wrapper. \
-                 The target MUST be the full request URL the wrapper builds: the wrapper's base \
-                 (keep any `${{...}}` host/config interpolation verbatim) + the wrapper's path \
-                 prefix + the site's path argument. Example: the wrapper's options carry baseURL \
-                 `${{cfg.host}}/api/v1` and the site passes \"/things\" -> target \
-                 `${{cfg.host}}/api/v1/things`. Emitting only the site's argument (\"/things\") \
-                 or dropping the wrapper's path prefix is WRONG — always prepend the wrapper's \
-                 full base. Take the method from the site's arguments when the wrapper \
-                 parameterizes it. Report the site's own line numbers and call_expression_text. \
-                 Do NOT report the wrapper's internal request line here — it belongs to the \
-                 wrapper's own file.\n{}\n",
+                "\n### IMPORTED HTTP WRAPPER DEFINITIONS (same-repo declarations this file calls)\n\
+                 The source below is read from OTHER files of this repo: each declaration a call \
+                 in THIS file reaches through an import (a function, a member of an exported \
+                 object, or a method of an exported class or instance), the helpers that \
+                 declaration calls, and the bindings they read. Each declaration is labelled \
+                 with how this file calls it. A call in THIS file to one of them (directly, \
+                 through the object or instance, or via `.call(...)`/`.apply(...)`) is a real \
+                 outbound HTTP data call happening at that call site. For each such call site, \
+                 emit a data_call whose method and target are RESOLVED through the declaration \
+                 and its helpers. The target MUST be the full request URL they build: the \
+                 helper's base (keep any `${{...}}` host/config interpolation verbatim) + any \
+                 path prefix the helper adds + the path the declaration passes (or this site \
+                 passes, when the declaration takes the path as an argument), with this \
+                 site's arguments standing in for the declaration's parameters. Example: the \
+                 helper builds `${{cfg.host}}/api/v1${{path}}` and the declaration passes \
+                 `/things/${{id}}` -> target `${{cfg.host}}/api/v1/things/${{id}}`. Emitting only \
+                 the declaration's path (\"/things/${{id}}\") or dropping the helper's path \
+                 prefix is WRONG — always prepend the helper's full base. Take the method from \
+                 the declaration, or from the site's arguments when the declaration \
+                 parameterizes it. Every literal path segment and host in the target must be \
+                 text written in this file or in the declarations below; when the path cannot \
+                 be read from them, emit no data_call for that site rather than naming one. \
+                 Report the site's own line numbers and call_expression_text. Do NOT report the \
+                 declarations' internal request lines here — they belong to their own files.\n{}\n",
                 wrapper_context.join("\n")
             )
         };
@@ -2271,7 +2281,7 @@ const r = await apiRequest.call(this, "GET", "/webhooks", {});"#;
         assert!(!without.contains("IMPORTED HTTP WRAPPER DEFINITIONS"));
 
         let wrapper = vec![
-            "--- wrapper module: nodes/GenericFunctions.ts ---\nexport async function apiRequest(method, resource) { /* baseURL: `${credentials.host}/api/v1` */ }".to_string(),
+            "--- module: nodes/GenericFunctions.ts ---\n// called by this file as apiRequest\nexport async function apiRequest(method, resource) { /* baseURL: `${credentials.host}/api/v1` */ }".to_string(),
         ];
         let with = agent
             .build_user_message_with_candidates(
@@ -2287,7 +2297,7 @@ const r = await apiRequest.call(this, "GET", "/webhooks", {});"#;
             )
             .text;
         assert!(with.contains("### IMPORTED HTTP WRAPPER DEFINITIONS"));
-        assert!(with.contains("wrapper module: nodes/GenericFunctions.ts"));
+        assert!(with.contains("--- module: nodes/GenericFunctions.ts ---"));
         // The section sits in the per-file zone: after the import table,
         // before the file content (cache-prefix invariant).
         let sec = with.find("### IMPORTED HTTP WRAPPER DEFINITIONS").unwrap();

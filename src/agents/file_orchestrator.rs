@@ -25,6 +25,7 @@ use crate::{
         },
         framework_guidance_agent::ProtocolGuidance,
     },
+    binding_facts::{self, ImporterFacts, ModuleIndex, TargetEvidence},
     call_base::resolve_call_base,
     cloud_storage::{ManifestRole, ManifestTypeKind},
     config::Config,
@@ -69,8 +70,10 @@ use crate::{
     wrapper_request_shape::{self, RequestShapeSignal, WrapperRequestShape},
 };
 use futures::stream::StreamExt;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use swc_common::{
     SourceMap,
     errors::{ColorConfig, Handler},
@@ -248,16 +251,169 @@ pub struct ProcessingStats {
     /// extraction gave them to the method their wrapper module hardcodes
     /// (carrick-cloud#386). A subset of `total_data_calls`.
     pub wrapper_method_propagations: usize,
+    /// Declarations cut or left out of a file's imported-declaration facts
+    /// for their size (carrick#1146). A non-zero count means some file was
+    /// handed less than its calls reach.
+    pub wrapper_facts_truncated: usize,
+    /// Model data calls dropped because their target states a path segment or
+    /// host written nowhere in the file or the declarations it was handed
+    /// (carrick#1146). Each one is logged with the part that was not found.
+    pub model_calls_without_evidence: usize,
+    /// Rows whose client name was set to the project function the call is
+    /// written through (carrick#1155).
+    pub call_via_stamped: usize,
+    /// Model data calls at an offered site whose base the model spelled
+    /// differently from the helper it reaches (carrick#1146). The helper's
+    /// spelling is served; each disagreement is logged with both.
+    pub model_base_disagreements: usize,
     pub total_data_calls: usize,
     pub errors: Vec<String>,
+}
+
+/// How the imported-declaration facts reach other modules (carrick#1146).
+///
+/// A specifier resolves relatively or through a tsconfig `paths`/`baseUrl`
+/// alias, and a re-export barrel stands for the modules behind it. A module is
+/// read for its declarations only when it can hold one that issues a request:
+/// it performs HTTP itself (`wrapper_map`), or it imports a module that does.
+/// Everything else is never parsed for this, which keeps the pass off the
+/// repo's utility modules. Indexes are built once per scan, on first use.
+struct FactModuleResolver<'a> {
+    wrapper_map: &'a HashMap<PathBuf, WrapperModule>,
+    request_modules: HashSet<PathBuf>,
+    reexport_cache: &'a RefCell<HashMap<PathBuf, Vec<String>>>,
+    indexes: RefCell<HashMap<PathBuf, Option<Rc<ModuleIndex>>>>,
+    /// Modules read only for a binding's declaration, not for requests.
+    declarations: RefCell<HashMap<PathBuf, Option<Rc<ModuleIndex>>>>,
+    scanner: &'a SwcScanner,
+    detection: &'a DetectionResult,
+    repo_root: Option<PathBuf>,
+    cm: &'a Lrc<SourceMap>,
+    handler: &'a Handler,
+}
+
+impl FactModuleResolver<'_> {
+    /// How a module is named in the material: repo-relative where it can be.
+    fn display(&self, module: &Path) -> String {
+        self.repo_root
+            .as_ref()
+            .and_then(|root| module.strip_prefix(root).ok())
+            .unwrap_or(module)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// The canonical path of the module `specifier` names from `from`.
+    fn resolve(from: &Path, specifier: &str) -> Option<PathBuf> {
+        if specifier.starts_with("./") || specifier.starts_with("../") {
+            return FileOrchestrator::resolve_relative_import(from, specifier);
+        }
+        let found = FileOrchestrator::resolve_import_path(&from.to_string_lossy(), specifier);
+        let path = PathBuf::from(&found);
+        if found != specifier && path.is_file() {
+            path.canonicalize().ok()
+        } else {
+            None
+        }
+    }
+
+    /// Whether any of `specifiers`, written in `from`, names a module whose
+    /// declarations can issue a request.
+    fn reaches_request_module(&self, from: &Path, specifiers: &[String]) -> bool {
+        specifiers.iter().any(|specifier| {
+            use binding_facts::ModuleResolver;
+            self.modules(from, specifier)
+                .iter()
+                .any(|module| self.request_modules.contains(module))
+        })
+    }
+}
+
+impl binding_facts::ModuleResolver for FactModuleResolver<'_> {
+    fn modules(&self, from: &Path, specifier: &str) -> Vec<PathBuf> {
+        let Some(resolved) = Self::resolve(from, specifier) else {
+            return Vec::new();
+        };
+        let self_canon = from.canonicalize().ok();
+        let mut modules = vec![resolved.clone()];
+        modules.extend(FileOrchestrator::wrapper_modules_behind(
+            &resolved,
+            self_canon.as_ref(),
+            self.wrapper_map,
+            &mut self.reexport_cache.borrow_mut(),
+            self.cm,
+            self.handler,
+        ));
+        let reexports = self
+            .reexport_cache
+            .borrow_mut()
+            .entry(resolved.clone())
+            .or_insert_with(|| FileOrchestrator::reexport_sources(&resolved, self.cm, self.handler))
+            .clone();
+        modules.extend(
+            reexports
+                .iter()
+                .filter_map(|specifier| Self::resolve(&resolved, specifier)),
+        );
+        let mut seen = HashSet::new();
+        modules.retain(|module| seen.insert(module.clone()));
+        modules
+    }
+
+    fn index(&self, module: &Path) -> Option<Rc<ModuleIndex>> {
+        if !self.request_modules.contains(module) {
+            return None;
+        }
+        if let Some(cached) = self.indexes.borrow().get(module) {
+            return cached.clone();
+        }
+        let built = std::fs::read_to_string(module).ok().and_then(|content| {
+            let scan = self.scanner.scan_content(
+                module,
+                &content,
+                &self.detection.data_fetchers,
+                &self.detection.messaging_clients,
+            );
+            let requests: Vec<((u32, u32), Option<String>)> = scan
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.protocol == Protocol::Http)
+                .map(|candidate| ((candidate.span_start, candidate.span_end), None))
+                .chain(scan.local_wrapper_calls.iter().map(|call| {
+                    (
+                        (call.span_start, call.span_end),
+                        binding_facts::leading_base(&call.target),
+                    )
+                }))
+                .collect();
+            ModuleIndex::build(module, &self.display(module), &content, requests).map(Rc::new)
+        });
+        self.indexes
+            .borrow_mut()
+            .insert(module.to_path_buf(), built.clone());
+        built
+    }
+
+    fn declarations(&self, module: &Path) -> Option<Rc<ModuleIndex>> {
+        if let Some(Some(index)) = self.indexes.borrow().get(module) {
+            return Some(Rc::clone(index));
+        }
+        if let Some(cached) = self.declarations.borrow().get(module) {
+            return cached.clone();
+        }
+        let built = std::fs::read_to_string(module).ok().and_then(|content| {
+            ModuleIndex::build(module, &self.display(module), &content, Vec::new()).map(Rc::new)
+        });
+        self.declarations
+            .borrow_mut()
+            .insert(module.to_path_buf(), built.clone());
+        built
+    }
 }
 
 /// A same-repo module that itself performs HTTP and exports a binding — the
 /// shape of a request wrapper another file imports (#369/#370).
 struct WrapperModule {
-    /// The module's source, injected into the importing file's prompt so its
-    /// delegating call sites can be emitted with a resolved target.
-    snippet: String,
     /// The method (and body presence) every request in the module agrees on,
     /// read off the AST. `None` when the module parameterizes its method, its
     /// requests disagree, or none is readable. See `crate::wrapper_request_shape`.
@@ -1130,6 +1286,27 @@ impl FileOrchestrator {
             /// user message so call sites of an imported wrapper can be emitted
             /// as resolved data calls. Empty for files with no such imports.
             wrapper_context: Vec<String>,
+            /// The literals the declarations in `wrapper_context` hold
+            /// (carrick#1146). With the file's own, they are the text a
+            /// model-stated target has to be made of.
+            fact_literals: Vec<String>,
+            /// Call sites raised as candidates because another pass knows they
+            /// issue a request, by call start offset: the same-file wrapper
+            /// sites the fixpoint could not resolve (carrick#1151) and the calls
+            /// through an imported binding whose declaration issues one
+            /// (carrick#1146). Their rows are delegations, whatever span they
+            /// carry.
+            offered_sites: HashSet<u32>,
+            /// The project function each call site is written through, by call
+            /// start offset (carrick#1155): a same-file wrapper, or the bare
+            /// function an imported binding names. Stamped over whatever client
+            /// name extraction wrote.
+            via_names: HashMap<u32, String>,
+            /// The base every request an offered site reaches opens with, by
+            /// call start offset: the module that reads it and the expression
+            /// as that module spells it (carrick#1146). The served row takes
+            /// its base from here; the model's spelling of it is advisory.
+            site_bases: HashMap<u32, (PathBuf, String)>,
             /// The request shape every wrapper module behind `wrapper_context`
             /// agrees on (carrick-cloud#386): the literal HTTP method, and
             /// whether the request carries a body. `None` — the common case —
@@ -1234,7 +1411,19 @@ impl FileOrchestrator {
             stats.wrapper_method_propagations += FileOrchestrator::propagate_wrapper_request_shape(
                 adjusted,
                 pf.wrapper_request_shape.as_ref(),
+                &pf.offered_sites,
             );
+            // A target the model stated alone must be made of text that was
+            // in front of it (carrick#1146). Before any pass that rewrites a
+            // target, so what is checked is what the model wrote.
+            stats.model_calls_without_evidence += FileOrchestrator::drop_unevidenced_model_calls(
+                adjusted,
+                Path::new(&pf.path_str),
+                &pf.content,
+                &pf.fact_literals,
+            )
+            .len();
+            stats.call_via_stamped += FileOrchestrator::stamp_call_via(adjusted, &pf.via_names);
             // Collapse inline env-var fallbacks the model rendered
             // verbatim (`${A ?? "http://localhost"}/p` -> `${A}/p`,
             // carrick#399) BEFORE alias resolution: a local alias with
@@ -1245,6 +1434,12 @@ impl FileOrchestrator {
             // env-var classification, uploads) sees one normalized
             // form.
             FileOrchestrator::normalize_fallback_targets(adjusted);
+            // The base of a call through an imported declaration is a fact of
+            // the helper's source; the model's spelling of it is advisory
+            // (carrick#1146). Before alias resolution, which reads the
+            // spelling this writes.
+            stats.model_base_disagreements +=
+                FileOrchestrator::settle_offered_site_bases(adjusted, &pf.site_bases, &pf.path_str);
             FileOrchestrator::resolve_target_bases(
                 adjusted,
                 &pf.env_alias_map,
@@ -1340,6 +1535,7 @@ impl FileOrchestrator {
         // work list of files that actually need an LLM call. Zero-cost skips are recorded here.
         let mut pending: Vec<PendingFile> = Vec::new();
         let mut deferred_zero_candidates: Vec<DeferredZeroCandidate> = Vec::new();
+        let mut file_import_specs: Vec<(PathBuf, Vec<String>)> = Vec::new();
         // Route tables that bind a path to an imported handler (#580 part b).
         // Collected here, where the file's content is already in hand, and
         // resolved after the whole pass: the endpoints belong to the CONTROLLER
@@ -1403,6 +1599,11 @@ impl FileOrchestrator {
             // A parse failure excludes the whole file (and any endpoints in
             // it) from the index — surface it instead of letting it look like
             // a healthy file with no API patterns.
+            // Which modules every parsed file imports, for the facts pass
+            // (carrick#1146): a module that imports a request wrapper can hold
+            // a declaration that issues a request through it.
+            file_import_specs.push((file_path.clone(), scan_result.import_sources.clone()));
+
             if scan_result.parse_failed {
                 warn!(
                     "Failed to parse {} — file excluded from analysis; any endpoints in it \
@@ -1675,18 +1876,14 @@ impl FileOrchestrator {
             );
 
             // STEP 3: Prepare Candidate Targets as hints for the LLM
-            let candidate_hints: Vec<String> =
-                http_candidates.iter().map(|c| c.format_hint()).collect();
-            let candidate_contexts: Vec<String> = http_candidates
-                .iter()
-                .map(|c| serde_json::to_string(c).unwrap_or_default())
-                .collect();
-            let candidate_map: HashMap<String, CandidateTarget> = http_candidates
-                .iter()
-                .map(|candidate| (candidate.candidate_id.clone(), candidate.clone()))
-                .collect();
+            let (candidate_hints, candidate_contexts, candidate_map) =
+                Self::candidate_inputs(&http_candidates);
 
             let symbols = Self::extract_symbol_table(file_path, &cm, &handler);
+            let (offered_sites, via_names) = Self::same_file_wrapper_sites(
+                &scan_result.local_wrapper_calls,
+                &scan_result.unresolved_wrapper_sites,
+            );
 
             pending.push(PendingFile {
                 path_str,
@@ -1706,6 +1903,10 @@ impl FileOrchestrator {
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: Vec::new(),
+                fact_literals: Vec::new(),
+                offered_sites,
+                via_names,
+                site_bases: HashMap::new(),
                 wrapper_request_shape: None,
                 pubsub_anchor_ops: scan_result.pubsub_anchor_ops,
                 local_wrapper_calls: scan_result.local_wrapper_calls,
@@ -1722,10 +1923,11 @@ impl FileOrchestrator {
         // PHASE 1b (#369 — cross-file wrapper-site resolution). Wrapper map:
         // same-repo modules that themselves perform HTTP (≥1 HTTP candidate)
         // AND export at least one binding — the shape of a request wrapper
-        // another file would import. Keyed by canonical file path. The whole
-        // (size-capped) file is the context snippet: wrappers are small client
-        // modules, and slicing exact function spans buys little over the cap.
-        const WRAPPER_SNIPPET_MAX: usize = 4_000;
+        // another file would import. Keyed by canonical file path. Each one is
+        // also read for its declarations (carrick#1146): an importing file is
+        // handed exactly the declarations its own calls reach, not a prefix of
+        // the module, which cut the member bodies off any client module longer
+        // than the prefix. See `crate::binding_facts`.
         let mut wrapper_map: HashMap<PathBuf, WrapperModule> = HashMap::new();
         for pf in &pending {
             // Rescued files (graphql/messaging fall-throughs) carry no HTTP
@@ -1744,17 +1946,6 @@ impl FileOrchestrator {
             let Ok(canonical) = path.canonicalize() else {
                 continue;
             };
-            let mut snippet = format!("--- wrapper module: {} ---\n", pf.path_str);
-            if pf.content.len() > WRAPPER_SNIPPET_MAX {
-                let mut end = WRAPPER_SNIPPET_MAX;
-                while end > 0 && !pf.content.is_char_boundary(end) {
-                    end -= 1;
-                }
-                snippet.push_str(&pf.content[..end]);
-                snippet.push_str("\n// (truncated)");
-            } else {
-                snippet.push_str(&pf.content);
-            }
             // The method the module's own request calls fix, read off the AST
             // candidates the gatekeeper already raised for it
             // (carrick-cloud#386). `None` whenever the module parameterizes its
@@ -1763,14 +1954,35 @@ impl FileOrchestrator {
             let request_shape = wrapper_request_shape::fold_module(
                 pf.candidate_map.values().map(|c| &c.request_shape),
             );
-            wrapper_map.insert(
-                canonical,
-                WrapperModule {
-                    snippet,
-                    request_shape,
-                },
-            );
+            wrapper_map.insert(canonical, WrapperModule { request_shape });
         }
+        // Barrel follows and per-module re-export specifiers, shared by the
+        // request-shape fold and the fact reader below (#472).
+        let reexport_cache: RefCell<HashMap<PathBuf, Vec<String>>> = RefCell::new(HashMap::new());
+        let mut fact_resolver = FactModuleResolver {
+            wrapper_map: &wrapper_map,
+            request_modules: wrapper_map.keys().cloned().collect(),
+            reexport_cache: &reexport_cache,
+            indexes: RefCell::new(HashMap::new()),
+            declarations: RefCell::new(HashMap::new()),
+            scanner: &self.swc_scanner,
+            detection: framework_detection,
+            repo_root: repo_root.canonicalize().ok(),
+            cm: &cm,
+            handler: &handler,
+        };
+        if !wrapper_map.is_empty() {
+            // One hop out: a module importing a request wrapper can declare a
+            // member that issues its request through it.
+            let hop: Vec<PathBuf> = file_import_specs
+                .iter()
+                .filter(|(file, specifiers)| fact_resolver.reaches_request_module(file, specifiers))
+                .filter_map(|(file, _)| file.canonicalize().ok())
+                .collect();
+            fact_resolver.request_modules.extend(hop);
+        }
+        let file_import_specs: HashMap<PathBuf, Vec<String>> =
+            file_import_specs.into_iter().collect();
 
         // Attach wrapper context to files that import a wrapper module via a
         // RELATIVE specifier (v1 scope: `./`/`../` only — tsconfig path
@@ -1808,7 +2020,6 @@ impl FileOrchestrator {
         // every importer: a package name resolves the same from every file, so
         // this is repo-wide rather than per-consumer.
         let mut surface_cache: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        let mut reexport_cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
         // The same-repo modules each module imports, resolved, memoized across
         // every importer that reaches it: the second ring of the member join
         // below reads it once per module, not once per consumer.
@@ -1845,7 +2056,7 @@ impl FileOrchestrator {
                         &resolved,
                         self_canon.as_ref(),
                         &wrapper_map,
-                        &mut reexport_cache,
+                        &mut reexport_cache.borrow_mut(),
                         &cm,
                         &handler,
                     ));
@@ -1861,10 +2072,40 @@ impl FileOrchestrator {
                         .filter_map(|path| wrapper_map.get(path))
                         .map(|module| module.request_shape.as_ref()),
                 );
-                pf.wrapper_context = matched
-                    .iter()
-                    .filter_map(|path| wrapper_map.get(path).map(|m| m.snippet.clone()))
-                    .collect();
+                // The declarations this file's calls reach (carrick#1146), and
+                // the sites that reach them offered as candidates.
+                if !wrapper_map.is_empty()
+                    && file_import_specs
+                        .get(&importer)
+                        .is_some_and(|specs| fact_resolver.reaches_request_module(&importer, specs))
+                {
+                    let facts = Self::importer_facts(&importer, &pf.content, &fact_resolver);
+                    stats.wrapper_facts_truncated += facts.truncated;
+                    let offered: HashSet<u32> = facts.sites.iter().copied().collect();
+                    let raised: HashSet<u32> =
+                        pf.candidate_map.values().map(|c| c.span_start).collect();
+                    if !offered.is_subset(&raised) {
+                        let rescan = self.swc_scanner.scan_content_offering(
+                            &importer,
+                            &pf.content,
+                            &framework_detection.data_fetchers,
+                            &framework_detection.messaging_clients,
+                            &offered,
+                        );
+                        let http: Vec<CandidateTarget> = rescan
+                            .candidates
+                            .into_iter()
+                            .filter(|candidate| candidate.protocol == Protocol::Http)
+                            .collect();
+                        (pf.candidate_hints, pf.candidate_contexts, pf.candidate_map) =
+                            Self::candidate_inputs(&http);
+                    }
+                    pf.offered_sites.extend(offered);
+                    pf.via_names.extend(facts.via);
+                    pf.site_bases = facts.bases;
+                    pf.wrapper_context = facts.material;
+                    pf.fact_literals = facts.literals;
+                }
                 // Members reached directly by a relative import, plus those
                 // behind a re-export barrel the wrapper pass already followed,
                 // and then one hop further: the modules those import. A
@@ -1976,7 +2217,7 @@ impl FileOrchestrator {
                                         specifier,
                                         &workspace_packages,
                                         repo_root,
-                                        &mut reexport_cache,
+                                        &mut reexport_cache.borrow_mut(),
                                         &cm,
                                         &handler,
                                     )
@@ -2016,10 +2257,13 @@ impl FileOrchestrator {
             }
         }
 
-        // Rescue or finalize the deferred zero-candidate skips: a file that
-        // imports a wrapper module is force-analyzed with the wrapper's source
-        // as context (its call sites are the repo's real outbound calls);
-        // everything else is skipped exactly as before this pass existed.
+        // Rescue or finalize the deferred zero-candidate skips. A file whose
+        // calls reach a request through an imported declaration is analyzed
+        // with those declarations as context and those calls as its candidates
+        // (carrick#1146); its call sites are the repo's real outbound calls.
+        // Importing a wrapper module is not enough on its own: a file that only
+        // calls the module's formatting helpers has nothing for the model to
+        // resolve, and is skipped exactly as a file with no imports is.
         for deferred in deferred_zero_candidates {
             let mut seen: HashSet<PathBuf> = HashSet::new();
             let mut matched: Vec<PathBuf> = Vec::new();
@@ -2037,7 +2281,7 @@ impl FileOrchestrator {
                         &resolved,
                         self_canon.as_ref(),
                         &wrapper_map,
-                        &mut reexport_cache,
+                        &mut reexport_cache.borrow_mut(),
                         &cm,
                         &handler,
                     ));
@@ -2045,17 +2289,25 @@ impl FileOrchestrator {
                 matched.sort();
                 matched.dedup();
             }
-            let rescued_shape = wrapper_request_shape::fold_wrappers(
-                matched
-                    .iter()
-                    .filter_map(|path| wrapper_map.get(path))
-                    .map(|module| module.request_shape.as_ref()),
-            );
-            let ctx: Vec<String> = matched
-                .iter()
-                .filter_map(|path| wrapper_map.get(path).map(|m| m.snippet.clone()))
-                .collect();
-            if ctx.is_empty() {
+            // Re-read the deferred file: content was not retained at defer time
+            // (memory), and the file was readable moments ago in this pass. Only
+            // a file that can reach an indexed declaration is read at all.
+            let facts_and_content = if wrapper_map.is_empty()
+                || !fact_resolver
+                    .reaches_request_module(&deferred.file_path, &deferred.import_sources)
+            {
+                None
+            } else {
+                std::fs::read_to_string(&deferred.file_path)
+                    .ok()
+                    .map(|content| {
+                        let facts =
+                            Self::importer_facts(&deferred.file_path, &content, &fact_resolver);
+                        (facts, content)
+                    })
+                    .filter(|(facts, _)| !facts.sites.is_empty())
+            };
+            let Some((facts, content)) = facts_and_content else {
                 debug!(
                     "Skipped (no API patterns): {} [0 candidates]",
                     deferred.path_str
@@ -2067,30 +2319,42 @@ impl FileOrchestrator {
                 // scanner that later raises a candidate for it dispatches it.
                 file_results.insert(deferred.path_str, FileAnalysisResult::default());
                 continue;
-            }
-            debug!(
-                "Force-analyzing wrapper-importing file (no HTTP candidates): {}",
-                deferred.path_str
-            );
-            // Re-read the rescued file: content was not retained at defer time
-            // (memory), and the file was readable moments ago in this pass.
-            let Ok(content) = std::fs::read_to_string(&deferred.file_path) else {
-                warn!(
-                    "Wrapper-importing file became unreadable, skipping: {}",
-                    deferred.path_str
-                );
-                stats.files_skipped += 1;
-                file_results.insert(deferred.path_str, FileAnalysisResult::default());
-                continue;
             };
+            let rescued_shape = wrapper_request_shape::fold_wrappers(
+                matched
+                    .iter()
+                    .filter_map(|path| wrapper_map.get(path))
+                    .map(|module| module.request_shape.as_ref()),
+            );
+            debug!(
+                "Force-analyzing file that calls an imported request declaration: {} [{} site(s)]",
+                deferred.path_str,
+                facts.sites.len()
+            );
+            stats.wrapper_facts_truncated += facts.truncated;
+            let offered: HashSet<u32> = facts.sites.iter().copied().collect();
+            let rescan = self.swc_scanner.scan_content_offering(
+                &deferred.file_path,
+                &content,
+                &framework_detection.data_fetchers,
+                &framework_detection.messaging_clients,
+                &offered,
+            );
+            let http: Vec<CandidateTarget> = rescan
+                .candidates
+                .into_iter()
+                .filter(|candidate| candidate.protocol == Protocol::Http)
+                .collect();
+            let (candidate_hints, candidate_contexts, candidate_map) =
+                Self::candidate_inputs(&http);
             let symbols = Self::extract_symbol_table(&deferred.file_path, &cm, &handler);
             pending.push(PendingFile {
                 path_str: deferred.path_str,
                 content,
                 route_module_claimed: deferred.route_module_claimed,
-                candidate_hints: Vec::new(),
-                candidate_contexts: Vec::new(),
-                candidate_map: HashMap::new(),
+                candidate_hints,
+                candidate_contexts,
+                candidate_map,
                 symbol_table: symbols.table,
                 env_alias_map: symbols.env_aliases,
                 whole_url_fallbacks: symbols.whole_url_fallbacks,
@@ -2101,7 +2365,11 @@ impl FileOrchestrator {
                 decorator_endpoints: Vec::new(),
                 graphql_producer_hints: graphql_producer_hints.lines.clone(),
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
-                wrapper_context: ctx,
+                wrapper_context: facts.material,
+                fact_literals: facts.literals,
+                offered_sites: offered,
+                via_names: facts.via,
+                site_bases: facts.bases,
                 wrapper_request_shape: rescued_shape,
                 // Rescued zero-candidate files by definition raised no Signal 7
                 // candidate, so they can carry no anchor ops either.
@@ -2202,6 +2470,53 @@ impl FileOrchestrator {
                     &cm,
                     &handler,
                 );
+            }
+        }
+
+        // PHASE 1c': the base an offered site's request opens with is read in
+        // the HELPER's module, so that module's resolution of it is the one
+        // the site's row must get (carrick#1146). Carry the helper's alias and
+        // literal-base entry for exactly that expression into the consumer's
+        // maps. A consumer that binds the same name to something else keeps
+        // its own, and its sites keep the model's spelling.
+        {
+            let helper_maps: HashMap<PathBuf, (EnvAliasMap, LiteralBaseMap)> = pending
+                .iter()
+                .filter_map(|pf| {
+                    let canonical = Path::new(&pf.path_str).canonicalize().ok()?;
+                    Some((
+                        canonical,
+                        (pf.env_alias_map.clone(), pf.literal_bases.clone()),
+                    ))
+                })
+                .collect();
+            for pf in &mut pending {
+                if pf.site_bases.is_empty() {
+                    continue;
+                }
+                let mut conflicting: Vec<u32> = Vec::new();
+                for (site, (module, base)) in &pf.site_bases {
+                    let Some((aliases, literals)) = helper_maps.get(module) else {
+                        continue;
+                    };
+                    let carried = [
+                        (aliases.get(base), &mut pf.env_alias_map),
+                        (literals.get(base), &mut pf.literal_bases),
+                    ];
+                    for (value, map) in carried {
+                        let Some(value) = value else { continue };
+                        match map.get(base) {
+                            Some(own) if own != value => conflicting.push(*site),
+                            Some(_) => {}
+                            None => {
+                                map.insert(base.clone(), value.clone());
+                            }
+                        }
+                    }
+                }
+                for site in conflicting {
+                    pf.site_bases.remove(&site);
+                }
             }
         }
 
@@ -2560,6 +2875,22 @@ impl FileOrchestrator {
         debug!(
             "  - Wrapper method propagations: {}",
             stats.wrapper_method_propagations
+        );
+        debug!(
+            "  - Imported declarations cut from a file's facts for size: {}",
+            stats.wrapper_facts_truncated
+        );
+        debug!(
+            "  - Model data calls dropped for a target written nowhere: {}",
+            stats.model_calls_without_evidence
+        );
+        debug!(
+            "  - Rows named after the function they are written through: {}",
+            stats.call_via_stamped
+        );
+        debug!(
+            "  - Model bases replaced by the helper's own: {}",
+            stats.model_base_disagreements
         );
 
         // PHASE 5 (carrick#656): state what the member join could not follow.
@@ -5861,6 +6192,193 @@ impl FileOrchestrator {
     /// candidate keeps no span, exactly as before, and is placed by its line.
     /// A model row with no deterministic twin is kept as its own row.
     #[allow(clippy::too_many_arguments)]
+    /// The three forms a file's HTTP candidates reach the analyzer and the
+    /// join in: the hint lines, the JSON contexts, and the map by id.
+    fn candidate_inputs(
+        http_candidates: &[CandidateTarget],
+    ) -> (Vec<String>, Vec<String>, HashMap<String, CandidateTarget>) {
+        let hints = http_candidates.iter().map(|c| c.format_hint()).collect();
+        let contexts = http_candidates
+            .iter()
+            .map(|c| serde_json::to_string(c).unwrap_or_default())
+            .collect();
+        let map = http_candidates
+            .iter()
+            .map(|candidate| (candidate.candidate_id.clone(), candidate.clone()))
+            .collect();
+        (hints, contexts, map)
+    }
+
+    /// The same-file wrapper sites of one file: which are offered as
+    /// candidates (the ones the fixpoint could not resolve, carrick#1151), and
+    /// the wrapper every one of them is written through (carrick#1155).
+    fn same_file_wrapper_sites(
+        calls: &[LocalWrapperCall],
+        unresolved: &[(u32, String)],
+    ) -> (HashSet<u32>, HashMap<u32, String>) {
+        let offered = unresolved.iter().map(|(start, _)| *start).collect();
+        let via = calls
+            .iter()
+            .map(|call| (call.span_start, call.wrapper_name.clone()))
+            .chain(unresolved.iter().cloned())
+            .collect();
+        (offered, via)
+    }
+
+    /// The declarations one file's calls reach through its imports
+    /// (carrick#1146). Empty when the file does not parse or reaches none.
+    fn importer_facts(
+        importer: &Path,
+        content: &str,
+        resolver: &FactModuleResolver<'_>,
+    ) -> ImporterFacts {
+        match binding_facts::scan_importer(importer, content) {
+            Some(scan) if !scan.sites.is_empty() => {
+                binding_facts::importer_facts(importer, &scan, resolver)
+            }
+            _ => ImporterFacts::default(),
+        }
+    }
+
+    /// Drop the model's data calls whose target states a path segment or host
+    /// that is written nowhere the model could read it (carrick#1146, Design 1
+    /// (c)): not in the analyzed file, and not in the declarations it was
+    /// handed. Only rows the model stated alone are read; a row that joined a
+    /// deterministic one already carries the source's target.
+    ///
+    /// Returns what was dropped, each as `(target, the unbacked part)`.
+    fn drop_unevidenced_model_calls(
+        result: &mut FileAnalysisResult,
+        file_path: &Path,
+        content: &str,
+        fact_literals: &[String],
+    ) -> Vec<(String, String)> {
+        if !result
+            .data_calls
+            .iter()
+            .any(|call| call.resolution_source == Some(ResolutionSource::Model))
+        {
+            return Vec::new();
+        }
+        let file_literals = TargetEvidence::file_literals(file_path, content);
+        let evidence = TargetEvidence::new(
+            file_literals
+                .iter()
+                .chain(fact_literals.iter())
+                .map(String::as_str),
+        );
+        let mut dropped = Vec::new();
+        result.data_calls.retain(|call| {
+            if call.resolution_source != Some(ResolutionSource::Model) {
+                return true;
+            }
+            match evidence.unbacked_part(&call.target) {
+                Some(part) => {
+                    debug!(
+                        "Dropping the model's data call {} {} at {}:{}: '{}' is written nowhere in the file or the declarations it was handed",
+                        call.method.as_deref().unwrap_or("<unstated>"),
+                        call.target,
+                        file_path.display(),
+                        call.line_number,
+                        part
+                    );
+                    dropped.push((call.target.clone(), part));
+                    false
+                }
+                None => true,
+            }
+        });
+        dropped
+    }
+
+    /// Serve the helper's base on a model row at an offered site
+    /// (carrick#1146): replace whatever opens the model's target (its own
+    /// `${...}`, an origin it resolved, or nothing) with the base the helper
+    /// reads, keeping everything after it. Returns how many rows the model
+    /// spelled differently.
+    fn settle_offered_site_bases(
+        result: &mut FileAnalysisResult,
+        site_bases: &HashMap<u32, (PathBuf, String)>,
+        file_path: &str,
+    ) -> usize {
+        if site_bases.is_empty() {
+            return 0;
+        }
+        let mut disagreements = 0;
+        for call in &mut result.data_calls {
+            if call.resolution_source != Some(ResolutionSource::Model) {
+                continue;
+            }
+            let Some((_, base)) = call
+                .call_expression_span_start
+                .and_then(|start| site_bases.get(&start))
+            else {
+                continue;
+            };
+            let target = call.target.trim();
+            let rest = if let Some(after) = target.strip_prefix("${") {
+                let mut depth = 1;
+                let mut end = None;
+                for (index, c) in after.char_indices() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(index);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(end) = end else { continue };
+                if after[..end].trim() == base {
+                    continue;
+                }
+                &after[end + 1..]
+            } else if let Some((_, after_scheme)) = target
+                .split_once("://")
+                .filter(|(scheme, _)| scheme.chars().all(|c| c.is_ascii_alphabetic()))
+            {
+                &after_scheme[after_scheme.find('/').unwrap_or(after_scheme.len())..]
+            } else if target.starts_with('/') {
+                target
+            } else {
+                continue;
+            };
+            let settled = format!("${{{base}}}{rest}");
+            debug!(
+                "Serving the helper's base on the model's data call at {}:{}: {:?} -> {:?}",
+                file_path, call.line_number, call.target, settled
+            );
+            call.target = settled;
+            disagreements += 1;
+        }
+        disagreements
+    }
+
+    /// Name the project function each row is written through (carrick#1155),
+    /// over whatever client name extraction wrote. Keyed on the row's own call
+    /// span, so only a row at a site the scanner read is touched.
+    fn stamp_call_via(result: &mut FileAnalysisResult, via_names: &HashMap<u32, String>) -> usize {
+        if via_names.is_empty() {
+            return 0;
+        }
+        let mut stamped = 0;
+        for call in &mut result.data_calls {
+            if let Some(name) = call
+                .call_expression_span_start
+                .and_then(|start| via_names.get(&start))
+                && call.pattern_matched != *name
+            {
+                call.pattern_matched = name.clone();
+                stamped += 1;
+            }
+        }
+        stamped
+    }
+
     fn join_model_rows(
         result: &mut FileAnalysisResult,
         model: FileAnalysisResult,
@@ -7043,6 +7561,7 @@ impl FileOrchestrator {
     fn propagate_wrapper_request_shape(
         result: &mut FileAnalysisResult,
         shape: Option<&WrapperRequestShape>,
+        offered_sites: &HashSet<u32>,
     ) -> usize {
         let Some(shape) = shape else {
             return 0;
@@ -7050,8 +7569,13 @@ impl FileOrchestrator {
         let mut propagated = 0;
         for data_call in &mut result.data_calls {
             // Extracted at its own client call site, not through the wrapper —
-            // its method is the one the scanner saw.
-            if data_call.call_expression_span_start.is_some() {
+            // its method is the one the scanner saw. A site offered because
+            // it calls through an imported declaration carries a span and is
+            // still a delegation (carrick#1146).
+            if data_call
+                .call_expression_span_start
+                .is_some_and(|start| !offered_sites.contains(&start))
+            {
                 continue;
             }
             let existing = data_call
@@ -8594,7 +9118,6 @@ mod tests {
                 (
                     p.canonicalize().expect("wrapper must exist"),
                     WrapperModule {
-                        snippet: format!("--- wrapper module: {} ---\n", p.display()),
                         request_shape: None,
                     },
                 )
@@ -10257,8 +10780,11 @@ export * from "./aFetch.js";"#,
             has_body: Some(true),
         };
 
-        let propagated =
-            FileOrchestrator::propagate_wrapper_request_shape(&mut result, Some(&shape));
+        let propagated = FileOrchestrator::propagate_wrapper_request_shape(
+            &mut result,
+            Some(&shape),
+            &HashSet::new(),
+        );
 
         assert_eq!(propagated, 1, "only the delegating site is rewritten");
         assert_eq!(
@@ -10275,7 +10801,7 @@ export * from "./aFetch.js";"#,
     fn an_unknown_wrapper_shape_rewrites_nothing() {
         let mut result = result_with_data_calls(vec![methodless_call(23, "/catalog/sync", None)]);
         assert_eq!(
-            FileOrchestrator::propagate_wrapper_request_shape(&mut result, None),
+            FileOrchestrator::propagate_wrapper_request_shape(&mut result, None, &HashSet::new()),
             0
         );
         assert_eq!(result.data_calls[0].method, None);
@@ -10298,6 +10824,7 @@ export * from "./aFetch.js";"#,
                 method: "DELETE".to_string(),
                 has_body: Some(false),
             }),
+            &HashSet::new(),
         );
 
         assert_eq!(result.data_calls[0].method.as_deref(), Some("DELETE"));
@@ -10320,6 +10847,7 @@ export * from "./aFetch.js";"#,
                 method: "POST".to_string(),
                 has_body: None,
             }),
+            &HashSet::new(),
         );
 
         assert_eq!(

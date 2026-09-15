@@ -61,7 +61,7 @@ fn call_at_line(calls: &[serde_json::Value], line: i64) -> &serde_json::Value {
 #[test]
 fn client_method_states_the_verb_and_the_version_for_its_call_sites() {
     let calls = calls("imported-request-member");
-    assert_eq!(calls.len(), 10, "one row per call site: {calls:#?}");
+    assert_eq!(calls.len(), 9, "one row per call site: {calls:#?}");
 
     // `client.createArtifactUrl(name)` reaches a PUT to /api/v2. The cassette
     // says POST, and says v2 only because the error message four lines below
@@ -85,11 +85,18 @@ fn client_method_states_the_verb_and_the_version_for_its_call_sites() {
     );
 
     // `apiClient.createArtifactUrl(name)` shares a name with the client's
-    // method and is imported from somewhere else, so the join must not fire
-    // and the row must keep what extraction gave it.
-    let local = call_at_line(&calls, 21);
-    assert_eq!(local["method"], "GET");
-    assert_eq!(local["target_url"], "/legacy/handles");
+    // method and is imported from somewhere else, so the join must not fire:
+    // a join that did would state the client's URL here as a row of its own.
+    // What extraction gave the site, `/legacy/handles`, is written nowhere the
+    // model read (the binding it calls issues no request, so it is handed
+    // nothing), and a model path made of text it never saw is dropped
+    // (carrick#1146). So the site has no row at all.
+    assert!(
+        calls
+            .iter()
+            .all(|call| call["line"].as_i64() != Some(21) || call["file"] != "src/artifacts.ts"),
+        "no row at artifacts.ts:21: {calls:#?}"
+    );
 }
 
 /// carrick#588 finding 3: the member builds its URL with `new URL(path, base)`

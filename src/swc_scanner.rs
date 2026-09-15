@@ -25,7 +25,7 @@ use swc_ecma_ast::*;
 
 use swc_ecma_visit::{Visit, VisitWith};
 
-use crate::local_http_wrapper::{LocalWrapperCall, collect_local_wrapper_calls};
+use crate::local_http_wrapper::{LocalWrapperCall, collect_local_wrapper_sites};
 use crate::new_url_target::{NewUrlPathMap, collect_new_url_paths};
 use crate::operation::{Protocol, PubsubRole};
 use crate::parser::parse_file;
@@ -235,6 +235,10 @@ pub struct ScanResult {
     /// own URL resolves to nothing, so the join is read off the AST and merged
     /// into the file's extraction afterwards. See `crate::local_http_wrapper`.
     pub local_wrapper_calls: Vec<LocalWrapperCall>,
+    /// Same-file wrapper sites the fixpoint could not resolve (carrick#1151),
+    /// as (call start offset, wrapper name). Each is also raised as a
+    /// candidate; the name is what the row is written through (carrick#1155).
+    pub unresolved_wrapper_sites: Vec<(u32, String)>,
 }
 
 /// A pub/sub operation asserted deterministically from the AST (carrick#387):
@@ -510,6 +514,7 @@ impl SwcScanner {
                     import_sources: Vec::new(),
                     pubsub_anchor_ops: Vec::new(),
                     local_wrapper_calls: Vec::new(),
+                    unresolved_wrapper_sites: Vec::new(),
                 };
             }
         };
@@ -525,7 +530,9 @@ impl SwcScanner {
         } else {
             HashMap::new()
         };
-        let local_wrapper_calls = collect_local_wrapper_calls(&module, &self.source_map);
+        let wrapper_sites = collect_local_wrapper_sites(&module, &self.source_map);
+        let local_wrapper_calls = wrapper_sites.calls;
+        let unresolved_wrapper_sites = wrapper_sites.unresolved;
         let new_url_paths = collect_new_url_paths(&module, &self.source_map);
         let mut visitor = CandidateVisitor::new(
             self.source_map.clone(),
@@ -535,6 +542,10 @@ impl SwcScanner {
             new_url_paths,
             repo_has_messaging_clients,
             package_import_locals(&module, messaging_clients),
+            unresolved_wrapper_sites
+                .iter()
+                .map(|(start, _)| *start)
+                .collect(),
         );
         module.visit_with(&mut visitor);
 
@@ -544,6 +555,7 @@ impl SwcScanner {
             import_sources,
             pubsub_anchor_ops: visitor.pubsub_anchor_ops,
             local_wrapper_calls,
+            unresolved_wrapper_sites,
         }
     }
 
@@ -558,6 +570,27 @@ impl SwcScanner {
         content: &str,
         data_fetchers: &[String],
         messaging_clients: &[String],
+    ) -> ScanResult {
+        self.scan_content_offering(
+            file_path,
+            content,
+            data_fetchers,
+            messaging_clients,
+            &HashSet::new(),
+        )
+    }
+
+    /// [`SwcScanner::scan_content`], with the calls starting at `offered`
+    /// raised as candidates too (Signal 9). The orchestrator offers the call
+    /// sites whose imported declaration issues a request (carrick#1146) once it
+    /// has read the modules they import, which the per-file pass cannot.
+    pub fn scan_content_offering(
+        &self,
+        file_path: &Path,
+        content: &str,
+        data_fetchers: &[String],
+        messaging_clients: &[String],
+        offered: &HashSet<u32>,
     ) -> ScanResult {
         use swc_common::{FileName, GLOBALS, Globals, Mark};
         use swc_ecma_parser::{Parser, StringInput, lexer::Lexer};
@@ -593,6 +626,7 @@ impl SwcScanner {
                     import_sources: Vec::new(),
                     pubsub_anchor_ops: Vec::new(),
                     local_wrapper_calls: Vec::new(),
+                    unresolved_wrapper_sites: Vec::new(),
                 };
             }
         };
@@ -616,7 +650,9 @@ impl SwcScanner {
         } else {
             HashMap::new()
         };
-        let local_wrapper_calls = collect_local_wrapper_calls(&module, &file_source_map);
+        let wrapper_sites = collect_local_wrapper_sites(&module, &file_source_map);
+        let local_wrapper_calls = wrapper_sites.calls;
+        let unresolved_wrapper_sites = wrapper_sites.unresolved;
         let new_url_paths = collect_new_url_paths(&module, &file_source_map);
         let mut visitor = CandidateVisitor::new(
             file_source_map,
@@ -626,6 +662,11 @@ impl SwcScanner {
             new_url_paths,
             repo_has_messaging_clients,
             package_import_locals(&module, messaging_clients),
+            unresolved_wrapper_sites
+                .iter()
+                .map(|(start, _)| *start)
+                .chain(offered.iter().copied())
+                .collect(),
         );
         module.visit_with(&mut visitor);
 
@@ -635,6 +676,7 @@ impl SwcScanner {
             import_sources,
             pubsub_anchor_ops: visitor.pubsub_anchor_ops,
             local_wrapper_calls,
+            unresolved_wrapper_sites,
         }
     }
 
@@ -2197,9 +2239,15 @@ struct CandidateVisitor {
     /// fn)` from becoming a phantom subscriber. Empty when the repo detected
     /// no messaging clients.
     messaging_import_locals: HashSet<String>,
+    /// Start offsets of call expressions offered as call sites by a pass that
+    /// already knows they issue a request (Signal 9): the same-file wrapper
+    /// sites the fixpoint could not resolve (carrick#1151), and the calls
+    /// through an imported binding whose declaration issues one (carrick#1146).
+    offered_spans: HashSet<u32>,
 }
 
 impl CandidateVisitor {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         source_map: Lrc<SourceMap>,
         network_import_locals: HashSet<String>,
@@ -2208,6 +2256,7 @@ impl CandidateVisitor {
         new_url_paths: NewUrlPathMap,
         repo_has_messaging_clients: bool,
         messaging_import_locals: HashSet<String>,
+        offered_spans: HashSet<u32>,
     ) -> Self {
         Self {
             candidates: Vec::new(),
@@ -2223,6 +2272,7 @@ impl CandidateVisitor {
             repo_has_messaging_clients,
             pubsub_anchor_ops: Vec::new(),
             messaging_import_locals,
+            offered_spans,
         }
     }
 
@@ -3423,6 +3473,20 @@ impl Visit for CandidateVisitor {
                     );
                 }
             }
+        }
+
+        // Signal 9: a call another pass already knows issues a request — a
+        // same-file wrapper site the fixpoint could not resolve (carrick#1151)
+        // or a call through an imported binding whose declaration issues one
+        // (carrick#1146). Last among the HTTP signals, so a site one of them
+        // already raised keeps the label it had.
+        if self.offered_spans.contains(&call.span.lo.0)
+            && let Callee::Expr(callee_expr) = &call.callee
+        {
+            let obj = Self::extract_callee_object(callee_expr)
+                .unwrap_or_else(|| "<offered-call>".to_string());
+            let prop = Self::callee_member_prop(callee_expr);
+            self.push_candidate(call, obj, prop);
         }
 
         // Signal 8 (UNGATED): web-platform cross-context messaging. postMessage

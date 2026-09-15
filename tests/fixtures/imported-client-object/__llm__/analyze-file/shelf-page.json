@@ -1,0 +1,32 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:5",
+      "line_number": 5,
+      "target": "${settings.gatewayUrl}/v2/shelves/${shelfId}/label",
+      "method": "PATCH",
+      "pattern_matched": "shelves.rename",
+      "call_expression_text": "shelves.rename(shelfId, formatShelfLabel(label))",
+      "call_expression_line": 5,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:9",
+      "line_number": 9,
+      "target": "${settings.gatewayUrl}/v2/shelf/${shelfId}/archived",
+      "method": "POST",
+      "pattern_matched": "shelves.archive",
+      "call_expression_text": "shelves.archive(shelfId)",
+      "call_expression_line": 9,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}
