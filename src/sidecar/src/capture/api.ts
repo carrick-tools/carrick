@@ -150,6 +150,10 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *  - `machinery_envelope`: the return resolved to transport (a
  *    Response/Request-shaped envelope) and no payload was recoverable inside
  *    it or from the handler's returned arguments.
+ *  - `coerced_input`: a request schema's INPUT is `any`/`unknown` at this
+ *    position while its parsed output is concrete, which is what a coercion
+ *    declares (carrick#1101). The published type carries the output there, so
+ *    this finding describes what a caller may send, not the printed member.
  *  - `not_recorded`: the position carries a top type and this layer has no
  *    cause for it.
  */
@@ -158,6 +162,7 @@ export type TypeProvenanceReason =
   | 'budget_exhausted'
   | 'no_payload_evidence'
   | 'machinery_envelope'
+  | 'coerced_input'
   | 'not_recorded';
 
 /**

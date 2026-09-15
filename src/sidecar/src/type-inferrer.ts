@@ -239,6 +239,27 @@ const STATUS_MEMBER_NAMES = ['status', 'statusCode'] as const;
 const REQUEST_BODY_PARTS = new Set<string>(['json', 'form', 'body']);
 
 /**
+ * Which of a validation schema's two types a contract reads (carrick#1101).
+ *
+ * A schema's INPUT is what a caller may send; its OUTPUT is what parsing hands
+ * the handler. They differ wherever parsing changes the value: a defaulted key
+ * is optional to send and present after parsing, a transform changes a
+ * member's type, a coercion accepts any value. A request contract is what a
+ * caller sends, so it reads the input; a response contract reads the output.
+ */
+type SchemaDirection = 'input' | 'output';
+
+/**
+ * A contract a route declares, as printed text, plus the provenance the reading
+ * recorded (a coerced request member, carrick#1101). Provenance is absent, not
+ * empty, when there is nothing to say.
+ */
+interface DeclaredContract {
+  text: string;
+  provenance?: TypeProvenance[];
+}
+
+/**
  * Print a `Type` to its string form WITHOUT the compiler's default truncation.
  *
  * `Type.getText()` truncates large/anonymous object types to ~160 chars and inserts
@@ -1252,13 +1273,10 @@ export class TypeInferrer {
           atLine.handler
         );
         if (requestType) {
-          return this.createInferredType(
+          return this.declaredRequestInferredType(
             request,
             requestType,
-            true,
-            this.getNodeLocation(atLine.handler),
-            undefined,
-            undefined
+            this.getNodeLocation(atLine.handler)
           );
         }
       }
@@ -1281,13 +1299,10 @@ export class TypeInferrer {
         registrationHandler
       );
       if (requestType) {
-        return this.createInferredType(
+        return this.declaredRequestInferredType(
           request,
           requestType,
-          true,
-          this.getNodeLocation(registrationHandler),
-          undefined,
-          undefined
+          this.getNodeLocation(registrationHandler)
         );
       }
       // A genuinely payload-less handler (no typed request read): do NOT fall
@@ -1329,13 +1344,10 @@ export class TypeInferrer {
           `Route registration at ${request.file_path}:${request.line_number} declares its ` +
             'request contract; using the declaration over the located expression'
         );
-        return this.createInferredType(
+        return this.declaredRequestInferredType(
           request,
           declared,
-          true,
-          this.getNodeLocation(declaredAt.handler),
-          undefined,
-          undefined
+          this.getNodeLocation(declaredAt.handler)
         );
       }
     }
@@ -1392,6 +1404,28 @@ export class TypeInferrer {
           node = stringifyArg;
           break;
         }
+      }
+    }
+
+    // carrick#1101: the locator landed on a validated read — a call inside a
+    // registered handler whose type IS the parsed output of a body schema that
+    // the enclosing registration declares. That value is what the handler
+    // receives, not what a caller sends, so publish the schema's input. Only a
+    // direct call is read this way: a value that went through a serialiser or
+    // a variable hop is left to the path below, so a consumer body forwarded
+    // from inside a handler keeps its own type.
+    if (node === unwrapped && Node.isCallExpression(node)) {
+      const validatedRead = this.validatedReadRequestContract(node);
+      if (validatedRead) {
+        this.log(
+          `Request locator at ${request.file_path}:${request.line_number} is a validated read ` +
+            "of its registration's body schema; publishing the schema's input"
+        );
+        return this.declaredRequestInferredType(
+          request,
+          validatedRead,
+          this.getNodeLocation(node)
+        );
       }
     }
 
@@ -3859,12 +3893,13 @@ export class TypeInferrer {
   //      of that parameter's type;
   //  (b) a validation-schema object passed alongside the handler — `{ schema:
   //      { body: ref('CreateWidget'), response: { 200: ref('Widget') } } }` —
-  //      whose entries reference schema VALUES that carry their parsed output
-  //      type.
+  //      whose entries reference schema VALUES that declare their input and
+  //      output types.
   //
   // Both are read structurally: (a) is "the `body` member of a parameter's
   // type", (b) is "a `schema` property on a registration argument, whose
-  // entries resolve to a value whose `parse` returns the contract". No
+  // entries resolve to a value that declares its types" (the body reads the
+  // input, the response the output; carrick#1101). No
   // framework, library, or method-name list is involved — a framework whose
   // request object exposes `body` and whose route options carry `schema` is
   // read the same way regardless of which one it is.
@@ -3901,7 +3936,7 @@ export class TypeInferrer {
     request: InferRequestItem,
     registration: Node
   ): InferredType | null {
-    const declared = this.routeSchemaContractText(registration, 'response');
+    const declared = this.routeSchemaContract(registration, 'response');
     if (!declared) {
       return null;
     }
@@ -3911,7 +3946,7 @@ export class TypeInferrer {
     );
     return this.createInferredType(
       request,
-      declared,
+      declared.text,
       true,
       this.getNodeLocation(registration),
       undefined,
@@ -3929,11 +3964,36 @@ export class TypeInferrer {
   private requestContractFromRegistration(
     registration: Node,
     handler: FunctionLike
-  ): string | null {
-    return (
-      this.declaredRequestContract(registration, handler) ??
-      this.inferRequestReadFromHandler(handler)
+  ): DeclaredContract | null {
+    const declared = this.declaredRequestContract(registration, handler);
+    if (declared) {
+      return declared;
+    }
+    const read = this.inferRequestReadFromHandler(handler);
+    return read ? { text: read } : null;
+  }
+
+  /**
+   * An explicit request `InferredType` for a contract the route declares,
+   * carrying the provenance the reading recorded.
+   */
+  private declaredRequestInferredType(
+    request: InferRequestItem,
+    contract: DeclaredContract,
+    location: SourceLocation
+  ): InferredType {
+    const inferred = this.createInferredType(
+      request,
+      contract.text,
+      true,
+      location,
+      undefined,
+      undefined
     );
+    if (contract.provenance && contract.provenance.length > 0) {
+      inferred.any_provenance = contract.provenance;
+    }
+    return inferred;
   }
 
   /**
@@ -3950,11 +4010,14 @@ export class TypeInferrer {
   private declaredRequestContract(
     registration: Node,
     handler: FunctionLike
-  ): string | null {
+  ): DeclaredContract | null {
+    const annotated = this.requestBodyFromHandlerParams(handler);
+    if (annotated) {
+      return { text: annotated };
+    }
     return (
-      this.requestBodyFromHandlerParams(handler) ??
-      this.routeSchemaContractText(registration, 'body') ??
-      this.validatedBodyContractText(registration)
+      this.routeSchemaContract(registration, 'body') ??
+      this.validatedBodyContract(registration)
     );
   }
 
@@ -4008,8 +4071,9 @@ export class TypeInferrer {
    * The shape is a CALL among the registration's arguments whose own arguments
    * are a request part and a schema value. Neither the middleware's name nor
    * the schema library is checked: the part is read off the string literal, and
-   * the schema is whatever exposes a parsed output (`schemaOutputTypeText`) —
-   * the same test anchor (b) already applies to a `schema: { body: … }` object.
+   * the schema is whatever declares its types (`schemaContract`) — the same
+   * test anchor (b) already applies to a `schema: { body: … }` object. The
+   * contract is the schema's INPUT, what a caller sends (carrick#1101).
    *
    * `REQUEST_BODY_PARTS` is HTTP vocabulary for how a body is carried, not a
    * framework list. A middleware bound to any other part (`query`, `param`,
@@ -4017,11 +4081,28 @@ export class TypeInferrer {
    * at all is not read: publishing a query schema as the request contract would
    * be the same confident-and-wrong answer this anchor exists to remove.
    */
-  private validatedBodyContractText(registration: Node): string | null {
+  private validatedBodyContract(registration: Node): DeclaredContract | null {
+    for (const candidate of this.middlewareBodySchemaValues(registration)) {
+      const declared = this.schemaContract(candidate, 'input');
+      if (declared) {
+        return declared;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The values a registration's validator middleware binds to a body part, in
+   * argument order: every non-literal argument of a middleware call that names
+   * a `REQUEST_BODY_PARTS` part. Whether each one IS a schema is the reader's
+   * question (`schemaContract`), not this walk's.
+   */
+  private middlewareBodySchemaValues(registration: Node): Node[] {
     if (!Node.isCallExpression(registration)) {
-      return null;
+      return [];
     }
 
+    const values: Node[] = [];
     for (const argument of registration.getArguments()) {
       const middleware = this.unwrapExpressionNode(argument);
       if (!Node.isCallExpression(middleware)) {
@@ -4031,31 +4112,70 @@ export class TypeInferrer {
       const middlewareArgs = middleware
         .getArguments()
         .map((arg) => this.unwrapExpressionNode(arg));
-      const parts = middlewareArgs.filter((arg): arg is StringLiteral =>
-        Node.isStringLiteral(arg)
+      const bindsBody = middlewareArgs.some(
+        (arg) =>
+          Node.isStringLiteral(arg) &&
+          REQUEST_BODY_PARTS.has(arg.getLiteralValue().toLowerCase())
       );
-      if (parts.length === 0) {
+      if (!bindsBody) {
         continue;
       }
+
+      values.push(...middlewareArgs.filter((arg) => !Node.isStringLiteral(arg)));
+    }
+    return values;
+  }
+
+  /**
+   * The request contract behind a VALIDATED READ: a call inside a registered
+   * handler whose type is exactly the parsed output of a body schema the
+   * enclosing registration declares (carrick#1101).
+   *
+   * The read's own type is what validation hands the handler, the schema's
+   * output, so a locator that lands on it would publish the output as the
+   * request. The registration is found by walking the read's ancestors to each
+   * call or registry object whose handler contains the read and which declares
+   * a body schema (anchor (b) or (b2)). The match is on the printed type: only
+   * a read whose structural text equals that schema's output is substituted, so
+   * any other expression in the handler (a query read, a payload of a different
+   * shape) keeps its own type.
+   */
+  private validatedReadRequestContract(read: CallExpression): DeclaredContract | null {
+    let readText: string | null | undefined;
+    for (const ancestor of read.getAncestors()) {
       if (
-        !parts.some((part) =>
-          REQUEST_BODY_PARTS.has(part.getLiteralValue().toLowerCase())
-        )
+        !Node.isCallExpression(ancestor) &&
+        !Node.isObjectLiteralExpression(ancestor)
+      ) {
+        continue;
+      }
+      const handler = this.registrationHandlerAt(ancestor);
+      if (
+        !handler ||
+        read.getStart() < handler.getStart() ||
+        read.getEnd() > handler.getEnd()
       ) {
         continue;
       }
 
-      for (const candidate of middlewareArgs) {
-        if (Node.isStringLiteral(candidate)) {
+      const schemaValues = [
+        ...this.routeSchemaEntryValues(ancestor, 'body'),
+        ...this.middlewareBodySchemaValues(ancestor),
+      ];
+      for (const value of schemaValues) {
+        const output = this.schemaContract(value, 'output');
+        if (!output) {
           continue;
         }
-        const declared = this.schemaOutputTypeText(candidate);
-        if (declared) {
-          return declared;
+        if (readText === undefined) {
+          readText = this.structuralTextFromType(read.getType(), read);
         }
+        if (readText !== output.text) {
+          continue;
+        }
+        return this.schemaContract(value, 'input');
       }
     }
-
     return null;
   }
 
@@ -4064,33 +4184,50 @@ export class TypeInferrer {
    *
    * `part` is `'body'` for the request contract and `'response'` for the
    * response contract; a `response` entry keyed by status code resolves to its
-   * success entry. Returns null when the registration carries no schema, when
-   * the entry references something whose parsed output cannot be resolved, or
-   * when the schema is a plain JSON-schema literal (whose own object type is
-   * the JSON-Schema document, not the payload — emitting that would be worse
-   * than abstaining).
+   * success entry. The body reads the schema's input and the response its
+   * output (carrick#1101). Returns null when the registration carries no
+   * schema, when the entry references something whose declared types cannot be
+   * resolved, or when the schema is a plain JSON-schema literal (whose own
+   * object type is the JSON-Schema document, not the payload — emitting that
+   * would be worse than abstaining).
    */
-  private routeSchemaContractText(
+  private routeSchemaContract(
     registration: Node,
     part: 'body' | 'response'
-  ): string | null {
+  ): DeclaredContract | null {
+    const [value] = this.routeSchemaEntryValues(registration, part);
+    if (!value) {
+      return null;
+    }
+    return this.schemaContract(value, part === 'body' ? 'input' : 'output');
+  }
+
+  /**
+   * The value a route `schema` object declares for `part`, as a zero- or
+   * one-element list: the `body` entry itself, or the success entry of a
+   * status-keyed `response` map.
+   */
+  private routeSchemaEntryValues(
+    registration: Node,
+    part: 'body' | 'response'
+  ): Node[] {
     const schemaObject = this.routeSchemaObject(registration);
     if (!schemaObject) {
-      return null;
+      return [];
     }
     const entry = schemaObject.getProperty(part);
     if (!entry || !Node.isPropertyAssignment(entry)) {
-      return null;
+      return [];
     }
     const initializer = entry.getInitializer();
     if (!initializer) {
-      return null;
+      return [];
     }
-    const value: Node =
+    return [
       part === 'response'
         ? (this.successStatusEntry(initializer) ?? initializer)
-        : initializer;
-    return this.schemaOutputTypeText(value);
+        : initializer,
+    ];
   }
 
   /**
@@ -4160,17 +4297,29 @@ export class TypeInferrer {
   }
 
   /**
-   * The payload type a schema entry declares.
+   * The payload type a schema entry declares, read in `direction`.
    *
    * The entry is either a REFERENCE call — `ref('CreateWidget')`, a
    * name-to-schema indirection whose registry is the argument the ref function
-   * was built from — or the schema value itself. Either way the payload is the
-   * schema's parsed output: the return type of its `parse` method (the shape
-   * every schema value exposes as its public validate-and-return API), falling
-   * back to a declared `_output` member. A value with neither is not a schema
-   * and yields null.
+   * was built from — or the schema value itself. A value that declares no type
+   * in either direction is not a schema and yields null.
+   *
+   * `output` is the parsed value (`schemaOutputType`). `input` is what a caller
+   * sends (`schemaInputType`), and a schema that declares no input member reads
+   * its output instead, which is the whole of what is knowable about it.
+   *
+   * One input shape cannot be published as it stands: a member whose input is
+   * `any`/`unknown` where the output is concrete, which is what a coercion
+   * declares (it accepts any value and parses it into, say, a number). A top
+   * type in a published contract disqualifies the whole row downstream, so the
+   * reading publishes the OUTPUT for that schema and records each such member
+   * as `coerced_input` provenance, rather than abstaining on a schema whose
+   * parsed shape is fully known.
    */
-  private schemaOutputTypeText(value: Node): string | null {
+  private schemaContract(
+    value: Node,
+    direction: SchemaDirection
+  ): DeclaredContract | null {
     const node = this.unwrapExpressionNode(value);
 
     let schemaType: Type | undefined;
@@ -4185,17 +4334,134 @@ export class TypeInferrer {
       }
     }
 
+    const location = this.getNodeLocation(node);
+    const where = `${location.file_path}:${location.start_line}`;
     const output = this.schemaOutputType(schemaType, node);
-    if (!output) {
+    const input =
+      direction === 'input' ? this.schemaInputType(schemaType, node) : undefined;
+
+    if (!output && !input) {
       this.log(
-        `Route schema entry at ${this.getNodeLocation(node).file_path}:${
-          this.getNodeLocation(node).start_line
-        } declares no resolvable parsed output (schema library types unavailable, ` +
-          'or a plain JSON-Schema literal); leaving unresolved'
+        `Route schema entry at ${where} declares no resolvable type (schema library ` +
+          'types unavailable, or a plain JSON-Schema literal); leaving unresolved'
       );
       return null;
     }
-    return this.structuralTextFromType(output, node);
+
+    if (direction === 'output' || !input) {
+      if (direction === 'input') {
+        this.log(
+          `Route schema entry at ${where} declares no input type; publishing its parsed output`
+        );
+      }
+      const text = output ? this.structuralTextFromType(output, node) : null;
+      return text ? { text } : null;
+    }
+
+    const inputTop = this.topTypePositions(input, node);
+    if (output && inputTop.size > 0) {
+      const outputTop = this.topTypePositions(output, node);
+      const coerced = [...inputTop.entries()]
+        .filter(([position]) => !outputTop.has(position))
+        .sort(([a], [b]) => a.localeCompare(b));
+      if (coerced.length > 0) {
+        const text = this.structuralTextFromType(output, node);
+        if (!text) {
+          return null;
+        }
+        this.log(
+          `Route schema entry at ${where} accepts any value at ` +
+            `${coerced.map(([position]) => position || '<root>').join(', ')} on input; ` +
+            'publishing its parsed output and recording the coercion'
+        );
+        return {
+          text,
+          provenance: coerced.map(([position, kind]) => ({
+            path: position,
+            kind,
+            reason: 'coerced_input',
+            detail:
+              `the schema accepts any value here and coerces it, so the published type ` +
+              `is what parsing produces, not a limit on what a caller may send`,
+          })),
+        };
+      }
+    }
+
+    const text = this.structuralTextFromType(input, node);
+    return text ? { text } : null;
+  }
+
+  /**
+   * Member positions inside `root` that are `any` or `unknown`, keyed by the
+   * member-path notation the provenance entries use (`''` for the root,
+   * `sub.field`, `items<0>` for an array element). Union and intersection
+   * members share their parent's position, so `unknown | undefined` on an
+   * optional key reads as `unknown` there.
+   *
+   * Bounded and cycle-safe: it only has to tell a schema's input apart from its
+   * output, so a subtree past the bound is simply not compared.
+   */
+  private topTypePositions(root: Type, at: Node): Map<string, 'any' | 'unknown'> {
+    const MAX_DEPTH = 8;
+    const MAX_VISITED = 512;
+    const found = new Map<string, 'any' | 'unknown'>();
+    const onPath = new Set<ts.Type>();
+    let visited = 0;
+
+    const walk = (type: Type, position: string, depth: number): void => {
+      if (depth > MAX_DEPTH || visited > MAX_VISITED) {
+        return;
+      }
+      if (type.isAny() || type.isUnknown()) {
+        found.set(position, type.isAny() ? 'any' : 'unknown');
+        return;
+      }
+      const compilerType = type.compilerType;
+      if (onPath.has(compilerType)) {
+        return;
+      }
+      onPath.add(compilerType);
+      visited += 1;
+      try {
+        const parts = type.isUnion()
+          ? type.getUnionTypes()
+          : type.isIntersection()
+            ? type.getIntersectionTypes()
+            : undefined;
+        if (parts) {
+          for (const part of parts) {
+            walk(part, position, depth + 1);
+          }
+          return;
+        }
+        if (type.isArray()) {
+          const element = type.getArrayElementType();
+          if (element) {
+            walk(element, `${position}<0>`, depth + 1);
+          }
+          return;
+        }
+        if (!type.isObject() || this.isCallableType(type)) {
+          return;
+        }
+        for (const property of type.getProperties()) {
+          let propertyType: Type;
+          try {
+            propertyType = property.getTypeAtLocation(at);
+          } catch {
+            continue;
+          }
+          const name = property.getName();
+          walk(propertyType, position === '' ? name : `${position}.${name}`, depth + 1);
+        }
+      } finally {
+        onPath.delete(compilerType);
+      }
+    };
+
+    walk(root, '', 0);
+    return found;
   }
 
   /**
@@ -4267,8 +4533,9 @@ export class TypeInferrer {
 
   /**
    * The parsed output type of a schema value: the return type of its `parse`
-   * method, else a declared `_output` member. Returns undefined when neither
-   * carries a usable type — including when the schema library's own types are
+   * method, else a declared `_output` member, else the Standard Schema member
+   * `~standard.types.output` (a library that exposes nothing else). Returns
+   * undefined when none carries a usable type — including when the schema library's own types are
    * unavailable (an uninstalled dependency resolves the schema to `any`), which
    * must abstain rather than publish `any` as a contract.
    */
@@ -4296,13 +4563,66 @@ export class TypeInferrer {
     const outputSymbol = schemaType.getProperty('_output');
     if (outputSymbol) {
       try {
-        return usable(outputSymbol.getTypeAtLocation(at));
+        const declared = usable(outputSymbol.getTypeAtLocation(at));
+        if (declared) {
+          return declared;
+        }
       } catch {
-        return undefined;
+        // fall through to the Standard Schema member
       }
     }
 
-    return undefined;
+    return usable(this.standardSchemaType(schemaType, at, 'output'));
+  }
+
+  /**
+   * The input type of a schema value, what a caller may send (carrick#1101):
+   * the Standard Schema member `~standard.types.input`, else a declared
+   * `_input` member. Undefined when the schema declares neither.
+   *
+   * Unlike the output, an input of `unknown` is kept: it is a declared fact
+   * (a coercion accepts any value), and `schemaContract` decides what to
+   * publish for it. An `any` that is really an unresolved library still reads
+   * as no input, because an unresolved schema type has no members to read.
+   */
+  private schemaInputType(schemaType: Type, at: Node): Type | undefined {
+    const standard = this.standardSchemaType(schemaType, at, 'input');
+    if (standard) {
+      return standard;
+    }
+    const inputSymbol = schemaType.getProperty('_input');
+    if (!inputSymbol) {
+      return undefined;
+    }
+    try {
+      return inputSymbol.getTypeAtLocation(at);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * `~standard.types.<side>` on a schema value: the Standard Schema
+   * specification's library-neutral statement of a schema's input and output
+   * types. `types` is declared optional, so its `undefined` is stripped before
+   * the side is read.
+   */
+  private standardSchemaType(
+    schemaType: Type,
+    at: Node,
+    side: SchemaDirection
+  ): Type | undefined {
+    try {
+      const standard = schemaType.getProperty('~standard');
+      const types = standard?.getTypeAtLocation(at).getProperty('types');
+      const member = types
+        ?.getTypeAtLocation(at)
+        .getNonNullableType()
+        .getProperty(side);
+      return member?.getTypeAtLocation(at);
+    } catch {
+      return undefined;
+    }
   }
 
   /**
