@@ -5793,7 +5793,7 @@ mod tests {
         super::report_preflight_failure(
             &storage,
             &repo.display().to_string(),
-            crate::scan_stage::Stage::Discovery,
+            crate::scan_stage::Stage::Preflight,
             error.as_ref(),
         )
         .await;
@@ -5808,7 +5808,7 @@ mod tests {
         assert_eq!(reported.len(), 1, "exactly one event: {reported:?}");
         let (repo_name, stage, reason) = &reported[0];
         assert_eq!(repo_name, &None, "a checkout with no origin names no repo");
-        assert_eq!(stage, "discovery");
+        assert_eq!(stage, "preflight");
         assert!(
             reason.starts_with("Deno is required to scan ~/work/api/")
                 && reason.contains("deno.json. Install or upgrade to Deno"),

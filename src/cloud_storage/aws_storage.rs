@@ -2672,7 +2672,7 @@ mod tests {
         storage
             .report_preflight_failed(
                 None,
-                "discovery",
+                "preflight",
                 "Deno is required to scan ~/api/deno.json.",
             )
             .await;
@@ -2684,7 +2684,7 @@ mod tests {
         assert_eq!(body["run_id"], crate::logging::run_id());
         assert!(body["repo"].is_null(), "{body}");
         assert!(body.as_object().unwrap().contains_key("repo"), "{body}");
-        assert_eq!(body["stage"], "discovery");
+        assert_eq!(body["stage"], "preflight");
         assert_eq!(body["reason"], "Deno is required to scan ~/api/deno.json.");
         assert_eq!(body["scanner_version"], env!("CARGO_PKG_VERSION"));
         assert!(body.get("scan_id").is_none(), "{body}");
@@ -2713,7 +2713,7 @@ mod tests {
             let (storage, server) =
                 bearer_storage(vec![(status, r#"{"message":"no"}"#.to_string())]);
             storage
-                .report_preflight_failed(Some("example/api"), "discovery", "no runtime")
+                .report_preflight_failed(Some("example/api"), "preflight", "no runtime")
                 .await;
             let requests = server.join().unwrap();
             assert_eq!(requests.len(), 1, "{status} was retried");
@@ -2732,7 +2732,7 @@ mod tests {
         let url = format!("{base}/types/check-or-upload");
 
         let ci = AwsStorage::for_test(&url, CloudAuth::Oidc, false);
-        ci.report_preflight_failed(Some("example/api"), "discovery", "whatever")
+        ci.report_preflight_failed(Some("example/api"), "preflight", "whatever")
             .await;
 
         let opened = AwsStorage::for_test(&url, CloudAuth::Bearer("t".into()), false);

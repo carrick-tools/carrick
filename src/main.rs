@@ -260,11 +260,11 @@ fn unknown_command(argv: &[String]) -> Option<String> {
 }
 
 async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // Everything before the engine is discovery: the path, the services, the
-    // runtime they need, and the storage. Said here rather than left at
-    // `unknown`, so a run that stops at a missing runtime names the stage it
-    // stopped in to the terminal and to the cloud (carrick#1096).
-    scan_stage::enter(scan_stage::Stage::Discovery);
+    // Everything before the engine is preflight: the path, the services, the
+    // runtime they need, the sidecar, and the storage. Said here rather than
+    // left at `unknown`, so a run that stops at a missing runtime names the
+    // stage it stopped in to the terminal and to the cloud (carrick#1096).
+    scan_stage::enter(scan_stage::Stage::Preflight);
 
     // Validate the scan target up front. A nonexistent path would otherwise
     // walk zero files and "succeed" with an empty analysis.
@@ -346,7 +346,6 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
                         scan_health::ALLOW_MISSING_TYPES_ENV,
                     );
                     logging::annotate(logging::Annotation::Error, &message);
-                    scan_stage::enter(scan_stage::Stage::TypeCapture);
                     return Err(message.into());
                 }
                 warn!("Sidecar failed to initialize: {}", e);
