@@ -277,10 +277,12 @@ jobs:
             else
               echo "publishing $tarball"
               # A version npm accepted but is still processing reads as absent
-              # above and refuses a second publish; that is published too.
+              # above, and npm refuses a second publish of it with a 409
+              # "previously staged"; a live one it refuses with a 403
+              # "previously published". Both mean the version is already there.
               if ! out=$(npm publish --access public "$tarball" 2>&1); then
                 echo "$out"
-                if grep -q "previously published" <<<"$out"; then
+                if grep -qE "previously (published|staged)" <<<"$out"; then
                   echo "::warning::$name@$version was already accepted and is still being processed"
                 else
                   exit 1
@@ -353,11 +355,35 @@ jobs:
           npm install --ignore-scripts --no-audit --no-fund
           if ! out=$(npm publish --access public 2>&1); then
             echo "$out"
-            grep -q "previously published" <<<"$out" || exit 1
+            grep -qE "previously (published|staged)" <<<"$out" || exit 1
             echo "::warning::carrick@$VERSION was already accepted and is still being processed"
           else
             echo "$out"
           fi
+
+      # npm queues the main package for processing too (0.3.72), so a publish
+      # that returned is not yet an install that works. Waiting here makes a
+      # green job mean `npx carrick@<version>` resolves, and a stall a red job
+      # that a re-run resumes.
+      - name: Wait until carrick is readable
+        timeout-minutes: 50
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          VERSION="${TAG##*v}"
+          DEADLINE=$(( $(date +%s) + 2700 ))
+          delay=5
+          until [ "$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://registry.npmjs.org/carrick/$VERSION")" = "200" ]; do
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::carrick@$VERSION was published but is still not readable after 45 minutes. Nothing here publishes twice, so re-run this job once the registry serves it."
+              exit 1
+            fi
+            echo "waiting for carrick@$VERSION (${delay}s)"
+            sleep "$delay"
+            if [ "$delay" -lt 60 ]; then delay=$(( delay * 2 )); else delay=60; fi
+          done
+          echo "carrick@$VERSION is readable"
 
   # Builds the carrick-match wasm artifact, attaches it to the release, and
   # dispatches the pin-bump PR in carrick-cloud (#325). Lives in the same
