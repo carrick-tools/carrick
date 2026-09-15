@@ -582,6 +582,10 @@ pub struct ServedSchemaSources {
 pub struct SchemaCatalogue {
     schemas: Vec<KnownSchema>,
     repo_root: PathBuf,
+    /// `repo_root` canonicalized: each service is scanned under this form, so
+    /// its rows' paths start with it when the given root is relative or runs
+    /// through a symlink.
+    canonical_root: PathBuf,
     /// Repository-relative files some service names in `graphqlSchemas`.
     declared: BTreeSet<PathBuf>,
     /// Walked, undeclared file -> whether a service that walks it serves a
@@ -791,6 +795,9 @@ impl SchemaCatalogue {
         Self {
             schemas,
             repo_root: repo_root.to_path_buf(),
+            canonical_root: repo_root
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf()),
             declared,
             walked_verdicts: Default::default(),
             unserved: Default::default(),
@@ -817,7 +824,7 @@ impl SchemaCatalogue {
         let files: BTreeSet<PathBuf> = extraction
             .producers
             .iter()
-            .map(|op| repo_relative(&self.repo_root, &op.file_path))
+            .map(|op| self.scanned_relative(&op.file_path))
             .filter(|file| !self.declared.contains(file))
             .collect();
         {
@@ -833,7 +840,7 @@ impl SchemaCatalogue {
         let mut removed: BTreeMap<PathBuf, usize> = BTreeMap::new();
         if !serves_schema {
             extraction.producers.retain(|op| {
-                let file = repo_relative(&self.repo_root, &op.file_path);
+                let file = self.scanned_relative(&op.file_path);
                 if self.declared.contains(&file) {
                     return true;
                 }
@@ -849,6 +856,16 @@ impl SchemaCatalogue {
             unserved.insert(service.to_string(), removed);
         }
         count
+    }
+
+    /// Repository-relative form of a path from a service's scan, which runs
+    /// under the canonical root rather than the root the catalogue was given.
+    fn scanned_relative(&self, path: &Path) -> PathBuf {
+        if path.starts_with(&self.canonical_root) {
+            repo_relative(&self.canonical_root, path)
+        } else {
+            repo_relative(&self.repo_root, path)
+        }
     }
 
     /// Whether `schema` is served, with the walked files' verdicts applied.
@@ -2644,6 +2661,42 @@ export const typeDefs = gql`
         assert_eq!(second.producers.len(), 1);
         let schema = &catalogue.schemas[0];
         assert!(catalogue.is_served(schema));
+    }
+
+    /// The engine builds the catalogue from the repository path as given, and
+    /// scans each service under its canonical form. A checkout reached
+    /// through a symlink (or given as `.`) must still settle its walked files.
+    #[cfg(unix)]
+    #[test]
+    fn a_walked_schema_settles_when_the_scan_root_is_the_canonical_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("checkout");
+        std::fs::create_dir_all(real.join("web/src/vendor")).unwrap();
+        std::fs::write(
+            real.join("web/src/vendor/ledger.graphql"),
+            "type Query { balance: Int }",
+        )
+        .unwrap();
+        std::fs::write(real.join("web/src/wallet.gql"), "query Wallet { balance }").unwrap();
+        let link = tmp.path().join("linked");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let catalogue = SchemaCatalogue::build(
+            &link,
+            &[ServedSchemaSources {
+                roots: vec![link.join("web")],
+                declared: vec![],
+            }],
+        );
+
+        let canonical = real.canonicalize().unwrap();
+        let mut web = scan_repo(&[canonical.join("web")], &[], &[]);
+        assert_eq!(catalogue.settle_walked_schemas("web", &mut web, false), 1);
+        let attribution = catalogue.attribute(&web, |_| TransportOrigin::Unknown);
+        let wallet = canonical.join("web/src/wallet.gql");
+        assert_eq!(
+            identity_of(&attribution, &web, &wallet.to_string_lossy()),
+            &DocumentIdentity::External(vec![PathBuf::from("web/src/vendor/ledger.graphql")])
+        );
     }
 
     fn known(file: &str, origin: SchemaOrigin, sdl: &str) -> KnownSchema {
