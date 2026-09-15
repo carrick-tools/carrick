@@ -53,7 +53,7 @@ const MAX_DEEP_FINDINGS = 32;
  *    void` safely accepts a stricter counterparty), so it is not a masked
  *    mismatch and demoting it would over-demote a sound shape;
  *  - TypeScript's unresolved-reference `error` placeholder (`intrinsicName ===
- *    'error'`) is excluded (see `flagOf`): it heals when the check installs the
+ *    'error'`) is excluded (see `disqualifyingFlag`): it heals when the check installs the
  *    pinned external, so it is a healable decay, not an author-baked `any`.
  * A type the walk cannot cheaply finish is NOT flagged — over-demoting a
  * legitimately fully-resolved type is the failure mode this guard must not have.
@@ -63,6 +63,50 @@ export function findDisqualifyingTopTypes(
   program: ts.Program,
   checker: ts.TypeChecker,
   location: ts.Node
+): DeepTopType[] {
+  return walkTopTypes(root, program, checker, location, disqualifyingFlag);
+}
+
+/**
+ * Member paths at which `root` holds TypeScript's unresolved-reference
+ * placeholder (the `error` intrinsic) rather than a type (carrick#1164).
+ *
+ * Run on the SOURCE program, where a member typed through an import that did
+ * not resolve still carries the placeholder. Once printed into the stub the
+ * placeholder is the keyword `any`, indistinguishable from an author's `any`,
+ * so this is the only point at which the two causes can be told apart. Same
+ * walk, same budget and the same path notation as the self-check's walk over
+ * the emitted text, so a path found here names the member a self-check finding
+ * names. A walk that runs out of budget reports what it found before it did.
+ */
+export function findUnresolvedPlaceholders(
+  root: ts.Type,
+  program: ts.Program,
+  checker: ts.TypeChecker,
+  location: ts.Node
+): string[] {
+  return walkTopTypes(root, program, checker, location, (t) =>
+    isErrorPlaceholder(t) ? 'any' : undefined
+  )
+    .filter((finding) => finding.kind !== 'budget_exhausted')
+    .map((finding) => finding.path);
+}
+
+/** TypeScript's unresolved-reference placeholder: `TypeFlags.Any` with the
+ * internal `intrinsicName === 'error'` (stable since TS 1.x; see `anchors.ts`). */
+function isErrorPlaceholder(t: ts.Type): boolean {
+  return (
+    (t.flags & ts.TypeFlags.Any) !== 0 &&
+    (t as unknown as { intrinsicName?: string }).intrinsicName === 'error'
+  );
+}
+
+function walkTopTypes(
+  root: ts.Type,
+  program: ts.Program,
+  checker: ts.TypeChecker,
+  location: ts.Node,
+  flagOf: (t: ts.Type) => 'any' | 'unknown' | undefined
 ): DeepTopType[] {
   // Cover v1's inline-expander reach with margin so this structural walk is a
   // genuine superset of v1's text-scan disqualifier AT DEPTH: anything v1 could
@@ -79,28 +123,6 @@ export function findDisqualifyingTopTypes(
   const seen = new Set<ts.Type>();
   let visited = 0;
 
-  const flagOf = (t: ts.Type): 'any' | 'unknown' | undefined => {
-    if (t.flags & ts.TypeFlags.Any) {
-      // TypeScript's unresolved-reference placeholder (e.g. `import('ext').Foo`
-      // on a bare checkout) carries `TypeFlags.Any` but `intrinsicName ===
-      // 'error'` — NOT an author-baked `any`. It resolves to the real type once
-      // the check phase installs the pinned external, so it must not count as a
-      // disqualifier: treating it as `any` would demote a healable external
-      // reference. Genuine author `any` carries `intrinsicName === 'any'`.
-      // (`intrinsicName` is internal but stable since TS 1.x — same standing as
-      // its use in anchors.ts.)
-      //
-      // The `error` placeholder also stands in for NON-healable causes (TS2304
-      // undefined name, TS2315 wrong-arity generic, a dangling internal
-      // specifier). Excluding those here is not a hole: each emits a diagnostic
-      // in the alias's own closure, so the closure-failure classification
-      // (`internalFailure` -> decayed_internal) or the check-phase POISON rule
-      // — NOT this deep walk — is their backstop, and both fail closed.
-      const name = (t as unknown as { intrinsicName?: string }).intrinsicName;
-      return name === 'error' ? undefined : 'any';
-    }
-    return t.flags & ts.TypeFlags.Unknown ? 'unknown' : undefined;
-  };
 
   // Findings accumulate rather than short-circuiting: the FIRST is what the
   // check phase pre-gates on (so the verdict is identical to the
@@ -238,16 +260,61 @@ export function findDisqualifyingTopTypes(
   return [head, ...rest];
 }
 
+/** The disqualifier the self-check and the check phase gate on (see
+ * `findDisqualifyingTopTypes`). */
+function disqualifyingFlag(t: ts.Type): 'any' | 'unknown' | undefined {
+  if (t.flags & ts.TypeFlags.Any) {
+    // TypeScript's unresolved-reference placeholder (e.g. `import('ext').Foo`
+    // on a bare checkout) carries `TypeFlags.Any` but `intrinsicName ===
+    // 'error'` — NOT an author-baked `any`. It resolves to the real type once
+    // the check phase installs the pinned external, so it must not count as a
+    // disqualifier: treating it as `any` would demote a healable external
+    // reference. Genuine author `any` carries `intrinsicName === 'any'`.
+    // (`intrinsicName` is internal but stable since TS 1.x — same standing as
+    // its use in anchors.ts.)
+    //
+    // The `error` placeholder also stands in for NON-healable causes (TS2304
+    // undefined name, TS2315 wrong-arity generic, a dangling internal
+    // specifier). Excluding those here is not a hole: each emits a diagnostic
+    // in the alias's own closure, so the closure-failure classification
+    // (`internalFailure` -> decayed_internal) or the check-phase POISON rule
+    // — NOT this deep walk — is their backstop, and both fail closed.
+    return isErrorPlaceholder(t) ? undefined : 'any';
+  }
+  return t.flags & ts.TypeFlags.Unknown ? 'unknown' : undefined;
+}
+
+/** What an anchor's SOURCE program could not resolve (carrick#1164). */
+export interface UnresolvedAtAnchor {
+  /** Member paths holding the unresolved-reference placeholder. */
+  paths: readonly string[];
+  /**
+   * Module specifiers, as the source wrote them, that did not resolve from the
+   * anchor's file or a module it reaches. Internal specifiers first. May be
+   * empty: a name the program never declared leaves the same placeholder.
+   */
+  specifiers: readonly string[];
+}
+
+/** How many unresolved specifiers a detail names before it counts the rest. */
+const MAX_NAMED_SPECIFIERS = 3;
+
 /**
  * Turn a deep finding into the published provenance entry (carrick#376).
  *
  * The self-check reads EMITTED declaration text, so a top type it finds is
- * text: whatever produced it — an author annotation, or an emitter that
- * printed a value it could not resolve — no install re-resolves it. That is
- * `declared`, and saying so is more useful than the bare `any` a reader gets
- * today. The one other cause it can distinguish is its own budget.
+ * text: an author annotation and an emitter that printed an unresolved value
+ * both read `any` there. The anchor's source program can still tell them apart
+ * (`findUnresolvedPlaceholders`), and when it recorded the finding's path as a
+ * placeholder the cause is `unresolved_import`: a dependency or a generated
+ * module was missing on the scanned checkout, which installing or generating
+ * it fixes (carrick#1164). Anything else at that position is `declared`. The
+ * one other cause the walk itself can distinguish is its own budget.
  */
-export function provenanceOf(finding: DeepTopType): TypeProvenance {
+export function provenanceOf(
+  finding: DeepTopType,
+  unresolved?: UnresolvedAtAnchor
+): TypeProvenance {
   if (finding.kind === 'budget_exhausted') {
     return {
       path: finding.path,
@@ -257,10 +324,33 @@ export function provenanceOf(finding: DeepTopType): TypeProvenance {
         'the type is too deep or wide to verify within the capture budget here, so it is reported unverified rather than assumed clean',
     };
   }
+  if (finding.kind === 'any' && unresolved?.paths.includes(finding.path)) {
+    return {
+      path: finding.path,
+      kind: finding.kind,
+      reason: 'unresolved_import',
+      detail: unresolvedDetail(unresolved.specifiers),
+    };
+  }
   return {
     path: finding.path,
     kind: finding.kind,
     reason: 'declared',
     detail: `the captured declaration states '${finding.kind}' at this position, so no counterparty shape can disagree with it`,
   };
+}
+
+function unresolvedDetail(specifiers: readonly string[]): string {
+  const lead =
+    "the type at this position did not resolve on the scanned checkout, so the compiler printed a placeholder 'any' rather than a declared type";
+  if (specifiers.length === 0) return lead;
+  const named = specifiers
+    .slice(0, MAX_NAMED_SPECIFIERS)
+    .map((specifier) => `'${specifier}'`)
+    .join(', ');
+  const more =
+    specifiers.length > MAX_NAMED_SPECIFIERS
+      ? ` and ${specifiers.length - MAX_NAMED_SPECIFIERS} more`
+      : '';
+  return `${lead}; unresolved imports reachable from the anchor: ${named}${more}`;
 }

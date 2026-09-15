@@ -354,7 +354,14 @@ impl WorkspaceScan {
 
 impl Built {
     fn for_repo(repo_root: &Path) -> Self {
-        let index = WorkspaceIndex::build(repo_root);
+        // The resolver that reads the repo's aliases (tsconfig `paths`, Deno
+        // import maps, package.json `imports`): a client reached through
+        // `@generated-db/client.ts` is otherwise an unresolved specifier and
+        // owns nothing (carrick#1159). These rows feed no analyzer input, so
+        // the manifest-only index pinned by carrick#474 does not apply. The
+        // pass is repo-wide, so each file reads its nearest config rather
+        // than a service's `tsconfig` override.
+        let index = WorkspaceIndex::build_with_aliases(repo_root, None);
         if !index.has_external_packages() {
             return Self {
                 repo_root: repo_root.to_path_buf(),
@@ -596,6 +603,8 @@ enum Root {
 enum Step {
     Prop(String),
     Call,
+    /// `await <value>`: the settled value of what came before.
+    Await,
 }
 
 /// A value expression reduced to the only thing ownership can use: where it
@@ -633,6 +642,7 @@ impl Chain {
                     text.push_str(name);
                 }
                 Step::Call => text.push_str("()"),
+                Step::Await => text = format!("(await {text})"),
             }
         }
         text
@@ -665,6 +675,19 @@ enum Owner {
     /// A value that came out of an external package. Any property of it, and
     /// any call on it, is still that package's, and carries the same anchors.
     Pkg(PkgRef),
+    /// What a call on a MEMBER of a package value returns (`db.user.findMany()`,
+    /// `api.create()`), before anything is known about it. Still the package's
+    /// while it is used unsettled: a builder chain (`from(t).select()`) or a
+    /// derived client (`axios.create()`) is called on directly. Awaited, it is
+    /// the operation's result (rows, a response), and a call on that result
+    /// (`rows.map(...)`) is not a call into the package (carrick#1159). The
+    /// export itself called (`createClient()`, `new Client()`) is a handle, not
+    /// this.
+    PkgCallResult(PkgRef),
+    /// An import binding itself (or a property path under it): the package's
+    /// published surface, not an instance. A call on it is a factory, a
+    /// constructor or a static method, so it yields a handle.
+    PkgExport(PkgRef),
     /// An object whose named properties are owned — a function's returned
     /// object literal, or a class instance's field map.
     Record(BTreeMap<String, PropValue>),
@@ -702,6 +725,13 @@ fn join_owners(left: &Owner, right: &Owner) -> Value {
         return Value::Owned(left.clone());
     }
     match (left, right) {
+        // One slot fed a handle and an unsettled call result of the same
+        // package: both are that package's, and the handle is what a call on
+        // the slot reaches.
+        (
+            Owner::Pkg(a) | Owner::PkgCallResult(a) | Owner::PkgExport(a),
+            Owner::Pkg(b) | Owner::PkgCallResult(b) | Owner::PkgExport(b),
+        ) if a == b => Value::Owned(Owner::Pkg(a.clone())),
         (Owner::Record(a), Owner::Record(b)) => {
             let mut merged = a.clone();
             for (key, value) in b {
@@ -785,11 +815,29 @@ impl Ownership {
             Root::Binding(id) => self.binding(file, id)?.clone(),
             Root::This(class) => self.class_instance(file, *class)?.clone(),
         };
+        // Whether the value in hand was read as a property off a package value,
+        // so a call on it is a member call rather than the export itself called.
+        let mut member = false;
         for step in &chain.steps {
+            let was_member = member;
+            member = matches!(step, Step::Prop(_));
             owner = match (step, owner) {
-                // Anything reached off a package's value is still that
-                // package's: a sub-client, a namespace, a builder.
-                (_, Owner::Pkg(package)) => Owner::Pkg(package),
+                // Awaiting a member call's result settles it into data.
+                (Step::Await, Owner::PkgCallResult(_)) => return None,
+                (Step::Await, owner) => owner,
+                // The import itself, and any path of properties under it, is
+                // the package's own surface: `Pdf.load()`, `axios.create()`,
+                // `sdk.clients.Queue()` produce a handle, awaited or not.
+                (Step::Prop(_), Owner::PkgExport(package)) => Owner::PkgExport(package),
+                (Step::Call, Owner::PkgExport(package)) => Owner::Pkg(package),
+                // A member called on a handle (`db.user.findMany()`) returns
+                // whatever the operation returns.
+                (Step::Call, Owner::Pkg(package) | Owner::PkgCallResult(package)) if was_member => {
+                    Owner::PkgCallResult(package)
+                }
+                // Anything else reached off a package's value is still that
+                // package's: a sub-client, a builder, a factory's product.
+                (_, Owner::Pkg(package) | Owner::PkgCallResult(package)) => Owner::Pkg(package),
                 (Step::Prop(name), Owner::Record(fields)) => match fields.get(name) {
                     Some(PropValue::Pkg(package)) => Owner::Pkg(package.clone()),
                     _ => return None,
@@ -819,7 +867,9 @@ impl Ownership {
     /// destinations, so they yield no row.
     fn resolve_package(&self, file: usize, chain: &Chain) -> Option<PkgRef> {
         match self.eval(file, chain)? {
-            Owner::Pkg(package) => Some(package),
+            Owner::Pkg(package) | Owner::PkgCallResult(package) | Owner::PkgExport(package) => {
+                Some(package)
+            }
             _ => None,
         }
     }
@@ -1196,7 +1246,9 @@ impl Workspace {
 
     fn source_value(&self, source: &Source, state: &Ownership) -> Option<Value> {
         match source {
-            Source::ExternalPackage(package) => Some(Value::Owned(Owner::Pkg(package.clone()))),
+            Source::ExternalPackage(package) => {
+                Some(Value::Owned(Owner::PkgExport(package.clone())))
+            }
             Source::InternalNamed(target, name) => {
                 state.exports.get(&(*target, name.clone())).cloned()
             }
@@ -1727,6 +1779,11 @@ impl FactCollector<'_> {
     /// transparent: they change the type of the expression, never where the
     /// value came from.
     fn chain_of(&self, expr: &Expr) -> Option<Chain> {
+        // `await` is kept as a step: settling a member call's result is what
+        // separates the rows it returned from the client (carrick#1159).
+        if let Expr::Await(awaited) = unwrap_type_only(expr) {
+            return Some(self.chain_of(&awaited.arg)?.extended(Step::Await));
+        }
         match unwrap_value(expr) {
             Expr::Ident(ident) => Some(Chain {
                 root: Root::Binding(BindingId::of(ident)),
@@ -1837,26 +1894,42 @@ impl FactCollector<'_> {
             // alias below reduces it to the class binding plus a call, and a
             // call on a class evaluates to that class's instance field map.
 
-            if let Some(chain) = self.chain_of(init) {
-                self.facts.aliases.push(AliasFact {
-                    local,
-                    value: chain,
-                });
+            // `const c = enabled ? new Client() : null` holds the client on
+            // one branch, so every branch contributes, exactly as a returned
+            // value's branches do: the branch with no chain adds nothing, and
+            // two branches naming different packages disagree (carrick#1159).
+            for branch in value_branches(init) {
+                if let Some(chain) = self.chain_of(branch) {
+                    self.facts.aliases.push(AliasFact {
+                        local: local.clone(),
+                        value: chain,
+                    });
+                }
             }
             return;
         }
 
         // `const { transport } = await getContext()` is the same chain as
         // `getContext().transport`, one step longer.
-        if let Pat::Object(pattern) = &declarator.name
-            && let Some(chain) = self.chain_of(init)
-        {
-            for (property, local) in destructured_properties(pattern) {
-                self.facts.aliases.push(AliasFact {
-                    local,
-                    value: chain.extended(Step::Prop(property)),
-                });
+        if let Pat::Object(pattern) = &declarator.name {
+            let chains: Vec<Chain> = value_branches(init)
+                .into_iter()
+                .filter_map(|branch| self.chain_of(branch))
+                .collect();
+            for chain in chains {
+                self.collect_destructured_aliases(pattern, &chain);
             }
+        }
+    }
+
+    /// `const { a, b: c } = <chain>`: each bound name aliases the chain plus
+    /// the property it reads.
+    fn collect_destructured_aliases(&mut self, pattern: &ObjectPat, chain: &Chain) {
+        for (property, local) in destructured_properties(pattern) {
+            self.facts.aliases.push(AliasFact {
+                local,
+                value: chain.extended(Step::Prop(property)),
+            });
         }
     }
 
@@ -2137,7 +2210,7 @@ impl FactCollector<'_> {
                 match step {
                     Step::Prop(name) => path.push(name.clone()),
                     // A call on the parameter is a value the site cannot supply.
-                    Step::Call => return,
+                    Step::Call | Step::Await => return,
                 }
             }
             self.facts.classes[class]
@@ -2277,11 +2350,24 @@ fn unwrap_value(expr: &Expr) -> &Expr {
     }
 }
 
+/// [`unwrap_value`] without `await`: the wrappers that change only the static
+/// type of an expression.
+fn unwrap_type_only(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(inner) => unwrap_type_only(&inner.expr),
+        Expr::TsNonNull(inner) => unwrap_type_only(&inner.expr),
+        Expr::TsAs(inner) => unwrap_type_only(&inner.expr),
+        Expr::TsSatisfies(inner) => unwrap_type_only(&inner.expr),
+        other => other,
+    }
+}
+
 /// The alternatives a value expression can take at runtime. A ternary and the
 /// short-circuiting operators each pick one branch, and any of them may be the
 /// one that carries the client.
 fn value_branches(expr: &Expr) -> Vec<&Expr> {
-    match unwrap_value(expr) {
+    // `await` is not stripped here: the chain reducer keeps it as a step.
+    match unwrap_type_only(expr) {
         Expr::Cond(cond) => {
             let mut branches = value_branches(&cond.cons);
             branches.extend(value_branches(&cond.alt));
@@ -2346,6 +2432,157 @@ mod tests {
     use crate::file_finder::find_service_files;
 
     const IGNORE_PATTERNS: &[&str] = &crate::packages::MANIFEST_SKIP_DIRS;
+
+    /// Two ways a Deno workspace hid its SDK clients (carrick#1159). The
+    /// service's import map aliases a generated client directory
+    /// (`@generated-db/`), which only the alias-reading resolver follows. A
+    /// member package declares its vendor SDK in its own `imports` and exports
+    /// the client from a ternary (`enabled ? new Client() : null`), whose
+    /// branches a declarator did not take apart. Both calls must become rows.
+    #[test]
+    fn deno_import_map_aliases_and_ternary_clients_reach_sdk_rows() {
+        let repo = tempfile::tempdir().unwrap();
+        let write = |path: &str, text: &str| {
+            let path = repo.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "deno.jsonc",
+            r#"{
+                // the root map points every member at the metrics package
+                "workspace": ["./apps/api", "./packages/metrics"],
+                "imports": { "@acme/metrics": "./packages/metrics/mod.ts" }
+            }"#,
+        );
+        write(
+            "packages/metrics/deno.json",
+            r#"{ "name": "@acme/metrics", "exports": { ".": "./mod.ts" },
+                 "imports": { "metrics-sdk": "npm:metrics-sdk@^5.0.0" } }"#,
+        );
+        write(
+            "packages/metrics/config.ts",
+            "export default { ENABLED: true, KEY: 'k', HOST: 'h' };\n",
+        );
+        write(
+            "packages/metrics/src/types.ts",
+            "import type { MetricsClient } from 'metrics-sdk';\n\
+             export type MetricsLike = MetricsClient | null;\n",
+        );
+        write(
+            "packages/metrics/mod.ts",
+            "import { MetricsClient } from 'metrics-sdk';\n\
+             import config from './config.ts';\n\
+             import type { MetricsLike } from './src/types.ts';\n\
+             export const metrics: MetricsLike = config.ENABLED && config.KEY\n\
+               ? new MetricsClient(config.KEY, { host: config.HOST })\n\
+               : null;\n",
+        );
+        write(
+            "apps/api/deno.json",
+            r#"{ "name": "@acme/api",
+                 "imports": { "db-sdk": "npm:db-sdk@^7.0.0",
+                              "@generated-db/": "./src/db/generated/client/" } }"#,
+        );
+        write(
+            "apps/api/src/db/generated/client/client.ts",
+            "import { DbClient } from 'db-sdk';\n\
+             export const db = new DbClient();\n",
+        );
+        write(
+            "apps/api/src/handler.ts",
+            "import { metrics } from '@acme/metrics';\n\
+             import { db } from '@generated-db/client.ts';\n\
+             export async function handle() {\n\
+               metrics.capture('handled');\n\
+               return db.account.findMany();\n\
+             }\n",
+        );
+
+        let service = Config {
+            directory: Some("apps/api".to_string()),
+            ..Default::default()
+        };
+        let (files, _) =
+            find_service_files(&repo.path().to_string_lossy(), &service, IGNORE_PATTERNS);
+        let rows = WorkspaceScan::new().rows_for_service(&files, repo.path());
+        let mut handler: Vec<(usize, String)> = rows
+            .iter()
+            .filter(|row| row.file == "apps/api/src/handler.ts")
+            .map(|row| (row.line, row.package.clone()))
+            .collect();
+        handler.sort();
+        assert_eq!(
+            handler,
+            vec![(4, "metrics-sdk".to_string()), (5, "db-sdk".to_string())],
+            "all rows: {:?}",
+            triples(&rows)
+        );
+    }
+
+    /// A call on what an awaited member call returned is a call on data, not
+    /// into the package (carrick#1159): `rows.map(...)` after
+    /// `rows = await db.user.findMany()`. Calls on the client, factory
+    /// products, unsettled builder chains and a derived client all stay rows.
+    #[test]
+    fn calls_on_awaited_member_call_results_are_not_sdk_rows() {
+        let repo = tempfile::tempdir().unwrap();
+        let write = |path: &str, text: &str| {
+            let path = repo.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "package.json",
+            r#"{ "name": "svc", "dependencies": { "db-sdk": "^1.0.0", "http-sdk": "^2.0.0" } }"#,
+        );
+        write(
+            "src/service.ts",
+            "import { DbClient, connect } from 'db-sdk';\n\
+             import http from 'http-sdk';\n\
+             const db = new DbClient();\n\
+             const api = http.create({ base: 'x' });\n\
+             async function listUsers() { return db.user.findMany(); }\n\
+             export async function run() {\n\
+               const rows = await db.user.findMany();\n\
+               rows.map((row) => row.id);\n\
+               const { data } = await db.table('t').select();\n\
+               data.filter(Boolean);\n\
+               const users = await listUsers();\n\
+               users.forEach((user) => user);\n\
+               const conn = await connect();\n\
+               conn.query('select 1');\n\
+               db.table('t').select().limit(1);\n\
+               api.get('/health');\n\
+             }\n",
+        );
+        let service = Config::default();
+        let (files, _) =
+            find_service_files(&repo.path().to_string_lossy(), &service, IGNORE_PATTERNS);
+        let rows = WorkspaceScan::new().rows_for_service(&files, repo.path());
+        let mut callees: Vec<(usize, String)> = rows
+            .iter()
+            .map(|row| (row.line, row.callee.clone()))
+            .collect();
+        callees.sort();
+        assert_eq!(
+            callees,
+            vec![
+                (4, "http.create".to_string()),
+                (5, "db.user.findMany".to_string()),
+                (7, "db.user.findMany".to_string()),
+                (9, "db.table".to_string()),
+                (9, "db.table().select".to_string()),
+                (13, "connect".to_string()),
+                (14, "conn.query".to_string()),
+                (15, "db.table".to_string()),
+                (15, "db.table().select".to_string()),
+                (15, "db.table().select().limit".to_string()),
+                (16, "api.get".to_string()),
+            ],
+            "rows.map, data.filter and users.forEach are calls on results"
+        );
+    }
 
     #[test]
     fn vite_artifacts_are_excluded_from_workspace_candidates() {

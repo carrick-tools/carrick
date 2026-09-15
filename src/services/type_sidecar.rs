@@ -242,6 +242,13 @@ pub enum CaptureAnchor {
         alias: String,
         type_text: String,
         anchor_origin: AnchorOrigin,
+        /// The file the text was printed from, when there is one (a v1
+        /// inference result, or a backfill replacing a located anchor). The
+        /// capture adds it to its analysis program, so a name the text prints
+        /// bare (an enum member, a recursive reference) is found declared
+        /// rather than recorded undeclared (#1165). LLM inline text has none.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_file: Option<String>,
     },
 }
 
@@ -252,6 +259,16 @@ impl CaptureAnchor {
             | CaptureAnchor::HandlerReturn { alias, .. }
             | CaptureAnchor::Infer { alias, .. }
             | CaptureAnchor::Literal { alias, .. } => alias,
+        }
+    }
+
+    /// Repo-relative file the anchor reads from, if it has one.
+    pub fn source_file(&self) -> Option<&str> {
+        match self {
+            CaptureAnchor::Symbol { source_file, .. }
+            | CaptureAnchor::HandlerReturn { source_file, .. }
+            | CaptureAnchor::Infer { source_file, .. } => Some(source_file),
+            CaptureAnchor::Literal { source_file, .. } => source_file.as_deref(),
         }
     }
 }
@@ -329,6 +346,36 @@ pub struct CaptureAliasRecord {
     /// rather than being handed a bare `any` (carrick#376).
     #[serde(default)]
     pub any_provenance: Vec<TypeProvenance>,
+    /// Internal module specifiers that fail to resolve in this alias's closure
+    /// (carrick#1165). The emitted tree is missing part of what the alias
+    /// refers to, so its printed answer can name types nothing declares.
+    /// File-granular: every alias whose closure reaches the failing file.
+    #[serde(default)]
+    pub dangling_specifiers: Vec<String>,
+    /// Identifiers the alias's anonymous print names that resolve to nothing
+    /// in the producer's program where the surface declares the alias
+    /// (carrick#1165).
+    #[serde(default)]
+    pub undeclared_names: Vec<String>,
+}
+
+impl CaptureAliasRecord {
+    /// Why this alias's printed answer is not a type to publish, if it is not
+    /// (carrick#1165): it names something the capture recorded as unresolved,
+    /// or it is itself a top type with no pinned external to heal it. A top
+    /// type the check phase heals by installing a pin (`allowlisted_external`)
+    /// is still worth publishing by name.
+    pub fn unpublishable_reason(&self) -> Option<&'static str> {
+        if !self.undeclared_names.is_empty() {
+            Some("the printed answer names an identifier nothing declares")
+        } else if !self.dangling_specifiers.is_empty() {
+            Some("the declaration behind the answer imports a module that did not resolve")
+        } else if self.top_type_at_self_check && self.self_check == "decayed_internal" {
+            Some("the answer is a top type with no pinned external to explain it")
+        } else {
+            None
+        }
+    }
 }
 
 /// One `any`/`unknown` finding inside a captured or inferred type, with its
@@ -342,9 +389,9 @@ pub struct TypeProvenance {
     pub path: String,
     /// `any`, `unknown`, or `budget_exhausted`.
     pub kind: String,
-    /// Categorized cause: `declared`, `budget_exhausted`,
+    /// Categorized cause: `declared`, `unresolved_import`, `budget_exhausted`,
     /// `no_payload_evidence`, `machinery_envelope`, `coerced_input`,
-    /// `no_success_payload`, `not_recorded`.
+    /// `no_success_payload`, `no_request_body`, `not_recorded`.
     pub reason: String,
     /// One scrubbed sentence a reader can act on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2114,10 +2161,21 @@ mod tests {
             alias: "C".into(),
             type_text: "{ id: string }".into(),
             anchor_origin: AnchorOrigin::LlmSymbol,
+            source_file: None,
         };
         let json = serde_json::to_string(&literal).unwrap();
         assert!(json.contains(r#""kind":"literal""#));
         assert!(json.contains(r#""type_text":"{ id: string }""#));
+        assert!(!json.contains("source_file"));
+
+        let located = CaptureAnchor::Literal {
+            alias: "D".into(),
+            type_text: "{ status: Status }".into(),
+            anchor_origin: AnchorOrigin::DeterministicInfer,
+            source_file: Some("src/routes.ts".into()),
+        };
+        let json = serde_json::to_string(&located).unwrap();
+        assert!(json.contains(r#""source_file":"src/routes.ts""#));
     }
 
     /// Check-pair wire shapes: lowercase protocol/type_kind enums, and the

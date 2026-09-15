@@ -64,6 +64,13 @@ export interface LiteralAnchorRequest {
   /** Verbatim TS type text (a bare symbol name or an inline object type). */
   type_text: string;
   anchor_origin: AnchorOrigin;
+  /**
+   * Repo-root-relative file the text was printed from, when there is one.
+   * It joins the analysis program, so a name the text prints bare (an enum
+   * member, a recursive reference) is found declared (carrick#1165). The
+   * record's `source_file` stays `<inline>`: the answer is still the text.
+   */
+  source_file?: string;
 }
 
 /**
@@ -136,9 +143,14 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  * honest value is `not_recorded` — never a guess.
  *
  *  - `declared`: the captured declaration states `any`/`unknown` at this
- *    position. Whatever put it there (an author annotation, or an emitter that
- *    printed an unresolved value as `any`), it is baked into the emitted text
- *    and no install re-resolves it.
+ *    position, and the producer's own program had a type there too: an author
+ *    annotation, not a failed resolution.
+ *  - `unresolved_import`: the position is `any` in the emitted text because the
+ *    producer's program could not resolve the type there — an import of a
+ *    dependency that is not installed, or of a generated module that was never
+ *    generated, on the scanned checkout (carrick#1164). The printer writes that
+ *    placeholder as `any`, so the text alone reads like `declared`; the capture
+ *    tells them apart on the source program at anchor time.
  *  - `budget_exhausted`: the subtree was too deep or wide to finish inside the
  *    capture walk's budget, so it is reported unverified rather than clean.
  *  - `no_payload_evidence`: a handler returned a call whose callee has no
@@ -158,16 +170,21 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    responses (by the status each send states), or no success send carries a
  *    body a JSON contract can describe, so the route publishes no success body
  *    rather than an error body or a redirect location (carrick#1161).
+ *  - `no_request_body`: the located request read is a validated part the
+ *    route's validator binds that is not a body (a path parameter, a query), so
+ *    the route states no request body contract there (carrick#1166).
  *  - `not_recorded`: the position carries a top type and this layer has no
  *    cause for it.
  */
 export type TypeProvenanceReason =
   | 'declared'
+  | 'unresolved_import'
   | 'budget_exhausted'
   | 'no_payload_evidence'
   | 'machinery_envelope'
   | 'coerced_input'
   | 'no_success_payload'
+  | 'no_request_body'
   | 'not_recorded';
 
 /**
@@ -232,6 +249,22 @@ export interface CaptureAliasRecord {
    * Sorted by `path`; absent (not empty) when the walk found nothing.
    */
   any_provenance?: TypeProvenance[];
+  /**
+   * Internal module specifiers that fail to resolve anywhere in this alias's
+   * closure, as the emitted files write them (carrick#1165). The emitted
+   * tree is missing part of what the alias refers to, so a shape printed from
+   * it can name types nothing declares. Sorted; absent when there are none.
+   */
+  dangling_specifiers?: string[];
+  /**
+   * Identifiers this alias's printed text names that do not resolve where the
+   * surface declares it (carrick#1165): a literal anchor's text naming a type
+   * nothing declares, or a node-builder print reusing a source annotation
+   * whose own import did not resolve. Checked on the producer's program, so a global the
+   * program declares (a runtime or `@types` global) is never listed. Sorted;
+   * absent when there are none.
+   */
+  undeclared_names?: string[];
 }
 
 /** Aggregate fidelity metric, emitted per capture (one service). */

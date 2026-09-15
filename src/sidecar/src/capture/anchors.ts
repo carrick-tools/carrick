@@ -12,8 +12,10 @@ import type {
   InferAnchorRequest,
   SymbolAnchorRequest,
 } from './api.js';
-import { printTypeForDestination } from './node-builder.js';
+import { printTypeForDestination, undeclaredNamesIn } from './node-builder.js';
 import { typeIsOrContainsMachinery } from './machinery.js';
+import type { UnresolvedAtAnchor } from './deep-walk.js';
+import { unresolvedAtAnchor } from './unresolved.js';
 
 export interface ResolvedAnchor {
   request: CaptureAnchorRequest;
@@ -43,6 +45,20 @@ export interface ResolvedAnchor {
    * backfillable; the reason rides `self_check_detail` instead.
    */
   abstainReason?: string;
+  /**
+   * carrick#1165: identifiers the alias text names (a literal anchor's text
+   * or a node-builder print) that nothing in the producer's program declares.
+   * Recorded on the capture record as `undeclared_names`.
+   */
+  undeclaredNames?: string[];
+  /**
+   * carrick#1164: member paths the SOURCE program could not resolve, and the
+   * unresolved imports the anchor's file reaches. Printed into the surface
+   * those members read `any`, like an author's `any`; the self-check uses this
+   * to label them `unresolved_import` instead of `declared`. Absent when the
+   * anchor's type holds no unresolved placeholder.
+   */
+  unresolved?: UnresolvedAtAnchor;
 }
 
 /** Repo-root-relative source file -> extensionless specifier from entryDir. */
@@ -108,6 +124,15 @@ export function resolveAnchor(
     const siblingSpec = bareIdentifier
       ? args.siblingSymbolSpecs?.get(text)
       : undefined;
+    // carrick#1165: literal text is printed elsewhere (the v1 walk) and can
+    // name a type by a bare identifier that nothing in the program declares
+    // (a generated model that was never generated). The stub then self-checks
+    // such a name as an error placeholder, which no walk flags. A name a
+    // sibling symbol anchor imports is resolved by that import.
+    const undeclaredNames =
+      siblingSpec || !args.placeholder
+        ? []
+        : undeclaredNamesInText(text, program, args.placeholder);
     return {
       request,
       aliasText: siblingSpec ? `import('${siblingSpec}').${text}` : text,
@@ -117,6 +142,7 @@ export function resolveAnchor(
       // them at this tier so the legacy dependence stays measurable and
       // ratchetable. Demotions are distinguished by failureReason.
       serialization: 'structural_fallback',
+      ...(undeclaredNames.length > 0 ? { undeclaredNames } : {}),
     };
   }
 
@@ -167,10 +193,20 @@ export function resolveAnchor(
       );
     }
 
+    const arrayDepth = Math.max(0, request.array_depth ?? 0);
+    const declared = checker.getDeclaredTypeOfSymbol(resolvedExport);
+    const unresolved = unresolvedAtAnchor(
+      program,
+      sourceFile,
+      declared,
+      resolvedExport.declarations?.[0] ?? sourceFile,
+      '<0>'.repeat(arrayDepth)
+    );
     return {
       request,
       aliasText: `import('${spec}').${request.symbol_name}${arraySuffix}`,
       serialization: 'emitted',
+      ...(unresolved ? { unresolved } : {}),
     };
   }
 
@@ -201,10 +237,18 @@ export function resolveAnchor(
       // Type parameters erase to their constraint/unknown under ReturnType<>.
       return demote(`handler '${request.symbol_name}' is generic`);
     }
+    const returned = callSignatures[0].getReturnType();
+    const unresolved = unresolvedAtAnchor(
+      program,
+      sourceFile,
+      checker.getAwaitedType(returned) ?? returned,
+      declaration ?? sourceFile
+    );
     return {
       request,
       aliasText: `Awaited<ReturnType<typeof import('${spec}').${request.symbol_name}>>`,
       serialization: 'emitted',
+      ...(unresolved ? { unresolved } : {}),
     };
   }
 
@@ -236,6 +280,10 @@ export function resolveAnchor(
   if (!located) {
     return demote(locatorFailureReason(request));
   }
+  // carrick#1162: a serialised body is the JSON of its argument. The call's own
+  // `string` result is never the payload's contract, and publishing it reads
+  // incompatible against every object-typed counterparty.
+  located = serialisedArgument(located);
   // #439 part 1: a producer anchor whose locator landed inside a fluent
   // builder chain's config-descriptor argument (an all-literal metadata
   // object) must never capture that descriptor as the request type. Re-aim at
@@ -362,12 +410,32 @@ function finishInferAnchor(
   if (!printed.text) {
     return demote(printed.failure ?? 'node builder print failed');
   }
+  const unresolved = unresolvedAtAnchor(program, sourceFile, type, located);
   return {
     request,
     aliasText: printed.text,
     serialization: 'node_builder',
     ...(reaimNote ? { reaimNote } : {}),
+    ...(printed.undeclaredNames ? { undeclaredNames: printed.undeclaredNames } : {}),
+    ...(unresolved ? { unresolved } : {}),
   };
+}
+
+/** `undeclaredNamesIn` over type text rather than a built node. */
+function undeclaredNamesInText(
+  text: string,
+  program: ts.Program,
+  destination: ts.Node
+): string[] {
+  const parsed = ts.createSourceFile(
+    'literal-anchor.ts',
+    `type __LiteralAnchor = ${text};`,
+    ts.ScriptTarget.Latest,
+    true
+  );
+  const statement = parsed.statements[0];
+  if (!statement || !ts.isTypeAliasDeclaration(statement)) return [];
+  return undeclaredNamesIn(statement.type, program, destination);
 }
 
 /**
@@ -893,6 +961,28 @@ function paramLocatorHints(request: InferAnchorRequest): string {
   return request.line_number !== undefined
     ? `line ${request.line_number}`
     : 'no line hint';
+}
+
+/**
+ * The argument of a `JSON.stringify(value)` call (through parentheses), or the
+ * node unchanged. The mirror of the v1 inferrer's `unwrapJsonStringifyArg`:
+ * the global serialiser is identified by the standard `JSON` object, the one
+ * name every runtime shares.
+ */
+function serialisedArgument(node: ts.Node): ts.Node {
+  let current = node;
+  while (ts.isParenthesizedExpression(current)) current = current.expression;
+  if (
+    ts.isCallExpression(current) &&
+    current.arguments.length > 0 &&
+    ts.isPropertyAccessExpression(current.expression) &&
+    ts.isIdentifier(current.expression.expression) &&
+    current.expression.expression.text === 'JSON' &&
+    current.expression.name.text === 'stringify'
+  ) {
+    return current.arguments[0];
+  }
+  return node;
 }
 
 function locatorFailureReason(request: InferAnchorRequest): string {

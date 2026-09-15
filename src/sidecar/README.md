@@ -199,13 +199,17 @@ An anchor is one of four kinds, discriminated on `kind`:
       "kind": "literal",
       "alias": "Endpoint_0011_Response",
       "type_text": "{ ok: boolean }",
-      "anchor_origin": "anchor-backfill"
+      "anchor_origin": "anchor-backfill",
+      "source_file": "src/routes/orders.ts"
     }
   ]
 }
 ```
 
 `anchor_origin` is one of `llm-symbol`, `deterministic-infer`, `anchor-backfill`.
+A literal anchor's optional `source_file` names the file its text was printed
+from; it joins the analysis program so names the text prints bare are found
+declared, and is omitted for inline text that has no file.
 
 Response (`result` is a `CaptureStubResult`, abbreviated here):
 ```json

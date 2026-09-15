@@ -566,8 +566,7 @@ function resolveAnchors(
     const anchorSources = [
       ...new Set(
         opts.anchors
-          .filter((a) => a.kind !== 'literal')
-          .map((a) => path.join(ctx.repoRoot, a.source_file))
+          .flatMap((a) => (a.source_file ? [path.join(ctx.repoRoot, a.source_file)] : []))
       ),
     ].filter((f) => fs.existsSync(f));
     const options = {

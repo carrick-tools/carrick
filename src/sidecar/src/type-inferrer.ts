@@ -1686,6 +1686,37 @@ export class TypeInferrer {
           this.getNodeLocation(node)
         );
       }
+
+      // carrick#1166: a validated read of a part the registration's validator
+      // binds and which is not a body (`valid('param')`) is not what a caller
+      // sends as the body. The route declares no body here, and saying so
+      // keeps a later locator re-run from publishing the parameters instead.
+      const nonBodyPart = declaredAt
+        ? this.nonBodyValidatedPart(node, declaredAt.registration)
+        : undefined;
+      if (nonBodyPart !== undefined) {
+        this.log(
+          `Request locator at ${request.file_path}:${request.line_number} reads the validated ` +
+            `'${nonBodyPart}' part, which is not a body; the route declares no request body here`
+        );
+        const abstain = this.createInferredType(
+          request,
+          'unknown',
+          false,
+          this.getNodeLocation(node)
+        );
+        abstain.any_provenance = [
+          {
+            path: '',
+            kind: 'unknown',
+            reason: 'no_request_body',
+            detail:
+              `the located read is the '${nonBodyPart}' part a validator binds, not a request body, ` +
+              'so the route states no body contract here',
+          },
+        ];
+        return abstain;
+      }
     }
 
     const payloadType = node.getType();
@@ -1730,6 +1761,31 @@ export class TypeInferrer {
     if (explicitType) {
       typeString = explicitType;
       isExplicit = true;
+    }
+
+    // carrick#1166: the read itself is untyped (`await c.req.json()` is `any`
+    // or `unknown`), and the handler validates it by handing it to a schema:
+    // `Schema.safeParse(body)`, `Schema.parse(await c.req.json())`. The schema
+    // declares what a caller may send, so its INPUT is the request contract,
+    // read the way every other request anchor reads a schema (carrick#1101).
+    const readType = this.unwrapPromiseType(payloadType);
+    if (
+      !explicitType &&
+      !unwrapResult.wasUnwrapped &&
+      (readType.isAny() || readType.isUnknown())
+    ) {
+      const parsedWith = this.schemaConsumingRead(node);
+      if (parsedWith) {
+        this.log(
+          `Request locator at ${request.file_path}:${request.line_number} is an untyped read ` +
+            "the handler validates with a schema; publishing the schema's input"
+        );
+        return this.declaredRequestInferredType(
+          request,
+          parsedWith,
+          this.getNodeLocation(node)
+        );
+      }
     }
 
     // Publication guard (carrick#964): the locator landed on machinery — a
@@ -4089,10 +4145,16 @@ export class TypeInferrer {
     }
 
     // `getDefinitionNodes()` may return the name identifier of a `const h = …`
-    // binding rather than the declaration; walk to the variable declaration.
+    // binding rather than the declaration; step up to the variable declaration
+    // it NAMES. Only that one step: a parameter of `const h = (input) => …` also
+    // has `h` as an ancestor, and climbing to it made the parameter read as the
+    // function it is declared inside (carrick#1162).
+    const parent = decl.getParent();
     const varDecl = Node.isVariableDeclaration(decl)
       ? decl
-      : decl.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
+      : parent && Node.isVariableDeclaration(parent) && parent.getNameNode() === decl
+        ? parent
+        : undefined;
     if (varDecl) {
       const initializer = varDecl.getInitializer();
       if (initializer) {
@@ -4457,6 +4519,106 @@ export class TypeInferrer {
       values.push(...middlewareArgs.filter((arg) => !Node.isStringLiteral(arg)));
     }
     return values;
+  }
+
+  /**
+   * The contract of the schema a handler validates an untyped body read with
+   * (carrick#1166), or null.
+   *
+   * `read` is the located expression: the read call, or the binding that holds
+   * it. Every call in the enclosing function that takes that value as an
+   * argument is a candidate, and the schema is the call's receiver
+   * (`Schema.safeParse(body)`) or one of its other arguments
+   * (`parse(Schema, body)`). A candidate counts only when it declares schema
+   * types (`schemaOutputType` / `schemaInputType`), so a logger or a service
+   * call the body is also handed to is never read as a contract. No method or
+   * library name is matched.
+   */
+  private schemaConsumingRead(read: Node): DeclaredContract | null {
+    const func = this.findContainingFunctionForNode(read);
+    if (!func) return null;
+
+    const bindings = new Set<unknown>();
+    const addBinding = (identifier: Node | undefined): void => {
+      const symbol = identifier?.getSymbol()?.compilerSymbol;
+      if (symbol) bindings.add(symbol);
+    };
+    if (Node.isIdentifier(read)) {
+      addBinding(read);
+    } else {
+      const declaration = read.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
+      const initializer = declaration?.getInitializer();
+      if (
+        declaration &&
+        initializer &&
+        this.unwrapExpressionNode(initializer) === read &&
+        Node.isIdentifier(declaration.getNameNode())
+      ) {
+        addBinding(declaration.getNameNode());
+      }
+    }
+    const carriesRead = (argument: Node): boolean =>
+      argument === read ||
+      (Node.isIdentifier(argument) &&
+        bindings.has(argument.getSymbol()?.compilerSymbol));
+
+    for (const call of func.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+      const args = call.getArguments().map((arg) => this.unwrapExpressionNode(arg));
+      const carrier = args.findIndex(carriesRead);
+      if (carrier < 0) continue;
+
+      const candidates: Node[] = [];
+      const callee = call.getExpression();
+      if (Node.isPropertyAccessExpression(callee)) {
+        candidates.push(callee.getExpression());
+      }
+      args.forEach((arg, index) => {
+        if (index !== carrier) candidates.push(arg);
+      });
+      for (const candidate of candidates) {
+        const candidateType = candidate.getType();
+        if (
+          !this.schemaOutputType(candidateType, candidate) &&
+          !this.schemaInputType(candidateType, candidate)
+        ) {
+          continue;
+        }
+        const contract = this.schemaContract(candidate, 'input');
+        if (contract) return contract;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The part a validated read names when that part is not a body, or
+   * `undefined` (carrick#1166).
+   *
+   * The read is a call whose only argument is a string literal, and the
+   * registration carries a validator middleware binding that same literal.
+   * The part names match through the source's own literal, so no framework
+   * vocabulary is assumed beyond `REQUEST_BODY_PARTS`, which already decides
+   * what a body is for the middleware anchor.
+   */
+  private nonBodyValidatedPart(read: Node, registration: Node): string | undefined {
+    if (!Node.isCallExpression(read) || !Node.isCallExpression(registration)) {
+      return undefined;
+    }
+    const readArgs = read.getArguments().map((arg) => this.unwrapExpressionNode(arg));
+    if (readArgs.length !== 1 || !Node.isStringLiteral(readArgs[0])) return undefined;
+    const part = readArgs[0].getLiteralValue();
+    if (REQUEST_BODY_PARTS.has(part.toLowerCase())) return undefined;
+
+    for (const argument of registration.getArguments()) {
+      const middleware = this.unwrapExpressionNode(argument);
+      if (!Node.isCallExpression(middleware)) continue;
+      const bindsPart = middleware
+        .getArguments()
+        .map((arg) => this.unwrapExpressionNode(arg))
+        .some((arg) => Node.isStringLiteral(arg) && arg.getLiteralValue() === part);
+      if (bindsPart) return part;
+    }
+    return undefined;
   }
 
   /**
@@ -5327,8 +5489,18 @@ export class TypeInferrer {
       // Prefer exact matches, then smallest containing
       const bestDelta = Math.abs(bestRange - (spanEnd - spanStart));
       const currentDelta = Math.abs(currentRange - (spanEnd - spanStart));
-
-      return currentDelta < bestDelta ? current : best;
+      if (currentDelta !== bestDelta) {
+        return currentDelta < bestDelta ? current : best;
+      }
+      // carrick#1166: on a tie keep the INNER node. Without a trailing
+      // semicolon a statement spans exactly the bytes of its expression, and
+      // the statement's own type is `any`, so a registration located by its
+      // span published `any` as its request body. Descendants follow their
+      // ancestors in `getDescendants()` order, so a tied later node inside the
+      // current best is the deeper one.
+      return current.getStart() >= best.getStart() && current.getEnd() <= best.getEnd()
+        ? current
+        : best;
     });
   }
 
