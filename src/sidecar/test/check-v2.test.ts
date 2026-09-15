@@ -62,6 +62,13 @@ const PAIRS: CheckPairSpec[] = [
   // HTTP request-body: sent=consumer(subset), expected=producer(superset) =>
   // the consumer body cannot satisfy the producer's required field => incompatible.
   mk('reqdir', 'Req_Superset', 'Req_Subset', { type_kind: 'request' }),
+  // carrick#1162: a consumer that reads no body is not a contract to compare.
+  mk('voidconsumer', 'V_Sent', 'V_Exp'),
+  mk('undefinedconsumer', 'V_Sent', 'Ud_Exp'),
+  // carrick#1162: a form-encoded body carries its fields as runtime appends.
+  mk('formbody', 'Form_Expected', 'Form_Sent', { type_kind: 'request' }),
+  // The known true positive: a free `string` sent where a union is required.
+  mk('unionrequest', 'Union_Expected', 'Union_Sent', { type_kind: 'request' }),
 ];
 
 function byKey(verdicts: CheckVerdict[]): Map<string, CheckVerdict> {
@@ -82,6 +89,9 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type U_Sent = unknown;',
         'export type A_Sent = any;',
         'export type Req_Superset = { a: string; b: number; };',
+        'export type V_Sent = { a: string; };',
+        'export type Form_Expected = { title: string; content: string; };',
+        'export type Union_Expected = { type: "boolean" | "file_upload" | "text_input"; };',
       ].join('\n') + '\n'
     );
     writeStub(
@@ -93,6 +103,10 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type U_Exp = { a: string; };',
         'export type A_Exp = { a: string; };',
         'export type Req_Subset = { a: string; };',
+        'export type V_Exp = void;',
+        'export type Ud_Exp = undefined;',
+        'export type Form_Sent = FormData;',
+        'export type Union_Sent = { type: string; };',
       ].join('\n') + '\n'
     );
     stubs = [
@@ -162,6 +176,29 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
     // compatible; the direction table makes it correctly incompatible.
     const v = verdicts.get('reqdir')!;
     assert.strictEqual(v.bucket, 'incompatible');
+  });
+
+  it('a consumer response of void or undefined is not compared (carrick#1162)', () => {
+    for (const key of ['voidconsumer', 'undefinedconsumer']) {
+      const v = verdicts.get(key)!;
+      assert.strictEqual(v.bucket, 'unverifiable', key);
+      assert.strictEqual(v.gate, 'consumer:void', key);
+      assert.strictEqual(v.resolved, false, key);
+      assert.match(v.unresolved_reason!, /consumer/, key);
+    }
+  });
+
+  it('a form-encoded consumer body is not compared (carrick#1162)', () => {
+    const v = verdicts.get('formbody')!;
+    assert.strictEqual(v.bucket, 'unverifiable');
+    assert.strictEqual(v.gate, 'consumer:form');
+    assert.strictEqual(v.resolved, false);
+  });
+
+  it('keeps the true positive: a string sent where a union is required', () => {
+    const v = verdicts.get('unionrequest')!;
+    assert.strictEqual(v.bucket, 'incompatible');
+    assert.match(v.diagnostic!, /type/);
   });
 
   it('diagnostics carry no absolute paths or scan internals', () => {

@@ -105,11 +105,12 @@ describe('graphql probe shape (resolver-return envelope unwrap)', () => {
     assert.strictEqual(lines[plan.assignmentLine - 1], 'const expected: Expected = sentComparand;');
   });
 
-  it('non-graphql pairs keep the raw sent assignment and six gates', () => {
+  it('non-graphql pairs keep the raw sent assignment and eight gates', () => {
     for (const protocol of ['http', 'socket', 'pubsub'] as const) {
       const plan = buildProbe(spec({ protocol }), PKG);
       assert.ok(!plan.source.includes('GqlComparand'), protocol);
-      assert.strictEqual(plan.gateLines.size, 6, protocol);
+      // any/unknown/never on both sides, plus void on both sides (carrick#1162).
+      assert.strictEqual(plan.gateLines.size, 8, protocol);
       const lines = plan.source.split('\n');
       assert.strictEqual(lines[plan.assignmentLine - 1], 'const expected: Expected = sent;');
     }
@@ -243,6 +244,45 @@ describe('four-bucket classifier precedence', () => {
     });
     assert.strictEqual(v.bucket, 'unverifiable');
     assert.strictEqual(v.gate, 'producer:unknown');
+  });
+
+  it('void gate -> unverifiable, below the unknown gate (carrick#1162)', () => {
+    const voidLine = [...plan.gateLines].find(([, n]) => n === 'expected:void')![0];
+    const unkLine = [...plan.gateLines].find(([, n]) => n === 'expected:unknown')![0];
+    const voidOnly = classifyPair({
+      plan,
+      probeDiags: [diag(voidLine, 2344), diag(plan.assignmentLine, 2322)],
+      poisonReason: noPoison,
+      scrubCtx,
+    });
+    assert.strictEqual(voidOnly.bucket, 'unverifiable');
+    // http/response => expected is the consumer.
+    assert.strictEqual(voidOnly.gate, 'consumer:void');
+    const both = classifyPair({
+      plan,
+      probeDiags: [diag(voidLine, 2344), diag(unkLine, 2344)],
+      poisonReason: noPoison,
+      scrubCtx,
+    });
+    assert.strictEqual(both.gate, 'consumer:unknown');
+  });
+
+  it('form gate exists only on an http request probe (carrick#1162)', () => {
+    const request = buildProbe(spec({ type_kind: 'request' }), PKG);
+    const formLine = [...request.gateLines].find(([, n]) => n === 'sent:form');
+    assert.ok(formLine, 'an http request probe gates a form-encoded sent body');
+    const v = classifyPair({
+      plan: request,
+      probeDiags: [diag(formLine[0], 2344), diag(request.assignmentLine, 2322)],
+      poisonReason: noPoison,
+      scrubCtx,
+    });
+    assert.strictEqual(v.bucket, 'unverifiable');
+    assert.strictEqual(v.gate, 'consumer:form');
+    assert.ok(
+      ![...buildProbe(spec(), PKG).gateLines.values()].includes('sent:form'),
+      'a response probe has no form gate'
+    );
   });
 
   it('surface import error -> unverifiable (missing/renamed export)', () => {

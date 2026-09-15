@@ -4915,6 +4915,10 @@ export class TypeInferrer {
   private normalizeWhitespace(text: string): string {
     return text
       .replace(/\s+/g, ' ')
+      // A member chain broken before its dot (`client\n  .list(…)`) reads the
+      // same as `client.list(…)`; a space around `.` / `?.` means nothing
+      // (carrick#1162).
+      .replace(/\s*(\?\.|\.)\s*/g, '$1')
       .replace(/\s*,?\s*([}\)\]])/g, '$1')
       .replace(/([\(\[{])\s+/g, '$1')
       .trim();

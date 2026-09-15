@@ -90,9 +90,12 @@ export type GateName =
   | 'sent:any'
   | 'sent:unknown'
   | 'sent:never'
+  | 'sent:void'
+  | 'sent:form'
   | 'expected:any'
   | 'expected:unknown'
-  | 'expected:never';
+  | 'expected:never'
+  | 'expected:void';
 
 export interface ProbePlan {
   pairId: string;
@@ -160,6 +163,22 @@ export function buildProbe(
     'expected:unknown'
   );
   gateLines.set(push(`type _G_expected_never = Assert<Not<IsNever<Expected>>>;`), 'expected:never');
+  // carrick#1162: `void`/`undefined` is what a call site that reads no body
+  // types its response as (a wrapper returning `Promise<void>`). It states no
+  // contract, so no counterparty shape can be judged against it.
+  push(`type IsVoid<T> = [T] extends [never] ? false : [T] extends [void] ? true : false;`);
+  gateLines.set(push(`type _G_sent_void = Assert<Not<IsVoid<Sent>>>;`), 'sent:void');
+  gateLines.set(push(`type _G_expected_void = Assert<Not<IsVoid<Expected>>>;`), 'expected:void');
+  // carrick#1162: a form-encoded request body (the platform `FormData` or
+  // `URLSearchParams`) carries its fields as runtime appends, which no type
+  // records, so a field-by-field comparison against a declared shape reads
+  // every such body as missing all of its fields.
+  if (spec.protocol === 'http' && spec.type_kind === 'request') {
+    push(
+      `type IsFormBody<T> = [T] extends [never] ? false : [T] extends [FormData | URLSearchParams] ? true : false;`
+    );
+    gateLines.set(push(`type _G_sent_form = Assert<Not<IsFormBody<Sent>>>;`), 'sent:form');
+  }
   push(`declare const sent: Sent;`);
 
   let assignmentLine: number;

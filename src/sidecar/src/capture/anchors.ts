@@ -953,21 +953,34 @@ function tightestCoveringNode(
   return best;
 }
 
+/**
+ * Locator text with insignificant whitespace removed: runs collapse to one
+ * space, and a member chain broken before its dot (`client\n  .list(…)`) reads
+ * as `client.list(…)` (carrick#1162), the same rule the v1 inferrer applies.
+ */
+function normalizeLocatorText(text: string): string {
+  return text
+    .replace(/\s+/g, ' ')
+    .replace(/\s*(\?\.|\.)\s*/g, '$1')
+    .trim();
+}
+
 function nodeByExpressionText(
   sourceFile: ts.SourceFile,
   text: string,
   fromLine?: number
 ): ts.Node | undefined {
-  const wanted = text.replace(/\s+/g, ' ').trim();
+  const wanted = normalizeLocatorText(text);
   let best: ts.Node | undefined;
   const visit = (node: ts.Node) => {
     if (best) return;
     if (isPreferredTarget(node)) {
-      const nodeText = node.getText(sourceFile).replace(/\s+/g, ' ').trim();
+      const nodeText = normalizeLocatorText(node.getText(sourceFile));
       if (nodeText === wanted) {
-        const line =
-          sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
-        if (fromLine === undefined || line >= fromLine) {
+        // On or after the line, or COVERING it: a chain broken before its dot
+        // starts a line above the line the analyzer reports for the call.
+        const endLine = sourceFile.getLineAndCharacterOfPosition(node.getEnd()).line + 1;
+        if (fromLine === undefined || endLine >= fromLine) {
           best = node;
           return;
         }
