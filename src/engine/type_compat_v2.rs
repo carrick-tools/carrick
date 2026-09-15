@@ -1407,6 +1407,55 @@ mod tests {
         }
     }
 
+    /// A peer that last uploaded under an older artifact schema is not judged
+    /// against its stored stub: its declaration text can name a path that
+    /// exists only on the machine that captured it (carrick#1174, carrick#1204)
+    /// and its `carrick-manifest.json` carries none of the record fields the
+    /// publish gate reads (carrick#1165, carrick#1164). It reads as no surface,
+    /// with the re-scan reason, until it re-scans.
+    #[test]
+    fn a_peer_artifact_from_an_older_schema_has_no_surface() {
+        let key = OperationKey::http("GET", "/orders");
+        let stale = CaptureStubArtifact {
+            artifact_version: CAPTURE_ARTIFACT_VERSION - 1,
+            ..fake_artifact()
+        };
+        let producer = repo(
+            "api",
+            None,
+            vec![entry(
+                key.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                "P",
+                "src/routes.ts",
+                3,
+                ManifestTypeState::Explicit,
+            )],
+            Some(stale),
+        );
+        let consumer = repo(
+            "web",
+            None,
+            vec![entry(
+                key,
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                "C",
+                "src/client.ts",
+                8,
+                ManifestTypeState::Explicit,
+            )],
+            Some(fake_artifact()),
+        );
+
+        let pairs = build_check_pairs(&[producer, consumer]);
+        assert_eq!(pairs.len(), 1);
+        let (bucket, reason) = pairs[0].pre_verdict.as_ref().expect("pre-verdict");
+        assert_eq!(*bucket, VerdictBucket::Unverifiable);
+        assert!(reason.contains("no v2 type surface"), "{reason}");
+    }
+
     fn fake_artifact() -> CaptureStubArtifact {
         CaptureStubArtifact {
             artifact_version: CAPTURE_ARTIFACT_VERSION,
