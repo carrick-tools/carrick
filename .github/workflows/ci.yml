@@ -72,6 +72,7 @@ jobs:
           --test graphql_schemas_setting_test
           --test incremental_raw_cache_test
           --test intent_incremental_test
+          --test jsx_component_callers_test
           --test literal_base_url_test
           --test llm_mock_pipeline_test
           --test log_value_guard_test
