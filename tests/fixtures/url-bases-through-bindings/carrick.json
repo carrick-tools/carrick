@@ -1,0 +1,3 @@
+{
+  "internalEnvVars": ["VITE_ORDERS_API_URL"]
+}

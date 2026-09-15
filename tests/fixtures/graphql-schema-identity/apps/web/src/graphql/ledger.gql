@@ -1,0 +1,17 @@
+query Balance {
+  balance {
+    amount
+  }
+}
+
+query Statements {
+  statements {
+    id
+  }
+}
+
+mutation Transfer($amount: Int!) {
+  transferFunds(amount: $amount) {
+    id
+  }
+}

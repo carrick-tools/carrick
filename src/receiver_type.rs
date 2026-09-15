@@ -60,6 +60,8 @@ use std::collections::HashMap;
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
+use crate::import_bindings::DEFAULT_EXPORT;
+
 /// Local binding name -> the type identifier declared for it.
 pub type ReceiverTypes = HashMap<String, String>;
 
@@ -117,6 +119,45 @@ pub fn class_field_types(class: &Class) -> ReceiverTypes {
                         .map(|ident| ident.sym.to_string());
                     collector.record(binding.id.sym.to_string(), declared);
                 }
+            }
+            _ => {}
+        }
+    }
+    collector.finish()
+}
+
+/// Which class each MODULE-SCOPE binding of one file is declared to be
+/// (carrick#1147).
+///
+/// `export const tokens = new TokenService()` is a statement about the value
+/// every importer of `tokens` receives, so `tokens.issue()` in another file is
+/// `TokenService.issue` as plainly as a call on a local `new TokenService()`
+/// is. Only the file's top level is read: a same-named binding inside a
+/// function is a different value and must not answer for the export.
+///
+/// The same two statements a local binding is read for: an annotation that
+/// names a class, or a `new X()` initialiser. An anonymous
+/// `export default new X()` has no binding name and is keyed by the default
+/// export's name (`default`, which is not a valid identifier and so cannot
+/// collide). A factory's result (`makeService()`) states nothing and is not
+/// recorded.
+pub fn module_scope_types(module: &Module) -> ReceiverTypes {
+    let mut collector = ReceiverTypeCollector::default();
+    for item in &module.body {
+        match item {
+            ModuleItem::Stmt(Stmt::Decl(Decl::Var(var)))
+            | ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl {
+                decl: Decl::Var(var),
+                ..
+            })) => {
+                for declarator in &var.decls {
+                    collector.record_declarator(declarator);
+                }
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export)) => {
+                let declared =
+                    constructed_type_ident(&export.expr).map(|ident| ident.sym.to_string());
+                collector.record(DEFAULT_EXPORT.to_string(), declared);
             }
             _ => {}
         }
@@ -187,6 +228,21 @@ impl ReceiverTypeCollector {
             .collect()
     }
 
+    /// Record what one `const`/`let`/`var` declarator states: an annotation
+    /// naming a class wins, else a `new X()` initialiser. A destructured
+    /// declarator binds a part of a value and states nothing.
+    fn record_declarator(&mut self, declarator: &VarDeclarator) {
+        if let Pat::Ident(ident) = &declarator.name {
+            let declared = ident
+                .type_ann
+                .as_deref()
+                .and_then(annotated_type_ident)
+                .or_else(|| declarator.init.as_deref().and_then(constructed_type_ident))
+                .map(|ident| ident.sym.to_string());
+            self.record(ident.id.sym.to_string(), declared);
+        }
+    }
+
     fn record(&mut self, name: String, type_name: Option<String>) {
         match self.types.get(&name) {
             Some(existing) if existing.as_deref() == type_name.as_deref() => {}
@@ -215,15 +271,7 @@ impl Visit for ReceiverTypeCollector {
     }
 
     fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
-        if let Pat::Ident(ident) = &declarator.name {
-            let declared = ident
-                .type_ann
-                .as_deref()
-                .and_then(annotated_type_ident)
-                .or_else(|| declarator.init.as_deref().and_then(constructed_type_ident))
-                .map(|ident| ident.sym.to_string());
-            self.record(ident.id.sym.to_string(), declared);
-        }
+        self.record_declarator(declarator);
         declarator.visit_children_with(self);
     }
 }

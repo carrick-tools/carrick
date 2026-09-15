@@ -1,0 +1,5 @@
+query Discontinued {
+  discontinuedQuery {
+    id
+  }
+}

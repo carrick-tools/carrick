@@ -1,0 +1,19 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:4",
+      "line_number": 4,
+      "target": "${serverConfig.reportsUrl}/v1/reports",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${serverConfig.reportsUrl}/v1/reports`, { method: \"GET\" })",
+      "call_expression_line": 4,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

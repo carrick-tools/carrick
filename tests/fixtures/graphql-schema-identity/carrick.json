@@ -1,0 +1,21 @@
+{
+  "services": [
+    {
+      "serviceName": "catalog-api",
+      "directory": "apps/api",
+      "graphqlSchemas": [
+        "tooling/graphql/dist/catalog.graphql"
+      ]
+    },
+    {
+      "serviceName": "storefront",
+      "directory": "apps/web",
+      "internalEnvVars": [
+        "CATALOG_URL"
+      ],
+      "externalEnvVars": [
+        "LEDGER_URL"
+      ]
+    }
+  ]
+}

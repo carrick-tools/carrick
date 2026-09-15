@@ -24,6 +24,7 @@ pub mod formatter;
 pub mod framework_detector;
 pub mod git_state;
 pub mod graphql;
+pub mod graphql_document_sites;
 pub mod help;
 pub mod import_bindings;
 pub mod imported_request_member;

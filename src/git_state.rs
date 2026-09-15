@@ -185,41 +185,64 @@ pub fn unchanged_since(repo_path: &str, commit: &str) -> Result<HashSet<String>,
     if commit.is_empty() || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!("{commit:?} is not a commit id"));
     }
-    let run = |args: &[&str]| -> Result<String, String> {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-        }
-        String::from_utf8(output.stdout).map_err(|e| e.to_string())
-    };
-    let paths = |text: String| -> Vec<String> {
-        text.split('\0')
-            .filter(|p| !p.is_empty())
-            .map(str::to_string)
-            .collect()
-    };
-    let changed: HashSet<String> = paths(run(&[
-        "diff",
-        "--name-only",
-        "--no-renames",
-        "--relative",
-        "-z",
-        commit,
-        "--",
-    ])?)
+    let changed: HashSet<String> = nul_paths(run_git(
+        repo_path,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--relative",
+            "-z",
+            commit,
+            "--",
+        ],
+    )?)
     .into_iter()
     .collect();
-    Ok(paths(run(&["ls-files", "-z"])?)
+    Ok(nul_paths(run_git(repo_path, &["ls-files", "-z"])?)
         .into_iter()
         .filter(|path| !changed.contains(path))
         .collect())
+}
+
+/// The tracked paths under `repo_path` that match any of `pathspecs` (git
+/// pathspec globs such as `*.graphql`), relative to `repo_path`.
+///
+/// "Tracked" is the index's answer, so a file that is committed or staged
+/// counts and an untracked or ignored one does not: a printed schema a
+/// developer generated locally and never committed is not part of what the
+/// repository states (carrick#1134). `Err` means git could not answer, as for
+/// [`unchanged_since`].
+pub fn tracked_paths(repo_path: &Path, pathspecs: &[&str]) -> Result<Vec<String>, String> {
+    let repo_path = repo_path.to_string_lossy();
+    let mut args = vec!["ls-files", "-z", "--"];
+    args.extend_from_slice(pathspecs);
+    Ok(nul_paths(run_git(&repo_path, &args)?))
+}
+
+/// Run git in `repo_path` with the inherited git environment cleared (see
+/// [`inspect`]), returning stdout, or stderr as the error.
+fn run_git(repo_path: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    String::from_utf8(output.stdout).map_err(|e| e.to_string())
+}
+
+/// Split `-z` output into paths.
+fn nul_paths(text: String) -> Vec<String> {
+    text.split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// A clone's `origin` remote, and the repository it names.

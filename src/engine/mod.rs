@@ -24,8 +24,8 @@ use crate::services::{
 use crate::signature_pass::populate_function_signatures;
 use crate::type_manifest::{
     append_missing_aliases, build_manifest_type_alias_with_site_id, build_site_id,
-    dts_alias_is_trivially_unknown, dts_defines_alias, is_http_method, normalize_manifest_method,
-    parse_file_location,
+    dts_alias_is_trivially_unknown, dts_defines_alias, is_http_method, is_producer_method,
+    normalize_manifest_method, parse_file_location,
 };
 use crate::url_normalizer::UrlNormalizer;
 use crate::utils::get_repository_name;
@@ -497,6 +497,23 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // question about the same tree, and rebuilding it per service was the
     // largest fixed cost in the analysis phase (carrick#767).
     let mut workspace_scan = crate::external_call_candidates::WorkspaceScan::new();
+    // Every schema file the repository holds, marked served or external, read
+    // once for the whole scan: a document in one service is attributed against
+    // the schemas every service serves (carrick#1134).
+    let graphql_schemas = crate::graphql::SchemaCatalogue::build(
+        Path::new(repo_path),
+        &services
+            .iter()
+            .map(|service| crate::graphql::ServedSchemaSources {
+                roots: service_graphql_roots(repo_path, service),
+                declared: crate::graphql::resolve_declared_schemas(
+                    Path::new(repo_path),
+                    &service.graphql_schemas,
+                )
+                .files,
+            })
+            .collect::<Vec<_>>(),
+    );
     // One intent memo for the whole scan, so a function several services hold
     // is described once (carrick#1080). The retry below reads it too.
     let run_intents = RunIntentMemo::default();
@@ -505,6 +522,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         sidecar,
         total: services.len(),
         run_intents: &run_intents,
+        graphql_schemas: &graphql_schemas,
     };
     // Where each service's previous generation is read from: the laptop's
     // hosted snapshot when the indexer handed one in, otherwise the download.
@@ -763,7 +781,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // Decided here, while every service's rows and dependency facts are still
     // in hand, and printed with the report (carrick#1099). Index for index
     // with `services`, as `current_services_data` is.
-    let graphql_notices = graphql_schema_notices(repo_path, &services, &current_services_data);
+    let mut graphql_notices = graphql_schema_notices(repo_path, &services, &current_services_data);
+    graphql_notices.hints.extend(graphql_schemas.notices());
 
     // 5. Prepare each service's upload payload, but DEFER the actual upload
     //    until after cross-repo analysis (step 6) so every payload can carry the
@@ -1269,6 +1288,7 @@ struct ServiceScan<'a> {
     sidecar: Option<&'a TypeSidecar>,
     total: usize,
     run_intents: &'a RunIntentMemo,
+    graphql_schemas: &'a crate::graphql::SchemaCatalogue,
 }
 
 /// One service's analysis in this run, and what it still owes.
@@ -1329,6 +1349,7 @@ impl ServiceScan<'_> {
             previous_data,
             workspace,
             self.run_intents,
+            self.graphql_schemas,
         )
         .await?;
 
@@ -2226,6 +2247,7 @@ fn reusable_model_answers(
 }
 
 /// Incremental analysis: reuse cached per-file LLM results for unchanged files.
+#[allow(clippy::too_many_arguments)]
 async fn analyze_current_repo_incremental(
     repo_path: &str,
     service: &Config,
@@ -2234,6 +2256,7 @@ async fn analyze_current_repo_incremental(
     previous_data: Option<&CloudRepoData>,
     workspace: &mut crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
+    graphql_schemas: &crate::graphql::SchemaCatalogue,
 ) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
     let start = Instant::now();
 
@@ -2479,9 +2502,14 @@ async fn analyze_current_repo_incremental(
             // the GraphQL consumer file set folds transport data calls out of
             // the graph (#307) so every downstream surface (cloud projection,
             // type manifest, type requests) sees the same call set.
-            let protocol_extractions =
+            let mut protocol_extractions =
                 scan_protocol_extractions(repo_path, service, &files, &merged_results);
-            fold_graphql_transport_calls(&mut mount_graph, &protocol_extractions.graphql);
+            settle_graphql_documents(
+                &mut protocol_extractions.graphql,
+                &mut mount_graph,
+                service,
+                graphql_schemas,
+            );
             crate::phase_timing::mark(crate::phase_timing::Phase::Protocols);
 
             // Collect the intents started after discovery (body_source is
@@ -2709,6 +2737,7 @@ async fn analyze_current_repo_incremental(
         settled,
         workspace,
         run_intents,
+        graphql_schemas,
     )
     .await?;
 
@@ -2911,6 +2940,78 @@ fn scan_protocol_extractions(
         sockets,
         event_bus,
     }
+}
+
+/// Attribute a service's GraphQL documents to schema identities, fold the
+/// transport calls of every document file out of the graph, then drop the
+/// operations of documents written against a schema no service here serves or
+/// whose schema cannot be settled (carrick#1134).
+///
+/// A document against someone else's API is not a call this project can
+/// match, and indexing it as one reads as a missing operation whenever the
+/// project serves any GraphQL at all. HTTP calls to a declared external base
+/// are not call rows either; this is the GraphQL half of that rule, decided by
+/// the schema because a vendor API proxied through an internal route has an
+/// internal base URL.
+///
+/// The fold runs on the full document set, before the drop, so a vendor
+/// document's transport POST does not come back as an HTTP call.
+fn settle_graphql_documents(
+    graphql: &mut crate::graphql::GraphqlExtraction,
+    mount_graph: &mut crate::mount_graph::MountGraph,
+    service: &Config,
+    catalogue: &crate::graphql::SchemaCatalogue,
+) {
+    let attribution = catalogue.attribute(graphql, |document_file| {
+        graphql_document_transport(service, document_file)
+    });
+    fold_graphql_transport_calls(mount_graph, graphql);
+    let summary = attribution.apply(graphql);
+    let label = service.service_name.as_deref().unwrap_or("(root)");
+    if !summary.is_empty() {
+        info!(
+            "GraphQL documents in {label}: {} operation(s) written against schemas no service \
+             serves, {} unresolved; not indexed as calls",
+            summary.external.values().sum::<usize>(),
+            summary.unresolved
+        );
+    }
+    catalogue.record(label, summary);
+}
+
+/// What a GraphQL document file's environment reads say about where it sends
+/// its documents: the tie-break for [`settle_graphql_documents`], asked only
+/// when a served and an external schema both hold a document's fields.
+///
+/// The source is the file's own `process.env` / `import.meta.env` reads
+/// ([`crate::graphql::file_env_reads`]), not the transport call row: a call
+/// that names its document binding has its target rewritten to the operation
+/// key by the #361 repair and never reaches the graph as an HTTP call. Every
+/// read the service's `internalEnvVars` / `externalEnvVars` classify must
+/// agree; a file whose reads are unclassified, mixed or absent says nothing.
+/// A base read in another module (an imported config object) is therefore
+/// unknown.
+fn graphql_document_transport(
+    service: &Config,
+    document_file: &Path,
+) -> crate::graphql::TransportOrigin {
+    use crate::graphql::TransportOrigin;
+    let mut origin: Option<TransportOrigin> = None;
+    for name in crate::graphql::file_env_reads(document_file) {
+        let this = if service.internal_env_vars.contains(&name) {
+            TransportOrigin::Internal
+        } else if service.is_external_env_var(&name) {
+            TransportOrigin::External
+        } else {
+            continue;
+        };
+        match origin {
+            None => origin = Some(this),
+            Some(seen) if seen == this => {}
+            Some(_) => return TransportOrigin::Unknown,
+        }
+    }
+    origin.unwrap_or(TransportOrigin::Unknown)
 }
 
 /// #307 (class 2): drop LLM HTTP data calls that are the TRANSPORT of
@@ -4666,6 +4767,7 @@ fn discover_files_and_symbols(
                     callees: func_extractor.callee_refs,
                     imports: file_imports,
                     field_types: func_extractor.field_types,
+                    instances: crate::receiver_type::module_scope_types(&module),
                 },
             );
             per_file_definitions.push((file_path.clone(), func_extractor.function_definitions));
@@ -5007,7 +5109,7 @@ fn build_type_manifest_entries(
     // order this loop saw them in.
     for endpoint in mount_graph.get_resolved_endpoints() {
         let method = normalize_manifest_method(&endpoint.method);
-        if !is_http_method(&method) {
+        if !is_producer_method(&method) {
             continue;
         }
         // Call-site-evidence entries (#379) never anchor Producer types: they
@@ -5490,6 +5592,7 @@ async fn analyze_current_repo(
     settled: Option<SettledDetection>,
     workspace: &mut crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
+    graphql_schemas: &crate::graphql::SchemaCatalogue,
 ) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
     debug!("Running multi-agent analysis on: {}", repo_path);
 
@@ -5595,12 +5698,14 @@ async fn analyze_current_repo(
     // GraphQL consumer file set folds transport data calls out of the mount
     // graph (#307) so every downstream surface (cloud projection, type
     // manifest, type requests) sees the same call set.
-    let protocol_extractions =
+    let mut protocol_extractions =
         scan_protocol_extractions(repo_path, service, &files, &analysis_result.file_results);
     let mut analysis_result = analysis_result;
-    fold_graphql_transport_calls(
+    settle_graphql_documents(
+        &mut protocol_extractions.graphql,
         &mut analysis_result.mount_graph,
-        &protocol_extractions.graphql,
+        service,
+        graphql_schemas,
     );
     // The repo's own statement of what a body-dispatching handler serves
     // (carrick#831), applied after every pass that reads the source: a
@@ -7507,6 +7612,7 @@ mod tests {
                 .into_iter()
                 .map(|path| EndpointResult {
                     handler_declaration_line: None,
+                    registration_literal: None,
                     view_module: false,
                     candidate_id: "cand_123".to_string(),
                     line_number: 10,
@@ -7966,6 +8072,7 @@ mod tests {
                     mounts: vec![],
                     endpoints: vec![EndpointResult {
                         handler_declaration_line: None,
+                        registration_literal: None,
                         view_module: false,
                         candidate_id: large_string.clone(),
                         line_number: 1,
@@ -9675,6 +9782,7 @@ mod tests {
             key: OperationKey::graphql(kind, field),
             file_path: PathBuf::from("src/schema.graphql"),
             line: 3,
+            document_line: 1,
             primary_type_symbol: anchor.map(String::from),
             payload_type_symbol: None,
             payload_type_source: None,
@@ -9698,6 +9806,7 @@ mod tests {
             key: OperationKey::graphql(crate::operation::GraphqlOperationKind::Query, field),
             file_path: PathBuf::from("web-frontend/lib/graphql.ts"),
             line: 76,
+            document_line: 70,
             primary_type_symbol: None,
             payload_type_symbol: payload_symbol.map(String::from),
             payload_type_source: payload_source.map(String::from),
@@ -9850,6 +9959,61 @@ mod tests {
         assert_eq!(mount_graph.data_calls.len(), 1);
     }
 
+    /// carrick#1134: a document written against a schema no service serves is
+    /// not a call, and its file's transport call is folded all the same, so
+    /// the vendor POST does not come back as an HTTP call once the document is
+    /// gone.
+    #[test]
+    fn settle_drops_external_documents_and_still_folds_their_transport() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("vendor")).unwrap();
+        std::fs::write(
+            repo.path().join("vendor/schema.graphql"),
+            "type Query { balance: Int }",
+        )
+        .unwrap();
+        let catalogue = crate::graphql::SchemaCatalogue::build(
+            repo.path(),
+            &[crate::graphql::ServedSchemaSources {
+                roots: vec![repo.path().join("src")],
+                declared: vec![],
+            }],
+        );
+        let mut mount_graph = MountGraph::new();
+        mount_graph.data_calls = vec![
+            transport_call("${LEDGER_URL}/graphql", "src/gql.ts:25"),
+            transport_call("${ORDERS_API}/orders", "src/orders.ts:12"),
+        ];
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![],
+            consumers: vec![graphql_consumer_op_at(
+                crate::operation::GraphqlOperationKind::Query,
+                "balance",
+                "src/gql.ts",
+                None,
+            )],
+        };
+
+        settle_graphql_documents(
+            &mut graphql,
+            &mut mount_graph,
+            &Config::default(),
+            &catalogue,
+        );
+
+        assert!(
+            graphql.consumers.is_empty(),
+            "the external document is not a call"
+        );
+        let targets: Vec<&str> = mount_graph
+            .data_calls
+            .iter()
+            .map(|c| c.target_url.as_str())
+            .collect();
+        assert_eq!(targets, vec!["${ORDERS_API}/orders"]);
+        assert_eq!(catalogue.notices().len(), 1);
+    }
+
     /// Variant of `graphql_consumer_op` with a caller-chosen `kind` and
     /// `file_path`, for the #268 per-file/per-kind join tests: the consumer
     /// locate merge is keyed on `(file_path, kind, field)`, so exercising
@@ -9866,6 +10030,7 @@ mod tests {
             key: OperationKey::graphql(kind, field),
             file_path: PathBuf::from(file_path),
             line: 10,
+            document_line: 9,
             primary_type_symbol: None,
             payload_type_symbol: payload_symbol.map(String::from),
             payload_type_source: None,
@@ -10228,6 +10393,7 @@ mod tests {
     fn endpoint_with_handler(handler_name: &str) -> EndpointResult {
         EndpointResult {
             handler_declaration_line: None,
+            registration_literal: None,
             view_module: false,
             candidate_id: "span:1-2".to_string(),
             line_number: 7,

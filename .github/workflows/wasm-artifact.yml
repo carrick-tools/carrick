@@ -91,6 +91,9 @@ jobs:
             assert.strictEqual(m.match_verdict('/*', '/api/v1/login'), m.MatchVerdict.CatchAllRoute);
             assert.strictEqual(m.reportable_agreement('/*', '/api/v1/login'), undefined);
             assert.strictEqual(m.reportable_agreement('/files/**', '/files/report'), 1);
+            assert.strictEqual(m.method_matches('ALL', 'POST'), true);
+            assert.strictEqual(m.method_matches('get', 'GET'), true);
+            assert.strictEqual(m.method_matches('POST', 'ALL'), false);
             console.log('wasm artifact smoke ok');
           "
 

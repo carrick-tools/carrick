@@ -36,7 +36,7 @@
 //! [`paths_match`], [`is_param_segment`], [`match_agreement`],
 //! [`path_literal_specificity`], [`is_catch_all_path`],
 //! [`is_unknown_call_path`], [`match_verdict`], [`reportable_agreement`],
-//! [`classify_relationship`], and the body-dispatch trio [`dispatch_key`],
+//! [`classify_relationship`], [`method_matches`], and the body-dispatch trio [`dispatch_key`],
 //! [`dispatch_verdict`], [`match_verdict_with_dispatch`] /
 //! [`reportable_agreement_with_dispatch`]:
 //!
@@ -188,6 +188,29 @@ pub fn is_catch_all_path(path: &str) -> bool {
 #[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
 pub fn is_unknown_call_path(call_path: &str) -> bool {
     path_literal_specificity(call_path) == 0
+}
+
+/// The method a producer registers to answer EVERY method on its path
+/// (`app.all("/graphql", handler)`). A producer-side label only: no request
+/// is ever sent with it.
+pub const ANY_METHOD: &str = "ALL";
+
+/// Whether a producer registered under `producer_method` serves a consumer
+/// call made with `consumer_method` (carrick#1148).
+///
+/// Methods compare case-insensitively. A producer registered with
+/// [`ANY_METHOD`] serves every method, the way the router dispatches it. The
+/// relation is not symmetric: a consumer never sends `ALL`, so a consumer
+/// `ALL` matches only a producer `ALL`.
+///
+/// Every surface that pairs a call with a route by method calls this rather
+/// than comparing the strings, so an any-method route pairs the same way in
+/// the scanner and in the cloud.
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn method_matches(producer_method: &str, consumer_method: &str) -> bool {
+    let producer = producer_method.trim();
+    producer.eq_ignore_ascii_case(consumer_method.trim())
+        || producer.eq_ignore_ascii_case(ANY_METHOD)
 }
 
 /// Why a producer route and a consumer call are, or are not, a reportable
@@ -543,6 +566,25 @@ fn agreement_with_wildcards(endpoint_path: &str, call_path: &str) -> Option<u32>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- methods (carrick#1148) --------------------------------------------
+
+    #[test]
+    fn an_any_method_producer_serves_every_consumer_method() {
+        for method in ["GET", "post", "PUT", "PATCH", "DELETE", "OPTIONS"] {
+            assert!(method_matches("ALL", method), "ALL must serve {method}");
+        }
+        assert!(method_matches("all", "GET"));
+    }
+
+    #[test]
+    fn methods_otherwise_compare_case_insensitively_and_one_way() {
+        assert!(method_matches("get", "GET"));
+        assert!(!method_matches("GET", "POST"));
+        // A consumer never sends ALL, so it does not widen a producer.
+        assert!(!method_matches("POST", "ALL"));
+        assert!(method_matches("ALL", "ALL"));
+    }
 
     // --- body dispatch (carrick#831) ---------------------------------------
 

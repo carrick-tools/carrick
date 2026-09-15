@@ -57,7 +57,7 @@ use swc_ecma_ast::{
 
 /// The export name a default export is published under. Not a valid
 /// identifier, so it can never collide with a named export in the same table.
-const DEFAULT_EXPORT: &str = "default";
+pub(crate) const DEFAULT_EXPORT: &str = "default";
 
 /// How many re-export hops a single binding may be followed through. A barrel
 /// in front of a barrel is two; a deeper chain is indistinguishable from a

@@ -69,12 +69,12 @@
 //! overwriting the first.
 
 use crate::agents::file_orchestrator::FileOrchestrator;
-use crate::import_bindings::{BindingResolver, ResolvedBinding};
+use crate::import_bindings::{BindingResolver, DEFAULT_EXPORT, ResolvedBinding};
 use crate::parser::parse_file;
-use crate::receiver_type::ReceiverTypes;
+use crate::receiver_type::{ReceiverTypes, module_scope_types};
 use crate::visitor::{
     CalleeRef, CalleeShape, FunctionCallRef, FunctionDefinition, FunctionDefinitionExtractor,
-    ImportedSymbol, SymbolKind,
+    ImportSymbolExtractor, ImportedSymbol, SymbolKind,
 };
 use crate::workspace_resolver::{Resolution, WorkspaceIndex};
 use std::collections::{HashMap, HashSet};
@@ -86,10 +86,6 @@ use swc_common::{
 };
 use swc_ecma_visit::VisitWith;
 use tracing::debug;
-
-/// The export name a default export is published under (mirrors
-/// `import_bindings`; not a valid identifier, so it cannot collide).
-const DEFAULT_EXPORT: &str = "default";
 
 /// Everything one source file contributes to call resolution.
 ///
@@ -112,6 +108,20 @@ pub struct FileCallIndex {
     /// a `this.field.foo()` receiver (carrick#782). Keyed by class, not by
     /// definition: a field belongs to the class and every method sees it.
     pub field_types: HashMap<String, ReceiverTypes>,
+    /// Module-scope binding → the class the file declares its value to be
+    /// ([`module_scope_types`], carrick#1147): `export const tokens = new
+    /// TokenService()`. What lets `tokens.issue()` in an importing file
+    /// resolve to `TokenService.issue`.
+    pub instances: ReceiverTypes,
+}
+
+/// What resolution reads from a file OUTSIDE the scanned service, parsed on
+/// first use: the same three tables [`FileCallIndex`] carries for a file
+/// inside it, minus the call sites nothing here resolves.
+struct ExternalModule {
+    definitions: HashMap<String, u32>,
+    imports: HashMap<String, ImportedSymbol>,
+    instances: ReceiverTypes,
 }
 
 /// One class member a workspace package's surface publishes.
@@ -469,7 +479,7 @@ struct CallResolver<'a> {
     /// Definition tables for files OUTSIDE the scanned service, parsed the
     /// first time an edge reaches one. `None` for a file that does not parse,
     /// so a broken sibling costs one parse rather than one per call site.
-    external: HashMap<PathBuf, Option<HashMap<String, u32>>>,
+    external: HashMap<PathBuf, Option<ExternalModule>>,
     /// Quiet diagnostics for those parses: a sibling that fails to parse is a
     /// resolution miss, not something to shout about mid-scan.
     source_map: Lrc<SourceMap>,
@@ -550,21 +560,53 @@ impl<'a> CallResolver<'a> {
     /// The definition table for a file OUTSIDE the scanned service, parsed on
     /// first use. `None` for a file that does not parse.
     fn external_definitions(&mut self, file: &Path) -> Option<&HashMap<String, u32>> {
+        self.external_module(file).map(|module| &module.definitions)
+    }
+
+    /// Everything resolution reads from a file OUTSIDE the scanned service,
+    /// parsed on first use. `None` for a file that does not parse.
+    fn external_module(&mut self, file: &Path) -> Option<&ExternalModule> {
         if !self.external.contains_key(file) {
-            let definitions = parse_file(file, &self.source_map, &self.handler).map(|module| {
+            let parsed = parse_file(file, &self.source_map, &self.handler).map(|module| {
                 let mut extractor =
                     FunctionDefinitionExtractor::new(file.to_path_buf(), self.source_map.clone());
                 module.visit_with(&mut extractor);
                 extractor.finalize_exports();
-                extractor
-                    .function_definitions
-                    .iter()
-                    .map(|(key, def)| (key.clone(), def.line_number))
-                    .collect::<HashMap<String, u32>>()
+                let mut imports = ImportSymbolExtractor::new();
+                module.visit_with(&mut imports);
+                ExternalModule {
+                    definitions: extractor
+                        .function_definitions
+                        .iter()
+                        .map(|(key, def)| (key.clone(), def.line_number))
+                        .collect(),
+                    imports: imports.imported_symbols,
+                    instances: module_scope_types(&module),
+                }
             });
-            self.external.insert(file.to_path_buf(), definitions);
+            self.external.insert(file.to_path_buf(), parsed);
         }
         self.external.get(file)?.as_ref()
+    }
+
+    /// The class `file` declares its module-scope binding `binding` to be,
+    /// and the import that class name is bound by in that file, if any
+    /// (carrick#1147).
+    fn module_instance(
+        &mut self,
+        file: &Path,
+        binding: &str,
+    ) -> Option<(String, Option<ImportedSymbol>)> {
+        let (instances, imports) = match self.per_file.get(file) {
+            Some(index) => (&index.instances, &index.imports),
+            None => {
+                let module = self.external_module(file)?;
+                (&module.instances, &module.imports)
+            }
+        };
+        let class = instances.get(binding)?.clone();
+        let import = imports.get(&class).cloned();
+        Some((class, import))
     }
 
     /// One file's definition table, wherever the file sits, plus the path an
@@ -785,7 +827,37 @@ impl<'a> CallResolver<'a> {
             .local_name
             .clone()
             .unwrap_or_else(|| symbol.imported_name.clone());
-        self.lookup_in_file(&binding.file, member_keys(&declaring_class, name))
+        if let Some(target) =
+            self.lookup_in_file(&binding.file, member_keys(&declaring_class, name))
+        {
+            return Some(target);
+        }
+        self.resolve_instance_member(&binding, name)
+    }
+
+    /// `tokens.issue(...)` where the imported `tokens` is a module-scope
+    /// binding its module declares the class of — `export const tokens = new
+    /// TokenService()`, `export const tokens: TokenService = …`, or an
+    /// anonymous `export default new TokenService()` (carrick#1147).
+    ///
+    /// The declaring module is the scope the class name is written in, so the
+    /// class resolves there exactly as it would at a call site in that file:
+    /// a class the module declares itself, or the one its own import names.
+    /// A binding the module states no class for — a factory's result, a
+    /// destructured value — still resolves to nothing.
+    fn resolve_instance_member(&mut self, binding: &ResolvedBinding, name: &str) -> Option<Target> {
+        // A binding with no local name is an anonymous default export.
+        let local = binding.local_name.as_deref().unwrap_or(DEFAULT_EXPORT);
+        let (class, import) = self.module_instance(&binding.file, local)?;
+        let Some(symbol) = import else {
+            return self.lookup_in_file(&binding.file, member_keys(&class, name));
+        };
+        let class_binding = self.resolve_import(&binding.file, &symbol)?;
+        let declaring_class = class_binding
+            .local_name
+            .clone()
+            .unwrap_or_else(|| symbol.imported_name.clone());
+        self.lookup_in_file(&class_binding.file, member_keys(&declaring_class, name))
     }
 
     /// `ns.foo(...)` where `ns` is a NAMED import of a namespace re-export
@@ -983,6 +1055,7 @@ mod tests {
                 callees: functions.callee_refs,
                 imports: imports.imported_symbols,
                 field_types: functions.field_types,
+                instances: module_scope_types(&module),
             };
             per_file.insert(path.clone(), index);
             per_file_definitions.push((path.clone(), functions.function_definitions));
@@ -1915,6 +1988,170 @@ mod tests {
         drop(dir);
     }
 
+    /// An imported module-scope instance resolves to the class its module
+    /// constructs it from (carrick#1147): through a relative import, through
+    /// a `@/` alias and a barrel, and when the class is itself imported into
+    /// the module that constructs it.
+    #[test]
+    fn an_imported_singleton_instance_resolves_to_its_class() {
+        let (dir, defs) = scan(&[
+            (
+                "tsconfig.json",
+                "{ \"compilerOptions\": { \"paths\": { \"@/*\": [\"./src/*\"] } } }\n",
+            ),
+            (
+                "src/auth/token.service.ts",
+                "export class TokenService {\n  issue(id: string) {\n    return id;\n  }\n}\n",
+            ),
+            (
+                "src/auth/tokens.ts",
+                "import { TokenService } from \"./token.service\";\n\
+                 export const tokens = new TokenService();\n",
+            ),
+            (
+                "src/auth/index.ts",
+                "export { tokens } from \"./tokens\";\n",
+            ),
+            (
+                "src/mail/mailer.ts",
+                "class Mailer {\n  send(to: string) {\n    return to;\n  }\n}\n\
+                 export const mailer = new Mailer();\n",
+            ),
+            (
+                "src/login.ts",
+                "import { tokens } from \"./auth/tokens\";\n\
+                 import { mailer } from \"@/mail/mailer\";\n\
+                 export function login(id: string) {\n  mailer.send(id);\n  return tokens.issue(id);\n}\n",
+            ),
+            (
+                "src/refresh.ts",
+                "import { tokens as issuer } from \"@/auth\";\n\
+                 export const refresh = (id: string) => issuer.issue(id);\n",
+            ),
+        ]);
+
+        assert_eq!(
+            callee_names(&defs, "login"),
+            ["Mailer.send", "TokenService.issue"]
+        );
+        let files = callee_files(&defs, "login");
+        assert!(files[0].ends_with("src/mail/mailer.ts"), "{files:?}");
+        assert!(files[1].ends_with("src/auth/token.service.ts"), "{files:?}");
+        assert_eq!(callee_names(&defs, "refresh"), ["TokenService.issue"]);
+        drop(dir);
+    }
+
+    /// An annotated module-scope binding states its class as a construction
+    /// does, and an anonymous `export default new X()` resolves through a
+    /// default import.
+    #[test]
+    fn an_annotated_or_default_exported_instance_resolves_to_its_class() {
+        let (dir, defs) = scan(&[
+            (
+                "src/jobs/cache.ts",
+                "export class CacheStore {\n  read(key: string) {\n    return key;\n  }\n}\n\
+                 function createCache(): CacheStore {\n  return new CacheStore();\n}\n\
+                 export const cache: CacheStore = createCache();\n",
+            ),
+            (
+                "src/jobs/queue.ts",
+                "export class JobQueue {\n  push(job: string) {\n    return job;\n  }\n}\n\
+                 export default new JobQueue();\n",
+            ),
+            (
+                "src/jobs/worker.ts",
+                "import { cache } from \"./cache\";\n\
+                 import queue from \"./queue\";\n\
+                 export function work(key: string) {\n  queue.push(key);\n  return cache.read(key);\n}\n",
+            ),
+        ]);
+
+        assert_eq!(
+            callee_names(&defs, "work"),
+            ["CacheStore.read", "JobQueue.push"]
+        );
+        drop(dir);
+    }
+
+    /// A module-scope singleton published by a sibling workspace package that
+    /// is not in the scanned service: the declaring module and the module it
+    /// imports the class from are both read on demand.
+    #[test]
+    fn a_singleton_in_a_sibling_workspace_package_resolves() {
+        let (dir, defs) = scan_service(
+            &[
+                (
+                    "package.json",
+                    r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+                ),
+                (
+                    "packages/core/package.json",
+                    r#"{"name":"@fixture/core","exports":{".":"./src/index.ts"}}"#,
+                ),
+                (
+                    "packages/core/src/index.ts",
+                    "export { ledger } from \"./ledger.instance\";\n",
+                ),
+                (
+                    "packages/core/src/ledger.ts",
+                    "export class Ledger {\n  post(entry: string) {\n    return entry;\n  }\n}\n",
+                ),
+                (
+                    "packages/core/src/ledger.instance.ts",
+                    "import { Ledger } from \"./ledger\";\n\
+                     export const ledger = new Ledger();\n",
+                ),
+                (
+                    "packages/app/package.json",
+                    r#"{"name":"@fixture/app","dependencies":{"@fixture/core":"workspace:*"}}"#,
+                ),
+                (
+                    "packages/app/src/billing.ts",
+                    "import { ledger } from \"@fixture/core\";\n\
+                     export function bill(entry: string) {\n  return ledger.post(entry);\n}\n",
+                ),
+            ],
+            "packages/app",
+        );
+
+        assert_eq!(callee_names(&defs, "bill"), ["Ledger.post"]);
+        assert!(callee_files(&defs, "bill")[0].ends_with("packages/core/src/ledger.ts"));
+        drop(dir);
+    }
+
+    /// What a module does NOT state resolves to nothing: a factory's
+    /// unannotated result, a same-named binding inside a function, an
+    /// instance of a class this repo does not declare, and a name bound to
+    /// two classes at module scope.
+    #[test]
+    fn an_instance_its_module_states_no_class_for_resolves_to_nothing() {
+        let (dir, defs) = scan(&[
+            (
+                "src/reports/service.ts",
+                "export class ReportService {\n  build(id: string) {\n    return id;\n  }\n}\n\
+                 export class AuditService {\n  build(id: string) {\n    return id;\n  }\n}\n\
+                 function makeReports() {\n  const reports = new ReportService();\n  return reports;\n}\n\
+                 export const reports = makeReports();\n\
+                 export const registry = new Map<string, string>();\n\
+                 export var contested = new ReportService();\n\
+                 export var contested = new AuditService();\n",
+            ),
+            (
+                "src/reports/reader.ts",
+                "import { reports, registry, contested } from \"./service\";\n\
+                 export function read(id: string) {\n  \
+                 registry.get(id);\n  contested.build(id);\n  return reports.build(id);\n}\n",
+            ),
+        ]);
+
+        assert!(
+            callee_names(&defs, "read").is_empty(),
+            "{:?}",
+            callee_names(&defs, "read")
+        );
+        drop(dir);
+    }
+
     /// A name the file states nothing about still resolves to nothing, and a
     /// name bound to two classes in one scope resolves to neither.
     #[test]
@@ -2416,6 +2653,97 @@ mod tests {
             callee_files(&defs, key)[0].ends_with("packages/core/src/index.ts"),
             "the edge must point into the sibling package: {:?}",
             callee_files(&defs, key)
+        );
+        drop(dir);
+    }
+
+    /// A JSX element renders the component its name binds, so it is recorded
+    /// as a call to it (carrick#1149): imported by name or by default, used
+    /// self-closing or with children, from a function component, an arrow
+    /// component, a class method, and module scope.
+    #[test]
+    fn a_jsx_element_is_a_call_to_the_component_it_renders() {
+        let (dir, defs) = scan(&[
+            (
+                "src/components/Badge.tsx",
+                "export function Badge(props: { label: string }) {\n  return <span>{props.label}</span>;\n}\n",
+            ),
+            (
+                "src/components/Panel.tsx",
+                "export default function Panel(props: { children: unknown }) {\n  return <section>{props.children}</section>;\n}\n",
+            ),
+            (
+                "src/pages/Home.tsx",
+                "import { Badge } from \"../components/Badge\";\n\
+                 import Panel from \"../components/Panel\";\n\
+                 export function Home() {\n  return (\n    <Panel>\n      <Badge label=\"home\" />\n    </Panel>\n  );\n}\n",
+            ),
+            (
+                "src/pages/About.tsx",
+                "import { Badge } from \"../components/Badge\";\n\
+                 export const About = () => <Badge label=\"about\" />;\n",
+            ),
+            (
+                "src/pages/Legacy.tsx",
+                "import { Badge } from \"../components/Badge\";\n\
+                 export class Legacy {\n  render() {\n    return <Badge label=\"legacy\" />;\n  }\n}\n",
+            ),
+            (
+                "src/main.tsx",
+                "import { Home } from \"./pages/Home\";\n\
+                 import { mount } from \"renderer\";\n\
+                 mount(<Home />);\n",
+            ),
+        ]);
+
+        assert_eq!(callee_names(&defs, "Home"), ["Badge", "Panel"]);
+        assert_eq!(defs["Home"].calls[1].call_site_line, 5);
+        assert!(callee_files(&defs, "Home")[0].ends_with("src/components/Badge.tsx"));
+        assert_eq!(callee_names(&defs, "About"), ["Badge"]);
+        assert_eq!(callee_names(&defs, "Legacy.render"), ["Badge"]);
+        assert_eq!(callee_names(&defs, "<module>@src/main.tsx"), ["Home"]);
+        drop(dir);
+    }
+
+    /// `<Card.Header />` resolves like `Card.Header()`: through a namespace
+    /// import, a local object of components, and `this` in a class.
+    #[test]
+    fn a_jsx_member_element_resolves_like_a_member_call() {
+        let (dir, defs) = scan(&[
+            (
+                "src/card.tsx",
+                "export function Header() {\n  return <h1 />;\n}\n",
+            ),
+            (
+                "src/page.tsx",
+                "import * as Card from \"./card\";\n\
+                 export const Layout = {\n  Sidebar() {\n    return <nav />;\n  },\n};\n\
+                 export function Page() {\n  return (\n    <main>\n      <Card.Header />\n      <Layout.Sidebar />\n    </main>\n  );\n}\n\
+                 export class Table {\n  Row() {\n    return <tr />;\n  }\n  render() {\n    return <this.Row />;\n  }\n}\n",
+            ),
+        ]);
+
+        assert_eq!(callee_names(&defs, "Page"), ["Header", "Layout.Sidebar"]);
+        assert_eq!(callee_names(&defs, "Table.render"), ["Table.Row"]);
+        drop(dir);
+    }
+
+    /// An intrinsic element names no binding, whatever is in scope under the
+    /// same name: `<header>` is the host element even beside a function called
+    /// `header`, and so is a custom element with a `-`. A namespaced name and
+    /// a component that resolves to nothing record no edge either.
+    #[test]
+    fn an_intrinsic_jsx_element_is_never_a_call() {
+        let (dir, defs) = scan(&[(
+            "src/shell.jsx",
+            "function header() {\n  return null;\n}\n\
+             export function Shell() {\n  return (\n    <div>\n      <header />\n      <my-widget />\n      <svg:rect />\n      <Unknown />\n    </div>\n  );\n}\n",
+        )]);
+
+        assert!(
+            callee_names(&defs, "Shell").is_empty(),
+            "{:?}",
+            callee_names(&defs, "Shell")
         );
         drop(dir);
     }

@@ -288,6 +288,16 @@ Each entry is a path relative to `carrick.json`, or a glob such as `packages/sch
 
 An entry that matches no file, or a file that defines no root field, is reported as a warning in the scan output. When a service depends on a GraphQL library and serves HTTP routes but indexes no GraphQL schema fields, the scan output suggests this setting.
 
+#### GraphQL documents for another team's API
+
+A client's GraphQL documents are indexed as calls only when they are written against a schema this repository serves. Carrick attributes each document (a `.graphql`/`.gql` file, or one `gql` template) to the committed schema file that holds its root fields. A schema file counts as served when it sits under a service's directory or is named in a service's `graphqlSchemas`. Any other committed schema file, such as a vendor schema a codegen step downloaded into `dist/`, marks its documents as calls to an external API, and they are not indexed as calls. The scan output names the schema file and counts the operations, so a schema that is served here but not declared can be added to `graphqlSchemas`.
+
+Some documents are left out as well:
+- a document whose fields no single schema holds;
+- a document whose fields sit in both a served and an external schema, when the file's environment reads don't settle it. A file that reads only variables from `internalEnvVars` counts as internal, and one that reads only `externalEnvVars` counts as external.
+
+A document whose fields appear in no schema the repository holds stays a call, because its server may be another repository in the project.
+
 ## How it works
 
 1. SWC parses each TypeScript file into an AST.
