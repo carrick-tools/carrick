@@ -603,7 +603,28 @@ pub struct CloudRepoData {
 /// Version of the v2 capture stub artifact schema. Bumped on incompatible
 /// changes; the check phase treats a peer scanned with a different version as
 /// having no surface (its pairs are unverifiable with a re-scan reason).
-pub const CAPTURE_ARTIFACT_VERSION: u32 = 1;
+///
+/// This is the capture half of the cache story, and it is NOT `CACHE_VERSION`.
+/// A service's own stub is rebuilt from the AST on every scan and nothing reads
+/// the previous blob's copy, so a capture change needs no analysis-cache bump.
+/// What IS read back is a PEER's stored artifact: [`crate::engine::type_compat_v2`]
+/// materialises the files of every other service's `capture_stub` into the
+/// check workspace, and the sidecar reads each one's `carrick-manifest.json`
+/// (`capture/check.ts`, `readStubAliasRecords`) to pre-gate pairs. A stale
+/// artifact therefore answers today's gate with yesterday's record.
+///
+/// 2 (0.3.73): three changes to what an artifact says, in one release.
+/// carrick#1174 rewrites absolute installed-package specifiers in the
+/// declaration text and carrick#1204 scrubs any machine path the rewrite
+/// missed, so a version-1 artifact can name a path that exists only on the
+/// machine that captured it — materialised anywhere else, those imports
+/// resolve to nothing. carrick#1165 and carrick#1164 added the record fields
+/// the publish gate and the provenance labels read (`dangling_specifiers`,
+/// `undeclared_names`, `unresolved_import`), and a version-1 manifest carries
+/// none of them, so its aliases pre-gate exactly as they did before the gate
+/// existed. Rather than judge against either, a peer still on version 1 is
+/// unverifiable until it re-scans.
+pub const CAPTURE_ARTIFACT_VERSION: u32 = 2;
 
 /// The v2 capture stub package as it travels between scan time and check
 /// time: a types-only npm package (package.json + tsconfig.snapshot.json +
