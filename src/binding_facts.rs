@@ -651,6 +651,16 @@ impl ModuleIndex {
                     construction: Some(&decl.body),
                 })
             }
+            // A member of a value this module builds by a call (a configured
+            // client) is declared by whatever built it, which is not in this
+            // module: the value's own declaration is what states its base.
+            ([_, ..], DeclKind::Value) => Some(Member {
+                body: &decl.body,
+                siblings: None,
+                header: None,
+                function_name: None,
+                construction: None,
+            }),
             _ => None,
         }
     }
@@ -1223,6 +1233,24 @@ pub fn importer_facts(
             .chain(site.path.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(".");
+        // Several calls reaching one declaration (a client value called as
+        // `lab.get` and `lab.post`) are named on its one entry, so the label
+        // does not read as though only the first of them went through it.
+        if let Some(existing) = entries.iter_mut().find(|entry| {
+            entry.priority == 0 && entry.module == target.module && entry.span == target.body.span
+        }) {
+            let (names, declared) = match existing.label.split_once("; declared in: ") {
+                Some((names, header)) => (names.to_string(), format!("; declared in: {header}")),
+                None => (existing.label.clone(), String::new()),
+            };
+            let already = names
+                .trim_start_matches("called by this file as ")
+                .split(", ")
+                .any(|name| name == called_as);
+            if !already {
+                existing.label = format!("{names}, {called_as}{declared}");
+            }
+        }
         let label = match header {
             Some(header) => format!("called by this file as {called_as}; declared in: {header}"),
             None => format!("called by this file as {called_as}"),
@@ -1735,6 +1763,65 @@ export const gateway = new Gateway(`${process.env.VAULT_URL}/v4`);
             facts.material[0]
         );
         assert!(facts.material[0].contains("constructor(private readonly base: string) {}"));
+    }
+
+    #[test]
+    fn a_member_call_on_an_exported_value_is_handed_the_value_and_the_binding_it_reads() {
+        let module = r#"import axios from "axios";
+
+export const labBaseUrl = process.env.PUBLIC_LAB_URL || "http://localhost:4600";
+
+const lab = axios.create({
+  baseURL: labBaseUrl,
+  timeout: 8000,
+});
+
+export const unrelated = Object.freeze(["a"]);
+
+export default lab;
+"#;
+        let spans = spans_of(module, &["axios.create("]);
+        let index =
+            ModuleIndex::build(Path::new("lab.ts"), "src/lab.ts", module, unbased(spans)).unwrap();
+        let scan = scan_importer(
+            Path::new("q.ts"),
+            "import lab from \"./lab\";\nimport { unrelated } from \"./lab\";\nlab.get(\"/samples\");\nlab.post(\"/samples\");\nlab.get(\"/panels\");\nunrelated.includes(\"a\");\n",
+        )
+        .unwrap();
+        let resolver = Fixed(
+            HashMap::from([("./lab".to_string(), PathBuf::from("/lab.ts"))]),
+            HashMap::from([(PathBuf::from("/lab.ts"), Rc::new(index))]),
+        );
+        let facts = importer_facts(Path::new("q.ts"), &scan, &resolver);
+        assert_eq!(
+            facts.sites.len(),
+            3,
+            "only the value whose declaration issues a request: {:?}",
+            scan.sites
+        );
+        let material = facts.material.join("\n");
+        assert!(
+            material.contains("called by this file as lab.get, lab.post\n"),
+            "{material}"
+        );
+        assert!(
+            material.contains("const lab = axios.create({"),
+            "{material}"
+        );
+        assert!(
+            material.contains("binding a declaration in this section reads: labBaseUrl"),
+            "{material}"
+        );
+        assert!(
+            material.contains("process.env.PUBLIC_LAB_URL"),
+            "{material}"
+        );
+        assert!(!material.contains("Object.freeze"), "{material}");
+        assert!(
+            facts.bases.is_empty(),
+            "a client built from an options object states no URL base: {:?}",
+            facts.bases
+        );
     }
 
     #[test]
