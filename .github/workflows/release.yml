@@ -242,6 +242,10 @@ jobs:
           path: dist/tarballs
           merge-multiple: true
 
+      # Every step from here to `Publish carrick` is safe to re-run: a version
+      # the registry already holds is skipped rather than published again, so
+      # re-running a failed job resumes where it stopped (carrick#1140). Before
+      # that, npm's 403 on the first already-live tarball killed every re-run.
       - name: Publish the platform packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -258,34 +262,58 @@ jobs:
           echo "publishing ${#tarballs[@]} platform package(s)"
           : > "$RUNNER_TEMP/published.txt"
           for tarball in "${tarballs[@]}"; do
-            echo "publishing $tarball"
-            npm publish --access public "$tarball"
-            # The name from the tarball itself rather than from its filename,
-            # so the wait below asks about exactly what was published — and
-            # only about that, since win32 is allowed to fail.
-            tar -xzOf "$tarball" package/package.json \
-              | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).name" \
-              >> "$RUNNER_TEMP/published.txt"
+            # Name and version from the tarball itself rather than from its
+            # filename, so the check and the wait below ask about exactly what
+            # is published — and only about that, since win32 is allowed to fail.
+            manifest=$(tar -xzOf "$tarball" package/package.json)
+            name=$(node -p "JSON.parse(process.argv[1]).name" "$manifest")
+            version=$(node -p "JSON.parse(process.argv[1]).version" "$manifest")
+            # The registry itself, not `npm view`, which answered inconsistently
+            # while 0.3.71 was being processed.
+            status=$(curl -sS -o /dev/null -w '%{http_code}' \
+              "https://registry.npmjs.org/${name//\//%2F}/$version" || true)
+            if [ "$status" = "200" ]; then
+              echo "$name@$version is already on the registry, skipping"
+            else
+              echo "publishing $tarball"
+              # A version npm accepted but is still processing reads as absent
+              # above and refuses a second publish; that is published too.
+              if ! out=$(npm publish --access public "$tarball" 2>&1); then
+                echo "$out"
+                if grep -q "previously published" <<<"$out"; then
+                  echo "::warning::$name@$version was already accepted and is still being processed"
+                else
+                  exit 1
+                fi
+              else
+                echo "$out"
+              fi
+            fi
+            echo "$name" >> "$RUNNER_TEMP/published.txt"
           done
 
-      # npm does not serve a freshly published version immediately, and the
-      # last of the five above was published seconds ago. An install that runs
-      # while one of them is still invisible resolves it to nothing, and the
-      # main package's install then fails on a lockfile that has lost an entry
-      # — which is how 0.3.55 published five platform packages and no
-      # `carrick`. Lag of about twenty minutes has been seen on this scope.
+      # npm does not serve a freshly published version immediately. An install
+      # that runs while one of them is still invisible resolves it to nothing,
+      # and the main package's install then fails on a lockfile that has lost an
+      # entry — which is how 0.3.55 published five platform packages and no
+      # `carrick`. npm sometimes queues a publish for processing instead: at
+      # 0.3.71 one platform package took 21 minutes to become readable, past the
+      # 15 minutes this step then allowed. The cap is 45 minutes for all of them
+      # together, and the step's own timeout sits just above it.
       - name: Wait until the platform packages are readable
+        timeout-minutes: 50
         run: |
           set -euo pipefail
           TAG="${{ needs.release-please.outputs.tag_name }}"
           VERSION="${TAG##*v}"
-          DEADLINE=$(( $(date +%s) + 900 ))
+          DEADLINE=$(( $(date +%s) + 2700 ))
           while read -r pkg; do
             [ -n "$pkg" ] || continue
             delay=5
-            until npm view "$pkg@$VERSION" version >/dev/null 2>&1; do
+            until [ "$(curl -sS -o /dev/null -w '%{http_code}' \
+              "https://registry.npmjs.org/${pkg//\//%2F}/$VERSION")" = "200" ]; do
               if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-                echo "::error::$pkg@$VERSION was published but is still not readable after 15 minutes. The platform packages are on npm; re-run this job when the registry serves them."
+                echo "::error::$pkg@$VERSION was published but is still not readable after 45 minutes. Nothing here publishes twice, so re-run this job once the registry serves it."
                 exit 1
               fi
               echo "waiting for $pkg@$VERSION (${delay}s)"
@@ -305,6 +333,13 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd npm/carrick
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          VERSION="${TAG##*v}"
+          if [ "$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://registry.npmjs.org/carrick/$VERSION")" = "200" ]; then
+            echo "carrick@$VERSION is already on the registry, skipping"
+            exit 0
+          fi
           # `npm install`, not `npm ci`: nothing here needs a lockfile that
           # agrees with the manifest, and at a release no lockfile can. The
           # pins name the exact version being released, so a committed
@@ -316,7 +351,13 @@ jobs:
           # prepack the toolchain it needs. `npm publish` reads the manifest,
           # never the lock, and the lock is not published.
           npm install --ignore-scripts --no-audit --no-fund
-          npm publish --access public
+          if ! out=$(npm publish --access public 2>&1); then
+            echo "$out"
+            grep -q "previously published" <<<"$out" || exit 1
+            echo "::warning::carrick@$VERSION was already accepted and is still being processed"
+          else
+            echo "$out"
+          fi
 
   # Builds the carrick-match wasm artifact, attaches it to the release, and
   # dispatches the pin-bump PR in carrick-cloud (#325). Lives in the same
