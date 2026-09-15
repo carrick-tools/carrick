@@ -962,6 +962,118 @@ pub fn normalize_env_fallback_target(target: &str) -> Option<String> {
     changed.then_some(out)
 }
 
+/// Rewrite a target whose query string is appended by a conditional as the
+/// last interpolation into the plain query form (carrick#1150):
+/// `/v1/jobs${query ? `?${query}` : ""}` -> `/v1/jobs?${query}`.
+///
+/// A request that sends its query only when there is one is still one request
+/// to one route, and the query string is not part of the route: every reader of
+/// the target truncates at the `?` ([`is_valid_route_shape`],
+/// `UrlNormalizer::clean_path`). Written as a ternary, though, that `?` sits
+/// inside an interpolation, where it belongs to the expression rather than the
+/// URL, and the interpolation's whitespace and quotes then fail the route-shape
+/// gate, so the call was dropped as a non-route target.
+///
+/// Tight on purpose: the interpolation must END the target, be a top-level
+/// ternary, and have one branch an empty string literal and the other a string
+/// or template literal whose text starts with `?`. Anything else — a branch
+/// that changes the PATH, a concatenation, a ternary mid-path — is left
+/// verbatim. Returns `None` when nothing was rewritten.
+pub fn strip_conditional_query_tail(target: &str) -> Option<String> {
+    // A target the model wrapped in its own delimiter keeps it.
+    let wrapper = target
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '`' | '"' | '\''));
+    let body = match wrapper {
+        Some(c) if target.len() > 1 && target.ends_with(c) => &target[1..target.len() - 1],
+        _ => target,
+    };
+
+    // The last interpolation that closes exactly at the end of the body.
+    let mut offset = 0;
+    let mut tail: Option<(usize, &str)> = None;
+    while let Some(found) = body[offset..].find("${") {
+        let start = offset + found;
+        let inner = &body[start + 2..];
+        let end = interpolation_end(inner)?;
+        if start + 2 + end + 1 == body.len() {
+            tail = Some((start, &inner[..end]));
+            break;
+        }
+        offset = start + 2 + end + 1;
+    }
+    let (start, content) = tail?;
+
+    let (consequent, alternate) = top_level_ternary(content)?;
+    let query = match (
+        string_literal_text(consequent)?,
+        string_literal_text(alternate)?,
+    ) {
+        (query, "") | ("", query) if query.starts_with('?') => query,
+        _ => return None,
+    };
+
+    let head = &target[..target.len() - body.len() - wrapper.map_or(0, char::len_utf8)];
+    let close = wrapper.map(String::from).unwrap_or_default();
+    Some(format!("{head}{}{query}{close}", &body[..start]))
+}
+
+/// The two branches of a top-level `cond ? a : b`, trimmed. `None` when the
+/// text is not one: the `?` and `:` must sit outside quotes and brackets, and
+/// a `?` opening `?.` or `??` is not a ternary.
+fn top_level_ternary(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut question: Option<usize> = None;
+    for i in 0..bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == q {
+                quote = None;
+            }
+            continue;
+        }
+        match b {
+            b'"' | b'\'' | b'`' => quote = Some(b),
+            b'{' | b'(' | b'[' => depth += 1,
+            b'}' | b')' | b']' => depth = depth.saturating_sub(1),
+            b'?' if depth == 0 && question.is_none() => {
+                let next = bytes.get(i + 1).copied();
+                let previous = i.checked_sub(1).map(|p| bytes[p]);
+                if next == Some(b'?') || previous == Some(b'?') || next == Some(b'.') {
+                    continue;
+                }
+                question = Some(i);
+            }
+            b':' if depth == 0 => {
+                let q = question?;
+                return Some((s[q + 1..i].trim(), s[i + 1..].trim()));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The text of a whole string or template literal (`"x"`, `'x'`, `` `x` ``),
+/// or `None` when `s` is anything else.
+fn string_literal_text(s: &str) -> Option<&str> {
+    let first = s.chars().next()?;
+    if !matches!(first, '"' | '\'' | '`') || s.len() < 2 || !s.ends_with(first) {
+        return None;
+    }
+    let inner = &s[1..s.len() - 1];
+    // One literal, not two joined by an operator (`"?" + q + ""`).
+    (!inner.contains(first)).then_some(inner)
+}
+
 /// Byte index of the `}` closing an interpolation whose `${` was already
 /// consumed. Brace-depth, quote, and escape aware, so a `}` inside a quoted
 /// fallback string (including behind an escaped quote, `"\"}"`) or a nested
@@ -3670,6 +3782,60 @@ mod tests {
             Analyzer::extract_env_var_name(&normalized),
             "AUDIT_WEBHOOK_URL"
         );
+    }
+
+    /// carrick#1150: a query string appended only when there is one is the
+    /// same route as the bare path, and reads as a route once rewritten.
+    #[test]
+    fn a_conditional_query_tail_becomes_a_plain_query_string() {
+        for (raw, expected) in [
+            (
+                r#"/admin/jobs${query ? `?${query}` : ""}"#,
+                "/admin/jobs?${query}",
+            ),
+            ("/v1/tasks${query ? `?${query}` : ''}", "/v1/tasks?${query}"),
+            (
+                r#"/v1/items${"" === q ? "" : "?page=1"}"#,
+                "/v1/items?page=1",
+            ),
+            (
+                "${process.env.ORDERS_URL}/v1/orders${params.size > 0 ? `?${params}` : ``}",
+                "${process.env.ORDERS_URL}/v1/orders?${params}",
+            ),
+            (
+                r#"`/admin/jobs${query ? `?${query}` : ""}`"#,
+                "`/admin/jobs?${query}`",
+            ),
+        ] {
+            assert!(
+                !is_valid_route_shape(raw),
+                "precondition: {raw} is rejected"
+            );
+            let rewritten = strip_conditional_query_tail(raw);
+            assert_eq!(rewritten.as_deref(), Some(expected), "{raw}");
+            let unwrapped = expected.trim_matches('`');
+            assert!(is_valid_route_shape(unwrapped), "{unwrapped} is a route");
+        }
+    }
+
+    #[test]
+    fn a_conditional_that_is_not_a_query_tail_is_left_verbatim() {
+        for raw in [
+            // A branch that changes the path, not the query.
+            r#"/v1/steps${id ? `/${id}` : ""}"#,
+            // A ternary mid-path.
+            r#"/v1/${kind ? "a" : "b"}/items"#,
+            // Neither branch empty.
+            r#"/v1/items${q ? `?${q}` : "?all=1"}"#,
+            // A concatenation, not one literal.
+            r#"/v1/items${q ? "?" + q : ""}"#,
+            // Optional chaining and a fallback, no ternary.
+            "/v1/items${opts?.query ?? ''}",
+            "/v1/items?${query}",
+            "/v1/items",
+        ] {
+            assert_eq!(strip_conditional_query_tail(raw), None, "{raw}");
+        }
     }
 
     #[test]

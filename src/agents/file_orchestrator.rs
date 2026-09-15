@@ -33,8 +33,9 @@ use crate::{
     env_alias::{
         EnvAliasExtractor, EnvAliasMap, EnvFallbackMap, EnvSchemaIndex, LiteralBaseMap,
         WholeUrlFallbackMap, base_default_states_a_path, exported_env_aliases,
-        merge_imported_env_aliases, module_env_schema, resolve_target_env_alias,
-        resolve_target_literal_base, resolve_whole_url_target, whole_url_local_default,
+        exported_literal_bases, merge_imported_bindings, module_env_schema,
+        resolve_target_env_alias, resolve_target_literal_base, resolve_whole_url_target,
+        whole_url_local_default,
     },
     file_based_router::{MethodSource, RoutingConvention, builtin_conventions, derive_route},
     framework_detector::DetectionResult,
@@ -2157,8 +2158,15 @@ impl FileOrchestrator {
         // the #369 wrapper pass) and fold the imported modules' exported env
         // aliases into the importer's map. Parsed modules are memoized per
         // canonical path, so each config module is parsed once per scan.
+        //
+        // The same hop carries base literals (carrick#1153): a URL base
+        // declared as an exported string constant in one module and
+        // interpolated in another (`${VENDOR_BASE}/v1/...`) otherwise keeps
+        // its `${…}` prefix, reads as an env-var base, and a third-party
+        // request is indexed as an internal call with no producer.
         {
             let mut module_exports_cache: HashMap<PathBuf, EnvAliasMap> = HashMap::new();
+            let mut module_bases_cache: HashMap<PathBuf, LiteralBaseMap> = HashMap::new();
             for pf in &mut pending {
                 let importer = PathBuf::from(&pf.path_str);
                 Self::merge_cross_file_env_aliases(
@@ -2166,6 +2174,14 @@ impl FileOrchestrator {
                     &importer,
                     &pf.symbol_table.imported_symbols,
                     &mut module_exports_cache,
+                    &cm,
+                    &handler,
+                );
+                Self::merge_cross_file_literal_bases(
+                    &mut pf.literal_bases,
+                    &importer,
+                    &pf.symbol_table.imported_symbols,
+                    &mut module_bases_cache,
                     &cm,
                     &handler,
                 );
@@ -6437,7 +6453,7 @@ impl FileOrchestrator {
         cm: &Lrc<SourceMap>,
         handler: &Handler,
     ) {
-        merge_imported_env_aliases(env_alias_map, imported_symbols, |spec| {
+        merge_imported_bindings(env_alias_map, imported_symbols, |spec| {
             let resolved = Self::resolve_relative_import(importer, spec)?;
             Some(
                 module_exports_cache
@@ -6445,6 +6461,34 @@ impl FileOrchestrator {
                     .or_insert_with(|| {
                         parse_file(&resolved, cm, handler)
                             .map(|module| exported_env_aliases(&module))
+                            .unwrap_or_default()
+                    })
+                    .clone(),
+            )
+        });
+    }
+
+    /// Fold base literals exported by same-repo modules `importer` imports
+    /// into its literal-base map (carrick#1153). The same one-hop,
+    /// relative-specifier walk as [`Self::merge_cross_file_env_aliases`], and
+    /// the same rule that a binding the file declares itself wins over an
+    /// imported one.
+    pub fn merge_cross_file_literal_bases(
+        literal_bases: &mut LiteralBaseMap,
+        importer: &Path,
+        imported_symbols: &HashMap<String, ImportedSymbol>,
+        module_bases_cache: &mut HashMap<PathBuf, LiteralBaseMap>,
+        cm: &Lrc<SourceMap>,
+        handler: &Handler,
+    ) {
+        merge_imported_bindings(literal_bases, imported_symbols, |spec| {
+            let resolved = Self::resolve_relative_import(importer, spec)?;
+            Some(
+                module_bases_cache
+                    .entry(resolved.clone())
+                    .or_insert_with(|| {
+                        parse_file(&resolved, cm, handler)
+                            .map(|module| exported_literal_bases(&module))
                             .unwrap_or_default()
                     })
                     .clone(),
@@ -6462,6 +6506,12 @@ impl FileOrchestrator {
     /// Pure string normalization, no re-parse; see
     /// [`crate::analyzer::normalize_env_fallback_target`] for the exact rules
     /// (non-fallback expressions stay verbatim and stay rejected).
+    ///
+    /// The same fold rewrites a query string appended by a trailing ternary
+    /// (`/v1/jobs${q ? `?${q}` : ""}` -> `/v1/jobs?${q}`, carrick#1150), which
+    /// fails the route-shape gate for the same reason: an expression's
+    /// whitespace and quotes standing where the URL's own `?` should be. See
+    /// [`crate::analyzer::strip_conditional_query_tail`].
     fn normalize_fallback_targets(result: &mut FileAnalysisResult) {
         for data_call in &mut result.data_calls {
             if let Some(normalized) =
@@ -6469,6 +6519,15 @@ impl FileOrchestrator {
             {
                 debug!(
                     "Collapsed inline fallback in data-call target: {:?} -> {:?}",
+                    data_call.target, normalized
+                );
+                data_call.target = normalized;
+            }
+            if let Some(normalized) =
+                crate::analyzer::strip_conditional_query_tail(&data_call.target)
+            {
+                debug!(
+                    "Rewrote conditional query tail in data-call target: {:?} -> {:?}",
                     data_call.target, normalized
                 );
                 data_call.target = normalized;
