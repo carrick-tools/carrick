@@ -29,7 +29,7 @@
  * structural form rather than a dangling name.
  */
 
-import { type Symbol, type Type, ts } from 'ts-morph';
+import { type Node, type Symbol, type Type, ts } from 'ts-morph';
 import { canonicalizeUnionsInText } from './type-text-canonicalizer.js';
 
 /**
@@ -40,19 +40,108 @@ import { canonicalizeUnionsInText } from './type-text-canonicalizer.js';
 export const MAX_EXPANSION_DEPTH = 12;
 
 /**
+ * Types to print at named member positions instead of the walked type
+ * (carrick#1105).
+ *
+ * A validation schema's request contract is its INPUT, except at a member
+ * whose input is `unknown` and whose output is concrete (a coercion): that
+ * member prints the OUTPUT type. The substitution is per member, so it has to
+ * happen inside the walk, where the member is printed.
+ *
+ * Positions use the member-path notation of the provenance entries: `''` for
+ * the root, `sub.field` for a property (keyed by symbol name), `items<0>` for
+ * an array element; union and intersection members share their parent's
+ * position. The walk records every position it printed an override at in
+ * `applied`, so a caller can tell a substitution the walk could not reach (a
+ * tuple, a cycle, the depth backstop) from one it made.
+ *
+ * `at` is the node the member types are read at while walking toward an
+ * override. A library's inferred object type is a mapped type whose member
+ * declaration sits inside a generic, where the member reads as `any`; read at
+ * the schema's own node it is the instantiated type, the same read the
+ * caller's position walk makes.
+ */
+export interface MemberOverrides {
+  readonly types: ReadonlyMap<string, Type>;
+  readonly applied: Set<string>;
+  readonly at: Node;
+}
+
+/** The overrides narrowed to one position of the walk. */
+interface OverrideCursor {
+  readonly overrides: MemberOverrides;
+  readonly position: string;
+}
+
+/** True when some override sits strictly below `position`. */
+function hasOverrideBelow({ overrides, position }: OverrideCursor): boolean {
+  for (const key of overrides.types.keys()) {
+    if (
+      position === ''
+        ? key !== ''
+        : key.startsWith(`${position}.`) || key.startsWith(`${position}<`)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function childCursor(
+  cursor: OverrideCursor | undefined,
+  segment: string,
+): OverrideCursor | undefined {
+  if (!cursor) return undefined;
+  const position = segment.startsWith('<')
+    ? `${cursor.position}${segment}`
+    : cursor.position === ''
+      ? segment
+      : `${cursor.position}.${segment}`;
+  return { overrides: cursor.overrides, position };
+}
+
+/**
  * Recursively render a `Type` as fully-inlined structural text.
  *
  * Named object/interface types are expanded to their member structure;
  * primitives, literals, library types (`Date`, `Promise`, tuples, …) and
  * functions stay by name. The `seen` set (object type ids on the current
- * branch) breaks reference cycles; `depth` is a hard backstop.
+ * branch) breaks reference cycles; `depth` is a hard backstop. `overrides`
+ * substitutes a type at named member positions (`MemberOverrides`); without
+ * it the print is unchanged.
  */
 export function expandTypeStructural(
   type: Type,
   seen: Set<number> = new Set(),
   depth = 0,
+  overrides?: MemberOverrides,
+): string {
+  return expandAt(
+    type,
+    seen,
+    depth,
+    overrides ? { overrides, position: '' } : undefined,
+  );
+}
+
+function expandAt(
+  type: Type,
+  seen: Set<number>,
+  depth: number,
+  at: OverrideCursor | undefined,
 ): string {
   if (depth > MAX_EXPANSION_DEPTH) return backstopText(type);
+
+  let cursor = at;
+  if (cursor) {
+    const replacement = cursor.overrides.types.get(cursor.position);
+    if (replacement) {
+      cursor.overrides.applied.add(cursor.position);
+      return expandAt(replacement, seen, depth, undefined);
+    }
+    // Nothing to substitute below here: print exactly as without overrides.
+    if (!hasOverrideBelow(cursor)) cursor = undefined;
+  }
 
   // Primitives & literals: nothing to inline.
   if (
@@ -75,12 +164,17 @@ export function expandTypeStructural(
 
   // Unions / intersections: expand each member, in canonical order.
   if (type.isUnion()) {
-    return canonicalMembers(type.getUnionTypes(), seen, depth).join(' | ');
+    return canonicalMembers(type.getUnionTypes(), seen, depth, cursor).join(
+      ' | ',
+    );
   }
   if (type.isIntersection()) {
-    return canonicalMembers(type.getIntersectionTypes(), seen, depth).join(
-      ' & ',
-    );
+    return canonicalMembers(
+      type.getIntersectionTypes(),
+      seen,
+      depth,
+      cursor,
+    ).join(' & ');
   }
 
   // Tuples are array-like but must keep their `[a, b]` shape, not be walked
@@ -92,7 +186,12 @@ export function expandTypeStructural(
   if (type.isArray()) {
     const element = type.getArrayElementType();
     if (!element) return namedText(type);
-    const inner = expandTypeStructural(element, seen, depth + 1);
+    const inner = expandAt(
+      element,
+      seen,
+      depth + 1,
+      childCursor(cursor, '<0>'),
+    );
     // Parenthesise a union/intersection element so `(A | B)[]` doesn't misparse
     // as `A | B[]`. Decide from the TYPE, not the string: a single object
     // literal like `{ a: A | B }` is NOT a union and must not be parenthesised,
@@ -101,8 +200,10 @@ export function expandTypeStructural(
     return needsParens ? `(${inner})[]` : `${inner}[]`;
   }
 
-  // Library / built-in types (Date, Promise, RegExp, …): keep by name.
-  if (isLibraryType(type)) {
+  // Library / built-in types (Date, Promise, RegExp, …): keep by name, unless
+  // a member below has to be substituted — a schema library declares its
+  // inferred object types itself, and they are only walkable, not by-name.
+  if (!cursor && isLibraryType(type)) {
     return namedText(type);
   }
 
@@ -123,7 +224,9 @@ export function expandTypeStructural(
     const props = type.getProperties();
     if (props.length === 0) return namedText(type);
 
-    const parts = props.map((prop) => expandProperty(prop, nextSeen, depth));
+    const parts = props.map((prop) =>
+      expandProperty(prop, nextSeen, depth, cursor),
+    );
     return `{ ${parts.join('; ')}; }`;
   }
 
@@ -189,9 +292,10 @@ function canonicalMembers(
   members: Type[],
   seen: Set<number>,
   depth: number,
+  cursor: OverrideCursor | undefined,
 ): string[] {
   return orderMembers(members, (member) =>
-    expandTypeStructural(member, seen, depth + 1),
+    expandAt(member, seen, depth + 1, cursor),
   );
 }
 
@@ -217,7 +321,12 @@ function orderMembers(
 }
 
 /** Render a single property as `name[?]: <expanded>`. */
-function expandProperty(prop: Symbol, seen: Set<number>, depth: number): string {
+function expandProperty(
+  prop: Symbol,
+  seen: Set<number>,
+  depth: number,
+  at: OverrideCursor | undefined,
+): string {
   const optional = (prop.getFlags() & ts.SymbolFlags.Optional) !== 0;
 
   const propDecl = prop.getDeclarations()[0];
@@ -225,9 +334,22 @@ function expandProperty(prop: Symbol, seen: Set<number>, depth: number): string 
   // ('x-y', "x y", [Symbol.iterator]) survive as valid TS text rather than
   // being unquoted into invalid output; fall back to the bare symbol name.
   const name = renderPropertyName(prop, propDecl);
-  let propType = propDecl
-    ? prop.getTypeAtLocation(propDecl)
-    : prop.getDeclaredType();
+  let propType = at
+    ? prop.getTypeAtLocation(at.overrides.at)
+    : propDecl
+      ? prop.getTypeAtLocation(propDecl)
+      : prop.getDeclaredType();
+
+  // A substituted member takes the override's TYPE but keeps this key's
+  // optionality, and is looked up before the `undefined` strip below so an
+  // override that carries `| undefined` strips like any other optional key.
+  let cursor = childCursor(at, prop.getName());
+  const replacement = cursor && cursor.overrides.types.get(cursor.position);
+  if (cursor && replacement) {
+    cursor.overrides.applied.add(cursor.position);
+    propType = replacement;
+    cursor = undefined;
+  }
 
   // An optional property's type includes `undefined`; the structural label
   // drops it (`note?: string`, not `note?: string | undefined`).
@@ -238,12 +360,14 @@ function expandProperty(prop: Symbol, seen: Set<number>, depth: number): string 
     if (nonUndefined.length === 1) {
       propType = nonUndefined[0];
     } else if (nonUndefined.length > 1) {
-      const inner = canonicalMembers(nonUndefined, seen, depth).join(' | ');
+      const inner = canonicalMembers(nonUndefined, seen, depth, cursor).join(
+        ' | ',
+      );
       return `${name}?: ${inner}`;
     }
   }
 
-  const inner = expandTypeStructural(propType, seen, depth + 1);
+  const inner = expandAt(propType, seen, depth + 1, cursor);
   return `${name}${optional ? '?' : ''}: ${inner}`;
 }
 
