@@ -1,0 +1,6 @@
+{
+  "frameworks": ["hono", "graphql-yoga"],
+  "data_fetchers": ["@example/schema-kit", "@example/courier-client"],
+  "messaging_clients": [],
+  "notes": "Hono server; the GraphQL schema is built in code with @example/schema-kit; @example/courier-client is an SDK called from request handlers."
+}
