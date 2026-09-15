@@ -336,7 +336,11 @@ function checkedRecord(
     self_check_detail: anchor.abstainReason ?? detail ?? anchor.reaimNote,
     top_type_at_self_check: topType,
     ...(unexplainedDeep.length > 0
-      ? { any_provenance: unexplainedDeep.map(provenanceOf) }
+      ? {
+          any_provenance: unexplainedDeep.map((finding) =>
+            provenanceOf(finding, anchor.unresolved)
+          ),
+        }
       : {}),
     ...(danglingSpecifiers.size > 0
       ? { dangling_specifiers: [...danglingSpecifiers].sort() }

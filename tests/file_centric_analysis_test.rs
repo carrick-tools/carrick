@@ -111,6 +111,7 @@ fn test_file_analysis_result_structures() {
     // Test EndpointResult structure
     let endpoint = EndpointResult {
         handler_declaration_line: None,
+        registration_literal: None,
         view_module: false,
         candidate_id: "span:100-140".to_string(),
         line_number: 15,
@@ -186,6 +187,7 @@ fn test_file_analysis_result_serialization() {
         endpoints: vec![
             EndpointResult {
                 handler_declaration_line: None,
+                registration_literal: None,
                 view_module: false,
                 candidate_id: "span:300-340".to_string(),
                 line_number: 10,
@@ -208,6 +210,7 @@ fn test_file_analysis_result_serialization() {
             },
             EndpointResult {
                 handler_declaration_line: None,
+                registration_literal: None,
                 view_module: false,
                 candidate_id: "span:350-400".to_string(),
                 line_number: 15,
@@ -318,6 +321,7 @@ fn test_processing_stats_tracking() {
         total_endpoints: 10,
         pubsub_anchor_backfills: 0,
         pubsub_phantom_topic_drops: 0,
+        graphql_document_site_drops: Default::default(),
         total_data_calls: 4,
         errors: vec!["Test error".to_string()],
     };
@@ -415,6 +419,7 @@ fn test_cross_file_import_resolution() {
             endpoints: vec![
                 EndpointResult {
                     handler_declaration_line: None,
+                    registration_literal: None,
                     view_module: false,
                     candidate_id: "span:470-500".to_string(),
                     line_number: 5,
@@ -437,6 +442,7 @@ fn test_cross_file_import_resolution() {
                 },
                 EndpointResult {
                     handler_declaration_line: None,
+                    registration_literal: None,
                     view_module: false,
                     candidate_id: "span:510-540".to_string(),
                     line_number: 10,
@@ -459,6 +465,7 @@ fn test_cross_file_import_resolution() {
                 },
                 EndpointResult {
                     handler_declaration_line: None,
+                    registration_literal: None,
                     view_module: false,
                     candidate_id: "span:550-580".to_string(),
                     line_number: 15,
@@ -496,6 +503,7 @@ fn test_cross_file_import_resolution() {
             endpoints: vec![
                 EndpointResult {
                     handler_declaration_line: None,
+                    registration_literal: None,
                     view_module: false,
                     candidate_id: "span:590-620".to_string(),
                     line_number: 5,
@@ -518,6 +526,7 @@ fn test_cross_file_import_resolution() {
                 },
                 EndpointResult {
                     handler_declaration_line: None,
+                    registration_literal: None,
                     view_module: false,
                     candidate_id: "span:630-660".to_string(),
                     line_number: 10,
@@ -734,6 +743,7 @@ fn test_nested_router_mounts() {
             mounts: vec![],
             endpoints: vec![EndpointResult {
                 handler_declaration_line: None,
+                registration_literal: None,
                 view_module: false,
                 candidate_id: "span:830-860".to_string(),
                 line_number: 5,
@@ -779,6 +789,7 @@ fn test_multiple_http_methods_on_same_path() {
         endpoints: vec![
             EndpointResult {
                 handler_declaration_line: None,
+                registration_literal: None,
                 view_module: false,
                 candidate_id: "span:870-900".to_string(),
                 line_number: 5,
@@ -801,6 +812,7 @@ fn test_multiple_http_methods_on_same_path() {
             },
             EndpointResult {
                 handler_declaration_line: None,
+                registration_literal: None,
                 view_module: false,
                 candidate_id: "span:910-940".to_string(),
                 line_number: 10,
@@ -823,6 +835,7 @@ fn test_multiple_http_methods_on_same_path() {
             },
             EndpointResult {
                 handler_declaration_line: None,
+                registration_literal: None,
                 view_module: false,
                 candidate_id: "span:950-980".to_string(),
                 line_number: 15,
@@ -845,6 +858,7 @@ fn test_multiple_http_methods_on_same_path() {
             },
             EndpointResult {
                 handler_declaration_line: None,
+                registration_literal: None,
                 view_module: false,
                 candidate_id: "span:990-1020".to_string(),
                 line_number: 20,

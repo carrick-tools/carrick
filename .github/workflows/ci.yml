@@ -69,9 +69,11 @@ jobs:
           --test file_centric_analysis_test
           --test framework_coverage_test
           --test graphql_extraction_test
+          --test graphql_schema_identity_test
           --test graphql_schemas_setting_test
           --test incremental_raw_cache_test
           --test intent_incremental_test
+          --test jsx_component_callers_test
           --test literal_base_url_test
           --test llm_mock_pipeline_test
           --test log_value_guard_test
@@ -91,8 +93,10 @@ jobs:
           --test socket_type_alias_test
           --test span_locator_units_test
           --test url_alias_matching_test
+          --test url_bases_through_bindings_test
           --test workspace_member_callers_test
           --test workspace_package_client_test
+          --test wrapper_chain_const_url_test
           --test wrapper_dispatch_test
 
       # Every tests/*.rs must be run by a step in one of the Rust shards or be
@@ -252,6 +256,9 @@ jobs:
             assert.strictEqual(m.match_verdict('/*', '/api/v1/login'), m.MatchVerdict.CatchAllRoute);
             assert.strictEqual(m.reportable_agreement('/*', '/api/v1/login'), undefined);
             assert.strictEqual(m.reportable_agreement('/files/**', '/files/report'), 1);
+            assert.strictEqual(m.method_matches('ALL', 'POST'), true);
+            assert.strictEqual(m.method_matches('get', 'GET'), true);
+            assert.strictEqual(m.method_matches('POST', 'ALL'), false);
             console.log('wasm smoke ok');
           "
 

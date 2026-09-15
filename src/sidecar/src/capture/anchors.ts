@@ -14,6 +14,8 @@ import type {
 } from './api.js';
 import { printTypeForDestination, undeclaredNamesIn } from './node-builder.js';
 import { typeIsOrContainsMachinery } from './machinery.js';
+import type { UnresolvedAtAnchor } from './deep-walk.js';
+import { unresolvedAtAnchor } from './unresolved.js';
 
 export interface ResolvedAnchor {
   request: CaptureAnchorRequest;
@@ -45,10 +47,18 @@ export interface ResolvedAnchor {
   abstainReason?: string;
   /**
    * carrick#1165: identifiers the alias text names (a literal anchor's text
-   * or a node-builder print) that resolve to nothing where the surface
-   * declares the alias. Recorded on the capture record as `undeclared_names`.
+   * or a node-builder print) that nothing in the producer's program declares.
+   * Recorded on the capture record as `undeclared_names`.
    */
   undeclaredNames?: string[];
+  /**
+   * carrick#1164: member paths the SOURCE program could not resolve, and the
+   * unresolved imports the anchor's file reaches. Printed into the surface
+   * those members read `any`, like an author's `any`; the self-check uses this
+   * to label them `unresolved_import` instead of `declared`. Absent when the
+   * anchor's type holds no unresolved placeholder.
+   */
+  unresolved?: UnresolvedAtAnchor;
 }
 
 /** Repo-root-relative source file -> extensionless specifier from entryDir. */
@@ -183,10 +193,20 @@ export function resolveAnchor(
       );
     }
 
+    const arrayDepth = Math.max(0, request.array_depth ?? 0);
+    const declared = checker.getDeclaredTypeOfSymbol(resolvedExport);
+    const unresolved = unresolvedAtAnchor(
+      program,
+      sourceFile,
+      declared,
+      resolvedExport.declarations?.[0] ?? sourceFile,
+      '<0>'.repeat(arrayDepth)
+    );
     return {
       request,
       aliasText: `import('${spec}').${request.symbol_name}${arraySuffix}`,
       serialization: 'emitted',
+      ...(unresolved ? { unresolved } : {}),
     };
   }
 
@@ -217,10 +237,18 @@ export function resolveAnchor(
       // Type parameters erase to their constraint/unknown under ReturnType<>.
       return demote(`handler '${request.symbol_name}' is generic`);
     }
+    const returned = callSignatures[0].getReturnType();
+    const unresolved = unresolvedAtAnchor(
+      program,
+      sourceFile,
+      checker.getAwaitedType(returned) ?? returned,
+      declaration ?? sourceFile
+    );
     return {
       request,
       aliasText: `Awaited<ReturnType<typeof import('${spec}').${request.symbol_name}>>`,
       serialization: 'emitted',
+      ...(unresolved ? { unresolved } : {}),
     };
   }
 
@@ -252,6 +280,10 @@ export function resolveAnchor(
   if (!located) {
     return demote(locatorFailureReason(request));
   }
+  // carrick#1162: a serialised body is the JSON of its argument. The call's own
+  // `string` result is never the payload's contract, and publishing it reads
+  // incompatible against every object-typed counterparty.
+  located = serialisedArgument(located);
   // #439 part 1: a producer anchor whose locator landed inside a fluent
   // builder chain's config-descriptor argument (an all-literal metadata
   // object) must never capture that descriptor as the request type. Re-aim at
@@ -378,12 +410,14 @@ function finishInferAnchor(
   if (!printed.text) {
     return demote(printed.failure ?? 'node builder print failed');
   }
+  const unresolved = unresolvedAtAnchor(program, sourceFile, type, located);
   return {
     request,
     aliasText: printed.text,
     serialization: 'node_builder',
     ...(reaimNote ? { reaimNote } : {}),
     ...(printed.undeclaredNames ? { undeclaredNames: printed.undeclaredNames } : {}),
+    ...(unresolved ? { unresolved } : {}),
   };
 }
 
@@ -929,6 +963,28 @@ function paramLocatorHints(request: InferAnchorRequest): string {
     : 'no line hint';
 }
 
+/**
+ * The argument of a `JSON.stringify(value)` call (through parentheses), or the
+ * node unchanged. The mirror of the v1 inferrer's `unwrapJsonStringifyArg`:
+ * the global serialiser is identified by the standard `JSON` object, the one
+ * name every runtime shares.
+ */
+function serialisedArgument(node: ts.Node): ts.Node {
+  let current = node;
+  while (ts.isParenthesizedExpression(current)) current = current.expression;
+  if (
+    ts.isCallExpression(current) &&
+    current.arguments.length > 0 &&
+    ts.isPropertyAccessExpression(current.expression) &&
+    ts.isIdentifier(current.expression.expression) &&
+    current.expression.expression.text === 'JSON' &&
+    current.expression.name.text === 'stringify'
+  ) {
+    return current.arguments[0];
+  }
+  return node;
+}
+
 function locatorFailureReason(request: InferAnchorRequest): string {
   const hints: string[] = [];
   if (request.span_start !== undefined) hints.push(`span ${request.span_start}-${request.span_end}`);
@@ -987,21 +1043,34 @@ function tightestCoveringNode(
   return best;
 }
 
+/**
+ * Locator text with insignificant whitespace removed: runs collapse to one
+ * space, and a member chain broken before its dot (`client\n  .list(…)`) reads
+ * as `client.list(…)` (carrick#1162), the same rule the v1 inferrer applies.
+ */
+function normalizeLocatorText(text: string): string {
+  return text
+    .replace(/\s+/g, ' ')
+    .replace(/\s*(\?\.|\.)\s*/g, '$1')
+    .trim();
+}
+
 function nodeByExpressionText(
   sourceFile: ts.SourceFile,
   text: string,
   fromLine?: number
 ): ts.Node | undefined {
-  const wanted = text.replace(/\s+/g, ' ').trim();
+  const wanted = normalizeLocatorText(text);
   let best: ts.Node | undefined;
   const visit = (node: ts.Node) => {
     if (best) return;
     if (isPreferredTarget(node)) {
-      const nodeText = node.getText(sourceFile).replace(/\s+/g, ' ').trim();
+      const nodeText = normalizeLocatorText(node.getText(sourceFile));
       if (nodeText === wanted) {
-        const line =
-          sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
-        if (fromLine === undefined || line >= fromLine) {
+        // On or after the line, or COVERING it: a chain broken before its dot
+        // starts a line above the line the analyzer reports for the call.
+        const endLine = sourceFile.getLineAndCharacterOfPosition(node.getEnd()).line + 1;
+        if (fromLine === undefined || endLine >= fromLine) {
           best = node;
           return;
         }

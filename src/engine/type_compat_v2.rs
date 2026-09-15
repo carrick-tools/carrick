@@ -224,6 +224,28 @@ pub(crate) fn text_is_bare_top_type(text: &str) -> bool {
     matches!(text.trim().trim_end_matches(';').trim(), "any" | "unknown")
 }
 
+/// Root `any_provenance` reasons with which the inferrer DECIDED a payload has
+/// no contract, as opposed to failing to see one. `no_success_payload`: every
+/// response the route's handler sends is an error or a redirect (carrick#1161).
+/// `no_request_body`: the located request read is a validated non-body part
+/// (carrick#1166).
+const DECIDED_ABSTAIN_REASONS: &[&str] = &["no_success_payload", "no_request_body"];
+
+/// True when an inference answered a bare top type because the inferrer read
+/// the use site and decided nothing there is a contract.
+///
+/// That answer is final. The capture's own infer anchor re-runs the raw
+/// locator without the inferrer's kind awareness, so for a redirect-only route
+/// it would read the redirect location back in and publish `string` as the
+/// body, which is the exact answer the inferrer just declined to give.
+fn inference_decided_no_contract(inf: &crate::services::type_sidecar::InferredType) -> bool {
+    text_is_bare_top_type(&inf.type_string)
+        && inf
+            .any_provenance
+            .iter()
+            .any(|p| p.path.is_empty() && DECIDED_ABSTAIN_REASONS.contains(&p.reason.as_str()))
+}
+
 /// Aliases whose deterministic inference ran and came back blind for EVERY
 /// result it produced. A single sighted inference for the alias clears it: the
 /// depth join (`apply_inferred_array_depth`) is first-anchor-carrying-wins, so
@@ -282,6 +304,11 @@ pub(crate) fn derive_capture_anchors(
         }
     }
     let blind = blind_inference_aliases(inferred);
+    let decided: HashSet<&str> = inferred
+        .iter()
+        .filter(|inf| inference_decided_no_contract(inf))
+        .map(|inf| inf.alias.as_str())
+        .collect();
 
     for request in explicit {
         let Some(alias) = request.alias.as_deref() else {
@@ -339,6 +366,18 @@ pub(crate) fn derive_capture_anchors(
                 type_text: (*text).to_string(),
                 anchor_origin: AnchorOrigin::DeterministicInfer,
                 source_file: Some(repo_relative(&request.file_path, repo_root)),
+            });
+            continue;
+        }
+        // The inferrer decided there is no contract here; a raw locator re-run
+        // must not overrule it (`inference_decided_no_contract`).
+        if decided.contains(alias) {
+            anchors.push(CaptureAnchor::Literal {
+                alias: alias.to_string(),
+                type_text: "unknown".to_string(),
+                anchor_origin: AnchorOrigin::DeterministicInfer,
+                // `unknown` names nothing, so no file needs to join the program.
+                source_file: None,
             });
             continue;
         }
@@ -1556,6 +1595,45 @@ mod tests {
                 other
             ),
         }
+    }
+
+    /// carrick#1161: a route whose handler only errors or redirects is answered
+    /// `unknown` with `no_success_payload`. The capture must keep that answer
+    /// rather than re-run the raw locator, which lands on the redirect location
+    /// and prints `string` as the route's body. A plain blind inference, with
+    /// no decision recorded, still falls to its infer anchor.
+    #[test]
+    fn derive_anchors_keeps_an_inferrer_decision_that_there_is_no_body() {
+        let mut decided = inferred("Endpoint_redirect_Response", "unknown", None, None);
+        decided.any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "no_success_payload".to_string(),
+            detail: None,
+        }];
+        let blind = inferred("Endpoint_blind_Response", "unknown", None, None);
+        let infer = vec![
+            response_body_infer("Endpoint_redirect_Response"),
+            response_body_infer("Endpoint_blind_Response"),
+        ];
+
+        let anchors = derive_capture_anchors(&[], &infer, &[], &[decided, blind], "/repo");
+
+        assert_eq!(anchors.len(), 2, "{anchors:?}");
+        match &anchors[0] {
+            CaptureAnchor::Literal {
+                alias, type_text, ..
+            } => {
+                assert_eq!(alias, "Endpoint_redirect_Response");
+                assert_eq!(type_text, "unknown");
+            }
+            other => panic!("a decided abstain must stay a literal unknown, got {other:?}"),
+        }
+        assert!(
+            matches!(&anchors[1], CaptureAnchor::Infer { alias, .. } if alias == "Endpoint_blind_Response"),
+            "a blind inference without a decision keeps its infer anchor, got {:?}",
+            anchors[1]
+        );
     }
 
     /// `unknown` is the scrubbers' failed-inference placeholder and means the

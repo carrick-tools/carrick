@@ -221,18 +221,36 @@ fn without_the_setting_the_report_hints_at_it_despite_a_consumer_row() {
     let hints: Vec<&str> = scan
         .stdout
         .lines()
-        .filter(|line| line.contains("`graphqlSchemas`"))
+        .filter(|line| line.contains("uses GraphQL"))
         .collect();
     assert_eq!(
         hints.len(),
         1,
-        "exactly one hint, for the server only (widgets-web serves no route):\n{}",
+        "exactly one code-first hint, for the server only (widgets-web serves no route):\n{}",
         scan.stdout
     );
     assert!(
         hints[0].contains("Service 'widgets-api' uses GraphQL (`graphql`, `graphql-request`)"),
         "{}",
         hints[0]
+    );
+    // Undeclared, the printed schema is a schema no service serves
+    // (carrick#1134), so widgets-web's document against it is not a call, and
+    // the report says which file to declare.
+    assert!(scan.graphql_rows("widgets-web", "calls").is_empty());
+    let external: Vec<&str> = scan
+        .stdout
+        .lines()
+        .filter(|line| line.contains("which no service in this repository serves"))
+        .collect();
+    assert_eq!(external.len(), 1, "{}", scan.stdout);
+    assert!(
+        external[0].contains(
+            "Service 'widgets-web': 1 GraphQL document operation(s) are written against \
+             'apps/web/dist/graphql/schema.graphql'"
+        ),
+        "{}",
+        external[0]
     );
 }
 

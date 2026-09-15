@@ -10,6 +10,8 @@
  *   surface import error (probe lines 1-2)-> unverifiable
  *   IsAny gate fired (TS2344)             -> gate_caught_baked_any
  *   IsUnknown/IsNever gate fired (TS2344) -> unverifiable
+ *   IsVoid gate fired (TS2344)            -> unverifiable (no body read)
+ *   IsFormBody gate fired (TS2344)        -> unverifiable (form-encoded body)
  *   assignment-class error                -> incompatible
  *   no diagnostics                        -> compatible     [lowest precedence]
  *
@@ -172,6 +174,33 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
       gate: `${side}:${kind}`,
       diagnostic: `the ${side} type resolved to '${kind}' at check time; compatibility cannot be verified.`,
       ...notAFact(`the ${side} type is '${kind}'`),
+    };
+  }
+
+  // 4b. A side that states no contract (carrick#1162), below the decay gates so
+  //     an `unknown` side is reported as `unknown`: a `void`/`undefined`
+  //     response a call site reads no body from, and a form-encoded body whose
+  //     fields are runtime appends.
+  const shapeGate = gateDiags
+    .map((d) => plan.gateLines.get(d.line)!)
+    .find((name) => name.endsWith(':void') || name.endsWith(':form'));
+  if (shapeGate) {
+    const { side, kind } = sideForGate(shapeGate, plan);
+    if (kind === 'void') {
+      return {
+        ...base,
+        bucket: 'unverifiable',
+        gate: `${side}:void`,
+        diagnostic: `the ${side} type is 'void' (it reads no body), so there is no contract to verify.`,
+        ...notAFact(`the ${side} type is 'void'`),
+      };
+    }
+    return {
+      ...base,
+      bucket: 'unverifiable',
+      gate: `${side}:form`,
+      diagnostic: `the ${side} sends a form-encoded body, whose fields are appended at runtime and cannot be compared with a declared shape.`,
+      ...notAFact(`the ${side} sends a form-encoded body`),
     };
   }
 

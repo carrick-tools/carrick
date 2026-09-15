@@ -16,10 +16,16 @@
 //! (carrick#1099, [`resolve_declared_schemas`]), and the scan report hints at
 //! that setting when a GraphQL-using server indexes no schema fields
 //! ([`service_notices`]).
+//!
+//! A document is a call only when the schema it is written against is served
+//! here: [`SchemaCatalogue`] attributes each document to a schema file, and a
+//! document against a committed schema no service serves is a call to someone
+//! else's API (carrick#1134). User-facing description: README, "GraphQL
+//! documents for another team's API".
 
 use crate::operation::{GraphqlOperationKind, OperationKey};
 use crate::parser::parse_file;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swc_common::errors::{ColorConfig, Handler};
 use swc_common::{GLOBALS, Globals, SourceMap, Spanned, sync::Lrc};
@@ -37,6 +43,12 @@ pub struct GraphqlOp {
     pub key: OperationKey,
     pub file_path: PathBuf,
     pub line: u32,
+    /// 1-based line in `file_path` where the GraphQL text this operation was
+    /// parsed from begins: `1` for a `.graphql`/`.gql` file, the template's
+    /// line for a tagged template. `(file_path, document_line)` names one
+    /// document, the unit a document is attributed to a schema by
+    /// ([`SchemaCatalogue::attribute`], carrick#1134).
+    pub document_line: u32,
     /// Deterministic type anchor (`primary_type_symbol`), mirroring the
     /// HTTP/socket anchors (#248). For SDL producers this is the root field's
     /// SDL type expression rendered to its canonical form (`Order`, `Order!`,
@@ -102,6 +114,12 @@ pub struct GraphqlOp {
     /// `resolver_file`). `None` when the type is declared in `file_path` itself.
     /// Null whenever `consumer_located_type_symbol` is null.
     pub consumer_located_type_source: Option<String>,
+    /// CONSUMER-only: the schema identity the document this operation was
+    /// parsed from is bound to, set by [`ConsumerAttribution::apply`] on every
+    /// consumer it keeps and carried onto the call row
+    /// (`calls[].schema_binding`). `None` for producers and before
+    /// attribution runs.
+    pub schema_binding: Option<SchemaBinding>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -280,6 +298,42 @@ const SKIP_DIRS: &[&str] = &[
     "__generated__", // Relay artifacts — out of scope
 ];
 
+/// Whether `path` names a GraphQL file by its extension.
+fn is_graphql_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext == "graphql" || ext == "gql")
+}
+
+/// Every `.graphql`/`.gql` file a service's own walk reads under `roots`, in
+/// walk order (roots in order, names sorted), skipping dependency, build and
+/// generated-artifact folders. A path under two overlapping roots is listed
+/// twice; callers dedup.
+fn graphql_files_under(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for root in roots {
+        for entry in WalkDir::new(root)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_entry(|e| {
+                !e.file_name()
+                    .to_str()
+                    .map(|name| {
+                        SKIP_DIRS.contains(&name)
+                            || crate::packages::MANIFEST_SKIP_DIRS.contains(&name)
+                    })
+                    .unwrap_or(false)
+            })
+            .filter_map(Result::ok)
+        {
+            if is_graphql_file(entry.path()) {
+                files.push(entry.path().to_path_buf());
+            }
+        }
+    }
+    files
+}
+
 /// Extract GraphQL operations for a single service: `.graphql`/`.gql` SDL files
 /// under the service's own `scan_roots` plus tagged template literals in the
 /// given service files (the same TS/JS set the rest of the pipeline analyzes).
@@ -317,37 +371,14 @@ pub fn scan_repo(
             .producers
             .extend(extract_from_document_text(&content, path, 1).producers);
     }
-    for root in scan_roots {
-        for entry in WalkDir::new(root)
-            .sort_by_file_name()
-            .into_iter()
-            .filter_entry(|e| {
-                !e.file_name()
-                    .to_str()
-                    .map(|name| {
-                        SKIP_DIRS.contains(&name)
-                            || crate::packages::MANIFEST_SKIP_DIRS.contains(&name)
-                    })
-                    .unwrap_or(false)
-            })
-            .filter_map(Result::ok)
-        {
-            let path = entry.path();
-            let is_graphql_file = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|ext| ext == "graphql" || ext == "gql");
-            if !is_graphql_file {
-                continue;
-            }
-            if !seen_sdl.insert(path.to_path_buf()) {
-                continue;
-            }
-            let Ok(content) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            extraction.merge(extract_from_document_text(&content, path, 1));
+    for path in graphql_files_under(scan_roots) {
+        if !seen_sdl.insert(path.clone()) {
+            continue;
         }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        extraction.merge(extract_from_document_text(&content, &path, 1));
     }
 
     for file in service_files {
@@ -471,6 +502,430 @@ pub fn resolve_declared_schemas(repo_root: &Path, patterns: &[String]) -> Declar
     }
     declared.files = files.into_iter().collect();
     declared
+}
+
+/// The schema identity a GraphQL call row is bound to, as the index blob
+/// carries it (`calls[].schema_binding`, carrick#1134). Only documents that
+/// stay calls have one: an external or unresolved document is not a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaBinding {
+    /// A schema a service in this repository serves holds the document's
+    /// fields. An operation no producer has is a real missing operation.
+    Served,
+    /// No schema this repository holds has any of the document's fields. Its
+    /// server may be a repository the project does not index.
+    NoLocalSchema,
+}
+
+/// Whether a schema file is one a service in this scan serves (carrick#1134).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaOrigin {
+    /// A service's own SDL walk reads the file, or a service names it in
+    /// `graphqlSchemas`.
+    Served,
+    /// The repository tracks the file but no service serves it: a copy of a
+    /// schema someone else serves, kept so documents can be checked against
+    /// it.
+    External,
+}
+
+/// One schema file the repository holds, reduced to what attribution reads.
+#[derive(Debug, Clone)]
+pub struct KnownSchema {
+    /// Repository-relative path.
+    pub file: PathBuf,
+    pub origin: SchemaOrigin,
+    /// Canonical keys (`graphql|query|order`) of its root operation fields.
+    root_keys: HashSet<String>,
+}
+
+/// Where one service reads schemas from, for [`SchemaCatalogue::build`].
+#[derive(Debug, Clone, Default)]
+pub struct ServedSchemaSources {
+    /// The service's SDL walk roots (its `directory` and `include` roots).
+    pub roots: Vec<PathBuf>,
+    /// The files its `graphqlSchemas` entries resolved to.
+    pub declared: Vec<PathBuf>,
+}
+
+/// Every schema file in the repository, each marked served or external: the
+/// identities a GraphQL document is attributed to (carrick#1134).
+///
+/// A document's operations are keyed by field name alone, so a client that
+/// talks to someone else's GraphQL API and a client of the project's own
+/// server produce the same kind of row, and the only thing that tells them
+/// apart without reading a codegen config is the schema the document is
+/// written against. SDL is the contract stated outright, so the check is set
+/// membership on parsed root fields: no library, file-name or URL convention.
+///
+/// "Tracked" is git's index, so a printed schema a developer generated locally
+/// and never committed is not an identity. When git cannot answer (the tree is
+/// not a repository), every schema file on disk outside dependency folders
+/// counts instead.
+///
+/// User-facing description: README, "GraphQL documents for another team's
+/// API".
+///
+/// Built once per scan. The tally records what each service's attribution
+/// removed, for the report.
+#[derive(Debug, Default)]
+pub struct SchemaCatalogue {
+    schemas: Vec<KnownSchema>,
+    tally: std::sync::Mutex<BTreeMap<String, AttributionSummary>>,
+}
+
+/// What a document's file says about where it is sent: its environment reads
+/// ([`file_env_reads`]) classified by `internalEnvVars` / `externalEnvVars`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportOrigin {
+    Internal,
+    External,
+    /// No classified read, or reads that disagree.
+    Unknown,
+}
+
+/// Every environment variable `file_path` reads, in any spelling
+/// [`crate::env_alias::env_read_name`] recognizes (`process.env.NAME`,
+/// `import.meta.env.NAME`, `Deno.env.get("NAME")`). Empty for a file that does
+/// not parse or is not a script, such as a `.graphql` file.
+///
+/// Used only as the transport tie-break of [`SchemaCatalogue::attribute`], so
+/// the file is parsed on demand rather than on every scan of it.
+pub fn file_env_reads(file_path: &Path) -> BTreeSet<String> {
+    let is_script = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext,
+                "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs"
+            )
+        });
+    if !is_script {
+        return BTreeSet::new();
+    }
+    let cm: Lrc<SourceMap> = Default::default();
+    let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
+    let globals = Globals::new();
+    GLOBALS.set(&globals, || {
+        let Some(module) = parse_file(file_path, &cm, &handler) else {
+            return BTreeSet::new();
+        };
+        let mut reads = EnvReads::default();
+        module.visit_with(&mut reads);
+        reads.names
+    })
+}
+
+/// Collects the names [`file_env_reads`] returns.
+#[derive(Default)]
+struct EnvReads {
+    names: BTreeSet<String>,
+}
+
+impl Visit for EnvReads {
+    fn visit_expr(&mut self, node: &Expr) {
+        if let Some(name) = crate::env_alias::env_read_name(node) {
+            self.names.insert(name);
+        }
+        node.visit_children_with(self);
+    }
+}
+
+/// The schema identity one document was attributed to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocumentIdentity {
+    /// A served schema covers it: its operations are calls to this project.
+    Served,
+    /// None of its fields is a root field of any schema this repository
+    /// holds. The server may be another repository in the project, so its
+    /// operations stay calls and matching decides.
+    NoLocalSchema,
+    /// Only schemas no service serves cover it (the files, sorted).
+    External(Vec<PathBuf>),
+    /// No single schema covers the fields it shares with known schemas, or
+    /// both a served and an external schema cover them and the transport does
+    /// not settle which.
+    Unresolved,
+}
+
+/// Per-document attribution for one service's consumers, from
+/// [`SchemaCatalogue::attribute`].
+#[derive(Debug, Clone, Default)]
+pub struct ConsumerAttribution {
+    documents: HashMap<(PathBuf, u32), DocumentIdentity>,
+}
+
+/// What [`ConsumerAttribution::apply`] removed from a service's consumers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AttributionSummary {
+    /// Operations attributed to external schemas, per sorted schema file set.
+    pub external: BTreeMap<Vec<PathBuf>, usize>,
+    /// Operations whose document is [`DocumentIdentity::Unresolved`].
+    pub unresolved: usize,
+}
+
+impl AttributionSummary {
+    pub fn is_empty(&self) -> bool {
+        self.external.is_empty() && self.unresolved == 0
+    }
+}
+
+/// Repository-relative form of `path`, with any leading `./` dropped.
+fn repo_relative(repo_root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(repo_root)
+        .unwrap_or(path)
+        .components()
+        .skip_while(|c| matches!(c, std::path::Component::CurDir))
+        .collect()
+}
+
+/// Every GraphQL file on disk under `repo_root`, skipping `.git` and
+/// dependency folders only: the fallback when git cannot say what is tracked.
+/// Build folders are walked, because a committed printed schema usually sits
+/// in one.
+fn graphql_files_on_disk(repo_root: &Path) -> Vec<PathBuf> {
+    WalkDir::new(repo_root)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|e| {
+            e.depth() == 0
+                || !e
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name == ".git" || name == "node_modules")
+        })
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file() && is_graphql_file(entry.path()))
+        .map(|entry| entry.path().to_path_buf())
+        .collect()
+}
+
+impl SchemaCatalogue {
+    /// Read every schema file the repository holds and mark each one served
+    /// or external. `services` are this scan's services.
+    pub fn build(repo_root: &Path, services: &[ServedSchemaSources]) -> Self {
+        let mut served: BTreeSet<PathBuf> = BTreeSet::new();
+        for service in services {
+            for path in graphql_files_under(&service.roots)
+                .iter()
+                .chain(&service.declared)
+            {
+                served.insert(repo_relative(repo_root, path));
+            }
+        }
+        let tracked: BTreeSet<PathBuf> = match crate::git_state::tracked_paths(
+            repo_root,
+            &["*.graphql", "*.gql"],
+        ) {
+            Ok(paths) => paths
+                .iter()
+                .map(|path| repo_relative(repo_root, Path::new(path)))
+                .collect(),
+            Err(reason) => {
+                debug!(
+                    "GraphQL schema catalogue: git cannot list tracked files ({reason}); reading every schema file on disk"
+                );
+                graphql_files_on_disk(repo_root)
+                    .iter()
+                    .map(|path| repo_relative(repo_root, path))
+                    .collect()
+            }
+        };
+        let schemas: Vec<KnownSchema> = served
+            .iter()
+            .chain(tracked.difference(&served))
+            .filter_map(|file| {
+                let content = std::fs::read_to_string(repo_root.join(file)).ok()?;
+                let root_keys: HashSet<String> = extract_from_document_text(&content, file, 1)
+                    .producers
+                    .iter()
+                    .map(|op| op.key.canonical())
+                    .collect();
+                if root_keys.is_empty() {
+                    return None;
+                }
+                let origin = if served.contains(file) {
+                    SchemaOrigin::Served
+                } else {
+                    SchemaOrigin::External
+                };
+                Some(KnownSchema {
+                    file: file.clone(),
+                    origin,
+                    root_keys,
+                })
+            })
+            .collect();
+        debug!(
+            served = schemas
+                .iter()
+                .filter(|s| s.origin == SchemaOrigin::Served)
+                .count(),
+            external = schemas
+                .iter()
+                .filter(|s| s.origin == SchemaOrigin::External)
+                .count(),
+            "GraphQL schema catalogue built"
+        );
+        Self {
+            schemas,
+            tally: Default::default(),
+        }
+    }
+
+    /// Attribute each of `extraction`'s documents to a schema identity.
+    ///
+    /// A document's attribution basis is the set of its root fields that are a
+    /// root field of SOME known schema. A field no schema has is left out of
+    /// the basis rather than failing the document, so a document against the
+    /// project's own schema that uses a field the server has since removed is
+    /// still attributed to that schema and the removed field still reads as a
+    /// missing operation. The candidates are the schemas holding the whole
+    /// basis; the service's own producers (including schema text in its source
+    /// files) are one more served candidate. Then:
+    ///
+    /// - empty basis: [`DocumentIdentity::NoLocalSchema`];
+    /// - served candidates only: [`DocumentIdentity::Served`];
+    /// - external candidates only: [`DocumentIdentity::External`];
+    /// - both: `transport(file)` decides, and without an answer the document
+    ///   is [`DocumentIdentity::Unresolved`];
+    /// - no candidate (the basis spans schemas): [`DocumentIdentity::Unresolved`].
+    ///
+    /// The transport is a same-file HTTP call, so a `.graphql` file, which has
+    /// none, is unresolved whenever the tie-break is needed.
+    pub fn attribute(
+        &self,
+        extraction: &GraphqlExtraction,
+        transport: impl Fn(&Path) -> TransportOrigin,
+    ) -> ConsumerAttribution {
+        let own: HashSet<String> = extraction
+            .producers
+            .iter()
+            .map(|op| op.key.canonical())
+            .collect();
+        let mut fields_by_document: BTreeMap<(PathBuf, u32), BTreeSet<String>> = BTreeMap::new();
+        for op in &extraction.consumers {
+            fields_by_document
+                .entry((op.file_path.clone(), op.document_line))
+                .or_default()
+                .insert(op.key.canonical());
+        }
+        let mut documents = HashMap::new();
+        for (document, fields) in fields_by_document {
+            let basis: Vec<&String> = fields
+                .iter()
+                .filter(|key| {
+                    own.contains(*key) || self.schemas.iter().any(|s| s.root_keys.contains(*key))
+                })
+                .collect();
+            let identity = if basis.is_empty() {
+                DocumentIdentity::NoLocalSchema
+            } else {
+                let covers = |keys: &HashSet<String>| basis.iter().all(|key| keys.contains(*key));
+                let served = covers(&own)
+                    || self
+                        .schemas
+                        .iter()
+                        .any(|s| s.origin == SchemaOrigin::Served && covers(&s.root_keys));
+                let external: Vec<PathBuf> = self
+                    .schemas
+                    .iter()
+                    .filter(|s| s.origin == SchemaOrigin::External && covers(&s.root_keys))
+                    .map(|s| s.file.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                match (served, external.is_empty()) {
+                    (true, true) => DocumentIdentity::Served,
+                    (false, false) => DocumentIdentity::External(external),
+                    (false, true) => DocumentIdentity::Unresolved,
+                    (true, false) => match transport(&document.0) {
+                        TransportOrigin::Internal => DocumentIdentity::Served,
+                        TransportOrigin::External => DocumentIdentity::External(external),
+                        TransportOrigin::Unknown => DocumentIdentity::Unresolved,
+                    },
+                }
+            };
+            documents.insert(document, identity);
+        }
+        ConsumerAttribution { documents }
+    }
+
+    /// Record what `service`'s attribution removed, replacing an earlier
+    /// record for the same service (a retried service is analysed twice).
+    pub fn record(&self, service: &str, summary: AttributionSummary) {
+        let mut tally = self.tally.lock().unwrap_or_else(|e| e.into_inner());
+        if summary.is_empty() {
+            tally.remove(service);
+        } else {
+            tally.insert(service.to_string(), summary);
+        }
+    }
+
+    /// The report lines for every service whose attribution removed an
+    /// operation, in service order.
+    pub fn notices(&self) -> Vec<String> {
+        let tally = self.tally.lock().unwrap_or_else(|e| e.into_inner());
+        let mut lines = Vec::new();
+        for (service, summary) in tally.iter() {
+            for (files, count) in &summary.external {
+                let files = files
+                    .iter()
+                    .map(|file| format!("'{}'", file.display()))
+                    .collect::<Vec<_>>()
+                    .join(" or ");
+                lines.push(format!(
+                    "Service '{service}': {count} GraphQL document operation(s) are written \
+                     against {files}, which no service in this repository serves, so they are \
+                     read as calls to an external API and not indexed. If a service here serves \
+                     that schema, name the file in its `graphqlSchemas`."
+                ));
+            }
+            if summary.unresolved > 0 {
+                lines.push(format!(
+                    "Service '{service}': {} GraphQL document operation(s) are not indexed \
+                     because no single schema holds all their fields, or both a served and an \
+                     external schema do and the call's base URL does not say which.",
+                    summary.unresolved
+                ));
+            }
+        }
+        lines
+    }
+}
+
+impl ConsumerAttribution {
+    /// The identity of the document `op` was parsed from.
+    pub fn identity(&self, op: &GraphqlOp) -> Option<&DocumentIdentity> {
+        self.documents
+            .get(&(op.file_path.clone(), op.document_line))
+    }
+
+    /// Remove every consumer whose document is external or unresolved, bind
+    /// every kept consumer to its identity, and say how many were removed.
+    pub fn apply(&self, extraction: &mut GraphqlExtraction) -> AttributionSummary {
+        let mut summary = AttributionSummary::default();
+        extraction.consumers.retain_mut(|op| {
+            let binding = match self.identity(op) {
+                Some(DocumentIdentity::External(files)) => {
+                    *summary.external.entry(files.clone()).or_default() += 1;
+                    return false;
+                }
+                Some(DocumentIdentity::Unresolved) => {
+                    summary.unresolved += 1;
+                    return false;
+                }
+                Some(DocumentIdentity::Served) => Some(SchemaBinding::Served),
+                Some(DocumentIdentity::NoLocalSchema) => Some(SchemaBinding::NoLocalSchema),
+                None => None,
+            };
+            op.schema_binding = binding;
+            true
+        });
+        summary
+    }
 }
 
 /// What the scan report says about one service's GraphQL schema coverage.
@@ -608,6 +1063,7 @@ pub fn extract_from_document_text(
                     key: OperationKey::graphql(*kind, field.name.clone()),
                     file_path: file_path.to_path_buf(),
                     line: to_line(field.position.line),
+                    document_line: base_line,
                     // Deterministic anchor: the root field's SDL type
                     // expression (e.g. `Order`, `Order!`, `[Order!]!`).
                     primary_type_symbol: Some(render_sdl_type(&field.field_type)),
@@ -626,6 +1082,7 @@ pub fn extract_from_document_text(
                     // on producers.
                     consumer_located_type_symbol: None,
                     consumer_located_type_source: None,
+                    schema_binding: None,
                 });
             }
         }
@@ -670,6 +1127,7 @@ pub fn extract_from_document_text(
                     key: OperationKey::graphql(kind, field.name.clone()),
                     file_path: file_path.to_path_buf(),
                     line: to_line(field.position.line),
+                    document_line: base_line,
                     // Executable documents carry no SDL type — the SDL-derived
                     // anchor stays unset. The consumer's real TS result type is
                     // captured separately at the `client.request<T>(DOC)` call
@@ -691,6 +1149,7 @@ pub fn extract_from_document_text(
                     // gets first shot via `payload_type_symbol`.
                     consumer_located_type_symbol: None,
                     consumer_located_type_source: None,
+                    schema_binding: None,
                 });
             }
         }
@@ -1974,5 +2433,353 @@ export const typeDefs = gql`
             vec!["Service 'api': `graphqlSchemas` entry 'x' matches no file".to_string()]
         );
         assert!(warned.hints.is_empty());
+    }
+
+    fn known(file: &str, origin: SchemaOrigin, sdl: &str) -> KnownSchema {
+        KnownSchema {
+            file: PathBuf::from(file),
+            origin,
+            root_keys: extract_from_document_text(sdl, Path::new(file), 1)
+                .producers
+                .iter()
+                .map(|op| op.key.canonical())
+                .collect(),
+        }
+    }
+
+    /// Two schemas that share one root field, `viewer`: the shape carrick#1134
+    /// has to tell apart without a codegen config.
+    fn two_schema_catalogue() -> SchemaCatalogue {
+        SchemaCatalogue {
+            schemas: vec![
+                known(
+                    "tools/dist/catalog.graphql",
+                    SchemaOrigin::Served,
+                    "type Query { products: [String] viewer: String } \
+                     type Mutation { addProduct(name: String): String }",
+                ),
+                known(
+                    "tools/dist/ledger.graphql",
+                    SchemaOrigin::External,
+                    "type Query { balance: Int statements: [String] viewer: String }",
+                ),
+            ],
+            tally: Default::default(),
+        }
+    }
+
+    /// One document per file, parsed as the scan parses a `.graphql` file.
+    fn documents(docs: &[(&str, &str)]) -> GraphqlExtraction {
+        let mut extraction = GraphqlExtraction::default();
+        for (file, text) in docs {
+            extraction.merge(extract_from_document_text(text, Path::new(file), 1));
+        }
+        extraction
+    }
+
+    fn identity_of<'a>(
+        attribution: &'a ConsumerAttribution,
+        extraction: &GraphqlExtraction,
+        file: &str,
+    ) -> &'a DocumentIdentity {
+        let op = extraction
+            .consumers
+            .iter()
+            .find(|op| op.file_path == Path::new(file))
+            .unwrap_or_else(|| panic!("no consumer in {file}"));
+        attribution
+            .identity(op)
+            .expect("every document is attributed")
+    }
+
+    #[test]
+    fn a_document_is_attributed_to_the_schema_that_holds_its_fields() {
+        let catalogue = two_schema_catalogue();
+        let extraction = documents(&[
+            (
+                "served.gql",
+                "query A { products } mutation B { addProduct(name: \"x\") }",
+            ),
+            // `retiredListing` is in no schema: left out of the basis, so the
+            // document is still the served schema's and the field still reads
+            // as a missing operation.
+            (
+                "drift.gql",
+                "query A { products } query B { retiredListing }",
+            ),
+            ("external.gql", "query A { balance } query B { statements }"),
+            ("spans.gql", "query A { products balance }"),
+            ("nowhere.gql", "query A { somethingElse }"),
+        ]);
+        let attribution = catalogue.attribute(&extraction, |_| TransportOrigin::Unknown);
+
+        assert_eq!(
+            identity_of(&attribution, &extraction, "served.gql"),
+            &DocumentIdentity::Served
+        );
+        assert_eq!(
+            identity_of(&attribution, &extraction, "drift.gql"),
+            &DocumentIdentity::Served
+        );
+        assert_eq!(
+            identity_of(&attribution, &extraction, "external.gql"),
+            &DocumentIdentity::External(vec![PathBuf::from("tools/dist/ledger.graphql")])
+        );
+        assert_eq!(
+            identity_of(&attribution, &extraction, "spans.gql"),
+            &DocumentIdentity::Unresolved
+        );
+        assert_eq!(
+            identity_of(&attribution, &extraction, "nowhere.gql"),
+            &DocumentIdentity::NoLocalSchema
+        );
+    }
+
+    /// A document that selects a nested field the served schema removed still
+    /// holds that schema's root field, so it stays the served schema's and its
+    /// operation stays a call. Attribution reads root fields only.
+    #[test]
+    fn a_removed_nested_field_keeps_the_document_with_its_schema() {
+        let catalogue = two_schema_catalogue();
+        let mut extraction = documents(&[("nested.gql", "query A { products { id legacySku } }")]);
+        let attribution = catalogue.attribute(&extraction, |_| TransportOrigin::Unknown);
+
+        assert_eq!(
+            identity_of(&attribution, &extraction, "nested.gql"),
+            &DocumentIdentity::Served
+        );
+        let summary = attribution.apply(&mut extraction);
+        assert!(summary.is_empty());
+        assert_eq!(keys(&extraction.consumers), vec!["graphql|query|products"]);
+        assert_eq!(
+            extraction.consumers[0].schema_binding,
+            Some(SchemaBinding::Served)
+        );
+    }
+
+    /// A document whose only root field no schema holds (the served schema
+    /// removed it, and no external schema declares it) is never dropped: it
+    /// has no local identity, stays a call, and reads as a missing operation.
+    /// The same holds whether or not the repository also holds an external
+    /// schema.
+    #[test]
+    fn a_removed_root_field_stays_a_call() {
+        let served_only = SchemaCatalogue {
+            schemas: vec![known(
+                "tools/dist/catalog.graphql",
+                SchemaOrigin::Served,
+                "type Query { products: [String] }",
+            )],
+            tally: Default::default(),
+        };
+        for catalogue in [served_only, two_schema_catalogue()] {
+            let mut extraction = documents(&[("retired.gql", "query A { retiredListing }")]);
+            let attribution = catalogue.attribute(&extraction, |_| TransportOrigin::Unknown);
+
+            assert_eq!(
+                identity_of(&attribution, &extraction, "retired.gql"),
+                &DocumentIdentity::NoLocalSchema
+            );
+            let summary = attribution.apply(&mut extraction);
+            assert!(summary.is_empty(), "nothing is dropped or counted");
+            assert_eq!(
+                keys(&extraction.consumers),
+                vec!["graphql|query|retiredListing"]
+            );
+            assert_eq!(
+                extraction.consumers[0].schema_binding,
+                Some(SchemaBinding::NoLocalSchema)
+            );
+        }
+    }
+
+    #[test]
+    fn a_shared_field_is_settled_by_the_transport_or_left_unresolved() {
+        let catalogue = two_schema_catalogue();
+        let extraction = documents(&[
+            ("internal.ts", "query A { viewer }"),
+            ("external.ts", "query A { viewer }"),
+            ("unknown.gql", "query A { viewer }"),
+        ]);
+        let attribution = catalogue.attribute(&extraction, |file| {
+            match file.to_str().unwrap_or_default() {
+                "internal.ts" => TransportOrigin::Internal,
+                "external.ts" => TransportOrigin::External,
+                _ => TransportOrigin::Unknown,
+            }
+        });
+
+        assert_eq!(
+            identity_of(&attribution, &extraction, "internal.ts"),
+            &DocumentIdentity::Served
+        );
+        assert_eq!(
+            identity_of(&attribution, &extraction, "external.ts"),
+            &DocumentIdentity::External(vec![PathBuf::from("tools/dist/ledger.graphql")])
+        );
+        assert_eq!(
+            identity_of(&attribution, &extraction, "unknown.gql"),
+            &DocumentIdentity::Unresolved
+        );
+    }
+
+    /// Schema text in the service's own source (a `typeDefs` template) is not
+    /// a file in the catalogue, but the service serves it all the same.
+    #[test]
+    fn the_services_own_producers_are_a_served_schema() {
+        let catalogue = two_schema_catalogue();
+        let mut extraction = documents(&[("doc.gql", "query A { balance }")]);
+        extraction.merge(extract_from_document_text(
+            "type Query { balance: Int }",
+            Path::new("src/typedefs.ts"),
+            4,
+        ));
+        let attribution = catalogue.attribute(&extraction, |_| TransportOrigin::Unknown);
+
+        assert_eq!(
+            identity_of(&attribution, &extraction, "doc.gql"),
+            &DocumentIdentity::Unresolved,
+            "own producers and the external schema both hold `balance`, with no transport"
+        );
+    }
+
+    #[test]
+    fn apply_removes_external_and_unresolved_documents_and_counts_them() {
+        let catalogue = two_schema_catalogue();
+        let mut extraction = documents(&[
+            ("served.gql", "query A { products }"),
+            ("external.gql", "query A { balance } query B { statements }"),
+            ("spans.gql", "query A { products balance }"),
+            ("nowhere.gql", "query A { somethingElse }"),
+        ]);
+        let attribution = catalogue.attribute(&extraction, |_| TransportOrigin::Unknown);
+        let summary = attribution.apply(&mut extraction);
+
+        assert_eq!(
+            keys(&extraction.consumers),
+            vec!["graphql|query|products", "graphql|query|somethingElse"]
+        );
+        assert_eq!(
+            extraction
+                .consumers
+                .iter()
+                .map(|op| op.schema_binding)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(SchemaBinding::Served),
+                Some(SchemaBinding::NoLocalSchema)
+            ]
+        );
+        assert_eq!(
+            summary,
+            AttributionSummary {
+                external: [(vec![PathBuf::from("tools/dist/ledger.graphql")], 2)]
+                    .into_iter()
+                    .collect(),
+                unresolved: 2,
+            }
+        );
+
+        catalogue.record("web", summary);
+        let notices = catalogue.notices();
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(
+            notices[0].starts_with(
+                "Service 'web': 2 GraphQL document operation(s) are written against \
+                 'tools/dist/ledger.graphql', which no service in this repository serves"
+            ),
+            "{}",
+            notices[0]
+        );
+        // A retry that removes nothing replaces the earlier record.
+        catalogue.record("web", AttributionSummary::default());
+        assert!(catalogue.notices().is_empty());
+    }
+
+    /// Outside a git repository every schema file on disk counts, build
+    /// folders included; dependency folders and documents never do.
+    #[test]
+    fn catalogue_marks_walked_and_declared_schemas_served_and_the_rest_external() {
+        let repo = tempfile::tempdir().unwrap();
+        let write = |relative: &str, text: &str| {
+            let path = repo.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "apps/api/src/schema.graphql",
+            "type Query { orders: [String] }",
+        );
+        write(
+            "tools/dist/printed.graphql",
+            "type Query { invoices: [String] }",
+        );
+        write("tools/dist/vendor.graphql", "type Query { balance: Int }");
+        write(
+            "node_modules/pkg/schema.graphql",
+            "type Query { dependency: Int }",
+        );
+        write("apps/web/src/doc.gql", "query A { balance }");
+        write("apps/web/src/types.graphql", "type Widget { id: ID! }");
+
+        let catalogue = SchemaCatalogue::build(
+            repo.path(),
+            &[
+                ServedSchemaSources {
+                    roots: vec![repo.path().join("apps/api")],
+                    declared: vec![repo.path().join("tools/dist/printed.graphql")],
+                },
+                ServedSchemaSources {
+                    roots: vec![repo.path().join("apps/web")],
+                    declared: vec![],
+                },
+            ],
+        );
+        let mut seen: Vec<(String, SchemaOrigin)> = catalogue
+            .schemas
+            .iter()
+            .map(|s| (s.file.display().to_string(), s.origin))
+            .collect();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "apps/api/src/schema.graphql".to_string(),
+                    SchemaOrigin::Served
+                ),
+                (
+                    "tools/dist/printed.graphql".to_string(),
+                    SchemaOrigin::Served
+                ),
+                (
+                    "tools/dist/vendor.graphql".to_string(),
+                    SchemaOrigin::External
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_reads_cover_every_runtime_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("client.ts");
+        std::fs::write(
+            &file,
+            "const a = process.env.CATALOG_URL ?? 'http://localhost:4000';\n\
+             const b = process.env['LEDGER_URL'];\n\
+             const c = import.meta.env.VITE_API_URL;\n\
+             const d = import.meta.url;\n\
+             const e = Deno.env.get('LEDGER_TOKEN');\n\
+             export { a, b, c, d, e };\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            file_env_reads(&file).into_iter().collect::<Vec<_>>(),
+            vec!["CATALOG_URL", "LEDGER_TOKEN", "LEDGER_URL", "VITE_API_URL"]
+        );
+        assert!(file_env_reads(&dir.path().join("schema.graphql")).is_empty());
     }
 }

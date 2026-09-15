@@ -344,11 +344,18 @@ pub struct PackageInfo {
     /// single version (see `clean_version_spec`). Lossy by design — `^3.0.0`
     /// and a `3.0.0` pin both clean to `3.0.0`.
     pub version: String,
-    /// The dependency specifier exactly as written in package.json (`^3.0.0`,
+    /// The dependency specifier as written in package.json (`^3.0.0`,
     /// `~1.2.3`, `>=2 <3`, `workspace:*`, a git URL). The cloud uses this raw
     /// form for semver-range conflict analysis, which `version` cannot answer
     /// because the operators are already gone by then. `default` for payloads
     /// serialised before the field existed.
+    ///
+    /// The one rewrite: a pnpm `catalog:` / `catalog:<name>` specifier is
+    /// replaced by the range the nearest `pnpm-workspace.yaml` catalog states
+    /// for the package (carrick#1156). `catalog:` is an indirection, not a
+    /// range, and comparing it verbatim reports every catalog dependency as
+    /// incomparable. A catalog entry the workspace file does not define keeps
+    /// the written specifier, so it still reads as incomparable.
     #[serde(default)]
     pub spec: String,
     pub source_path: PathBuf,
@@ -368,6 +375,103 @@ pub struct Packages {
     /// payloads persisted before the field existed.
     #[serde(default)]
     pub internal_names: std::collections::HashSet<String>,
+}
+
+/// The pnpm catalogs one `pnpm-workspace.yaml` declares (carrick#1156).
+///
+/// `catalog` is the default catalog and `catalogs.<name>` the named ones;
+/// `catalogs.default` is another spelling of the first. A value is whatever
+/// range pnpm would install, so a YAML number (`1.0`) is read as its text.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PnpmCatalogs {
+    catalogs: HashMap<String, HashMap<String, String>>,
+}
+
+impl PnpmCatalogs {
+    fn parse(text: &str) -> Option<Self> {
+        let root: serde_yaml_ng::Value = serde_yaml_ng::from_str(text).ok()?;
+        let entries = |value: &serde_yaml_ng::Value| -> HashMap<String, String> {
+            value
+                .as_mapping()
+                .into_iter()
+                .flatten()
+                .filter_map(|(name, range)| {
+                    let range = match range {
+                        serde_yaml_ng::Value::String(s) => s.clone(),
+                        serde_yaml_ng::Value::Number(n) => n.to_string(),
+                        _ => return None,
+                    };
+                    Some((name.as_str()?.to_string(), range))
+                })
+                .collect()
+        };
+        let mut catalogs: HashMap<String, HashMap<String, String>> = HashMap::new();
+        if let Some(named) = root
+            .get("catalogs")
+            .and_then(serde_yaml_ng::Value::as_mapping)
+        {
+            for (name, catalog) in named {
+                if let Some(name) = name.as_str() {
+                    catalogs.insert(name.to_string(), entries(catalog));
+                }
+            }
+        }
+        if let Some(default) = root.get("catalog") {
+            catalogs
+                .entry("default".to_string())
+                .or_default()
+                .extend(entries(default));
+        }
+        Some(Self { catalogs })
+    }
+
+    /// The range `spec` names for `package`, when `spec` is a catalog
+    /// reference this file defines.
+    fn resolve(&self, package: &str, spec: &str) -> Option<String> {
+        let catalog = spec.trim().strip_prefix("catalog:")?.trim();
+        let catalog = if catalog.is_empty() {
+            "default"
+        } else {
+            catalog
+        };
+        self.catalogs.get(catalog)?.get(package).cloned()
+    }
+}
+
+/// The nearest `pnpm-workspace.yaml` above each manifest, read once per
+/// directory. pnpm finds its workspace root the same way: the closest
+/// ancestor holding the file, which in a mixed monorepo is often a
+/// subdirectory rather than the repository root.
+#[derive(Default)]
+struct PnpmCatalogLookup {
+    by_dir: HashMap<PathBuf, Option<PnpmCatalogs>>,
+}
+
+impl PnpmCatalogLookup {
+    fn resolve(&mut self, manifest: &Path, package: &str, spec: &str) -> Option<String> {
+        if !spec.trim_start().starts_with("catalog:") {
+            return None;
+        }
+        let dir = manifest.parent()?;
+        self.catalogs_for(dir)?.resolve(package, spec)
+    }
+
+    fn catalogs_for(&mut self, dir: &Path) -> Option<&PnpmCatalogs> {
+        if !self.by_dir.contains_key(dir) {
+            let found = dir.ancestors().find_map(|ancestor| {
+                let text = std::fs::read_to_string(ancestor.join("pnpm-workspace.yaml")).ok()?;
+                Some(PnpmCatalogs::parse(&text).unwrap_or_else(|| {
+                    tracing::warn!(
+                        "Ignoring unparseable {}",
+                        ancestor.join("pnpm-workspace.yaml").display()
+                    );
+                    PnpmCatalogs::default()
+                }))
+            });
+            self.by_dir.insert(dir.to_path_buf(), found);
+        }
+        self.by_dir.get(dir)?.as_ref()
+    }
 }
 
 /// Directories excluded when walking a repo tree for manifests: dependency
@@ -525,6 +629,7 @@ impl Packages {
 
     /// Resolves dependencies across all package.json files, choosing the highest version for conflicts
     pub fn resolve_dependencies(&mut self) {
+        let mut catalogs = PnpmCatalogLookup::default();
         for (idx, package_json) in self.package_jsons.iter().enumerate() {
             let source_path = &self.source_paths[idx];
 
@@ -536,7 +641,11 @@ impl Packages {
             ];
 
             for deps in all_deps {
-                for (name, version_spec) in deps {
+                for (name, written_spec) in deps {
+                    // A `catalog:` specifier names a range the workspace file
+                    // states, so the range is what gets compared (carrick#1156).
+                    let resolved = catalogs.resolve(source_path, name, written_spec);
+                    let version_spec = resolved.as_ref().unwrap_or(written_spec);
                     let clean_version = self.clean_version_spec(version_spec);
 
                     match self.merged_dependencies.get(name) {
@@ -548,7 +657,7 @@ impl Packages {
                                     PackageInfo {
                                         name: name.clone(),
                                         version: clean_version,
-                                        spec: version_spec.clone(),
+                                        spec: version_spec.to_string(),
                                         source_path: source_path.clone(),
                                     },
                                 );
@@ -560,7 +669,7 @@ impl Packages {
                                 PackageInfo {
                                     name: name.clone(),
                                     version: clean_version,
-                                    spec: version_spec.clone(),
+                                    spec: version_spec.to_string(),
                                     source_path: source_path.clone(),
                                 },
                             );
@@ -892,6 +1001,69 @@ mod tests {
             assert_eq!(info.spec, "~4.17.30", "order {paths:?}");
             assert_eq!(info.source_path, high, "order {paths:?}");
         }
+    }
+
+    /// A `catalog:` specifier is compared as the range the nearest
+    /// `pnpm-workspace.yaml` states for it (carrick#1156). The workspace file
+    /// sits in a subdirectory, not at the root, as it does in a mixed
+    /// monorepo; a reference the file does not define keeps its written form
+    /// so it still reads as incomparable rather than as a guess.
+    #[test]
+    fn catalog_specifiers_resolve_from_the_nearest_pnpm_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let clients = dir.path().join("apps/clients");
+        let member = clients.join("web/package.json");
+        std::fs::create_dir_all(member.parent().unwrap()).unwrap();
+        std::fs::write(
+            clients.join("pnpm-workspace.yaml"),
+            "packages:\n  - \"web\"\n\ncatalog:\n  react: 19.2.5\n  # a YAML number is still a range\n  tiny-lib: 1.5\n\ncatalogs:\n  legacy:\n    react-dom: ^18.3.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &member,
+            r#"{
+                "name": "web",
+                "dependencies": {
+                    "react": "catalog:",
+                    "tiny-lib": "catalog:default",
+                    "react-dom": "catalog:legacy",
+                    "left-pad": "catalog:",
+                    "right-pad": "catalog:nowhere",
+                    "plain": "^2.0.0"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let packages = Packages::new(vec![member]).unwrap();
+        let expected = [
+            ("react", "19.2.5", "19.2.5"),
+            ("tiny-lib", "1.5", "1.5"),
+            ("react-dom", "18.3.0", "^18.3.0"),
+            ("left-pad", "catalog:", "catalog:"),
+            ("right-pad", "catalog:nowhere", "catalog:nowhere"),
+            ("plain", "2.0.0", "^2.0.0"),
+        ];
+        for (name, version, spec) in expected {
+            let info = &packages.merged_dependencies[name];
+            assert_eq!(info.spec, spec, "spec for {name}");
+            assert_eq!(info.version, version, "cleaned version for {name}");
+        }
+    }
+
+    /// A manifest with no `pnpm-workspace.yaml` above it keeps `catalog:`
+    /// verbatim: there is no range to substitute.
+    #[test]
+    fn catalog_specifiers_without_a_workspace_file_stay_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        std::fs::write(
+            &manifest,
+            r#"{ "name": "solo", "dependencies": { "react": "catalog:" } }"#,
+        )
+        .unwrap();
+        let packages = Packages::new(vec![manifest]).unwrap();
+        assert_eq!(packages.merged_dependencies["react"].spec, "catalog:");
     }
 
     /// Regression anchor on the real corpus-3 fixture: the workspace member

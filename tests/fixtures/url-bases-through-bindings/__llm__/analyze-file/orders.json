@@ -1,0 +1,19 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:4",
+      "line_number": 4,
+      "target": "${config.ORDERS_API_URL}/v1/orders/${orderId}",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${config.ORDERS_API_URL}/v1/orders/${orderId}`, { method: \"GET\" })",
+      "call_expression_line": 4,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

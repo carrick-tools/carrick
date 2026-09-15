@@ -24,8 +24,8 @@ use crate::services::{
 use crate::signature_pass::populate_function_signatures;
 use crate::type_manifest::{
     append_missing_aliases, build_manifest_type_alias_with_site_id, build_site_id,
-    dts_alias_is_trivially_unknown, dts_defines_alias, is_http_method, normalize_manifest_method,
-    parse_file_location,
+    dts_alias_is_trivially_unknown, dts_defines_alias, is_http_method, is_producer_method,
+    normalize_manifest_method, parse_file_location,
 };
 use crate::url_normalizer::UrlNormalizer;
 use crate::utils::get_repository_name;
@@ -47,6 +47,7 @@ use swc_common::{
 use swc_ecma_visit::VisitWith;
 
 pub mod durability;
+pub(crate) mod served_paths;
 pub(crate) mod type_compat_v2;
 
 /// Current cache format version.
@@ -497,6 +498,23 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // question about the same tree, and rebuilding it per service was the
     // largest fixed cost in the analysis phase (carrick#767).
     let mut workspace_scan = crate::external_call_candidates::WorkspaceScan::new();
+    // Every schema file the repository holds, marked served or external, read
+    // once for the whole scan: a document in one service is attributed against
+    // the schemas every service serves (carrick#1134).
+    let graphql_schemas = crate::graphql::SchemaCatalogue::build(
+        Path::new(repo_path),
+        &services
+            .iter()
+            .map(|service| crate::graphql::ServedSchemaSources {
+                roots: service_graphql_roots(repo_path, service),
+                declared: crate::graphql::resolve_declared_schemas(
+                    Path::new(repo_path),
+                    &service.graphql_schemas,
+                )
+                .files,
+            })
+            .collect::<Vec<_>>(),
+    );
     // One intent memo for the whole scan, so a function several services hold
     // is described once (carrick#1080). The retry below reads it too.
     let run_intents = RunIntentMemo::default();
@@ -505,6 +523,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         sidecar,
         total: services.len(),
         run_intents: &run_intents,
+        graphql_schemas: &graphql_schemas,
     };
     // Where each service's previous generation is read from: the laptop's
     // hosted snapshot when the indexer handed one in, otherwise the download.
@@ -763,7 +782,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // Decided here, while every service's rows and dependency facts are still
     // in hand, and printed with the report (carrick#1099). Index for index
     // with `services`, as `current_services_data` is.
-    let graphql_notices = graphql_schema_notices(repo_path, &services, &current_services_data);
+    let mut graphql_notices = graphql_schema_notices(repo_path, &services, &current_services_data);
+    graphql_notices.hints.extend(graphql_schemas.notices());
 
     // 5. Prepare each service's upload payload, but DEFER the actual upload
     //    until after cross-repo analysis (step 6) so every payload can carry the
@@ -1269,6 +1289,7 @@ struct ServiceScan<'a> {
     sidecar: Option<&'a TypeSidecar>,
     total: usize,
     run_intents: &'a RunIntentMemo,
+    graphql_schemas: &'a crate::graphql::SchemaCatalogue,
 }
 
 /// One service's analysis in this run, and what it still owes.
@@ -1329,6 +1350,7 @@ impl ServiceScan<'_> {
             previous_data,
             workspace,
             self.run_intents,
+            self.graphql_schemas,
         )
         .await?;
 
@@ -2226,6 +2248,7 @@ fn reusable_model_answers(
 }
 
 /// Incremental analysis: reuse cached per-file LLM results for unchanged files.
+#[allow(clippy::too_many_arguments)]
 async fn analyze_current_repo_incremental(
     repo_path: &str,
     service: &Config,
@@ -2234,6 +2257,7 @@ async fn analyze_current_repo_incremental(
     previous_data: Option<&CloudRepoData>,
     workspace: &mut crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
+    graphql_schemas: &crate::graphql::SchemaCatalogue,
 ) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
     let start = Instant::now();
 
@@ -2479,9 +2503,14 @@ async fn analyze_current_repo_incremental(
             // the GraphQL consumer file set folds transport data calls out of
             // the graph (#307) so every downstream surface (cloud projection,
             // type manifest, type requests) sees the same call set.
-            let protocol_extractions =
+            let mut protocol_extractions =
                 scan_protocol_extractions(repo_path, service, &files, &merged_results);
-            fold_graphql_transport_calls(&mut mount_graph, &protocol_extractions.graphql);
+            settle_graphql_documents(
+                &mut protocol_extractions.graphql,
+                &mut mount_graph,
+                service,
+                graphql_schemas,
+            );
             crate::phase_timing::mark(crate::phase_timing::Phase::Protocols);
 
             // Collect the intents started after discovery (body_source is
@@ -2635,7 +2664,11 @@ async fn analyze_current_repo_incremental(
             // absolute tree on disk, everything after this reads the payload as
             // index data. `repo_path` is the canonicalized root the whole
             // function ran against, so the strip is exact.
-            relativize_cloud_paths(&mut cloud_data, repo_path);
+            relativize_cloud_paths(
+                &mut cloud_data,
+                repo_path,
+                &served_paths::PathScrub::for_scan(repo_path),
+            );
 
             // Same last step as the full branch: the boundary is read off the
             // finished payload once its paths are repo-relative (carrick#705).
@@ -2709,6 +2742,7 @@ async fn analyze_current_repo_incremental(
         settled,
         workspace,
         run_intents,
+        graphql_schemas,
     )
     .await?;
 
@@ -2913,6 +2947,78 @@ fn scan_protocol_extractions(
     }
 }
 
+/// Attribute a service's GraphQL documents to schema identities, fold the
+/// transport calls of every document file out of the graph, then drop the
+/// operations of documents written against a schema no service here serves or
+/// whose schema cannot be settled (carrick#1134).
+///
+/// A document against someone else's API is not a call this project can
+/// match, and indexing it as one reads as a missing operation whenever the
+/// project serves any GraphQL at all. HTTP calls to a declared external base
+/// are not call rows either; this is the GraphQL half of that rule, decided by
+/// the schema because a vendor API proxied through an internal route has an
+/// internal base URL.
+///
+/// The fold runs on the full document set, before the drop, so a vendor
+/// document's transport POST does not come back as an HTTP call.
+fn settle_graphql_documents(
+    graphql: &mut crate::graphql::GraphqlExtraction,
+    mount_graph: &mut crate::mount_graph::MountGraph,
+    service: &Config,
+    catalogue: &crate::graphql::SchemaCatalogue,
+) {
+    let attribution = catalogue.attribute(graphql, |document_file| {
+        graphql_document_transport(service, document_file)
+    });
+    fold_graphql_transport_calls(mount_graph, graphql);
+    let summary = attribution.apply(graphql);
+    let label = service.service_name.as_deref().unwrap_or("(root)");
+    if !summary.is_empty() {
+        info!(
+            "GraphQL documents in {label}: {} operation(s) written against schemas no service \
+             serves, {} unresolved; not indexed as calls",
+            summary.external.values().sum::<usize>(),
+            summary.unresolved
+        );
+    }
+    catalogue.record(label, summary);
+}
+
+/// What a GraphQL document file's environment reads say about where it sends
+/// its documents: the tie-break for [`settle_graphql_documents`], asked only
+/// when a served and an external schema both hold a document's fields.
+///
+/// The source is the file's own `process.env` / `import.meta.env` reads
+/// ([`crate::graphql::file_env_reads`]), not the transport call row: a call
+/// that names its document binding has its target rewritten to the operation
+/// key by the #361 repair and never reaches the graph as an HTTP call. Every
+/// read the service's `internalEnvVars` / `externalEnvVars` classify must
+/// agree; a file whose reads are unclassified, mixed or absent says nothing.
+/// A base read in another module (an imported config object) is therefore
+/// unknown.
+fn graphql_document_transport(
+    service: &Config,
+    document_file: &Path,
+) -> crate::graphql::TransportOrigin {
+    use crate::graphql::TransportOrigin;
+    let mut origin: Option<TransportOrigin> = None;
+    for name in crate::graphql::file_env_reads(document_file) {
+        let this = if service.internal_env_vars.contains(&name) {
+            TransportOrigin::Internal
+        } else if service.is_external_env_var(&name) {
+            TransportOrigin::External
+        } else {
+            continue;
+        };
+        match origin {
+            None => origin = Some(this),
+            Some(seen) if seen == this => {}
+            Some(_) => return TransportOrigin::Unknown,
+        }
+    }
+    origin.unwrap_or(TransportOrigin::Unknown)
+}
+
 /// #307 (class 2): drop LLM HTTP data calls that are the TRANSPORT of
 /// deterministically-extracted GraphQL consumer operations — one contract must
 /// not be indexed twice. A file whose `gql` documents produced consumer ops
@@ -3006,6 +3112,7 @@ fn append_deterministic_protocol_operations(
         // event are already identified by their own name, and nothing
         // switches on a request field to reach them.
         dispatch: None,
+        schema_binding: None,
     };
 
     let graphql = &extractions.graphql;
@@ -3021,12 +3128,12 @@ fn append_deterministic_protocol_operations(
                 .iter()
                 .map(|op| to_details(op.key.clone(), &op.file_path, op.line)),
         );
-        cloud_data.calls.extend(
-            graphql
-                .consumers
-                .iter()
-                .map(|op| to_details(op.key.clone(), &op.file_path, op.line)),
-        );
+        cloud_data
+            .calls
+            .extend(graphql.consumers.iter().map(|op| ApiEndpointDetails {
+                schema_binding: op.schema_binding,
+                ..to_details(op.key.clone(), &op.file_path, op.line)
+            }));
     }
 
     let sockets = &extractions.sockets;
@@ -3853,11 +3960,24 @@ fn relativize_path_buf(path: &mut PathBuf, repo_root: &str) {
 /// strip of the real root — never a match on `/home/runner/`, which would only
 /// cover GitHub-hosted runners.
 ///
-/// Deliberately NOT rewritten: `capture_stub.files`, the compiler-emitted
-/// declaration tree. It is re-materialized into the synthetic type-check
-/// workspace verbatim, and rewriting module specifiers inside it would change
-/// what tsc resolves. `mounts`, `apps` and `imported_handlers` carry no paths.
-fn relativize_cloud_paths(cloud_data: &mut CloudRepoData, repo_path: &str) {
+/// Printed type text is a second kind of path carrier: the compiler names an
+/// out-of-scope module by its absolute path, which can sit under the checkout
+/// root, a package store or a runtime cache in the scanning account's home
+/// directory (carrick#1160). Every such string goes through `scrub`, which
+/// turns a package path into `<name>@<version>` and strips the root and home.
+///
+/// Deliberately NOT rewritten: the declaration files in `capture_stub.files`.
+/// They are re-materialized into the synthetic type-check workspace verbatim,
+/// and rewriting module specifiers inside them would change what tsc resolves.
+/// The stub's `carrick-manifest.json` is not compiled — it is the capture's
+/// per-alias record, whose detail sentences name the modules that failed — so
+/// it is scrubbed like any other served text. `mounts`, `apps` and
+/// `imported_handlers` carry no paths.
+fn relativize_cloud_paths(
+    cloud_data: &mut CloudRepoData,
+    repo_path: &str,
+    scrub: &served_paths::PathScrub,
+) {
     let prefix = format!("{}/", repo_path.trim_end_matches('/'));
 
     // Endpoints and calls: the op's own source location, plus the source file
@@ -3911,8 +4031,11 @@ fn relativize_cloud_paths(cloud_data: &mut CloudRepoData, repo_path: &str) {
             .into_iter()
             .flatten()
             {
-                if definition.contains(&prefix) {
-                    *definition = definition.replace(&prefix, "");
+                scrub.in_place(definition);
+            }
+            for finding in &mut entry.any_provenance {
+                if let Some(detail) = finding.detail.as_mut() {
+                    scrub.in_place(detail);
                 }
             }
         }
@@ -3921,14 +4044,21 @@ fn relativize_cloud_paths(cloud_data: &mut CloudRepoData, repo_path: &str) {
     // Function definitions are already stripped on both branches (see
     // `relativize_function_definition_paths`); re-running is a no-op and keeps
     // the invariant true for any future construction path that forgets to.
-    relativize_function_definition_paths(&mut cloud_data.function_definitions, repo_path);
+    relativize_function_definition_paths(&mut cloud_data.function_definitions, repo_path, scrub);
 
     // The compiler leaks the absolute root into the bundle as
     // `import("/abs/path/x")`, the same way it does into signatures.
-    if let Some(bundled) = cloud_data.bundled_types.as_mut()
-        && bundled.contains(&prefix)
+    if let Some(bundled) = cloud_data.bundled_types.as_mut() {
+        scrub.in_place(bundled);
+    }
+
+    // The capture's per-alias record: served text, not compiled (see above).
+    if let Some(record) = cloud_data
+        .capture_stub
+        .as_mut()
+        .and_then(|stub| stub.files.get_mut(CAPTURE_MANIFEST_FILE))
     {
-        *bundled = bundled.replace(&prefix, "");
+        scrub.in_place(record);
     }
 
     // Package manifest locations. `merged_dependencies` holds its own copy of
@@ -3980,6 +4110,9 @@ fn relativize_cloud_paths(cloud_data: &mut CloudRepoData, repo_path: &str) {
     }
 }
 
+/// The capture's per-alias record inside the stub file map.
+const CAPTURE_MANIFEST_FILE: &str = "carrick-manifest.json";
+
 /// Repo-relative paths for cloud-bound function definitions. The scan runs
 /// against a canonicalized absolute repo root (in CI the runner checkout,
 /// e.g. `/home/runner/work/<dir>/<repo>`), and the extractor stamps that
@@ -3990,9 +4123,14 @@ fn relativize_cloud_paths(cloud_data: &mut CloudRepoData, repo_path: &str) {
 /// `repos/{owner}/{repo}/contents/{file_path}`). Strip the root at the
 /// cloud-projection boundary only — internal passes (sidecar type
 /// resolution, git-diff comparisons) still operate on absolute paths.
+///
+/// Every printed type on the row goes through `scrub`: the composed
+/// `signature`, and the `return_type` and parameter `type_string`s it was
+/// composed from, which are served on their own (carrick#1160).
 fn relativize_function_definition_paths(
     function_definitions: &mut HashMap<String, FunctionDefinition>,
     repo_path: &str,
+    scrub: &served_paths::PathScrub,
 ) {
     let root = std::path::Path::new(repo_path);
     let prefix = format!("{}/", repo_path.trim_end_matches('/'));
@@ -4005,10 +4143,14 @@ fn relativize_function_definition_paths(
                 call.file_path = stripped.to_string();
             }
         }
-        if let Some(sig) = &mut def.signature
-            && sig.contains(&prefix)
+        for printed in def
+            .arguments
+            .iter_mut()
+            .filter_map(|argument| argument.type_string.as_mut())
+            .chain(def.return_type.as_mut())
+            .chain(def.signature.as_mut())
         {
-            *sig = sig.replace(&prefix, "");
+            scrub.in_place(printed);
         }
     }
 }
@@ -4111,7 +4253,11 @@ fn build_cloud_data_from_mount_graph(
     function_definitions: HashMap<String, FunctionDefinition>,
 ) -> CloudRepoData {
     let mut function_definitions = function_definitions;
-    relativize_function_definition_paths(&mut function_definitions, repo_path);
+    relativize_function_definition_paths(
+        &mut function_definitions,
+        repo_path,
+        &served_paths::PathScrub::for_scan(repo_path),
+    );
     let config_json = serde_json::to_string(config).ok();
     let service_name = config_json.as_ref().and_then(|json| {
         serde_json::from_str::<serde_json::Value>(json)
@@ -4975,7 +5121,7 @@ fn apply_resolved_definitions(
 fn read_capture_records(
     stub_dir: &Path,
 ) -> HashMap<String, crate::services::type_sidecar::CaptureAliasRecord> {
-    let path = stub_dir.join("carrick-manifest.json");
+    let path = stub_dir.join(CAPTURE_MANIFEST_FILE);
     let Ok(text) = std::fs::read_to_string(&path) else {
         return HashMap::new();
     };
@@ -5037,7 +5183,7 @@ fn build_type_manifest_entries(
     // order this loop saw them in.
     for endpoint in mount_graph.get_resolved_endpoints() {
         let method = normalize_manifest_method(&endpoint.method);
-        if !is_http_method(&method) {
+        if !is_producer_method(&method) {
             continue;
         }
         // Call-site-evidence entries (#379) never anchor Producer types: they
@@ -5528,6 +5674,7 @@ async fn analyze_current_repo(
     settled: Option<SettledDetection>,
     workspace: &mut crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
+    graphql_schemas: &crate::graphql::SchemaCatalogue,
 ) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
     debug!("Running multi-agent analysis on: {}", repo_path);
 
@@ -5633,12 +5780,14 @@ async fn analyze_current_repo(
     // GraphQL consumer file set folds transport data calls out of the mount
     // graph (#307) so every downstream surface (cloud projection, type
     // manifest, type requests) sees the same call set.
-    let protocol_extractions =
+    let mut protocol_extractions =
         scan_protocol_extractions(repo_path, service, &files, &analysis_result.file_results);
     let mut analysis_result = analysis_result;
-    fold_graphql_transport_calls(
+    settle_graphql_documents(
+        &mut protocol_extractions.graphql,
         &mut analysis_result.mount_graph,
-        &protocol_extractions.graphql,
+        service,
+        graphql_schemas,
     );
     // The repo's own statement of what a body-dispatching handler serves
     // (carrick#831), applied after every pass that reads the source: a
@@ -5656,7 +5805,11 @@ async fn analyze_current_repo(
     // this from build_cloud_data_from_mount_graph; this full path constructs
     // CloudRepoData directly, so relativize here (after signatures are
     // composed — they embed the same absolute prefix).
-    relativize_function_definition_paths(&mut function_definitions, repo_path);
+    relativize_function_definition_paths(
+        &mut function_definitions,
+        repo_path,
+        &served_paths::PathScrub::for_scan(repo_path),
+    );
 
     // 5. Build CloudRepoData directly from multi-agent results (bypassing Analyzer adapter layer)
     let mut cloud_data = CloudRepoData::from_multi_agent_results(
@@ -5793,7 +5946,11 @@ async fn analyze_current_repo(
     // graph; step 7 above normalizes only the cached copy, too late for the
     // projections), so without this the same repo uploads absolute locations on
     // a full scan and relative ones on an incremental scan.
-    relativize_cloud_paths(&mut cloud_data, repo_path);
+    relativize_cloud_paths(
+        &mut cloud_data,
+        repo_path,
+        &served_paths::PathScrub::for_scan(repo_path),
+    );
 
     // 9. What this scan could not classify, stated beside what it did
     // (carrick#705). Collected last, off the finished payload and the stats of
@@ -6995,7 +7152,11 @@ mod tests {
             },
         );
 
-        relativize_function_definition_paths(&mut defs, repo_path);
+        relativize_function_definition_paths(
+            &mut defs,
+            repo_path,
+            &served_paths::PathScrub::new(repo_path, None),
+        );
 
         let handler = &defs["handler"];
         assert_eq!(handler.file_path, PathBuf::from("src/api/handler.ts"));
@@ -7016,13 +7177,14 @@ mod tests {
     /// as-scanned paths, so the same repo shipped absolute call sites on a
     /// full scan and relative ones on an incremental scan.
     ///
-    /// Walks the serialized blob for any string that still starts with the
-    /// repo root. Known limit of that walk: it catches a path that IS the
-    /// root-prefixed string, not a root EMBEDDED mid-string. The three fields
-    /// carrying printed TypeScript (`bundled_types`, `resolved_definition`,
-    /// `expanded_definition`) leak the root that way and are asserted
-    /// separately below; `capture_stub.files` can still hold one and is
-    /// deliberately left untouched by the pass (see `relativize_cloud_paths`).
+    /// Walks the serialized blob for any string that still CONTAINS the repo
+    /// root or the home directory, anywhere in it: printed TypeScript embeds
+    /// both mid-string (`import("/abs/path").Name`), and a package store or a
+    /// runtime cache under home is the account name on a served row
+    /// (carrick#1160). The one exemption is the capture stub's declaration
+    /// files, which are compiled again at check time and deliberately left
+    /// untouched by the pass (see `relativize_cloud_paths`); the test asserts
+    /// that exemption holds rather than assuming it.
     #[test]
     fn relativize_cloud_paths_leaves_no_absolute_path_in_the_payload() {
         use crate::external_call_candidates::{CallMechanism, ExternalCallCandidate};
@@ -7031,7 +7193,11 @@ mod tests {
         use crate::visitor::FunctionDefinition;
 
         let repo_path = "/home/runner/work/acme-app/acme-app";
+        let home = "/home/runner";
         let abs = |rel: &str| format!("{}/{}", repo_path, rel);
+        // A runtime's npm cache under the account's home directory.
+        let cached =
+            |pkg: &str| format!("{home}/.cache/runtime/npm/registry.npmjs.org/{pkg}/dist/types");
 
         let op = |file: &str| ApiEndpointDetails {
             view_module: false,
@@ -7061,6 +7227,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         };
 
         let mut graph = MountGraph::new();
@@ -7113,7 +7280,6 @@ mod tests {
                 name: "handler".to_string(),
                 file_path: PathBuf::from(abs("src/routes/orders.ts")),
                 node_type: Default::default(),
-                arguments: vec![],
                 body_source: None,
                 is_exported: true,
                 line_number: 18,
@@ -7121,11 +7287,28 @@ mod tests {
                 intent: None,
                 calls: vec![],
                 tokens: vec![],
-                return_type: None,
+                arguments: vec![crate::visitor::FunctionArgument {
+                    name: "c".to_string(),
+                    type_ann: None,
+                    type_string: Some(format!(
+                        "import(\"{}\").Ctx",
+                        abs("node_modules/.pnpm/@acme+kit@2.0.1_react@18.2.0/node_modules/@acme/kit/dist/index")
+                    )),
+                    is_explicit: false,
+                    is_optional: false,
+                    has_default: false,
+                    default_value: None,
+                    is_rest: false,
+                }],
+                return_type: Some(format!(
+                    "Promise<import(\"{}\").TypedResponse<any>>",
+                    cached("web-kit/4.12.12")
+                )),
                 return_is_explicit: false,
                 signature: Some(format!(
-                    "(req: import(\"{}\").Req) => void",
-                    abs("src/types")
+                    "(req: import(\"{}\").Req, c: import(\"{}\").Ctx) => void",
+                    abs("src/types"),
+                    cached("web-kit/4.12.12")
                 )),
                 intent_input_hash: None,
                 dispatch_table: None,
@@ -7169,8 +7352,9 @@ mod tests {
             dirty: None,
             mount_graph: Some(graph),
             bundled_types: Some(format!(
-                "export type Order = import(\"{}\").Order;\n",
-                abs("src/types/order")
+                "export type Order = import(\"{}\").Order;\nexport type Ctx = import(\"{}\").Context;\n",
+                abs("src/types/order"),
+                cached("web-kit/4.12.12")
             )),
             type_manifest: Some(vec![TypeManifestEntry {
                 key: OperationKey::http("GET", "/orders".to_string()),
@@ -7194,7 +7378,11 @@ mod tests {
                     "export type Endpoint_Response = import(\"{}\").Order;",
                     abs("src/types/order")
                 )),
-                expanded_definition: Some(format!("import(\"{}\").Order", abs("src/types/order"))),
+                expanded_definition: Some(format!(
+                    "{{ order: import(\"{}\").Order; ctx: import(\"{}\").Context; }}",
+                    abs("src/types/order"),
+                    cached("@acme/schema/9.6.0")
+                )),
                 primary_type_symbol: None,
                 defined_in: None,
                 any_provenance: Vec::new(),
@@ -7209,7 +7397,38 @@ mod tests {
             type_extraction_status: None,
             types_degraded: None,
             compat_verdicts: None,
-            capture_stub: None,
+            capture_stub: Some(crate::cloud_storage::CaptureStubArtifact {
+                artifact_version: 1,
+                package_name: "@carrick/acme-app".to_string(),
+                ts_version: "5.8.2".to_string(),
+                bare_checkout: false,
+                files: std::collections::BTreeMap::from([
+                    (
+                        CAPTURE_MANIFEST_FILE.to_string(),
+                        serde_json::json!({
+                            "aliases": [
+                                {
+                                    "alias": "Endpoint_Response",
+                                    "source_file": abs("@/features/types"),
+                                    "self_check_detail": format!(
+                                        "declaration emit was skipped for module '../../../../../..{}'; alias demoted",
+                                        cached("result-kit/8.2.0")
+                                    ),
+                                    "capture_failure_reason": format!(
+                                        "source file not in program: {}",
+                                        abs("packages/utils/id.ts")
+                                    ),
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ),
+                    (
+                        "types/surface.d.ts".to_string(),
+                        format!("export type Endpoint_Response = import(\"{}\").Order;\n", abs("src/types/order")),
+                    ),
+                ]),
+            }),
             external_call_candidates: Some(vec![ExternalCallCandidate {
                 file: abs("src/providers/search.ts"),
                 line: 313,
@@ -7239,7 +7458,11 @@ mod tests {
             dispatch_tables: None,
         };
 
-        relativize_cloud_paths(&mut data, repo_path);
+        relativize_cloud_paths(
+            &mut data,
+            repo_path,
+            &served_paths::PathScrub::new(repo_path, Some(home)),
+        );
 
         // Spot-check the field the CI comment actually renders, so a walk that
         // silently stopped finding strings can't pass this test.
@@ -7255,8 +7478,25 @@ mod tests {
         );
         assert_eq!(
             data.bundled_types.as_deref(),
-            Some("export type Order = import(\"src/types/order\").Order;\n"),
+            Some(
+                "export type Order = import(\"src/types/order\").Order;\nexport type Ctx = import(\"web-kit@4.12.12\").Context;\n"
+            ),
             "the compiler leaks the absolute root into the bundle as import(\"...\")"
+        );
+        // Every printed type on a function row is served on its own, not only
+        // the signature composed from them.
+        let handler = &data.function_definitions["handler"];
+        assert_eq!(
+            handler.signature.as_deref(),
+            Some("(req: import(\"src/types\").Req, c: import(\"web-kit@4.12.12\").Ctx) => void")
+        );
+        assert_eq!(
+            handler.return_type.as_deref(),
+            Some("Promise<import(\"web-kit@4.12.12\").TypedResponse<any>>")
+        );
+        assert_eq!(
+            handler.arguments[0].type_string.as_deref(),
+            Some("import(\"@acme/kit@2.0.1\").Ctx")
         );
         // Printed TypeScript carries the same leak, and `expanded_definition`
         // is what a mismatch row prints as the type label. The JSON sweep below
@@ -7269,14 +7509,40 @@ mod tests {
         );
         assert_eq!(
             entry.expanded_definition.as_deref(),
-            Some("import(\"src/types/order\").Order")
+            Some(
+                "{ order: import(\"src/types/order\").Order; ctx: import(\"@acme/schema@9.6.0\").Context; }"
+            )
+        );
+        let stub = data.capture_stub.as_ref().expect("capture stub");
+        let record: serde_json::Value =
+            serde_json::from_str(&stub.files[CAPTURE_MANIFEST_FILE]).expect("record stays JSON");
+        assert_eq!(
+            record["aliases"][0]["self_check_detail"],
+            "declaration emit was skipped for module 'result-kit@8.2.0'; alias demoted"
+        );
+        assert_eq!(
+            record["aliases"][0]["capture_failure_reason"],
+            "source file not in program: packages/utils/id.ts"
+        );
+        assert_eq!(record["aliases"][0]["source_file"], "@/features/types");
+        // The compiled tree is exempt, byte for byte.
+        assert_eq!(
+            stub.files["types/surface.d.ts"],
+            format!(
+                "export type Endpoint_Response = import(\"{}\").Order;\n",
+                abs("src/types/order")
+            )
         );
 
         // Then the exhaustive sweep over the serialized payload.
-        let json = serde_json::to_value(&data).expect("payload serializes");
+        let mut sweep = data.clone();
+        if let Some(stub) = sweep.capture_stub.as_mut() {
+            stub.files.retain(|name, _| !name.ends_with(".d.ts"));
+        }
+        let json = serde_json::to_value(&sweep).expect("payload serializes");
         let mut offenders: Vec<String> = Vec::new();
         walk_json_strings(&json, &mut |s| {
-            if s.starts_with(repo_path) {
+            if s.contains(repo_path) || s.contains(home) {
                 offenders.push(s.to_string());
             }
         });
@@ -7338,6 +7604,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         };
 
         let test_data = CloudRepoData {
@@ -7480,6 +7747,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         };
 
         let test_data = vec![CloudRepoData {
@@ -7545,6 +7813,7 @@ mod tests {
                 .into_iter()
                 .map(|path| EndpointResult {
                     handler_declaration_line: None,
+                    registration_literal: None,
                     view_module: false,
                     candidate_id: "cand_123".to_string(),
                     line_number: 10,
@@ -8004,6 +8273,7 @@ mod tests {
                     mounts: vec![],
                     endpoints: vec![EndpointResult {
                         handler_declaration_line: None,
+                        registration_literal: None,
                         view_module: false,
                         candidate_id: large_string.clone(),
                         line_number: 1,
@@ -9903,6 +10173,7 @@ mod tests {
             key: OperationKey::graphql(kind, field),
             file_path: PathBuf::from("src/schema.graphql"),
             line: 3,
+            document_line: 1,
             primary_type_symbol: anchor.map(String::from),
             payload_type_symbol: None,
             payload_type_source: None,
@@ -9912,6 +10183,7 @@ mod tests {
             response_type_source: None,
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
+            schema_binding: None,
         }
     }
 
@@ -9926,6 +10198,7 @@ mod tests {
             key: OperationKey::graphql(crate::operation::GraphqlOperationKind::Query, field),
             file_path: PathBuf::from("web-frontend/lib/graphql.ts"),
             line: 76,
+            document_line: 70,
             primary_type_symbol: None,
             payload_type_symbol: payload_symbol.map(String::from),
             payload_type_source: payload_source.map(String::from),
@@ -9935,6 +10208,7 @@ mod tests {
             response_type_source: None,
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
+            schema_binding: None,
         }
     }
 
@@ -10078,6 +10352,61 @@ mod tests {
         assert_eq!(mount_graph.data_calls.len(), 1);
     }
 
+    /// carrick#1134: a document written against a schema no service serves is
+    /// not a call, and its file's transport call is folded all the same, so
+    /// the vendor POST does not come back as an HTTP call once the document is
+    /// gone.
+    #[test]
+    fn settle_drops_external_documents_and_still_folds_their_transport() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("vendor")).unwrap();
+        std::fs::write(
+            repo.path().join("vendor/schema.graphql"),
+            "type Query { balance: Int }",
+        )
+        .unwrap();
+        let catalogue = crate::graphql::SchemaCatalogue::build(
+            repo.path(),
+            &[crate::graphql::ServedSchemaSources {
+                roots: vec![repo.path().join("src")],
+                declared: vec![],
+            }],
+        );
+        let mut mount_graph = MountGraph::new();
+        mount_graph.data_calls = vec![
+            transport_call("${LEDGER_URL}/graphql", "src/gql.ts:25"),
+            transport_call("${ORDERS_API}/orders", "src/orders.ts:12"),
+        ];
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![],
+            consumers: vec![graphql_consumer_op_at(
+                crate::operation::GraphqlOperationKind::Query,
+                "balance",
+                "src/gql.ts",
+                None,
+            )],
+        };
+
+        settle_graphql_documents(
+            &mut graphql,
+            &mut mount_graph,
+            &Config::default(),
+            &catalogue,
+        );
+
+        assert!(
+            graphql.consumers.is_empty(),
+            "the external document is not a call"
+        );
+        let targets: Vec<&str> = mount_graph
+            .data_calls
+            .iter()
+            .map(|c| c.target_url.as_str())
+            .collect();
+        assert_eq!(targets, vec!["${ORDERS_API}/orders"]);
+        assert_eq!(catalogue.notices().len(), 1);
+    }
+
     /// Variant of `graphql_consumer_op` with a caller-chosen `kind` and
     /// `file_path`, for the #268 per-file/per-kind join tests: the consumer
     /// locate merge is keyed on `(file_path, kind, field)`, so exercising
@@ -10094,6 +10423,7 @@ mod tests {
             key: OperationKey::graphql(kind, field),
             file_path: PathBuf::from(file_path),
             line: 10,
+            document_line: 9,
             primary_type_symbol: None,
             payload_type_symbol: payload_symbol.map(String::from),
             payload_type_source: None,
@@ -10103,6 +10433,7 @@ mod tests {
             response_type_source: None,
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
+            schema_binding: None,
         }
     }
 
@@ -10456,6 +10787,7 @@ mod tests {
     fn endpoint_with_handler(handler_name: &str) -> EndpointResult {
         EndpointResult {
             handler_declaration_line: None,
+            registration_literal: None,
             view_module: false,
             candidate_id: "span:1-2".to_string(),
             line_number: 7,
@@ -11329,6 +11661,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         };
         append_pubsub_operations(
             &mut cloud_data,

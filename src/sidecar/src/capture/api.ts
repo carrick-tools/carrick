@@ -143,9 +143,14 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  * honest value is `not_recorded` — never a guess.
  *
  *  - `declared`: the captured declaration states `any`/`unknown` at this
- *    position. Whatever put it there (an author annotation, or an emitter that
- *    printed an unresolved value as `any`), it is baked into the emitted text
- *    and no install re-resolves it.
+ *    position, and the producer's own program had a type there too: an author
+ *    annotation, not a failed resolution.
+ *  - `unresolved_import`: the position is `any` in the emitted text because the
+ *    producer's program could not resolve the type there — an import of a
+ *    dependency that is not installed, or of a generated module that was never
+ *    generated, on the scanned checkout (carrick#1164). The printer writes that
+ *    placeholder as `any`, so the text alone reads like `declared`; the capture
+ *    tells them apart on the source program at anchor time.
  *  - `budget_exhausted`: the subtree was too deep or wide to finish inside the
  *    capture walk's budget, so it is reported unverified rather than clean.
  *  - `no_payload_evidence`: a handler returned a call whose callee has no
@@ -161,15 +166,25 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    position while its parsed output is concrete, which is what a coercion
  *    declares (carrick#1101). The published type carries the output there, so
  *    this finding describes what a caller may send, not the printed member.
+ *  - `no_success_payload`: a route's handler sends only error or redirect
+ *    responses (by the status each send states), or no success send carries a
+ *    body a JSON contract can describe, so the route publishes no success body
+ *    rather than an error body or a redirect location (carrick#1161).
+ *  - `no_request_body`: the located request read is a validated part the
+ *    route's validator binds that is not a body (a path parameter, a query), so
+ *    the route states no request body contract there (carrick#1166).
  *  - `not_recorded`: the position carries a top type and this layer has no
  *    cause for it.
  */
 export type TypeProvenanceReason =
   | 'declared'
+  | 'unresolved_import'
   | 'budget_exhausted'
   | 'no_payload_evidence'
   | 'machinery_envelope'
   | 'coerced_input'
+  | 'no_success_payload'
+  | 'no_request_body'
   | 'not_recorded';
 
 /**

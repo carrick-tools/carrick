@@ -748,6 +748,7 @@ mod tests {
                 field: "action".to_string(),
                 value: "search-by-intent".to_string(),
             }),
+            schema_binding: None,
         });
 
         let findings = dispatch_operation_findings(&[producer, consumer]);

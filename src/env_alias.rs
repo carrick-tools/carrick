@@ -38,13 +38,15 @@
 //! map handles this with *dotted keys* (`config.catalogUrl -> CATALOG_URL`):
 //! [`EnvAliasExtractor`] records object-literal properties of local bindings,
 //! [`exported_env_aliases`] projects a module's aliases onto its export names,
-//! and [`merge_imported_env_aliases`] folds imported modules' exported aliases
+//! and [`merge_imported_bindings`] folds imported modules' exported aliases
 //! into the importing file's map under the local import names. The rewrite in
 //! [`resolve_target_env_alias`] needs no changes: the text between `${` and
 //! `}` is the lookup key whether or not it contains dots.
 //!
-//! Scope is deliberately structural and tight: only values that read
-//! `process.env` *directly* (optionally with a `??`/`||` default), either as a
+//! Scope is deliberately structural and tight: only values that read the
+//! environment *directly* (`process.env.X`, `import.meta.env.X` or
+//! `Deno.env.get("X")`, carrick#1152, optionally with a `??`/`||` default),
+//! either as a
 //! plain binding or one object-literal level deep, are tracked. Anything
 //! beyond — reassignment, string concatenation building the base URL, nested
 //! config objects (`config.api.url`), `Object.freeze(...)` wrappers, re-export
@@ -130,7 +132,11 @@ pub struct EnvSchemaDeclaration {
 pub type EnvSchemaMap = HashMap<String, EnvSchemaDeclaration>;
 
 /// Maps a module-level binding name to the absolute URL literal it was declared
-/// with (`https://api.example.com` for `const BASE = "https://api.example.com"`).
+/// with (`https://api.example.com` for `const BASE = "https://api.example.com"`),
+/// or to the root-relative path literal it was declared with (`/admin/accounts`
+/// for `const ACCOUNTS_PATH = "/admin/accounts"`, carrick#1150). A module's
+/// exported entries also reach the files that import them (carrick#1153, see
+/// [`exported_literal_bases`]).
 ///
 /// A base declared once as a plain literal and interpolated at the call
 /// (`fetch(`${BASE}/api/v1/whoami`)`) is the only base shape the scanner left
@@ -185,8 +191,8 @@ impl EnvAliasExtractor {
     }
 }
 
-/// The absolute URL literals a module declares at its TOP LEVEL, exported or
-/// not (carrick#627).
+/// The base literals (absolute URLs, carrick#627, and root-relative paths,
+/// carrick#1150) a module declares at its TOP LEVEL, exported or not.
 ///
 /// Module level, and not one statement deeper, because the map is keyed on the
 /// binding name alone and a name is only unambiguous where there is one of it.
@@ -213,7 +219,7 @@ fn module_literal_bases(module: &Module) -> LiteralBaseMap {
             let Some(init) = &decl.init else {
                 continue;
             };
-            if let Some(base) = absolute_url_literal(init) {
+            if let Some(base) = base_literal(init) {
                 bases.insert(binding.id.sym.to_string(), base);
             }
         }
@@ -233,7 +239,7 @@ impl Visit for EnvAliasExtractor {
                 continue;
             };
 
-            if let Some(env_name) = process_env_name(init) {
+            if let Some(env_name) = env_read_name(init) {
                 // `const url = process.env.X ?? "http://host:port/api/answer"`.
                 // The whole URL comes from the env var, so the binding is not
                 // a base a path is appended to and the call site interpolates
@@ -296,7 +302,7 @@ fn object_env_props(obj: &ObjectLit, known_aliases: &EnvAliasMap) -> Vec<(String
                     PropName::Str(s) => s.value.to_string(),
                     _ => continue,
                 };
-                let env_name = process_env_name(&kv.value).or_else(|| {
+                let env_name = env_read_name(&kv.value).or_else(|| {
                     // A property referencing a local alias binding.
                     match unwrap_transparent(&kv.value) {
                         Expr::Ident(ident) => known_aliases.get(ident.sym.as_ref()).cloned(),
@@ -341,12 +347,68 @@ fn unwrap_transparent(expr: &Expr) -> &Expr {
 /// recursive module resolution (documented limitation).
 pub fn exported_env_aliases(module: &Module) -> EnvAliasMap {
     let locals = EnvAliasExtractor::build(module);
-
-    // (exported name, local name) pairs for every export that could carry an
-    // env alias.
-    let mut exports: Vec<(String, String)> = Vec::new();
     let mut out = EnvAliasMap::new();
 
+    for export in module_exports(module) {
+        match export {
+            ModuleExport::Binding { exported, local } => {
+                // Plain alias exported under this name.
+                if let Some(env_name) = locals.get(&local) {
+                    out.insert(exported.clone(), env_name.clone());
+                }
+                // Config-object properties exported under this name.
+                let prefix = format!("{}.", local);
+                for (key, env_name) in &locals {
+                    if let Some(suffix) = key.strip_prefix(&prefix) {
+                        out.insert(format!("{}.{}", exported, suffix), env_name.clone());
+                    }
+                }
+            }
+            ModuleExport::DefaultObject(obj) => {
+                for (prop, env_name) in object_env_props(obj, &locals) {
+                    out.insert(format!("default.{}", prop), env_name);
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// The base literals a module makes visible to its importers, keyed by
+/// *export* name (carrick#1153): `VENDOR_BASE` for
+/// `export const VENDOR_BASE = "https://api.vendor.example"`, followed through
+/// `export { a as b }` renames and `export default BASE`, exactly as
+/// [`exported_env_aliases`] projects env aliases. Folded into an importer's
+/// [`LiteralBaseMap`] by [`merge_imported_bindings`], which is agnostic to
+/// what the values are.
+pub fn exported_literal_bases(module: &Module) -> LiteralBaseMap {
+    let locals = module_literal_bases(module);
+    let mut out = LiteralBaseMap::new();
+    for export in module_exports(module) {
+        if let ModuleExport::Binding { exported, local } = export
+            && let Some(base) = locals.get(&local)
+        {
+            out.insert(exported, base.clone());
+        }
+    }
+    out
+}
+
+/// One export a module declares that could carry a URL-shaped binding.
+enum ModuleExport<'a> {
+    /// A local binding published under `exported` (`export const x`,
+    /// `export { x as y }`, `export default x`).
+    Binding { exported: String, local: String },
+    /// `export default { … }`: an object literal with no local name.
+    DefaultObject(&'a ObjectLit),
+}
+
+/// Every export of `module` that names a local binding or a default object
+/// literal. `export { x } from "./y"` and `export * from` re-exports carry no
+/// local binding and are not followed (documented limitation).
+fn module_exports(module: &Module) -> Vec<ModuleExport<'_>> {
+    let mut exports = Vec::new();
     for item in &module.body {
         let ModuleItem::ModuleDecl(decl) = item else {
             continue;
@@ -358,7 +420,10 @@ pub fn exported_env_aliases(module: &Module) -> EnvAliasMap {
                     for d in &var_decl.decls {
                         if let Pat::Ident(binding) = &d.name {
                             let name = binding.id.sym.to_string();
-                            exports.push((name.clone(), name));
+                            exports.push(ModuleExport::Binding {
+                                exported: name.clone(),
+                                local: name,
+                            });
                         }
                     }
                 }
@@ -379,42 +444,27 @@ pub fn exported_env_aliases(module: &Module) -> EnvAliasMap {
                         Some(ModuleExportName::Str(s)) => s.value.to_string(),
                         None => orig.sym.to_string(),
                     };
-                    exports.push((exported, orig.sym.to_string()));
+                    exports.push(ModuleExport::Binding {
+                        exported,
+                        local: orig.sym.to_string(),
+                    });
                 }
             }
             // `export default config` / `export default {...}`
             ModuleDecl::ExportDefaultExpr(default_expr) => {
                 match unwrap_transparent(&default_expr.expr) {
-                    Expr::Ident(ident) => {
-                        exports.push(("default".to_string(), ident.sym.to_string()));
-                    }
-                    Expr::Object(obj) => {
-                        for (prop, env_name) in object_env_props(obj, &locals) {
-                            out.insert(format!("default.{}", prop), env_name);
-                        }
-                    }
+                    Expr::Ident(ident) => exports.push(ModuleExport::Binding {
+                        exported: "default".to_string(),
+                        local: ident.sym.to_string(),
+                    }),
+                    Expr::Object(obj) => exports.push(ModuleExport::DefaultObject(obj)),
                     _ => {}
                 }
             }
             _ => {}
         }
     }
-
-    for (exported, local) in exports {
-        // Plain alias exported under this name.
-        if let Some(env_name) = locals.get(&local) {
-            out.insert(exported.clone(), env_name.clone());
-        }
-        // Config-object properties exported under this name.
-        let prefix = format!("{}.", local);
-        for (key, env_name) in &locals {
-            if let Some(suffix) = key.strip_prefix(&prefix) {
-                out.insert(format!("{}.{}", exported, suffix), env_name.clone());
-            }
-        }
-    }
-
-    out
+    exports
 }
 
 /// Fold imported modules' exported env aliases into an importing file's alias
@@ -430,7 +480,7 @@ pub fn exported_env_aliases(module: &Module) -> EnvAliasMap {
 /// [`exported_env_aliases`] (or `None` when the specifier does not resolve to
 /// a parseable same-repo file). Locally-defined aliases always win: imports
 /// only fill vacant keys.
-pub fn merge_imported_env_aliases<F>(
+pub fn merge_imported_bindings<F>(
     aliases: &mut EnvAliasMap,
     imported_symbols: &HashMap<String, ImportedSymbol>,
     mut resolve_module: F,
@@ -475,38 +525,50 @@ pub fn merge_imported_env_aliases<F>(
     }
 }
 
-/// If `expr` reads a single `process.env` variable (optionally with a `??`/`||`
+/// If `expr` reads a single environment variable (optionally with a `??`/`||`
 /// default), return that variable's name.
 ///
-/// Handles:
-/// - `process.env.NAME`
-/// - `process.env["NAME"]`
-/// - `process.env.NAME ?? <default>` / `process.env.NAME || <default>`
+/// Handles the three ways a TypeScript runtime spells an environment read
+/// (carrick#1152):
+/// - `process.env.NAME` / `process.env["NAME"]`
+/// - `import.meta.env.NAME` / `import.meta.env["NAME"]`
+/// - `Deno.env.get("NAME")`
+///
+/// each optionally followed by `?? <default>` / `|| <default>`. The spellings
+/// are the runtimes' own APIs, not library names, and every one of them states
+/// the variable's name as a literal.
 ///
 /// Transparent wrappers (parens, `!`, `as`, `as const`, `satisfies`) are
 /// stripped via [`unwrap_transparent`] before matching, so every caller —
 /// direct-alias bindings AND config-object property values — recognizes a
 /// wrapped env read.
-pub(crate) fn process_env_name(expr: &Expr) -> Option<String> {
+pub(crate) fn env_read_name(expr: &Expr) -> Option<String> {
     match unwrap_transparent(expr) {
-        Expr::Member(member) => process_env_member_name(member),
+        Expr::Member(member) => env_member_name(member),
+        Expr::Call(call) => env_get_call_name(call),
         // `process.env.NAME ?? "default"` / `... || "default"`: the env read is
         // the left operand. The default literal is discarded — the env-var name
         // is all the classifier needs.
         Expr::Bin(bin) if matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr) => {
-            process_env_name(&bin.left)
+            env_read_name(&bin.left)
         }
         _ => None,
     }
 }
 
-/// If `member` is `process.env.NAME` or `process.env["NAME"]`, return `NAME`.
-fn process_env_member_name(member: &MemberExpr) -> Option<String> {
-    // The object must be exactly `process.env`.
+/// If `member` is `process.env.NAME` or `import.meta.env.NAME` (dotted or
+/// with a string-literal index), return `NAME`.
+fn env_member_name(member: &MemberExpr) -> Option<String> {
+    // The object must be exactly `process.env` or `import.meta.env`.
     let Expr::Member(obj) = &*member.obj else {
         return None;
     };
-    if !is_ident(&obj.obj, "process") || !is_ident_prop(&obj.prop, "env") {
+    let env_object = match &*obj.obj {
+        Expr::Ident(ident) => ident.sym.as_ref() == "process",
+        Expr::MetaProp(meta) => meta.kind == MetaPropKind::ImportMeta,
+        _ => false,
+    };
+    if !env_object || !is_ident_prop(&obj.prop, "env") {
         return None;
     }
 
@@ -518,6 +580,33 @@ fn process_env_member_name(member: &MemberExpr) -> Option<String> {
         },
         MemberProp::PrivateName(_) => None,
     }
+}
+
+/// If `call` is `Deno.env.get("NAME")` with a single string-literal argument,
+/// return `NAME`.
+fn env_get_call_name(call: &CallExpr) -> Option<String> {
+    let Callee::Expr(callee) = &call.callee else {
+        return None;
+    };
+    let Expr::Member(get) = unwrap_transparent(callee) else {
+        return None;
+    };
+    let Expr::Member(env) = &*get.obj else {
+        return None;
+    };
+    if !is_ident(&env.obj, "Deno") || !is_ident_prop(&env.prop, "env") {
+        return None;
+    }
+    if !is_ident_prop(&get.prop, "get") {
+        return None;
+    }
+    let [arg] = call.args.as_slice() else {
+        return None;
+    };
+    if arg.spread.is_some() {
+        return None;
+    }
+    string_literal(&arg.expr)
 }
 
 fn is_ident(expr: &Expr, name: &str) -> bool {
@@ -708,11 +797,12 @@ pub fn is_loopback_origin(literal: &str) -> bool {
 
 /// The value of an initializer that is an absolute URL string literal.
 ///
-/// Narrow on purpose. A scheme and a host is what makes the value unambiguously
-/// an origin, so splicing it into the base slot of a target says exactly what
-/// the source says. Any other literal (`"/api/v1"`, a flag, a name) would be
-/// spliced into the same slot on the strength of the binding's position alone,
-/// which is a guess, and an interpolated literal states no fixed origin at all.
+/// A scheme and a host is what makes the value unambiguously an origin, so
+/// splicing it into the base slot of a target says exactly what the source
+/// says. A root-relative path is the other shape that does ([`base_literal`]);
+/// a flag or a name would be spliced in on the strength of the binding's
+/// position alone, which is a guess, and an interpolated literal states no
+/// fixed value at all.
 fn absolute_url_literal(expr: &Expr) -> Option<String> {
     let literal = string_literal(expr)?;
     let after_scheme = literal
@@ -720,6 +810,23 @@ fn absolute_url_literal(expr: &Expr) -> Option<String> {
         .or_else(|| literal.strip_prefix("https://"))?;
     // A scheme with no host behind it is not an origin.
     (!after_scheme.trim().is_empty() && !after_scheme.starts_with('/')).then_some(literal)
+}
+
+/// The value of an initializer that can stand in a target's base slot: an
+/// absolute URL literal, or a root-relative path literal (carrick#1150).
+///
+/// A path literal is the whole of what the source says the prefix is.
+/// `const ACCOUNTS_PATH = "/admin/accounts"` followed by
+/// `fetch(`${ACCOUNTS_PATH}/${id}`)` requests `/admin/accounts/:id` and nothing
+/// else, so splicing the literal in states the request exactly. The rewrite
+/// only ever runs on a CALL target, so a prefix a router registers routes
+/// under never reaches it. A protocol-relative `//host` is neither shape, and a
+/// bare name (`"orders"`) or an interpolated template states no fixed prefix.
+fn base_literal(expr: &Expr) -> Option<String> {
+    absolute_url_literal(expr).or_else(|| {
+        let literal = string_literal(expr)?;
+        (literal.starts_with('/') && !literal.starts_with("//")).then_some(literal)
+    })
 }
 
 /// The value of a plain string literal, ignoring template literals: a fallback
@@ -1017,17 +1124,187 @@ mod tests {
     }
 
     #[test]
-    fn only_an_absolute_url_literal_is_read_as_a_base() {
+    fn only_an_absolute_url_or_a_root_relative_path_is_read_as_a_base() {
         let bases = build_literal_bases(
-            r#"const PREFIX = "/api/v1";
-               const NAME = "orders-service";
+            r#"const NAME = "orders-service";
                const SCHEME_ONLY = "https://";
-               const TEMPLATED = `https://${host}`;"#,
+               const TEMPLATED = `https://${host}`;
+               const PROTOCOL_RELATIVE = "//cdn.example";"#,
         );
         assert!(
             bases.is_empty(),
-            "a path, a name, a scheme with no host, and an interpolated literal \
-             all state no origin: {bases:?}"
+            "a name, a scheme with no host, an interpolated literal and a \
+             protocol-relative host all state no fixed base: {bases:?}"
+        );
+    }
+
+    /// carrick#1150: a request prefix declared once as a path literal and
+    /// interpolated at every call site states the whole route.
+    #[test]
+    fn a_path_literal_base_resolves_to_the_route_it_states() {
+        let bases = build_literal_bases(r#"const ACCOUNTS_PATH = "/admin/accounts";"#);
+        assert_eq!(
+            resolve_target_literal_base("${ACCOUNTS_PATH}/${accountId}", &bases).as_deref(),
+            Some("/admin/accounts/${accountId}")
+        );
+        assert_eq!(
+            resolve_target_literal_base("${ACCOUNTS_PATH}?page=${page}", &bases).as_deref(),
+            Some("/admin/accounts?page=${page}"),
+            "a query string straight after the prefix is kept as written"
+        );
+        assert_eq!(
+            resolve_target_literal_base("${ACCOUNTS_PATH}", &bases).as_deref(),
+            Some("/admin/accounts"),
+            "the prefix alone is the route"
+        );
+    }
+
+    fn build_exported_bases(source: &str) -> LiteralBaseMap {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = tmp_dir.path().join("input.ts");
+        std::fs::write(&file_path, source).expect("write file");
+
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, true, false, Some(cm.clone()));
+        let module = parse_file(&file_path, &cm, &handler).expect("parsed module");
+
+        exported_literal_bases(&module)
+    }
+
+    /// carrick#1153: a base literal published by its module, under the name
+    /// importers see.
+    #[test]
+    fn exported_literal_bases_follow_export_names() {
+        let bases = build_exported_bases(
+            r#"export const VENDOR_BASE = "https://api.vendor.example";
+               const INTERNAL = "https://hidden.example";
+               const RENAMED = "https://renamed.example";
+               export { RENAMED as PUBLIC_BASE };
+               const DEFAULT_BASE = "/v2";
+               export default DEFAULT_BASE;"#,
+        );
+        assert_eq!(
+            bases.get("VENDOR_BASE").map(String::as_str),
+            Some("https://api.vendor.example")
+        );
+        assert_eq!(
+            bases.get("PUBLIC_BASE").map(String::as_str),
+            Some("https://renamed.example")
+        );
+        assert_eq!(bases.get("default").map(String::as_str), Some("/v2"));
+        assert!(
+            !bases.contains_key("INTERNAL") && !bases.contains_key("RENAMED"),
+            "an unexported binding, or one exported only under another name, is not \
+             visible to an importer: {bases:?}"
+        );
+    }
+
+    #[test]
+    fn imported_literal_bases_merge_under_local_names_and_locals_win() {
+        use crate::visitor::{ImportedSymbol, SymbolKind};
+
+        let exports =
+            build_exported_bases(r#"export const VENDOR_BASE = "https://api.vendor.example";"#);
+        let mut imported = HashMap::new();
+        imported.insert(
+            "BASE".to_string(),
+            ImportedSymbol {
+                local_name: "BASE".to_string(),
+                imported_name: "VENDOR_BASE".to_string(),
+                source: "./vendor.types".to_string(),
+                kind: SymbolKind::Named,
+            },
+        );
+        imported.insert(
+            "types".to_string(),
+            ImportedSymbol {
+                local_name: "types".to_string(),
+                imported_name: "types".to_string(),
+                source: "./vendor.types".to_string(),
+                kind: SymbolKind::Namespace,
+            },
+        );
+
+        let mut bases = LiteralBaseMap::new();
+        merge_imported_bindings(&mut bases, &imported, |_| Some(exports.clone()));
+        assert_eq!(
+            resolve_target_literal_base("${BASE}/v1/charges", &bases).as_deref(),
+            Some("https://api.vendor.example/v1/charges")
+        );
+        assert_eq!(
+            resolve_target_literal_base("${types.VENDOR_BASE}/v1/charges", &bases).as_deref(),
+            Some("https://api.vendor.example/v1/charges")
+        );
+
+        let mut local = LiteralBaseMap::new();
+        local.insert("BASE".to_string(), "http://localhost:9000".to_string());
+        merge_imported_bindings(&mut local, &imported, |_| Some(exports.clone()));
+        assert_eq!(
+            local.get("BASE").map(String::as_str),
+            Some("http://localhost:9000"),
+            "a binding the file declares itself is the one its calls read"
+        );
+    }
+
+    /// carrick#1152: the env read spellings of the other runtimes alias
+    /// exactly as `process.env` does, directly and one object level deep.
+    #[test]
+    fn import_meta_env_and_deno_env_get_are_env_reads() {
+        let map = build_map(
+            r#"const ORDERS = import.meta.env.VITE_ORDERS_URL;
+               const LEDGER = Deno.env.get("LEDGER_URL") ?? "http://localhost:4100";
+               const INDEXED = import.meta.env["VITE_INDEXED_URL"];
+               const settings = {
+                 billingUrl: import.meta.env.VITE_BILLING_URL || "http://localhost:4000",
+                 searchUrl: Deno.env.get("SEARCH_URL"),
+               };"#,
+        );
+        assert_eq!(
+            map.get("ORDERS").map(String::as_str),
+            Some("VITE_ORDERS_URL")
+        );
+        assert_eq!(map.get("LEDGER").map(String::as_str), Some("LEDGER_URL"));
+        assert_eq!(
+            map.get("INDEXED").map(String::as_str),
+            Some("VITE_INDEXED_URL")
+        );
+        assert_eq!(
+            map.get("settings.billingUrl").map(String::as_str),
+            Some("VITE_BILLING_URL")
+        );
+        assert_eq!(
+            map.get("settings.searchUrl").map(String::as_str),
+            Some("SEARCH_URL")
+        );
+    }
+
+    #[test]
+    fn env_reads_that_name_no_variable_are_not_aliases() {
+        let map = build_map(
+            r#"const DYNAMIC = Deno.env.get(name);
+               const TWO = Deno.env.get("A", "B");
+               const OBJ = Deno.env.toObject();
+               const META = import.meta.url;
+               const OTHER = config.env.get("X");"#,
+        );
+        assert!(map.is_empty(), "{map:?}");
+    }
+
+    #[test]
+    fn a_default_exported_config_object_of_import_meta_reads_exports_its_env_vars() {
+        let exports = build_exports(
+            r#"export default {
+                 ORDERS_API_URL: import.meta.env.VITE_ORDERS_API_URL || "http://localhost:4000",
+                 FLAG: import.meta.env.VITE_FLAG !== "false",
+               };"#,
+        );
+        assert_eq!(
+            exports.get("default.ORDERS_API_URL").map(String::as_str),
+            Some("VITE_ORDERS_API_URL")
+        );
+        assert!(
+            !exports.contains_key("default.FLAG"),
+            "a comparison is not an env read: {exports:?}"
         );
     }
 
@@ -1494,7 +1771,7 @@ export * from "./other";"#,
         // A locally-defined alias must never be clobbered by an import.
         aliases.insert("CATALOG_BASE".to_string(), "LOCAL_WINS".to_string());
 
-        merge_imported_env_aliases(&mut aliases, &imported, |spec| {
+        merge_imported_bindings(&mut aliases, &imported, |spec| {
             assert_eq!(spec, "./config");
             Some(exports.clone())
         });

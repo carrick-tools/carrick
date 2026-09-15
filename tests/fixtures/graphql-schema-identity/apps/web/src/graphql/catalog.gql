@@ -1,0 +1,18 @@
+query Products {
+  products {
+    id
+    name
+  }
+}
+
+mutation AddProduct($name: String!) {
+  addProduct(name: $name) {
+    id
+  }
+}
+
+query RetiredListing {
+  retiredListing {
+    id
+  }
+}
