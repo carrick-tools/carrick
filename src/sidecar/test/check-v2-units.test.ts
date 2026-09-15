@@ -285,6 +285,21 @@ describe('four-bucket classifier precedence', () => {
     );
   });
 
+  it('a top-type gate outranks a void or form gate on the same side (carrick#1162)', () => {
+    const request = buildProbe(spec({ type_kind: 'request' }), PKG);
+    const line = (name: string) => [...request.gateLines].find(([, n]) => n === name)![0];
+    for (const shape of ['sent:void', 'sent:form']) {
+      const v = classifyPair({
+        plan: request,
+        probeDiags: [diag(line(shape), 2344), diag(line('sent:any'), 2344)],
+        poisonReason: noPoison,
+        scrubCtx,
+      });
+      assert.strictEqual(v.bucket, 'gate_caught_baked_any', shape);
+      assert.strictEqual(v.gate, 'consumer:any', shape);
+    }
+  });
+
   it('surface import error -> unverifiable (missing/renamed export)', () => {
     const v = classifyPair({
       plan,

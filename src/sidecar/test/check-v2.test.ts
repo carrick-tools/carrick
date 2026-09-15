@@ -67,6 +67,9 @@ const PAIRS: CheckPairSpec[] = [
   mk('undefinedconsumer', 'V_Sent', 'Ud_Exp'),
   // carrick#1162: a form-encoded body carries its fields as runtime appends.
   mk('formbody', 'Form_Expected', 'Form_Sent', { type_kind: 'request' }),
+  // An `any` side keeps its top-type reason; it is not "reads no body".
+  mk('anyconsumer', 'V_Sent', 'Any_Exp'),
+  mk('anyrequest', 'Form_Expected', 'Any_Exp', { type_kind: 'request' }),
   // The known true positive: a free `string` sent where a union is required.
   mk('unionrequest', 'Union_Expected', 'Union_Sent', { type_kind: 'request' }),
 ];
@@ -107,6 +110,7 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type Ud_Exp = undefined;',
         'export type Form_Sent = FormData;',
         'export type Union_Sent = { type: string; };',
+        'export type Any_Exp = any;',
       ].join('\n') + '\n'
     );
     stubs = [
@@ -193,6 +197,14 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
     assert.strictEqual(v.bucket, 'unverifiable');
     assert.strictEqual(v.gate, 'consumer:form');
     assert.strictEqual(v.resolved, false);
+  });
+
+  it('an any consumer keeps its top-type gate, not the void or form gate (carrick#1162)', () => {
+    for (const key of ['anyconsumer', 'anyrequest']) {
+      const v = verdicts.get(key)!;
+      assert.strictEqual(v.bucket, 'gate_caught_baked_any', key);
+      assert.strictEqual(v.gate, 'consumer:any', key);
+    }
   });
 
   it('keeps the true positive: a string sent where a union is required', () => {
