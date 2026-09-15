@@ -920,16 +920,38 @@ impl HostedInput {
     /// snapshot; nothing is guessed. A dirty generation carries no replayable
     /// answers by design, so it keeps the sentence that says so.
     pub(super) fn uploaded(&self, path: &Path, blob: &CloudRepoData) -> ServiceEnrichment {
-        // Unless the hosted index already described this exact commit. A scan
-        // at a commit the cloud holds is answered `already_current` and writes
-        // nothing, so the row that is being served is the older one — and it
-        // may be CI's, with a login and a source of its own. Stamping "by a
-        // laptop scan" over it would be a claim this run did not earn.
+        /// Did the cloud refuse this write as already current, leaving the
+        /// stored row in place (carrick#1214)?
+        ///
+        /// The commit alone does not answer it. The ingest's `isIndexCurrent`
+        /// (carrick-cloud `lambdas/check-or-upload/index_freshness.js`) keeps a
+        /// stored row only when the hash matches AND it was written by this
+        /// scanner release AND neither side is dirty; a row from an older
+        /// release, or from no release at all (a row written before the field
+        /// existed), is stale and is rewritten. A laptop caller also supersedes
+        /// a CI row at the same commit only through those same clauses, so
+        /// matching them here is what keeps `carrick status` describing the row
+        /// that is actually being served.
+        ///
+        /// Conservative in one direction on purpose: every clause the cloud
+        /// checks and this cannot see (its own view of the stored row) can only
+        /// make the write land, which is the case that stamps this run.
+        fn write_was_refused(hosted: &HostedProvenance, blob: &CloudRepoData) -> bool {
+            hosted.commit == blob.commit_hash
+                && hosted.scanner_version.as_deref() == Some(env!("CARGO_PKG_VERSION"))
+                && hosted.dirty != Some(true)
+                && blob.dirty != Some(true)
+        }
+
+        // Unless the write was refused as already current, in which case the
+        // row being served is the older one — possibly CI's, with a login and
+        // a source of its own — and stamping "by a laptop scan" over it would
+        // be a claim this run did not earn.
         let previous = self.service(path, blob);
         if previous
             .hosted
             .as_ref()
-            .is_some_and(|hosted| hosted.commit == blob.commit_hash)
+            .is_some_and(|hosted| write_was_refused(hosted, blob))
         {
             return previous;
         }
@@ -1108,6 +1130,15 @@ mod tests {
         json!({"schema":"carrick.resolve-repos/0", "workspace":{"slug":"fixture","billing_tier":"free","installed":true},
             "allowance_sentence":null,"repos":[{"full_name":"example/api","connected":true,"project_id":"p","project_slug":"fixture","services":[]}],
             "project_repos":[{"project_slug":"fixture","repos":["example/api"]}]})
+    }
+
+    /// The stored generation as the cloud holds it, stamped with the release
+    /// that wrote it — which is where `service()` reads the hosted provenance
+    /// version from.
+    fn blob_from(version: Option<&str>) -> CloudRepoData {
+        let mut stored = blob();
+        stored.scanner_version = version.map(str::to_string);
+        stored
     }
 
     fn blob() -> CloudRepoData {
@@ -1722,23 +1753,31 @@ mod tests {
         assert!(note.contains("by a laptop scan"), "{note}");
     }
 
-    /// A scan at a commit the cloud already holds is answered
-    /// `already_current` and writes nothing, so the row being served is the
-    /// older one — possibly CI's, with a login of its own. This run did not
-    /// earn the right to stamp "by a laptop scan" over it.
+    /// A scan the cloud refuses as already current writes nothing, so the row
+    /// being served is the older one — possibly CI's, with a login of its own.
+    /// This run did not earn the right to stamp "by a laptop scan" over it.
+    ///
+    /// The refusal is the ingest's, and its clauses are the commit AND the
+    /// scanner release AND neither side dirty (carrick#1214): a row from
+    /// another release at this commit is rewritten, and this run is what the
+    /// cloud is serving.
     #[test]
     fn a_scan_that_uploaded_nothing_new_keeps_the_row_that_is_served() {
         let mut metadata = resolution();
         metadata["repos"][0]["services"] = json!([{
             "service": "api", "hash": "abcdef", "updated_at": null,
-            "scanner_version": null, "source": "ci", "uploaded_by": "ci-bot", "dirty": false
+            "scanner_version": env!("CARGO_PKG_VERSION"), "source": "ci",
+            "uploaded_by": "ci-bot", "dirty": false
         }]);
         let input = HostedInput {
             snapshot: Some(Snapshot {
                 identity: "test".into(),
                 checked_at: "now".into(),
                 resolution: Resolution::parse(metadata).unwrap(),
-                projects: BTreeMap::from([("p".into(), vec![blob()])]),
+                projects: BTreeMap::from([(
+                    "p".into(),
+                    vec![blob_from(Some(env!("CARGO_PKG_VERSION")))],
+                )]),
             }),
             failure: None,
             remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
@@ -1756,6 +1795,77 @@ mod tests {
         let after = input.uploaded(Path::new("/w/api"), &moved);
         assert_eq!(
             after.hosted.as_ref().and_then(|h| h.source.as_deref()),
+            Some("laptop")
+        );
+    }
+
+    /// The same commit at a DIFFERENT scanner release is re-indexed by the
+    /// cloud, so the row being served is this run's (carrick#1214). A stored
+    /// row carrying no release at all is the same case: the ingest compares
+    /// the field and rewrites a row that does not match.
+    #[test]
+    fn a_rescan_at_a_new_release_stamps_its_own_row_at_the_same_commit() {
+        let row = |version: Option<&str>| {
+            let mut metadata = resolution();
+            metadata["repos"][0]["services"] = json!([{
+                "service": "api", "hash": "abcdef", "updated_at": "2026-09-01T00:00:00Z",
+                "scanner_version": version, "source": "ci", "uploaded_by": "ci-bot",
+                "dirty": false
+            }]);
+            HostedInput {
+                snapshot: Some(Snapshot {
+                    identity: "test".into(),
+                    checked_at: "now".into(),
+                    resolution: Resolution::parse(metadata).unwrap(),
+                    projects: BTreeMap::from([("p".into(), vec![blob_from(version)])]),
+                }),
+                failure: None,
+                remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
+                unnamed: BTreeMap::new(),
+                downloads: None,
+            }
+        };
+
+        for stored in [Some("0.0.1"), None] {
+            let answer = row(stored).uploaded(Path::new("/w/api"), &blob());
+            let hosted = answer.hosted.as_ref().expect("this run's row");
+            assert_eq!(hosted.source.as_deref(), Some("laptop"), "{stored:?}");
+            assert_eq!(
+                hosted.scanner_version.as_deref(),
+                Some(env!("CARGO_PKG_VERSION")),
+                "{stored:?}"
+            );
+        }
+    }
+
+    /// A dirty generation is never current for the cloud, whichever side holds
+    /// it, so a rescan at the same commit and release still lands.
+    #[test]
+    fn a_dirty_row_or_a_dirty_upload_is_this_runs_row() {
+        let mut metadata = resolution();
+        metadata["repos"][0]["services"] = json!([{
+            "service": "api", "hash": "abcdef", "updated_at": null,
+            "scanner_version": env!("CARGO_PKG_VERSION"), "source": "ci",
+            "uploaded_by": "ci-bot", "dirty": true
+        }]);
+        let input = HostedInput {
+            snapshot: Some(Snapshot {
+                identity: "test".into(),
+                checked_at: "now".into(),
+                resolution: Resolution::parse(metadata).unwrap(),
+                projects: BTreeMap::from([(
+                    "p".into(),
+                    vec![blob_from(Some(env!("CARGO_PKG_VERSION")))],
+                )]),
+            }),
+            failure: None,
+            remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
+            unnamed: BTreeMap::new(),
+            downloads: None,
+        };
+        let answer = input.uploaded(Path::new("/w/api"), &blob());
+        assert_eq!(
+            answer.hosted.as_ref().and_then(|h| h.source.as_deref()),
             Some("laptop")
         );
     }
