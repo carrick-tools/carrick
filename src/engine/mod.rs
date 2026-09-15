@@ -7027,6 +7027,7 @@ mod tests {
                     file_path: "/home/runner/work/acme/acme/src/lib/helper.ts".to_string(),
                     line_number: 9,
                     call_site_line: 4,
+                    call_count: 1,
                 }],
                 tokens: vec![],
                 return_type: None,
