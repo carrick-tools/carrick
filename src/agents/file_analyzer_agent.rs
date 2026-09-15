@@ -362,6 +362,23 @@ pub struct EndpointResult {
     /// model's raw answers, where this is always absent.
     #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub handler_declaration_line: Option<u32>,
+    /// The route literal the registration call itself states, when the kept
+    /// `path` extends it with a prefix the model wrote in front
+    /// (`/tasks/:taskId` for a `router.get("/:taskId")` registration)
+    /// (carrick#1145).
+    ///
+    /// Such a prefix is either baked in by the router itself (a constructor
+    /// base path, a class decorator), which the mount graph never states, or
+    /// a copy of the segment the router is MOUNTED under, which the mount
+    /// graph states again. Only the mount chain can tell the two apart, so the
+    /// join keeps the model's path and records the literal here for
+    /// `resolve_endpoint_paths` to decide.
+    ///
+    /// A fact of the candidate, never the model's, and only read in-process
+    /// by the graph build that follows the join on the same run, so it never
+    /// goes on the wire.
+    #[serde(skip)]
+    pub registration_literal: Option<String>,
 }
 
 /// Result of analyzing a single data-fetching call
@@ -1692,6 +1709,7 @@ mod tests {
     fn test_endpoint_result_serialization() {
         let endpoint = EndpointResult {
             handler_declaration_line: None,
+            registration_literal: None,
             view_module: false,
             candidate_id: "span:100-140".to_string(),
             line_number: 15,
@@ -1763,6 +1781,7 @@ mod tests {
             mounts: vec![],
             endpoints: vec![EndpointResult {
                 handler_declaration_line: None,
+                registration_literal: None,
                 view_module: false,
                 candidate_id: "span:10-50".to_string(),
                 line_number: 1,
@@ -1922,6 +1941,7 @@ mod tests {
             }],
             endpoints: vec![EndpointResult {
                 handler_declaration_line: None,
+                registration_literal: None,
                 view_module: false,
                 candidate_id: "span:80-120".to_string(),
                 line_number: 10,

@@ -7507,6 +7507,7 @@ mod tests {
                 .into_iter()
                 .map(|path| EndpointResult {
                     handler_declaration_line: None,
+                    registration_literal: None,
                     view_module: false,
                     candidate_id: "cand_123".to_string(),
                     line_number: 10,
@@ -7966,6 +7967,7 @@ mod tests {
                     mounts: vec![],
                     endpoints: vec![EndpointResult {
                         handler_declaration_line: None,
+                        registration_literal: None,
                         view_module: false,
                         candidate_id: large_string.clone(),
                         line_number: 1,
@@ -10228,6 +10230,7 @@ mod tests {
     fn endpoint_with_handler(handler_name: &str) -> EndpointResult {
         EndpointResult {
             handler_declaration_line: None,
+            registration_literal: None,
             view_module: false,
             candidate_id: "span:1-2".to_string(),
             line_number: 7,

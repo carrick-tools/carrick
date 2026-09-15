@@ -433,6 +433,20 @@ fn call_text_has_type_generic(call_text: &str, symbol: &str) -> bool {
 /// trim: the model sometimes emits the target with its source quoting intact
 /// (`"https://…/graphql"`, `` `${GQL_URL}/graphql` ``), which must not let the
 /// URL escape the prefix checks.
+/// How a model endpoint's path relates to the route literal its registration
+/// call states. See [`FileOrchestrator::inline_literal_path`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RegistrationLiteral {
+    /// The paths agree, or the registration states no plain literal.
+    Agrees,
+    /// The model's path is the literal with a prefix in front, at a segment
+    /// boundary. Carries the canonical literal.
+    ExtendsWithPrefix(String),
+    /// The model's path disagrees with the literal. Carries the canonical
+    /// literal, which replaces it.
+    Contradicts(String),
+}
+
 fn is_transport_shaped_target(target: &str) -> bool {
     let t = target.trim().trim_matches(['`', '"', '\'']);
     t.contains("${")
@@ -4754,6 +4768,7 @@ impl FileOrchestrator {
                         .into_iter()
                         .map(|method| EndpointResult {
                             handler_declaration_line: None,
+                            registration_literal: None,
                             candidate_id: format!("file-route:{}:{}", method, h.span_start),
                             line_number: h.line_number as i32,
                             owner_node: FILE_BASED_ROUTE_OWNER.to_string(),
@@ -4814,6 +4829,7 @@ impl FileOrchestrator {
                 EndpointResult {
                     view_module: false,
                     handler_declaration_line: None,
+                    registration_literal: None,
                     candidate_id: format!("route-descriptor:{}:{}", method, d.span_start),
                     line_number: d.line_number as i32,
                     owner_node: handler.clone(),
@@ -4865,6 +4881,7 @@ impl FileOrchestrator {
             .map(|route: DecoratorRoute| EndpointResult {
                 view_module: false,
                 handler_declaration_line: u32::try_from(route.declaration_line).ok(),
+                registration_literal: None,
                 candidate_id: format!("decorator-route:{}:{}", route.method, route.span_start),
                 line_number: i32::try_from(route.line_number).unwrap_or(0),
                 owner_node: route.class_name,
@@ -4955,6 +4972,7 @@ impl FileOrchestrator {
                     EndpointResult {
                         view_module: false,
                         handler_declaration_line: u32::try_from(method.declaration_line).ok(),
+                        registration_literal: None,
                         candidate_id: format!(
                             "class-controller:{}:{}",
                             method.http_method, method.span_start
@@ -5552,6 +5570,7 @@ impl FileOrchestrator {
     ) -> EndpointResult {
         EndpointResult {
             handler_declaration_line: None,
+            registration_literal: None,
             candidate_id: candidate.candidate_id.clone(),
             line_number: line,
             owner_node: candidate
@@ -5851,14 +5870,23 @@ impl FileOrchestrator {
             endpoint.call_expression_span_start = Some(candidate.span_start);
             endpoint.call_expression_span_end = Some(candidate.span_end);
             endpoint.resolution_source = Some(ResolutionSource::Model);
-            if let Some(literal) = Self::inline_literal_path(&endpoint.path, candidate) {
-                warn!(
-                    "[FileOrchestrator] Re-anchored endpoint path '{}' to registration literal '{}' ({}:{})",
-                    endpoint.path, literal, file_path, candidate.line_number
-                );
-                endpoint.path = literal;
-                endpoint.resolution_source = Some(ResolutionSource::InlineLiteral);
-                stats.model_contradictions_discarded += 1;
+            match Self::inline_literal_path(&endpoint.path, candidate) {
+                RegistrationLiteral::Agrees => {}
+                RegistrationLiteral::Contradicts(literal) => {
+                    warn!(
+                        "[FileOrchestrator] Re-anchored endpoint path '{}' to registration literal '{}' ({}:{})",
+                        endpoint.path, literal, file_path, candidate.line_number
+                    );
+                    endpoint.path = literal;
+                    endpoint.resolution_source = Some(ResolutionSource::InlineLiteral);
+                    stats.model_contradictions_discarded += 1;
+                }
+                // Whether the prefix is the router's own or a copy of the
+                // segment it is mounted under is the mount chain's question
+                // (carrick#1145): keep the path, hand the literal on.
+                RegistrationLiteral::ExtendsWithPrefix(literal) => {
+                    endpoint.registration_literal = Some(literal);
+                }
             }
             // One registration, stated twice by the model, is one row. The
             // handler branch for a route can hold several calls the scanner
@@ -6304,33 +6332,38 @@ impl FileOrchestrator {
         }
     }
 
-    /// The path the candidate's own first-argument literal states, when the
-    /// model's path disagrees with it (#332).
+    /// How the model's path for a registration relates to the literal the
+    /// candidate's own first argument states (#332, carrick#1145).
     ///
     /// For root routes the model emits whitespace junk (`"/ "`) or copies a
     /// sibling route's path (`"/:id"`); the literal at the registration the
-    /// endpoint already points at is deterministic ground truth. A path that
+    /// endpoint already points at is deterministic ground truth, so a
+    /// disagreement is [`RegistrationLiteral::Contradicts`]. A path that
     /// merely EXTENDS the literal at a segment boundary (`/api/v1/status` vs
-    /// `/status`) is kept: that is a constructor-carried prefix baked into the
-    /// path, not a mis-copy, and `join_paths`' idempotent guard depends on it
-    /// surviving. `None` means the model's path stands.
-    fn inline_literal_path(path: &str, candidate: &CandidateTarget) -> Option<String> {
-        let literal = Self::route_literal_from_snippet(candidate.path_snippet.as_deref())?;
+    /// `/status`) is not a mis-copy, and is
+    /// [`RegistrationLiteral::ExtendsWithPrefix`]: the prefix is either baked
+    /// in by the router (a constructor base path, which `join_paths`'
+    /// idempotent guard depends on surviving) or a copy of the segment the
+    /// router is mounted under, and only `resolve_endpoint_paths` can tell.
+    fn inline_literal_path(path: &str, candidate: &CandidateTarget) -> RegistrationLiteral {
+        let Some(literal) = Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
+        else {
+            return RegistrationLiteral::Agrees;
+        };
         let canonical_literal = Self::canonicalize_route_path(&literal);
         let canonical_path = Self::canonicalize_route_path(path);
         if canonical_literal == canonical_path {
-            return None;
+            return RegistrationLiteral::Agrees;
         }
-        // Baked-prefix escape hatch. A root literal never qualifies: every
-        // path trivially "ends with" `/`, and the observed mis-copies are
-        // exactly root routes.
+        // A root literal never extends: every path trivially "ends with" `/`,
+        // and the observed mis-copies are exactly root routes.
         if canonical_literal != "/"
             && let Some(rest) = canonical_path.strip_suffix(&canonical_literal)
-            && (rest.is_empty() || rest.ends_with('/') || canonical_literal.starts_with('/'))
+            && (rest.ends_with('/') || canonical_literal.starts_with('/'))
         {
-            return None;
+            return RegistrationLiteral::ExtendsWithPrefix(canonical_literal);
         }
-        Some(canonical_literal)
+        RegistrationLiteral::Contradicts(canonical_literal)
     }
 
     /// Why a reported operation failed the candidate join, phrased so the two
@@ -7623,6 +7656,13 @@ impl FileOrchestrator {
         self.infer_node_types(&mut graph);
 
         // Fourth pass: add endpoints with resolved owners
+        //
+        // `registration_literals[i]` is the route literal behind
+        // `graph.endpoints[i]` when the model's path extends it with a prefix
+        // (carrick#1145). Kept beside the graph rather than on the wire type:
+        // it is read once, by `resolve_endpoint_paths` below, and nothing
+        // between here and there adds or removes an endpoint.
+        let mut registration_literals: Vec<Option<String>> = Vec::new();
         for (file_path, result) in file_results {
             for endpoint in &result.endpoints {
                 let method = endpoint.method.trim().to_uppercase();
@@ -7691,6 +7731,7 @@ impl FileOrchestrator {
                     // fields above it, matching reads this one.
                     dispatch: endpoint.dispatch.clone(),
                 });
+                registration_literals.push(endpoint.registration_literal.clone());
             }
         }
 
@@ -7821,7 +7862,7 @@ impl FileOrchestrator {
         }
 
         // Sixth pass: resolve full paths for endpoints
-        self.resolve_endpoint_paths(&mut graph);
+        self.resolve_endpoint_paths(&mut graph, &registration_literals);
 
         // Evidence classification (#379): an "endpoint" whose exact source
         // site was ALSO extracted as a data call is a client call expression
@@ -8174,7 +8215,11 @@ impl FileOrchestrator {
     }
 
     /// Resolve full paths for endpoints by traversing the mount graph.
-    fn resolve_endpoint_paths(&self, graph: &mut MountGraph) {
+    fn resolve_endpoint_paths(
+        &self,
+        graph: &mut MountGraph,
+        registration_literals: &[Option<String>],
+    ) {
         // Build owner -> full mount path prefixes. A router's own mount
         // prefix is only the last hop: routers are routinely registered on a
         // parent that is itself registered under a prefix
@@ -8196,28 +8241,80 @@ impl FileOrchestrator {
         // Apply prefixes to endpoints, fanning an endpoint out once per
         // distinct alias prefix. Endpoints whose owner is not mounted keep
         // their path as the full path.
+        debug_assert_eq!(registration_literals.len(), graph.endpoints.len());
         let mut resolved = Vec::with_capacity(graph.endpoints.len());
-        for endpoint in graph.endpoints.drain(..) {
+        for (index, endpoint) in graph.endpoints.drain(..).enumerate() {
             match owner_prefixes.get(&endpoint.owner) {
                 Some(prefixes) => {
+                    let literal = registration_literals.get(index).and_then(Option::as_deref);
                     let mut seen_full_paths: HashSet<String> = HashSet::new();
                     for prefix in prefixes {
-                        let full_path = Self::join_paths(prefix, &endpoint.path);
+                        let path = Self::path_under_prefix(prefix, &endpoint.path, literal);
+                        let full_path = Self::join_paths(prefix, path);
                         // Distinct prefixes can still join to the same full
                         // path (the idempotent guard in `join_paths` skips a
                         // prefix the path already carries); emit each full
                         // path once.
                         if seen_full_paths.insert(full_path.clone()) {
                             let mut fanned = endpoint.clone();
+                            if path != endpoint.path {
+                                debug!(
+                                    "Endpoint {} {} at {} repeats mount prefix '{}' in front of \
+                                     its registration literal '{}'; serving {}",
+                                    endpoint.method,
+                                    endpoint.path,
+                                    endpoint.file_location,
+                                    prefix,
+                                    path,
+                                    full_path
+                                );
+                                fanned.path = path.to_string();
+                            }
                             fanned.full_path = full_path;
                             resolved.push(fanned);
                         }
                     }
                 }
+                // An unmounted owner states no prefix of its own, so whatever
+                // the model wrote in front of the literal (a class decorator,
+                // a constructor base path) is the only prefix there is.
                 None => resolved.push(endpoint),
             }
         }
         graph.endpoints = resolved;
+    }
+
+    /// The router-relative path to compose under one mount `prefix`
+    /// (carrick#1145).
+    ///
+    /// `literal` is the route literal the registration call states, present
+    /// only when the model's `path` is that literal with a prefix in front of
+    /// it (`/tasks/:taskId` for `router.get("/:taskId")`). When the composed
+    /// mount prefix already ENDS with that front part (`/v1/tasks`), the model
+    /// copied the mount segment into the route, and composing its path would
+    /// serve `/v1/tasks/tasks/:taskId`, so the literal is the path. Otherwise
+    /// the front part is the router's own (a base path no mount states) and
+    /// the model's path stands. Without a literal nothing is inferred from an
+    /// overlap: a router mounted at `/tasks` that registers `/tasks/:id`
+    /// really does serve `/tasks/tasks/:id`.
+    fn path_under_prefix<'a>(prefix: &str, path: &'a str, literal: Option<&'a str>) -> &'a str {
+        let Some(literal) = literal else {
+            return path;
+        };
+        let Some(front) = path.strip_suffix(literal) else {
+            return path;
+        };
+        let front = front.trim_matches('/');
+        if front.is_empty() {
+            return path;
+        }
+        // The mount chain is composed by `join_paths`, so it is absolute with
+        // no trailing slash; a `/`-led suffix match is a segment match.
+        if prefix.trim_end_matches('/').ends_with(&format!("/{front}")) {
+            literal
+        } else {
+            path
+        }
     }
 
     /// Reclassify endpoints whose evidence is actually a client call
@@ -9250,6 +9347,7 @@ export * from "./aFetch.js";"#,
                 }],
                 endpoints: vec![EndpointResult {
                     handler_declaration_line: None,
+                    registration_literal: None,
                     view_module: false,
                     candidate_id: "span:100-140".to_string(),
                     line_number: 5,
@@ -9304,6 +9402,7 @@ export * from "./aFetch.js";"#,
 
         let endpoint = |line_number: i32, method: &str, path: &str| EndpointResult {
             handler_declaration_line: None,
+            registration_literal: None,
             view_module: false,
             candidate_id: format!("span:{line_number}"),
             line_number,
@@ -9659,6 +9758,7 @@ export * from "./aFetch.js";"#,
             FileAnalysisResult {
                 endpoints: vec![EndpointResult {
                     handler_declaration_line: None,
+                    registration_literal: None,
                     view_module: false,
                     candidate_id: "span:100-140".to_string(),
                     line_number: 5,
@@ -9712,6 +9812,7 @@ export * from "./aFetch.js";"#,
 
         let endpoint = |path: &str| EndpointResult {
             handler_declaration_line: None,
+            registration_literal: None,
             view_module: false,
             candidate_id: "span:100-140".to_string(),
             line_number: 5,
@@ -9786,6 +9887,7 @@ export * from "./aFetch.js";"#,
             FileAnalysisResult {
                 endpoints: vec![EndpointResult {
                     handler_declaration_line: None,
+                    registration_literal: None,
                     view_module: false,
                     candidate_id: "span:1-2".to_string(),
                     line_number: 1,
@@ -10486,6 +10588,7 @@ export * from "./aFetch.js";"#,
                 mounts: vec![],
                 endpoints: vec![EndpointResult {
                     handler_declaration_line: None,
+                    registration_literal: None,
                     view_module: false,
                     candidate_id: "span:1-40".to_string(),
                     line_number: 5,
@@ -10556,6 +10659,7 @@ export * from "./aFetch.js";"#,
 
         let mk_endpoint = |line: u32, method: &str, path: &str| EndpointResult {
             handler_declaration_line: None,
+            registration_literal: None,
             view_module: false,
             candidate_id: format!("span:{line}"),
             line_number: line as i32,
@@ -10990,6 +11094,7 @@ export * from "./aFetch.js";"#,
                 mounts: vec![],
                 endpoints: vec![EndpointResult {
                     handler_declaration_line: None,
+                    registration_literal: None,
                     view_module: false,
                     candidate_id: "file-route:GET:42".to_string(),
                     line_number: 7,
@@ -11052,6 +11157,7 @@ export * from "./aFetch.js";"#,
             view_module: false,
             // `@Post(":id/rename")` on line 29, `rename(...)` on line 30.
             handler_declaration_line: Some(29),
+            registration_literal: None,
             candidate_id: "decorator-route:POST:734".to_string(),
             line_number: 30,
             owner_node: "UsersController".to_string(),
@@ -11133,6 +11239,7 @@ export * from "./aFetch.js";"#,
     ) -> EndpointResult {
         EndpointResult {
             handler_declaration_line: None,
+            registration_literal: None,
             view_module: false,
             candidate_id: "span:100-200".to_string(),
             line_number: 12,
@@ -11325,6 +11432,7 @@ export * from "./aFetch.js";"#,
             endpoints: vec![
                 EndpointResult {
                     handler_declaration_line: None,
+                    registration_literal: None,
                     view_module: false,
                     candidate_id: "span:590-650".to_string(),
                     line_number: 10,
@@ -11347,6 +11455,7 @@ export * from "./aFetch.js";"#,
                 },
                 EndpointResult {
                     handler_declaration_line: None,
+                    registration_literal: None,
                     view_module: false,
                     candidate_id: "span:700-740".to_string(),
                     line_number: 12,
@@ -11451,6 +11560,7 @@ export * from "./aFetch.js";"#,
             mounts: vec![],
             endpoints: vec![EndpointResult {
                 handler_declaration_line: None,
+                registration_literal: None,
                 view_module: false,
                 candidate_id: "span:1-2".to_string(),
                 line_number: 10,
@@ -11809,6 +11919,7 @@ export * from "./aFetch.js";"#,
             mounts: vec![],
             endpoints: vec![EndpointResult {
                 handler_declaration_line: None,
+                registration_literal: None,
                 view_module: false,
                 candidate_id: "span:1-2".to_string(),
                 line_number: 10,
@@ -11924,6 +12035,7 @@ export * from "./aFetch.js";"#,
                 endpoints: vec![
                     EndpointResult {
                         handler_declaration_line: None,
+                        registration_literal: None,
                         view_module: false,
                         candidate_id: "span:710-740".to_string(),
                         line_number: 5,
@@ -11946,6 +12058,7 @@ export * from "./aFetch.js";"#,
                     },
                     EndpointResult {
                         handler_declaration_line: None,
+                        registration_literal: None,
                         view_module: false,
                         candidate_id: "span:750-780".to_string(),
                         line_number: 10,
@@ -12172,6 +12285,7 @@ export default [
     fn plugin_endpoint(method: &str, path: &str) -> EndpointResult {
         EndpointResult {
             handler_declaration_line: None,
+            registration_literal: None,
             view_module: false,
             candidate_id: format!("span:{method}:{path}"),
             line_number: 4,
@@ -13118,6 +13232,7 @@ export { routes };
     fn synthetic_endpoint(method: &str, path: &str) -> EndpointResult {
         EndpointResult {
             handler_declaration_line: None,
+            registration_literal: None,
             view_module: false,
             candidate_id: format!("file-route:{}:0", method),
             line_number: 1,
@@ -13626,6 +13741,7 @@ export { routes };
 
         let route = |candidate_id: &str, path: &str| EndpointResult {
             handler_declaration_line: None,
+            registration_literal: None,
             view_module: false,
             candidate_id: candidate_id.to_string(),
             line_number: 41,
@@ -13688,6 +13804,7 @@ export { routes };
 
         let route = |owner: &str, candidate_id: &str| EndpointResult {
             handler_declaration_line: None,
+            registration_literal: None,
             view_module: false,
             candidate_id: candidate_id.to_string(),
             line_number: 12,
@@ -13740,6 +13857,7 @@ export { routes };
 
         let case = |value: &str| EndpointResult {
             handler_declaration_line: None,
+            registration_literal: None,
             view_module: false,
             candidate_id: "handler".to_string(),
             line_number: 12,
@@ -13864,6 +13982,121 @@ export { routes };
         );
         let (result, _) = emit_and_join(result, &candidate_map, "src/app.ts");
         assert_eq!(result.endpoints[0].path, "/api/v1/status");
+        // The literal is handed on, for the mount chain to judge the prefix
+        // against (carrick#1145).
+        assert_eq!(
+            result.endpoints[0].registration_literal.as_deref(),
+            Some("/status")
+        );
+    }
+
+    /// Join a router file's model rows against their registration literals,
+    /// then build the graph under `mounts`, the way `analyze_files` does.
+    /// Each row is (model path, registration literal snippet).
+    fn full_paths_under_mounts(mounts: Vec<MountResult>, rows: &[(&str, &str)]) -> Vec<String> {
+        let mut model = FileAnalysisResult::default();
+        let mut candidate_map = HashMap::new();
+        for (index, (path, snippet)) in rows.iter().enumerate() {
+            let id = format!("c{index}");
+            let mut endpoint = endpoint_with_candidate(path, &id);
+            endpoint.owner_node = "itemsRouter".to_string();
+            model.endpoints.push(endpoint);
+            candidate_map.insert(id.clone(), candidate_with_snippet(&id, Some(snippet)));
+        }
+        let (mut result, _) = emit_and_join(model, &candidate_map, "src/items.router.ts");
+        FileOrchestrator::canonicalize_endpoint_paths(&mut result);
+        result.mounts = mounts;
+
+        let mut file_results = HashMap::new();
+        file_results.insert("src/items.router.ts".to_string(), result);
+        let graph = FileOrchestrator::new(AgentService::new()).build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        let mut paths: Vec<String> = graph
+            .endpoints
+            .iter()
+            .map(|e| e.full_path.clone())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    fn same_file_mount(parent: &str, child: &str, prefix: &str) -> MountResult {
+        MountResult {
+            line_number: 3,
+            parent_node: parent.to_string(),
+            child_node: child.to_string(),
+            mount_path: prefix.to_string(),
+            import_source: None,
+            pattern_matched: ".route(".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_mount_segment_copied_into_the_route_is_served_once() {
+        // carrick#1145: a router mounted at `/items` under a router mounted at
+        // `/v1`. The model wrote the mount segment into every route
+        // (`/items/:itemId` for `router.get("/:itemId")`), and composing that
+        // under `/v1/items` served `/v1/items/items/:itemId`.
+        let paths = full_paths_under_mounts(
+            vec![
+                same_file_mount("app", "v1Router", "/v1"),
+                same_file_mount("v1Router", "itemsRouter", "/items"),
+            ],
+            &[
+                ("/items/:itemId", "'/:itemId'"),
+                ("/items/:itemId/files/:fileId", "'/:itemId/files/:fileId'"),
+                ("/items/members", "\"/members\""),
+                ("/items/", "'/'"),
+            ],
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "/v1/items",
+                "/v1/items/:itemId",
+                "/v1/items/:itemId/files/:fileId",
+                "/v1/items/members",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_prefix_the_mount_chain_does_not_state_is_kept() {
+        // A router with its own base path (`/api`), mounted at `/svc`: the
+        // model's `/api/status` over the literal `/status` carries a prefix no
+        // mount states, so it is composed as written.
+        let paths = full_paths_under_mounts(
+            vec![same_file_mount("app", "itemsRouter", "/svc")],
+            &[("/api/status", "'/status'")],
+        );
+        assert_eq!(paths, vec!["/svc/api/status"]);
+    }
+
+    #[test]
+    fn an_unmounted_router_keeps_the_prefix_in_front_of_its_literal() {
+        // No mount states a prefix for a class with a decorator prefix, so
+        // the model's path is the only statement of it.
+        let paths = full_paths_under_mounts(Vec::new(), &[("/items/:itemId", "'/:itemId'")]);
+        assert_eq!(paths, vec!["/items/:itemId"]);
+    }
+
+    #[test]
+    fn each_alias_prefix_judges_the_copied_segment_on_its_own() {
+        // One router under two mounts (#373): the model's `/items` in front of
+        // the literal repeats the first mount's last segment and not the
+        // second's, so only the first drops it.
+        let paths = full_paths_under_mounts(
+            vec![
+                same_file_mount("app", "itemsRouter", "/v1/items"),
+                same_file_mount("app", "itemsRouter", "/legacy"),
+            ],
+            &[("/items/:itemId", "'/:itemId'")],
+        );
+        assert_eq!(paths, vec!["/legacy/items/:itemId", "/v1/items/:itemId"]);
     }
 
     #[test]
