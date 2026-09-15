@@ -521,8 +521,9 @@ pub enum SchemaBinding {
 /// Whether a schema file is one a service in this scan serves (carrick#1134).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaOrigin {
-    /// A service's own SDL walk reads the file, or a service names it in
-    /// `graphqlSchemas`.
+    /// A service names the file in `graphqlSchemas`, or its own SDL walk reads
+    /// the file and the service shows it serves a schema
+    /// ([`SchemaCatalogue::settle_walked_schemas`], carrick#1189).
     Served,
     /// The repository tracks the file but no service serves it: a copy of a
     /// schema someone else serves, kept so documents can be checked against
@@ -569,9 +570,29 @@ pub struct ServedSchemaSources {
 ///
 /// Built once per scan. The tally records what each service's attribution
 /// removed, for the report.
+///
+/// A file a service's SDL walk finds, and no service declares, is served only
+/// when that service shows it serves a schema (carrick#1189). A client app
+/// often commits a copy of a third-party API's schema in its own tree for
+/// codegen, and location alone would make it that API's server. The evidence
+/// is known only once the service's rows are built, so each walked file is
+/// served until [`Self::settle_walked_schemas`] has heard from a service that
+/// walks it.
 #[derive(Debug, Default)]
 pub struct SchemaCatalogue {
     schemas: Vec<KnownSchema>,
+    repo_root: PathBuf,
+    /// `repo_root` canonicalized: each service is scanned under this form, so
+    /// its rows' paths start with it when the given root is relative or runs
+    /// through a symlink.
+    canonical_root: PathBuf,
+    /// Repository-relative files some service names in `graphqlSchemas`.
+    declared: BTreeSet<PathBuf>,
+    /// Walked, undeclared file -> whether a service that walks it serves a
+    /// schema. Absent until such a service is settled.
+    walked_verdicts: std::sync::Mutex<BTreeMap<PathBuf, bool>>,
+    /// Service -> what its walk read that it does not serve, for the report.
+    unserved: std::sync::Mutex<BTreeMap<String, BTreeMap<PathBuf, usize>>>,
     tally: std::sync::Mutex<BTreeMap<String, AttributionSummary>>,
 }
 
@@ -707,14 +728,16 @@ impl SchemaCatalogue {
     /// or external. `services` are this scan's services.
     pub fn build(repo_root: &Path, services: &[ServedSchemaSources]) -> Self {
         let mut served: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut declared: BTreeSet<PathBuf> = BTreeSet::new();
         for service in services {
-            for path in graphql_files_under(&service.roots)
-                .iter()
-                .chain(&service.declared)
-            {
-                served.insert(repo_relative(repo_root, path));
+            for path in graphql_files_under(&service.roots) {
+                served.insert(repo_relative(repo_root, &path));
+            }
+            for path in &service.declared {
+                declared.insert(repo_relative(repo_root, path));
             }
         }
+        served.extend(declared.iter().cloned());
         let tracked: BTreeSet<PathBuf> = match crate::git_state::tracked_paths(
             repo_root,
             &["*.graphql", "*.gql"],
@@ -771,8 +794,90 @@ impl SchemaCatalogue {
         );
         Self {
             schemas,
+            repo_root: repo_root.to_path_buf(),
+            canonical_root: repo_root
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf()),
+            declared,
+            walked_verdicts: Default::default(),
+            unserved: Default::default(),
             tally: Default::default(),
         }
+    }
+
+    /// Decide whether the schema files `service`'s own walk read are schemas it
+    /// serves, and drop its producers from the ones it does not (carrick#1189).
+    ///
+    /// `serves_schema` is the service's evidence: it names a schema in
+    /// `graphqlSchemas`, serves HTTP routes, or has a resolver or backing type
+    /// joined to one of its fields. Without it, every producer the walk read is
+    /// removed, and each file it came from counts as external for every
+    /// service settled after this one, unless another service that walks the
+    /// same file serves a schema. A file some service declares keeps its
+    /// origin. Returns how many producers were removed.
+    pub fn settle_walked_schemas(
+        &self,
+        service: &str,
+        extraction: &mut GraphqlExtraction,
+        serves_schema: bool,
+    ) -> usize {
+        let files: BTreeSet<PathBuf> = extraction
+            .producers
+            .iter()
+            .map(|op| self.scanned_relative(&op.file_path))
+            .filter(|file| !self.declared.contains(file))
+            .collect();
+        {
+            let mut verdicts = self
+                .walked_verdicts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for file in &files {
+                let verdict = verdicts.entry(file.clone()).or_insert(serves_schema);
+                *verdict |= serves_schema;
+            }
+        }
+        let mut removed: BTreeMap<PathBuf, usize> = BTreeMap::new();
+        if !serves_schema {
+            extraction.producers.retain(|op| {
+                let file = self.scanned_relative(&op.file_path);
+                if self.declared.contains(&file) {
+                    return true;
+                }
+                *removed.entry(file).or_default() += 1;
+                false
+            });
+        }
+        let count = removed.values().sum();
+        let mut unserved = self.unserved.lock().unwrap_or_else(|e| e.into_inner());
+        if removed.is_empty() {
+            unserved.remove(service);
+        } else {
+            unserved.insert(service.to_string(), removed);
+        }
+        count
+    }
+
+    /// Repository-relative form of a path from a service's scan, which runs
+    /// under the canonical root rather than the root the catalogue was given.
+    fn scanned_relative(&self, path: &Path) -> PathBuf {
+        if path.starts_with(&self.canonical_root) {
+            repo_relative(&self.canonical_root, path)
+        } else {
+            repo_relative(&self.repo_root, path)
+        }
+    }
+
+    /// Whether `schema` is served, with the walked files' verdicts applied.
+    fn is_served(&self, schema: &KnownSchema) -> bool {
+        if schema.origin != SchemaOrigin::Served || self.declared.contains(&schema.file) {
+            return schema.origin == SchemaOrigin::Served;
+        }
+        let verdicts = self
+            .walked_verdicts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        verdicts.get(&schema.file).copied().unwrap_or(true)
     }
 
     /// Attribute each of `extraction`'s documents to a schema identity.
@@ -828,11 +933,11 @@ impl SchemaCatalogue {
                     || self
                         .schemas
                         .iter()
-                        .any(|s| s.origin == SchemaOrigin::Served && covers(&s.root_keys));
+                        .any(|s| self.is_served(s) && covers(&s.root_keys));
                 let external: Vec<PathBuf> = self
                     .schemas
                     .iter()
-                    .filter(|s| s.origin == SchemaOrigin::External && covers(&s.root_keys))
+                    .filter(|s| !self.is_served(s) && covers(&s.root_keys))
                     .map(|s| s.file.clone())
                     .collect::<BTreeSet<_>>()
                     .into_iter()
@@ -867,8 +972,22 @@ impl SchemaCatalogue {
     /// The report lines for every service whose attribution removed an
     /// operation, in service order.
     pub fn notices(&self) -> Vec<String> {
-        let tally = self.tally.lock().unwrap_or_else(|e| e.into_inner());
         let mut lines = Vec::new();
+        let unserved = self.unserved.lock().unwrap_or_else(|e| e.into_inner());
+        for (service, files) in unserved.iter() {
+            for (file, count) in files {
+                lines.push(format!(
+                    "Service '{service}': {count} GraphQL schema field(s) in '{}' are not \
+                     indexed as operations it serves. The file sits in its directory, but the \
+                     service serves no HTTP route and no resolver was found for its fields, so \
+                     it is read as another API's schema. If this service serves it, name the \
+                     file in its `graphqlSchemas`.",
+                    file.display()
+                ));
+            }
+        }
+        drop(unserved);
+        let tally = self.tally.lock().unwrap_or_else(|e| e.into_inner());
         for (service, summary) in tally.iter() {
             for (files, count) in &summary.external {
                 let files = files
@@ -2435,6 +2554,151 @@ export const typeDefs = gql`
         assert!(warned.hints.is_empty());
     }
 
+    /// carrick#1189: a schema a service's walk finds is served only when that
+    /// service shows it serves a schema. Without the evidence its producers go
+    /// and the file is another API's schema for every service settled after.
+    #[test]
+    fn a_walked_schema_is_served_only_by_a_service_with_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        write(
+            "api/src/schema.graphql",
+            "type Query { accounts: [String] }",
+        );
+        write(
+            "web/src/vendor/ledger.graphql",
+            "type Query { balance: Int statements: [String] }",
+        );
+        let wallet = write("web/src/wallet.gql", "query Wallet { balance }");
+        let audit = write("ops/src/audit.gql", "query Audit { statements }");
+        let roots = |dir: &str| vec![root.join(dir)];
+        let catalogue = SchemaCatalogue::build(
+            root,
+            &[
+                ServedSchemaSources {
+                    roots: roots("api"),
+                    declared: vec![],
+                },
+                ServedSchemaSources {
+                    roots: roots("web"),
+                    declared: vec![],
+                },
+                ServedSchemaSources {
+                    roots: roots("ops"),
+                    declared: vec![],
+                },
+            ],
+        );
+
+        // The server: its routes are its evidence, and its fields stay.
+        let mut api = scan_repo(&roots("api"), &[], &[]);
+        assert_eq!(catalogue.settle_walked_schemas("api", &mut api, true), 0);
+        assert_eq!(api.producers.len(), 1);
+
+        // The client with a vendor copy in its tree: no evidence.
+        let mut web = scan_repo(&roots("web"), &[], &[]);
+        assert_eq!(web.producers.len(), 2);
+        assert_eq!(catalogue.settle_walked_schemas("web", &mut web, false), 2);
+        assert!(web.producers.is_empty(), "the client serves none of it");
+        let vendor = vec![PathBuf::from("web/src/vendor/ledger.graphql")];
+        let attribution = catalogue.attribute(&web, |_| TransportOrigin::Unknown);
+        assert_eq!(
+            identity_of(&attribution, &web, &wallet.to_string_lossy()),
+            &DocumentIdentity::External(vendor.clone())
+        );
+
+        // A service settled afterwards reads the copy as external too.
+        let ops = scan_repo(&roots("ops"), &[], &[]);
+        let attribution = catalogue.attribute(&ops, |_| TransportOrigin::Unknown);
+        assert_eq!(
+            identity_of(&attribution, &ops, &audit.to_string_lossy()),
+            &DocumentIdentity::External(vendor)
+        );
+
+        assert_eq!(
+            catalogue.notices(),
+            vec![
+                "Service 'web': 2 GraphQL schema field(s) in 'web/src/vendor/ledger.graphql' are \
+                 not indexed as operations it serves. The file sits in its directory, but the \
+                 service serves no HTTP route and no resolver was found for its fields, so it is \
+                 read as another API's schema. If this service serves it, name the file in its \
+                 `graphqlSchemas`."
+                    .to_string()
+            ]
+        );
+    }
+
+    /// A second service that walks the same file and serves a schema keeps it
+    /// served, whichever of the two is settled first.
+    #[test]
+    fn a_walked_schema_stays_served_when_any_service_that_walks_it_serves_a_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        std::fs::write(
+            root.join("shared/schema.graphql"),
+            "type Query { accounts: [String] }",
+        )
+        .unwrap();
+        let sources = ServedSchemaSources {
+            roots: vec![root.join("shared")],
+            declared: vec![],
+        };
+        let catalogue = SchemaCatalogue::build(root, &[sources.clone(), sources]);
+
+        let mut first = scan_repo(&[root.join("shared")], &[], &[]);
+        catalogue.settle_walked_schemas("tooling", &mut first, false);
+        let mut second = scan_repo(&[root.join("shared")], &[], &[]);
+        catalogue.settle_walked_schemas("api", &mut second, true);
+
+        assert!(first.producers.is_empty());
+        assert_eq!(second.producers.len(), 1);
+        let schema = &catalogue.schemas[0];
+        assert!(catalogue.is_served(schema));
+    }
+
+    /// The engine builds the catalogue from the repository path as given, and
+    /// scans each service under its canonical form. A checkout reached
+    /// through a symlink (or given as `.`) must still settle its walked files.
+    #[cfg(unix)]
+    #[test]
+    fn a_walked_schema_settles_when_the_scan_root_is_the_canonical_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("checkout");
+        std::fs::create_dir_all(real.join("web/src/vendor")).unwrap();
+        std::fs::write(
+            real.join("web/src/vendor/ledger.graphql"),
+            "type Query { balance: Int }",
+        )
+        .unwrap();
+        std::fs::write(real.join("web/src/wallet.gql"), "query Wallet { balance }").unwrap();
+        let link = tmp.path().join("linked");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let catalogue = SchemaCatalogue::build(
+            &link,
+            &[ServedSchemaSources {
+                roots: vec![link.join("web")],
+                declared: vec![],
+            }],
+        );
+
+        let canonical = real.canonicalize().unwrap();
+        let mut web = scan_repo(&[canonical.join("web")], &[], &[]);
+        assert_eq!(catalogue.settle_walked_schemas("web", &mut web, false), 1);
+        let attribution = catalogue.attribute(&web, |_| TransportOrigin::Unknown);
+        let wallet = canonical.join("web/src/wallet.gql");
+        assert_eq!(
+            identity_of(&attribution, &web, &wallet.to_string_lossy()),
+            &DocumentIdentity::External(vec![PathBuf::from("web/src/vendor/ledger.graphql")])
+        );
+    }
+
     fn known(file: &str, origin: SchemaOrigin, sdl: &str) -> KnownSchema {
         KnownSchema {
             file: PathBuf::from(file),
@@ -2464,7 +2728,7 @@ export const typeDefs = gql`
                     "type Query { balance: Int statements: [String] viewer: String }",
                 ),
             ],
-            tally: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -2570,7 +2834,7 @@ export const typeDefs = gql`
                 SchemaOrigin::Served,
                 "type Query { products: [String] }",
             )],
-            tally: Default::default(),
+            ..Default::default()
         };
         for catalogue in [served_only, two_schema_catalogue()] {
             let mut extraction = documents(&[("retired.gql", "query A { retiredListing }")]);

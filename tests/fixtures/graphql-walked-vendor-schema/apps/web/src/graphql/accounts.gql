@@ -1,0 +1,5 @@
+query WalletAccounts {
+  accounts {
+    id
+  }
+}

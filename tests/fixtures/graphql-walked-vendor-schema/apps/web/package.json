@@ -1,0 +1,8 @@
+{
+  "name": "wallet-web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "graphql": "^16.9.0"
+  }
+}

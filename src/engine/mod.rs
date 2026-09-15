@@ -2995,11 +2995,33 @@ fn settle_graphql_documents(
 ) {
     fold_graphql_transport_calls(mount_graph, graphql);
     document_sites.apply(graphql);
+    let label = service.service_name.as_deref().unwrap_or("(root)");
+    // A schema the service's walk found is one it serves only with evidence
+    // that it serves a schema at all (carrick#1189): it declares one, it serves
+    // HTTP routes, or the model joined a resolver or backing type to a field.
+    // A client app with a vendor schema copied into its tree has none of
+    // these. Any HTTP route is broader than a GraphQL server (a backend-for-
+    // frontend with a vendor copy has one), but it keeps an SDL-first server's
+    // own fields when its resolver join was dropped; carrick#1213 replaces it
+    // with a detected GraphQL-server signal.
+    let serves_schema = !service.graphql_schemas.is_empty()
+        || !mount_graph.endpoints.is_empty()
+        || graphql
+            .producers
+            .iter()
+            .any(|producer| producer.resolver_file.is_some());
+    let unserved = catalogue.settle_walked_schemas(label, graphql, serves_schema);
+    if unserved > 0 {
+        info!(
+            "GraphQL schema fields in {label}: {unserved} walked from its directory are not \
+             served by it (no graphqlSchemas, no HTTP route, no resolver); read as another \
+             API's schema"
+        );
+    }
     let attribution = catalogue.attribute(graphql, |document_file| {
         graphql_document_transport(service, document_file)
     });
     let summary = attribution.apply(graphql);
-    let label = service.service_name.as_deref().unwrap_or("(root)");
     if !summary.is_empty() {
         info!(
             "GraphQL documents in {label}: {} operation(s) written against schemas no service \

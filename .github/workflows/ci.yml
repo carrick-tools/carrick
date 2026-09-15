@@ -72,6 +72,7 @@ jobs:
           --test graphql_extraction_test
           --test graphql_schema_identity_test
           --test graphql_schemas_setting_test
+          --test graphql_walked_schema_evidence_test
           --test incremental_raw_cache_test
           --test intent_incremental_test
           --test jsx_component_callers_test
