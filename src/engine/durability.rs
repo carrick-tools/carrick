@@ -24,11 +24,15 @@
 //! 3. What is still owed after that is PENDING. A pending service that already
 //!    has an index is held back, so a thinner index cannot replace it (#461);
 //!    every other service lands.
-//! 4. A laptop run with pending work does not close its scan with the last
-//!    write (`scan_final`), because the cloud stamps a repo's first index
-//!    complete on that write and would meter the re-run under the monthly pool
-//!    (carrick-cloud#892). It closes it with `scan-failed`, which releases the
-//!    slot and stamps nothing.
+//! 4. A laptop run with pending work still closes its scan with the last write
+//!    (`scan_final`), and that write names the pending services
+//!    (`pending_services`), so the cloud releases the slot, writes the receipt
+//!    and the last-scan row, and leaves the repo's first index open for the
+//!    re-run (carrick-cloud#892). A cloud that did not answer
+//!    `accepts_pending_services` at `start-scan` would stamp the first index
+//!    complete on that write whatever it said, so against such a cloud, or when
+//!    no write is left to carry the list, no write is marked final and the run
+//!    closes with `scan-failed`, which releases the slot and stamps nothing.
 //!
 //! Why the uploads are not moved to "as soon as each service is done": the
 //! payloads carry the compat verdicts, SDK edges and boundary the cross-repo

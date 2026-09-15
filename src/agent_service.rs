@@ -1123,6 +1123,8 @@ struct MockFailure {
     task_path: String,
     body_contains: String,
     remaining: usize,
+    /// `model_error` (transient) or `llm_disabled` (a budget refusal).
+    code: &'static str,
 }
 
 fn mock_failures() -> &'static Mutex<Vec<MockFailure>> {
@@ -1144,6 +1146,20 @@ pub fn inject_mock_failure(task_path: &str, body_contains: &str, times: usize) {
         task_path: task_path.to_string(),
         body_contains: body_contains.to_string(),
         remaining: times,
+        code: "model_error",
+    });
+}
+
+/// The same, answered the way a spent allowance answers: `llm_disabled`,
+/// `retriable: false`. For the tests that pin what a refused service does to
+/// the scan (carrick-cloud#892).
+#[allow(dead_code)] // Called by tests/ through the library, never by the binary.
+pub fn inject_mock_budget_refusal(task_path: &str, body_contains: &str, times: usize) {
+    mock_failures().lock().unwrap().push(MockFailure {
+        task_path: task_path.to_string(),
+        body_contains: body_contains.to_string(),
+        remaining: times,
+        code: LLM_DISABLED_CODE,
     });
 }
 
@@ -1157,6 +1173,12 @@ fn take_mock_failure<B: Serialize + ?Sized>(task_path: &str, body: &B) -> Option
         f.remaining > 0 && f.task_path == task_path && serialized.contains(&f.body_contains)
     })?;
     failure.remaining -= 1;
+    if failure.code == LLM_DISABLED_CODE {
+        return Some(AgentCallError::permanent(
+            LLM_DISABLED_CODE,
+            "The allowance for this scan is spent (injected offline refusal)".to_string(),
+        ));
+    }
     Some(AgentCallError::transient(
         "model_error",
         "Gemini overloaded; retries exhausted (injected offline failure)".to_string(),

@@ -97,6 +97,12 @@ impl CloudStorage for TeeStorage {
         self.cloud.index_landed(data, written_after).await
     }
 
+    /// The cloud side: the first index being kept open is the cloud's, and
+    /// the local copy has no scan to close.
+    fn name_pending_on_final_write(&self, pending_services: &[String]) -> bool {
+        self.cloud.name_pending_on_final_write(pending_services)
+    }
+
     fn supports_multi_service(&self) -> bool {
         self.cloud.supports_multi_service()
     }
@@ -222,6 +228,49 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&written).unwrap()).unwrap();
         assert_eq!(local.repo_name, "api");
         assert_eq!(local.commit_hash, "4f2a1c9");
+    }
+
+    /// A laptop run is a tee, so the pending list must reach the cloud through
+    /// it: a tee that kept the trait's `false` would close every partial run
+    /// with `scan-failed` even on a cloud that reads the list
+    /// (carrick-cloud#892).
+    #[tokio::test]
+    async fn the_pending_list_reaches_the_cloud_through_the_tee() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, server) = tee(
+            vec![
+                (
+                    200,
+                    serde_json::json!({
+                        "schema": "carrick.start-scan/0",
+                        "scan_id": "scan_01J",
+                        "project_id": "proj_1",
+                        "project_slug": "acme",
+                        "indexed_services": [],
+                        "multi_service": true,
+                        "accepts_pending_services": true
+                    })
+                    .to_string(),
+                ),
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            dir.path(),
+        );
+        storage
+            .begin_run(&RunContext {
+                repo_full_name: Some("acme/api".to_string()),
+                commit: "4f2a1c9".to_string(),
+                dirty: false,
+            })
+            .await
+            .unwrap();
+
+        assert!(storage.name_pending_on_final_write(&["billing".to_string()]));
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        let write = body_of(&server.join().unwrap()[2]);
+        assert_eq!(write["pending_services"], serde_json::json!(["billing"]));
     }
 
     /// The analysis has already been paid for by the time either write

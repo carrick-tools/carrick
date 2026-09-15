@@ -9,8 +9,12 @@
 //! - the run finishes, and services 1 and 3 land either way;
 //! - one failure is absorbed by the in-run retry, and everything lands;
 //! - a failure that outlasts the retry leaves service 2 pending: uploaded
-//!   facts-only with no cached detection, and the laptop scan closed with a
-//!   fail marker rather than its last write (carrick-cloud#892);
+//!   facts-only with no cached detection. Against a cloud that reads
+//!   `pending_services` the last write closes the scan and names service 2;
+//!   against one that does not, no write closes it and a fail marker does
+//!   (carrick-cloud#892);
+//! - a detection a budget refused is pending too, so a first index whose
+//!   ceiling is spent stays open for a raised ceiling to govern its re-run;
 //! - the rescan asks for service 2's detection and nobody else's.
 //!
 //! Its own test binary, `#[serial]`, and every count read as a delta: the
@@ -44,6 +48,11 @@ struct StubStorage {
     scan_failed: Arc<Mutex<Vec<(String, String)>>>,
     kept: Arc<Mutex<Vec<String>>>,
     indexed: Option<Vec<String>>,
+    /// Whether this stands for a cloud that answered
+    /// `accepts_pending_services` at `start-scan`.
+    accepts_pending: bool,
+    /// Every list the engine asked the final write to carry.
+    pending_named: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
 impl StubStorage {
@@ -51,6 +60,14 @@ impl StubStorage {
         Self {
             indexed: Some(indexed.iter().map(|s| s.to_string()).collect()),
             ..Self::default()
+        }
+    }
+
+    /// A laptop run against a cloud that reads `pending_services`.
+    fn laptop_on_current_cloud(indexed: &[&str]) -> Self {
+        Self {
+            accepts_pending: true,
+            ..Self::laptop(indexed)
         }
     }
 
@@ -104,6 +121,16 @@ impl CloudStorage for StubStorage {
         })
     }
     fn supports_multi_service(&self) -> bool {
+        true
+    }
+    fn name_pending_on_final_write(&self, pending_services: &[String]) -> bool {
+        if !self.accepts_pending {
+            return false;
+        }
+        self.pending_named
+            .lock()
+            .unwrap()
+            .push(pending_services.to_vec());
         true
     }
     fn keep_served_generation(&self, data: &CloudRepoData) {
@@ -297,10 +324,12 @@ async fn a_detection_failure_the_in_run_retry_recovers_lands_every_service() {
     assert!(storage.scan_failed.lock().unwrap().is_empty());
 }
 
-/// A failure that outlasts the retry: the run still exits cleanly, services 1
-/// and 3 land complete, service 2 lands facts-only as a first index with no
-/// cached detection, no write closes the scan, and the fail marker names
-/// service 2. The rescan then asks for service 2's detection only.
+/// A failure that outlasts the retry, against a cloud deployed before
+/// `accepts_pending_services`: the run still exits cleanly, services 1 and 3
+/// land complete, service 2 lands facts-only as a first index with no cached
+/// detection, no write closes the scan (that cloud would stamp the first index
+/// complete on it), and the fail marker names service 2. The rescan then asks
+/// for service 2's detection only.
 #[tokio::test]
 #[serial]
 async fn a_detection_failure_that_outlasts_the_retry_leaves_only_that_service_pending() {
@@ -335,8 +364,9 @@ async fn a_detection_failure_that_outlasts_the_retry_leaves_only_that_service_pe
     );
     assert!(
         storage.uploads().iter().all(|u| !u.final_in_run),
-        "a run with a pending service must not close its scan with a write"
+        "against this cloud a run with a pending service must not close its scan with a write"
     );
+    assert!(storage.pending_named.lock().unwrap().is_empty());
     let markers = storage.scan_failed.lock().unwrap().clone();
     assert_eq!(markers.len(), 1, "{markers:?}");
     assert!(markers[0].1.contains("beta"), "{markers:?}");
@@ -368,6 +398,101 @@ async fn a_detection_failure_that_outlasts_the_retry_leaves_only_that_service_pe
         rescan.scan_failed.lock().unwrap().len() == 1,
         "no new marker"
     );
+}
+
+/// The same failure against a cloud that reads `pending_services`: every
+/// service lands, the last write closes the scan and names service 2, and no
+/// fail marker is sent, so the run gets its receipt and last-scan row and the
+/// founder is told it finished (carrick-cloud#892). The complete rescan closes
+/// with its last write and names nothing.
+#[tokio::test]
+#[serial]
+async fn a_pending_service_rides_the_final_write_to_a_cloud_that_reads_it() {
+    offline_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = three_service_repo(tmp.path());
+    let storage = StubStorage::laptop_on_current_cloud(&[]);
+
+    carrick::agent_service::inject_mock_failure("/framework-detect", BETA_ONLY_DEPENDENCY, 2);
+    run_analysis_engine_with_sidecar(storage.clone(), repo.to_str().unwrap(), None, false)
+        .await
+        .expect("a laptop run with a pending service exits 0");
+
+    assert_eq!(storage.uploaded_services(), ["alpha", "beta", "gamma"]);
+    let uploads = storage.uploads();
+    assert!(
+        uploads.last().unwrap().final_in_run,
+        "the last write closes the scan"
+    );
+    assert_eq!(
+        uploads.iter().filter(|u| u.final_in_run).count(),
+        1,
+        "only the last write is final"
+    );
+    assert_eq!(
+        *storage.pending_named.lock().unwrap(),
+        [vec!["beta".to_string()]],
+        "the final write names the pending service"
+    );
+    assert!(
+        storage.scan_failed.lock().unwrap().is_empty(),
+        "a finished run is not reported failed"
+    );
+
+    let rescan = StubStorage {
+        indexed: Some(vec!["alpha".into(), "beta".into(), "gamma".into()]),
+        ..storage.clone()
+    };
+    let already = rescan.uploads().len();
+    run_analysis_engine_with_sidecar(rescan.clone(), repo.to_str().unwrap(), None, false)
+        .await
+        .expect("the rescan succeeds");
+    assert!(rescan.uploads()[already..].last().unwrap().final_in_run);
+    assert_eq!(
+        rescan.pending_named.lock().unwrap().len(),
+        1,
+        "a complete rescan names nothing"
+    );
+    assert!(rescan.scan_failed.lock().unwrap().is_empty());
+}
+
+/// A detection the budget refused is pending like any other: the first index
+/// stays open, so a per-workspace ceiling raised after the refusal still
+/// governs the re-run, and an operator kill switch during a first index does
+/// not end it. Against a cloud that reads the list, the last write closes the
+/// scan and names the service; no fail marker is sent.
+#[tokio::test]
+#[serial]
+async fn a_budget_refusal_keeps_the_first_index_open() {
+    offline_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = three_service_repo(tmp.path());
+    let storage = StubStorage::laptop_on_current_cloud(&[]);
+
+    carrick::agent_service::inject_mock_budget_refusal(
+        "/framework-detect",
+        BETA_ONLY_DEPENDENCY,
+        1,
+    );
+    let before = detect_requests();
+    run_analysis_engine_with_sidecar(storage.clone(), repo.to_str().unwrap(), None, false)
+        .await
+        .expect("a budget refusal does not fail a laptop run");
+
+    // alpha, beta (refused), gamma: a refusal is not retried in the same run.
+    assert_eq!(detect_requests() - before, 3);
+    assert_eq!(storage.uploaded_services(), ["alpha", "beta", "gamma"]);
+    let beta = storage.latest("beta").unwrap();
+    assert!(
+        beta.cached_detection.is_none(),
+        "the refused service is analysed facts-only"
+    );
+    assert!(storage.uploads().last().unwrap().final_in_run);
+    assert_eq!(
+        *storage.pending_named.lock().unwrap(),
+        [vec!["beta".to_string()]]
+    );
+    assert!(storage.scan_failed.lock().unwrap().is_empty());
 }
 
 /// On CI the same failure lands services 1 and 3 and ends non-zero naming
