@@ -158,6 +158,9 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    responses (by the status each send states), or no success send carries a
  *    body a JSON contract can describe, so the route publishes no success body
  *    rather than an error body or a redirect location (carrick#1161).
+ *  - `no_request_body`: the located request read is a validated part the
+ *    route's validator binds that is not a body (a path parameter, a query), so
+ *    the route states no request body contract there (carrick#1166).
  *  - `not_recorded`: the position carries a top type and this layer has no
  *    cause for it.
  */
@@ -168,6 +171,7 @@ export type TypeProvenanceReason =
   | 'machinery_envelope'
   | 'coerced_input'
   | 'no_success_payload'
+  | 'no_request_body'
   | 'not_recorded';
 
 /**

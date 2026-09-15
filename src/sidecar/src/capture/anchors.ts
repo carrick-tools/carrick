@@ -236,6 +236,10 @@ export function resolveAnchor(
   if (!located) {
     return demote(locatorFailureReason(request));
   }
+  // carrick#1162: a serialised body is the JSON of its argument. The call's own
+  // `string` result is never the payload's contract, and publishing it reads
+  // incompatible against every object-typed counterparty.
+  located = serialisedArgument(located);
   // #439 part 1: a producer anchor whose locator landed inside a fluent
   // builder chain's config-descriptor argument (an all-literal metadata
   // object) must never capture that descriptor as the request type. Re-aim at
@@ -893,6 +897,28 @@ function paramLocatorHints(request: InferAnchorRequest): string {
   return request.line_number !== undefined
     ? `line ${request.line_number}`
     : 'no line hint';
+}
+
+/**
+ * The argument of a `JSON.stringify(value)` call (through parentheses), or the
+ * node unchanged. The mirror of the v1 inferrer's `unwrapJsonStringifyArg`:
+ * the global serialiser is identified by the standard `JSON` object, the one
+ * name every runtime shares.
+ */
+function serialisedArgument(node: ts.Node): ts.Node {
+  let current = node;
+  while (ts.isParenthesizedExpression(current)) current = current.expression;
+  if (
+    ts.isCallExpression(current) &&
+    current.arguments.length > 0 &&
+    ts.isPropertyAccessExpression(current.expression) &&
+    ts.isIdentifier(current.expression.expression) &&
+    current.expression.expression.text === 'JSON' &&
+    current.expression.name.text === 'stringify'
+  ) {
+    return current.arguments[0];
+  }
+  return node;
 }
 
 function locatorFailureReason(request: InferAnchorRequest): string {
