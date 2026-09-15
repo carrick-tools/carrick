@@ -1010,12 +1010,29 @@ pub trait CloudStorage {
 
     /// Whether this run's debug log is shipped to the cloud at all.
     ///
-    /// True everywhere it always was. False on the laptop path, where
-    /// `upload-logs` is not an action the credential may take and the log
-    /// names the developer's own machine.
+    /// True everywhere. It was false on the laptop path, where the log was a
+    /// 0644 file naming the developer's machine and logging every dependency
+    /// at debug — so the one run whose log anyone needed, a first index that
+    /// died at minute 66, left the cloud nothing to read (carrick#1063). The
+    /// file is now filtered to this crate's own debug lines, and what leaves
+    /// the machine is redacted first ([`crate::logging::redact_log`]).
     fn uploads_run_logs(&self) -> bool {
         true
     }
+
+    /// Say that this run died, and in which stage, before it could upload.
+    ///
+    /// The other half of carrick#1063: a run that ends badly leaves a scan
+    /// slot the cloud can only time out, and no row anywhere says what the
+    /// run had been doing. `stage` is one of
+    /// [`crate::scan_stage::Stage`]'s tokens and `reason` is the error's own
+    /// words, redacted and truncated.
+    ///
+    /// Best-effort by contract, and it takes no `Result` for that reason:
+    /// there is nothing a caller could do with a failure to report a failure,
+    /// and the run's exit code is the analysis's, never this call's. A default
+    /// no-op, because only the laptop path has a slot to mark.
+    async fn report_scan_failed(&self, _stage: &str, _reason: &str) {}
 
     /// Relay a PR run's structured findings to the cloud, which renders and
     /// posts (and updates in place on later pushes) a single GitHub App

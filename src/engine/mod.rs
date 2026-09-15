@@ -260,9 +260,58 @@ pub async fn run_analysis_engine_with_sidecar<T: CloudStorage + Sync>(
     no_cache: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let result = run_analysis_engine_inner(&storage, repo_path, sidecar, no_cache).await;
+    // The marker first, then the log: the marker is four short fields and the
+    // log is up to five megabytes, and a run that is already failing may not
+    // get to finish both.
+    if let Err(error) = &result {
+        report_scan_failure(&storage, error.as_ref()).await;
+    }
     upload_run_logs(&storage, repo_path).await;
     result
 }
+
+/// Tell the cloud this run died before it could upload, and where
+/// (carrick#1063).
+///
+/// The stage comes from [`crate::scan_stage`], which every phase of the
+/// pipeline moves forward as it starts; the reason is the error's own words,
+/// redacted and cut. Best-effort in both directions — the storage decides
+/// whether it has a slot to mark, and nothing here can change what the run
+/// returns.
+///
+/// Only a run that ends through this function can say anything at all. A
+/// process the OS kills — SIGKILL, the OOM killer, a laptop lid — sends
+/// nothing, and the cloud's slot TTL is what covers that.
+async fn report_scan_failure<T: CloudStorage + Sync>(storage: &T, error: &dyn std::error::Error) {
+    let stage = crate::scan_stage::current();
+    storage
+        .report_scan_failed(stage.as_str(), &fail_reason(&error.to_string()))
+        .await;
+}
+
+/// What a fail marker's `reason` carries: the error's own words, with the
+/// home directory replaced by `~` and the whole thing cut to
+/// [`FAIL_REASON_LIMIT`] characters.
+///
+/// Characters, not bytes, so a multi-byte error message is cut on a boundary
+/// rather than panicking on the way out of a run that is already failing.
+/// The cut is marked, so a truncated reason does not read as a complete
+/// sentence that happens to stop.
+fn fail_reason(error: &str) -> String {
+    const ELLIPSIS: &str = "...";
+    let redacted = logging::redact_home_in(error, logging::home_for_redaction().as_deref());
+    if redacted.chars().count() <= FAIL_REASON_LIMIT {
+        return redacted;
+    }
+    let kept: String = redacted
+        .chars()
+        .take(FAIL_REASON_LIMIT - ELLIPSIS.len())
+        .collect();
+    format!("{kept}{ELLIPSIS}")
+}
+
+/// The wire limit on a fail marker's `reason`.
+const FAIL_REASON_LIMIT: usize = 500;
 
 async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     storage: &T,
@@ -302,6 +351,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         commit: git_state.commit.clone(),
         dirty: git_state.dirty,
     };
+    crate::scan_stage::enter(crate::scan_stage::Stage::Discovery);
     let sp = logging::spinner("Connecting to Carrick Cloud...");
     let run_start = storage
         .begin_run(&run_context)
@@ -617,6 +667,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     //    would clobber. Gate it on the backend advertising support; cross-repo
     //    analysis below still runs locally regardless. `None` = do not upload
     //    (PR/branch mode, or an unsupported multi-service repo).
+    crate::scan_stage::enter(crate::scan_stage::Stage::BlobBuild);
     let upload_payloads: Option<Vec<CloudRepoData>> = if should_upload {
         if multi_service && !storage.supports_multi_service() {
             warn!(
@@ -837,6 +888,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             .collect::<Vec<_>>(),
     );
 
+    crate::scan_stage::enter(crate::scan_stage::Stage::CrossRepoCheck);
     let sp = logging::spinner("Running cross-repo analysis...");
     let analyzer =
         match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar).await {
@@ -1122,7 +1174,11 @@ async fn upload_run_logs<T: CloudStorage>(storage: &T, repo_path: &str) {
     // in UTF-8), so the resulting `log_content.len()` may exceed the original
     // raw byte count when the file contains non-UTF-8 noise. Close enough for
     // a logged size hint.
-    let log_content = String::from_utf8_lossy(&buf);
+    // What leaves the machine is not what is on it (carrick#1063): the home
+    // directory becomes `~`, and any line naming a credential is dropped.
+    // Done here rather than in the writer so the local copy stays complete for
+    // whoever is debugging with it.
+    let log_content = logging::redact_log(&String::from_utf8_lossy(&buf));
     let repo_name = get_repository_name(repo_path);
     match storage.upload_logs(&repo_name, &log_content).await {
         Ok(()) => {
@@ -1132,10 +1188,31 @@ async fn upload_run_logs<T: CloudStorage>(storage: &T, repo_path: &str) {
                 "Uploaded run logs to S3"
             );
         }
+        Err(e) if cloud_has_not_deployed_log_upload(&e.to_string()) => {
+            // A cloud that does not serve `upload-logs` for this credential
+            // yet. Nothing is wrong with the run, and a warning on the way out
+            // of every scan would say there is.
+            debug!("Carrick Cloud did not accept this run's log: {e}");
+        }
         Err(e) => {
             warn!("Failed to upload logs: {}", e);
         }
     }
+}
+
+/// Whether a log-upload refusal is "this cloud has not deployed the action for
+/// this credential", which is a 403 or a 404 and is not worth a warning.
+///
+/// Read out of the message because that is where the status is: the storage
+/// errors are strings by the time they reach here, and `health_check` already
+/// classifies its own refusals the same way. Deliberately narrow — only these
+/// two statuses, and only as the standalone number the refusal formats.
+fn cloud_has_not_deployed_log_upload(message: &str) -> bool {
+    ["403", "404"].iter().any(|status| {
+        message
+            .split(|c: char| !c.is_ascii_digit())
+            .any(|word| word == *status)
+    })
 }
 
 /// Serialize CloudRepoData without AST nodes in ApiEndpointDetails
@@ -1338,6 +1415,7 @@ async fn upload_service_payloads<T: CloudStorage>(
     payloads: &[CloudRepoData],
     forced: bool,
 ) -> Vec<UnconfirmedUpload> {
+    crate::scan_stage::enter(crate::scan_stage::Stage::Upload);
     let sp = logging::spinner("Uploading results...");
     let mut outcomes: Vec<UploadOutcome> = Vec::with_capacity(payloads.len());
     let mut confirmed: Vec<&str> = Vec::new();
@@ -1907,6 +1985,7 @@ async fn analyze_current_repo_incremental(
             // fix reach this repo without a model call — and it is why there is
             // no merge with the previous scan's rows below: this run states
             // them all, and a deleted file simply has no row.
+            crate::scan_stage::enter(crate::scan_stage::Stage::FileAnalysis);
             let analysis = file_orchestrator
                 .analyze_files(
                     &files,
@@ -1963,9 +2042,11 @@ async fn analyze_current_repo_incremental(
             // Collect the intents started after discovery (body_source is
             // stripped from every definition by now). `Intents` times only the
             // wait left at this point; the rest overlapped the stages above.
+            crate::scan_stage::enter(crate::scan_stage::Stage::Intents);
             let mut function_definitions = intents.finish().await;
             crate::phase_timing::mark(crate::phase_timing::Phase::Intents);
 
+            crate::scan_stage::enter(crate::scan_stage::Stage::Signatures);
             // Compose function signatures, inferring unannotated slots via sidecar.
             populate_function_signatures(
                 signature_sidecar(sidecar),
@@ -1973,6 +2054,7 @@ async fn analyze_current_repo_incremental(
                 repo_path,
             );
             crate::phase_timing::mark(crate::phase_timing::Phase::Signatures);
+            crate::scan_stage::enter(crate::scan_stage::Stage::BlobBuild);
 
             let elapsed = start.elapsed();
             debug!(
@@ -2179,6 +2261,7 @@ async fn run_framework_detection_and_guidance(
     ),
     Box<dyn std::error::Error>,
 > {
+    crate::scan_stage::enter(crate::scan_stage::Stage::FrameworkDetect);
     let agent_service = AgentService::new();
     let framework_detector = FrameworkDetector::new(agent_service.clone());
     let detection = framework_detector
@@ -3796,6 +3879,7 @@ fn run_capture_for_service(
     type_resolution: &TypeResolutionResult,
     cloud_data: &mut CloudRepoData,
 ) -> Option<PathBuf> {
+    crate::scan_stage::enter(crate::scan_stage::Stage::TypeCapture);
     let (mut explicit, mut infer, inline_aliases) =
         file_orchestrator.collect_type_requests(file_results, repo_path, mount_graph, config);
     explicit.extend_from_slice(extra_explicit);
@@ -3915,6 +3999,7 @@ fn discover_files_and_symbols(
     service: &Config,
     cm: Lrc<SourceMap>,
 ) -> FileDiscoveryResult {
+    crate::scan_stage::enter(crate::scan_stage::Stage::Discovery);
     let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
     let repo_name = get_repository_name(repo_path);
 
@@ -4129,6 +4214,7 @@ fn resolve_per_endpoint_definitions(
     cloud_data: &mut CloudRepoData,
     stub_dir: &Path,
 ) {
+    crate::scan_stage::enter(crate::scan_stage::Stage::Definitions);
     let Some(ref mut manifest) = cloud_data.type_manifest else {
         return;
     };
@@ -4836,6 +4922,7 @@ async fn analyze_current_repo(
     // 4. Run the complete multi-agent analysis
     let normalizer = UrlNormalizer::new(config);
     let service_root = service_scan_root(repo_path, config);
+    crate::scan_stage::enter(crate::scan_stage::Stage::FileAnalysis);
     let analysis_result = orchestrator
         .run_complete_analysis(
             files.clone(),
@@ -4854,9 +4941,11 @@ async fn analyze_current_repo(
     // 4b. Collect the function intents started after discovery. `Intents`
     // times only the wait left at this point; the rest overlapped the model
     // stage above.
+    crate::scan_stage::enter(crate::scan_stage::Stage::Intents);
     let mut function_definitions = intents.finish().await;
     crate::phase_timing::mark(crate::phase_timing::Phase::Intents);
 
+    crate::scan_stage::enter(crate::scan_stage::Stage::Signatures);
     // 4c. Compose function signatures, inferring unannotated slots via sidecar.
     populate_function_signatures(
         signature_sidecar(sidecar),
@@ -4864,6 +4953,7 @@ async fn analyze_current_repo(
         repo_path,
     );
     crate::phase_timing::mark(crate::phase_timing::Phase::Signatures);
+    crate::scan_stage::enter(crate::scan_stage::Stage::BlobBuild);
 
     // 4d. Deterministic protocol scans run BEFORE the graph is projected: the
     // GraphQL consumer file set folds transport data calls out of the mount
@@ -5498,6 +5588,116 @@ mod tests {
             super::log_tail_range(six_mb, Some(0)),
             (six_mb - five_mb, five_mb as usize)
         );
+    }
+
+    /// The fail marker's `reason` is the error's own words, with the home
+    /// directory gone and the whole thing inside the wire's limit
+    /// (carrick#1063).
+    #[test]
+    fn a_fail_reason_is_redacted_and_bounded() {
+        let short = super::fail_reason("Carrick Cloud did not open this scan: already running");
+        assert_eq!(
+            short,
+            "Carrick Cloud did not open this scan: already running"
+        );
+
+        let long = super::fail_reason(&"e".repeat(2_000));
+        assert_eq!(long.chars().count(), super::FAIL_REASON_LIMIT);
+        assert!(long.ends_with("..."), "a cut reason says it was cut");
+
+        // Cut on a character boundary, not a byte one: a run that is already
+        // failing must not end in a panic on the way out.
+        let multibyte = super::fail_reason(&"é".repeat(2_000));
+        assert_eq!(multibyte.chars().count(), super::FAIL_REASON_LIMIT);
+    }
+
+    /// A run that dies names the stage it died in, and the marker carries the
+    /// error's own words (carrick#1063).
+    ///
+    /// Driven through the same function the engine calls on its error path,
+    /// with the process-global stage set as the pipeline would have left it.
+    #[tokio::test]
+    async fn a_failing_run_marks_the_stage_it_died_in() {
+        let storage = crate::cloud_storage::MockStorage::new();
+        crate::scan_stage::enter(crate::scan_stage::Stage::FileAnalysis);
+
+        let error: Box<dyn std::error::Error> =
+            "Carrick Cloud LLM quota was exhausted mid-scan".into();
+        super::report_scan_failure(&storage, error.as_ref()).await;
+
+        assert_eq!(
+            storage.scan_failures(),
+            vec![(
+                "file_analysis".to_string(),
+                "Carrick Cloud LLM quota was exhausted mid-scan".to_string()
+            )]
+        );
+        crate::scan_stage::enter(crate::scan_stage::Stage::Unknown);
+    }
+
+    /// What leaves the machine is redacted, and the wiring that does it is
+    /// the upload path itself (carrick#1063).
+    ///
+    /// Drives the real `upload_run_logs` against a temporary home, so the file
+    /// it finds, the offset it slices from and the redaction it applies are
+    /// the ones a laptop run uses. `#[serial]` because `HOME` is process-wide.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_uploaded_run_log_carries_no_home_and_no_credential() {
+        let home = tempfile::tempdir().expect("temp home");
+        let logs = home.path().join(".carrick").join("logs");
+        std::fs::create_dir_all(&logs).expect("log dir");
+        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        std::fs::write(
+            logs.join(format!("carrick.log.{day}")),
+            format!(
+                "reading {}/work/api/src/index.ts\n  Authorization: Bearer secret\nanalysed 12 files\n",
+                home.path().display()
+            ),
+        )
+        .expect("seed log");
+
+        let previous = std::env::var_os("HOME");
+        // SAFETY: a `#[serial]` test, and the variable is restored below.
+        unsafe { std::env::set_var("HOME", home.path()) };
+        let storage = crate::cloud_storage::MockStorage::new();
+        upload_run_logs(&storage, ".").await;
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        let uploaded = storage.uploaded_logs();
+        assert_eq!(uploaded.len(), 1, "nothing was uploaded");
+        let log = &uploaded[0];
+        assert!(log.contains("reading ~/work/api/src/index.ts"), "{log}");
+        assert!(log.contains("analysed 12 files"), "{log}");
+        assert!(!log.contains("Authorization"), "{log}");
+        assert!(!log.contains(&home.path().display().to_string()), "{log}");
+    }
+
+    /// A refusal that is simply a cloud without the action deployed is not a
+    /// warning on the way out of every scan; a real failure still is.
+    #[test]
+    fn only_a_403_or_404_reads_as_a_cloud_that_cannot_take_the_log() {
+        assert!(super::cloud_has_not_deployed_log_upload(
+            "Lambda returned error 403: {\"message\":\"Forbidden\"}"
+        ));
+        assert!(super::cloud_has_not_deployed_log_upload(
+            "Lambda returned error 404: Not Found"
+        ));
+        assert!(!super::cloud_has_not_deployed_log_upload(
+            "Lambda returned error 500: internal error"
+        ));
+        assert!(!super::cloud_has_not_deployed_log_upload(
+            "Lambda request failed: connection reset"
+        ));
+        // Not a status that happens to appear inside a longer number.
+        assert!(!super::cloud_has_not_deployed_log_upload(
+            "Lambda returned error 500: object 4030 is missing"
+        ));
     }
 
     #[test]

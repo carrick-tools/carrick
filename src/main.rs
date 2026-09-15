@@ -44,6 +44,7 @@ mod receiver_origin;
 mod receiver_type;
 mod scan_health;
 mod scan_spend;
+mod scan_stage;
 mod sdk_edges;
 mod sdk_surface;
 mod service_derivation;
@@ -159,7 +160,15 @@ async fn main() {
     logging::init(args.verbose);
 
     if let Err(e) = run_analysis(args).await {
-        error!("Analysis failed: {}", e);
+        // The stage is in the line a user pastes. The same token goes to the
+        // cloud as the fail marker's `stage` (carrick#1063), so a terminal and
+        // a dashboard name the same thing, and a run that could reach neither
+        // still says it on the way out.
+        error!(
+            "Analysis failed during {}: {}",
+            scan_stage::current().as_str(),
+            e
+        );
         std::process::exit(1);
     }
 }

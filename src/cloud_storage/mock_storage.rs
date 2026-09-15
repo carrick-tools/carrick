@@ -10,6 +10,11 @@ use tracing::debug;
 pub struct MockStorage {
     data: Mutex<Vec<CloudRepoData>>,
     type_files: Mutex<HashMap<String, String>>,
+    /// Every `(stage, reason)` this storage was asked to mark, so a test can
+    /// read back what a failing run reported (carrick#1063).
+    scan_failures: Mutex<Vec<(String, String)>>,
+    /// Every run log this storage was handed, as the redaction left it.
+    logs: Mutex<Vec<String>>,
 }
 
 impl Default for MockStorage {
@@ -23,7 +28,26 @@ impl MockStorage {
         Self {
             data: Mutex::new(Vec::new()),
             type_files: Mutex::new(HashMap::new()),
+            scan_failures: Mutex::new(Vec::new()),
+            logs: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The failures reported against this storage, in order.
+    ///
+    /// Test-only: the mock is a production type (it backs `CARRICK_MOCK_ALL`),
+    /// and a recorder nobody reads outside a test is dead code in every other
+    /// build.
+    #[cfg(test)]
+    pub fn scan_failures(&self) -> Vec<(String, String)> {
+        self.scan_failures.lock().unwrap().clone()
+    }
+
+    /// The run logs this storage was handed, in order, as the redaction left
+    /// them. Test-only, for the same reason.
+    #[cfg(test)]
+    pub fn uploaded_logs(&self) -> Vec<String> {
+        self.logs.lock().unwrap().clone()
     }
 }
 
@@ -211,9 +235,18 @@ impl CloudStorage for MockStorage {
         Ok(())
     }
 
-    async fn upload_logs(&self, repo: &str, _log_content: &str) -> Result<(), StorageError> {
-        debug!("MOCK: Skipping log upload for {}", repo);
+    async fn upload_logs(&self, repo: &str, log_content: &str) -> Result<(), StorageError> {
+        debug!("MOCK: Recording a run log for {}", repo);
+        self.logs.lock().unwrap().push(log_content.to_string());
         Ok(())
+    }
+
+    async fn report_scan_failed(&self, stage: &str, reason: &str) {
+        debug!("MOCK: Recording scan failure in {}", stage);
+        self.scan_failures
+            .lock()
+            .unwrap()
+            .push((stage.to_string(), reason.to_string()));
     }
 }
 

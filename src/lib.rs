@@ -44,6 +44,7 @@ pub mod receiver_origin;
 pub mod receiver_type;
 pub mod scan_health;
 pub mod scan_spend;
+pub mod scan_stage;
 pub mod sdk_edges;
 pub mod sdk_surface;
 pub mod service_derivation;
