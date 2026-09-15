@@ -171,6 +171,35 @@ fn test_basic_endpoint_detection() {
     );
 }
 
+/// A scan with no previous index falls from the incremental path to the full
+/// one, and both used to discover the service: the whole SWC parse, the call
+/// graph and the manifest walk ran twice, and `Discovered N file(s)` was
+/// printed twice (carrick#1108). The mock store holds no previous index, so
+/// this is exactly that path.
+#[test]
+fn a_scan_with_no_previous_index_discovers_the_service_once() {
+    let test_repo_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("express-single");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
+        .arg(test_repo_path.to_str().unwrap())
+        .env("CARRICK_MOCK_ALL", "1")
+        .output()
+        .expect("Failed to execute carrick");
+    let stderr = String::from_utf8(output.stderr).expect("Invalid UTF-8 in stderr");
+    assert!(output.status.success(), "carrick failed:\n{stderr}");
+
+    let discoveries = stderr
+        .lines()
+        .filter(|line| line.contains("Discovered ") && line.contains(" file(s) under "))
+        .count();
+    assert_eq!(
+        discoveries, 1,
+        "one service, one discovery; stderr:\n{stderr}"
+    );
+}
+
 // Helper function to recursively copy directories
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     if !dst.exists() {
