@@ -2373,11 +2373,21 @@ async fn analyze_current_repo_incremental(
     let prev_intents = previous_data
         .map(|prev| PreviousIntents::from_definitions(&prev.function_definitions))
         .unwrap_or_default();
+    // Discovery above already parsed every file, resolved the call edges and
+    // walked the manifests; the full analysis reads the same result rather
+    // than running all of it a second time (carrick#1108).
     let cloud_data = analyze_current_repo(
         repo_path,
         config,
         packages,
         sidecar,
+        Discovered {
+            cm,
+            files,
+            import_facts: all_import_facts,
+            function_definitions,
+            repo_name,
+        },
         prev_intents,
         workspace,
         run_intents,
@@ -5073,36 +5083,53 @@ fn enrich_manifest_with_type_resolution(
     );
 }
 
+/// What one service's discovery produced: the files, the import facts and the
+/// function definitions, with the source map their spans belong to.
+///
+/// Discovery is the whole-service SWC parse, the call-graph pass and the
+/// manifest walk. The incremental path runs it before it knows whether it can
+/// reuse anything, so the full path it falls back to takes this rather than
+/// discovering again (carrick#1108).
+struct Discovered {
+    cm: Lrc<SourceMap>,
+    files: Vec<PathBuf>,
+    import_facts: BTreeSet<crate::visitor::ImportedSymbol>,
+    function_definitions: HashMap<String, FunctionDefinition>,
+    repo_name: String,
+}
+
+/// The full analysis of one service over its discovery.
+///
+/// `repo_path` is canonical: the caller canonicalised it before discovering,
+/// so the paths in `discovered` and the paths normalised here agree.
+#[allow(clippy::too_many_arguments)]
 async fn analyze_current_repo(
     repo_path: &str,
     service: &Config,
     packages: &Packages,
     sidecar: Option<&TypeSidecar>,
+    discovered: Discovered,
     previous_intents: PreviousIntents,
     workspace: &mut crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
-    // Canonicalize repo_path for consistent path normalization between runs
-    let canonical = std::fs::canonicalize(repo_path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| repo_path.to_string());
-    let repo_path = canonical.as_str();
-
     debug!("Running multi-agent analysis on: {}", repo_path);
 
     let config = service;
 
-    // Create shared SourceMap and discover files and symbols, scoped to the service
-    let cm: Lrc<SourceMap> = Default::default();
-    let (files, all_import_facts, function_definitions, repo_name) =
-        discover_files_and_symbols(repo_path, config, cm.clone())?;
+    let Discovered {
+        cm,
+        files,
+        import_facts: all_import_facts,
+        function_definitions,
+        repo_name,
+    } = discovered;
     debug!(
         "Repository '{}': {} files, {} function definitions",
         repo_name,
         files.len(),
         function_definitions.len()
     );
-    crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
 
     // Function intents need only discovery's definitions and the previous
     // scan's hashes, so they run beside the multi-agent analysis rather than
