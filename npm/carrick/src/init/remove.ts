@@ -1,16 +1,18 @@
 // Undoing `carrick init`, on this machine.
 //
 // An install that can state its own undo is the courtesy that makes people
-// willing to try it (carrick#1034), and init now writes in six places: the
+// willing to try it (carrick#1034), and init now writes in seven places: the
 // hook entries in a workspace's `.claude` settings, an MCP server entry in
-// each agent client's own configuration, the `.carrick` directory, and the
-// credential in the user's configuration directory.
+// each agent client's own configuration, the `.carrick` directory, the
+// install id in `~/.carrick`, and the credential in the user's configuration
+// directory.
 //
 // Every step here is the inverse of a writer in this folder, and each pair
 // lives in one file so the two cannot drift: `mergeCarrickHooks` /
 // `removeCarrickHooks` in `settings.ts`, `mergeServerEntry` /
 // `removeServerEntry` and `connectMcpClients` / `disconnectMcpClients` in
-// `mcp.ts`, `writeProposal` / the `.carrick` removal below, `saveCredential` /
+// `mcp.ts`, `ensureInstallId` / `removeInstallId` in `install-id.ts`,
+// `writeProposal` / the `.carrick` removal below, `saveCredential` /
 // `removeCredential` in `../auth/credentials.ts`.
 //
 // What it does NOT do is edit a tracked file. The scaffold pull request put
@@ -26,6 +28,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { removeCredential, credentialPath } from "../auth/credentials.ts";
+import { installIdPath, removeInstallId } from "./install-id.ts";
 import { disconnectMcpClients, type McpRemoval } from "./mcp.ts";
 import { repoRoots } from "./repos.ts";
 import { removeCarrickHooks } from "./settings.ts";
@@ -70,7 +73,8 @@ function help(): string {
     "",
     "Undo what carrick init wrote on this machine: the Carrick hook entries in",
     "this folder's .claude settings, the carrick MCP server in each agent",
-    "client's configuration, the .carrick directory, and the saved credential.",
+    "client's configuration, the .carrick directory, this machine's install id,",
+    "and the saved credential.",
     "Other hooks, other MCP servers and the settings files themselves are left",
     "as they are. Files the scaffold added to the repository are listed with the",
     "git rm line that removes them; this command never edits a tracked file.",
@@ -219,6 +223,19 @@ export async function remove(argv: string[], out: InitOutput = createOutput()): 
     removed += 1;
   }
   for (const line of warn) out.warn(line);
+
+  // The install id goes with the entries that carried it: what the header
+  // named is this machine's setup, and the setup is what just came off it. A
+  // later `carrick init` mints a new one, which is the reset the file exists
+  // to give (carrick-cloud#890).
+  try {
+    if (removeInstallId()) {
+      out.done("This machine's install id removed");
+      removed += 1;
+    }
+  } catch (error) {
+    out.refuse(`${(error as Error).message}. Delete ${installIdPath()} by hand.`);
+  }
 
   const carrick = path.join(workspace, ".carrick");
   if (fs.existsSync(carrick)) {

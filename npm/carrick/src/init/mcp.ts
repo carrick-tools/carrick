@@ -34,11 +34,46 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
+import { INSTALL_ID_HEADER, INSTALL_ID_PATTERN, installIdOrNull, readInstallId } from "./install-id.ts";
+
 export const MCP_URL = "https://api.carrick.tools/mcp";
 export const MCP_NAME = "carrick";
-export const MCP_LINE = `claude mcp add --scope user --transport http ${MCP_NAME} ${MCP_URL}`;
 /** The host an entry has to name before `carrick remove` will take it out. */
 export const MCP_HOST = new URL(MCP_URL).hostname;
+
+/**
+ * The arguments that add this server to Claude Code, with the install id on it.
+ *
+ * `--header` goes LAST, after the name and the URL, and that is not a style
+ * choice: the flag is variadic (`-H, --header <header...>`), so a `--header`
+ * placed before the positionals swallows them and `claude mcp add` exits with
+ * "missing required argument 'name'". Verified against Claude Code 2.1.272.
+ */
+export function claudeAddArgs(installId: string | null): string[] {
+  const args = ["mcp", "add", "--scope", "user", "--transport", "http", MCP_NAME, MCP_URL];
+  return installId === null ? args : [...args, "--header", `${INSTALL_ID_HEADER}: ${installId}`];
+}
+
+/** The same thing as a line to paste, for the places that print one. */
+export function mcpLine(installId: string | null = installIdOrNull()): string {
+  const base = `claude mcp add --scope user --transport http ${MCP_NAME} ${MCP_URL}`;
+  return installId === null ? base : `${base} --header "${INSTALL_ID_HEADER}: ${installId}"`;
+}
+
+/**
+ * What puts the install id on a Claude Code entry that has none.
+ *
+ * `claude mcp add` will not edit an entry it already holds, so the id can only
+ * go on by writing the entry again — and THAT is the user's call, not this
+ * command's. Removing somebody's server takes with it anything else on the
+ * entry and sends the next session back through the server's OAuth, which is
+ * not a thing to do to a machine that was only being set up. So `carrick init`
+ * prints this pair and changes nothing; the file clients, whose entries can be
+ * merged in place, are still done for them.
+ */
+export function claudeRestampLine(installId: string | null): string {
+  return `claude mcp remove --scope user ${MCP_NAME} && ${mcpLine(installId)}`;
+}
 
 /** Everything this module touches outside itself, so a test can state a machine. */
 export type McpEnvironment = {
@@ -49,6 +84,20 @@ export type McpEnvironment = {
   capture: (command: string, args: string[]) => { status: number | null; stdout: string };
   home: string;
   platform: NodeJS.Platform;
+  /**
+   * This machine's install id, minting one if it has none: the writers' one.
+   *
+   * A function, not a value, so the file is only ever created by a call that
+   * is about to configure a client.
+   */
+  installId: () => string | null;
+  /**
+   * The id this machine already has, never creating one: the reader's.
+   *
+   * `inspectMcpClients` is what `carrick doctor` runs, and that command writes
+   * nothing at all — not even a file of ours in a directory of ours.
+   */
+  storedInstallId: () => string | null;
   appData: string | null;
   readFile: (file: string) => string | null;
   writeFile: (file: string, body: string) => void;
@@ -73,6 +122,8 @@ export function realEnvironment(): McpEnvironment {
     },
     home: os.homedir(),
     platform: process.platform,
+    installId: () => installIdOrNull(),
+    storedInstallId: () => readInstallId(),
     appData: process.env["APPDATA"] ?? null,
     readFile: (file) => {
       try {
@@ -101,6 +152,15 @@ export type FileClient = {
   urlKey: "url" | "serverUrl";
   /** Whether a fresh entry states `"type": "http"`. */
   statesType: boolean;
+  /**
+   * Whether this client reads a `headers` object on an HTTP server entry.
+   *
+   * Only a client whose format is known gets the install id: a header written
+   * into a shape a client does not read is a header that never arrives, and
+   * one this command would then have to explain. Cursor, Windsurf and VS Code
+   * all document `headers` for HTTP servers, so all three carry it.
+   */
+  headers: boolean;
 };
 
 function vsCodeUserDirectory(env: McpEnvironment): string | null {
@@ -121,6 +181,7 @@ const FILE_CLIENTS: FileClient[] = [
     container: "mcpServers",
     urlKey: "url",
     statesType: false,
+    headers: true,
   },
   {
     name: "Windsurf",
@@ -129,6 +190,7 @@ const FILE_CLIENTS: FileClient[] = [
     container: "mcpServers",
     urlKey: "serverUrl",
     statesType: false,
+    headers: true,
   },
   {
     name: "VS Code",
@@ -140,19 +202,64 @@ const FILE_CLIENTS: FileClient[] = [
     container: "servers",
     urlKey: "url",
     statesType: true,
+    headers: true,
   },
 ];
 
 /** What happened for one client, in the order init prints it. */
 export type McpOutcome = {
   client: string;
-  state: "written" | "present" | "failed";
+  /**
+   * `unstamped` is the one that changed nothing on purpose: the client is
+   * connected, its entry predates the install id, and putting one on would
+   * mean taking the entry out and writing it again. The detail is the pair of
+   * commands that does it, for the person whose entry it is (carrick-cloud#890).
+   */
+  state: "written" | "present" | "unstamped" | "failed";
   /** The line to print: the path written, or what to do by hand. */
   detail: string;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Our entry with this machine's install id on it, or null to leave it alone.
+ *
+ * Three things make an existing entry none of our business: a client whose
+ * format has no place to put a header, an entry naming some other host — the
+ * same gate the remover uses — and one that already carries an id, which a
+ * re-run must not churn. Everything else on the entry, every other header
+ * included, is carried through: the id is added to what is there, never
+ * written over it.
+ */
+function stampInstallId(
+  entry: unknown,
+  client: FileClient,
+  installId: string | null,
+): Record<string, unknown> | null {
+  if (!client.headers || installId === null) return null;
+  if (!isRecord(entry) || !isCarrickUrl(entryUrl(entry))) return null;
+  const headers = isRecord(entry["headers"]) ? { ...(entry["headers"] as Record<string, unknown>) } : {};
+  const current = headers[INSTALL_ID_HEADER];
+  if (typeof current === "string" && INSTALL_ID_PATTERN.test(current)) return null;
+  headers[INSTALL_ID_HEADER] = installId;
+  return { ...entry, headers };
+}
+
+/** The document back, with `servers` in the container it came from. */
+function withServers(
+  document: Record<string, unknown>,
+  container: string,
+  servers: Record<string, unknown>,
+): string {
+  const merged: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(document)) {
+    merged[key] = key === container ? servers : value;
+  }
+  if (!(container in merged)) merged[container] = servers;
+  return `${JSON.stringify(merged, null, 2)}\n`;
 }
 
 /**
@@ -164,6 +271,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function mergeServerEntry(
   client: FileClient,
   existing: string | null,
+  installId: string | null = null,
 ): { body: string; state: "written" | "present" } {
   const document: Record<string, unknown> =
     existing === null || existing.trim() === "" ? {} : (JSON.parse(existing) as Record<string, unknown>);
@@ -179,7 +287,15 @@ export function mergeServerEntry(
         ? "servers"
         : client.container;
   const servers = isRecord(document[container]) ? { ...(document[container] as Record<string, unknown>) } : {};
-  if (MCP_NAME in servers) return { body: `${JSON.stringify(document, null, 2)}\n`, state: "present" };
+  if (MCP_NAME in servers) {
+    // Connected already. The one thing still missing from an entry written
+    // before this release is the install id, and adding it is the whole of
+    // what init does to an entry it did not have to create (carrick-cloud#890).
+    const stamped = stampInstallId(servers[MCP_NAME], client, installId);
+    if (stamped === null) return { body: `${JSON.stringify(document, null, 2)}\n`, state: "present" };
+    servers[MCP_NAME] = stamped;
+    return { body: withServers(document, container, servers), state: "written" };
+  }
 
   // The URL key and the type field are read off a sibling where there is one.
   const siblings = Object.values(servers).filter(isRecord);
@@ -196,14 +312,10 @@ export function mergeServerEntry(
   const entry: Record<string, unknown> = statesType
     ? { type: "http", [urlKey]: MCP_URL }
     : { [urlKey]: MCP_URL };
+  if (client.headers && installId !== null) entry["headers"] = { [INSTALL_ID_HEADER]: installId };
 
   servers[MCP_NAME] = entry;
-  const merged: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(document)) {
-    merged[key] = key === container ? servers : value;
-  }
-  if (!(container in merged)) merged[container] = servers;
-  return { body: `${JSON.stringify(merged, null, 2)}\n`, state: "written" };
+  return { body: withServers(document, container, servers), state: "written" };
 }
 
 /**
@@ -216,24 +328,26 @@ export function mergeServerEntry(
  */
 function configureClaudeCode(env: McpEnvironment): McpOutcome | null {
   if (!env.onPath("claude") || !env.exists(path.join(env.home, ".claude"))) return null;
-  // `claude mcp add` refuses a name it already holds, so the read comes first
-  // and a client already connected is left exactly as it is.
-  if (env.run("claude", ["mcp", "get", MCP_NAME]) === 0) {
-    return { client: "Claude Code", state: "present", detail: `already connected as "${MCP_NAME}"` };
+  const installId = env.installId();
+  // `claude mcp add` refuses a name it already holds, so the read comes first.
+  // It is read rather than tested because it also prints the headers on the
+  // entry, which is the only way to tell an entry that predates the install id
+  // from one that carries it.
+  const read = env.capture("claude", ["mcp", "get", MCP_NAME]);
+  if (read.status === 0) {
+    const stamped = read.stdout.includes(INSTALL_ID_HEADER);
+    if (stamped || installId === null || !read.stdout.includes(MCP_HOST)) {
+      return { client: "Claude Code", state: "present", detail: `already connected as "${MCP_NAME}"` };
+    }
+    // Ours, and older than the header. The entry stays exactly as it is: see
+    // `claudeRestampLine` for why this command will not take it out and write
+    // it again on somebody's behalf.
+    return { client: "Claude Code", state: "unstamped", detail: unstampedRepair(installId) };
   }
-  const status = env.run("claude", [
-    "mcp",
-    "add",
-    "--scope",
-    "user",
-    "--transport",
-    "http",
-    MCP_NAME,
-    MCP_URL,
-  ]);
+  const status = env.run("claude", claudeAddArgs(installId));
   return status === 0
     ? { client: "Claude Code", state: "written", detail: "connected for this user" }
-    : { client: "Claude Code", state: "failed", detail: MCP_LINE };
+    : { client: "Claude Code", state: "failed", detail: mcpLine(installId) };
 }
 
 function configureFileClient(env: McpEnvironment, client: FileClient): McpOutcome | null {
@@ -243,7 +357,7 @@ function configureFileClient(env: McpEnvironment, client: FileClient): McpOutcom
   if (!env.exists(directory) && !env.exists(file)) return null;
   const existing = env.readFile(file);
   try {
-    const { body, state } = mergeServerEntry(client, existing);
+    const { body, state } = mergeServerEntry(client, existing, env.installId());
     if (state === "present") {
       return { client: client.name, state: "present", detail: `already in ${file}` };
     }
@@ -287,6 +401,32 @@ export type McpRemoval = {
 function entryUrl(entry: Record<string, unknown>): string | null {
   const url = entry["url"] ?? entry["serverUrl"];
   return typeof url === "string" ? url : null;
+}
+
+/** Whether an entry carries an install id the server would accept. */
+function hasInstallId(entry: unknown): boolean {
+  if (!isRecord(entry) || !isRecord(entry["headers"])) return false;
+  const value = (entry["headers"] as Record<string, unknown>)[INSTALL_ID_HEADER];
+  return typeof value === "string" && INSTALL_ID_PATTERN.test(value);
+}
+
+/**
+ * What is said about an entry with no install id, and what to do about it.
+ *
+ * An entry written before this release answers questions perfectly well; the
+ * only thing wrong with it is that nothing it asks can be attributed to this
+ * machine. For a client whose file is merged in place, the repair is the setup
+ * command. For Claude Code, whose entry can only be stamped by writing it
+ * again, it is the pair of commands that does that — printed, never run
+ * (`claudeRestampLine`). A machine with no id yet is told to run the setup,
+ * because that is what mints one.
+ */
+const UNSTAMPED = "MCP entry has no install id; run carrick init";
+
+function unstampedRepair(installId: string | null): string {
+  return installId === null
+    ? UNSTAMPED
+    : `MCP entry has no install id. To add it: ${claudeRestampLine(installId)}`;
 }
 
 /** Whether a URL points at the Carrick MCP server this package installs. */
@@ -407,13 +547,16 @@ function disconnectFileClient(env: McpEnvironment, client: FileClient): McpRemov
 export type McpInspection = {
   client: string;
   /**
-   * `connected` — an entry naming this server's host. `elsewhere` — an entry
+   * `connected` — an entry naming this server's host, carrying this machine's
+   * install id. `unstamped` — the same entry without the id: it works, and
+   * nothing it asks can be told apart from every other machine's, which is the
+   * drift `carrick init` repairs (carrick-cloud#890). `elsewhere` — an entry
    * called `carrick` pointing somewhere else, which is somebody else's and the
    * reason a reader gets no Carrick answers in that client. `absent` — this
    * client is on the machine and has no entry. `unreadable` — its file is not
    * JSON, or its own command would not answer.
    */
-  state: "connected" | "absent" | "elsewhere" | "unreadable";
+  state: "connected" | "absent" | "elsewhere" | "unstamped" | "unreadable";
   detail: string;
 };
 
@@ -440,6 +583,9 @@ export function inspectMcpClients(env: McpEnvironment = realEnvironment()): McpI
         state: "elsewhere",
         detail: `"${MCP_NAME}" there does not point at ${MCP_HOST}`,
       });
+    } else if (!read.stdout.includes(INSTALL_ID_HEADER)) {
+      // Read, never minted: `carrick doctor` runs this one.
+      found.push({ client: "Claude Code", state: "unstamped", detail: unstampedRepair(env.storedInstallId()) });
     } else {
       found.push({ client: "Claude Code", state: "connected", detail: MCP_URL });
     }
@@ -481,6 +627,10 @@ export function inspectMcpClients(env: McpEnvironment = realEnvironment()): McpI
         state: "elsewhere",
         detail: `"${MCP_NAME}" in ${file} points at ${url ?? "no URL"}`,
       });
+      continue;
+    }
+    if (client.headers && !hasInstallId(entry)) {
+      found.push({ client: client.name, state: "unstamped", detail: UNSTAMPED });
       continue;
     }
     found.push({ client: client.name, state: "connected", detail: url ?? MCP_URL });

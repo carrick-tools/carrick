@@ -35,7 +35,8 @@ import { spawnSync } from "node:child_process";
 import { status as runStatus } from "../cli.ts";
 import { nativeEnv, resolveNativeBinary } from "../native.ts";
 import { DEFAULTS, renderTemplate, TEMPLATE_PATHS } from "../templates.ts";
-import { inspectMcpClients, MCP_LINE, type McpInspection } from "./mcp.ts";
+import { inspectMcpClients, mcpLine, type McpInspection } from "./mcp.ts";
+import { readInstallId } from "./install-id.ts";
 import { createOutput, DOCS, type InitOutput } from "./output.ts";
 import { repoRoots } from "./repos.ts";
 import {
@@ -611,6 +612,10 @@ export function checkMcp(inspections: McpInspection[]): Line[] {
   }
   const lines: Line[] = [];
   const connected: string[] = [];
+  // Read, never created: this command writes nothing, so a machine that has
+  // never run `carrick init` is told the line without an id rather than given
+  // one as a side effect of being inspected.
+  const byHand = mcpLine(readInstallId());
   for (const client of inspections) {
     if (client.state === "connected") {
       connected.push(client.client);
@@ -619,7 +624,7 @@ export function checkMcp(inspections: McpInspection[]): Line[] {
     if (client.state === "absent") {
       lines.push(
         warn(
-          `${client.client} is on this machine and is not connected to Carrick (${client.detail}), so it answers nothing across your repos. \`carrick init\` connects it; by hand it is \`${MCP_LINE}\`.`,
+          `${client.client} is on this machine and is not connected to Carrick (${client.detail}), so it answers nothing across your repos. \`carrick init\` connects it; by hand it is \`${byHand}\`.`,
         ),
       );
       continue;

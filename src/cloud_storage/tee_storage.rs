@@ -129,6 +129,12 @@ impl CloudStorage for TeeStorage {
         self.cloud.uploads_run_logs()
     }
 
+    /// The marker goes to the cloud, which is the only side of the tee that
+    /// holds a scan slot; the local cache has nothing to record it against.
+    async fn report_scan_failed(&self, stage: &str, reason: &str) {
+        self.cloud.report_scan_failed(stage, reason).await;
+    }
+
     async fn post_pr_result(
         &self,
         payload: &crate::findings::PrResultPayload,

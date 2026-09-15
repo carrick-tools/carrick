@@ -2462,7 +2462,9 @@ pub(crate) mod tests {
     }
 
     /// A stub GitHub token endpoint that hands out each token in turn.
-    fn stub_token_endpoint(tokens: Vec<String>) -> (String, std::thread::JoinHandle<()>) {
+    pub(crate) fn stub_token_endpoint(
+        tokens: Vec<String>,
+    ) -> (String, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 

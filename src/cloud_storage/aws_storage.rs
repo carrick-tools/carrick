@@ -233,6 +233,26 @@ fn relogin_message(status: reqwest::StatusCode, body: &str) -> String {
     message
 }
 
+/// The run key, on every cloud request this client makes.
+///
+/// The prompt-lambda calls have sent it since it existed, and the storage and
+/// action calls sent nothing but their credential — so the cloud could see
+/// that a run made 4,000 model calls and could not join that run to the
+/// `check-or-upload` and `store-metadata` rows that say what it did with them
+/// (carrick#1063). Same value on both, from [`crate::logging::run_id`], which
+/// a child process inherits from the parent that drives it.
+const RUN_ID_HEADER: &str = "X-Carrick-Run-Id";
+
+/// The release that made the request. Sent beside the run id for the same
+/// reason the prompt lambdas get it: a behaviour that appeared in one release
+/// is otherwise attributed by guessing at timestamps.
+const SCANNER_VERSION_HEADER: &str = "X-Carrick-Scanner-Version";
+
+/// How long the fail marker waits. A run that is already over should not
+/// hold a terminal open on the way out, and the marker is worth exactly one
+/// short attempt.
+const SCAN_FAILED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct AwsStorage {
     lambda_url: String,
     http_client: Client,
@@ -829,6 +849,8 @@ impl AwsStorage {
                 .http_client
                 .post(&self.lambda_url)
                 .header("Authorization", format!("Bearer {}", token))
+                .header(RUN_ID_HEADER, crate::logging::run_id())
+                .header(SCANNER_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
                 .json(body)
                 .send()
                 .await
@@ -931,6 +953,8 @@ impl AwsStorage {
                 .http_client
                 .post(&self.lambda_url)
                 .header("X-Carrick-OIDC", &token)
+                .header(RUN_ID_HEADER, crate::logging::run_id())
+                .header(SCANNER_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
                 .json(body)
                 .send()
                 .await
@@ -1472,6 +1496,13 @@ impl CloudStorage for AwsStorage {
             action: String,
             repo: String,
             timestamp: String,
+            /// The laptop scan this log belongs to, so the cloud stores it
+            /// against the run rather than against the repository alone: a
+            /// machine that scans the same repo six times a day produces six
+            /// of these, and only the slot tells them apart. Omitted on the
+            /// CI path, where no scan is opened and the body is what it was.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            scan_id: Option<String>,
         }
 
         #[derive(Deserialize)]
@@ -1484,6 +1515,7 @@ impl CloudStorage for AwsStorage {
             action: "upload-logs".to_string(),
             repo: repo.to_string(),
             timestamp,
+            scan_id: self.scan_id(),
         };
 
         let resp: UploadLogsResponse = self.call_lambda_generic(&request.action, &request).await?;
@@ -1492,15 +1524,89 @@ impl CloudStorage for AwsStorage {
         Ok(())
     }
 
-    /// A laptop's debug log stays on the laptop.
+    /// Every run ships its log, laptop runs included (carrick#1063).
     ///
-    /// `upload-logs` is deliberately outside the set of actions a `cli`
-    /// credential may take (§1.2): the log is a 0644 file naming the
-    /// developer's own machine and paths, and shipping it to S3 is a CI
-    /// affordance. Answering here rather than letting the call 403 keeps a
-    /// guaranteed failure out of every laptop run's tail.
+    /// It used to be CI only. The log was a 0644 file naming the developer's
+    /// own machine and logging every dependency at debug, so shipping it was
+    /// a privacy question rather than an observability one — and the answer
+    /// was that a first index which died at minute 66 left the cloud with
+    /// nothing to read. What changed is the file: it now carries this crate's
+    /// debug lines and nobody else's, and the upload path redacts the home
+    /// directory and drops any line naming a credential before a byte leaves
+    /// (`crate::logging::redact_log`). The CI behaviour is exactly what it
+    /// was.
     fn uploads_run_logs(&self) -> bool {
-        !self.auth.is_bearer()
+        true
+    }
+
+    /// Mark this run as dead in the cloud, naming the stage it died in.
+    ///
+    /// Wire contract: the usual check-or-upload envelope,
+    /// `{ action: "scan-failed", scan_id, stage, reason }`, Bearer auth, 200
+    /// `{ ok: true }`. Sent before the log upload, so the marker exists even
+    /// if the log does not.
+    ///
+    /// One attempt, a short timeout and no retry loop: a run that is already
+    /// failing must not spend a backoff ladder on telling anyone so, and a
+    /// marker the cloud never receives costs the same as the nothing that was
+    /// sent before this existed — the slot falls to its TTL. Nothing here can
+    /// change the run's exit code.
+    ///
+    /// Only the laptop path: the CI path opens no scan, so there is no slot to
+    /// mark and no `scan_id` to name it with. And nothing can be sent at all
+    /// when the OS kills the process — a SIGKILL, an OOM, a closed lid — which
+    /// is exactly the case the cloud's own slot TTL still has to cover.
+    async fn report_scan_failed(&self, stage: &str, reason: &str) {
+        let CloudAuth::Bearer(token) = &self.auth else {
+            return;
+        };
+        let Some(scan_id) = self.scan_id() else {
+            return;
+        };
+
+        #[derive(Serialize)]
+        struct ScanFailedRequest<'a> {
+            action: &'a str,
+            scan_id: &'a str,
+            stage: &'a str,
+            reason: &'a str,
+        }
+
+        let request = ScanFailedRequest {
+            action: "scan-failed",
+            scan_id: &scan_id,
+            stage,
+            reason,
+        };
+
+        let sent = self
+            .http_client
+            .post(&self.lambda_url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header(RUN_ID_HEADER, crate::logging::run_id())
+            .header(SCANNER_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
+            .timeout(SCAN_FAILED_TIMEOUT)
+            .json(&request)
+            .send()
+            .await;
+
+        // Debug on every outcome, including the refusals. A cloud deployed
+        // before `scan-failed` existed answers 4xx, and a run that has already
+        // failed must not print a second failure about its own bookkeeping.
+        match sent {
+            Ok(response) if response.status().is_success() => {
+                debug!(scan_id = %scan_id, stage = %stage, "Reported this scan as failed");
+            }
+            Ok(response) => {
+                debug!(
+                    status = %response.status(),
+                    "Carrick Cloud did not record this scan as failed"
+                );
+            }
+            Err(e) => {
+                debug!("Could not report this scan as failed: {e}");
+            }
+        }
     }
 
     async fn post_pr_result(
@@ -2353,6 +2459,184 @@ mod tests {
         assert_eq!(v["unanalysed_files"][0]["reason"], "model_error");
     }
 
+    /// Every cloud request this client makes names its run and its release.
+    ///
+    /// The prompt-lambda calls have carried both since they existed; the
+    /// storage and action calls carried only their credential, so nothing on
+    /// the cloud side could join a `check-or-upload` row to the run that made
+    /// the model calls beside it (carrick#1063). Asserted on the wire, with
+    /// the credential still in place, because the header set is the contract
+    /// and not the builder call that produces it.
+    #[tokio::test]
+    async fn a_laptop_request_names_its_run_and_its_release() {
+        let (storage, server) = bearer_storage(vec![check_ok()]);
+
+        storage.health_check().await.unwrap();
+
+        let request = &server.join().unwrap()[0];
+        assert!(
+            has_header(request, "authorization", "Bearer carrick_sk_live_test"),
+            "{request}"
+        );
+        assert_eq!(
+            header_of(request, RUN_ID_HEADER).as_deref(),
+            Some(crate::logging::run_id()),
+            "{request}"
+        );
+        assert_eq!(
+            header_of(request, SCANNER_VERSION_HEADER).as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "{request}"
+        );
+    }
+
+    /// The same two headers on the CI branch, where the credential is the
+    /// minted OIDC token rather than a bearer secret. Serialised because the
+    /// provider reads the runner's variables out of the process environment
+    /// and is a process-global once it has.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_ci_request_names_its_run_and_its_release() {
+        let issued = crate::oidc::tests::jwt_with_exp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600,
+        );
+        let (token_url, token_server) =
+            crate::agent_service::tests::stub_token_endpoint(vec![issued.clone()]);
+        // SAFETY: a `#[serial]` test, and the provider is read once per
+        // process — nothing else in this binary asks for it.
+        unsafe {
+            std::env::set_var("ACTIONS_ID_TOKEN_REQUEST_URL", &token_url);
+            std::env::set_var("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runner-secret");
+        }
+
+        let (base, server) = crate::agent_service::tests::stub_server(vec![check_ok()]);
+        let storage = AwsStorage::for_test(
+            &format!("{base}/types/check-or-upload"),
+            CloudAuth::Oidc,
+            false,
+        );
+        storage.health_check().await.unwrap();
+
+        let request = &server.join().unwrap()[0];
+        token_server.join().unwrap();
+        assert!(has_header(request, "x-carrick-oidc", &issued), "{request}");
+        assert_eq!(
+            header_of(request, RUN_ID_HEADER).as_deref(),
+            Some(crate::logging::run_id()),
+            "{request}"
+        );
+        assert_eq!(
+            header_of(request, SCANNER_VERSION_HEADER).as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "{request}"
+        );
+    }
+
+    /// One header value off a raw request, as the prompt-lambda tests read
+    /// theirs.
+    fn header_of(request: &str, name: &str) -> Option<String> {
+        request.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+    }
+
+    /// The fail marker's wire shape (carrick#1063): the check-or-upload
+    /// envelope with `scan-failed`, the slot, the stage and the reason, under
+    /// the laptop credential.
+    #[tokio::test]
+    async fn a_dead_laptop_scan_marks_its_slot_with_the_stage_it_died_in() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![(200, serde_json::json!({ "ok": true }).to_string())],
+            "scan_01J",
+        );
+
+        storage
+            .report_scan_failed("file_analysis", "the sidecar stopped answering")
+            .await;
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        let body = body_of(&requests[0]);
+        assert_eq!(body["action"], "scan-failed");
+        assert_eq!(body["scan_id"], "scan_01J");
+        assert_eq!(body["stage"], "file_analysis");
+        assert_eq!(body["reason"], "the sidecar stopped answering");
+        assert!(
+            has_header(&requests[0], "authorization", "Bearer carrick_sk_live_test"),
+            "{}",
+            requests[0]
+        );
+    }
+
+    /// A cloud deployed before `scan-failed` existed answers 4xx, and the run
+    /// carries on: the marker is bookkeeping about a failure, never a second
+    /// failure of its own. One attempt, so the refusal is not retried either.
+    #[tokio::test]
+    async fn a_refused_fail_marker_is_swallowed_and_never_retried() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![(404, r#"{"message":"Not Found"}"#.to_string())],
+            "scan_01J",
+        );
+
+        storage.report_scan_failed("upload", "nothing landed").await;
+
+        assert_eq!(server.join().unwrap().len(), 1, "the marker was retried");
+    }
+
+    /// The CI path opens no scan, so there is no slot to mark and nothing to
+    /// name it with. Asserted as silence on the wire, because a request with
+    /// no `scan_id` is one the cloud would have to reject.
+    #[tokio::test]
+    async fn a_ci_run_sends_no_fail_marker() {
+        let ci = AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Oidc, false);
+        // Nothing is listening on that port: reaching the network at all would
+        // hang or error, and this returns instead.
+        ci.report_scan_failed("upload", "whatever").await;
+
+        // The same for a laptop credential that never opened a scan — the
+        // failure came before `start-scan` answered.
+        let unopened =
+            AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Bearer("t".into()), false);
+        unopened.report_scan_failed("discovery", "no remote").await;
+    }
+
+    /// A laptop run's log now ships, and it carries the scan it belongs to —
+    /// without which a machine that scans the same repo six times a day
+    /// produces six logs nothing can tell apart (carrick#1063).
+    #[tokio::test]
+    async fn a_laptop_log_upload_names_its_scan() {
+        // The S3 stand-in first, so the action's response can name it: the
+        // PUT that follows must land somewhere that answers, or the upload
+        // spends its whole backoff ladder inside this test.
+        let (s3_base, s3) = crate::agent_service::tests::stub_server(vec![(200, String::new())]);
+        let (storage, server) = bearer_storage_in_scan(
+            vec![(
+                200,
+                serde_json::json!({ "uploadUrl": format!("{s3_base}/logs/k"), "s3Key": "k" })
+                    .to_string(),
+            )],
+            "scan_01J",
+        );
+        assert!(storage.uploads_run_logs());
+
+        storage.upload_logs("api", "a line").await.unwrap();
+
+        let requests = server.join().unwrap();
+        let put = &s3.join().unwrap()[0];
+        assert!(put.starts_with("PUT /logs/k"), "{put}");
+        let body = body_of(&requests[0]);
+        assert_eq!(body["action"], "upload-logs");
+        assert_eq!(body["repo"], "api");
+        assert_eq!(body["scan_id"], "scan_01J");
+        assert!(body.get("timestamp").is_some(), "{body}");
+    }
+
     /// `unanalysed_files` is a laptop field. CI's own gate already aborts the
     /// run before the upload, so sending the list there would offer the cloud
     /// a decision it must not be asked to make — and would answer a CI caller
@@ -2365,13 +2649,15 @@ mod tests {
         assert!(ci.uploads_run_logs());
     }
 
-    /// A laptop's debug log names the developer's own machine, and
-    /// `upload-logs` is outside what a `cli` credential may do (§1.2).
+    /// Both credentials ship their run log now (carrick#1063). The laptop's
+    /// is the one that was missing, and it is the one anyone needed.
     #[test]
-    fn a_laptop_run_does_not_ship_its_debug_log() {
+    fn every_run_ships_its_debug_log() {
         let laptop =
             AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Bearer("t".into()), false);
-        assert!(!laptop.uploads_run_logs());
+        assert!(laptop.uploads_run_logs());
+        let ci = AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Oidc, false);
+        assert!(ci.uploads_run_logs());
     }
 
     /// `start-scan` keys on the full `owner/repo`, and a clone with no GitHub

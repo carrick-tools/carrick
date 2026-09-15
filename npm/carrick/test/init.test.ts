@@ -30,6 +30,7 @@ import {
   configuredLine,
   connectedLine,
   mcpClientLines,
+  mcpUnstampedLines,
   packagesLine,
   parseArgs,
   init,
@@ -547,13 +548,23 @@ test("the executable CLI accepts the named assignment on repeated init", posixNa
       // the scaffold tool, which carries the instructions (cloud#832).
       assert.ok(result.stdout.includes(SCAFFOLD_SENTENCE), result.stdout);
       // No agent client under this fixture's home, so the MCP step states the
-      // line rather than claiming a connection.
+      // line rather than claiming a connection. The line carries this
+      // machine's install id, which the run has just minted
+      // (carrick-cloud#890).
+      const installId = fs.readFileSync(path.join(fixture.root, "home", ".carrick", "install-id"), "utf8").trim();
+      assert.match(installId, /^[A-Za-z0-9_-]{8,64}$/);
       assert.ok(
         result.stdout.includes(
-          "▲ No agent client found on this machine. In Claude Code: claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp",
+          "▲ No agent client found on this machine. In Claude Code: claude mcp add --scope user " +
+            `--transport http carrick https://api.carrick.tools/mcp --header "X-Carrick-Install-Id: ${installId}"`,
         ),
         result.stdout,
       );
+      if (process.platform !== "win32") {
+        // Nobody else's to read: it is this machine's name, not a shared one.
+        const mode = fs.statSync(path.join(fixture.root, "home", ".carrick", "install-id")).mode & 0o777;
+        assert.equal(mode, 0o600);
+      }
     }
   } finally {
     fixture.cleanup();
@@ -1269,6 +1280,33 @@ test("the setup line names the clients this run changed, and no others", () => {
   ];
   assert.equal(configuredLine(machine), "Claude Code hooks and MCP configured (restart the client)");
   assert.deepEqual(mcpClientLines(machine), ["MCP added for Cursor: /home/.cursor/mcp.json"]);
+});
+
+// A client connected before the install id existed. `carrick init` does not
+// take somebody's Claude Code entry out and write it again — that would lose
+// whatever else is on it and send the next session back through the server's
+// OAuth — so it states the pair that does it and changes nothing
+// (carrick-cloud#890).
+test("an entry with no install id is one warning, and the commands that fix it", () => {
+  const add =
+    'claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp ' +
+    '--header "X-Carrick-Install-Id: 11111111-2222-4333-8444-555555555555"';
+  const mcp = [
+    {
+      client: "Claude Code",
+      state: "unstamped",
+      detail: `MCP entry has no install id. To add it: claude mcp remove --scope user carrick && ${add}`,
+    } as const,
+    { client: "Cursor", state: "written", detail: "/home/.cursor/mcp.json" } as const,
+  ];
+  assert.deepEqual(mcpUnstampedLines(mcp), [
+    "Claude Code: MCP entry has no install id. To add it: " +
+      `claude mcp remove --scope user carrick && ${add}`,
+  ]);
+  // Nothing was configured for Claude Code, so the setup line does not say it
+  // was, and the client is not counted among the files this run wrote.
+  assert.equal(configuredLine(mcp), "Claude Code hooks configured");
+  assert.deepEqual(mcpClientLines(mcp), ["MCP added for Cursor: /home/.cursor/mcp.json"]);
 });
 
 test("the connected repos are one line however many there are", () => {
