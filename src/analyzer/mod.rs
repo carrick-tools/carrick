@@ -282,6 +282,20 @@ pub struct ApiEndpointDetails {
     /// index, and read by matching.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch: Option<crate::dispatch::Dispatch>,
+    /// On a GraphQL CALL entry: which schema identity the document it was
+    /// parsed from is bound to (carrick#1134). `served` when a schema a
+    /// service in this repository serves holds the document's fields, so an
+    /// operation no producer has is a real missing operation; `no_local_schema`
+    /// when no schema this repository holds has any of them, so the server may
+    /// be a repository the project does not index. Documents bound to an
+    /// external schema, or unresolved, are not call entries at all.
+    ///
+    /// `None` on every other entry (HTTP, socket, pub/sub, endpoints) and on
+    /// every blob written before the field existed. Nothing in the scanner's
+    /// own matching reads it; the cloud grades an unmatched GraphQL call by it
+    /// (cloud#946). Wire path: `calls[].schema_binding`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_binding: Option<crate::graphql::SchemaBinding>,
 }
 
 pub struct ApiAnalysisResult {
@@ -4071,6 +4085,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         }
     }
 
@@ -4432,6 +4447,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         });
 
         // 2. Unclassified env var (not in internal/external list)
@@ -4451,6 +4467,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         });
 
         // 3. Process.env pattern (should be detected as env var)
@@ -4470,6 +4487,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         });
 
         // 4. Raw code pattern with UPPERCASE var (common in legacy code)
@@ -4490,6 +4508,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         });
 
         let mount_graph = MountGraph::new(); // Empty graph
@@ -4565,6 +4584,7 @@ mod tests {
                 provenance: Default::default(),
                 resolution_source: None,
                 dispatch: None,
+                schema_binding: None,
             });
         }
 
@@ -4634,6 +4654,7 @@ mod tests {
                 provenance: Default::default(),
                 resolution_source: None,
                 dispatch: None,
+                schema_binding: None,
             });
         }
 
@@ -4682,6 +4703,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -4768,6 +4790,7 @@ mod tests {
                 provenance: Default::default(),
                 resolution_source: consumer_source,
                 dispatch: None,
+                schema_binding: None,
             });
 
             let mut mount_graph = MountGraph::new();
@@ -4846,6 +4869,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: Some(ResolutionSource::ImportedMember),
             dispatch: None,
+            schema_binding: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -4992,6 +5016,7 @@ mod tests {
                 provenance: Default::default(),
                 resolution_source: None,
                 dispatch: value.map(&case),
+                schema_binding: None,
             });
         };
         call(Some("search-by-intent"), 115);
@@ -5068,6 +5093,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -5128,6 +5154,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -5188,6 +5215,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -5248,6 +5276,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         });
 
         let mut mount_graph = MountGraph::new();

@@ -3107,6 +3107,7 @@ fn append_deterministic_protocol_operations(
         // event are already identified by their own name, and nothing
         // switches on a request field to reach them.
         dispatch: None,
+        schema_binding: None,
     };
 
     let graphql = &extractions.graphql;
@@ -3122,12 +3123,12 @@ fn append_deterministic_protocol_operations(
                 .iter()
                 .map(|op| to_details(op.key.clone(), &op.file_path, op.line)),
         );
-        cloud_data.calls.extend(
-            graphql
-                .consumers
-                .iter()
-                .map(|op| to_details(op.key.clone(), &op.file_path, op.line)),
-        );
+        cloud_data
+            .calls
+            .extend(graphql.consumers.iter().map(|op| ApiEndpointDetails {
+                schema_binding: op.schema_binding,
+                ..to_details(op.key.clone(), &op.file_path, op.line)
+            }));
     }
 
     let sockets = &extractions.sockets;
@@ -7128,6 +7129,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         };
 
         let mut graph = MountGraph::new();
@@ -7405,6 +7407,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         };
 
         let test_data = CloudRepoData {
@@ -7547,6 +7550,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         };
 
         let test_data = vec![CloudRepoData {
@@ -9792,6 +9796,7 @@ mod tests {
             response_type_source: None,
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
+            schema_binding: None,
         }
     }
 
@@ -9816,6 +9821,7 @@ mod tests {
             response_type_source: None,
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
+            schema_binding: None,
         }
     }
 
@@ -10040,6 +10046,7 @@ mod tests {
             response_type_source: None,
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
+            schema_binding: None,
         }
     }
 
@@ -11267,6 +11274,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         };
         append_pubsub_operations(
             &mut cloud_data,
