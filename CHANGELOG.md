@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.70](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.69...carrick-v0.3.70) (2026-09-15)
+
+
+### Bug Fixes
+
+* **agent:** drop the analyze-file retry the result cache always answers ([#1082](https://github.com/carrick-tools/carrick/issues/1082)) ([ff2b404](https://github.com/carrick-tools/carrick/commit/ff2b4047f968473ea8cad49eadebc0d8c4069a73)), closes [#1071](https://github.com/carrick-tools/carrick/issues/1071)
+* **agent:** honour Retry-After and number attempts for the lambda's retry budget ([#1075](https://github.com/carrick-tools/carrick/issues/1075)) ([995f2c0](https://github.com/carrick-tools/carrick/commit/995f2c02af454cdec50d4558be73456118b58f57))
+* **agent:** release the concurrency slot while a call waits out a retry ([#1081](https://github.com/carrick-tools/carrick/issues/1081)) ([4a3e609](https://github.com/carrick-tools/carrick/commit/4a3e6099595a4d36fcc7f1a8ede0e33243939fda)), closes [#1077](https://github.com/carrick-tools/carrick/issues/1077)
+* **deps:** bump rustls to 0.23.45 for RUSTSEC-2026-0285 ([#1083](https://github.com/carrick-tools/carrick/issues/1083)) ([9579d1b](https://github.com/carrick-tools/carrick/commit/9579d1bd48c8726e9ede0ec27375f1ad70906676))
+* **engine:** keep a dirty tree's cached answers for the files it did not touch ([#1085](https://github.com/carrick-tools/carrick/issues/1085)) ([6c93110](https://github.com/carrick-tools/carrick/commit/6c931104e5aeb974e13f19e3253fe316d74f2497)), closes [#1079](https://github.com/carrick-tools/carrick/issues/1079)
+
+
+### Performance
+
+* **engine:** run function intents beside file analysis, default depth 20 ([#1074](https://github.com/carrick-tools/carrick/issues/1074)) ([ef3baba](https://github.com/carrick-tools/carrick/commit/ef3babafbb2a59d0d64a8bb7b69cd1b9e7651a3d))
+* **intents:** describe up to 20 functions per generate-intent request ([#1064](https://github.com/carrick-tools/carrick/issues/1064)) ([#1089](https://github.com/carrick-tools/carrick/issues/1089)) ([fd76c88](https://github.com/carrick-tools/carrick/commit/fd76c88be4f6eb2aa63e1f9142f8f693faed67e5))
+
 ## [0.3.69](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.68...carrick-v0.3.69) (2026-09-14)
 
 
