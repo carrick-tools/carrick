@@ -1,0 +1,8 @@
+type Query {
+  balance: Int!
+  statements: [Statement!]!
+}
+
+type Statement {
+  id: ID!
+}

@@ -1,0 +1,9 @@
+{
+  "name": "ledger-api",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "graphql": "^16.9.0",
+    "hono": "^4.6.0"
+  }
+}
