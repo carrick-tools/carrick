@@ -115,14 +115,14 @@ export function resolveAnchor(
       ? args.siblingSymbolSpecs?.get(text)
       : undefined;
     // carrick#1165: literal text is printed elsewhere (the v1 walk) and can
-    // name a type by a bare identifier that nothing declares where the surface
-    // declares the alias. The stub then self-checks such a name as an error
-    // placeholder, which no walk flags. A name a sibling symbol anchor
-    // imports is resolved by that import.
+    // name a type by a bare identifier that nothing in the program declares
+    // (a generated model that was never generated). The stub then self-checks
+    // such a name as an error placeholder, which no walk flags. A name a
+    // sibling symbol anchor imports is resolved by that import.
     const undeclaredNames =
       siblingSpec || !args.placeholder
         ? []
-        : undeclaredNamesInText(text, checker, args.placeholder);
+        : undeclaredNamesInText(text, program, args.placeholder);
     return {
       request,
       aliasText: siblingSpec ? `import('${siblingSpec}').${text}` : text,
@@ -390,7 +390,7 @@ function finishInferAnchor(
 /** `undeclaredNamesIn` over type text rather than a built node. */
 function undeclaredNamesInText(
   text: string,
-  checker: ts.TypeChecker,
+  program: ts.Program,
   destination: ts.Node
 ): string[] {
   const parsed = ts.createSourceFile(
@@ -401,7 +401,7 @@ function undeclaredNamesInText(
   );
   const statement = parsed.statements[0];
   if (!statement || !ts.isTypeAliasDeclaration(statement)) return [];
-  return undeclaredNamesIn(statement.type, checker, destination);
+  return undeclaredNamesIn(statement.type, program, destination);
 }
 
 /**

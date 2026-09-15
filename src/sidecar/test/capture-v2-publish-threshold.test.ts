@@ -28,6 +28,8 @@ import type { CaptureAliasRecord } from '../src/capture/api.js';
 const ROUTE = 'src/parcels/route.ts';
 const VIEWS = 'src/parcels/views.ts';
 const CLEAN = 'src/parcels/clean.ts';
+const MODEL = 'src/parcels/model.ts';
+const STATUS_ROUTE = 'src/parcels/status-route.ts';
 
 const FILES: Record<string, string> = {
   'tsconfig.json': JSON.stringify({
@@ -79,6 +81,30 @@ const FILES: Record<string, string> = {
     '}',
     '',
   ].join('\n'),
+  // Declared in the project, so a healthy checkout resolves both. The v1 walk
+  // prints an enum member and a recursive reference by name, so literal text
+  // printed from the route file names them without importing them where the
+  // surface declares the alias.
+  [MODEL]: [
+    "export enum ParcelStatus { Open = 'open', Closed = 'closed' }",
+    '',
+    'export interface ParcelTree {',
+    '  id: string;',
+    '  children: ParcelTree[];',
+    '}',
+    '',
+  ].join('\n'),
+  // Reached by no other anchor: only the literal anchor's `source_file` puts
+  // it (and the model it imports) in the capture's program.
+  [STATUS_ROUTE]: [
+    "import { ParcelStatus, type ParcelTree } from './model';",
+    '',
+    'export function readStatus(tree: ParcelTree) {',
+    '  const status = { status: ParcelStatus.Open as ParcelStatus, tree };',
+    '  return status;',
+    '}',
+    '',
+  ].join('\n'),
 };
 
 function lineOf(source: string, text: string): number {
@@ -125,6 +151,14 @@ describe('capture record carries what an answer cannot resolve (#1165)', () => {
           alias: 'Endpoint_literal_Response',
           type_text: '{ manifest: ManifestRow; issued: Date; items: Array<LineRow>; }',
           anchor_origin: 'deterministic-infer',
+        },
+        {
+          kind: 'literal',
+          alias: 'Endpoint_declared_Response',
+          type_text:
+            '{ status: ParcelStatus.Closed | ParcelStatus.Open; tree: { id: string; children: ParcelTree[]; }; }',
+          anchor_origin: 'deterministic-infer',
+          source_file: STATUS_ROUTE,
         },
         {
           kind: 'literal',
@@ -194,6 +228,16 @@ describe('capture record carries what an answer cannot resolve (#1165)', () => {
     const record = records.get('Endpoint_sibling_Response');
     assert.strictEqual(record?.self_check, 'decayed_internal', JSON.stringify(record));
     assert.deepStrictEqual(record?.dangling_specifiers, ['../generated/client']);
+  });
+
+  it('does not record a name the project declares, even out of scope at the surface', () => {
+    // A healthy checkout: the enum and the recursive interface exist, the
+    // literal text only names them bare. Withholding every row that touches
+    // an enum or a recursive type would lose correct rows, not refuse wrong
+    // ones.
+    const record = records.get('Endpoint_declared_Response');
+    assert.strictEqual(record?.undeclared_names, undefined, JSON.stringify(record));
+    assert.strictEqual(record?.source_file, '<inline>', 'the answer is still the text');
   });
 
   it('records neither for aliases that resolve, globals included', () => {

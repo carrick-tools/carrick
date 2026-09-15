@@ -186,56 +186,120 @@ export function printTypeForDestination(
     node,
     destination.getSourceFile()
   );
-  const undeclaredNames = undeclaredNamesIn(node, checker, destination);
+  const undeclaredNames = undeclaredNamesIn(node, program, destination);
   return { text, inaccessible, ...(undeclaredNames.length > 0 ? { undeclaredNames } : {}) };
 }
 
 /**
- * Bare names in a printed type node that resolve to nothing at `destination`
- * (carrick#1165).
+ * Bare names in a printed type node that nothing in the producer's program
+ * declares (carrick#1165).
  *
  * The builder names an out-of-scope declaration through `import("...")`, and
  * the tracker demotes a symbol it cannot reach, so a bare reference is meant
  * to be in scope where the alias is declared. The one way it is not: the
  * builder REUSES a source annotation as written (`parcel: Row`) when the
  * annotation's import did not resolve. There is then no symbol to track, and
- * the surface names an identifier nothing declares. Resolving each bare name
- * at the destination, in the producer's own program, finds exactly those while
- * leaving every global the program knows (lib, runtime and `@types` globals)
- * alone. Type parameters the print itself declares (generic signatures,
- * mapped and `infer` types) are excluded. Also run over literal anchor text,
- * which the v1 walk printed and which can name a type the same way.
+ * the surface names an identifier nothing declares. Literal anchor text, which
+ * the v1 walk printed, can name a type the same way.
+ *
+ * A name is listed only when it neither resolves at the destination (every
+ * lib, runtime and `@types` global does) nor has a declaration anywhere in the
+ * program. The second test matters on a healthy checkout: the v1 walk prints
+ * an enum member (`Status.Open`) or a recursive reference by name, and that
+ * name is declared in the project though not in scope at the surface. An
+ * import binding is not a declaration, so a name whose only source is an
+ * import that did not resolve is still listed. Type parameters the print
+ * itself declares (generic signatures, mapped and `infer` types) are excluded.
  */
 export function undeclaredNamesIn(
   node: ts.TypeNode,
-  checker: ts.TypeChecker,
+  program: ts.Program,
   destination: ts.Node
 ): string[] {
+  const checker = program.getTypeChecker();
   const typeParameters = new Set<string>();
-  const references: Array<{ name: string; meaning: ts.SymbolFlags }> = [];
   const leftmost = (name: ts.EntityName): ts.Identifier =>
     ts.isIdentifier(name) ? name : leftmost(name.left);
+  const references: Array<{ name: string; space: 'types' | 'values' }> = [];
   const visit = (current: ts.Node): void => {
     if (ts.isTypeParameterDeclaration(current)) {
       typeParameters.add(current.name.text);
     } else if (ts.isTypeReferenceNode(current)) {
-      references.push({
-        name: leftmost(current.typeName).text,
-        meaning: ts.SymbolFlags.Type | ts.SymbolFlags.Namespace | ts.SymbolFlags.Alias,
-      });
+      references.push({ name: leftmost(current.typeName).text, space: 'types' });
     } else if (ts.isTypeQueryNode(current)) {
-      references.push({
-        name: leftmost(current.exprName).text,
-        meaning: ts.SymbolFlags.Value | ts.SymbolFlags.Namespace | ts.SymbolFlags.Alias,
-      });
+      references.push({ name: leftmost(current.exprName).text, space: 'values' });
     }
     ts.forEachChild(current, visit);
   };
   visit(node);
   const undeclared = new Set<string>();
-  for (const { name, meaning } of references) {
+  for (const { name, space } of references) {
     if (typeParameters.has(name) || undeclared.has(name)) continue;
-    if (!checker.resolveName(name, destination, meaning, false)) undeclared.add(name);
+    const meaning =
+      (space === 'types' ? ts.SymbolFlags.Type : ts.SymbolFlags.Value) |
+      ts.SymbolFlags.Namespace |
+      ts.SymbolFlags.Alias;
+    if (checker.resolveName(name, destination, meaning, false)) continue;
+    if (declaredNamesOf(program)[space].has(name)) continue;
+    undeclared.add(name);
   }
   return [...undeclared].sort();
+}
+
+interface DeclaredNames {
+  /** Names usable as the leftmost part of a type reference. */
+  types: Set<string>;
+  /** Names usable as the leftmost part of a `typeof` query. */
+  values: Set<string>;
+}
+
+const declaredNamesCache = new WeakMap<ts.Program, DeclaredNames>();
+
+/**
+ * Every name a declaration in the program introduces, split by the space it
+ * can be referenced from: at any depth of a source file and at any namespace
+ * depth of a declaration file. Import bindings are left out on purpose (see
+ * `undeclaredNamesIn`). Built once per program.
+ */
+function declaredNamesOf(program: ts.Program): DeclaredNames {
+  const cached = declaredNamesCache.get(program);
+  if (cached) return cached;
+  const names: DeclaredNames = { types: new Set(), values: new Set() };
+  const record = (name: ts.Node | undefined, types: boolean, values: boolean): void => {
+    if (!name || !ts.isIdentifier(name)) return;
+    if (types) names.types.add(name.text);
+    if (values) names.values.add(name.text);
+  };
+  const visit = (current: ts.Node, deep: boolean): void => {
+    if (ts.isInterfaceDeclaration(current) || ts.isTypeAliasDeclaration(current)) {
+      record(current.name, true, false);
+    } else if (
+      ts.isClassDeclaration(current) ||
+      ts.isEnumDeclaration(current) ||
+      ts.isModuleDeclaration(current)
+    ) {
+      // A namespace can qualify a type reference (`Ns.Row`) and a query.
+      record(current.name, true, true);
+    } else if (ts.isFunctionDeclaration(current) || ts.isVariableDeclaration(current)) {
+      record(current.name, false, true);
+    }
+    // A declaration file has no bodies to hide a declaration in, so its
+    // statement lists (and namespace blocks) are the whole story; a lib or
+    // package file is walked no deeper than that.
+    if (
+      deep ||
+      ts.isSourceFile(current) ||
+      ts.isModuleDeclaration(current) ||
+      ts.isModuleBlock(current) ||
+      ts.isVariableStatement(current) ||
+      ts.isVariableDeclarationList(current)
+    ) {
+      ts.forEachChild(current, (child) => visit(child, deep));
+    }
+  };
+  for (const sourceFile of program.getSourceFiles()) {
+    visit(sourceFile, !sourceFile.isDeclarationFile);
+  }
+  declaredNamesCache.set(program, names);
+  return names;
 }

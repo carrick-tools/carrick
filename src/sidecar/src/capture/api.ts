@@ -64,6 +64,13 @@ export interface LiteralAnchorRequest {
   /** Verbatim TS type text (a bare symbol name or an inline object type). */
   type_text: string;
   anchor_origin: AnchorOrigin;
+  /**
+   * Repo-root-relative file the text was printed from, when there is one.
+   * It joins the analysis program, so a name the text prints bare (an enum
+   * member, a recursive reference) is found declared (carrick#1165). The
+   * record's `source_file` stays `<inline>`: the answer is still the text.
+   */
+  source_file?: string;
 }
 
 /**

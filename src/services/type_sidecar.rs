@@ -242,6 +242,13 @@ pub enum CaptureAnchor {
         alias: String,
         type_text: String,
         anchor_origin: AnchorOrigin,
+        /// The file the text was printed from, when there is one (a v1
+        /// inference result, or a backfill replacing a located anchor). The
+        /// capture adds it to its analysis program, so a name the text prints
+        /// bare (an enum member, a recursive reference) is found declared
+        /// rather than recorded undeclared (#1165). LLM inline text has none.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_file: Option<String>,
     },
 }
 
@@ -252,6 +259,16 @@ impl CaptureAnchor {
             | CaptureAnchor::HandlerReturn { alias, .. }
             | CaptureAnchor::Infer { alias, .. }
             | CaptureAnchor::Literal { alias, .. } => alias,
+        }
+    }
+
+    /// Repo-relative file the anchor reads from, if it has one.
+    pub fn source_file(&self) -> Option<&str> {
+        match self {
+            CaptureAnchor::Symbol { source_file, .. }
+            | CaptureAnchor::HandlerReturn { source_file, .. }
+            | CaptureAnchor::Infer { source_file, .. } => Some(source_file),
+            CaptureAnchor::Literal { source_file, .. } => source_file.as_deref(),
         }
     }
 }
@@ -2143,10 +2160,21 @@ mod tests {
             alias: "C".into(),
             type_text: "{ id: string }".into(),
             anchor_origin: AnchorOrigin::LlmSymbol,
+            source_file: None,
         };
         let json = serde_json::to_string(&literal).unwrap();
         assert!(json.contains(r#""kind":"literal""#));
         assert!(json.contains(r#""type_text":"{ id: string }""#));
+        assert!(!json.contains("source_file"));
+
+        let located = CaptureAnchor::Literal {
+            alias: "D".into(),
+            type_text: "{ status: Status }".into(),
+            anchor_origin: AnchorOrigin::DeterministicInfer,
+            source_file: Some("src/routes.ts".into()),
+        };
+        let json = serde_json::to_string(&located).unwrap();
+        assert!(json.contains(r#""source_file":"src/routes.ts""#));
     }
 
     /// Check-pair wire shapes: lowercase protocol/type_kind enums, and the
