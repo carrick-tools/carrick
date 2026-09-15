@@ -30,7 +30,10 @@
  */
 
 import { type Node, type Symbol, type Type, ts } from 'ts-morph';
-import { canonicalizeUnionsInText } from './type-text-canonicalizer.js';
+import {
+  canonicalizeUnionsInText,
+  foldBooleanLiterals,
+} from './type-text-canonicalizer.js';
 
 /**
  * Bound on the structural-expansion recursion. Deep enough for every realistic
@@ -309,9 +312,9 @@ function orderMembers(
   members: Type[],
   render: (member: Type) => string,
 ): string[] {
-  const rendered = members.map((member, index) => ({
+  const rendered = foldBooleanLiterals(members.map(render)).map((text, index) => ({
     index,
-    text: render(member),
+    text,
   }));
   rendered.sort((a, b) => {
     if (a.text !== b.text) return a.text < b.text ? -1 : 1;

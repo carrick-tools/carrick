@@ -329,6 +329,36 @@ pub struct CaptureAliasRecord {
     /// rather than being handed a bare `any` (carrick#376).
     #[serde(default)]
     pub any_provenance: Vec<TypeProvenance>,
+    /// Internal module specifiers that fail to resolve in this alias's closure
+    /// (carrick#1165). The emitted tree is missing part of what the alias
+    /// refers to, so its printed answer can name types nothing declares.
+    /// File-granular: every alias whose closure reaches the failing file.
+    #[serde(default)]
+    pub dangling_specifiers: Vec<String>,
+    /// Identifiers the alias's anonymous print names that resolve to nothing
+    /// in the producer's program where the surface declares the alias
+    /// (carrick#1165).
+    #[serde(default)]
+    pub undeclared_names: Vec<String>,
+}
+
+impl CaptureAliasRecord {
+    /// Why this alias's printed answer is not a type to publish, if it is not
+    /// (carrick#1165): it names something the capture recorded as unresolved,
+    /// or it is itself a top type with no pinned external to heal it. A top
+    /// type the check phase heals by installing a pin (`allowlisted_external`)
+    /// is still worth publishing by name.
+    pub fn unpublishable_reason(&self) -> Option<&'static str> {
+        if !self.undeclared_names.is_empty() {
+            Some("the printed answer names an identifier nothing declares")
+        } else if !self.dangling_specifiers.is_empty() {
+            Some("the declaration behind the answer imports a module that did not resolve")
+        } else if self.top_type_at_self_check && self.self_check == "decayed_internal" {
+            Some("the answer is a top type with no pinned external to explain it")
+        } else {
+            None
+        }
+    }
 }
 
 /// One `any`/`unknown` finding inside a captured or inferred type, with its

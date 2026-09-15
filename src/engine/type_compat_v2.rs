@@ -1948,6 +1948,8 @@ mod tests {
             capture_failure_reason: failure.map(str::to_string),
             top_type_at_self_check: failure.is_some(),
             any_provenance: Vec::new(),
+            dangling_specifiers: Vec::new(),
+            undeclared_names: Vec::new(),
         }
     }
 

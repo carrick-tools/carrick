@@ -12,7 +12,7 @@ import type {
   InferAnchorRequest,
   SymbolAnchorRequest,
 } from './api.js';
-import { printTypeForDestination } from './node-builder.js';
+import { printTypeForDestination, undeclaredNamesIn } from './node-builder.js';
 import { typeIsOrContainsMachinery } from './machinery.js';
 
 export interface ResolvedAnchor {
@@ -43,6 +43,12 @@ export interface ResolvedAnchor {
    * backfillable; the reason rides `self_check_detail` instead.
    */
   abstainReason?: string;
+  /**
+   * carrick#1165: identifiers the alias text names (a literal anchor's text
+   * or a node-builder print) that resolve to nothing where the surface
+   * declares the alias. Recorded on the capture record as `undeclared_names`.
+   */
+  undeclaredNames?: string[];
 }
 
 /** Repo-root-relative source file -> extensionless specifier from entryDir. */
@@ -108,6 +114,15 @@ export function resolveAnchor(
     const siblingSpec = bareIdentifier
       ? args.siblingSymbolSpecs?.get(text)
       : undefined;
+    // carrick#1165: literal text is printed elsewhere (the v1 walk) and can
+    // name a type by a bare identifier that nothing declares where the surface
+    // declares the alias. The stub then self-checks such a name as an error
+    // placeholder, which no walk flags. A name a sibling symbol anchor
+    // imports is resolved by that import.
+    const undeclaredNames =
+      siblingSpec || !args.placeholder
+        ? []
+        : undeclaredNamesInText(text, checker, args.placeholder);
     return {
       request,
       aliasText: siblingSpec ? `import('${siblingSpec}').${text}` : text,
@@ -117,6 +132,7 @@ export function resolveAnchor(
       // them at this tier so the legacy dependence stays measurable and
       // ratchetable. Demotions are distinguished by failureReason.
       serialization: 'structural_fallback',
+      ...(undeclaredNames.length > 0 ? { undeclaredNames } : {}),
     };
   }
 
@@ -367,7 +383,25 @@ function finishInferAnchor(
     aliasText: printed.text,
     serialization: 'node_builder',
     ...(reaimNote ? { reaimNote } : {}),
+    ...(printed.undeclaredNames ? { undeclaredNames: printed.undeclaredNames } : {}),
   };
+}
+
+/** `undeclaredNamesIn` over type text rather than a built node. */
+function undeclaredNamesInText(
+  text: string,
+  checker: ts.TypeChecker,
+  destination: ts.Node
+): string[] {
+  const parsed = ts.createSourceFile(
+    'literal-anchor.ts',
+    `type __LiteralAnchor = ${text};`,
+    ts.ScriptTarget.Latest,
+    true
+  );
+  const statement = parsed.statements[0];
+  if (!statement || !ts.isTypeAliasDeclaration(statement)) return [];
+  return undeclaredNamesIn(statement.type, checker, destination);
 }
 
 /**

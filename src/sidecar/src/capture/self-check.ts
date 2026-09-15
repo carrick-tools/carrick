@@ -240,11 +240,13 @@ function checkedRecord(
 
   let blamedExternal: string | undefined;
   let internalFailure: string | undefined;
+  const danglingSpecifiers = new Set<string>();
   for (const file of closure) {
     const failures = ctx.failuresByFile.get(file);
     if (!failures) continue;
     if (!blamedExternal) blamedExternal = [...failures.externalPinned][0];
     if (!internalFailure) internalFailure = [...failures.internal][0];
+    for (const specifier of failures.internal) danglingSpecifiers.add(specifier);
   }
 
   // Classification consults the closure failures REGARDLESS of the root
@@ -336,6 +338,10 @@ function checkedRecord(
     ...(unexplainedDeep.length > 0
       ? { any_provenance: unexplainedDeep.map(provenanceOf) }
       : {}),
+    ...(danglingSpecifiers.size > 0
+      ? { dangling_specifiers: [...danglingSpecifiers].sort() }
+      : {}),
+    ...(anchor.undeclaredNames ? { undeclared_names: anchor.undeclaredNames } : {}),
   };
 }
 

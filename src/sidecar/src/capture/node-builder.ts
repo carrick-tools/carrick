@@ -30,6 +30,11 @@ export interface NodeBuilderPrintResult {
   inaccessible: string[];
   /** Failure description when text is absent. */
   failure?: string;
+  /**
+   * Names the print refers to that do not resolve at the destination in the
+   * producer's program (carrick#1165). Present only when there are some.
+   */
+  undeclaredNames?: string[];
 }
 
 /**
@@ -181,5 +186,56 @@ export function printTypeForDestination(
     node,
     destination.getSourceFile()
   );
-  return { text, inaccessible };
+  const undeclaredNames = undeclaredNamesIn(node, checker, destination);
+  return { text, inaccessible, ...(undeclaredNames.length > 0 ? { undeclaredNames } : {}) };
+}
+
+/**
+ * Bare names in a printed type node that resolve to nothing at `destination`
+ * (carrick#1165).
+ *
+ * The builder names an out-of-scope declaration through `import("...")`, and
+ * the tracker demotes a symbol it cannot reach, so a bare reference is meant
+ * to be in scope where the alias is declared. The one way it is not: the
+ * builder REUSES a source annotation as written (`parcel: Row`) when the
+ * annotation's import did not resolve. There is then no symbol to track, and
+ * the surface names an identifier nothing declares. Resolving each bare name
+ * at the destination, in the producer's own program, finds exactly those while
+ * leaving every global the program knows (lib, runtime and `@types` globals)
+ * alone. Type parameters the print itself declares (generic signatures,
+ * mapped and `infer` types) are excluded. Also run over literal anchor text,
+ * which the v1 walk printed and which can name a type the same way.
+ */
+export function undeclaredNamesIn(
+  node: ts.TypeNode,
+  checker: ts.TypeChecker,
+  destination: ts.Node
+): string[] {
+  const typeParameters = new Set<string>();
+  const references: Array<{ name: string; meaning: ts.SymbolFlags }> = [];
+  const leftmost = (name: ts.EntityName): ts.Identifier =>
+    ts.isIdentifier(name) ? name : leftmost(name.left);
+  const visit = (current: ts.Node): void => {
+    if (ts.isTypeParameterDeclaration(current)) {
+      typeParameters.add(current.name.text);
+    } else if (ts.isTypeReferenceNode(current)) {
+      references.push({
+        name: leftmost(current.typeName).text,
+        meaning: ts.SymbolFlags.Type | ts.SymbolFlags.Namespace | ts.SymbolFlags.Alias,
+      });
+    } else if (ts.isTypeQueryNode(current)) {
+      references.push({
+        name: leftmost(current.exprName).text,
+        meaning: ts.SymbolFlags.Value | ts.SymbolFlags.Namespace | ts.SymbolFlags.Alias,
+      });
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(node);
+  const undeclared = new Set<string>();
+  for (const { name, meaning } of references) {
+    if (typeParameters.has(name) || undeclared.has(name)) continue;
+    if (!checker.resolveName(name, destination, meaning, false)) undeclared.add(name);
+  }
+  return [...undeclared].sort();
 }
