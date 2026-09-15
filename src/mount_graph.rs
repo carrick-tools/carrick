@@ -98,6 +98,24 @@ pub struct ResolvedEndpoint {
     /// above: it is a marker on a minority of rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch: Option<crate::dispatch::Dispatch>,
+    /// Where the handler function sits in this row's own file (cloud#948).
+    /// `file_location` is the line the registration call opens on, which for an
+    /// inline handler behind a validator chain is lines above the function, so
+    /// a reader placing a function by that line alone reads the handler as
+    /// "outside" the route. Stamped once the payload's paths are relative
+    /// ([`crate::handler_span::attach_handler_spans`]); `None` when the handler
+    /// could not be placed, and on graphs serialized before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler_span: Option<HandlerSpan>,
+}
+
+/// A 1-based, inclusive line range in an endpoint row's own file: the span of
+/// the function that handles the route (cloud#948). The spelling on the wire,
+/// `{ "start_line": N, "end_line": M }`, is the cloud's `HandlerSpan`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandlerSpan {
+    pub start_line: u32,
+    pub end_line: u32,
 }
 
 /// Represents a data-fetching call with its target
@@ -655,6 +673,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
 
         // Create config with internal domain
@@ -934,6 +953,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
 
         let config = Config {
@@ -981,6 +1001,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
         let normalizer = UrlNormalizer::new(&Config::default());
         for method in ["GET", "POST"] {
@@ -1019,6 +1040,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
 
         // No env vars declared: the injected base cannot be classified through
@@ -1055,6 +1077,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
 
         let config = Config {
@@ -1092,6 +1115,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
 
         let config = Config::default();
@@ -1129,6 +1153,7 @@ mod tests {
                 evidence: carrick_match::MatchEvidence::RouteDefinition,
                 resolution_source: None,
                 dispatch: None,
+                handler_span: None,
             });
         }
         let normalizer = UrlNormalizer::default_permissive();
@@ -1183,6 +1208,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
         crate::cloud_storage::CloudRepoData {
             repo_name: repo.to_string(),

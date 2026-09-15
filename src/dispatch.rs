@@ -287,6 +287,7 @@ pub fn apply_declared_operations(
                         field: block.dispatch.field.clone(),
                         value: operation.value.clone(),
                     }),
+                    handler_span: None,
                 });
                 written += 1;
             }
@@ -603,6 +604,7 @@ mod tests {
             resolution_source: None,
             view_module: false,
             dispatch: None,
+            handler_span: None,
         });
 
         apply_declared_operations(
@@ -650,6 +652,7 @@ mod tests {
                 field: "action".to_string(),
                 value: value.to_string(),
             }),
+            handler_span: None,
         };
         // Inference found two of the three, and misread one of them.
         graph.endpoints.push(inferred("search-by-intent"));
@@ -749,6 +752,7 @@ mod tests {
                 value: "search-by-intent".to_string(),
             }),
             schema_binding: None,
+            handler_span: None,
         });
 
         let findings = dispatch_operation_findings(&[producer, consumer]);

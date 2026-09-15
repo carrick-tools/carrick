@@ -611,6 +611,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         };
         let data = CloudRepoData {
             endpoints: vec![

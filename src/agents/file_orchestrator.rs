@@ -7822,6 +7822,10 @@ impl FileOrchestrator {
                     // switches on a request field (carrick#831). Unlike the
                     // fields above it, matching reads this one.
                     dispatch: endpoint.dispatch.clone(),
+                    // Placed once the payload is built and its paths are
+                    // relative (cloud#948): the function index it is read from
+                    // is not merged yet here.
+                    handler_span: None,
                 });
                 registration_literals.push(endpoint.registration_literal.clone());
             }

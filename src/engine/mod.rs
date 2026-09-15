@@ -2669,6 +2669,8 @@ async fn analyze_current_repo_incremental(
                 repo_path,
                 &served_paths::PathScrub::for_scan(repo_path),
             );
+            let placed = crate::handler_span::attach_handler_spans(&mut cloud_data);
+            debug!("Handler spans placed on endpoint rows: {placed}");
 
             // Same last step as the full branch: the boundary is read off the
             // finished payload once its paths are repo-relative (carrick#705).
@@ -3114,6 +3116,9 @@ fn append_deterministic_protocol_operations(
         // switches on a request field to reach them.
         dispatch: None,
         schema_binding: None,
+        // The handler span is placed from an HTTP route's registration
+        // (cloud#948); these rows have none.
+        handler_span: None,
     };
 
     let graphql = &extractions.graphql;
@@ -5952,6 +5957,10 @@ async fn analyze_current_repo(
         repo_path,
         &served_paths::PathScrub::for_scan(repo_path),
     );
+    // Each route's handler function, placed once paths are relative so a row's
+    // file and a definition's file compare (cloud#948).
+    let placed = crate::handler_span::attach_handler_spans(&mut cloud_data);
+    debug!("Handler spans placed on endpoint rows: {placed}");
 
     // 9. What this scan could not classify, stated beside what it did
     // (carrick#705). Collected last, off the finished payload and the stats of
@@ -7236,6 +7245,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         };
 
         let mut graph = MountGraph::new();
@@ -7263,6 +7273,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
         graph.data_calls.push(DataFetchingCall {
             method: "GET".to_string(),
@@ -7606,6 +7617,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         };
 
         let test_data = CloudRepoData {
@@ -7749,6 +7761,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         };
 
         let test_data = vec![CloudRepoData {
@@ -7982,6 +7995,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         };
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints = vec![
@@ -8059,6 +8073,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::CallSite,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         }];
         mount_graph.data_calls = vec![crate::mount_graph::DataFetchingCall {
             method: "POST".to_string(),
@@ -11663,6 +11678,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         };
         append_pubsub_operations(
             &mut cloud_data,
