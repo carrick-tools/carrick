@@ -15,8 +15,9 @@
  *  1. a type with call signatures is never a payload, on any anchor or on the
  *     located expression itself; and
  *  2. when a validator middleware on the registration binds a schema to the
- *     request body, the schema's parsed output IS the request contract,
- *     required and optional members intact.
+ *     request body, the schema's input IS the request contract, required and
+ *     optional members intact (input vs output is locked in by
+ *     `infer-schema-direction.test.ts`, carrick#1101).
  *
  * A validator bound to a non-body part declares no request body, and a route
  * that declares nothing stays unresolved — never a framework internal.

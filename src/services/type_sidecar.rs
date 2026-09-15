@@ -343,7 +343,7 @@ pub struct TypeProvenance {
     /// `any`, `unknown`, or `budget_exhausted`.
     pub kind: String,
     /// Categorized cause: `declared`, `budget_exhausted`,
-    /// `no_payload_evidence`, `machinery_envelope`, `not_recorded`.
+    /// `no_payload_evidence`, `machinery_envelope`, `coerced_input`, `not_recorded`.
     pub reason: String,
     /// One scrubbed sentence a reader can act on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
