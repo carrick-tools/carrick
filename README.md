@@ -298,6 +298,10 @@ Some documents are left out as well:
 
 A document whose fields appear in no schema the repository holds stays a call, because its server may be another repository in the project.
 
+#### Where a GraphQL call is indexed
+
+A document written in a `.graphql`/`.gql` file and compiled into a typed declaration (`OrdersDocument`) is sent from the code that passes that declaration to a client, such as `useQuery(OrdersDocument)`. Carrick indexes the operation's fields at each of those calls, resolving the import through relative paths, `tsconfig` path aliases and workspace packages. An operation that no call executes stays indexed at its line in the document file. A `gql` template written in source stays indexed where it is written.
+
 ## How it works
 
 1. SWC parses each TypeScript file into an AST.

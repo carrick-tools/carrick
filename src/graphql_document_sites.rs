@@ -1,4 +1,5 @@
-//! HTTP rows at call sites that execute a GraphQL document (carrick#1154).
+//! Call sites that execute a GraphQL document: their HTTP twins
+//! (carrick#1154) and the operations they send (carrick#1157).
 //!
 //! A call that hands a GraphQL document to a client (`useQuery(OrdersDocument)`,
 //! `client.query(OrdersDocument, vars)`, `client.request(ORDERS_QUERY)`)
@@ -31,22 +32,42 @@
 //! HTTP twin back.
 //!
 //! Every dropped row is counted and logged with its reason.
+//!
+//! The same reading places the GraphQL consumer rows. A document written in a
+//! `.graphql` file is compiled into a declaration that states its operation
+//! (`export const OrdersDocument = {"kind":"Document",...}`), and the call that
+//! passes that declaration is where the operation is sent from. Before this,
+//! the index pointed at the line of the `.graphql` file, which no agent edits
+//! when it changes the call. [`collect_document_site_consumers`] reads each
+//! executed declaration's operations (kind, name, root fields) and places one
+//! consumer row per root field at the call. A document-file operation with
+//! the same kind, name and root fields is then the same operation seen from
+//! its source, and its rows are removed; a document-file operation no call
+//! executes keeps its rows.
+//!
+//! A declaration the GraphQL extraction already indexes where it is written (a
+//! `gql` tagged template in source) keeps its row at the declaration: the
+//! source line IS the document, and the call-site anchor for its result type
+//! is read there. An operation with no name is placed at its calls but covers
+//! nothing, because nothing ties it to one document-file operation.
 
 use crate::agents::file_analyzer_agent::FileAnalysisResult;
+use crate::graphql::{GraphqlExtraction, GraphqlOp};
 use crate::import_bindings::BindingResolver;
+use crate::operation::{GraphqlOperationKind, OperationKey};
 use crate::parser::parse_file;
 use crate::swc_scanner::SWC_SPAN_BASE;
 use crate::workspace_resolver::WorkspaceIndex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swc_common::{
-    SourceMap,
+    SourceMap, Spanned,
     errors::{ColorConfig, Handler},
     sync::Lrc,
 };
 use swc_ecma_ast::{
-    CallExpr, Callee, Decl, Expr, ImportDecl, ImportSpecifier, Module, ModuleDecl,
-    ModuleExportName, ModuleItem, Pat, Prop, PropName, PropOrSpread, Stmt,
+    CallExpr, Callee, Decl, Expr, ImportDecl, ImportSpecifier, Lit, Module, ModuleDecl,
+    ModuleExportName, ModuleItem, ObjectLit, Pat, Prop, PropName, PropOrSpread, Stmt,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::debug;
@@ -82,6 +103,37 @@ struct FileSites {
     /// Calls with no document argument but an identifier argument whose
     /// import resolves to nothing, with their callee.
     unresolved_sites: Vec<(u32, CalleeKey)>,
+    /// Every document a call in this file executes, with the call's line.
+    executed: Vec<ExecutedDocument>,
+}
+
+/// One executable operation a document states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentOperation {
+    pub kind: GraphqlOperationKind,
+    /// `None` for an anonymous operation.
+    pub name: Option<String>,
+    /// Root field names (not aliases), introspection fields left out, in
+    /// document order.
+    pub fields: Vec<String>,
+}
+
+/// A document bound to a name, or a document file imported whole.
+#[derive(Debug, Clone)]
+struct DeclaredDocument {
+    /// Canonical path of the file the document is written in.
+    file: PathBuf,
+    /// 1-based line its text or literal starts on: `1` for a document file.
+    line: u32,
+    operations: Vec<DocumentOperation>,
+}
+
+/// A call that passes a document.
+#[derive(Debug, Clone)]
+struct ExecutedDocument {
+    /// 1-based line of the call.
+    line: u32,
+    document: DeclaredDocument,
 }
 
 /// Drop HTTP data calls at GraphQL document sites across one service's file
@@ -162,6 +214,176 @@ pub fn suppress_document_site_http_rows(
     drops
 }
 
+/// The documents one service's calls execute, read before they are placed in
+/// the service's GraphQL extraction ([`DocumentSiteConsumers::apply`]).
+#[derive(Debug, Default)]
+pub struct DocumentSiteConsumers {
+    /// `(site file as the service lists it, executed document)`, in file
+    /// order.
+    sites: Vec<(PathBuf, ExecutedDocument)>,
+}
+
+/// What placing the call-site rows changed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DocumentSiteSummary {
+    /// Consumer rows added at calls.
+    pub site_rows: usize,
+    /// Document-file rows removed because a call executes their operation.
+    pub covered_rows: usize,
+    /// Calls whose document is already indexed where it is declared.
+    pub declared_in_source: usize,
+}
+
+/// Read every call in `files` that passes a GraphQL document, with the
+/// operations that document states. `workspace` resolves aliased and package
+/// specifiers; relative specifiers resolve without it.
+pub fn collect_document_site_consumers(
+    files: &[PathBuf],
+    workspace: Option<&WorkspaceIndex>,
+) -> DocumentSiteConsumers {
+    let mut reader = DocumentReader::new(workspace);
+    let mut sites = Vec::new();
+    for file in files {
+        let is_script = file
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| matches!(ext, "ts" | "tsx" | "js" | "jsx" | "mts" | "cts"));
+        if !is_script {
+            continue;
+        }
+        for executed in reader.file_sites(file).executed {
+            sites.push((file.clone(), executed));
+        }
+    }
+    DocumentSiteConsumers { sites }
+}
+
+impl DocumentSiteConsumers {
+    /// Place a consumer row at every call for each root field its document
+    /// selects, and remove the document-file rows of every operation a call
+    /// executes.
+    pub fn apply(self, extraction: &mut GraphqlExtraction) -> DocumentSiteSummary {
+        let mut summary = DocumentSiteSummary::default();
+        let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        // Documents the extraction indexes where they are written in source.
+        let indexed_in_source: HashSet<(PathBuf, u32)> = extraction
+            .consumers
+            .iter()
+            .filter(|op| !is_graphql_document_path(&op.file_path))
+            .map(|op| (canonical(&op.file_path), op.document_line))
+            .collect();
+
+        let mut seen: HashSet<(PathBuf, u32, String)> = HashSet::new();
+        let mut executed_operations: HashSet<(GraphqlOperationKind, String, Vec<String>)> =
+            HashSet::new();
+        let mut rows = Vec::new();
+        for (site_file, executed) in self.sites {
+            let document = &executed.document;
+            if !is_graphql_document_path(&document.file)
+                && indexed_in_source.contains(&(document.file.clone(), document.line))
+            {
+                summary.declared_in_source += 1;
+                continue;
+            }
+            for operation in &document.operations {
+                if let Some(name) = &operation.name {
+                    executed_operations.insert((
+                        operation.kind,
+                        name.clone(),
+                        operation.fields.clone(),
+                    ));
+                }
+                for field in &operation.fields {
+                    let key = OperationKey::graphql(operation.kind, field.clone());
+                    if !seen.insert((site_file.clone(), executed.line, key.canonical())) {
+                        continue;
+                    }
+                    rows.push(site_consumer(key, &site_file, executed.line));
+                }
+            }
+        }
+
+        // The document-file operations those calls execute, located by the
+        // line and key of each of their rows.
+        let mut document_files: HashMap<PathBuf, HashMap<(u32, String), DocumentOperation>> =
+            HashMap::new();
+        extraction.consumers.retain(|op| {
+            if !is_graphql_document_path(&op.file_path) {
+                return true;
+            }
+            let operations = document_files
+                .entry(op.file_path.clone())
+                .or_insert_with(|| document_file_rows(&op.file_path));
+            let Some(operation) = operations.get(&(op.line, op.key.canonical())) else {
+                return true;
+            };
+            let Some(name) = &operation.name else {
+                return true;
+            };
+            if executed_operations.contains(&(
+                operation.kind,
+                name.clone(),
+                operation.fields.clone(),
+            )) {
+                summary.covered_rows += 1;
+                false
+            } else {
+                true
+            }
+        });
+
+        summary.site_rows = rows.len();
+        extraction.consumers.extend(rows);
+        if summary != DocumentSiteSummary::default() {
+            debug!(
+                site_rows = summary.site_rows,
+                covered_rows = summary.covered_rows,
+                declared_in_source = summary.declared_in_source,
+                "GraphQL consumer rows placed at the calls that execute their documents"
+            );
+        }
+        summary
+    }
+}
+
+/// A consumer row at a call. The call is its own document for attribution:
+/// its root fields are the basis the schema catalogue judges.
+fn site_consumer(key: OperationKey, file: &Path, line: u32) -> GraphqlOp {
+    GraphqlOp {
+        key,
+        file_path: file.to_path_buf(),
+        line,
+        document_line: line,
+        primary_type_symbol: None,
+        payload_type_symbol: None,
+        payload_type_source: None,
+        resolver_file: None,
+        resolver_line: None,
+        response_type_symbol: None,
+        response_type_source: None,
+        consumer_located_type_symbol: None,
+        consumer_located_type_source: None,
+        // Set by attribution, which runs after these rows are placed.
+        schema_binding: None,
+    }
+}
+
+/// `(root field line, canonical key) -> operation` for a document file, the
+/// coordinates its extracted consumer rows carry.
+fn document_file_rows(file: &Path) -> HashMap<(u32, String), DocumentOperation> {
+    let mut rows = HashMap::new();
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return rows;
+    };
+    for (operation, lines) in text_operations_with_lines(&text) {
+        for (field, line) in operation.fields.iter().zip(lines) {
+            let key = OperationKey::graphql(operation.kind, field.clone());
+            rows.insert((line, key.canonical()), operation.clone());
+        }
+    }
+    rows
+}
+
 /// Reads call sites and document declarations, caching every module it
 /// parses: one generated document module is read once however many files
 /// import it.
@@ -170,8 +392,8 @@ struct DocumentReader<'a> {
     handler: Handler,
     resolver: BindingResolver,
     workspace: Option<&'a WorkspaceIndex>,
-    /// Module → the names it binds to a GraphQL document at module scope.
-    documents: HashMap<PathBuf, HashSet<String>>,
+    /// Module → the documents it binds to a name at module scope.
+    documents: HashMap<PathBuf, HashMap<String, DeclaredDocument>>,
 }
 
 impl<'a> DocumentReader<'a> {
@@ -192,27 +414,31 @@ impl<'a> DocumentReader<'a> {
         }
     }
 
-    fn module_documents(&mut self, file: &Path) -> &HashSet<String> {
+    fn module_documents(&mut self, file: &Path) -> &HashMap<String, DeclaredDocument> {
         if !self.documents.contains_key(file) {
-            let names = parse_file(file, &self.source_map, &self.handler)
-                .map(|module| document_bindings(&module))
+            let documents = parse_file(file, &self.source_map, &self.handler)
+                .map(|module| document_declarations(&module, &self.source_map, file))
                 .unwrap_or_default();
-            self.documents.insert(file.to_path_buf(), names);
+            self.documents.insert(file.to_path_buf(), documents);
         }
         &self.documents[file]
+    }
+
+    /// The module a specifier names from `importer`, when it is on disk.
+    fn resolve_module(&self, importer: &Path, specifier: &str) -> Option<PathBuf> {
+        match self.workspace {
+            Some(workspace) => workspace.resolve_module_path(importer, specifier),
+            None => crate::agents::file_orchestrator::FileOrchestrator::resolve_relative_import(
+                importer, specifier,
+            ),
+        }
     }
 
     /// The module key a specifier names from `importer`: the resolved file
     /// when there is one, else the specifier as written (a package name reads
     /// the same from every file).
     fn module_key(&self, importer: &Path, specifier: &str) -> String {
-        let resolved = match self.workspace {
-            Some(workspace) => workspace.resolve_module_path(importer, specifier),
-            None => crate::agents::file_orchestrator::FileOrchestrator::resolve_relative_import(
-                importer, specifier,
-            ),
-        };
-        match resolved {
+        match self.resolve_module(importer, specifier) {
             Some(path) => path.to_string_lossy().into_owned(),
             None => specifier.to_string(),
         }
@@ -224,7 +450,8 @@ impl<'a> DocumentReader<'a> {
         let Some(module) = parse_file(file, &cm, &handler) else {
             return FileSites::default();
         };
-        let local_documents = document_bindings(&module);
+        let canonical = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+        let local_documents = document_declarations(&module, &cm, &canonical);
         let local_declarations = module_declarations(&module);
         let imports = import_table(&module);
 
@@ -241,11 +468,17 @@ impl<'a> DocumentReader<'a> {
             else {
                 continue;
             };
+            let line = cm.lookup_char_pos(call.span_lo).line as u32;
             let mut has_document = false;
             let mut has_unresolved = false;
             for name in &call.ident_args {
                 match self.classify_argument(file, name, &local_documents, &imports) {
-                    Argument::Document => has_document = true,
+                    Argument::Document(document) => {
+                        has_document = true;
+                        if let Some(document) = document {
+                            sites.executed.push(ExecutedDocument { line, document });
+                        }
+                    }
                     Argument::Unresolved => has_unresolved = true,
                     Argument::Other => {}
                 }
@@ -270,17 +503,32 @@ impl<'a> DocumentReader<'a> {
         &mut self,
         file: &Path,
         name: &str,
-        local_documents: &HashSet<String>,
+        local_documents: &HashMap<String, DeclaredDocument>,
         imports: &HashMap<String, Import>,
     ) -> Argument {
-        if local_documents.contains(name) {
-            return Argument::Document;
+        if let Some(document) = local_documents.get(name) {
+            return Argument::Document(Some(document.clone()));
         }
         let Some(import) = imports.get(name) else {
             return Argument::Other;
         };
         if import.imported == "default" && is_graphql_document_file(&import.specifier) {
-            return Argument::Document;
+            // The file is the document. One that is not on disk still makes
+            // this call a GraphQL execution; it just states no operation.
+            let document = self
+                .resolve_module(file, &import.specifier)
+                .and_then(|path| {
+                    let text = std::fs::read_to_string(&path).ok()?;
+                    Some(DeclaredDocument {
+                        file: path,
+                        line: 1,
+                        operations: text_operations_with_lines(&text)
+                            .into_iter()
+                            .map(|(operation, _)| operation)
+                            .collect(),
+                    })
+                });
+            return Argument::Document(document);
         }
         let Some(binding) = self
             .resolver
@@ -291,10 +539,9 @@ impl<'a> DocumentReader<'a> {
         let Some(local_name) = binding.local_name else {
             return Argument::Other;
         };
-        if self.module_documents(&binding.file).contains(&local_name) {
-            Argument::Document
-        } else {
-            Argument::Other
+        match self.module_documents(&binding.file).get(&local_name) {
+            Some(document) => Argument::Document(Some(document.clone())),
+            None => Argument::Other,
         }
     }
 
@@ -331,7 +578,8 @@ impl<'a> DocumentReader<'a> {
 }
 
 enum Argument {
-    Document,
+    /// A GraphQL document, with what it states when it can be read.
+    Document(Option<DeclaredDocument>),
     /// An import whose declaration the module graph cannot reach.
     Unresolved,
     Other,
@@ -415,9 +663,14 @@ fn module_scope_decls(module: &Module) -> impl Iterator<Item = &Decl> {
     })
 }
 
-/// The names a module binds to a GraphQL document at module scope.
-pub fn document_bindings(module: &Module) -> HashSet<String> {
-    let mut names = HashSet::new();
+/// The documents a module binds to a name at module scope. `file` is the
+/// module's canonical path.
+fn document_declarations(
+    module: &Module,
+    source_map: &Lrc<SourceMap>,
+    file: &Path,
+) -> HashMap<String, DeclaredDocument> {
+    let mut documents = HashMap::new();
     for decl in module_scope_decls(module) {
         let Decl::Var(var) = decl else {
             continue;
@@ -426,11 +679,176 @@ pub fn document_bindings(module: &Module) -> HashSet<String> {
             if let (Pat::Ident(ident), Some(init)) = (&declarator.name, declarator.init.as_deref())
                 && is_document_expression(init)
             {
-                names.insert(ident.id.sym.to_string());
+                let expression = unwrap_expression(init);
+                documents.insert(
+                    ident.id.sym.to_string(),
+                    DeclaredDocument {
+                        file: file.to_path_buf(),
+                        line: source_map.lookup_char_pos(expression.span().lo).line as u32,
+                        operations: expression_operations(expression),
+                    },
+                );
             }
         }
     }
-    names
+    documents
+}
+
+/// The operations a document expression states: read off the graphql-js AST
+/// object literal, or parsed from the text of a template or string.
+fn expression_operations(expr: &Expr) -> Vec<DocumentOperation> {
+    match unwrap_expression(expr) {
+        Expr::Object(object) => object_operations(object),
+        Expr::TaggedTpl(tagged) => text_operations(&template_text(&tagged.tpl)),
+        Expr::Call(call) if call.args.len() == 1 && call.args[0].spread.is_none() => {
+            match unwrap_expression(&call.args[0].expr) {
+                Expr::Tpl(tpl) => text_operations(&template_text(tpl)),
+                Expr::Lit(Lit::Str(s)) => text_operations(s.value.as_ref()),
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The value of property `key` in an object literal.
+fn property<'e>(object: &'e ObjectLit, key: &str) -> Option<&'e Expr> {
+    object.props.iter().find_map(|prop| {
+        let PropOrSpread::Prop(prop) = prop else {
+            return None;
+        };
+        let Prop::KeyValue(pair) = &**prop else {
+            return None;
+        };
+        let matches = match &pair.key {
+            PropName::Ident(ident) => ident.sym == *key,
+            PropName::Str(s) => s.value == *key,
+            _ => false,
+        };
+        matches.then(|| unwrap_expression(&pair.value))
+    })
+}
+
+fn string_property<'e>(object: &'e ObjectLit, key: &str) -> Option<&'e str> {
+    match property(object, key)? {
+        Expr::Lit(Lit::Str(s)) => Some(s.value.as_ref()),
+        _ => None,
+    }
+}
+
+/// `{ ..., key: { value: "..." } }`, the graphql-js `Name` node.
+fn name_value<'e>(object: &'e ObjectLit, key: &str) -> Option<&'e str> {
+    match property(object, key)? {
+        Expr::Object(name) => string_property(name, "value"),
+        _ => None,
+    }
+}
+
+/// The object literals in the array property `key`.
+fn object_elements<'e>(object: &'e ObjectLit, key: &str) -> Vec<&'e ObjectLit> {
+    let Some(Expr::Array(array)) = property(object, key) else {
+        return Vec::new();
+    };
+    array
+        .elems
+        .iter()
+        .flatten()
+        .filter(|element| element.spread.is_none())
+        .filter_map(|element| match unwrap_expression(&element.expr) {
+            Expr::Object(object) => Some(object),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Operations of a graphql-js `Document` node written as an object literal.
+/// A root fragment spread states no field and is left out, as it is when the
+/// same document is parsed from text.
+fn object_operations(document: &ObjectLit) -> Vec<DocumentOperation> {
+    object_elements(document, "definitions")
+        .into_iter()
+        .filter(|definition| string_property(definition, "kind") == Some("OperationDefinition"))
+        .filter_map(|definition| {
+            let kind = match string_property(definition, "operation")? {
+                "query" => GraphqlOperationKind::Query,
+                "mutation" => GraphqlOperationKind::Mutation,
+                "subscription" => GraphqlOperationKind::Subscription,
+                _ => return None,
+            };
+            let fields = match property(definition, "selectionSet") {
+                Some(Expr::Object(selection_set)) => object_elements(selection_set, "selections")
+                    .into_iter()
+                    .filter(|selection| string_property(selection, "kind") == Some("Field"))
+                    .filter_map(|selection| name_value(selection, "name"))
+                    .filter(|name| !name.starts_with("__"))
+                    .map(str::to_string)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            Some(DocumentOperation {
+                kind,
+                name: name_value(definition, "name").map(str::to_string),
+                fields,
+            })
+        })
+        .collect()
+}
+
+fn text_operations(text: &str) -> Vec<DocumentOperation> {
+    text_operations_with_lines(text)
+        .into_iter()
+        .map(|(operation, _)| operation)
+        .collect()
+}
+
+/// Operations of an executable document's text, each with the 1-based line
+/// of every root field, in the order of `fields`. The same reading the
+/// GraphQL extraction gives a document's consumer rows: an anonymous
+/// selection set is a query, fragment spreads and introspection fields at the
+/// root are left out.
+fn text_operations_with_lines(text: &str) -> Vec<(DocumentOperation, Vec<u32>)> {
+    use graphql_parser::query::{Definition, OperationDefinition, Selection};
+    let Ok(document) = graphql_parser::parse_query::<String>(text) else {
+        return Vec::new();
+    };
+    let mut operations = Vec::new();
+    for definition in &document.definitions {
+        let Definition::Operation(operation) = definition else {
+            continue;
+        };
+        let (kind, name, selection_set) = match operation {
+            OperationDefinition::SelectionSet(set) => (GraphqlOperationKind::Query, None, set),
+            OperationDefinition::Query(q) => (
+                GraphqlOperationKind::Query,
+                q.name.clone(),
+                &q.selection_set,
+            ),
+            OperationDefinition::Mutation(m) => (
+                GraphqlOperationKind::Mutation,
+                m.name.clone(),
+                &m.selection_set,
+            ),
+            OperationDefinition::Subscription(s) => (
+                GraphqlOperationKind::Subscription,
+                s.name.clone(),
+                &s.selection_set,
+            ),
+        };
+        let mut fields = Vec::new();
+        let mut lines = Vec::new();
+        for selection in &selection_set.items {
+            let Selection::Field(field) = selection else {
+                continue;
+            };
+            if field.name.starts_with("__") {
+                continue;
+            }
+            fields.push(field.name.clone());
+            lines.push(field.position.line as u32);
+        }
+        operations.push((DocumentOperation { kind, name, fields }, lines));
+    }
+    operations
 }
 
 /// Is `expr` a GraphQL document, read from its shape alone?
@@ -519,6 +937,12 @@ fn is_executable_document(text: &str) -> bool {
 /// A module that IS a GraphQL document, imported whole.
 fn is_graphql_document_file(specifier: &str) -> bool {
     specifier.ends_with(".graphql") || specifier.ends_with(".gql")
+}
+
+fn is_graphql_document_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext == "graphql" || ext == "gql")
 }
 
 enum CalleeName {
@@ -905,5 +1329,233 @@ export async function loadOrder(id: string) {
 
         assert_eq!(targets(&results, &page), vec!["POST graphql|query|orders"]);
         assert_eq!(drops.total(), 0);
+    }
+
+    /// The document file a generated module is compiled from.
+    const ORDER_DOCUMENTS: &str = "query Orders {\n  orders { id }\n  shippingZones { code }\n}\n\nmutation PlaceOrder($id: ID!) {\n  placeOrder(id: $id) { id }\n}\n\nquery Carriers {\n  carriers { name }\n}\n";
+
+    /// What a codegen compiles `ORDER_DOCUMENTS` into: every operation as a
+    /// graphql-js AST literal, with an alias and an introspection field to
+    /// show the field name is read, not the alias.
+    const COMPILED_DOCUMENTS: &str = r#"import { TypedDocumentNode as DocumentNode } from "@example/typed-document";
+export const OrdersDocument = {"kind":"Document","definitions":[{"kind":"OperationDefinition","operation":"query","name":{"kind":"Name","value":"Orders"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"orders"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"id"}}]}},{"kind":"Field","alias":{"kind":"Name","value":"zones"},"name":{"kind":"Name","value":"shippingZones"}},{"kind":"Field","name":{"kind":"Name","value":"__typename"}}]}}]} as unknown as DocumentNode<unknown, unknown>;
+export const PlaceOrderDocument = {"kind":"Document","definitions":[{"kind":"OperationDefinition","operation":"mutation","name":{"kind":"Name","value":"PlaceOrder"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"placeOrder"}}]}}]} as unknown as DocumentNode<unknown, unknown>;
+export const CarriersDocument = {"kind":"Document","definitions":[{"kind":"OperationDefinition","operation":"query","name":{"kind":"Name","value":"Carriers"},"selectionSet":{"kind":"SelectionSet","selections":[{"kind":"Field","name":{"kind":"Name","value":"carriers"}}]}}]} as unknown as DocumentNode<unknown, unknown>;
+"#;
+
+    /// Two pages executing two of the three operations; the mutation twice.
+    const CHECKOUT_PAGE: &str = r#"import { useMutation, useQuery } from "@example/gql-client";
+import { OrdersDocument, PlaceOrderDocument } from "../generated/documents";
+// Caisse — récapitulatif
+export function CheckoutPage() {
+  const [orders] = useQuery(OrdersDocument);
+  const [place] = useMutation(PlaceOrderDocument);
+  return { orders, place };
+}
+"#;
+
+    const RETRY_PAGE: &str = r#"import { useMutation } from "@example/gql-client";
+import { PlaceOrderDocument } from "../generated/documents";
+export function RetryButton() {
+  return useMutation(PlaceOrderDocument);
+}
+"#;
+
+    fn rows(extraction: &GraphqlExtraction, root: &Path) -> Vec<(String, String, u32)> {
+        let mut rows: Vec<(String, String, u32)> = extraction
+            .consumers
+            .iter()
+            .map(|op| {
+                let file = op
+                    .file_path
+                    .strip_prefix(root)
+                    .unwrap_or(&op.file_path)
+                    .display()
+                    .to_string();
+                (op.key.canonical(), file, op.line)
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    fn row(key: &str, file: &str, line: u32) -> (String, String, u32) {
+        (key.to_string(), file.to_string(), line)
+    }
+
+    #[test]
+    fn operations_are_placed_at_the_calls_that_execute_their_compiled_documents() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Canonical, as the service walk lists files on a real checkout.
+        let root = tmp.path().canonicalize().unwrap();
+        write(&root, "src/graphql/orders.graphql", ORDER_DOCUMENTS);
+        write(&root, "src/generated/documents.ts", COMPILED_DOCUMENTS);
+        let checkout = write(&root, "src/pages/CheckoutPage.tsx", CHECKOUT_PAGE);
+        let retry = write(&root, "src/pages/RetryButton.tsx", RETRY_PAGE);
+        let files: Vec<PathBuf> = [
+            root.join("src/graphql/orders.graphql")
+                .display()
+                .to_string(),
+            root.join("src/generated/documents.ts")
+                .display()
+                .to_string(),
+            checkout,
+            retry,
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+
+        let mut extraction = crate::graphql::scan_repo(&[root.join("src")], &[], &files);
+        assert_eq!(
+            rows(&extraction, &root),
+            vec![
+                row(
+                    "graphql|mutation|placeOrder",
+                    "src/graphql/orders.graphql",
+                    7
+                ),
+                row("graphql|query|carriers", "src/graphql/orders.graphql", 11),
+                row("graphql|query|orders", "src/graphql/orders.graphql", 2),
+                row(
+                    "graphql|query|shippingZones",
+                    "src/graphql/orders.graphql",
+                    3
+                ),
+            ],
+            "the document file's rows before the calls are read"
+        );
+
+        let summary = collect_document_site_consumers(&files, None).apply(&mut extraction);
+
+        assert_eq!(
+            rows(&extraction, &root),
+            vec![
+                row(
+                    "graphql|mutation|placeOrder",
+                    "src/pages/CheckoutPage.tsx",
+                    6
+                ),
+                row(
+                    "graphql|mutation|placeOrder",
+                    "src/pages/RetryButton.tsx",
+                    4
+                ),
+                row("graphql|query|carriers", "src/graphql/orders.graphql", 11),
+                row("graphql|query|orders", "src/pages/CheckoutPage.tsx", 5),
+                row(
+                    "graphql|query|shippingZones",
+                    "src/pages/CheckoutPage.tsx",
+                    5
+                ),
+            ],
+            "executed operations move to their calls; the one no call executes stays"
+        );
+        assert_eq!(
+            summary,
+            DocumentSiteSummary {
+                site_rows: 4,
+                covered_rows: 3,
+                declared_in_source: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_compiled_document_whose_fields_differ_covers_nothing() {
+        // A stale generated module: the document file gained a root field the
+        // compiled literal does not have. The call still sends what the
+        // literal states, and the document file's rows are not the same
+        // operation, so both stay.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let edited = ORDER_DOCUMENTS.replace(
+            "  orders { id }\n",
+            "  orders { id }\n  taxRates { code }\n",
+        );
+        write(&root, "src/graphql/orders.graphql", &edited);
+        write(&root, "src/generated/documents.ts", COMPILED_DOCUMENTS);
+        let checkout = write(&root, "src/pages/CheckoutPage.tsx", CHECKOUT_PAGE);
+        let files = vec![
+            root.join("src/graphql/orders.graphql"),
+            PathBuf::from(checkout),
+        ];
+
+        let mut extraction = crate::graphql::scan_repo(&[root.join("src")], &[], &files);
+        collect_document_site_consumers(&files, None).apply(&mut extraction);
+        let kept: Vec<(String, String, u32)> = rows(&extraction, &root)
+            .into_iter()
+            .filter(|(_, file, _)| file.ends_with(".graphql"))
+            .collect();
+
+        // `PlaceOrder` is unchanged, so its row still moves to the call.
+        assert_eq!(
+            kept,
+            vec![
+                row("graphql|query|carriers", "src/graphql/orders.graphql", 12),
+                row("graphql|query|orders", "src/graphql/orders.graphql", 2),
+                row(
+                    "graphql|query|shippingZones",
+                    "src/graphql/orders.graphql",
+                    4
+                ),
+                row("graphql|query|taxRates", "src/graphql/orders.graphql", 3),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_template_document_indexed_where_it_is_written_keeps_its_row_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let source = r#"import { gql, request } from "graphql-request";
+const ORDER = gql`
+  query Order($id: ID!) { order(id: $id) { id } }
+`;
+export const loadOrder = (id: string) => request("/graphql", ORDER, { id });
+"#;
+        let file = PathBuf::from(write(&root, "src/order.ts", source));
+        let files = vec![file];
+
+        let mut extraction = crate::graphql::scan_repo(&[root.join("src")], &[], &files);
+        let summary = collect_document_site_consumers(&files, None).apply(&mut extraction);
+
+        assert_eq!(
+            rows(&extraction, &root),
+            vec![row("graphql|query|order", "src/order.ts", 3)]
+        );
+        assert_eq!(summary.declared_in_source, 1);
+        assert_eq!(summary.site_rows, 0);
+    }
+
+    #[test]
+    fn a_document_file_imported_whole_is_placed_at_its_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write(
+            &root,
+            "src/graphql/carriers.graphql",
+            "query Carriers {\n  carriers { name }\n}\n",
+        );
+        let source = r#"import { useQuery } from "@example/gql-client";
+import CarriersQuery from "../graphql/carriers.graphql";
+export function CarrierList() {
+  return useQuery(CarriersQuery);
+}
+"#;
+        let page = PathBuf::from(write(&root, "src/pages/CarrierList.tsx", source));
+        let files = vec![root.join("src/graphql/carriers.graphql"), page];
+
+        let mut extraction = crate::graphql::scan_repo(&[root.join("src")], &[], &files);
+        collect_document_site_consumers(&files, None).apply(&mut extraction);
+
+        assert_eq!(
+            rows(&extraction, &root),
+            vec![row(
+                "graphql|query|carriers",
+                "src/pages/CarrierList.tsx",
+                4
+            )]
+        );
     }
 }

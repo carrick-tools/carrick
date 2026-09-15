@@ -1,0 +1,15 @@
+{
+  "services": [
+    {
+      "serviceName": "orders-api",
+      "directory": "apps/api"
+    },
+    {
+      "serviceName": "shop-web",
+      "directory": "apps/web",
+      "internalEnvVars": [
+        "ORDERS_API_URL"
+      ]
+    }
+  ]
+}
