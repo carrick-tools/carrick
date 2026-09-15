@@ -97,6 +97,11 @@ pub struct ScanState {
     /// The last count the scan reported inside that phase, if it reported one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<Update>,
+    /// Why the scan is slow right now, in the words the scan used: the model
+    /// refusing work, the gateway throttling, requests being retried
+    /// (carrick#1122). Cleared by the next phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// What this scan has paid Carrick Cloud so far, once a repo's upload has
@@ -187,8 +192,12 @@ impl ScanState {
         };
         let paid = if self.infer { ", paid" } else { "" };
         if self.is_running() {
+            let notice = match &self.notice {
+                Some(notice) => format!(" ({notice})"),
+                None => String::new(),
+            };
             return format!(
-                "scan {} running for {elapsed} (started {started}{paid}): {}{counts}",
+                "scan {} running for {elapsed} (started {started}{paid}): {}{counts}{notice}",
                 self.scan_id, self.phase
             );
         }
@@ -346,6 +355,7 @@ pub fn begin(index_dir: &Path, scan_id: &str, workspace: &Path, infer: bool) {
         finished_at: None,
         phase: "starting".to_string(),
         progress: None,
+        notice: None,
         error: None,
         spend: None,
     };
@@ -381,6 +391,9 @@ pub fn note(phase: &str, update: Option<&Update>) {
     } else if phase_changed {
         active.state.progress = None;
     }
+    if phase_changed {
+        active.state.notice = None;
+    }
 
     let now = Instant::now();
     let due = |last: Option<Instant>, gap: Duration| {
@@ -413,6 +426,26 @@ pub fn note(phase: &str, update: Option<&Update>) {
         }
         active.last_log = Some(now);
     }
+}
+
+/// Record why the scan is slow, as the scan said it (carrick#1122): into the
+/// state `carrick status` reads, and as a line in the log, at once rather than
+/// at the next pulse. A no-op in a scan nobody detached. The next phase clears
+/// it, because a busy model in one repo's scan says nothing about the next.
+pub fn notice(text: &str) {
+    let Ok(mut guard) = ACTIVE.lock() else {
+        return;
+    };
+    let Some(active) = guard.as_mut() else {
+        return;
+    };
+    active.state.notice = Some(text.to_string());
+    active.state.updated_at = timestamp();
+    write(&active.file, &active.state);
+    let now = Instant::now();
+    active.last_write = Some(now);
+    let age = human_duration(now.duration_since(active.started).as_secs() as i64);
+    eprintln!("carrick: {age} {text}");
 }
 
 /// Record what this scan has paid so far. A no-op in a scan nobody detached,
@@ -561,6 +594,7 @@ mod tests {
                 total: 240,
             }),
             error: None,
+            notice: None,
         }
     }
 
@@ -572,6 +606,22 @@ mod tests {
         assert!(line.contains("indexing gateway"), "{line}");
         assert!(line.contains("118 of 240 files"), "{line}");
         assert!(line.contains("paid"), "the paid pass says so: {line}");
+    }
+
+    /// A running scan the model is slowing says why, after its counts
+    /// (carrick#1122).
+    #[test]
+    fn a_running_scan_says_why_it_is_slow() {
+        let mut slowed = state(ScanStatus::Running, std::process::id());
+        slowed.notice =
+            Some("model busy: slowing analyze-file to 4 requests at a time".to_string());
+        let line = slowed.line();
+        assert!(
+            line.ends_with(
+                "118 of 240 files (model busy: slowing analyze-file to 4 requests at a time)"
+            ),
+            "{line}"
+        );
     }
 
     /// The case the ticket exists for: an agent's shell killed the scan, and

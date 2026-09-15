@@ -172,6 +172,42 @@ pub fn parse(line: &str) -> Option<Update> {
     serde_json::from_str(payload).ok()
 }
 
+/// The prefix of the line a scan states a notice on.
+const NOTICE_MARKER: &str = "@carrick-notice ";
+
+#[derive(Serialize, Deserialize)]
+struct Notice {
+    text: String,
+}
+
+/// Say something a person watching the scan should know about why it is
+/// slow: the model refusing work, the gateway throttling, requests being
+/// retried.
+///
+/// Logged as an `info` line, which a direct scan's terminal shows. A scan the
+/// indexer runs is a child whose plain stderr nobody sees until it fails, so
+/// for a parent that is reading the same text also crosses as a marker, and
+/// the indexer puts it beside the progress it shows (carrick#1122).
+pub fn announce(text: &str) {
+    tracing::info!("{text}");
+    if !enabled() {
+        return;
+    }
+    if let Ok(line) = serde_json::to_string(&Notice {
+        text: text.to_string(),
+    }) {
+        eprintln!("{NOTICE_MARKER}{line}");
+    }
+}
+
+/// Read a notice out of a line of a scan's stderr, if that is what it is.
+pub fn parse_notice(line: &str) -> Option<String> {
+    let payload = line.trim_start().strip_prefix(NOTICE_MARKER)?;
+    serde_json::from_str::<Notice>(payload)
+        .ok()
+        .map(|notice| notice.text)
+}
+
 /// The prefix of the line a failing scan states its reason on.
 const FAILURE_MARKER: &str = "@carrick-failure ";
 
@@ -272,6 +308,24 @@ mod tests {
         let line = format!("{MARKER}{}", serde_json::to_string(&update).unwrap());
         assert_eq!(parse(&line).as_ref(), Some(&update));
         assert_eq!(update.render(), "api (1/3): 12 of 40 files");
+    }
+
+    #[test]
+    fn a_notice_survives_the_round_trip_and_is_not_another_marker() {
+        let line = format!(
+            "{NOTICE_MARKER}{}",
+            serde_json::to_string(&Notice {
+                text: "model busy: slowing analyze-file to 4 requests at a time".to_string()
+            })
+            .unwrap()
+        );
+        assert_eq!(
+            parse_notice(&line).as_deref(),
+            Some("model busy: slowing analyze-file to 4 requests at a time")
+        );
+        assert!(parse_notice("@carrick-progress {}").is_none());
+        assert!(parse(&line).is_none());
+        assert!(parse_failure(&line).is_none());
     }
 
     /// The reason is the error's leading sentence, and it survives the

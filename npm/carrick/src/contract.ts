@@ -258,6 +258,9 @@ export type RunningScan = {
     done?: number;
     total?: number;
   };
+  /** Why a running scan is slow, in the scan's own words (carrick#1122). */
+  notice?: string;
+  /** A failed scan's reason on the first line, then an excerpt of its log (carrick#1103). */
   error?: string;
   /** RFC 3339, when the scan ended. Absent while it is running. */
   finished_at?: string;

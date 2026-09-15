@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 mod limiter;
 use limiter::{RatePacer, RouteLimits};
@@ -96,7 +96,7 @@ fn note_retry() {
     };
     if retry_announcement_due(*last, now) {
         *last = Some(now);
-        info!("{}", retry_line(count));
+        crate::progress::announce(&retry_line(count));
     }
 }
 

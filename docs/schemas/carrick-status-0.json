@@ -76,7 +76,8 @@
           },
           "additionalProperties": true
         },
-        "error": { "type": "string" },
+        "notice": { "type": "string", "description": "Why a running scan is slow, in the scan's own words (`model busy: slowing analyze-file to 4 requests at a time`). Cleared by the next phase (carrick#1122)." },
+        "error": { "type": "string", "description": "A failed scan's reason in one sentence on the first line, then an excerpt of the scan's own log (carrick#1103)." },
         "spend": { "$ref": "#/$defs/run_spend" }
       },
       "additionalProperties": true
