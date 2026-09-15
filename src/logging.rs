@@ -51,7 +51,7 @@ pub fn run_id() -> &'static str {
 ///    Uses a minimal format without timestamps or targets for a clean look.
 ///
 /// 2. **File layer** (best effort): when `~/.carrick/logs/` is writable, appends
-///    `DEBUG`-level logs with timestamps to `carrick.log.YYYY-MM-DD` (daily
+///    [`FILE_FILTER`] logs with timestamps to `carrick.log.YYYY-MM-DD` (daily
 ///    rotation, [`RETAINED_LOG_DAYS`] days kept). If the directory can't be
 ///    created the file layer is skipped and only the terminal layer is active
 ///    — in that case the run preamble only reaches stderr.
@@ -109,7 +109,7 @@ pub fn init(verbose: bool) {
             .with_writer(file_appender)
             .with_ansi(false)
             .with_target(true)
-            .with_filter(EnvFilter::new("debug"));
+            .with_filter(EnvFilter::new(FILE_FILTER));
 
         let _ = tracing_subscriber::registry()
             .with(terminal_layer)
@@ -134,6 +134,78 @@ pub fn init(verbose: bool) {
         .with(terminal_layer)
         .try_init();
     emit_run_preamble();
+}
+
+/// What the file layer writes: this crate at `debug`, everything else at
+/// `info`.
+///
+/// It was a bare `debug`, which meant every dependency's debug lines too —
+/// reqwest and hyper narrate each connection, its pool and its headers, and
+/// those lines are the reason a laptop's log could not be shipped without
+/// reading it first. Our own `debug` is what the file is for: stage names,
+/// counts, timings and code identifiers. The terminal layer is unchanged; it
+/// has its own filter and shows `info` (or `debug` with `--verbose`).
+const FILE_FILTER: &str = "info,carrick=debug";
+
+/// Rewrite one log line for upload, or drop it.
+///
+/// Two rules, and both are about what a line may carry off the machine
+/// (carrick#1063):
+///
+/// 1. The user's home directory becomes `~`. A laptop's paths carry the
+///    account name and often the employer's directory layout, and none of it
+///    identifies a run — the repo and the scanner version already do.
+/// 2. A line naming a credential goes entirely. `Authorization` is the header
+///    this scanner sends, `X-Amz-Signature` rides every presigned URL it is
+///    handed, and `carrick_sk_` is the literal prefix of the credential
+///    itself. None of these are logged today; the rule is what keeps a line
+///    added later from shipping one before anyone notices.
+///
+/// Whole lines rather than a surgical edit: a line naming a credential is a
+/// line whose value is already suspect, and a debug log is never worth
+/// deciding that question on.
+pub fn redact_log_line(line: &str, home: Option<&str>) -> Option<String> {
+    const SECRET_MARKERS: [&str; 3] = ["Authorization", "X-Amz-Signature", "carrick_sk_"];
+    if SECRET_MARKERS.iter().any(|marker| line.contains(marker)) {
+        return None;
+    }
+    Some(redact_home_in(line, home))
+}
+
+/// The home directory this process runs under, as the path spelling a log line
+/// would carry. `None` when there is no home to redact, which is most of CI.
+pub fn home_for_redaction() -> Option<String> {
+    // `dirs::home_dir` is what `log_dir` already resolves the log directory
+    // with, so the spelling this replaces is the spelling that gets written.
+    let home = dirs::home_dir()?;
+    let home = home.to_str()?.trim_end_matches('/').to_string();
+    // `/` as a home would turn every absolute path into `~...`, and a one-
+    // character home is not a home worth hiding.
+    (home.len() > 1).then_some(home)
+}
+
+/// Replace `home` with `~` wherever it appears in `text`.
+///
+/// Shared by the run-log upload and the fail marker's `reason`, so a failure
+/// and the log that explains it redact the same way.
+pub fn redact_home_in(text: &str, home: Option<&str>) -> String {
+    match home {
+        Some(home) if !home.is_empty() => text.replace(home, "~"),
+        _ => text.to_string(),
+    }
+}
+
+/// [`redact_log_line`] over a whole log slice, dropping the lines it drops.
+pub fn redact_log(content: &str) -> String {
+    let home = home_for_redaction();
+    let mut out = String::with_capacity(content.len());
+    for line in content.lines() {
+        if let Some(kept) = redact_log_line(line, home.as_deref()) {
+            out.push_str(&kept);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Bytes one debug log file may hold.
@@ -181,12 +253,19 @@ fn budget(cap: u64, existing: u64) -> u64 {
     cap.saturating_sub(existing)
 }
 
-/// The day this run's file is named for, in local time — the same clock
-/// `get_log_file_path` uses, so the roll looks at the file the upload path
-/// reads. The appender names its own files in UTC, which is carrick#789 and is
-/// neither fixed nor made worse here.
+/// The day this run's file is named for, in UTC.
+///
+/// One clock, and it is the appender's (carrick#1052). `tracing_appender`
+/// names `carrick.log.<date>` from `Utc::now()` and nothing here can tell it
+/// otherwise, so every reader of that name has to use the same clock or it
+/// reads a file that does not exist. This is the reader: the roll at startup,
+/// the offset the upload slices from, and [`get_log_file_path`] all go through
+/// it. With `Local` here, a machine west of UTC spent the hours between local
+/// midnight and 00:00 UTC computing yesterday's name for today's file — the
+/// roll looked at nothing, and the run-log upload found nothing to ship, which
+/// is the window a first index was lost in.
 fn today() -> String {
-    chrono::Local::now().format("%Y-%m-%d").to_string()
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
 }
 
 /// Move today's file aside when it is already at the cap, and keep exactly one
@@ -555,8 +634,10 @@ mod tests {
         writeln!(appender, "a line").expect("write");
         appender.flush().expect("flush");
 
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let expected = dir.path().join(format!("carrick.log.{}", today));
+        // `today()`, not a second spelling of the clock: the point of the
+        // assertion is that the name the upload path computes is the name the
+        // appender wrote (carrick#1052).
+        let expected = dir.path().join(format!("carrick.log.{}", today()));
         assert!(
             expected.is_file(),
             "expected {}, found {:?}",
@@ -595,9 +676,8 @@ mod tests {
             RETAINED_LOG_DAYS,
             kept
         );
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         assert!(
-            kept.contains(&format!("carrick.log.{}", today)),
+            kept.contains(&format!("carrick.log.{}", today())),
             "today's file was pruned: {kept:?}"
         );
         assert!(
@@ -703,8 +783,7 @@ mod tests {
             writer.flush().expect("flush");
         }
 
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let written = std::fs::metadata(dir.path().join(format!("carrick.log.{today}")))
+        let written = std::fs::metadata(dir.path().join(format!("carrick.log.{}", today())))
             .expect("today's file")
             .len();
         // One event of overshoot is allowed; five are not.
@@ -734,7 +813,10 @@ mod tests {
         }
         std::fs::write(dir.path().join("carrick.log.2026-09-01.1"), "older still\n")
             .expect("seed rolled");
+        // The appender's clock, read once and used for both the seed and the
+        // roll, so the two cannot disagree across a midnight (carrick#1052).
         let day = today();
+        assert_eq!(day, chrono::Utc::now().format("%Y-%m-%d").to_string());
         std::fs::write(
             dir.path().join(format!("carrick.log.{day}")),
             vec![b'x'; 512],
@@ -770,6 +852,150 @@ mod tests {
                 <= 1,
             "more than one rolled generation: {kept:?}"
         );
+    }
+
+    /// One clock, and it is the appender's (carrick#1052).
+    ///
+    /// `tracing_appender` names its files from `Utc::now()`. Everything that
+    /// reads that name — the roll at startup, the offset the run-log upload
+    /// slices from, `get_log_file_path` — goes through `today()`, so this is
+    /// the assertion that keeps them on the same day. With `Local` here, every
+    /// machine west of UTC had a window between local midnight and 00:00 UTC
+    /// in which the upload looked for a file nobody was writing.
+    #[test]
+    fn todays_name_is_computed_on_the_appenders_clock() {
+        assert_eq!(today(), chrono::Utc::now().format("%Y-%m-%d").to_string());
+
+        // And the appender agrees, which is the half a constant cannot state.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut appender = rolling::Builder::new()
+            .rotation(rolling::Rotation::DAILY)
+            .filename_prefix("carrick.log")
+            .max_log_files(RETAINED_LOG_DAYS)
+            .build(dir.path())
+            .expect("build appender");
+        writeln!(appender, "a line").expect("write");
+        appender.flush().expect("flush");
+        assert!(
+            dir.path()
+                .join(format!("carrick.log.{}", today()))
+                .is_file(),
+            "the appender wrote {:?}, not carrick.log.{}",
+            log_files(dir.path()),
+            today()
+        );
+    }
+
+    /// The file layer keeps our own debug lines and drops everyone else's.
+    ///
+    /// The filter is the whole reason a laptop's log can be shipped: at a bare
+    /// `debug` the file carried reqwest's and hyper's per-connection narration,
+    /// which is where URLs, headers and pool internals appear. Driven through a
+    /// real subscriber rather than by reading the directive string, so a filter
+    /// that stops meaning what it says fails here.
+    #[test]
+    fn the_file_layer_keeps_our_debug_and_nobody_elses() {
+        let written = Shared::default();
+        let layer = fmt::layer()
+            .with_writer(written.clone())
+            .with_ansi(false)
+            .with_target(true)
+            .with_filter(EnvFilter::new(FILE_FILTER));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "carrick::engine", "ours at debug");
+            tracing::debug!(target: "reqwest::connect", "theirs at debug");
+            tracing::debug!(target: "hyper_util::client::legacy::pool", "theirs too");
+            // Another crate's info is still worth keeping: it is rare, and a
+            // warning from a dependency is often the only record of why a run
+            // behaved the way it did.
+            tracing::info!(target: "reqwest::connect", "theirs at info");
+        });
+
+        let log = written.text();
+        assert!(log.contains("ours at debug"), "{log}");
+        assert!(log.contains("theirs at info"), "{log}");
+        assert!(!log.contains("theirs at debug"), "{log}");
+        assert!(!log.contains("theirs too"), "{log}");
+    }
+
+    /// A writer the test can read back.
+    #[derive(Clone, Default)]
+    struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Shared {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Shared {
+        type Writer = Shared;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A laptop's paths name the account and often the employer. The repo and
+    /// the scanner version identify the run; the home directory identifies the
+    /// person.
+    #[test]
+    fn the_home_directory_becomes_a_tilde() {
+        assert_eq!(
+            redact_log_line(
+                "  reading /Users/ada/work/payments-api/src/index.ts",
+                Some("/Users/ada")
+            )
+            .as_deref(),
+            Some("  reading ~/work/payments-api/src/index.ts")
+        );
+        // Several times on one line, and in the middle of a longer word-shaped
+        // path, because that is how a log writes them.
+        assert_eq!(
+            redact_home_in("/home/ada/a -> /home/ada/b", Some("/home/ada")),
+            "~/a -> ~/b"
+        );
+        // Nothing to redact against is not an error; the line ships as it is.
+        assert_eq!(redact_home_in("/home/ada/a", None), "/home/ada/a");
+    }
+
+    /// A line naming a credential does not leave the machine, whichever of the
+    /// three shapes it names it in. None of these are logged today — the rule
+    /// is what keeps a line added later from shipping one.
+    #[test]
+    fn a_line_naming_a_credential_is_dropped_whole() {
+        for line in [
+            "  DEBUG request headers: Authorization: Bearer abc",
+            "  DEBUG presigned PUT https://b.s3/k?X-Amz-Signature=deadbeef",
+            "  DEBUG credential carrick_sk_live_9f2 loaded",
+        ] {
+            assert_eq!(
+                redact_log_line(line, Some("/home/ada")),
+                None,
+                "not dropped: {line}"
+            );
+        }
+    }
+
+    /// The two rules over a slice: the credential line goes, the rest keeps
+    /// its order and loses its home directory.
+    #[test]
+    fn redacting_a_slice_drops_lines_and_rewrites_the_rest() {
+        let redacted = redact_log("first line\n  Authorization: Bearer abc\nlast line\n");
+        assert_eq!(redacted, "first line\nlast line\n");
     }
 
     fn log_files(dir: &Path) -> Vec<String> {
