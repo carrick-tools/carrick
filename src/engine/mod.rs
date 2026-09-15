@@ -2675,6 +2675,7 @@ async fn analyze_current_repo_incremental(
             cloud_data.boundary = Some(crate::boundary::ServiceBoundary::collect(
                 &cloud_data,
                 &analysis.stats,
+                &merged_results,
                 repo_path,
             ));
             if crate::local_mode::no_model() {
@@ -5923,6 +5924,7 @@ async fn analyze_current_repo(
     cloud_data.boundary = Some(crate::boundary::ServiceBoundary::collect(
         &cloud_data,
         &analysis_result.stats,
+        &analysis_result.file_results,
         repo_path,
     ));
     crate::phase_timing::mark(crate::phase_timing::Phase::Other);

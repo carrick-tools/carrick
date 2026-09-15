@@ -1267,26 +1267,32 @@ impl FunctionDefinitionExtractor {
     /// function expression) under `key`, and return its retrieval tokens (see
     /// `FunctionDefinition::tokens`). A body-less node — an overload signature,
     /// an abstract method — still yields its parameter tokens.
+    ///
+    /// The parameter list is walked for call sites too: a call in a parameter
+    /// default (`function f(now = clock())`) runs as part of the function, and
+    /// with only the body walked it fell through to the file's module-scope
+    /// row (carrick#1159).
     fn record_fn_callees(&mut self, key: &str, function: &Function) -> Vec<String> {
         let mut params = Vec::new();
         for param in &function.params {
             collect_pat_tokens(&param.pat, &mut params);
         }
         let body = function.body.as_ref().map(|body| self.walk_body(body));
-        let (refs, tokens) = match body {
+        let (mut refs, tokens) = match body {
             Some(collector) => (
                 collector.out,
                 build_tokens(&params, &collector.identifiers, &collector.literals),
             ),
             None => (Vec::new(), build_tokens(&params, &[], &[])),
         };
+        refs.extend(self.walk_body(&function.params).out);
         self.callee_refs.insert(key.to_string(), refs);
 
         tokens
     }
 
-    /// Record the call sites of an arrow function under `key`, and return its
-    /// retrieval tokens.
+    /// Record the call sites of an arrow function under `key`, parameter
+    /// defaults included, and return its retrieval tokens.
     fn record_arrow_callees(&mut self, key: &str, arrow: &ArrowExpr) -> Vec<String> {
         let mut params = Vec::new();
         for pat in &arrow.params {
@@ -1294,7 +1300,9 @@ impl FunctionDefinitionExtractor {
         }
         let collector = self.walk_body(&*arrow.body);
         let tokens = build_tokens(&params, &collector.identifiers, &collector.literals);
-        self.callee_refs.insert(key.to_string(), collector.out);
+        let mut refs = collector.out;
+        refs.extend(self.walk_body(&arrow.params).out);
+        self.callee_refs.insert(key.to_string(), refs);
 
         tokens
     }
