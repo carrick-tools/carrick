@@ -8,12 +8,19 @@
 //! The rules this module holds, in the order a run meets them:
 //!
 //! 1. A service whose detection or guidance cannot be had is DEFERRED
-//!    ([`ModelSetup::deferred`]): analysed facts-only, nothing cached as the
-//!    model's answer, the run carries on.
+//!    ([`ModelSetup::deferred`]): analysed facts-only, nothing cached that the
+//!    model did not answer, the run carries on. A detection that answered is
+//!    kept when only its guidance failed ([`ModelSetup::guidance_deferred`]).
 //! 2. Once every service has been through, the work still owed — a deferred
 //!    service, files the analyzer never answered for, intents that failed, calls
 //!    the quota breaker stopped — gets ONE more try in the same run, after a
 //!    wait of minutes ([`retry_delay`]).
+//!
+//!    Both kinds of waiting, the patient retries inside detection and guidance
+//!    and this wait, draw on one run-wide budget ([`crate::retry_budget`],
+//!    `CARRICK_RETRY_BUDGET_SECS`, 20 minutes by default). Once it is spent a
+//!    service defers after one attempt and the retry is skipped, so a model
+//!    that refuses the whole run cannot hold it for hours (carrick#1126).
 //! 3. What is still owed after that is PENDING. A pending service that already
 //!    has an index is held back, so a thinner index cannot replace it (#461);
 //!    every other service lands.
@@ -46,6 +53,16 @@ pub struct ModelSetup {
     /// Why this service's model analysis is deferred, when it is: the stage
     /// and the cloud's error code, e.g. `framework detection: model_error`.
     pub deferred: Option<String>,
+    /// What a deferred service keeps in its cache because the model did
+    /// answer it: the detection and extraction config when only the guidance
+    /// failed. Never analysed with (see [`Self::deferred`]).
+    kept: Option<KeptAnswers>,
+}
+
+/// The answers a guidance-deferred service caches.
+struct KeptAnswers {
+    detection: DetectionResult,
+    extraction_config: Option<crate::services::type_sidecar::ExtractionConfig>,
 }
 
 impl ModelSetup {
@@ -59,6 +76,7 @@ impl ModelSetup {
             guidance,
             extraction_config,
             deferred: None,
+            kept: None,
         }
     }
 
@@ -74,29 +92,58 @@ impl ModelSetup {
             .downcast_ref::<crate::agent_service::AgentCallError>()
             .map(|e| e.code.clone())
             .unwrap_or_else(|| "unparseable_response".to_string());
+        let again = if crate::retry_budget::remaining().is_zero() {
+            "the next scan asks again, because this run has spent its retry budget"
+        } else {
+            "the scan asks again before it ends"
+        };
         tracing::warn!(
             "Deferring this service's model analysis: {stage} failed ({error}). Its files are \
-             analysed facts-only for now, and the scan asks again before it ends."
+             analysed facts-only for now, and {again}."
         );
         Self {
             detection: DetectionResult::default(),
             guidance: crate::local_mode::offline_guidance(),
             extraction_config: None,
             deferred: Some(format!("{stage}: {code}")),
+            kept: None,
+        }
+    }
+
+    /// The setup of a service whose detection answered and whose guidance
+    /// failed with `error`: deferred like [`Self::deferred`], analysed with the
+    /// same stand-ins, but the detection (and the extraction config asked with
+    /// it) is cached, so the next ask is guidance only (carrick#1126).
+    pub fn guidance_deferred(
+        detection: DetectionResult,
+        extraction_config: Option<crate::services::type_sidecar::ExtractionConfig>,
+        error: &(dyn std::error::Error + 'static),
+    ) -> Self {
+        Self {
+            kept: Some(KeptAnswers {
+                detection,
+                extraction_config,
+            }),
+            ..Self::deferred("framework guidance", error)
         }
     }
 
     /// Write the cache fields this setup is allowed to write.
     ///
-    /// A deferred service writes none: the absence of `cached_detection` is
-    /// what makes the next scan ask for it (the incremental branch reuses a
-    /// cached detection only when one is there), so it doubles as the blob's
-    /// "pending model analysis" mark without a field of its own.
+    /// A deferred service never writes `cached_guidance`: its absence is what
+    /// makes the next scan ask for the model stages again (the incremental
+    /// branch reuses them only when both are there), so it doubles as the
+    /// blob's "pending model analysis" mark without a field of its own. A
+    /// detection that answered is kept beside it, and the next scan asks for
+    /// the guidance alone.
     pub fn stamp_cache(&self, data: &mut CloudRepoData) {
         if self.deferred.is_some() {
-            data.cached_detection = None;
             data.cached_guidance = None;
-            data.cached_extraction_config = None;
+            data.cached_detection = self.kept.as_ref().map(|kept| kept.detection.clone());
+            data.cached_extraction_config = self
+                .kept
+                .as_ref()
+                .and_then(|kept| kept.extraction_config.clone());
             return;
         }
         data.cached_detection = Some(self.detection.clone());
@@ -240,6 +287,23 @@ fn retry_delay_from(value: Option<&str>, thinning: bool) -> Duration {
         .min(MAX_RETRY_DELAY)
 }
 
+/// Sleep `delay` as the run's in-run retry wait: charged to the run's retry
+/// budget, and saying how long is left at the start and about once a minute,
+/// so a run parked here never reads as a dead one.
+pub async fn wait_with_progress(delay: Duration, mut progress: impl FnMut(Duration)) {
+    const TICK: Duration = Duration::from_secs(60);
+    let mut left = delay;
+    progress(left);
+    while !left.is_zero() {
+        let step = left.min(TICK);
+        crate::retry_budget::wait(step).await;
+        left -= step;
+        if !left.is_zero() {
+            progress(left);
+        }
+    }
+}
+
 /// The closing lines of a run that still owes work: which services are
 /// complete, which are pending and why, and what re-running does.
 ///
@@ -353,6 +417,56 @@ mod tests {
         };
         assert!(owed.thins_the_index());
         assert!(!owed.worth_retrying());
+    }
+
+    #[test]
+    fn a_guidance_failure_keeps_the_detection_and_analyses_with_the_stand_ins() {
+        let error = crate::agent_service::AgentCallError {
+            code: "model_error".to_string(),
+            message: "overloaded".to_string(),
+            retriable: true,
+        };
+        let detection = DetectionResult {
+            frameworks: vec!["express".to_string()],
+            ..DetectionResult::default()
+        };
+        let setup = ModelSetup::guidance_deferred(detection.clone(), None, &error);
+        assert_eq!(
+            setup.deferred.as_deref(),
+            Some("framework guidance: model_error")
+        );
+        // Analysed with the stand-ins, like any deferred service.
+        assert!(setup.detection.frameworks.is_empty());
+
+        // What it caches is asserted end to end in
+        // `tests/scan_durability_test.rs`, which reads the uploaded payload.
+        assert_eq!(
+            setup
+                .kept
+                .as_ref()
+                .map(|kept| kept.detection.frameworks.clone()),
+            Some(detection.frameworks)
+        );
+        assert!(
+            ModelSetup::deferred("framework detection", &error)
+                .kept
+                .is_none()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_retry_wait_says_what_is_left_about_once_a_minute_and_charges_the_budget() {
+        let _serial = crate::retry_budget::tests::SERIAL.lock().await;
+        crate::retry_budget::reset();
+        let mut said = Vec::new();
+        wait_with_progress(Duration::from_secs(150), |left| said.push(left.as_secs())).await;
+        assert_eq!(said, [150, 90, 30]);
+        assert_eq!(crate::retry_budget::spent(), Duration::from_secs(150));
+
+        said.clear();
+        wait_with_progress(Duration::ZERO, |left| said.push(left.as_secs())).await;
+        assert_eq!(said, [0]);
+        crate::retry_budget::reset();
     }
 
     /// What the blob then caches is asserted end to end in

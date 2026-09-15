@@ -371,6 +371,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let should_upload = should_upload_data();
     debug!(upload = should_upload, "Running Carrick in CI mode");
+    // The run's one ceiling on waiting out a refusing model (carrick#1126).
+    crate::retry_budget::reset();
 
     // Said before the scan, not after it: the point is that a capture pass set
     // up this way costs a full pass and leaves nothing behind (carrick#966).
@@ -571,26 +573,41 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         .filter(|(_, run)| run.owed.worth_retrying())
         .map(|(index, _)| index)
         .collect();
-    if !retrying.is_empty() && !crate::local_mode::no_model() {
+    let retry_budget_left = crate::retry_budget::remaining();
+    if !retrying.is_empty() && !crate::local_mode::no_model() && retry_budget_left.is_zero() {
+        // The run already spent its ceiling on waiting (carrick#1126): what is
+        // owed stays pending and the run finishes now.
+        warn!(
+            "Not retrying {} service(s) in this run: it has spent its {}s retry budget ({}). \
+             They stay pending for the next scan.",
+            retrying.len(),
+            crate::retry_budget::budget().as_secs(),
+            crate::retry_budget::BUDGET_ENV
+        );
+    } else if !retrying.is_empty() && !crate::local_mode::no_model() {
+        // The wait is charged to the run's budget and never outlasts it.
         let delay = durability::retry_delay(
             retrying
                 .iter()
                 .any(|index| runs[*index].owed.thins_the_index()),
-        );
+        )
+        .min(retry_budget_left);
         let names: Vec<String> = retrying
             .iter()
             .map(|index| format!("{} ({})", runs[*index].label, runs[*index].owed.describe()))
             .collect();
-        logging::progress(
-            &sp,
-            &format!(
-                "{} service(s) still owe model work: {}. Retrying them once in {}s",
-                retrying.len(),
-                names.join(", "),
-                delay.as_secs()
-            ),
-        );
-        tokio::time::sleep(delay).await;
+        durability::wait_with_progress(delay, |left| {
+            logging::progress(
+                &sp,
+                &format!(
+                    "{} service(s) still owe model work: {}. Retrying them once in {}s",
+                    retrying.len(),
+                    names.join(", "),
+                    left.as_secs()
+                ),
+            );
+        })
+        .await;
         // The breaker never re-closes on its own inside a scan. After a wait
         // this long it is worth one more call to find out; a quota that has
         // not refilled trips it again at once.
@@ -2344,13 +2361,20 @@ async fn analyze_current_repo_incremental(
                     };
                     ModelSetup::ready(det.clone(), guid.clone(), extraction)
                 } else {
-                    // No cached detection: a first scan's cache entry, or the
-                    // service a previous scan deferred. Asked again here.
-                    model_setup(packages, &all_import_facts).await
+                    // Something is missing: a first scan's cache entry, or the
+                    // service a previous scan deferred. A detection that
+                    // landed without its guidance is kept, and only the
+                    // guidance is asked again (carrick#1126).
+                    model_setup(
+                        packages,
+                        &all_import_facts,
+                        SettledDetection::kept_by(prev, &current_pkg_hash),
+                    )
+                    .await
                 }
             } else {
                 debug!("package.json changed, re-running framework detection");
-                model_setup(packages, &all_import_facts).await
+                model_setup(packages, &all_import_facts, None).await
             };
 
             // What this scan actually dispatches is decided per file inside the
@@ -2639,6 +2663,15 @@ async fn analyze_current_repo_incremental(
     let prev_intents = previous_data
         .map(|prev| PreviousIntents::from_definitions(&prev.function_definitions))
         .unwrap_or_default();
+    // A service whose previous pass deferred its guidance carries no file
+    // answers, so it always lands here; its detection is kept all the same
+    // (carrick#1126).
+    let settled = match previous_data {
+        Some(prev) => {
+            SettledDetection::kept_by(prev, &hash_workspace_package_jsons(packages, repo_path)?)
+        }
+        None => None,
+    };
     // Discovery above already parsed every file, resolved the call edges and
     // walked the manifests; the full analysis reads the same result rather
     // than running all of it a second time (carrick#1108).
@@ -2655,6 +2688,7 @@ async fn analyze_current_repo_incremental(
             repo_name,
         },
         prev_intents,
+        settled,
         workspace,
         run_intents,
     )
@@ -2666,17 +2700,49 @@ async fn analyze_current_repo_incremental(
     Ok(analysis)
 }
 
+/// A detection an earlier pass of this service already has, with the
+/// extraction config asked alongside it (when that answered).
+struct SettledDetection {
+    detection: DetectionResult,
+    extraction_config: Option<crate::services::type_sidecar::ExtractionConfig>,
+}
+
+impl SettledDetection {
+    /// The detection `prev` kept when its guidance was deferred
+    /// ([`ModelSetup::guidance_deferred`]): there is a cached detection and no
+    /// cached guidance, from this cache version and these manifests. A
+    /// complete previous generation returns `None`; the incremental branch
+    /// reuses it whole, and a full analysis asks again as it always has.
+    fn kept_by(prev: &CloudRepoData, current_pkg_hash: &str) -> Option<Self> {
+        if prev.cached_guidance.is_some()
+            || prev.cache_version != Some(CACHE_VERSION)
+            || prev.package_json_hash.as_deref() != Some(current_pkg_hash)
+        {
+            return None;
+        }
+        prev.cached_detection.clone().map(|detection| Self {
+            detection,
+            extraction_config: prev.cached_extraction_config.clone(),
+        })
+    }
+}
+
 /// Run framework detection, per-protocol guidance generation, and
 /// extraction-config generation (machinery-unwrap rules). All three are
 /// cached together under the package_json_hash gate.
 ///
+/// `settled` is a detection the service already holds from a pass whose
+/// guidance failed: detection is not asked again, only guidance (and the
+/// extraction config, when that failed too).
+///
 /// Never fails. Detection and guidance are single calls a whole service
 /// depends on, so they retry under [`RetryPolicy::PATIENT`]; when even that is
 /// spent, the service's model analysis is DEFERRED rather than the run ended:
-/// its files are analysed facts-only, none of it is cached as the model's
-/// answer, and the engine names it at the end and asks again (2026-09-15: one
+/// its files are analysed facts-only, none of the missing answers is cached,
+/// and the engine names it at the end and asks again (2026-09-15: one
 /// exhausted detection call aborted a seven-service first index after four
-/// services were done).
+/// services were done). A guidance failure keeps the detection that answered,
+/// so the next ask is guidance only (carrick#1126).
 ///
 /// A deferred service is never analysed under a stand-in guidance. The
 /// analyzer's cache key names the guidance it embedded, so answers bought
@@ -2685,15 +2751,22 @@ async fn analyze_current_repo_incremental(
 async fn model_setup(
     packages: &Packages,
     import_facts: &BTreeSet<crate::visitor::ImportedSymbol>,
+    settled: Option<SettledDetection>,
 ) -> ModelSetup {
     crate::scan_stage::enter(crate::scan_stage::Stage::FrameworkDetect);
     let patient = AgentService::new().with_retry_policy(RetryPolicy::PATIENT);
-    let detection = match FrameworkDetector::new(patient.clone())
-        .detect_frameworks_and_libraries(packages, import_facts)
-        .await
-    {
-        Ok(detection) => detection,
-        Err(error) => return ModelSetup::deferred("framework detection", error.as_ref()),
+    let (detection, settled_extraction_config) = match settled {
+        Some(settled) => {
+            debug!("Reusing this service's detection; asking for its guidance only");
+            (settled.detection, settled.extraction_config)
+        }
+        None => match FrameworkDetector::new(patient.clone())
+            .detect_frameworks_and_libraries(packages, import_facts)
+            .await
+        {
+            Ok(detection) => (detection, None),
+            Err(error) => return ModelSetup::deferred("framework detection", error.as_ref()),
+        },
     };
 
     let guidance_agent = FrameworkGuidanceAgent::new(patient);
@@ -2705,11 +2778,16 @@ async fn model_setup(
     // them concurrently instead of paying a lone extra lambda round-trip.
     let (guidance, extraction_config) = tokio::join!(
         guidance_agent.generate_for_active_protocols(&detection),
-        generate_extraction_config(&extraction_agent, &detection, packages),
+        async {
+            match settled_extraction_config {
+                Some(config) => Some(config),
+                None => generate_extraction_config(&extraction_agent, &detection, packages).await,
+            }
+        },
     );
     match guidance {
         Ok(guidance) => ModelSetup::ready(detection, guidance, extraction_config),
-        Err(error) => ModelSetup::deferred("framework guidance", error.as_ref()),
+        Err(error) => ModelSetup::guidance_deferred(detection, extraction_config, error.as_ref()),
     }
 }
 
@@ -5391,6 +5469,7 @@ async fn analyze_current_repo(
     sidecar: Option<&TypeSidecar>,
     discovered: Discovered,
     previous_intents: PreviousIntents,
+    settled: Option<SettledDetection>,
     workspace: &mut crate::external_call_candidates::WorkspaceScan,
     run_intents: &RunIntentMemo,
 ) -> Result<ServiceAnalysis, Box<dyn std::error::Error>> {
@@ -5455,7 +5534,7 @@ async fn analyze_current_repo(
             None,
         )
     } else {
-        model_setup(packages, &all_import_facts).await
+        model_setup(packages, &all_import_facts, settled).await
     };
 
     // 4. Run the complete multi-agent analysis

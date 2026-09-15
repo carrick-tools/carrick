@@ -300,6 +300,9 @@ pub struct RetryPolicy {
     /// Ceiling on the sleeps added together. A retry whose wait would cross it
     /// is not made.
     wait_budget: Duration,
+    /// Whether this call's sleeps draw on the run-wide budget
+    /// ([`crate::retry_budget`]) as well as its own.
+    run_budgeted: bool,
 }
 
 impl RetryPolicy {
@@ -309,20 +312,52 @@ impl RetryPolicy {
         max_delay: RETRY_MAX_DELAY,
         // Never the binding limit: the attempts run out first (~126 s at most).
         wait_budget: Duration::from_secs(3600),
+        run_budgeted: false,
     };
 
     /// A call a whole service depends on: exponential with jitter, sleeps of
-    /// up to two minutes, and up to ten minutes of sleeping before it fails.
+    /// up to two minutes, and up to ten minutes of sleeping before it fails,
+    /// all of it drawn from the run's retry budget ([`crate::retry_budget`]).
+    /// Once that is spent the call gets its first attempt and no sleep.
     pub const PATIENT: Self = Self {
         max_attempts: 32,
         max_delay: PATIENT_RETRY_MAX_DELAY,
         wait_budget: Duration::from_secs(600),
+        run_budgeted: true,
     };
 
     /// Whether a failed attempt `attempt` may be followed by a sleep of `next`
     /// after `waited` has already been slept on this call.
     fn permits(&self, attempt: u32, waited: Duration, next: Duration) -> bool {
         attempt < self.max_attempts && waited + next <= self.wait_budget
+    }
+
+    /// [`Self::permits`], and for a run-budgeted policy, whether the run's
+    /// budget still has room for `next`.
+    fn permits_in_run(&self, attempt: u32, waited: Duration, next: Duration) -> bool {
+        if !self.permits(attempt, waited, next) {
+            return false;
+        }
+        if self.run_budgeted && !crate::retry_budget::fits(next) {
+            debug!(
+                "Not retrying: this run has spent its {}s retry budget ({}), so the call fails \
+                 now",
+                crate::retry_budget::budget().as_secs(),
+                crate::retry_budget::BUDGET_ENV
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Sleep before the next attempt, charged to the run's budget when the
+    /// policy draws on it.
+    async fn sleep(&self, duration: Duration) {
+        if self.run_budgeted {
+            crate::retry_budget::wait(duration).await;
+        } else {
+            sleep(duration).await;
+        }
     }
 }
 
@@ -816,7 +851,7 @@ impl AgentService {
                             // application, so it is retriable by definition.
                             let wait_time =
                                 backoff_delay_within(attempt, jitter_seed(), policy.max_delay);
-                            if policy.permits(attempt, waited, wait_time) {
+                            if policy.permits_in_run(attempt, waited, wait_time) {
                                 note_retry();
                                 warn!(
                                     target: crate::logging::RETRY_TARGET,
@@ -825,7 +860,7 @@ impl AgentService {
                                 );
                                 drop(permit);
                                 drop(route_slot);
-                                sleep(wait_time).await;
+                                policy.sleep(wait_time).await;
                                 waited += wait_time;
                                 lambda_attempt += 1;
                                 continue;
@@ -913,7 +948,7 @@ impl AgentService {
                                 policy.max_delay,
                             );
                             if is_transient_gateway_status
-                                && policy.permits(attempt, waited, wait_time)
+                                && policy.permits_in_run(attempt, waited, wait_time)
                             {
                                 let line = format!(
                                     "Gateway status {} with non-envelope body ({}): {}. Retrying in {:?} (attempt {}/{})",
@@ -946,7 +981,7 @@ impl AgentService {
                                     warn!(target: crate::logging::RETRY_TARGET, "{line}");
                                     lambda_attempt += 1;
                                 }
-                                sleep(wait_time).await;
+                                policy.sleep(wait_time).await;
                                 waited += wait_time;
                                 continue;
                             }
@@ -1018,7 +1053,7 @@ impl AgentService {
                     let wait_time =
                         retry_wait_within(attempt, jitter_seed(), retry_after, policy.max_delay);
                     if should_retry(&call_err, attempt, max_retries)
-                        && policy.permits(attempt, waited, wait_time)
+                        && policy.permits_in_run(attempt, waited, wait_time)
                     {
                         let line = format!(
                             "Agent error '{}' is retriable, retrying in {:?} (attempt {}/{}): {}",
@@ -1035,7 +1070,7 @@ impl AgentService {
                             warn!(target: crate::logging::RETRY_TARGET, "{line}");
                             drop(route_slot);
                         }
-                        sleep(wait_time).await;
+                        policy.sleep(wait_time).await;
                         waited += wait_time;
                         lambda_attempt += 1;
                         continue;
@@ -1052,7 +1087,7 @@ impl AgentService {
                 Err(e) => {
                     // Bare network failure (no response received) — retriable by definition.
                     let wait_time = backoff_delay_within(attempt, jitter_seed(), policy.max_delay);
-                    if policy.permits(attempt, waited, wait_time) {
+                    if policy.permits_in_run(attempt, waited, wait_time) {
                         note_retry();
                         warn!(
                             target: crate::logging::RETRY_TARGET,
@@ -1061,7 +1096,7 @@ impl AgentService {
                         );
                         drop(permit);
                         drop(route_slot);
-                        sleep(wait_time).await;
+                        policy.sleep(wait_time).await;
                         waited += wait_time;
                         lambda_attempt += 1;
                         continue;
@@ -2625,6 +2660,28 @@ pub(crate) mod tests {
         assert!(retry_wait_within(1, 0, hint, RETRY_MAX_DELAY) <= RETRY_MAX_DELAY * 3 / 2);
         let (_, waited) = worst_case(RetryPolicy::PATIENT, hint);
         assert!(waited <= Duration::from_secs(600), "{waited:?}");
+    }
+
+    /// A patient call stops sleeping once the run's retry budget is spent
+    /// (carrick#1126), and a per-file call never draws on it.
+    #[tokio::test(start_paused = true)]
+    async fn a_spent_run_budget_ends_patient_retries_and_leaves_file_calls_alone() {
+        let _serial = crate::retry_budget::tests::SERIAL.lock().await;
+        crate::retry_budget::reset();
+        let wait = Duration::from_secs(2);
+        assert!(RetryPolicy::PATIENT.permits_in_run(1, Duration::ZERO, wait));
+
+        // Spend all of it, through the same sleep the loop takes.
+        RetryPolicy::PATIENT
+            .sleep(crate::retry_budget::budget())
+            .await;
+        assert!(!RetryPolicy::PATIENT.permits_in_run(1, Duration::ZERO, wait));
+        assert!(RetryPolicy::STANDARD.permits_in_run(1, Duration::ZERO, wait));
+
+        // A standard sleep charges nothing.
+        crate::retry_budget::reset();
+        RetryPolicy::STANDARD.sleep(Duration::from_secs(60)).await;
+        assert_eq!(crate::retry_budget::spent(), Duration::ZERO);
     }
 
     #[test]
