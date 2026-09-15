@@ -1,0 +1,18 @@
+type Query {
+  products: [Product!]!
+  product(id: ID!): Product
+  viewer: Account
+}
+
+type Mutation {
+  addProduct(name: String!): Product!
+}
+
+type Product {
+  id: ID!
+  name: String!
+}
+
+type Account {
+  id: ID!
+}

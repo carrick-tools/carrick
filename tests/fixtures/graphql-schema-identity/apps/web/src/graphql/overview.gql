@@ -1,0 +1,8 @@
+query Overview {
+  products {
+    id
+  }
+  balance {
+    amount
+  }
+}

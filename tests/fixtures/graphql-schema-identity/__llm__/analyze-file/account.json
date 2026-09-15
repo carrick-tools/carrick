@@ -1,0 +1,19 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:12",
+      "line_number": 12,
+      "target": "${process.env.CATALOG_URL}/graphql",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${process.env.CATALOG_URL}/graphql`, { method: \"POST\", body: JSON.stringify({ query: CATALOG_VIEWER }) })",
+      "call_expression_line": 12,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}
