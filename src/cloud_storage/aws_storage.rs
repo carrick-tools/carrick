@@ -233,6 +233,21 @@ fn relogin_message(status: reqwest::StatusCode, body: &str) -> String {
     message
 }
 
+/// The run key, on every cloud request this client makes.
+///
+/// The prompt-lambda calls have sent it since it existed, and the storage and
+/// action calls sent nothing but their credential — so the cloud could see
+/// that a run made 4,000 model calls and could not join that run to the
+/// `check-or-upload` and `store-metadata` rows that say what it did with them
+/// (carrick#1063). Same value on both, from [`crate::logging::run_id`], which
+/// a child process inherits from the parent that drives it.
+const RUN_ID_HEADER: &str = "X-Carrick-Run-Id";
+
+/// The release that made the request. Sent beside the run id for the same
+/// reason the prompt lambdas get it: a behaviour that appeared in one release
+/// is otherwise attributed by guessing at timestamps.
+const SCANNER_VERSION_HEADER: &str = "X-Carrick-Scanner-Version";
+
 pub struct AwsStorage {
     lambda_url: String,
     http_client: Client,
@@ -829,6 +844,8 @@ impl AwsStorage {
                 .http_client
                 .post(&self.lambda_url)
                 .header("Authorization", format!("Bearer {}", token))
+                .header(RUN_ID_HEADER, crate::logging::run_id())
+                .header(SCANNER_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
                 .json(body)
                 .send()
                 .await
@@ -931,6 +948,8 @@ impl AwsStorage {
                 .http_client
                 .post(&self.lambda_url)
                 .header("X-Carrick-OIDC", &token)
+                .header(RUN_ID_HEADER, crate::logging::run_id())
+                .header(SCANNER_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
                 .json(body)
                 .send()
                 .await
@@ -2351,6 +2370,93 @@ mod tests {
         assert_eq!(v["scan_final"], true);
         assert_eq!(v["unanalysed_files"][0]["path"], "src/a.ts");
         assert_eq!(v["unanalysed_files"][0]["reason"], "model_error");
+    }
+
+    /// Every cloud request this client makes names its run and its release.
+    ///
+    /// The prompt-lambda calls have carried both since they existed; the
+    /// storage and action calls carried only their credential, so nothing on
+    /// the cloud side could join a `check-or-upload` row to the run that made
+    /// the model calls beside it (carrick#1063). Asserted on the wire, with
+    /// the credential still in place, because the header set is the contract
+    /// and not the builder call that produces it.
+    #[tokio::test]
+    async fn a_laptop_request_names_its_run_and_its_release() {
+        let (storage, server) = bearer_storage(vec![check_ok()]);
+
+        storage.health_check().await.unwrap();
+
+        let request = &server.join().unwrap()[0];
+        assert!(
+            has_header(request, "authorization", "Bearer carrick_sk_live_test"),
+            "{request}"
+        );
+        assert_eq!(
+            header_of(request, RUN_ID_HEADER).as_deref(),
+            Some(crate::logging::run_id()),
+            "{request}"
+        );
+        assert_eq!(
+            header_of(request, SCANNER_VERSION_HEADER).as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "{request}"
+        );
+    }
+
+    /// The same two headers on the CI branch, where the credential is the
+    /// minted OIDC token rather than a bearer secret. Serialised because the
+    /// provider reads the runner's variables out of the process environment
+    /// and is a process-global once it has.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_ci_request_names_its_run_and_its_release() {
+        let issued = crate::oidc::tests::jwt_with_exp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600,
+        );
+        let (token_url, token_server) =
+            crate::agent_service::tests::stub_token_endpoint(vec![issued.clone()]);
+        // SAFETY: a `#[serial]` test, and the provider is read once per
+        // process — nothing else in this binary asks for it.
+        unsafe {
+            std::env::set_var("ACTIONS_ID_TOKEN_REQUEST_URL", &token_url);
+            std::env::set_var("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runner-secret");
+        }
+
+        let (base, server) = crate::agent_service::tests::stub_server(vec![check_ok()]);
+        let storage = AwsStorage::for_test(
+            &format!("{base}/types/check-or-upload"),
+            CloudAuth::Oidc,
+            false,
+        );
+        storage.health_check().await.unwrap();
+
+        let request = &server.join().unwrap()[0];
+        token_server.join().unwrap();
+        assert!(has_header(request, "x-carrick-oidc", &issued), "{request}");
+        assert_eq!(
+            header_of(request, RUN_ID_HEADER).as_deref(),
+            Some(crate::logging::run_id()),
+            "{request}"
+        );
+        assert_eq!(
+            header_of(request, SCANNER_VERSION_HEADER).as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "{request}"
+        );
+    }
+
+    /// One header value off a raw request, as the prompt-lambda tests read
+    /// theirs.
+    fn header_of(request: &str, name: &str) -> Option<String> {
+        request.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
     }
 
     /// `unanalysed_files` is a laptop field. CI's own gate already aborts the
