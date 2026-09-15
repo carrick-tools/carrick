@@ -2,6 +2,7 @@ pub mod agent_service;
 pub mod agents;
 pub mod analyzer;
 pub mod app_context;
+pub mod binding_facts;
 pub mod boundary;
 pub mod call_base;
 pub mod call_graph;

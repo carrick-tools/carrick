@@ -2,6 +2,7 @@ mod agent_service;
 mod agents;
 mod analyzer;
 mod app_context;
+mod binding_facts;
 mod boundary;
 mod call_base;
 mod call_graph;

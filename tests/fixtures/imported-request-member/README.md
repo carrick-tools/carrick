@@ -55,7 +55,7 @@ method and path live in a client module it imports, and nowhere in its own file.
 |---|---|
 | `artifacts.ts:5` `client.createArtifactUrl(name)` | `PUT /api/v2/artifacts/:encoded` |
 | `artifacts.ts:16` `client.readArtifactUrl(name)` | `GET /api/v1/artifacts/:encoded` |
-| `artifacts.ts:21` `apiClient.createArtifactUrl(name)` | `GET /legacy/handles`, untouched |
+| `artifacts.ts:21` `apiClient.createArtifactUrl(name)` | no row: the join does not fire, and the cassette's `/legacy/handles` is written nowhere the model read, so it is dropped (carrick#1146) |
 | `artifacts.ts:25` `client.describeSession()` | `GET /api/v2/session` |
 | `uploads.ts:7` `client.createArtifactUrl(name)` | `PUT /api/v2/artifacts/:encoded` |
 | `uploads.ts:11` `client.readArtifactUrl(name)` | `GET /api/v1/artifacts/:encoded` |

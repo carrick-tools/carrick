@@ -184,14 +184,29 @@ struct FnRecord {
     uses: Vec<RequestUse>,
 }
 
+/// What the same-file wrapper pass reads off one module.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalWrapperSites {
+    /// The sites whose request the fixpoint resolved, in source order.
+    pub calls: Vec<LocalWrapperCall>,
+    /// Start offsets of the sites that call a resolved wrapper and that the
+    /// fixpoint could NOT resolve (carrick#1151): the path is picked by a
+    /// `switch`, read from a table, built by a call, or the method is. Their
+    /// request is real and only the model can read it, so the candidate
+    /// scanner offers each one as a call site. A call made from inside another
+    /// wrapper is that wrapper's delegation, not a site, and is not here.
+    /// Each carries the wrapper it calls.
+    pub unresolved: Vec<(u32, String)>,
+}
+
 /// Every same-file wrapper call site in `module`, in source order.
 ///
 /// `source_map` must be the one the module was parsed with: interpolations the
 /// wrapper closes over are carried through by their source text.
-pub fn collect_local_wrapper_calls(
+pub fn collect_local_wrapper_sites(
     module: &Module,
     source_map: &Lrc<SourceMap>,
-) -> Vec<LocalWrapperCall> {
+) -> LocalWrapperSites {
     let consts = collect_consts(module);
     let mut functions = FnCollector {
         reader: Reader {
@@ -204,7 +219,7 @@ pub fn collect_local_wrapper_calls(
     module.visit_with(&mut functions);
     let wrappers = resolve_wrappers(functions.records);
     if wrappers.is_empty() {
-        return Vec::new();
+        return LocalWrapperSites::default();
     }
 
     let mut sites = SiteCollector {
@@ -213,7 +228,9 @@ pub fn collect_local_wrapper_calls(
             consts: &consts,
         },
         wrappers,
+        enclosing: Vec::new(),
         calls: Vec::new(),
+        unresolved: Vec::new(),
     };
     module.visit_with(&mut sites);
 
@@ -222,7 +239,10 @@ pub fn collect_local_wrapper_calls(
     // rows.
     calls.sort_by_key(|call| (call.span_start, call.span_end));
     calls.dedup_by_key(|call| (call.span_start, call.span_end));
-    calls
+    let mut unresolved = sites.unresolved;
+    unresolved.sort_unstable();
+    unresolved.dedup();
+    LocalWrapperSites { calls, unresolved }
 }
 
 /// Every `const` binding in the module whose initializer could state a URL, a
@@ -803,17 +823,51 @@ fn compose(shape: &Shape, args: &[ArgForm]) -> Option<Shape> {
 struct SiteCollector<'a> {
     reader: Reader<'a>,
     wrappers: HashMap<BindingKey, (String, Shape)>,
+    /// The named functions enclosing the node being visited.
+    enclosing: Vec<BindingKey>,
     calls: Vec<LocalWrapperCall>,
+    unresolved: Vec<(u32, String)>,
 }
 
 impl Visit for SiteCollector<'_> {
+    fn visit_fn_decl(&mut self, node: &FnDecl) {
+        self.enclosing
+            .push((node.ident.sym.to_string(), node.ident.ctxt));
+        node.visit_children_with(self);
+        self.enclosing.pop();
+    }
+
+    fn visit_var_declarator(&mut self, node: &VarDeclarator) {
+        let framed = match (&node.name, node.init.as_deref().map(unwrap)) {
+            (Pat::Ident(ident), Some(Expr::Arrow(_) | Expr::Fn(_))) => {
+                self.enclosing
+                    .push((ident.id.sym.to_string(), ident.id.ctxt));
+                true
+            }
+            _ => false,
+        };
+        node.visit_children_with(self);
+        if framed {
+            self.enclosing.pop();
+        }
+    }
+
     fn visit_call_expr(&mut self, node: &CallExpr) {
         if let Callee::Expr(callee) = &node.callee
             && let Expr::Ident(ident) = unwrap(callee)
             && let Some((name, shape)) = self.wrappers.get(&(ident.sym.to_string(), ident.ctxt))
-            && let Some(call) = resolve_site(&self.reader, name, shape, node)
         {
-            self.calls.push(call);
+            match resolve_site(&self.reader, name, shape, node) {
+                Some(call) => self.calls.push(call),
+                None if !self
+                    .enclosing
+                    .iter()
+                    .any(|key| self.wrappers.contains_key(key)) =>
+                {
+                    self.unresolved.push((node.span.lo.0, name.clone()));
+                }
+                None => {}
+            }
         }
         node.visit_children_with(self);
     }
@@ -949,6 +1003,10 @@ mod tests {
     /// shadowed bindings carry distinct syntax contexts) and collect its
     /// same-file wrapper call sites.
     fn collect(content: &str) -> Vec<LocalWrapperCall> {
+        collect_sites(content).calls
+    }
+
+    fn collect_sites(content: &str) -> LocalWrapperSites {
         use swc_common::{FileName, GLOBALS, Globals, Mark};
         use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
         use swc_ecma_transforms_base::resolver;
@@ -976,7 +1034,47 @@ mod tests {
             let top_level = Mark::new();
             module.visit_mut_with(&mut resolver(unresolved, top_level, true));
         });
-        collect_local_wrapper_calls(&module, &source_map)
+        collect_local_wrapper_sites(&module, &source_map)
+    }
+
+    /// The residual of carrick#1151: a site that calls a resolved wrapper with
+    /// a path nothing structural can state is offered, a delegation from one
+    /// wrapper to another is not, and a resolved site is a row rather than an
+    /// offer.
+    #[test]
+    fn a_site_the_fixpoint_cannot_state_is_offered_and_a_delegation_is_not() {
+        let content = r#"function send(path: string) {
+  return fetch(`/ledger${path}`, { method: "POST" });
+}
+function relay(path: string) {
+  return send(path);
+}
+function pick(kind: string): string {
+  switch (kind) {
+    case "a": return "/entries";
+    default: return "/totals";
+  }
+}
+export async function load(kind: string) {
+  await send(pick(kind));
+  await relay("/balances");
+}
+"#;
+        let sites = collect_sites(content);
+        assert_eq!(
+            targets(&sites.calls),
+            vec![(Some("POST"), "/ledger/balances")]
+        );
+        let offered: Vec<&str> = sites
+            .unresolved
+            .iter()
+            .map(|(start, wrapper)| {
+                let from = (*start - crate::swc_scanner::SWC_SPAN_BASE) as usize;
+                assert_eq!(wrapper, "send");
+                &content[from..from + 15]
+            })
+            .collect();
+        assert_eq!(offered, vec!["send(pick(kind)"]);
     }
 
     fn targets(calls: &[LocalWrapperCall]) -> Vec<(Option<&str>, &str)> {
