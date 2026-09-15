@@ -342,7 +342,7 @@ pub struct TypeProvenance {
     pub path: String,
     /// `any`, `unknown`, or `budget_exhausted`.
     pub kind: String,
-    /// Categorized cause: `declared`, `budget_exhausted`,
+    /// Categorized cause: `declared`, `unresolved_import`, `budget_exhausted`,
     /// `no_payload_evidence`, `machinery_envelope`, `coerced_input`,
     /// `no_success_payload`, `no_request_body`, `not_recorded`.
     pub reason: String,

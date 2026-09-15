@@ -96,7 +96,7 @@ function walkImportedAlias(
       const type = checker.getDeclaredTypeOfSymbol(target);
       if (!type) return undefined;
       return findDisqualifyingTopTypes(type, program, checker, element.name).map(
-        provenanceOf
+        (finding) => provenanceOf(finding)
       );
     }
   }

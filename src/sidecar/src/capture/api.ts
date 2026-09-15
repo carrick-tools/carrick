@@ -136,9 +136,14 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  * honest value is `not_recorded` — never a guess.
  *
  *  - `declared`: the captured declaration states `any`/`unknown` at this
- *    position. Whatever put it there (an author annotation, or an emitter that
- *    printed an unresolved value as `any`), it is baked into the emitted text
- *    and no install re-resolves it.
+ *    position, and the producer's own program had a type there too: an author
+ *    annotation, not a failed resolution.
+ *  - `unresolved_import`: the position is `any` in the emitted text because the
+ *    producer's program could not resolve the type there — an import of a
+ *    dependency that is not installed, or of a generated module that was never
+ *    generated, on the scanned checkout (carrick#1164). The printer writes that
+ *    placeholder as `any`, so the text alone reads like `declared`; the capture
+ *    tells them apart on the source program at anchor time.
  *  - `budget_exhausted`: the subtree was too deep or wide to finish inside the
  *    capture walk's budget, so it is reported unverified rather than clean.
  *  - `no_payload_evidence`: a handler returned a call whose callee has no
@@ -166,6 +171,7 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  */
 export type TypeProvenanceReason =
   | 'declared'
+  | 'unresolved_import'
   | 'budget_exhausted'
   | 'no_payload_evidence'
   | 'machinery_envelope'
