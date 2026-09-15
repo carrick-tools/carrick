@@ -1139,34 +1139,50 @@ fn log_tail_range(file_len: u64, run_start: Option<u64>) -> (u64, usize) {
 /// ones whose logs we need. Errors here are non-fatal: a failed upload is
 /// logged at warn but never propagated.
 async fn upload_run_logs<T: CloudStorage>(storage: &T, repo_path: &str) {
-    // A laptop's debug log stays on the laptop: `upload-logs` is outside what
-    // a `cli` credential may do, and the log names the developer's own machine
-    // (§1.2). Asked before the file is read, so the tail of every laptop run
-    // is silent rather than a guaranteed 403.
+    // Asked before the file is read: a backend with no cloud behind it (the
+    // offline harness, the local join after a laptop scan) has nowhere to send
+    // the log. CI and laptop scans both ship it (carrick#1063).
+    //
+    // Every return below says why nothing left the machine. They were silent,
+    // and a run that uploaded nothing read exactly like a run that never got
+    // here, which is how a scan on an older installed binary passed for a
+    // defect in this function.
     if !storage.uploads_run_logs() {
+        debug!("Run log not uploaded: this storage backend does not ship run logs");
         return;
     }
 
     let Some(log_path) = logging::get_log_file_path() else {
+        debug!("Run log not uploaded: no debug log file for today in ~/.carrick/logs");
         return;
     };
-    let Ok(mut file) = std::fs::File::open(&log_path) else {
-        return;
+    let mut file = match std::fs::File::open(&log_path) {
+        Ok(file) => file,
+        Err(e) => {
+            debug!("Run log not uploaded: could not open today's debug log: {e}");
+            return;
+        }
     };
-    let Ok(metadata) = file.metadata() else {
-        return;
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            debug!("Run log not uploaded: could not read the debug log's size: {e}");
+            return;
+        }
     };
 
     use std::io::{Read, Seek};
 
     let (start, expected) = log_tail_range(metadata.len(), logging::get_run_log_offset());
 
-    if file.seek(std::io::SeekFrom::Start(start)).is_err() {
+    if let Err(e) = file.seek(std::io::SeekFrom::Start(start)) {
+        debug!("Run log not uploaded: could not seek to this run's offset {start}: {e}");
         return;
     }
 
     let mut buf = Vec::with_capacity(expected);
-    if file.read_to_end(&mut buf).is_err() {
+    if let Err(e) = file.read_to_end(&mut buf) {
+        debug!("Run log not uploaded: could not read this run's slice of the debug log: {e}");
         return;
     }
 
