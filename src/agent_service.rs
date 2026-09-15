@@ -864,6 +864,33 @@ struct AgentError {
     retriable: bool,
 }
 
+/// The mock `/generate-intent` answer: the canned sentence for a single
+/// request, and the same sentence for every function of a batched one, in the
+/// lambda's batched `text` shape (carrick#1064).
+fn mock_intent_answer<B: Serialize + ?Sized>(body: &B) -> String {
+    const MOCK_INTENT: &str = "Mock intent: function does something.";
+    let functions = serde_json::to_value(body).ok().and_then(|v| {
+        v.get("functions")
+            .and_then(|f| f.as_array())
+            .map(|functions| {
+                functions
+                    .iter()
+                    .filter_map(|f| f.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+    });
+    match functions {
+        Some(names) => serde_json::json!({
+            "intents": names
+                .iter()
+                .map(|name| serde_json::json!({"name": name, "intent": MOCK_INTENT, "cached": false}))
+                .collect::<Vec<_>>()
+        })
+        .to_string(),
+        None => MOCK_INTENT.to_string(),
+    }
+}
+
 /// Mock-mode dispatch by task path. Some lambdas don't send a
 /// `response_schema` (e.g. /generate-intent ships only `{name, body,
 /// called_intents}`), so falling through to schema-based dispatch
@@ -878,7 +905,7 @@ fn generate_mock_for_task<B: Serialize + ?Sized>(
         return canned;
     }
     match task_path {
-        "/generate-intent" => "Mock intent: function does something.".to_string(),
+        "/generate-intent" => mock_intent_answer(body),
         _ => {
             // Tasks that send a schema (file-analyzer, framework-guidance)
             // dispatch by inspecting the schema shape. Tasks that don't but
