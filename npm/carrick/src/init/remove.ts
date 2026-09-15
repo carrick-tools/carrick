@@ -99,6 +99,10 @@ export const SETTINGS_FILES = [
  * `lambdas/mcp-server/src/tools/scaffold.ts`): the workflow, the agent skill,
  * the three hook-pack scripts and the config. Only the ones that exist are
  * printed, so the `git rm` line is one a reader can paste.
+ *
+ * `src/git_state.rs` (`SCAFFOLD_FILES`) mirrors this list, the settings files
+ * and the section carriers below, so a tree whose only changes are the
+ * scaffold does not read as dirty (carrick#1117). Change both together.
  */
 export const SCAFFOLD_FILES = [
   path.join(".github", "workflows", "carrick.yml"),

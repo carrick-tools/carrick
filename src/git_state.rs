@@ -38,7 +38,9 @@ pub struct GitState {
 /// or a harness subprocess can carry a `GIT_DIR` for a different repository,
 /// and this would then describe that one.
 pub fn inspect(repo_path: &str) -> GitState {
-    let run = |args: &[&str]| -> Option<String> {
+    // Untrimmed: a porcelain status entry starts with a space when only the
+    // working tree changed, and trimming the answer would shift the first one.
+    let run_raw = |args: &[&str]| -> Option<String> {
         let output = Command::new("git")
             .args(args)
             .current_dir(repo_path)
@@ -50,18 +52,30 @@ pub fn inspect(repo_path: &str) -> GitState {
         output
             .status
             .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
     };
+    let run = |args: &[&str]| run_raw(args).map(|out| out.trim().to_string());
 
     let commit = run(&["rev-parse", "HEAD"]).unwrap_or_default();
     if commit.is_empty() {
         return GitState::default();
     }
     let branch = run(&["rev-parse", "--abbrev-ref", "HEAD"]).filter(|name| name != "HEAD");
-    // `--porcelain` prints one line per path git considers changed, staged or
-    // untracked, and nothing at all for a clean tree. Emptiness is the whole
-    // answer, so the output is never parsed.
-    let dirty = run(&["status", "--porcelain"]).is_some_and(|out| !out.is_empty());
+    // One entry per path git considers changed, staged or untracked. Every
+    // untracked file is listed on its own (`--untracked-files=all`), because a
+    // wholly new `.claude/` otherwise collapses to one entry that cannot be
+    // told apart from any other directory. The paths are relative to the
+    // repository's top level whatever directory this runs in, so the scan
+    // root's own position is asked for beside them.
+    let prefix = run(&["rev-parse", "--show-prefix"]).unwrap_or_default();
+    let dirty = run_raw(&[
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--no-renames",
+    ])
+    .is_some_and(|out| carries_changes_beyond_the_scaffold(&out, &prefix));
     // `None`, not `false`, when the ref is absent: a clone with no
     // `origin/main` cannot say whether HEAD is at it, and saying "not at
     // origin/main" there would warn every user of a repo whose default branch
@@ -74,6 +88,70 @@ pub fn inspect(repo_path: &str) -> GitState {
         dirty,
         at_origin_main,
     }
+}
+
+/// Files the Carrick scaffold writes into a repository that no scan reads.
+///
+/// The ruled first run (carrick#987) has an agent write these, then scan,
+/// before any of them is committed, so a tree whose only changes are these
+/// would otherwise read dirty on every run until the scaffold PR merges: the
+/// warning on every run, and a blob every other clone refuses (carrick#1024,
+/// carrick#1117). A change to any of them, new or edited, leaves what the
+/// index describes exactly what the commit holds.
+///
+/// Mirrors `npm/carrick/src/init/remove.ts` (`SCAFFOLD_FILES`,
+/// `SETTINGS_FILES` and the files `SECTION_CARRIERS` merges into), which
+/// mirrors the scaffold tool in carrick-cloud
+/// (`lambdas/mcp-server/src/tools/scaffold.ts`). A file added there is added
+/// here too, or a first run is dirty again.
+const SCAFFOLD_FILES: &[&str] = &[
+    ".github/workflows/carrick.yml",
+    ".claude/skills/carrick/SKILL.md",
+    ".claude/session-start.sh",
+    ".claude/turn-reminder.sh",
+    ".claude/search-gate.sh",
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".gitignore",
+];
+
+/// The scaffold's config, which a scan DOES read. It is part of the scaffold
+/// only while the commit does not hold it at all: a `carrick.json` the tree
+/// adds is the first run's, and an edit to a committed one is a change to what
+/// the index describes, so it still counts.
+const SCAFFOLD_CONFIG: &str = "carrick.json";
+
+/// Whether a `git status --porcelain=v1 -z` answer names any change that is
+/// not the Carrick scaffold's.
+///
+/// `prefix` is the scan root's path from the repository's top level (`sub/`,
+/// or empty at the top), because the scaffold lands where the agent was told
+/// to write it: the root of the repo it scanned. Paths are matched at the top
+/// level and at that prefix, and `.carrick/` anywhere, which is the ignored
+/// directory `carrick init` and `carrick index` write.
+fn carries_changes_beyond_the_scaffold(porcelain: &str, prefix: &str) -> bool {
+    porcelain
+        .split('\0')
+        .filter(|entry| entry.len() > 3)
+        .any(|entry| {
+            let (status, path) = entry.split_at(3);
+            !is_scaffold_change(status.trim_end(), path, prefix)
+        })
+}
+
+fn is_scaffold_change(status: &str, path: &str, prefix: &str) -> bool {
+    if path.starts_with(".carrick/") || path.contains("/.carrick/") {
+        return true;
+    }
+    let at_root = |name: &str| path == name || path.strip_prefix(prefix) == Some(name);
+    if SCAFFOLD_FILES.iter().any(|name| at_root(name)) {
+        return true;
+    }
+    // `??` untracked, or `A` staged as a new file (with or without a later
+    // edit): either way the commit has no copy of it.
+    at_root(SCAFFOLD_CONFIG) && (status == "??" || status.starts_with('A'))
 }
 
 /// The paths under `repo_path` whose content on disk is the content `commit`
@@ -457,6 +535,128 @@ mod tests {
         assert!(inspect(&dir.to_string_lossy()).dirty);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repository built for a test, with one committed source file.
+    fn committed_repo() -> (std::path::PathBuf, impl Fn(&[&str])) {
+        let dir = std::env::temp_dir().join(format!("carrick-git-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let at = dir.clone();
+        let git = move |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(&at)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "{args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("AGENTS.md"), "# Agents\n").unwrap();
+        std::fs::write(dir.join("sub").join("index.ts"), "export {};\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "one"]);
+        (dir, git)
+    }
+
+    /// Everything the ruled first run writes before its scan, uncommitted,
+    /// and nothing else: the tree is what the commit holds (carrick#1117).
+    #[test]
+    fn a_tree_whose_only_changes_are_the_scaffold_is_clean() {
+        let (dir, git) = committed_repo();
+        for file in [
+            "carrick.json",
+            ".github/workflows/carrick.yml",
+            ".claude/skills/carrick/SKILL.md",
+            ".claude/session-start.sh",
+            ".claude/turn-reminder.sh",
+            ".claude/search-gate.sh",
+            ".claude/settings.json",
+            ".carrick/.gitignore",
+            ".carrick/proposal.json",
+        ] {
+            let path = dir.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "{}").unwrap();
+        }
+        // The section the scaffold merges into an existing agent file.
+        std::fs::write(dir.join("AGENTS.md"), "# Agents\n\n## Carrick\n").unwrap();
+        let root = dir.to_string_lossy().into_owned();
+        assert!(!inspect(&root).dirty, "scaffold only");
+
+        // Staged as the agent's PR branch would have it: still no change to
+        // anything the commit describes.
+        git(&["add", "carrick.json"]);
+        assert!(!inspect(&root).dirty, "scaffold staged");
+
+        // One real change beside it, and the tree is dirty again.
+        std::fs::write(dir.join("sub").join("index.ts"), "export const a = 1;\n").unwrap();
+        assert!(inspect(&root).dirty, "scaffold plus an edited source file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An edit to a committed `carrick.json` changes what the scan reads, so
+    /// it is a change; an untracked file that merely shares a scaffold name
+    /// somewhere else is too.
+    #[test]
+    fn an_edited_committed_config_and_a_lookalike_path_still_count() {
+        let (dir, git) = committed_repo();
+        std::fs::write(dir.join("carrick.json"), "{}").unwrap();
+        git(&["add", "carrick.json"]);
+        git(&["commit", "-qm", "config"]);
+        let root = dir.to_string_lossy().into_owned();
+        assert!(!inspect(&root).dirty);
+
+        std::fs::write(dir.join("carrick.json"), "{\"services\": []}").unwrap();
+        assert!(inspect(&root).dirty, "an edited committed carrick.json");
+        git(&["checkout", "-q", "--", "carrick.json"]);
+
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs").join("CLAUDE.md"), "x").unwrap();
+        assert!(
+            inspect(&root).dirty,
+            "a CLAUDE.md that is not the scaffold's"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scan root below the top level: git names the scaffold from the top
+    /// (`sub/carrick.json`), and it is still the scaffold of the repo scanned.
+    #[test]
+    fn a_scan_root_inside_the_repository_finds_its_own_scaffold() {
+        let (dir, _git) = committed_repo();
+        std::fs::write(dir.join("sub").join("carrick.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.join("sub").join(".claude")).unwrap();
+        std::fs::write(dir.join("sub").join(".claude").join("settings.json"), "{}").unwrap();
+        assert!(!inspect(&dir.join("sub").to_string_lossy()).dirty);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_porcelain_answer_is_read_entry_by_entry() {
+        assert!(!carries_changes_beyond_the_scaffold("", ""));
+        assert!(!carries_changes_beyond_the_scaffold(
+            "?? carrick.json\0 M AGENTS.md\0?? .carrick/scan-1.log\0",
+            ""
+        ));
+        assert!(carries_changes_beyond_the_scaffold(
+            "?? carrick.json\0 M src/a.ts\0",
+            ""
+        ));
+        assert!(carries_changes_beyond_the_scaffold(" M carrick.json\0", ""));
+        assert!(!carries_changes_beyond_the_scaffold(
+            "AM carrick.json\0",
+            ""
+        ));
     }
 
     /// Every form git writes, read for the name and nothing else.
