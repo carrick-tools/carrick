@@ -80,14 +80,16 @@ function unresolvedSpecifiersReachableFrom(
   while (queue.length > 0 && visited.size <= MAX_REACHABLE_FILES) {
     const file = queue.shift()!;
     for (const literal of moduleSpecifiersOf(file)) {
-      const target = checker
-        .getSymbolAtLocation(literal)
-        ?.declarations?.find(ts.isSourceFile);
-      if (!target) {
+      const module = checker.getSymbolAtLocation(literal);
+      if (!module) {
         unresolved.add(literal.text);
         continue;
       }
+      // An ambient `declare module 'x'` resolves to a module declaration, not
+      // a file: resolved, with nothing further to walk.
+      const target = module.declarations?.find(ts.isSourceFile);
       if (
+        !target ||
         visited.has(target.fileName) ||
         program.isSourceFileDefaultLibrary(target) ||
         program.isSourceFileFromExternalLibrary(target)

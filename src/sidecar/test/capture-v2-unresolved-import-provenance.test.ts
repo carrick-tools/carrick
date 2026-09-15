@@ -23,7 +23,7 @@ import * as path from 'node:path';
 import { captureStub } from '../src/capture/index.js';
 import type { CaptureAliasRecord, TypeProvenance } from '../src/capture/api.js';
 
-const ROUTE = 'src/tasks/route.ts';
+const ROUTE = 'src/parcels/route.ts';
 
 const FILES: Record<string, string> = {
   'tsconfig.json': JSON.stringify({
@@ -37,10 +37,14 @@ const FILES: Record<string, string> = {
     },
     include: ['src'],
   }),
+  // An ambient module declaration resolves without a file behind it.
+  'src/ambient.d.ts': "declare module 'virtual:settings' { export const region: string; }\n",
   // The generated client this module imports was never generated.
   'src/db/client.ts': [
+    '/// <reference path="../ambient.d.ts" />',
+    "import { region } from 'virtual:settings';",
     "import { GeneratedClient } from './generated/client';",
-    'export const db = new GeneratedClient();',
+    'export const db = new GeneratedClient(region);',
     '',
   ].join('\n'),
   [ROUTE]: [
@@ -48,16 +52,16 @@ const FILES: Record<string, string> = {
     '',
     "type Status = 'open' | 'done';",
     '',
-    'export async function loadTask(id: string) {',
-    '  const row = await db.task.findUnique({ where: { id } });',
+    'export async function loadParcel(id: string) {',
+    '  const row = await db.parcel.findUnique({ where: { id } });',
     "  const status: Status = 'open';",
     '  const loaded = { id: row.id, title: row.title, status };',
     '  return loaded;',
     '}',
     '',
-    'export type LoadedTask = Awaited<ReturnType<typeof loadTask>>;',
+    'export type LoadedParcel = Awaited<ReturnType<typeof loadParcel>>;',
     '',
-    'export function describeTask() {',
+    'export function describeParcel() {',
     "  const described: { id: any; title: string } = { id: 1, title: 'x' };",
     '  return described;',
     '}',
@@ -114,7 +118,7 @@ describe('any_provenance separates an unresolved import from a declared any (#11
           kind: 'symbol',
           alias: 'Endpoint_symbol_Response',
           source_file: ROUTE,
-          symbol_name: 'LoadedTask',
+          symbol_name: 'LoadedParcel',
           anchor_origin: 'llm-symbol',
           array_depth: 1,
         },
@@ -142,6 +146,7 @@ describe('any_provenance separates an unresolved import from a declared any (#11
   it('names the module that did not resolve, as the source wrote it', () => {
     const detail = findingAt(records.get('Endpoint_loaded_Response'), 'id').detail ?? '';
     assert.match(detail, /'\.\/generated\/client'/, detail);
+    assert.ok(!detail.includes('virtual:settings'), `an ambient module resolved: ${detail}`);
     assert.ok(!detail.includes(root), `the detail must not carry an absolute path: ${detail}`);
   });
 
