@@ -610,6 +610,7 @@ mod tests {
             provenance: Default::default(),
             resolution_source: None,
             dispatch: None,
+            schema_binding: None,
         };
         let data = CloudRepoData {
             endpoints: vec![
