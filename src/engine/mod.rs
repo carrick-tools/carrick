@@ -3774,9 +3774,11 @@ fn merge_graphql_consumer_locations(
 /// Each op gets a single Response-kind entry keyed by its real `OperationKey`
 /// (so `OperationKey::canonical()` joins it in the cloud index and eval
 /// projection). Listeners / SDL producers are `Producer`; emitters / document
-/// consumers are `Consumer`. Only the Response kind is emitted: a phantom
-/// Request alias would never resolve and would drag a second `Unknown` entry
-/// into the manifest for ops that have no request body concept.
+/// consumers are `Consumer`. Every op gets a Response-kind entry. A Request
+/// entry is emitted only where the request is stated: an SDL root field that
+/// declares arguments ([`add_graphql_request_entry`], carrick#1158). Anywhere
+/// else a Request alias would never resolve and would drag a second `Unknown`
+/// entry into the manifest.
 ///
 /// Socket entries carry `primary_type_symbol` directly (the payload type the
 /// extractor captured), which the sidecar then resolves through the existing
@@ -3801,6 +3803,14 @@ fn append_protocol_manifest_entries(
             op.primary_type_symbol.clone(),
             None,
         );
+        if let Some(arguments) = &op.arguments {
+            add_graphql_request_entry(
+                entries,
+                op,
+                arguments,
+                &extractions.graphql.input_declarations,
+            );
+        }
     }
     for op in &extractions.graphql.consumers {
         add_protocol_manifest_entry(
@@ -3849,6 +3859,59 @@ fn append_protocol_manifest_entries(
             None,
         );
     }
+}
+
+/// The Request-kind entry for an SDL root field that declares arguments
+/// (carrick#1158).
+///
+/// The definition is the schema's own statement of the request, so it is
+/// written here rather than asked of the type sidecar: the field's argument
+/// list and the `input`, `enum` and `scalar` declarations it reaches, printed as
+/// SDL ([`crate::graphql::request_definition`]). The entry is `Explicit` because
+/// the schema declares it. No capture anchor is emitted for it, so the capture
+/// never answers for its alias and the definition stands. GraphQL consumers
+/// carry no Request entry, so no compatibility pair forms on it.
+///
+/// `primary_type_symbol` is the one `input` object the arguments name
+/// directly, when there is exactly one, which is the name an agent asks
+/// `get_type_definition` for (`CreateInvoiceInput`).
+fn add_graphql_request_entry(
+    entries: &mut Vec<TypeManifestEntry>,
+    op: &crate::graphql::GraphqlOp,
+    arguments: &crate::graphql::SdlArguments,
+    declarations: &std::collections::BTreeMap<String, crate::graphql::SdlInputDeclaration>,
+) {
+    let (definition, symbol) = crate::graphql::request_definition(arguments, declarations);
+    let role = ManifestRole::Producer;
+    let type_kind = ManifestTypeKind::Request;
+    let file_path = op.file_path.to_string_lossy().to_string();
+    entries.push(TypeManifestEntry {
+        key: op.key.clone(),
+        role,
+        type_kind,
+        type_alias: crate::type_manifest::build_manifest_type_alias_with_site_id(
+            &op.key, role, type_kind, None,
+        ),
+        file_path: file_path.clone(),
+        line_number: op.line,
+        is_explicit: true,
+        type_state: ManifestTypeState::Explicit,
+        evidence: crate::cloud_storage::TypeEvidence {
+            file_path,
+            span_start: None,
+            span_end: None,
+            line_number: op.line,
+            infer_kind: infer_kind_for_manifest(role, type_kind),
+            is_explicit: true,
+            type_state: ManifestTypeState::Explicit,
+        },
+        resolved_definition: Some(definition.clone()),
+        expanded_definition: Some(definition),
+        primary_type_symbol: symbol,
+        defined_in: None,
+        any_provenance: Vec::new(),
+        v1_unresolved: false,
+    });
 }
 
 /// Add a single Response-kind manifest entry for a non-HTTP operation. Shared
@@ -10200,6 +10263,7 @@ mod tests {
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
             schema_binding: None,
+            arguments: None,
         }
     }
 
@@ -10225,6 +10289,7 @@ mod tests {
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
             schema_binding: None,
+            arguments: None,
         }
     }
 
@@ -10268,6 +10333,7 @@ mod tests {
                 "src/gql.ts",
                 None,
             )],
+            input_declarations: Default::default(),
         };
 
         fold_graphql_transport_calls(&mut mount_graph, &graphql);
@@ -10311,6 +10377,7 @@ mod tests {
                 "src/gql.ts",
                 None,
             )],
+            input_declarations: Default::default(),
         };
 
         fold_graphql_transport_calls(&mut mount_graph, &graphql);
@@ -10338,6 +10405,7 @@ mod tests {
                 "./src/gql.ts",
                 None,
             )],
+            input_declarations: Default::default(),
         };
 
         fold_graphql_transport_calls(&mut mount_graph, &graphql);
@@ -10361,6 +10429,7 @@ mod tests {
                 Some("Order"),
             )],
             consumers: vec![],
+            input_declarations: Default::default(),
         };
 
         fold_graphql_transport_calls(&mut mount_graph, &graphql);
@@ -10401,6 +10470,7 @@ mod tests {
                 "src/gql.ts",
                 None,
             )],
+            input_declarations: Default::default(),
         };
 
         settle_graphql_documents(
@@ -10450,6 +10520,7 @@ mod tests {
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
             schema_binding: None,
+            arguments: None,
         }
     }
 
@@ -10493,6 +10564,7 @@ mod tests {
                 graphql_op(GraphqlOperationKind::Query, "orders", Some("[Order!]!")),
             ],
             consumers: vec![],
+            input_declarations: Default::default(),
         };
 
         // file_results keyed by path, carrying the matching LLM graphql_operation
@@ -10596,6 +10668,7 @@ mod tests {
                 Some("[Order!]!"),
             )],
             consumers: vec![],
+            input_declarations: Default::default(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -10660,6 +10733,7 @@ mod tests {
                 Some("[Order!]!"),
             )],
             consumers: vec![],
+            input_declarations: Default::default(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -10718,6 +10792,7 @@ mod tests {
                 graphql_op(GraphqlOperationKind::Query, "orders", Some("[Order!]!")),
             ],
             consumers: vec![],
+            input_declarations: Default::default(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -10847,6 +10922,7 @@ mod tests {
                 Some("Ticket"),
             )],
             consumers: vec![],
+            input_declarations: Default::default(),
         };
 
         let claim = |function: &str, line: i32| GraphqlOperation {
@@ -10923,6 +10999,7 @@ mod tests {
                 Some("Ticket"),
             )],
             consumers: vec![],
+            input_declarations: Default::default(),
         };
 
         let claim = |function: &str, line: i32| GraphqlOperation {
@@ -10976,6 +11053,7 @@ mod tests {
                 Some("Ticket"),
             )],
             consumers: vec![],
+            input_declarations: Default::default(),
         };
         let mut agreeing_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         agreeing_results.insert(
@@ -11010,6 +11088,7 @@ mod tests {
         let mut graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],
             consumers: vec![anchored],
+            input_declarations: Default::default(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -11070,6 +11149,7 @@ mod tests {
         let mut graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],
             consumers: vec![consumer_a, consumer_b],
+            input_declarations: Default::default(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -11139,6 +11219,7 @@ mod tests {
         let mut graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],
             consumers: vec![consumer],
+            input_declarations: Default::default(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -11184,6 +11265,7 @@ mod tests {
                     Some("Order"),
                 )],
                 consumers: vec![graphql_op(GraphqlOperationKind::Query, "order", None)],
+                input_declarations: Default::default(),
             },
             sockets: crate::socket_io::SocketExtraction {
                 listeners: vec![],
@@ -11241,6 +11323,73 @@ mod tests {
             })
             .expect("graphql consumer manifest entry");
         assert_eq!(graphql_consumer.primary_type_symbol, None);
+    }
+
+    /// An SDL root field that declares arguments gets a Request-kind producer
+    /// entry carrying the schema's own statement of the request (carrick#1158):
+    /// the definition `get_type_definition` serves by alias, and by the input
+    /// type's name through `primary_type_symbol`. A field without arguments and
+    /// a document consumer still get no Request entry.
+    #[test]
+    fn sdl_arguments_become_a_request_manifest_entry_on_the_wire() {
+        let sdl = r#"
+            type Mutation { createInvoice(input: CreateInvoiceInput!): Invoice! }
+            type Query { health: String! }
+            input CreateInvoiceInput { customerId: ID!, total: Int! }
+        "#;
+        let mut graphql =
+            crate::graphql::extract_from_document_text(sdl, Path::new("schema.graphql"), 1);
+        graphql.consumers = crate::graphql::extract_from_document_text(
+            "mutation { createInvoice(input: $i) { id } }",
+            Path::new("web/q.graphql"),
+            1,
+        )
+        .consumers;
+        let extractions = ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction::default(),
+            graphql,
+            sockets: crate::socket_io::SocketExtraction::default(),
+        };
+
+        let mut entries = Vec::new();
+        append_protocol_manifest_entries(&mut entries, &extractions);
+
+        let requests: Vec<&TypeManifestEntry> = entries
+            .iter()
+            .filter(|e| e.type_kind == ManifestTypeKind::Request)
+            .collect();
+        assert_eq!(requests.len(), 1, "got: {entries:#?}");
+        let request = requests[0];
+        assert_eq!(request.role, ManifestRole::Producer);
+        assert_eq!(request.type_state, ManifestTypeState::Explicit);
+        assert_eq!(
+            request.type_alias,
+            crate::type_manifest::build_manifest_type_alias_with_site_id(
+                &request.key,
+                ManifestRole::Producer,
+                ManifestTypeKind::Request,
+                None,
+            )
+        );
+
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["protocol"], "graphql");
+        assert_eq!(json["field"], "createInvoice");
+        assert_eq!(json["type_kind"], "request");
+        assert_eq!(json["role"], "producer");
+        assert_eq!(json["primary_type_symbol"], "CreateInvoiceInput");
+        let definition = json["resolved_definition"].as_str().unwrap().to_string();
+        assert!(
+            definition.starts_with(
+                "createInvoice(input: CreateInvoiceInput!)\n\ninput CreateInvoiceInput {"
+            ),
+            "got: {definition}"
+        );
+
+        // A reader holding this row reads it back unchanged: no field is new,
+        // only the row is.
+        let back: TypeManifestEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(back.resolved_definition, Some(definition));
     }
 
     /// The fragile contract the whole anchor join hinges on: the alias on the
@@ -12044,6 +12193,7 @@ mod tests {
             graphql: crate::graphql::GraphqlExtraction {
                 producers: vec![],
                 consumers: vec![consumer.clone()],
+                input_declarations: Default::default(),
             },
             sockets: crate::socket_io::SocketExtraction::default(),
         };
@@ -12123,6 +12273,7 @@ mod tests {
         let extraction = crate::graphql::GraphqlExtraction {
             producers: vec![],
             consumers: vec![located_only, both, neither],
+            input_declarations: Default::default(),
         };
 
         let orchestrator = FileOrchestrator::new(AgentService::new());
@@ -12174,6 +12325,7 @@ mod tests {
             graphql: crate::graphql::GraphqlExtraction {
                 producers: vec![producer.clone()],
                 consumers: vec![],
+                input_declarations: Default::default(),
             },
             sockets: crate::socket_io::SocketExtraction::default(),
         };
@@ -12233,6 +12385,7 @@ mod tests {
                     Some("Order"),
                 )],
                 consumers: vec![],
+                input_declarations: Default::default(),
             },
             sockets: crate::socket_io::SocketExtraction::default(),
         };
