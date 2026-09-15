@@ -24,6 +24,7 @@ mod formatter;
 mod framework_detector;
 mod git_state;
 mod graphql;
+mod graphql_document_sites;
 mod help;
 mod import_bindings;
 mod imported_request_member;

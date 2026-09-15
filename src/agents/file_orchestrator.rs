@@ -199,6 +199,9 @@ pub struct ProcessingStats {
     /// a topic from a wrapper-function NAME (`publishStatusChanged` ->
     /// `status.changed`); the real op lives in the file that holds the literal.
     pub pubsub_phantom_topic_drops: usize,
+    /// HTTP rows dropped at call sites that execute a GraphQL document
+    /// (carrick#1154), by the step that decided it.
+    pub graphql_document_site_drops: crate::graphql_document_sites::DocumentSiteDrops,
     /// Model rows that joined a deterministic row at their span and
     /// contributed only what determinism did not state.
     pub model_rows_joined: usize,
@@ -2551,6 +2554,29 @@ impl FileOrchestrator {
         let carried = Self::carry_wrapper_dispatch(&mut file_results, &dispatch_sites, &analysed);
         if carried > 0 {
             debug!("  - Rows carrying a wrapper's dispatch value: {carried}");
+        }
+
+        // PHASE 5c (carrick#1154): a call that hands a GraphQL document to a
+        // client executes an operation, whose transport lives in the client's
+        // configuration. An HTTP row the model stated at such a site is not a
+        // request this site makes. Cross-file for two reasons: the document is
+        // usually declared in another module, and when that module is not on
+        // disk the callee's other sites are what show it executes documents.
+        // Resolved through the repo's aliases as well: this runs after the
+        // model, so following more specifiers changes nothing it was asked.
+        let alias_workspace = WorkspaceIndex::build_with_aliases(repo_root, None);
+        stats.graphql_document_site_drops =
+            crate::graphql_document_sites::suppress_document_site_http_rows(
+                &mut file_results,
+                Some(&alias_workspace),
+            );
+        if stats.graphql_document_site_drops.total() > 0 {
+            debug!(
+                "  - HTTP rows dropped at GraphQL document call sites: {} (document argument {}, known document executor {})",
+                stats.graphql_document_site_drops.total(),
+                stats.graphql_document_site_drops.document_argument,
+                stats.graphql_document_site_drops.document_executor
+            );
         }
 
         // STEP 5: Build aggregated mount graph from all file results
