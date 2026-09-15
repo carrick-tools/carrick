@@ -442,6 +442,31 @@ pub async fn generate_function_intents(
     function_definitions: &mut HashMap<String, FunctionDefinition>,
     prev_intents_by_hash: &HashMap<String, String>,
 ) {
+    describe_functions(function_definitions, prev_intents_by_hash, |payload| async move {
+        // The mock seed only picks a canned answer in mock mode.
+        let seed = payload
+            .get("name")
+            .and_then(|name| name.as_str())
+            .unwrap_or("batch")
+            .to_string();
+        agent_service
+            .post_to_lambda("/generate-intent", &payload, &seed)
+            .await
+    })
+    .await
+}
+
+/// [`generate_function_intents`] over any `/generate-intent` transport: `send`
+/// takes one request body and returns the lambda's answer text. The public
+/// function passes the real lambda; tests pass a recorder.
+async fn describe_functions<S, SFut>(
+    function_definitions: &mut HashMap<String, FunctionDefinition>,
+    prev_intents_by_hash: &HashMap<String, String>,
+    send: S,
+) where
+    S: Fn(serde_json::Value) -> SFut,
+    SFut: std::future::Future<Output = Result<String, AgentCallError>>,
+{
     // Process every function with a body source, skipping trivial
     // single-line bodies (see TRIVIAL_BODY_MAX_CHARS): no lambda call,
     // no intent, permanently cheap. There is no export gate. Non-exported
@@ -592,20 +617,10 @@ pub async fn generate_function_intents(
         let attempted = to_generate.len();
         let units = batch_units(to_generate, batch_size);
         let state = &batch_state;
+        let send = &send;
         let outcomes: Vec<(Pending, Result<String, AgentCallError>)> =
             generate_level(units, intent_concurrency(), |unit| async move {
-                describe_unit(unit, state, |payload| async move {
-                    // The mock seed only picks a canned answer in mock mode.
-                    let seed = payload
-                        .get("name")
-                        .and_then(|name| name.as_str())
-                        .unwrap_or("batch")
-                        .to_string();
-                    agent_service
-                        .post_to_lambda("/generate-intent", &payload, &seed)
-                        .await
-                })
-                .await
+                describe_unit(unit, state, send).await
             })
             .await
             .into_iter()
@@ -1923,6 +1938,183 @@ mod tests {
             Some(hash.as_str())
         );
         assert!(defs["helper"].body_source.is_none());
+    }
+
+    // ------------------------------------- key material pinned (#1080)
+
+    /// A recording `/generate-intent` transport for [`describe_functions`]:
+    /// every request body it was sent, in send order, and an answer per
+    /// function named `describes <name>`, batched or single. A name in `fail`
+    /// is refused, alone or as part of any batch that carries it.
+    #[derive(Clone, Default)]
+    struct Recorder {
+        sent: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        fail: std::sync::Arc<HashSet<String>>,
+    }
+
+    impl Recorder {
+        fn failing(names: &[&str]) -> Self {
+            Self {
+                fail: std::sync::Arc::new(names.iter().map(|n| n.to_string()).collect()),
+                ..Self::default()
+            }
+        }
+
+        fn send(
+            &self,
+            payload: serde_json::Value,
+        ) -> impl std::future::Future<Output = Result<String, AgentCallError>> + use<> {
+            let recorder = self.clone();
+            async move {
+                recorder.sent.lock().unwrap().push(payload.clone());
+                let names: Vec<String> = match payload.get("functions") {
+                    Some(_) => batch_names(&payload),
+                    None => vec![payload["name"].as_str().unwrap().to_string()],
+                };
+                if names.iter().any(|n| recorder.fail.contains(n)) {
+                    return Err(AgentCallError {
+                        code: "model_error".to_string(),
+                        message: "retries exhausted".to_string(),
+                        retriable: true,
+                    });
+                }
+                if payload.get("functions").is_some() {
+                    let rows: Vec<(String, String)> = names
+                        .iter()
+                        .map(|n| (n.clone(), format!("describes {n}")))
+                        .collect();
+                    let rows: Vec<(&str, Option<&str>)> = rows
+                        .iter()
+                        .map(|(n, i)| (n.as_str(), Some(i.as_str())))
+                        .collect();
+                    Ok(answer(&rows))
+                } else {
+                    Ok(format!("describes {}", names[0]))
+                }
+            }
+        }
+
+        /// Every function name this recorder was asked to describe, in send
+        /// order, whether it went alone or in a batch.
+        fn asked(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|p| match p.get("functions") {
+                    Some(_) => batch_names(p),
+                    None => vec![p["name"].as_str().unwrap().to_string()],
+                })
+                .collect()
+        }
+    }
+
+    /// Three levels over two files: leaves `a1`, `a2` (a.ts) and `b1` (b.ts),
+    /// `mid` calling `a1` and `b1`, and `top` calling `mid` and `a2`.
+    fn layered_fixture() -> HashMap<String, FunctionDefinition> {
+        let in_file = |name: &str, file: &str, body: &str, calls: Vec<FunctionCallRef>| {
+            let def = FunctionDefinition {
+                file_path: file.into(),
+                ..def_with_body(name, body)
+            };
+            (name.to_string(), with_calls(def, calls))
+        };
+        HashMap::from([
+            in_file("a1", "a.ts", "const x = load(id);\nreturn x.total;", vec![]),
+            in_file("a2", "a.ts", "const y = parse(raw);\nreturn y.items;", vec![]),
+            in_file("b1", "b.ts", "const r = await fetch(url);\nreturn r.json();", vec![]),
+            in_file(
+                "mid",
+                "b.ts",
+                "const t = a1(id);\nconst u = b1(url);\nreturn { t, u };",
+                vec![call_ref("a1", "a.ts", 1, 1), call_ref("b1", "b.ts", 1, 2)],
+            ),
+            in_file(
+                "top",
+                "c.ts",
+                "const m = mid(id, url);\nreturn a2(m.raw);",
+                vec![call_ref("mid", "b.ts", 4, 1), call_ref("a2", "a.ts", 2, 2)],
+            ),
+        ])
+    }
+
+    /// Run [`describe_functions`] with no previous scan, returning each
+    /// request body as sent (sorted, since requests in a level race) and each
+    /// function's `(name, intent, hash)`.
+    async fn describe_layered_fixture(
+        defs: &mut HashMap<String, FunctionDefinition>,
+        recorder: &Recorder,
+    ) -> (Vec<String>, Vec<(String, Option<String>, Option<String>)>) {
+        describe_functions(defs, &HashMap::new(), |payload| recorder.send(payload)).await;
+        let mut bodies: Vec<String> = recorder
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        bodies.sort();
+        let mut rows: Vec<(String, Option<String>, Option<String>)> = defs
+            .iter()
+            .map(|(k, d)| (k.clone(), d.intent.clone(), d.intent_input_hash.clone()))
+            .collect();
+        rows.sort();
+        (bodies, rows)
+    }
+
+    /// The key material the scanner cache and the cloud `intentCacheKey` read
+    /// is byte-identical to what main sent before carrick#1080: the same
+    /// request bodies and the same content hashes, on a normal run through
+    /// batching and three dependency levels. Every literal below was captured
+    /// from main before the change.
+    #[tokio::test]
+    async fn a_normal_run_sends_the_request_bodies_and_hashes_main_sent() {
+        let _env = ENV_LOCK.lock().await;
+        assert_eq!(INTENT_CACHE_VERSION, 2);
+        let mut defs = layered_fixture();
+        let recorder = Recorder::default();
+        let (bodies, rows) = describe_layered_fixture(&mut defs, &recorder).await;
+
+        assert_eq!(
+            bodies,
+            vec![
+                r#"{"body":"const m = mid(id, url);\nreturn a2(m.raw);","called_intents":["- mid: describes mid","- a2: describes a2"],"name":"top"}"#,
+                r#"{"body":"const t = a1(id);\nconst u = b1(url);\nreturn { t, u };","called_intents":["- a1: describes a1","- b1: describes b1"],"name":"mid"}"#,
+                r#"{"functions":[{"body":"const x = load(id);\nreturn x.total;","called_intents":[],"name":"a1"},{"body":"const y = parse(raw);\nreturn y.items;","called_intents":[],"name":"a2"},{"body":"const r = await fetch(url);\nreturn r.json();","called_intents":[],"name":"b1"}]}"#,
+            ]
+        );
+        let row = |name: &str, hash: &str| {
+            (
+                name.to_string(),
+                Some(format!("describes {name}")),
+                Some(hash.to_string()),
+            )
+        };
+        assert_eq!(
+            rows,
+            vec![
+                row(
+                    "a1",
+                    "caf526315c7adeef18ea44a90ca74e8a7149a0cd9783ffd290537b81bb26c59a"
+                ),
+                row(
+                    "a2",
+                    "ab79db251f5dea5aba9b0fcc7e4293f6e22bfc560cf5b9d6b2044bedb9732777"
+                ),
+                row(
+                    "b1",
+                    "1658b50668d7b279da90f2b55b43267bbd5e1e02ca1bd72afde41d3a76e842cf"
+                ),
+                row(
+                    "mid",
+                    "63345450bd79e3a36e8c2e7312615a1017912bb7ae3a908a082db0b9b4e48810"
+                ),
+                row(
+                    "top",
+                    "aeed9070a2b8c8d7cba07ac583751857def81412865b6e7d8bb6333917559f1b"
+                ),
+            ]
+        );
     }
 
     /// A service whose analysis fails returns before it collects its intents;
