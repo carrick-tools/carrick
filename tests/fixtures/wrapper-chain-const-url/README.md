@@ -30,6 +30,7 @@ route.
 | `client.ts:34` | `GET ${ORDERS_API_URL}/v1/orders/:orderId` |
 | `client.ts:35` | `PATCH ${ORDERS_API_URL}/v1/orders/:orderId/cancel` |
 | `client.ts:40` | `GET ${ORDERS_API_URL}/v1/orders/:orderId/invoice` |
+| `client.ts:43` | `GET ${ORDERS_API_URL}/v1/orders/search` (query string sent only when present, dropped from the route) |
 
 `ORDERS_API_URL` is undeclared (there is no `carrick.json`), so each row keeps
 its env-var base: an expected find.

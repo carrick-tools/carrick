@@ -40,4 +40,5 @@ export const ordersApi = {
     const response = await sendWithRetry(url, options, endpoint);
     return response.blob();
   },
+  search: (query: string) => callApi("GET", `/v1/orders/search${query ? `?${query}` : ""}`),
 };

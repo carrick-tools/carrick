@@ -93,6 +93,15 @@ fn every_site_through_the_chain_is_one_row_with_its_method_and_path() {
                 "GET".to_string(),
                 "${process.env.ORDERS_API_URL}/v1/orders/${orderId}/invoice".to_string()
             ),
+            // The query string is sent only when there is one. The wrapper
+            // pass carries the site's ternary tail verbatim, and the
+            // query-tail fold (carrick#1150) turns it into a plain query
+            // string before the route-shape gate.
+            (
+                43,
+                "GET".to_string(),
+                "${process.env.ORDERS_API_URL}/v1/orders/search?${query}".to_string()
+            ),
         ],
         "one row per site and none for the wrappers' own internal requests: {calls:#?}"
     );
