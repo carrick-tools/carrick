@@ -114,6 +114,12 @@ pub struct GraphqlOp {
     /// `resolver_file`). `None` when the type is declared in `file_path` itself.
     /// Null whenever `consumer_located_type_symbol` is null.
     pub consumer_located_type_source: Option<String>,
+    /// CONSUMER-only: the schema identity the document this operation was
+    /// parsed from is bound to, set by [`ConsumerAttribution::apply`] on every
+    /// consumer it keeps and carried onto the call row
+    /// (`calls[].schema_binding`). `None` for producers and before
+    /// attribution runs.
+    pub schema_binding: Option<SchemaBinding>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -496,6 +502,20 @@ pub fn resolve_declared_schemas(repo_root: &Path, patterns: &[String]) -> Declar
     }
     declared.files = files.into_iter().collect();
     declared
+}
+
+/// The schema identity a GraphQL call row is bound to, as the index blob
+/// carries it (`calls[].schema_binding`, carrick#1134). Only documents that
+/// stay calls have one: an external or unresolved document is not a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaBinding {
+    /// A schema a service in this repository serves holds the document's
+    /// fields. An operation no producer has is a real missing operation.
+    Served,
+    /// No schema this repository holds has any of the document's fields. Its
+    /// server may be a repository the project does not index.
+    NoLocalSchema,
 }
 
 /// Whether a schema file is one a service in this scan serves (carrick#1134).
@@ -883,20 +903,26 @@ impl ConsumerAttribution {
             .get(&(op.file_path.clone(), op.document_line))
     }
 
-    /// Remove every consumer whose document is external or unresolved, and
-    /// say how many were removed.
+    /// Remove every consumer whose document is external or unresolved, bind
+    /// every kept consumer to its identity, and say how many were removed.
     pub fn apply(&self, extraction: &mut GraphqlExtraction) -> AttributionSummary {
         let mut summary = AttributionSummary::default();
-        extraction.consumers.retain(|op| match self.identity(op) {
-            Some(DocumentIdentity::External(files)) => {
-                *summary.external.entry(files.clone()).or_default() += 1;
-                false
-            }
-            Some(DocumentIdentity::Unresolved) => {
-                summary.unresolved += 1;
-                false
-            }
-            Some(DocumentIdentity::Served | DocumentIdentity::NoLocalSchema) | None => true,
+        extraction.consumers.retain_mut(|op| {
+            let binding = match self.identity(op) {
+                Some(DocumentIdentity::External(files)) => {
+                    *summary.external.entry(files.clone()).or_default() += 1;
+                    return false;
+                }
+                Some(DocumentIdentity::Unresolved) => {
+                    summary.unresolved += 1;
+                    return false;
+                }
+                Some(DocumentIdentity::Served) => Some(SchemaBinding::Served),
+                Some(DocumentIdentity::NoLocalSchema) => Some(SchemaBinding::NoLocalSchema),
+                None => None,
+            };
+            op.schema_binding = binding;
+            true
         });
         summary
     }
@@ -1056,6 +1082,7 @@ pub fn extract_from_document_text(
                     // on producers.
                     consumer_located_type_symbol: None,
                     consumer_located_type_source: None,
+                    schema_binding: None,
                 });
             }
         }
@@ -1122,6 +1149,7 @@ pub fn extract_from_document_text(
                     // gets first shot via `payload_type_symbol`.
                     consumer_located_type_symbol: None,
                     consumer_located_type_source: None,
+                    schema_binding: None,
                 });
             }
         }
@@ -2523,6 +2551,10 @@ export const typeDefs = gql`
         let summary = attribution.apply(&mut extraction);
         assert!(summary.is_empty());
         assert_eq!(keys(&extraction.consumers), vec!["graphql|query|products"]);
+        assert_eq!(
+            extraction.consumers[0].schema_binding,
+            Some(SchemaBinding::Served)
+        );
     }
 
     /// A document whose only root field no schema holds (the served schema
@@ -2553,6 +2585,10 @@ export const typeDefs = gql`
             assert_eq!(
                 keys(&extraction.consumers),
                 vec!["graphql|query|retiredListing"]
+            );
+            assert_eq!(
+                extraction.consumers[0].schema_binding,
+                Some(SchemaBinding::NoLocalSchema)
             );
         }
     }
@@ -2622,6 +2658,17 @@ export const typeDefs = gql`
         assert_eq!(
             keys(&extraction.consumers),
             vec!["graphql|query|products", "graphql|query|somethingElse"]
+        );
+        assert_eq!(
+            extraction
+                .consumers
+                .iter()
+                .map(|op| op.schema_binding)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(SchemaBinding::Served),
+                Some(SchemaBinding::NoLocalSchema)
+            ]
         );
         assert_eq!(
             summary,

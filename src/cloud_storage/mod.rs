@@ -806,6 +806,7 @@ pub fn mount_graph_to_api_details(
             // operation's identity, so it travels onto the index row: without
             // it, nine operations behind one route are one row on the wire.
             dispatch: endpoint.dispatch.clone(),
+            schema_binding: None,
         })
         .collect();
 
@@ -832,6 +833,7 @@ pub fn mount_graph_to_api_details(
             // The value this call sends for the field its target dispatches
             // on (carrick#831): the consumer half of the same identity.
             dispatch: call.dispatch.clone(),
+            schema_binding: None,
         })
         .collect();
 
@@ -2020,6 +2022,92 @@ mod tests {
         }"#;
         let data: CloudRepoData = serde_json::from_str(json).unwrap();
         assert!(data.compat_verdicts.is_none());
+    }
+
+    /// `calls[].schema_binding` on the wire (carrick#1134): the two values in
+    /// snake case on GraphQL call rows, and no key at all on a row that has
+    /// none, so HTTP rows and every endpoint keep their exact shape.
+    #[test]
+    fn schema_binding_rides_graphql_call_rows_only() {
+        use crate::graphql::SchemaBinding;
+        use crate::operation::{GraphqlOperationKind, OperationKey};
+        let row = |key: OperationKey, binding: Option<SchemaBinding>| ApiEndpointDetails {
+            owner: None,
+            key,
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: std::path::PathBuf::from("src/doc.graphql:2"),
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            resolution_source: None,
+            view_module: false,
+            dispatch: None,
+            schema_binding: binding,
+        };
+        let mut data = empty_repo("org/web", Some("web"));
+        data.calls = vec![
+            row(
+                OperationKey::graphql(GraphqlOperationKind::Query, "products"),
+                Some(SchemaBinding::Served),
+            ),
+            row(
+                OperationKey::graphql(GraphqlOperationKind::Mutation, "retire"),
+                Some(SchemaBinding::NoLocalSchema),
+            ),
+            row(OperationKey::http("GET", "/health".to_string()), None),
+        ];
+        data.endpoints = vec![row(OperationKey::http("GET", "/health".to_string()), None)];
+
+        let wire = serde_json::to_value(&data).unwrap();
+        assert_eq!(wire["calls"][0]["schema_binding"], "served");
+        assert_eq!(wire["calls"][1]["schema_binding"], "no_local_schema");
+        assert!(wire["calls"][2].get("schema_binding").is_none());
+        assert!(wire["endpoints"][0].get("schema_binding").is_none());
+
+        let back: CloudRepoData = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.calls[0].schema_binding, Some(SchemaBinding::Served));
+        assert_eq!(
+            back.calls[1].schema_binding,
+            Some(SchemaBinding::NoLocalSchema)
+        );
+        assert_eq!(back.calls[2].schema_binding, None);
+    }
+
+    /// A blob from a scanner that predates `schema_binding` reads with the
+    /// field absent on its GraphQL call rows.
+    #[test]
+    fn cloud_repo_data_without_schema_binding_deserializes_to_none() {
+        let json = r#"{
+            "repo_name": "org/web",
+            "endpoints": [],
+            "calls": [{
+                "owner": null,
+                "key": {"protocol": "graphql", "kind": "query", "field": "products"},
+                "params": [],
+                "request_body": null,
+                "response_body": null,
+                "handler_name": null,
+                "request_type": null,
+                "response_type": null,
+                "file_path": "src/graphql/catalog.gql:2"
+            }],
+            "mounts": [],
+            "apps": {},
+            "imported_handlers": [],
+            "function_definitions": {},
+            "config_json": null,
+            "package_json": null,
+            "packages": null,
+            "last_updated": "2026-01-01T00:00:00Z",
+            "commit_hash": "abc123"
+        }"#;
+        let data: CloudRepoData = serde_json::from_str(json).expect("an older blob still reads");
+        assert!(data.calls[0].schema_binding.is_none());
     }
 
     /// A blob from a scanner that predates `resolution_source` (v20/v21)
