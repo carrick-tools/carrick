@@ -233,6 +233,21 @@ pub struct FunctionCallRef {
     /// deserialises (it reports 0 until the next scan rewrites it).
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub call_site_line: u32,
+    /// How many times the caller calls this function (carrick#1159). The
+    /// call graph keeps one edge per (caller, callee), reporting the first
+    /// call site, so a function called three times from one body is one
+    /// entry with `call_count: 3`. Omitted on the wire when 1, the common
+    /// case, and read as 1 from an index written before the field existed.
+    #[serde(default = "one_u32", skip_serializing_if = "is_one_u32")]
+    pub call_count: u32,
+}
+
+fn one_u32() -> u32 {
+    1
+}
+
+fn is_one_u32(n: &u32) -> bool {
+    *n == 1
 }
 
 /// How a call site names its callee. Resolution differs per shape: a bare name

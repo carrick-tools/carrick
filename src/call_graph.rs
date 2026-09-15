@@ -361,6 +361,7 @@ pub fn resolve_call_edges(
                     file_path: target.file.to_string_lossy().to_string(),
                     line_number: target.line,
                     call_site_line: callee.line,
+                    call_count: 1,
                 });
             }
 
@@ -455,14 +456,27 @@ fn specifier_kind(specifier: &str) -> SpecifierKind {
     }
 }
 
-/// One entry per called function, reporting its FIRST call site, in a stable
-/// order. A function called three times is one edge, not three.
+/// One entry per called function, reporting its FIRST call site and how many
+/// call sites it folds, in a stable order. A function called three times is one
+/// edge with `call_count: 3`, not three edges: every reader of `calls` (the
+/// dependency order, callee intent context, the function listings) wants the
+/// callee once, and the count keeps what the fold would otherwise lose
+/// (carrick#1159).
 fn dedupe_edges(edges: &mut Vec<FunctionCallRef>) {
     edges.sort_by(|a, b| {
         (&a.file_path, &a.name, a.call_site_line).cmp(&(&b.file_path, &b.name, b.call_site_line))
     });
-    edges.dedup_by(|a, b| a.file_path == b.file_path && a.name == b.name);
-    edges.sort_by(|a, b| (&a.name, &a.file_path).cmp(&(&b.name, &b.file_path)));
+    let mut folded: Vec<FunctionCallRef> = Vec::with_capacity(edges.len());
+    for edge in edges.drain(..) {
+        match folded.last_mut() {
+            Some(kept) if kept.file_path == edge.file_path && kept.name == edge.name => {
+                kept.call_count += edge.call_count;
+            }
+            _ => folded.push(edge),
+        }
+    }
+    folded.sort_by(|a, b| (&a.name, &a.file_path).cmp(&(&b.name, &b.file_path)));
+    *edges = folded;
 }
 
 /// Resolves call sites against the per-file index, caching import lookups.
@@ -1518,6 +1532,63 @@ mod tests {
         let call = &defs["useHelper"].calls[0];
         assert_eq!(call.line_number, 2, "callee is defined on line 2");
         assert_eq!(call.call_site_line, 7, "the call is written on line 7");
+    }
+
+    /// Repeat calls to one callee from one body fold into one edge that keeps
+    /// the first call site and counts the rest (carrick#1159). Before the count,
+    /// every edge in an index read as one call, whatever the source said.
+    #[test]
+    fn repeat_calls_fold_into_one_edge_that_counts_them() {
+        let (_dir, defs) = scan(&[(
+            "app.ts",
+            "function helper(n: number) {\n  return n + 1;\n}\n\
+             function other() {}\n\
+             export function run(n: number) {\n\
+               const a = helper(n);\n\
+               other();\n\
+               const b = helper(a);\n\
+               return helper(b);\n\
+             }\n",
+        )]);
+
+        let calls = &defs["run"].calls;
+        assert_eq!(callee_names(&defs, "run"), vec!["helper", "other"]);
+        let helper = calls.iter().find(|c| c.name == "helper").unwrap();
+        assert_eq!(helper.call_site_line, 6, "the first call site is kept");
+        assert_eq!(helper.call_count, 3);
+        let other = calls.iter().find(|c| c.name == "other").unwrap();
+        assert_eq!(other.call_count, 1);
+    }
+
+    /// The wire spelling, the omission of the common case, and an index row
+    /// written before the field existed.
+    #[test]
+    fn call_count_wire_spelling_and_old_rows() {
+        let folded = FunctionCallRef {
+            name: "helper".to_string(),
+            file_path: "src/app.ts".to_string(),
+            line_number: 1,
+            call_site_line: 6,
+            call_count: 3,
+        };
+        let json = serde_json::to_value(&folded).unwrap();
+        assert_eq!(json["call_count"], 3);
+
+        let single = FunctionCallRef {
+            call_count: 1,
+            ..folded.clone()
+        };
+        let text = serde_json::to_string(&single).unwrap();
+        assert!(!text.contains("call_count"), "got: {text}");
+
+        let old: FunctionCallRef = serde_json::from_value(serde_json::json!({
+            "name": "helper",
+            "file_path": "src/app.ts",
+            "line_number": 1,
+            "call_site_line": 6
+        }))
+        .unwrap();
+        assert_eq!(old.call_count, 1);
     }
 
     #[test]

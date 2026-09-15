@@ -1353,6 +1353,7 @@ mod tests {
             file_path: file.to_string(),
             line_number: line,
             call_site_line: call_site,
+            call_count: 1,
         }
     }
 
