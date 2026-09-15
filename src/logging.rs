@@ -1,19 +1,34 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 use tracing::info;
-use tracing_appender::rolling::{self, RollingFileAppender, RollingWriter};
-use tracing_subscriber::fmt::writer::MakeWriter;
+use tracing_appender::rolling;
+use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriter};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Byte offset into today's log file at which *this run* started writing.
-/// Captured during `init()` and used by `get_run_log_offset()` so log uploads
-/// only ship the current run's content, not the day's accumulated tail (which
-/// could include unrelated repos analyzed earlier on the same machine).
-static RUN_START_OFFSET: OnceLock<u64> = OnceLock::new();
+/// The file this process's own lines go to, when it logs to a run file.
+///
+/// The run-log upload reads it whole. It used to read the day's shared file
+/// from this process's start offset, and every carrick process on the machine
+/// writes that file: a fifteen-minute scan shipped 118 other runs' banners
+/// with its own, and nothing in a line said which process wrote it
+/// (carrick#1133).
+static RUN_LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Where a process's debug log goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSink {
+    /// `~/.carrick/logs/carrick.log.<date>`, shared by every process that
+    /// writes it that day: the builds `index` and `refresh` run, which upload
+    /// nothing.
+    Daily,
+    /// `~/.carrick/logs/runs/<started>-<run>-<pid>.log`, this process's lines
+    /// and nobody else's: the scan, which uploads its log (carrick#1133).
+    Run,
+}
 
 /// UUID v4 generated once per scanner invocation. Sent on every cloud
 /// request as `X-Carrick-Run-Id` and logged in the run preamble so the
@@ -51,11 +66,13 @@ pub fn run_id() -> &'static str {
 ///    Uses a minimal format without timestamps or targets for a clean look.
 ///
 /// 2. **File layer** (best effort): when `~/.carrick/logs/` is writable, appends
-///    [`FILE_FILTER`] logs with timestamps to `carrick.log.YYYY-MM-DD` (daily
-///    rotation, [`RETAINED_LOG_DAYS`] days kept). If the directory can't be
-///    created the file layer is skipped and only the terminal layer is active
-///    — in that case the run preamble only reaches stderr.
-pub fn init(verbose: bool) {
+///    [`FILE_FILTER`] logs with timestamps to the file `sink` names — the
+///    shared `carrick.log.YYYY-MM-DD` (daily rotation, [`RETAINED_LOG_DAYS`]
+///    days kept), or a file of this process's own under `runs/`. If the
+///    directory can't be created the file layer is skipped and only the
+///    terminal layer is active — in that case the run preamble only reaches
+///    stderr.
+pub fn init(verbose: bool, sink: LogSink) {
     let terminal_filter = EnvFilter::new(terminal_filter(verbose));
 
     let terminal_layer = fmt::layer()
@@ -68,12 +85,6 @@ pub fn init(verbose: bool) {
     // Try to set up file logging to ~/.carrick/logs/
     let log_dir = dirs::home_dir().map(|h| h.join(".carrick").join("logs"));
 
-    // Daily rotation with a retention cap. Rotation alone bounded nothing —
-    // nothing deleted an old file, and 143 GB of them filled a disk
-    // mid-session (carrick#741). The file name is unchanged,
-    // `carrick.log.<date>` exactly as `get_log_file_path` computes it, so the
-    // run-log upload still finds today's file and ships this run's bytes from
-    // RUN_START_OFFSET.
     let cap = log_size_cap();
     // Reported after the subscriber exists, so the fresh file says why it
     // starts where it does rather than a reader finding a log that begins
@@ -81,23 +92,52 @@ pub fn init(verbose: bool) {
     let mut rolled = None;
     let file_appender = log_dir.as_ref().and_then(|dir| {
         std::fs::create_dir_all(dir).ok()?;
-        // Roll before the offset is taken: a run that starts on a file already
-        // at the cap starts on an empty one, so the log you want — this run's —
-        // is the one that fits.
-        rolled = roll_over_cap(dir, &today(), cap);
-        // Capture the current size of today's log file *before* we write
-        // anything. Anything past this offset belongs to this run.
-        let _ = RUN_START_OFFSET.set(current_log_file_size());
-        let inner = rolling::Builder::new()
-            .rotation(rolling::Rotation::DAILY)
-            .filename_prefix("carrick.log")
-            .max_log_files(RETAINED_LOG_DAYS)
-            .build(dir)
-            .ok()?;
-        Some(CappedAppender::new(
-            inner,
-            budget(cap, RUN_START_OFFSET.get().copied().unwrap_or(0)),
-        ))
+        match sink {
+            // Daily rotation with a retention cap. Rotation alone bounded
+            // nothing — nothing deleted an old file, and 143 GB of them filled
+            // a disk mid-session (carrick#741).
+            LogSink::Daily => {
+                // Roll before the size is read: a run that starts on a file
+                // already at the cap starts on an empty one.
+                rolled = roll_over_cap(dir, &today(), cap);
+                let existing = std::fs::metadata(dir.join(format!("carrick.log.{}", today())))
+                    .map(|meta| meta.len())
+                    .unwrap_or(0);
+                let inner = rolling::Builder::new()
+                    .rotation(rolling::Rotation::DAILY)
+                    .filename_prefix("carrick.log")
+                    .max_log_files(RETAINED_LOG_DAYS)
+                    .build(dir)
+                    .ok()?;
+                Some(BoxMakeWriter::new(CappedAppender::new(
+                    inner,
+                    budget(cap, existing),
+                    DAILY_LOG,
+                )))
+            }
+            // A file nobody else writes, so what the upload reads is this
+            // run's and only this run's (carrick#1133). Pruned here, on the
+            // way in, by the same days as the daily files and a byte bound of
+            // their size: a machine that runs a test suite starts hundreds of
+            // scans a day, and the count is not what the disk cares about.
+            LogSink::Run => {
+                let runs = dir.join(RUN_LOG_DIR);
+                std::fs::create_dir_all(&runs).ok()?;
+                prune_run_logs(&runs, SystemTime::now(), run_logs_bound(cap));
+                let path = runs.join(run_log_name(
+                    run_id(),
+                    std::process::id(),
+                    chrono::Utc::now(),
+                ));
+                let file = create_private(&path).ok()?;
+                let _ = RUN_LOG_FILE.set(path);
+                Some(BoxMakeWriter::new(CappedAppender::new(
+                    Mutex::new(file),
+                    cap,
+                    RUN_LOG,
+                )))
+            }
+        }
     });
 
     if let Some(file_appender) = file_appender {
@@ -466,9 +506,9 @@ fn budget(cap: u64, existing: u64) -> u64 {
 /// One clock, and it is the appender's (carrick#1052). `tracing_appender`
 /// names `carrick.log.<date>` from `Utc::now()` and nothing here can tell it
 /// otherwise, so every reader of that name has to use the same clock or it
-/// reads a file that does not exist. This is the reader: the roll at startup,
-/// the offset the upload slices from, and [`get_log_file_path`] all go through
-/// it. With `Local` here, a machine west of UTC spent the hours between local
+/// reads a file that does not exist. This is the reader: the roll at startup
+/// and the size a run's budget is taken from both go through it. With `Local`
+/// here, a machine west of UTC spent the hours between local
 /// midnight and 00:00 UTC computing yesterday's name for today's file — the
 /// roll looked at nothing, and the run-log upload found nothing to ship, which
 /// is the window a first index was lost in.
@@ -528,48 +568,59 @@ fn rolled_files(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The rolling appender, with a byte budget for this run.
+/// What the cap message calls the shared daily file.
+const DAILY_LOG: &str = "Carrick's debug log for today";
+
+/// What the cap message calls a run's own file.
+const RUN_LOG: &str = "This run's debug log";
+
+/// A log file's appender, with a byte budget for this run.
 ///
 /// Rolling aside at startup bounds what earlier runs left behind; this bounds
 /// what one run can write, which is the other half — a single large scan is
 /// what produced the gigabytes. Past the budget the lines are dropped rather
 /// than the run failing: a debug log is never worth ending a scan for. One
 /// line on stderr says it happened and how to turn the cap off.
-struct CappedAppender {
-    inner: RollingFileAppender,
+struct CappedAppender<A> {
+    inner: A,
     remaining: AtomicU64,
     announced: AtomicBool,
+    /// Which file this is, in the words of the cap message.
+    what: &'static str,
 }
 
-impl CappedAppender {
-    fn new(inner: RollingFileAppender, remaining: u64) -> Self {
+impl<A> CappedAppender<A> {
+    fn new(inner: A, remaining: u64, what: &'static str) -> Self {
         Self {
             inner,
             remaining: AtomicU64::new(remaining),
             announced: AtomicBool::new(false),
+            what,
         }
     }
 }
 
-impl<'a> MakeWriter<'a> for CappedAppender {
-    type Writer = CappedWriter<'a>;
+impl<'a, A: MakeWriter<'a>> MakeWriter<'a> for CappedAppender<A> {
+    type Writer = CappedWriter<'a, A::Writer>;
 
     fn make_writer(&'a self) -> Self::Writer {
         CappedWriter {
             inner: self.inner.make_writer(),
             remaining: &self.remaining,
             announced: &self.announced,
+            what: self.what,
         }
     }
 }
 
-struct CappedWriter<'a> {
-    inner: RollingWriter<'a>,
+struct CappedWriter<'a, W> {
+    inner: W,
     remaining: &'a AtomicU64,
     announced: &'a AtomicBool,
+    what: &'static str,
 }
 
-impl Write for CappedWriter<'_> {
+impl<W: Write> Write for CappedWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let left = self.remaining.load(Ordering::Relaxed);
         if left == 0 {
@@ -584,8 +635,9 @@ impl Write for CappedWriter<'_> {
         self.remaining.store(now, Ordering::Relaxed);
         if now == 0 && !self.announced.swap(true, Ordering::Relaxed) {
             eprintln!(
-                "Carrick's debug log for today reached its {} MB cap and the rest of this run is \
-                 not being written to it. Set {}=0 to log without a cap.",
+                "{} reached its {} MB cap and the rest of this run is not being written to it. \
+                 Set {}=0 to log without a cap.",
+                self.what,
                 log_size_cap() / (1024 * 1024),
                 LOG_SIZE_CAP_ENV
             );
@@ -606,6 +658,89 @@ impl Write for CappedWriter<'_> {
 /// days covers "what happened in the run I am asking about", which is all the
 /// local copy is for — the cloud gets this run's slice at upload time.
 const RETAINED_LOG_DAYS: usize = 3;
+
+/// The directory under `~/.carrick/logs/` that holds one file per run.
+///
+/// A directory of its own, not a `carrick.log.*` name beside the daily files:
+/// the appender prunes every file matching its prefix down to
+/// [`RETAINED_LOG_DAYS`], so three scans named that way would evict every day
+/// of the shared log, and the roll matches the same prefix.
+const RUN_LOG_DIR: &str = "runs";
+
+/// How long a run file that is not being written is protected from the byte
+/// bound. A scan that is still going keeps writing, and deleting a file a
+/// running scan still holds open would leave its upload reading nothing.
+const RUN_LOG_IN_USE: Duration = Duration::from_secs(60 * 60);
+
+/// The bytes every run file together may hold: the days the daily files are
+/// kept for, at the size one of them is capped at. Unbounded when the cap is
+/// off.
+fn run_logs_bound(cap: u64) -> u64 {
+    cap.saturating_mul(RETAINED_LOG_DAYS as u64)
+}
+
+/// `2026-09-15T13-28-04Z-e52ff358-41234.log`: when it started, the head of the
+/// run id that joins it to the cloud's logs, and the process, because a build
+/// and every scan it drives share one run id.
+fn run_log_name(run_id: &str, pid: u32, started: chrono::DateTime<chrono::Utc>) -> String {
+    let head: String = run_id.chars().take(8).collect();
+    format!("{}-{head}-{pid}.log", started.format("%Y-%m-%dT%H-%M-%SZ"))
+}
+
+/// Create a run's log file readable by this account alone. It names the
+/// machine's paths, which is why the upload redacts it; the local copy does
+/// not need to be readable by anyone else to be useful.
+fn create_private(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Delete the run files the retention no longer covers: every one older than
+/// [`RETAINED_LOG_DAYS`], then the oldest of the rest while together they
+/// hold more than `bound` bytes — except a file written in the last
+/// [`RUN_LOG_IN_USE`], which may belong to a scan that is still running.
+fn prune_run_logs(dir: &Path, now: SystemTime, bound: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let max_age = Duration::from_secs(60 * 60 * 24 * RETAINED_LOG_DAYS as u64);
+    let mut kept: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("log") {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(now);
+        let age = now.duration_since(modified).unwrap_or_default();
+        if age > max_age {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        kept.push((path, modified, meta.len()));
+    }
+    let mut total: u64 = kept.iter().map(|(_, _, len)| len).sum();
+    kept.sort_by_key(|(_, modified, _)| *modified);
+    for (path, modified, len) in kept {
+        if total <= bound {
+            break;
+        }
+        if now.duration_since(modified).unwrap_or_default() < RUN_LOG_IN_USE {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+        }
+    }
+}
 
 /// Size at which the log directory is worth mentioning: nothing about a
 /// scanner says "check your home directory", and the first symptom of not
@@ -638,29 +773,28 @@ fn log_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".carrick").join("logs"))
 }
 
+/// The bytes the log directory holds, the run files under it included.
 fn log_dir_size(dir: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
     entries
         .filter_map(Result::ok)
-        .filter_map(|entry| entry.metadata().ok())
-        .filter(|meta| meta.is_file())
-        .map(|meta| meta.len())
+        .map(|entry| match entry.metadata() {
+            Ok(meta) if meta.is_file() => meta.len(),
+            Ok(meta) if meta.is_dir() && entry.file_name() == RUN_LOG_DIR => {
+                log_dir_size(&entry.path())
+            }
+            _ => 0,
+        })
         .sum()
 }
 
-fn current_log_file_size() -> u64 {
-    get_log_file_path()
-        .and_then(|p| std::fs::metadata(&p).ok())
-        .map(|m| m.len())
-        .unwrap_or(0)
-}
-
-/// Byte offset into the daily log file at which this run began. `None` if
-/// the file layer wasn't initialized (terminal-only fallback).
-pub fn get_run_log_offset() -> Option<u64> {
-    RUN_START_OFFSET.get().copied()
+/// This process's own log file, when it writes one: the file the run-log
+/// upload reads. `None` for a process that logs to the daily file, and for one
+/// whose file could not be created.
+pub fn run_log_file() -> Option<&'static Path> {
+    RUN_LOG_FILE.get().map(PathBuf::as_path)
 }
 
 /// Emit a structured preamble at the start of every run. Goes through `tracing`
@@ -709,18 +843,6 @@ fn emit_run_preamble() {
         runner_os = %env("RUNNER_OS"),
         "Carrick run starting"
     );
-}
-
-/// Return the path to today's log file, if it exists.
-///
-/// The rolling appender creates files named `carrick.log.YYYY-MM-DD`.
-pub fn get_log_file_path() -> Option<std::path::PathBuf> {
-    let log_file = log_dir()?.join(format!("carrick.log.{}", today()));
-    if log_file.exists() {
-        Some(log_file)
-    } else {
-        None
-    }
 }
 
 /// True when stderr is attached to a terminal (TTY). False under CI redirects
@@ -825,12 +947,12 @@ mod tests {
 
     /// The retention cap must not change the file name.
     ///
-    /// `get_log_file_path` computes `carrick.log.<date>` by hand, and the
-    /// run-log upload reads this run's bytes from an offset into that exact
-    /// file. A builder that spelled the name differently would leave both
-    /// pointing at nothing, and the upload would go quiet rather than fail.
+    /// The roll at startup computes `carrick.log.<date>` by hand, and the
+    /// run's byte budget is taken from the size of that exact file. A builder
+    /// that spelled the name differently would leave both looking at nothing,
+    /// and the cap would stop capping without failing.
     #[test]
-    fn the_capped_appender_writes_the_name_the_upload_path_looks_for() {
+    fn the_capped_appender_writes_the_name_the_roll_looks_for() {
         let dir = tempfile::tempdir().expect("temp dir");
 
         let mut appender = rolling::Builder::new()
@@ -843,7 +965,7 @@ mod tests {
         appender.flush().expect("flush");
 
         // `today()`, not a second spelling of the clock: the point of the
-        // assertion is that the name the upload path computes is the name the
+        // assertion is that the name the roll computes is the name the
         // appender wrote (carrick#1052).
         let expected = dir.path().join(format!("carrick.log.{}", today()));
         assert!(
@@ -982,6 +1104,7 @@ mod tests {
                 .build(dir.path())
                 .expect("build appender"),
             10,
+            DAILY_LOG,
         );
 
         let line = b"0123456789abcdef\n";
@@ -996,6 +1119,99 @@ mod tests {
             .len();
         // One event of overshoot is allowed; five are not.
         assert_eq!(written, line.len() as u64);
+    }
+
+    /// A run's file is named for when it started, the run it belongs to and
+    /// the process that wrote it: a build and each scan it drives share a run
+    /// id, and each of them is a file.
+    #[test]
+    fn a_run_file_names_its_start_its_run_and_its_process() {
+        let started = chrono::DateTime::parse_from_rfc3339("2026-09-15T13:28:04Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            run_log_name("e52ff358-1c2d-4f7e-9a0b-5d6e7f8a9b0c", 41234, started),
+            "2026-09-15T13-28-04Z-e52ff358-41234.log"
+        );
+    }
+
+    /// A run file is written by one process, capped like the daily file, and
+    /// readable by this account alone (carrick#1133).
+    #[test]
+    fn a_run_file_is_private_and_capped() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("run.log");
+        let appender = CappedAppender::new(
+            Mutex::new(create_private(&path).expect("create")),
+            10,
+            RUN_LOG,
+        );
+        let line = b"0123456789abcdef\n";
+        for _ in 0..3 {
+            let mut writer = appender.make_writer();
+            assert_eq!(writer.write(line).expect("write"), line.len());
+        }
+        assert_eq!(std::fs::read(&path).expect("read").len(), line.len());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+        }
+    }
+
+    /// The run files are kept for the days the daily files are, and together
+    /// they hold no more than their byte bound — but a file a scan may still
+    /// be writing is never the one that goes (carrick#1133).
+    #[test]
+    fn run_files_are_pruned_by_age_and_then_by_bytes_oldest_first() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let now = SystemTime::now();
+        let hours = |h: u64| now - Duration::from_secs(h * 60 * 60);
+        let seed = |name: &str, bytes: usize, modified: SystemTime| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, vec![b'x'; bytes]).expect("seed");
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open")
+                .set_modified(modified)
+                .expect("set mtime");
+        };
+        // Past the days kept, however small.
+        seed("expired.log", 1, hours(24 * RETAINED_LOG_DAYS as u64 + 1));
+        // Within the days, and together over a bound of 250 bytes.
+        seed("oldest.log", 100, hours(30));
+        seed("older.log", 100, hours(20));
+        seed("recent.log", 100, hours(2));
+        // Written a minute ago: may be a running scan's, so it stays even
+        // though the bound is still exceeded without it.
+        seed("live.log", 100, now - Duration::from_secs(60));
+        // Not a run file.
+        seed("notes.txt", 1_000, hours(24 * 30));
+
+        prune_run_logs(dir.path(), now, 250);
+
+        assert_eq!(
+            log_files(dir.path()),
+            vec![
+                "live.log".to_string(),
+                "notes.txt".to_string(),
+                "recent.log".to_string()
+            ]
+        );
+    }
+
+    /// The directory's size counts the run files, so the notice about a large
+    /// log directory still fires when they are what is large.
+    #[test]
+    fn the_log_directory_size_counts_the_run_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("carrick.log.2026-09-15"), vec![b'x'; 10]).unwrap();
+        std::fs::create_dir_all(dir.path().join(RUN_LOG_DIR)).unwrap();
+        std::fs::write(dir.path().join(RUN_LOG_DIR).join("a.log"), vec![b'x'; 32]).unwrap();
+        assert_eq!(log_dir_size(dir.path()), 42);
+        assert_eq!(run_logs_bound(u64::MAX), u64::MAX);
     }
 
     /// The cap is a number a user can change for one run, including off.
@@ -1065,11 +1281,11 @@ mod tests {
     /// One clock, and it is the appender's (carrick#1052).
     ///
     /// `tracing_appender` names its files from `Utc::now()`. Everything that
-    /// reads that name — the roll at startup, the offset the run-log upload
-    /// slices from, `get_log_file_path` — goes through `today()`, so this is
-    /// the assertion that keeps them on the same day. With `Local` here, every
-    /// machine west of UTC had a window between local midnight and 00:00 UTC
-    /// in which the upload looked for a file nobody was writing.
+    /// reads that name — the roll at startup, the size a run's budget is taken
+    /// from — goes through `today()`, so this is the assertion that keeps them
+    /// on the same day. With `Local` here, every machine west of UTC had a
+    /// window between local midnight and 00:00 UTC in which the roll looked at
+    /// a file nobody was writing.
     #[test]
     fn todays_name_is_computed_on_the_appenders_clock() {
         assert_eq!(today(), chrono::Utc::now().format("%Y-%m-%d").to_string());

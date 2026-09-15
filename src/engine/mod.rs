@@ -1518,37 +1518,37 @@ fn print_graphql_notices(notices: &crate::graphql::GraphqlNotices) {
     }
 }
 
-/// How much of the log file this run's upload reads, and from where.
-///
-/// Start at this run's own offset, but never before the last 5 MB of the
-/// file: a pathologically chatty run must not ship hundreds of megabytes.
-///
-/// The clamp to `file_len` is the whole reason this is a function of its own.
-/// The day's log is rolled aside when it reaches its cap, and a build that
-/// crosses that moment holds an offset INTO THE ROLLED FILE while the live one
-/// is small or empty — so `file_len - start` underflowed, `Vec::with_capacity`
-/// was asked for something near `u64::MAX` bytes, and the process aborted on
-/// an allocation failure that read as a scanner crash (carrick#936). Past the
-/// end there is nothing of this run's left to upload, and an empty read says
-/// so.
-fn log_tail_range(file_len: u64, run_start: Option<u64>) -> (u64, usize) {
+/// How much of this run's log file the upload reads, and from where: all of
+/// it, up to its last 5 MB. A pathologically chatty run must not ship hundreds
+/// of megabytes, and the tail is where a failure is.
+fn log_tail_range(file_len: u64) -> (u64, usize) {
     const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
-    let cap_start = file_len.saturating_sub(MAX_LOG_BYTES);
-    let start = run_start.unwrap_or(0).max(cap_start).min(file_len);
-    (start, file_len.saturating_sub(start) as usize)
+    let start = file_len.saturating_sub(MAX_LOG_BYTES);
+    (start, (file_len - start) as usize)
 }
 
 /// Best-effort upload of the current run's log tail to S3.
 ///
-/// Reads from the byte offset captured at `logging::init` time so the upload
-/// only contains *this run's* output — not the day's accumulated tail, which
-/// on a developer machine could include unrelated repos analyzed earlier.
+/// Reads this process's own log file, which no other process writes
+/// (carrick#1133). It used to read the day's shared file from this process's
+/// start offset, and every carrick process on the machine — other scans, a
+/// test suite, the builds `index` and `refresh` run — wrote into that slice.
 /// Capped at 5 MB in case a single run is unusually verbose.
 ///
 /// Runs on both success and failure paths — failing runs are exactly the
 /// ones whose logs we need. Errors here are non-fatal: a failed upload is
 /// logged at warn but never propagated.
 async fn upload_run_logs<T: CloudStorage>(storage: &T, repo_path: &str) {
+    upload_run_log_from(storage, repo_path, logging::run_log_file()).await;
+}
+
+/// [`upload_run_logs`], reading `log_path` — the run's own file, or `None`
+/// when this process has none.
+async fn upload_run_log_from<T: CloudStorage>(
+    storage: &T,
+    repo_path: &str,
+    log_path: Option<&Path>,
+) {
     // Asked before the file is read: a backend with no cloud behind it (the
     // offline harness, the local join after a laptop scan) has nowhere to send
     // the log. CI and laptop scans both ship it (carrick#1063).
@@ -1562,14 +1562,14 @@ async fn upload_run_logs<T: CloudStorage>(storage: &T, repo_path: &str) {
         return;
     }
 
-    let Some(log_path) = logging::get_log_file_path() else {
-        debug!("Run log not uploaded: no debug log file for today in ~/.carrick/logs");
+    let Some(log_path) = log_path else {
+        debug!("Run log not uploaded: this run has no log file of its own in ~/.carrick/logs/runs");
         return;
     };
-    let mut file = match std::fs::File::open(&log_path) {
+    let mut file = match std::fs::File::open(log_path) {
         Ok(file) => file,
         Err(e) => {
-            debug!("Run log not uploaded: could not open today's debug log: {e}");
+            debug!("Run log not uploaded: could not open this run's debug log: {e}");
             return;
         }
     };
@@ -1583,16 +1583,16 @@ async fn upload_run_logs<T: CloudStorage>(storage: &T, repo_path: &str) {
 
     use std::io::{Read, Seek};
 
-    let (start, expected) = log_tail_range(metadata.len(), logging::get_run_log_offset());
+    let (start, expected) = log_tail_range(metadata.len());
 
     if let Err(e) = file.seek(std::io::SeekFrom::Start(start)) {
-        debug!("Run log not uploaded: could not seek to this run's offset {start}: {e}");
+        debug!("Run log not uploaded: could not seek to offset {start} of this run's log: {e}");
         return;
     }
 
     let mut buf = Vec::with_capacity(expected);
     if let Err(e) = file.read_to_end(&mut buf) {
-        debug!("Run log not uploaded: could not read this run's slice of the debug log: {e}");
+        debug!("Run log not uploaded: could not read this run's debug log: {e}");
         return;
     }
 
@@ -6198,27 +6198,16 @@ mod tests {
         assert_ne!(mapped, hash());
     }
 
-    /// The log is rolled aside at its cap, and a build that crosses that
-    /// moment holds an offset into the file that was rolled: the live one is
-    /// smaller than the offset. Subtracting the other way round asked
-    /// `Vec::with_capacity` for about 18 exabytes and aborted the process
-    /// (carrick#936).
+    /// A run's file is read whole up to its last 5 MB, and an empty one reads
+    /// nothing rather than underflowing into an allocation abort (carrick#936).
     #[test]
-    fn a_log_offset_past_the_end_of_a_rolled_file_reads_nothing() {
-        // The rolled case: this run wrote 200 MB, then the file it was writing
-        // to was renamed and a new one started.
-        assert_eq!(super::log_tail_range(4_096, Some(209_715_200)), (4_096, 0));
-        // The file is gone entirely and a fresh one has not been written yet.
-        assert_eq!(super::log_tail_range(0, Some(209_715_200)), (0, 0));
-        // The ordinary case is unchanged: this run's own bytes, in full.
-        assert_eq!(super::log_tail_range(10_000, Some(4_000)), (4_000, 6_000));
-        // A run with no recorded offset reads from the start of the file.
-        assert_eq!(super::log_tail_range(10_000, None), (0, 10_000));
-        // And the cap holds: 6 MB of one run ships its last 5 MB.
+    fn a_run_log_ships_whole_up_to_its_last_five_megabytes() {
+        assert_eq!(super::log_tail_range(0), (0, 0));
+        assert_eq!(super::log_tail_range(10_000), (0, 10_000));
         let six_mb = 6 * 1024 * 1024;
         let five_mb = 5 * 1024 * 1024;
         assert_eq!(
-            super::log_tail_range(six_mb, Some(0)),
+            super::log_tail_range(six_mb),
             (six_mb - five_mb, five_mb as usize)
         );
     }
@@ -6362,20 +6351,20 @@ mod tests {
     /// What leaves the machine is redacted, and the wiring that does it is
     /// the upload path itself (carrick#1063).
     ///
-    /// Drives the real `upload_run_logs` against a temporary home, so the file
-    /// it finds, the offset it slices from and the redaction it applies are
-    /// the ones a laptop run uses. `#[serial]` because `HOME` is process-wide.
+    /// Drives the real upload against a temporary home, so the redaction it
+    /// applies is the one a laptop run uses. `#[serial]` because `HOME` is
+    /// process-wide.
     #[tokio::test]
     #[serial_test::serial]
     async fn an_uploaded_run_log_carries_no_home_and_no_credential() {
         let home = tempfile::tempdir().expect("temp home");
         // A checkout outside the home directory (carrick#1098).
         let repo = tempfile::tempdir().expect("temp repo");
-        let logs = home.path().join(".carrick").join("logs");
-        std::fs::create_dir_all(&logs).expect("log dir");
-        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let runs = home.path().join(".carrick").join("logs").join("runs");
+        std::fs::create_dir_all(&runs).expect("log dir");
+        let own = runs.join("2026-09-15T13-28-04Z-e52ff358-41234.log");
         std::fs::write(
-            logs.join(format!("carrick.log.{day}")),
+            &own,
             format!(
                 "reading {}/work/api/src/index.ts\n  Authorization: Bearer secret\nanalysed 12 files\nparsing {}/src/a.ts\n",
                 home.path().display(),
@@ -6388,7 +6377,7 @@ mod tests {
         // SAFETY: a `#[serial]` test, and the variable is restored below.
         unsafe { std::env::set_var("HOME", home.path()) };
         let storage = crate::cloud_storage::MockStorage::new();
-        upload_run_logs(&storage, &repo.path().to_string_lossy()).await;
+        upload_run_log_from(&storage, &repo.path().to_string_lossy(), Some(&own)).await;
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("HOME", value),
@@ -6404,6 +6393,58 @@ mod tests {
         assert!(!log.contains("Authorization"), "{log}");
         assert!(!log.contains(&home.path().display().to_string()), "{log}");
         assert!(log.contains("parsing <repo>/src/a.ts"), "{log}");
+    }
+
+    /// The field report behind carrick#1133: while one scan ran, every other
+    /// carrick process on the machine wrote the same daily file, and the
+    /// upload shipped their lines as this scan's. The upload reads this run's
+    /// own file, so neither another run's file nor the daily file reaches it.
+    #[tokio::test]
+    async fn a_run_log_upload_holds_this_runs_lines_and_no_other_process() {
+        let logs = tempfile::tempdir().expect("log dir");
+        let runs = logs.path().join("runs");
+        std::fs::create_dir_all(&runs).expect("runs dir");
+        let banner =
+            |run: &str| format!("INFO carrick::logging: Carrick run starting run_id=\"{run}\"\n");
+        let own = runs.join("2026-09-15T13-28-04Z-e52ff358-41234.log");
+        std::fs::write(
+            &own,
+            format!("{}analysed 12 files\n", banner("e52ff358-own")),
+        )
+        .unwrap();
+        std::fs::write(
+            runs.join("2026-09-15T13-28-05Z-0badc0de-41300.log"),
+            banner("0badc0de-other"),
+        )
+        .unwrap();
+        std::fs::write(
+            logs.path().join("carrick.log.2026-09-15"),
+            format!("{}{}", banner("e52ff358-own"), banner("feedface-lsp")),
+        )
+        .unwrap();
+
+        let storage = crate::cloud_storage::MockStorage::new();
+        upload_run_log_from(&storage, "/repos/api", Some(&own)).await;
+
+        let uploaded = storage.uploaded_logs();
+        assert_eq!(uploaded.len(), 1, "nothing was uploaded");
+        assert_eq!(
+            uploaded[0].matches("Carrick run starting").count(),
+            1,
+            "{}",
+            uploaded[0]
+        );
+        assert!(uploaded[0].contains("e52ff358-own"), "{}", uploaded[0]);
+        assert!(uploaded[0].contains("analysed 12 files"), "{}", uploaded[0]);
+        for foreign in ["0badc0de-other", "feedface-lsp"] {
+            assert!(!uploaded[0].contains(foreign), "{foreign}: {}", uploaded[0]);
+        }
+
+        // A process with no file of its own uploads nothing, rather than
+        // falling back to a file other processes write.
+        let none = crate::cloud_storage::MockStorage::new();
+        upload_run_log_from(&none, "/repos/api", None).await;
+        assert!(none.uploaded_logs().is_empty());
     }
 
     /// A refusal that is simply a cloud without the action deployed is not a
