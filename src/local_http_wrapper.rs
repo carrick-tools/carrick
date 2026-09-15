@@ -34,20 +34,57 @@
 //! library, framework or helper name appears anywhere, and a helper that builds
 //! its whole URL internally is left to the existing path.
 //!
+//! ## Chains and bindings (carrick#1151)
+//!
+//! Real clients stack helpers, and hold the URL in a local binding on the way
+//! down:
+//!
+//! ```ignore
+//! function send(url: string, options: RequestInit) {
+//!   return fetch(url, { ...options, headers: traceHeaders() });
+//! }
+//! export function callApi(method: string, endpoint: string, data?: object) {
+//!   const url = `${config.API_URL}${endpoint}`;
+//!   const options = { method, body: JSON.stringify(data) };
+//!   return send(url, options);
+//! }
+//! callApi("POST", "/v1/orders", order);
+//! ```
+//!
+//! Three structural reads make that one request:
+//!
+//! - **A `const` is its initializer.** Every `const` binding in the module is
+//!   read by its resolver identity (name and syntax context), so a URL or an
+//!   options object held in one substitutes exactly where it is referenced,
+//!   through any number of `const` hops. `let`/`var` can be reassigned and are
+//!   not read.
+//! - **A method can arrive in an options object.** A request that spreads a
+//!   parameter into its options bag (`{ ...options, headers }`) and states no
+//!   `method` of its own takes the method from whatever the caller passes in
+//!   that position.
+//! - **A wrapper can call a wrapper.** A function whose request is a call to
+//!   another same-file wrapper takes that wrapper's shape, with each parameter
+//!   slot filled by what this function passes. Resolved to a fixpoint, so the
+//!   depth of the chain does not matter.
+//!
+//! What stays unresolved is anything a `const` cannot state: a path picked by a
+//! `switch`, read from a lookup table, or built by a call. Those sites raise no
+//! row here, and are the model's to read.
+//!
 //! Scope: a wrapper is a named function declaration or a function/arrow bound to
 //! a name, invoked by that name. A class method reached through a receiver
 //! (`this.request("/things")`) is the same indirection through a different
 //! binding shape and is not resolved here; it needs receiver resolution the way
 //! the controller pass does, and is left for a follow-up rather than guessed at.
 
+use std::collections::HashMap;
+
 use swc_common::{SourceMap, SourceMapper, Spanned, SyntaxContext, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::type_manifest::{is_http_method, normalize_manifest_method};
-use crate::wrapper_request_shape::{
-    literal_string, prop_value, request_options_argument, verb_from_callee_property,
-};
+use crate::wrapper_request_shape::{is_request_options, literal_string, verb_from_callee_property};
 
 /// One outbound call resolved through a request wrapper declared in the same
 /// file: the site's own span and line, and the request it actually issues.
@@ -72,6 +109,18 @@ pub struct LocalWrapperCall {
     pub method: Option<String>,
 }
 
+/// How many `const` hops a binding is followed through before giving up. A
+/// real chain is two or three deep; the bound only keeps a cycle the resolver
+/// did not break from looping.
+const MAX_CONST_HOPS: usize = 8;
+
+/// An object literal with more properties than this is a table, not a request
+/// options bag or a URL, and is not kept in the `const` index.
+const MAX_INDEXED_OBJECT_PROPS: usize = 64;
+
+/// A binding's resolver identity: its name and syntax context.
+type BindingKey = (String, SyntaxContext);
+
 /// A part of the URL a wrapper builds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UrlPart {
@@ -89,34 +138,50 @@ enum MethodSource {
     Fixed(String),
     /// The wrapper parameterizes it, so the SITE's argument is the method.
     Param(usize),
+    /// The `method` of the options object the SITE passes at this position
+    /// (carrick#1151): the wrapper spreads that parameter into its own options
+    /// and states no method over it.
+    OptionsParam(usize),
     /// The request states no method. Not an assertion of GET — the value is
     /// left unset and the existing consumer normalization decides.
     Unstated,
 }
 
-/// A request wrapper declared in this file whose URL carries one of its own
-/// parameters.
-#[derive(Debug, Clone)]
-struct WrapperDef {
-    name: String,
-    /// The binding's syntax context, so a shadowing declaration elsewhere in
-    /// the file cannot be mistaken for a call to this one. Meaningful only
-    /// after the resolver pass; where it has not run every context compares
-    /// equal and this degrades to a name match.
-    ctxt: SyntaxContext,
+/// The request a wrapper issues, in terms of its own parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Shape {
     url: Vec<UrlPart>,
     method: MethodSource,
 }
 
-/// One named function currently being walked.
-struct FnFrame {
+/// One argument a function passes to a call, read in that function's terms:
+/// as URL text, as a method, and as an options object. Whichever reading the
+/// callee's shape asks for is the one used.
+#[derive(Debug, Clone)]
+struct ArgForm {
+    url: Option<Vec<UrlPart>>,
+    method: Option<MethodSource>,
+    options_method: Option<MethodSource>,
+}
+
+/// One call inside a named function that may be the request it issues.
+#[derive(Debug, Clone)]
+struct RequestUse {
+    /// The call's own request shape, when it is request-shaped where it stands
+    /// (an HTTP-verb callee or a request-options bag) and its URL carries a
+    /// parameter.
+    direct: Option<Shape>,
+    /// The call's callee and arguments, when the callee is a plain identifier:
+    /// a call to another same-file wrapper takes that wrapper's shape.
+    delegate: Option<(BindingKey, Vec<ArgForm>)>,
+}
+
+/// One named function and the calls it makes.
+#[derive(Debug, Clone)]
+struct FnRecord {
     name: String,
-    ctxt: SyntaxContext,
-    params: Vec<Option<String>>,
-    resolved: Option<(Vec<UrlPart>, MethodSource)>,
-    /// Two parameterized requests in one helper: a site could be reaching
-    /// either, so nothing about it is asserted.
-    ambiguous: bool,
+    key: BindingKey,
+    uses: Vec<RequestUse>,
 }
 
 /// Every same-file wrapper call site in `module`, in source order.
@@ -127,19 +192,27 @@ pub fn collect_local_wrapper_calls(
     module: &Module,
     source_map: &Lrc<SourceMap>,
 ) -> Vec<LocalWrapperCall> {
-    let mut wrappers = WrapperCollector {
-        source_map,
+    let consts = collect_consts(module);
+    let mut functions = FnCollector {
+        reader: Reader {
+            source_map,
+            consts: &consts,
+        },
         stack: Vec::new(),
-        wrappers: Vec::new(),
+        records: Vec::new(),
     };
-    module.visit_with(&mut wrappers);
-    if wrappers.wrappers.is_empty() {
+    module.visit_with(&mut functions);
+    let wrappers = resolve_wrappers(functions.records);
+    if wrappers.is_empty() {
         return Vec::new();
     }
 
     let mut sites = SiteCollector {
-        source_map,
-        wrappers: wrappers.wrappers,
+        reader: Reader {
+            source_map,
+            consts: &consts,
+        },
+        wrappers,
         calls: Vec::new(),
     };
     module.visit_with(&mut sites);
@@ -152,55 +225,313 @@ pub fn collect_local_wrapper_calls(
     calls
 }
 
-/// Finds the file's request wrappers: named functions whose own request call
-/// interpolates one of their parameters into the URL.
-struct WrapperCollector<'a> {
-    source_map: &'a Lrc<SourceMap>,
-    /// The named functions enclosing the node being visited, innermost last.
-    /// A request is attributed to the innermost one, so a helper's own nested
-    /// closures count as the helper's and a nested named function owns its own.
-    stack: Vec<FnFrame>,
-    wrappers: Vec<WrapperDef>,
+/// Every `const` binding in the module whose initializer could state a URL, a
+/// method or an options object, by resolver identity. A key declared twice
+/// (possible only where the resolver has not run) states nothing and is
+/// dropped.
+fn collect_consts(module: &Module) -> HashMap<BindingKey, Expr> {
+    #[derive(Default)]
+    struct ConstCollector {
+        consts: HashMap<BindingKey, Option<Expr>>,
+    }
+    impl Visit for ConstCollector {
+        fn visit_var_decl(&mut self, node: &VarDecl) {
+            if node.kind == VarDeclKind::Const {
+                for decl in &node.decls {
+                    let (Pat::Ident(binding), Some(init)) = (&decl.name, decl.init.as_deref())
+                    else {
+                        continue;
+                    };
+                    if !indexable_initializer(init) {
+                        continue;
+                    }
+                    let key = (binding.id.sym.to_string(), binding.id.ctxt);
+                    self.consts
+                        .entry(key)
+                        .and_modify(|held| *held = None)
+                        .or_insert_with(|| Some(init.clone()));
+                }
+            }
+            node.visit_children_with(self);
+        }
+    }
+
+    let mut collector = ConstCollector::default();
+    module.visit_with(&mut collector);
+    collector
+        .consts
+        .into_iter()
+        .filter_map(|(key, init)| Some((key, init?)))
+        .collect()
 }
 
-impl WrapperCollector<'_> {
-    fn push_frame(&mut self, ident: &Ident, params: Vec<Option<String>>) {
-        self.stack.push(FnFrame {
-            name: ident.sym.to_string(),
-            ctxt: ident.ctxt,
-            params,
-            resolved: None,
-            ambiguous: false,
-        });
+/// Whether a `const` initializer is one of the shapes this module reads: a
+/// string, a template, a concatenation, another binding, or a small object.
+fn indexable_initializer(expr: &Expr) -> bool {
+    match unwrap(expr) {
+        Expr::Lit(Lit::Str(_)) | Expr::Tpl(_) | Expr::Ident(_) | Expr::Bin(_) => true,
+        Expr::Object(obj) => obj.props.len() <= MAX_INDEXED_OBJECT_PROPS,
+        _ => false,
+    }
+}
+
+/// Strip wrappers that do not change a value: parentheses and type assertions.
+fn unwrap(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(inner) => unwrap(&inner.expr),
+        Expr::TsAs(inner) => unwrap(&inner.expr),
+        Expr::TsNonNull(inner) => unwrap(&inner.expr),
+        Expr::TsConstAssertion(inner) => unwrap(&inner.expr),
+        Expr::TsSatisfies(inner) => unwrap(&inner.expr),
+        Expr::TsTypeAssertion(inner) => unwrap(&inner.expr),
+        _ => expr,
+    }
+}
+
+/// A piece of text an expression evaluates to, as this module reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Piece {
+    /// Text. `literal` is true when the source writes it as literal text (a
+    /// string or a template quasi, directly or through a `const`), false for an
+    /// interpolation carried through verbatim.
+    Text { text: String, literal: bool },
+    /// The enclosing function's parameter at this position.
+    Param(usize),
+}
+
+/// Reads expressions against the module's `const` index.
+struct Reader<'a> {
+    source_map: &'a Lrc<SourceMap>,
+    consts: &'a HashMap<BindingKey, Expr>,
+}
+
+impl Reader<'_> {
+    /// The `const` initializer `ident` names, when it names one.
+    fn const_init(&self, ident: &Ident) -> Option<&Expr> {
+        self.consts.get(&(ident.sym.to_string(), ident.ctxt))
     }
 
-    fn pop_frame(&mut self) {
-        let Some(frame) = self.stack.pop() else {
-            return;
-        };
-        if frame.ambiguous {
-            return;
-        }
-        let Some((url, method)) = frame.resolved else {
-            return;
-        };
-        self.wrappers.push(WrapperDef {
-            name: frame.name,
-            ctxt: frame.ctxt,
-            url,
-            method,
-        });
-    }
-
-    /// The URL parts and method source of `call`, when it is a request whose
-    /// URL carries one of `params`.
-    fn request_shape(
+    /// The pieces of text `expr` evaluates to, with `params` read as
+    /// parameter slots. `None` when the expression is not a string this can
+    /// state (a call, a member access at the top level, an unknown binding).
+    fn pieces(
         &self,
-        call: &CallExpr,
-        params: &[Option<String>],
-    ) -> Option<(Vec<UrlPart>, MethodSource)> {
+        expr: &Expr,
+        params: &[Option<BindingKey>],
+        hops: usize,
+    ) -> Option<Vec<Piece>> {
+        match unwrap(expr) {
+            Expr::Lit(Lit::Str(literal)) => Some(vec![Piece::Text {
+                text: literal.value.to_string(),
+                literal: !literal.value.is_empty(),
+            }]),
+            Expr::Ident(ident) => {
+                if let Some(index) = param_position(ident, params) {
+                    return Some(vec![Piece::Param(index)]);
+                }
+                if hops >= MAX_CONST_HOPS {
+                    return None;
+                }
+                self.pieces(self.const_init(ident)?, params, hops + 1)
+            }
+            Expr::Tpl(tpl) => {
+                let mut pieces = Vec::new();
+                for (index, quasi) in tpl.quasis.iter().enumerate() {
+                    let text = quasi.raw.to_string();
+                    if !text.is_empty() {
+                        pieces.push(Piece::Text {
+                            text,
+                            literal: true,
+                        });
+                    }
+                    let Some(interpolated) = tpl.exprs.get(index) else {
+                        continue;
+                    };
+                    pieces.extend(self.interpolation(interpolated, params, hops)?);
+                }
+                Some(pieces)
+            }
+            // `base + path`: each side is read the way a template reads one
+            // interpolation, so an opaque side is carried verbatim.
+            Expr::Bin(bin) if bin.op == BinaryOp::Add => {
+                let mut pieces = self.interpolation(&bin.left, params, hops)?;
+                pieces.extend(self.interpolation(&bin.right, params, hops)?);
+                Some(pieces)
+            }
+            // `cond ? "/v1/things?x=1" : "/v1/things"`: two spellings of one
+            // route. Read when both branches state the same text up to the
+            // query string, as that text; any other conditional states two
+            // requests and is not read.
+            Expr::Cond(cond) => {
+                let consequent = self.pieces(&cond.cons, params, hops)?;
+                let alternate = self.pieces(&cond.alt, params, hops)?;
+                let route = |pieces: &[Piece]| -> Vec<Piece> {
+                    let mut route = Vec::new();
+                    for piece in pieces {
+                        match piece {
+                            Piece::Text { text, literal } if *literal => match text.find('?') {
+                                Some(query) => {
+                                    if query > 0 {
+                                        route.push(Piece::Text {
+                                            text: text[..query].to_string(),
+                                            literal: true,
+                                        });
+                                    }
+                                    return route;
+                                }
+                                None => route.push(piece.clone()),
+                            },
+                            other => route.push(other.clone()),
+                        }
+                    }
+                    route
+                };
+                let consequent_route = route(&consequent);
+                (merge_text(&consequent_route) == merge_text(&route(&alternate)))
+                    .then_some(consequent_route)
+            }
+            _ => None,
+        }
+    }
+
+    /// One interpolated value: its pieces when it resolves, else its own source
+    /// text carried verbatim as `${…}`.
+    fn interpolation(
+        &self,
+        expr: &Expr,
+        params: &[Option<BindingKey>],
+        hops: usize,
+    ) -> Option<Vec<Piece>> {
+        if let Expr::Ident(_) | Expr::Lit(Lit::Str(_)) | Expr::Tpl(_) = unwrap(expr)
+            && let Some(pieces) = self.pieces(expr, params, hops)
+        {
+            return Some(pieces);
+        }
+        let snippet = self.source_map.span_to_snippet(expr.span()).ok()?;
+        Some(vec![Piece::Text {
+            text: format!("${{{}}}", snippet.trim()),
+            literal: false,
+        }])
+    }
+
+    /// `expr` read as an HTTP method: a literal verb, a parameter, or a
+    /// `const` holding either.
+    fn method(
+        &self,
+        expr: &Expr,
+        params: &[Option<BindingKey>],
+        hops: usize,
+    ) -> Option<MethodSource> {
+        if let Some(literal) = literal_string(unwrap(expr)) {
+            let normalized = normalize_manifest_method(&literal);
+            return is_http_method(&normalized).then_some(MethodSource::Fixed(normalized));
+        }
+        let Expr::Ident(ident) = unwrap(expr) else {
+            return None;
+        };
+        if let Some(index) = param_position(ident, params) {
+            return Some(MethodSource::Param(index));
+        }
+        if hops >= MAX_CONST_HOPS {
+            return None;
+        }
+        self.method(self.const_init(ident)?, params, hops + 1)
+    }
+
+    /// `expr` read as a request options object, for the method it carries: an
+    /// object literal, a parameter holding one, or a `const` holding one.
+    fn options_method(
+        &self,
+        expr: &Expr,
+        params: &[Option<BindingKey>],
+        hops: usize,
+    ) -> Option<MethodSource> {
+        match unwrap(expr) {
+            Expr::Object(obj) => self.object_method(obj, params, hops),
+            Expr::Ident(ident) => {
+                if let Some(index) = param_position(ident, params) {
+                    return Some(MethodSource::OptionsParam(index));
+                }
+                if hops >= MAX_CONST_HOPS {
+                    return None;
+                }
+                self.options_method(self.const_init(ident)?, params, hops + 1)
+            }
+            _ => None,
+        }
+    }
+
+    /// The method an options object literal states, read in property order so
+    /// a `method` written after a spread overrides it and a spread written
+    /// after a `method` may replace it. `None` when a property that could
+    /// carry the method cannot be read.
+    fn object_method(
+        &self,
+        obj: &ObjectLit,
+        params: &[Option<BindingKey>],
+        hops: usize,
+    ) -> Option<MethodSource> {
+        let mut method = MethodSource::Unstated;
+        for prop in &obj.props {
+            match prop {
+                // A spread this can read replaces the method; one it cannot
+                // read is left out, as a request states no method through it
+                // that this could name.
+                PropOrSpread::Spread(spread) => {
+                    if let Some(spread_method) = self.options_method(&spread.expr, params, hops) {
+                        method = spread_method;
+                    }
+                }
+                PropOrSpread::Prop(prop) => match &**prop {
+                    Prop::KeyValue(kv) if prop_name_is(&kv.key, "method") => {
+                        method = self.method(&kv.value, params, hops)?;
+                    }
+                    Prop::Shorthand(ident) if ident.sym.as_ref() == "method" => {
+                        method = self.method(&Expr::Ident(ident.clone()), params, hops)?;
+                    }
+                    _ => {}
+                },
+            }
+        }
+        Some(method)
+    }
+
+    /// The request-options bag among a call's arguments, read through `const`
+    /// bindings: the one argument that is (or names) an object literal
+    /// carrying a request-options key.
+    fn options_bag<'e>(&'e self, call: &'e CallExpr) -> Option<&'e ObjectLit> {
+        let mut found: Option<&ObjectLit> = None;
+        for arg in &call.args {
+            if arg.spread.is_some() {
+                continue;
+            }
+            let mut expr = unwrap(&arg.expr);
+            for _ in 0..MAX_CONST_HOPS {
+                let Expr::Ident(ident) = expr else {
+                    break;
+                };
+                match self.const_init(ident) {
+                    Some(init) => expr = unwrap(init),
+                    None => break,
+                }
+            }
+            if let Expr::Object(obj) = expr
+                && is_request_options(obj)
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(obj);
+            }
+        }
+        found
+    }
+
+    /// The request `call` issues where it stands, when it is request-shaped
+    /// and its URL carries one of `params`.
+    fn direct_shape(&self, call: &CallExpr, params: &[Option<BindingKey>]) -> Option<Shape> {
         let verb = verb_from_callee_property(callee_property(call).as_deref());
-        let options = request_options_argument(call);
+        let options = self.options_bag(call);
         // Not request-shaped: no HTTP-verb callee and no request-options bag.
         // The same structural test the cross-file wrapper pass uses.
         if verb.is_none() && options.is_none() {
@@ -208,53 +539,131 @@ impl WrapperCollector<'_> {
         }
 
         let url_arg = call.args.first().filter(|arg| arg.spread.is_none())?;
-        let url = url_parts(&url_arg.expr, params, self.source_map)?;
+        let url = url_parts(self.pieces(&url_arg.expr, params, 0)?);
+        if !url.iter().any(|part| matches!(part, UrlPart::Param(_))) {
+            return None;
+        }
 
-        let method = match options {
-            Some((_, obj)) => match prop_value(obj, "method") {
-                Some(Some(value)) => match literal_string(value) {
-                    Some(literal) => {
-                        let normalized = normalize_manifest_method(&literal);
-                        if !is_http_method(&normalized) {
-                            return None;
-                        }
-                        MethodSource::Fixed(normalized)
-                    }
-                    // A `method` key that is not a literal is the
-                    // parameterized wrapper: only the site knows the method,
-                    // so bind it to the site the way the URL is bound.
-                    None => MethodSource::Param(param_index(value, params)?),
-                },
-                // Shorthand `{ method }` — the value is the binding of that
-                // name, so it is a parameter or nothing this can read.
-                Some(None) => MethodSource::Param(named_param_index("method", params)?),
-                None => match verb {
-                    Some(verb) => MethodSource::Fixed(verb),
-                    None => MethodSource::Unstated,
-                },
+        let method = match options.map(|obj| self.object_method(obj, params, 0)) {
+            Some(Some(MethodSource::Unstated)) | None => match verb {
+                Some(verb) => MethodSource::Fixed(verb),
+                None => MethodSource::Unstated,
             },
-            None => MethodSource::Fixed(verb?),
+            Some(Some(method)) => method,
+            Some(None) => return None,
         };
-        Some((url, method))
+        Some(Shape { url, method })
+    }
+
+    /// One argument read in its function's terms.
+    fn arg_form(&self, expr: &Expr, params: &[Option<BindingKey>]) -> ArgForm {
+        ArgForm {
+            url: self.pieces(expr, params, 0).map(url_parts),
+            method: self.method(expr, params, 0),
+            options_method: self.options_method(expr, params, 0),
+        }
     }
 }
 
-impl Visit for WrapperCollector<'_> {
+/// Whether a property key names `name`.
+fn prop_name_is(key: &PropName, name: &str) -> bool {
+    match key {
+        PropName::Ident(ident) => ident.sym.as_ref() == name,
+        PropName::Str(literal) => literal.value.as_ref() == name,
+        _ => false,
+    }
+}
+
+/// The position of the parameter `ident` refers to, matched by resolver
+/// identity so a nested closure's own parameter of the same name is not it.
+fn param_position(ident: &Ident, params: &[Option<BindingKey>]) -> Option<usize> {
+    params.iter().position(|param| {
+        param
+            .as_ref()
+            .is_some_and(|(name, ctxt)| name == ident.sym.as_ref() && *ctxt == ident.ctxt)
+    })
+}
+
+/// Pieces as a wrapper's URL parts, adjacent text merged so two spellings of
+/// one URL compare equal.
+fn url_parts(pieces: Vec<Piece>) -> Vec<UrlPart> {
+    let mut parts: Vec<UrlPart> = Vec::new();
+    for piece in pieces {
+        match piece {
+            Piece::Text { text, .. } => match parts.last_mut() {
+                Some(UrlPart::Fixed(held)) => held.push_str(&text),
+                _ => parts.push(UrlPart::Fixed(text)),
+            },
+            Piece::Param(index) => parts.push(UrlPart::Param(index)),
+        }
+    }
+    parts
+}
+
+/// Pieces as plain text, for comparing two spellings of one route.
+fn merge_text(pieces: &[Piece]) -> Vec<UrlPart> {
+    url_parts(pieces.to_vec())
+}
+
+/// Collects every named function and the calls it makes.
+struct FnCollector<'a> {
+    reader: Reader<'a>,
+    /// The named functions enclosing the node being visited, innermost last,
+    /// as (record, parameters). A call is attributed to the innermost one, so
+    /// a helper's own nested closures count as the helper's and a nested named
+    /// function owns its own.
+    stack: Vec<(FnRecord, Vec<Option<BindingKey>>)>,
+    records: Vec<FnRecord>,
+}
+
+impl FnCollector<'_> {
+    fn push_frame(&mut self, ident: &Ident, params: Vec<Option<BindingKey>>) {
+        self.stack.push((
+            FnRecord {
+                name: ident.sym.to_string(),
+                key: (ident.sym.to_string(), ident.ctxt),
+                uses: Vec::new(),
+            },
+            params,
+        ));
+    }
+
+    fn pop_frame(&mut self) {
+        if let Some((record, _)) = self.stack.pop()
+            && !record.uses.is_empty()
+        {
+            self.records.push(record);
+        }
+    }
+}
+
+impl Visit for FnCollector<'_> {
     fn visit_fn_decl(&mut self, node: &FnDecl) {
-        let params = fn_params(&node.function.params);
+        let params = node
+            .function
+            .params
+            .iter()
+            .map(|param| pat_key(&param.pat))
+            .collect();
         self.push_frame(&node.ident, params);
         node.visit_children_with(self);
         self.pop_frame();
     }
 
     fn visit_var_declarator(&mut self, node: &VarDeclarator) {
-        let framed = match (&node.name, node.init.as_deref()) {
+        let framed = match (&node.name, node.init.as_deref().map(unwrap)) {
             (Pat::Ident(ident), Some(Expr::Arrow(arrow))) => {
-                self.push_frame(&ident.id, arrow.params.iter().map(pat_name).collect());
+                self.push_frame(&ident.id, arrow.params.iter().map(pat_key).collect());
                 true
             }
             (Pat::Ident(ident), Some(Expr::Fn(fn_expr))) => {
-                self.push_frame(&ident.id, fn_params(&fn_expr.function.params));
+                let params = fn_expr
+                    .function
+                    .params
+                    .iter()
+                    .map(|param| pat_key(&param.pat))
+                    .collect();
+                self.push_frame(&ident.id, params);
                 true
             }
             _ => false,
@@ -266,40 +675,143 @@ impl Visit for WrapperCollector<'_> {
     }
 
     fn visit_call_expr(&mut self, node: &CallExpr) {
-        let params = match self.stack.last() {
-            Some(frame) if !frame.params.is_empty() => frame.params.clone(),
-            _ => Vec::new(),
-        };
-        if !params.is_empty()
-            && let Some(shape) = self.request_shape(node, &params)
-            && let Some(frame) = self.stack.last_mut()
+        if let Some((_, params)) = self.stack.last()
+            && params.iter().any(Option::is_some)
         {
-            if frame.resolved.is_some() {
-                frame.ambiguous = true;
-            } else {
-                frame.resolved = Some(shape);
+            let direct = self.reader.direct_shape(node, params);
+            let delegate = match &node.callee {
+                Callee::Expr(callee) => match unwrap(callee) {
+                    Expr::Ident(ident) => Some((
+                        (ident.sym.to_string(), ident.ctxt),
+                        node.args
+                            .iter()
+                            .map(|arg| match arg.spread {
+                                Some(_) => ArgForm {
+                                    url: None,
+                                    method: None,
+                                    options_method: None,
+                                },
+                                None => self.reader.arg_form(&arg.expr, params),
+                            })
+                            .collect(),
+                    )),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if (direct.is_some() || delegate.is_some())
+                && let Some((record, _)) = self.stack.last_mut()
+            {
+                record.uses.push(RequestUse { direct, delegate });
             }
         }
         node.visit_children_with(self);
     }
 }
 
-/// Finds the call sites that delegate to one of the collected wrappers.
+/// The wrappers the file declares, resolved to a fixpoint: a function whose
+/// requests all come to ONE shape carrying one of its parameters is a
+/// wrapper, and a call to a wrapper is a request of that wrapper's shape.
+///
+/// Recomputed from scratch each round against the previous round's answer,
+/// so the result does not depend on declaration order, and bounded by the
+/// number of functions, which is the longest chain there can be.
+fn resolve_wrappers(records: Vec<FnRecord>) -> HashMap<BindingKey, (String, Shape)> {
+    // A key two records share (possible only where the resolver has not run)
+    // names two functions; neither is readable by name.
+    let mut counts: HashMap<&BindingKey, usize> = HashMap::new();
+    for record in &records {
+        *counts.entry(&record.key).or_default() += 1;
+    }
+    let records: Vec<&FnRecord> = records
+        .iter()
+        .filter(|record| counts.get(&record.key) == Some(&1))
+        .collect();
+
+    let mut resolved: HashMap<BindingKey, (String, Shape)> = HashMap::new();
+    for _ in 0..=records.len() {
+        let mut next: HashMap<BindingKey, (String, Shape)> = HashMap::new();
+        for record in &records {
+            let mut shapes: Vec<Shape> = Vec::new();
+            for request in &record.uses {
+                let delegated = request.delegate.as_ref().and_then(|(callee, args)| {
+                    if *callee == record.key {
+                        return None;
+                    }
+                    let (_, shape) = resolved.get(callee)?;
+                    compose(shape, args)
+                });
+                let Some(shape) = delegated.or_else(|| request.direct.clone()) else {
+                    continue;
+                };
+                if shape
+                    .url
+                    .iter()
+                    .any(|part| matches!(part, UrlPart::Param(_)))
+                    && !shapes.contains(&shape)
+                {
+                    shapes.push(shape);
+                }
+            }
+            // Two different parameterized requests in one helper: a site could
+            // be reaching either, so nothing about it is asserted. The same
+            // request made twice (a retry) is one shape.
+            if let [shape] = shapes.as_slice() {
+                next.insert(record.key.clone(), (record.name.clone(), shape.clone()));
+            }
+        }
+        if next == resolved {
+            break;
+        }
+        resolved = next;
+    }
+    resolved
+}
+
+/// A wrapper's shape with each parameter slot filled by what the caller
+/// passes, in the caller's own terms. `None` when a slot the shape reads is
+/// filled by something that cannot be read.
+fn compose(shape: &Shape, args: &[ArgForm]) -> Option<Shape> {
+    let mut pieces = Vec::new();
+    for part in &shape.url {
+        match part {
+            UrlPart::Fixed(text) => pieces.push(UrlPart::Fixed(text.clone())),
+            UrlPart::Param(index) => pieces.extend(args.get(*index)?.url.clone()?),
+        }
+    }
+    let mut url: Vec<UrlPart> = Vec::new();
+    for part in pieces {
+        match (url.last_mut(), part) {
+            (Some(UrlPart::Fixed(held)), UrlPart::Fixed(text)) => held.push_str(&text),
+            (_, part) => url.push(part),
+        }
+    }
+    let method = match &shape.method {
+        MethodSource::Fixed(method) => MethodSource::Fixed(method.clone()),
+        MethodSource::Unstated => MethodSource::Unstated,
+        MethodSource::Param(index) => args.get(*index)?.method.clone()?,
+        // No options argument at all: the request states no method.
+        MethodSource::OptionsParam(index) => match args.get(*index) {
+            Some(arg) => arg.options_method.clone()?,
+            None => MethodSource::Unstated,
+        },
+    };
+    Some(Shape { url, method })
+}
+
+/// Finds the call sites that delegate to one of the resolved wrappers.
 struct SiteCollector<'a> {
-    source_map: &'a Lrc<SourceMap>,
-    wrappers: Vec<WrapperDef>,
+    reader: Reader<'a>,
+    wrappers: HashMap<BindingKey, (String, Shape)>,
     calls: Vec<LocalWrapperCall>,
 }
 
 impl Visit for SiteCollector<'_> {
     fn visit_call_expr(&mut self, node: &CallExpr) {
         if let Callee::Expr(callee) = &node.callee
-            && let Expr::Ident(ident) = &**callee
-            && let Some(wrapper) = self
-                .wrappers
-                .iter()
-                .find(|wrapper| wrapper.name == ident.sym.as_ref() && wrapper.ctxt == ident.ctxt)
-            && let Some(call) = resolve_site(wrapper, node, self.source_map)
+            && let Expr::Ident(ident) = unwrap(callee)
+            && let Some((name, shape)) = self.wrappers.get(&(ident.sym.to_string(), ident.ctxt))
+            && let Some(call) = resolve_site(&self.reader, name, shape, node)
         {
             self.calls.push(call);
         }
@@ -309,31 +821,38 @@ impl Visit for SiteCollector<'_> {
 
 /// Substitute this site's arguments into the wrapper's URL and method.
 fn resolve_site(
-    wrapper: &WrapperDef,
+    reader: &Reader<'_>,
+    wrapper_name: &str,
+    shape: &Shape,
     call: &CallExpr,
-    source_map: &Lrc<SourceMap>,
 ) -> Option<LocalWrapperCall> {
     let mut target = String::new();
-    // At least one parameter slot must be filled by a literal the site states.
-    // A wrapper whose every slot is filled by a variable tells us nothing the
-    // wrapper's own line did not already say.
+    // At least one parameter slot must be filled with literal text the site
+    // states (directly or through a `const`). A slot filled only by variables
+    // tells us nothing the wrapper's own line did not already say — which is
+    // also what keeps one wrapper delegating to another from reading as a
+    // site.
     let mut states_a_literal = false;
-    for part in &wrapper.url {
+    for part in &shape.url {
         match part {
             UrlPart::Fixed(text) => target.push_str(text),
             UrlPart::Param(index) => {
                 let arg = call.args.get(*index).filter(|arg| arg.spread.is_none())?;
-                match argument_text(&arg.expr, source_map) {
-                    Some(text) => {
-                        states_a_literal = true;
-                        target.push_str(&text);
+                match reader.pieces(&arg.expr, &[], 0) {
+                    Some(pieces) => {
+                        for piece in pieces {
+                            if let Piece::Text { text, literal } = piece {
+                                states_a_literal |= literal;
+                                target.push_str(&text);
+                            }
+                        }
                     }
                     // A slot the site fills with an expression — the base URL
                     // it holds in a variable, most often. Carried through as an
                     // interpolation of that expression, which is exactly what
                     // the wrapper's own request line reads as.
                     None => {
-                        let snippet = source_map.span_to_snippet(arg.expr.span()).ok()?;
+                        let snippet = reader.source_map.span_to_snippet(arg.expr.span()).ok()?;
                         target.push_str(&format!("${{{}}}", snippet.trim()));
                     }
                 }
@@ -348,116 +867,35 @@ fn resolve_site(
         return None;
     }
 
-    let method = match &wrapper.method {
+    let method = match &shape.method {
         MethodSource::Fixed(method) => Some(method.clone()),
         MethodSource::Param(index) => {
             let arg = call.args.get(*index).filter(|arg| arg.spread.is_none())?;
-            let normalized = normalize_manifest_method(&literal_string(&arg.expr)?);
-            if !is_http_method(&normalized) {
-                return None;
+            match reader.method(&arg.expr, &[], 0)? {
+                MethodSource::Fixed(method) => Some(method),
+                _ => return None,
             }
-            Some(normalized)
         }
+        MethodSource::OptionsParam(index) => match call.args.get(*index) {
+            None => None,
+            Some(arg) if arg.spread.is_some() => return None,
+            Some(arg) => match reader.options_method(&arg.expr, &[], 0)? {
+                MethodSource::Fixed(method) => Some(method),
+                MethodSource::Unstated => None,
+                _ => return None,
+            },
+        },
         MethodSource::Unstated => None,
     };
 
     Some(LocalWrapperCall {
         span_start: call.span.lo.0,
         span_end: call.span.hi.0,
-        line_number: source_map.lookup_char_pos(call.span.lo).line,
-        wrapper_name: wrapper.name.clone(),
+        line_number: reader.source_map.lookup_char_pos(call.span.lo).line,
+        wrapper_name: wrapper_name.to_string(),
         target,
         method,
     })
-}
-
-/// The URL a request builds, as fixed text and parameter slots, or `None` when
-/// it carries none of the enclosing function's parameters (a wrapper that
-/// builds its whole URL internally is already extractable where it stands).
-fn url_parts(
-    expr: &Expr,
-    params: &[Option<String>],
-    source_map: &Lrc<SourceMap>,
-) -> Option<Vec<UrlPart>> {
-    match expr {
-        Expr::Paren(paren) => url_parts(&paren.expr, params, source_map),
-        Expr::TsAs(as_expr) => url_parts(&as_expr.expr, params, source_map),
-        Expr::TsNonNull(non_null) => url_parts(&non_null.expr, params, source_map),
-        // The whole URL is the parameter: `fetch(path, …)`.
-        Expr::Ident(_) => Some(vec![UrlPart::Param(param_index(expr, params)?)]),
-        Expr::Tpl(tpl) => {
-            let mut parts = Vec::new();
-            let mut carries_param = false;
-            for (index, quasi) in tpl.quasis.iter().enumerate() {
-                let text = quasi
-                    .cooked
-                    .as_ref()
-                    .map(|cooked| cooked.to_string())
-                    .unwrap_or_else(|| quasi.raw.to_string());
-                if !text.is_empty() {
-                    parts.push(UrlPart::Fixed(text));
-                }
-                let Some(interpolated) = tpl.exprs.get(index) else {
-                    continue;
-                };
-                match param_index(interpolated, params) {
-                    Some(param) => {
-                        parts.push(UrlPart::Param(param));
-                        carries_param = true;
-                    }
-                    // Anything the wrapper closes over is carried through
-                    // verbatim, exactly as the analyzer emits it from the
-                    // wrapper's own line.
-                    None => {
-                        let snippet = source_map.span_to_snippet(interpolated.span()).ok()?;
-                        parts.push(UrlPart::Fixed(format!("${{{}}}", snippet.trim())));
-                    }
-                }
-            }
-            if !carries_param {
-                return None;
-            }
-            Some(parts)
-        }
-        _ => None,
-    }
-}
-
-/// The position of the parameter `expr` names, when it names one.
-fn param_index(expr: &Expr, params: &[Option<String>]) -> Option<usize> {
-    match expr {
-        Expr::Paren(paren) => param_index(&paren.expr, params),
-        Expr::TsAs(as_expr) => param_index(&as_expr.expr, params),
-        Expr::TsNonNull(non_null) => param_index(&non_null.expr, params),
-        Expr::Ident(ident) => named_param_index(ident.sym.as_ref(), params),
-        _ => None,
-    }
-}
-
-fn named_param_index(name: &str, params: &[Option<String>]) -> Option<usize> {
-    params
-        .iter()
-        .position(|param| param.as_deref() == Some(name))
-}
-
-/// The text a site's argument contributes to the URL: a string literal's value,
-/// or a template's source with its interpolations intact.
-fn argument_text(expr: &Expr, source_map: &Lrc<SourceMap>) -> Option<String> {
-    match expr {
-        Expr::Paren(paren) => argument_text(&paren.expr, source_map),
-        Expr::TsAs(as_expr) => argument_text(&as_expr.expr, source_map),
-        Expr::TsNonNull(non_null) => argument_text(&non_null.expr, source_map),
-        Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string()),
-        Expr::Tpl(_) => {
-            let snippet = source_map.span_to_snippet(expr.span()).ok()?;
-            let trimmed = snippet.trim();
-            let inner = trimmed
-                .strip_prefix('`')
-                .and_then(|rest| rest.strip_suffix('`'))?;
-            Some(inner.to_string())
-        }
-        _ => None,
-    }
 }
 
 /// Whether a resolved target is shaped like something a consumer requests: an
@@ -490,17 +928,14 @@ fn callee_property(call: &CallExpr) -> Option<String> {
     }
 }
 
-/// The names a function's parameters bind, by position.
-fn fn_params(params: &[Param]) -> Vec<Option<String>> {
-    params.iter().map(|param| pat_name(&param.pat)).collect()
-}
-
-/// The name a parameter binds, when it is a plain identifier. Destructured and
-/// rest parameters bind no single name and hold a position no argument can be
-/// read from.
-fn pat_name(pat: &Pat) -> Option<String> {
+/// The binding a parameter introduces, when it is a plain identifier.
+/// Destructured and rest parameters bind no single name and hold a position no
+/// argument can be read from.
+fn pat_key(pat: &Pat) -> Option<BindingKey> {
     match pat {
-        Pat::Ident(ident) => Some(ident.id.sym.to_string()),
+        Pat::Ident(ident) => Some((ident.id.sym.to_string(), ident.id.ctxt)),
+        // `path = "/default"`: the binding is the left side.
+        Pat::Assign(assign) => pat_key(&assign.left),
         _ => None,
     }
 }
@@ -746,5 +1181,174 @@ twoWays("/v1/things", body);
             .is_empty(),
             "two parameterized requests in one helper leave the site ambiguous"
         );
+    }
+
+    /// carrick#1151: the URL held in a `const`, the method carried in an
+    /// options object the wrapper spreads, and a wrapper that calls a second
+    /// wrapper. Each alone left the site with no row.
+    #[test]
+    fn resolves_a_two_hop_chain_with_the_url_and_options_in_consts() {
+        let calls = collect(
+            r#"
+function send(url: string, options: RequestInit, label: string) {
+  return tracer.span(label, async () => {
+    const response = await fetch(url, { ...options, headers: traceHeaders() });
+    return response;
+  });
+}
+
+export async function callApi(method: string, endpoint: string, data?: object) {
+  const url = `${config.apiUrl}${endpoint}`;
+  const init: RequestInit = {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: data ? JSON.stringify(data) : undefined,
+  };
+  const response = await send(url, init, endpoint);
+  return response.json();
+}
+
+export const ordersApi = {
+  list: () => callApi("GET", "/v1/orders"),
+  get: (orderId: string) => callApi("GET", `/v1/orders/${orderId}`),
+  cancel: (orderId: string) => callApi("PATCH", `/v1/orders/${orderId}/cancel`, {}),
+};
+"#,
+        );
+        assert_eq!(
+            targets(&calls),
+            vec![
+                (Some("GET"), "${config.apiUrl}/v1/orders"),
+                (Some("GET"), "${config.apiUrl}/v1/orders/${orderId}"),
+                (
+                    Some("PATCH"),
+                    "${config.apiUrl}/v1/orders/${orderId}/cancel"
+                ),
+            ],
+            "one row per site, method from the site, base kept verbatim: {calls:#?}"
+        );
+        assert!(
+            calls.iter().all(|call| call.wrapper_name == "callApi"),
+            "each site is attributed to the wrapper it calls, not the one beneath it"
+        );
+    }
+
+    /// A retry makes the same request twice. One shape, not an ambiguity.
+    #[test]
+    fn a_retried_request_through_a_second_hop_is_one_shape() {
+        let calls = collect(
+            r#"
+function send(url: string, options: RequestInit) {
+  return fetch(url, { ...options, headers: authHeaders() });
+}
+
+async function sendWithRetry(url: string, options: RequestInit) {
+  const first = await send(url, options);
+  if (first.status !== 401) return first;
+  const retried = { ...options, headers: { Authorization: await refresh() } };
+  return send(url, retried);
+}
+
+export function callAuthed(method: string, endpoint: string) {
+  const url = `${base}${endpoint}`;
+  const options = { method, credentials: "include" };
+  return report(() => sendWithRetry(url, options), endpoint);
+}
+
+callAuthed("DELETE", "/v1/sessions/current");
+"#,
+        );
+        assert_eq!(
+            targets(&calls),
+            vec![(Some("DELETE"), "${base}/v1/sessions/current")],
+            "{calls:#?}"
+        );
+    }
+
+    /// A site whose own `const`s state the URL and the options bag is a site,
+    /// two `const` hops deep.
+    #[test]
+    fn a_site_that_holds_its_url_and_options_in_consts_resolves() {
+        let calls = collect(
+            r#"
+function send(url: string, options: RequestInit) {
+  return fetch(url, { ...options, headers: authHeaders() });
+}
+
+export async function download(fileId: string) {
+  const endpoint = `/v1/files/${fileId}/content`;
+  const url = `${base}${endpoint}`;
+  const options: RequestInit = { method: "GET", credentials: "include" };
+  const response = await send(url, options);
+  return response.blob();
+}
+"#,
+        );
+        assert_eq!(
+            targets(&calls),
+            vec![(Some("GET"), "${base}/v1/files/${fileId}/content")],
+            "{calls:#?}"
+        );
+    }
+
+    /// Two spellings of one route in a conditional argument are that route.
+    #[test]
+    fn a_conditional_argument_naming_one_route_resolves_to_it() {
+        let calls = collect(
+            r#"
+function call(method: string, path: string) {
+  return fetch(`${host}${path}`, { method });
+}
+call("POST", q.length > 0 ? `/v1/items?${q}` : "/v1/items");
+call("GET", admin ? "/v1/admin/items" : "/v1/items");
+"#,
+        );
+        assert_eq!(
+            targets(&calls),
+            vec![(Some("POST"), "${host}/v1/items")],
+            "a conditional choosing between two routes states neither: {calls:#?}"
+        );
+    }
+
+    /// A wrapper's delegation to the wrapper beneath it passes variables, not
+    /// a route, and must not itself read as a site.
+    #[test]
+    fn a_delegation_between_wrappers_is_not_a_site() {
+        let calls = collect(
+            r#"
+function send(url: string, options: RequestInit) {
+  return fetch(url, { ...options, headers: authHeaders() });
+}
+export function callApi(method: string, endpoint: string) {
+  const url = `${config.apiUrl}${endpoint}`;
+  return send(url, { method });
+}
+"#,
+        );
+        assert!(calls.is_empty(), "{calls:#?}");
+    }
+
+    /// A `let` can be reassigned before the request, so it is not read, and a
+    /// method the site passes through a variable is not guessed.
+    #[test]
+    fn reassignable_bindings_and_variable_methods_are_not_read() {
+        let calls = collect(
+            r#"
+function send(url: string, options: RequestInit) {
+  return fetch(url, { ...options, headers: authHeaders() });
+}
+export function callApi(method: string, endpoint: string) {
+  const url = `${base}${endpoint}`;
+  return send(url, { method });
+}
+let path = "/v1/first";
+path = "/v1/second";
+callApi("GET", path);
+callApi(verb, "/v1/things");
+const options = { method: pickVerb() };
+send("/v1/other", options);
+"#,
+        );
+        assert!(calls.is_empty(), "{calls:#?}");
     }
 }
