@@ -9,18 +9,27 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import path from "node:path";
 import {
+  claudeAddArgs,
+  claudeRestampLine,
   connectMcpClients,
   disconnectMcpClients,
   inspectMcpClients,
+  mcpLine,
   mergeServerEntry,
   removeServerEntry,
-  MCP_LINE,
   MCP_URL,
   type McpEnvironment,
   type FileClient,
 } from "../src/init/mcp.ts";
+import { INSTALL_ID_HEADER } from "../src/init/install-id.ts";
 
 const HOME = "/home/dev";
+/** This machine's id, stated rather than generated: the file is `install-id.test.ts`'s subject. */
+const INSTALL_ID = "11111111-2222-4333-8444-555555555555";
+/** The add, as the `ran` log of a fake spawn joins it: one argv entry per word. */
+const ADD_LINE = `claude mcp add --scope user --transport http carrick ${MCP_URL} --header ${INSTALL_ID_HEADER}: ${INSTALL_ID}`;
+/** The same add as a line a person pastes, where the header needs its quotes. */
+const ADD_LINE_QUOTED = `claude mcp add --scope user --transport http carrick ${MCP_URL} --header "${INSTALL_ID_HEADER}: ${INSTALL_ID}"`;
 
 type Machine = {
   commands?: string[];
@@ -30,6 +39,8 @@ type Machine = {
   statuses?: Record<string, number>;
   /** What a command prints, keyed the same way, for the reads that parse it. */
   outputs?: Record<string, string>;
+  /** This machine's install id; null is a machine that could not make one. */
+  installId?: string | null;
 };
 
 function machine(state: Machine): { env: McpEnvironment; written: Record<string, string>; ran: string[] } {
@@ -51,6 +62,8 @@ function machine(state: Machine): { env: McpEnvironment; written: Record<string,
     home: HOME,
     platform: "linux",
     appData: null,
+    installId: () => (state.installId === undefined ? INSTALL_ID : state.installId),
+    storedInstallId: () => (state.installId === undefined ? INSTALL_ID : state.installId),
     readFile: (file) => files[file] ?? null,
     writeFile: (file, body) => {
       files[file] = body;
@@ -64,6 +77,32 @@ function machine(state: Machine): { env: McpEnvironment; written: Record<string,
 const cursorFile = path.join(HOME, ".cursor", "mcp.json");
 const windsurfFile = path.join(HOME, ".codeium", "windsurf", "mcp_config.json");
 const vsCodeFile = path.join(HOME, ".config", "Code", "User", "mcp.json");
+
+const cursor: FileClient = {
+  name: "Cursor",
+  directory: (env) => path.join(env.home, ".cursor"),
+  file: (env) => path.join(env.home, ".cursor", "mcp.json"),
+  container: "mcpServers",
+  urlKey: "url",
+  statesType: false,
+  headers: true,
+};
+
+/** What `claude mcp get carrick` prints for an entry this release wrote. */
+const CLAUDE_GET = `carrick:
+  Scope: User config (available in all your projects)
+  Type: http
+  URL: ${MCP_URL}
+  Headers:
+    ${INSTALL_ID_HEADER}: ${INSTALL_ID}
+`;
+
+/** The same entry as written before the install id existed. */
+const UNSTAMPED_GET = `carrick:
+  Scope: User config (available in all your projects)
+  Type: http
+  URL: ${MCP_URL}
+`;
 
 test("a machine with no agent client is told the line, and nothing is written", () => {
   const { env, written } = machine({ commands: ["claude"] });
@@ -81,10 +120,15 @@ test("Claude Code is connected by its own command, once", () => {
   assert.deepEqual(outcomes, [
     { client: "Claude Code", state: "written", detail: "connected for this user" },
   ]);
-  assert.deepEqual(ran, [
-    "claude mcp get carrick",
-    `claude mcp add --scope user --transport http carrick ${MCP_URL}`,
+  // The header goes on the end, after the name and the URL: `--header` is
+  // variadic, so a flag placed before them swallows both and the command
+  // exits with "missing required argument 'name'" (Claude Code 2.1.272).
+  assert.deepEqual(ran, ["claude mcp get carrick", ADD_LINE]);
+  assert.deepEqual(claudeAddArgs(INSTALL_ID).slice(-2), [
+    "--header",
+    `${INSTALL_ID_HEADER}: ${INSTALL_ID}`,
   ]);
+  assert.equal(mcpLine(INSTALL_ID), ADD_LINE_QUOTED);
 
   // A client that already holds the server is left exactly as it is: `mcp add`
   // refuses a name it already has, so the read is what decides.
@@ -92,6 +136,7 @@ test("Claude Code is connected by its own command, once", () => {
     commands: ["claude"],
     directories: [path.join(HOME, ".claude")],
     statuses: { "claude mcp get carrick": 0 },
+    outputs: { "claude mcp get carrick": CLAUDE_GET },
   });
   assert.equal(connectMcpClients(second.env)[0]?.state, "present");
   assert.deepEqual(second.ran, ["claude mcp get carrick"]);
@@ -101,11 +146,81 @@ test("a command that fails leaves the line to copy, and no claim", () => {
   const { env } = machine({
     commands: ["claude"],
     directories: [path.join(HOME, ".claude")],
-    statuses: { "claude mcp get carrick": 1, [`claude mcp add --scope user --transport http carrick ${MCP_URL}`]: 2 },
+    statuses: { "claude mcp get carrick": 1, [ADD_LINE]: 2 },
   });
   const outcomes = connectMcpClients(env);
   assert.equal(outcomes[0]?.state, "failed");
-  assert.equal(outcomes[0]?.detail, MCP_LINE);
+  assert.equal(outcomes[0]?.detail, mcpLine(INSTALL_ID));
+});
+
+// An entry written before the install id existed is the common machine: it
+// works, and nothing it asks can be attributed to this install
+// (carrick-cloud#890). `mcp add` will not edit an entry it already holds, so
+// stamping it would mean removing the server and writing it again — which
+// takes anything else on that entry with it and sends the next session back
+// through the server's OAuth. The entry is left alone and the pair of commands
+// is printed for the person whose entry it is.
+test("a Claude Code entry with no install id is left alone, with the pair to run", () => {
+  const { env, ran } = machine({
+    commands: ["claude"],
+    directories: [path.join(HOME, ".claude")],
+    outputs: { "claude mcp get carrick": UNSTAMPED_GET },
+  });
+  assert.deepEqual(connectMcpClients(env), [
+    {
+      client: "Claude Code",
+      state: "unstamped",
+      detail: `MCP entry has no install id. To add it: claude mcp remove --scope user carrick && ${ADD_LINE_QUOTED}`,
+    },
+  ]);
+  // Read, and nothing else: `carrick init` runs no `mcp remove`, ever.
+  assert.deepEqual(ran, ["claude mcp get carrick"]);
+  assert.equal(
+    claudeRestampLine(INSTALL_ID),
+    `claude mcp remove --scope user carrick && ${ADD_LINE_QUOTED}`,
+  );
+
+  // The entry that already carries one is read and left alone.
+  const stamped = machine({
+    commands: ["claude"],
+    directories: [path.join(HOME, ".claude")],
+    outputs: { "claude mcp get carrick": CLAUDE_GET },
+  });
+  assert.equal(connectMcpClients(stamped.env)[0]?.state, "present");
+  assert.deepEqual(stamped.ran, ["claude mcp get carrick"]);
+
+  // And a `carrick` pointing at somebody else's server is not re-written to
+  // carry our id, whatever it is called.
+  const elsewhere = machine({
+    commands: ["claude"],
+    directories: [path.join(HOME, ".claude")],
+    outputs: { "claude mcp get carrick": "carrick:\n  URL: https://mcp.example.test/mcp\n" },
+  });
+  assert.equal(connectMcpClients(elsewhere.env)[0]?.state, "present");
+  assert.deepEqual(elsewhere.ran, ["claude mcp get carrick"]);
+});
+
+// A home directory that will not take a file costs the header, never the
+// setup: the client is still connected, and doctor reports the drift.
+test("a machine that could not make an install id is still connected", () => {
+  const { env, ran } = machine({
+    commands: ["claude"],
+    directories: [path.join(HOME, ".claude"), path.join(HOME, ".cursor")],
+    statuses: { "claude mcp get carrick": 1 },
+    installId: null,
+  });
+  const outcomes = connectMcpClients(env);
+  assert.deepEqual(
+    outcomes.map((outcome) => outcome.state),
+    ["written", "written"],
+  );
+  assert.deepEqual(ran, [
+    "claude mcp get carrick",
+    `claude mcp add --scope user --transport http carrick ${MCP_URL}`,
+  ]);
+  assert.deepEqual(JSON.parse(mergeServerEntry(cursor, null, null).body), {
+    mcpServers: { carrick: { url: MCP_URL } },
+  });
 });
 
 test("a client with no config file yet gets one in that client's own shape", () => {
@@ -121,14 +236,17 @@ test("a client with no config file yet gets one in that client's own shape", () 
     outcomes.map((outcome) => outcome.client),
     ["Cursor", "Windsurf", "VS Code"],
   );
+  // Every one of the three documents `headers` on an HTTP server, so every
+  // one of them carries the install id (carrick-cloud#890).
+  const headers = { [INSTALL_ID_HEADER]: INSTALL_ID };
   assert.deepEqual(JSON.parse(written[cursorFile]!), {
-    mcpServers: { carrick: { url: MCP_URL } },
+    mcpServers: { carrick: { url: MCP_URL, headers } },
   });
   assert.deepEqual(JSON.parse(written[windsurfFile]!), {
-    mcpServers: { carrick: { serverUrl: MCP_URL } },
+    mcpServers: { carrick: { serverUrl: MCP_URL, headers } },
   });
   assert.deepEqual(JSON.parse(written[vsCodeFile]!), {
-    servers: { carrick: { type: "http", url: MCP_URL } },
+    servers: { carrick: { type: "http", url: MCP_URL, headers } },
   });
   for (const outcome of outcomes) assert.equal(outcome.state, "written");
 });
@@ -141,15 +259,6 @@ test("a client that is not on this machine is not configured", () => {
   );
   assert.deepEqual(Object.keys(written), [cursorFile]);
 });
-
-const cursor: FileClient = {
-  name: "Cursor",
-  directory: (env) => path.join(env.home, ".cursor"),
-  file: (env) => path.join(env.home, ".cursor", "mcp.json"),
-  container: "mcpServers",
-  urlKey: "url",
-  statesType: false,
-};
 
 test("an existing file keeps every server it already holds", () => {
   const existing = JSON.stringify(
@@ -185,15 +294,71 @@ test("the entry follows the keys the file already uses", () => {
   assert.equal(merged.mcpServers, undefined);
 });
 
-test("a server already called carrick is left alone", () => {
+test("a server already called carrick keeps the URL it names, and gains the install id", () => {
   const existing = JSON.stringify({ mcpServers: { carrick: { url: "https://api.carrick.tools/mcp/p/one" } } }, null, 2);
+  // Nothing to stamp it with: the entry comes back exactly as it was.
   const result = mergeServerEntry(cursor, existing);
   assert.equal(result.state, "present");
   assert.deepEqual(JSON.parse(result.body), JSON.parse(existing));
 
   const { env, written } = machine({ directories: [path.join(HOME, ".cursor")], files: { [cursorFile]: existing } });
-  assert.equal(connectMcpClients(env)[0]?.state, "present");
-  assert.deepEqual(written, {});
+  assert.equal(connectMcpClients(env)[0]?.state, "written");
+  assert.deepEqual(JSON.parse(written[cursorFile]!), {
+    mcpServers: {
+      carrick: {
+        url: "https://api.carrick.tools/mcp/p/one",
+        headers: { [INSTALL_ID_HEADER]: INSTALL_ID },
+      },
+    },
+  });
+
+  // Run again and there is nothing left to do: an id on the entry is the id,
+  // and a second `carrick init` must not churn the file.
+  const second = machine({
+    directories: [path.join(HOME, ".cursor")],
+    files: { [cursorFile]: written[cursorFile]! },
+  });
+  assert.equal(connectMcpClients(second.env)[0]?.state, "present");
+  assert.deepEqual(second.written, {});
+});
+
+// The header is added to what is on the entry, never written over it: a user
+// who put an Authorization header on their carrick server keeps it.
+test("the install id joins the headers already on the entry", () => {
+  const existing = JSON.stringify(
+    {
+      mcpServers: {
+        other: { url: "https://example.test/mcp" },
+        carrick: { type: "http", url: MCP_URL, headers: { Authorization: "Bearer theirs" } },
+      },
+    },
+    null,
+    2,
+  );
+  const merged = mergeServerEntry(cursor, existing, INSTALL_ID);
+  assert.equal(merged.state, "written");
+  const document = JSON.parse(merged.body);
+  assert.deepEqual(document.mcpServers.carrick, {
+    type: "http",
+    url: MCP_URL,
+    headers: { Authorization: "Bearer theirs", [INSTALL_ID_HEADER]: INSTALL_ID },
+  });
+  assert.deepEqual(document.mcpServers.other, { url: "https://example.test/mcp" });
+
+  // An id already there is left as it is, whoever wrote it.
+  const theirs = JSON.stringify({
+    mcpServers: { carrick: { url: MCP_URL, headers: { [INSTALL_ID_HEADER]: "already-installed-here" } } },
+  });
+  const kept = mergeServerEntry(cursor, theirs, INSTALL_ID);
+  assert.equal(kept.state, "present");
+  assert.equal(JSON.parse(kept.body).mcpServers.carrick.headers[INSTALL_ID_HEADER], "already-installed-here");
+
+  // A `carrick` naming another host is somebody else's, so it is not stamped:
+  // the same gate the remover uses.
+  const elsewhere = JSON.stringify({ mcpServers: { carrick: { url: "https://mcp.example.test/mcp" } } }, null, 2);
+  const untouched = mergeServerEntry(cursor, elsewhere, INSTALL_ID);
+  assert.equal(untouched.state, "present");
+  assert.deepEqual(JSON.parse(untouched.body), JSON.parse(elsewhere));
 });
 
 test("a hand-edited file that no longer parses is reported, never replaced", () => {
@@ -221,11 +386,6 @@ test("every path written is reported, for the line init prints", () => {
 // test states the machine the same way, because the subject is still a user's
 // own configuration files.
 
-const CLAUDE_GET = `carrick:
-  Scope: User config (available in all your projects)
-  Type: http
-  URL: ${MCP_URL}
-`;
 
 test("what the writer added is exactly what the remover takes away", () => {
   // One document per client shape, each holding something of somebody else's,
@@ -238,7 +398,7 @@ test("what the writer added is exactly what the remover takes away", () => {
     "{}\n",
   ];
   for (const before of documents) {
-    const written = mergeServerEntry(cursor, before);
+    const written = mergeServerEntry(cursor, before, INSTALL_ID);
     assert.equal(written.state, "written");
     const removed = removeServerEntry(written.body);
     assert.equal(removed.state, "removed");
@@ -246,7 +406,7 @@ test("what the writer added is exactly what the remover takes away", () => {
   }
 
   // And a file this package created from nothing comes back to nothing.
-  const fresh = mergeServerEntry(cursor, null).body;
+  const fresh = mergeServerEntry(cursor, null, INSTALL_ID).body;
   assert.deepEqual(JSON.parse(removeServerEntry(fresh).body), {});
 });
 
@@ -366,10 +526,12 @@ test("the read-only inspection states each client, and writes nothing", () => {
     commands: ["claude"],
     directories: [path.join(HOME, ".claude"), path.join(HOME, ".cursor"), path.join(HOME, ".codeium", "windsurf")],
     files: {
-      [cursorFile]: JSON.stringify({ mcpServers: { carrick: { url: MCP_URL } } }),
+      [cursorFile]: JSON.stringify({
+        mcpServers: { carrick: { url: MCP_URL, headers: { [INSTALL_ID_HEADER]: INSTALL_ID } } },
+      }),
       [windsurfFile]: JSON.stringify({ mcpServers: { carrick: { serverUrl: "http://localhost:9000/mcp" } } }),
     },
-    outputs: { "claude mcp get carrick": `carrick: ${MCP_URL} (HTTP)` },
+    outputs: { "claude mcp get carrick": CLAUDE_GET },
   });
   assert.deepEqual(
     inspectMcpClients(env).map((client) => [client.client, client.state]),
@@ -379,6 +541,54 @@ test("the read-only inspection states each client, and writes nothing", () => {
       ["Windsurf", "elsewhere"],
     ],
   );
+  assert.deepEqual(written, {});
+  assert.deepEqual(ran, ["claude mcp get carrick"]);
+});
+
+// The drift this release adds: connected, and answering as nobody in
+// particular. `carrick doctor` reports it, and `carrick init` repairs it.
+test("an entry with no install id is drift, not a healthy connection", () => {
+  const { env, written, ran } = machine({
+    commands: ["claude"],
+    directories: [path.join(HOME, ".claude"), path.join(HOME, ".cursor"), path.join(HOME, ".codeium", "windsurf")],
+    files: {
+      [cursorFile]: JSON.stringify({ mcpServers: { carrick: { url: MCP_URL } } }),
+      [windsurfFile]: JSON.stringify({
+        mcpServers: { carrick: { serverUrl: MCP_URL, headers: { [INSTALL_ID_HEADER]: "short" } } },
+      }),
+    },
+    outputs: { "claude mcp get carrick": UNSTAMPED_GET },
+  });
+  const inspected = inspectMcpClients(env);
+  assert.deepEqual(
+    inspected.map((client) => [client.client, client.state]),
+    [
+      ["Claude Code", "unstamped"],
+      ["Cursor", "unstamped"],
+      // A value the server would reject is not an install id either.
+      ["Windsurf", "unstamped"],
+    ],
+  );
+  // Claude Code's entry is the owner's to write again, so doctor states the
+  // pair that does it; the file clients are merged in place by the setup.
+  assert.equal(
+    inspected[0]?.detail,
+    `MCP entry has no install id. To add it: claude mcp remove --scope user carrick && ${ADD_LINE_QUOTED}`,
+  );
+  for (const client of inspected.slice(1)) {
+    assert.equal(client.detail, "MCP entry has no install id; run carrick init");
+  }
+
+  // A machine with no id of its own yet is told to run the setup, because
+  // that is what mints one.
+  const fresh = machine({
+    commands: ["claude"],
+    directories: [path.join(HOME, ".claude")],
+    outputs: { "claude mcp get carrick": UNSTAMPED_GET },
+    installId: null,
+  });
+  assert.equal(inspectMcpClients(fresh.env)[0]?.detail, "MCP entry has no install id; run carrick init");
+  // Read-only, still: the repair is `carrick init`'s.
   assert.deepEqual(written, {});
   assert.deepEqual(ran, ["claude mcp get carrick"]);
 });

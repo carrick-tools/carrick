@@ -383,6 +383,26 @@ test("an MCP client that is connected, one that is not, and one pointing elsewhe
   assert.match(mixed[1]!.text, /points at http:\/\/localhost:9000/);
 });
 
+// Connected, and answering as nobody in particular: an entry written before
+// the install id existed is drift (carrick-cloud#890). The repair travels in
+// the detail, because it differs per client — a file client is merged in place
+// by `carrick init`, and Claude Code's entry is the owner's to write again.
+test("an MCP entry with no install id is a finding, with the repair on the line", () => {
+  const pair =
+    "MCP entry has no install id. To add it: claude mcp remove --scope user carrick && " +
+    'claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp ' +
+    '--header "X-Carrick-Install-Id: 11111111-2222-4333-8444-555555555555"';
+  const lines = checkMcp([
+    { client: "Cursor", state: "unstamped", detail: "MCP entry has no install id; run carrick init" },
+    { client: "Claude Code", state: "unstamped", detail: pair },
+  ]);
+  assert.equal(findingCount(lines), 2);
+  assert.deepEqual(texts(lines), [
+    "warn: Cursor: MCP entry has no install id; run carrick init.",
+    `warn: Claude Code: ${pair}.`,
+  ]);
+});
+
 const noGit: GitReader = { defaultRemoteBranch: () => null, commitsBetween: () => null };
 
 test("an index that answers for every service, with the working tree as a note", () => {

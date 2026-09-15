@@ -23,8 +23,11 @@ import {
   SETTINGS_FILES,
 } from "../src/init/remove.ts";
 import { MCP_URL } from "../src/init/mcp.ts";
+import { INSTALL_ID_HEADER, installIdPath } from "../src/init/install-id.ts";
 
 const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+/** What this machine calls itself to the index, until this command deletes it. */
+const INSTALL_ID = "11111111-2222-4333-8444-555555555555";
 
 test("remove reads its arguments", () => {
   assert.deepEqual(parseArgs([], "/work"), { workspace: "/work", keepLogin: false });
@@ -156,7 +159,8 @@ test("a client left alone is a warning, and a client changed is a done line", ()
 
 /**
  * A machine with everything `carrick init` writes on it: an agent client, a
- * credential, hook entries beside somebody else's, and a scaffolded repo.
+ * credential, an install id, hook entries beside somebody else's, and a
+ * scaffolded repo.
  *
  * `claude` is a fake on PATH that logs what it was asked and answers `mcp get`
  * with the URL the real one prints. Without it the run would reach the real
@@ -191,10 +195,24 @@ process.exit(0);
 `);
   fs.chmodSync(claude, 0o755);
 
+  // The entry this release writes, with the install id on it, beside a server
+  // of somebody else's that has to survive.
   fs.writeFileSync(
     path.join(home, ".cursor", "mcp.json"),
-    `${JSON.stringify({ mcpServers: { other: { url: "https://example.test/mcp" }, carrick: { url: MCP_URL } } }, null, 2)}\n`,
+    `${JSON.stringify(
+      {
+        mcpServers: {
+          other: { url: "https://example.test/mcp" },
+          carrick: { url: MCP_URL, headers: { [INSTALL_ID_HEADER]: INSTALL_ID } },
+        },
+      },
+      null,
+      2,
+    )}\n`,
   );
+
+  fs.mkdirSync(path.dirname(installIdPath(home)), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(installIdPath(home), `${INSTALL_ID}\n`, { mode: 0o600 });
 
   const credentials = path.join(root, "config", "carrick");
   fs.mkdirSync(credentials, { recursive: true, mode: 0o700 });
@@ -264,6 +282,7 @@ test("remove takes back what init wrote, lists what it will not touch, and says 
     `◇ Carrick hook entries removed from ${SETTINGS_FILES[0]}`,
     "◇ MCP server removed for Claude Code",
     `◇ MCP server removed for Cursor: ${path.join(state.home, ".cursor", "mcp.json")}`,
+    "◇ This machine's install id removed",
     "◇ .carrick removed, with the proposal and the index in it",
     "◇ Signed out: the saved credential is gone",
     `  git rm ${[".github/workflows/carrick.yml", ".claude/skills/carrick/SKILL.md", "carrick.json"].join(" ")}`,
@@ -289,10 +308,15 @@ test("remove takes back what init wrote, lists what it will not touch, and says 
   assert.match(settings.hooks.SessionStart[0].hooks[0].command, /session-start\.sh/);
   assert.equal(settings.hooks.PostToolUse, undefined);
 
-  // The client's own file keeps the server that is not ours.
+  // The client's own file keeps the server that is not ours, and the header
+  // went with the entry it was on.
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(state.home, ".cursor", "mcp.json"), "utf8")), {
     mcpServers: { other: { url: "https://example.test/mcp" } },
   });
+  // The id itself is gone, and the directory it was alone in with it: the
+  // next `carrick init` is a new install (carrick-cloud#890).
+  assert.equal(fs.existsSync(installIdPath(state.home)), false);
+  assert.equal(fs.existsSync(path.join(state.home, ".carrick")), false);
   assert.deepEqual(fs.readFileSync(state.log, "utf8").trim().split("\n"), [
     "mcp get carrick",
     "mcp remove --scope user carrick",
@@ -332,6 +356,8 @@ test("--keep-login removes everything else and leaves the credential", posixFixt
   assert.equal(result.status, 0, result.stderr);
   assert.ok(result.stdout.includes("This machine stays signed in"));
   assert.equal(result.stdout.includes("Signed out"), false);
+  // The install id is not a login: it goes whichever way this flag points.
+  assert.equal(fs.existsSync(installIdPath(state.home)), false);
   assert.ok(fs.existsSync(path.join(state.root, "config", "carrick", "credentials.json")));
   assert.equal(fs.existsSync(path.join(state.workspace, ".carrick")), false);
 });

@@ -24,7 +24,7 @@ import {
 import { connectRepos, reposAreInProject, projectAssignments } from "./connect.ts";
 import { downloadHostedIndex, hostedReport, nativeRunner } from "./hosted.ts";
 import { ensureProject, projectStep, SLUG } from "./projects.ts";
-import { connectMcpClients, MCP_LINE, type McpOutcome } from "./mcp.ts";
+import { connectMcpClients, mcpLine, type McpOutcome } from "./mcp.ts";
 import { hookCommand, mergeCarrickHooks, removeCarrickHooks } from "./settings.ts";
 import { createOutput, DOCS, type InitOutput } from "./output.ts";
 import { renderTemplate } from "../templates.ts";
@@ -214,6 +214,8 @@ export function packagesLine(plan: WorkspaceProposal): string {
  * subject.
  */
 export function configuredLine(mcp: McpOutcome[]): string {
+  // `unstamped` is not `written`: that run changed nothing for Claude Code,
+  // and the line must not say it did.
   const claude = mcp.some((outcome) => outcome.client === "Claude Code" && outcome.state === "written");
   return claude
     ? "Claude Code hooks and MCP configured (restart the client)"
@@ -232,6 +234,19 @@ export function mcpClientLines(mcp: McpOutcome[]): string[] {
   return mcp
     .filter((outcome) => outcome.state === "written" && outcome.client !== "Claude Code")
     .map((outcome) => `MCP added for ${outcome.client}: ${outcome.detail}`);
+}
+
+/**
+ * One warning per client connected before the install id existed.
+ *
+ * Not a failure — the client works, and this run deliberately changed nothing
+ * on its entry — so the line is the client, what is missing, and the commands
+ * that put it there, which are the owner's to run (`mcp.ts`).
+ */
+export function mcpUnstampedLines(mcp: McpOutcome[]): string[] {
+  return mcp
+    .filter((outcome) => outcome.state === "unstamped")
+    .map((outcome) => `${outcome.client}: ${outcome.detail}`);
 }
 
 export async function init(argv: string[]): Promise<number> {
@@ -457,7 +472,10 @@ export async function init(argv: string[]): Promise<number> {
   for (const outcome of mcp.filter((entry) => entry.state === "failed")) {
     out.warn(`MCP not configured for ${outcome.client}: ${outcome.detail}`);
   }
-  if (mcp.length === 0) out.warn(`No agent client found on this machine. In Claude Code: ${MCP_LINE}`);
+  // Connected, and older than the install id: nothing was changed on that
+  // entry and nothing here failed (carrick-cloud#890, `mcp.ts`).
+  for (const line of mcpUnstampedLines(mcp)) out.warn(line);
+  if (mcp.length === 0) out.warn(`No agent client found on this machine. In Claude Code: ${mcpLine()}`);
 
   // No paid scan ran here, and that is the point (carrick-cloud#799): the one
   // scan runs against a config someone has read. Where CI has already built an

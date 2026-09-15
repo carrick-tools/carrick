@@ -183,10 +183,18 @@ default-branch indexes. They are available over MCP, and `carrick init`
 connects the agent clients it finds on the machine: Claude Code through
 `claude mcp add`, and Cursor, Windsurf and VS Code by adding a `carrick` server
 to the client's own configuration file, leaving every other entry in it alone.
-A machine with none of them is given the line to run:
+Each entry carries an `X-Carrick-Install-Id` header: a UUID generated once,
+kept in `~/.carrick/install-id`, and sent with every MCP call so a slow session
+can be told apart from a busy one. It says nothing about the machine or the
+person — `carrick remove` deletes it, and the next `carrick init` mints
+another. A `carrick` entry that is already there keeps everything on it: the
+file clients have the header merged into their entry, and Claude Code, whose
+entry can only be replaced whole, is left as it is and told the two commands
+that add it. A machine with no client on it is given the line to run, with the
+id already in it:
 
 ```
-claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp
+claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp --header "X-Carrick-Install-Id: <id>"
 ```
 
 The first scan on a repository's default branch writes its hosted index. A
