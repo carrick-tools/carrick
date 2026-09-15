@@ -67,8 +67,20 @@ pub struct ManifestFacts {
 }
 
 pub(crate) fn read_json_config(path: &Path) -> Result<serde_json::Value, io::Error> {
+    parse_json_config(path, path.extension().is_some_and(|ext| ext == "jsonc"))
+}
+
+/// A config file that may carry comments and trailing commas whatever its
+/// extension. `tsconfig.json` is JSONC by specification, and a `.json` Deno
+/// config is too; reading either strictly drops a real config on its first
+/// comment (carrick#1104).
+pub(crate) fn read_jsonc_config(path: &Path) -> Result<serde_json::Value, io::Error> {
+    parse_json_config(path, true)
+}
+
+fn parse_json_config(path: &Path, jsonc: bool) -> Result<serde_json::Value, io::Error> {
     let content = std::fs::read_to_string(path)?;
-    let json_text = if path.extension().is_some_and(|ext| ext == "jsonc") {
+    let json_text = if jsonc {
         strip_jsonc_syntax(&content).map_err(|message| {
             io::Error::new(
                 io::ErrorKind::InvalidData,

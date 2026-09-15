@@ -1,0 +1,7 @@
+{
+  "name": "@acme/lockers",
+  "dependencies": { "hono": "^4.6.0" },
+  "imports": {
+    "#pickup/*": "./src/pickup/*"
+  }
+}

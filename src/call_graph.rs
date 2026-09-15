@@ -302,13 +302,17 @@ pub fn merge_definitions(
 /// resolve to nothing however plainly the source names it (carrick#776); the
 /// index says which file the package specifier means, and the target is parsed
 /// on demand.
+///
+/// Returns the imports the pass could not follow (carrick#1104), for the
+/// caller to report: an edge that was not recorded because its specifier
+/// resolved to nothing must be counted, not silently absent.
 pub fn resolve_call_edges(
     function_definitions: &mut HashMap<String, FunctionDefinition>,
     per_file: &HashMap<PathBuf, FileCallIndex>,
     keys: &RekeyIndex,
     workspace: &WorkspaceIndex,
     repo_root: &Path,
-) {
+) -> UnresolvedImports {
     let mut resolver = CallResolver::new(per_file, workspace, repo_root);
 
     // Sorted so a resolution cache built while walking one file cannot make a
@@ -372,6 +376,73 @@ pub fn resolve_call_edges(
         "call_graph: package-surface origins resolved {} receiver(s), dropped {} on a member more than one class in the surface declares (carrick#781)",
         resolver.origin_resolved, resolver.origin_conflicts
     );
+    resolver.unresolved
+}
+
+/// Imports a call depended on whose specifier resolved to no file and no
+/// declared package, grouped by specifier (carrick#1104). Counted per imported
+/// binding, since that is the unit an edge is resolved from.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UnresolvedImports {
+    /// Specifiers that cannot name a package (`@/x`, `~/x`, `#x`, `$lib/x`),
+    /// so something aliased them and no config the scan reads says to what:
+    /// a bundler or build-tool alias set in code, or config the resolver does
+    /// not follow. Each is a caller `get_callers` cannot see.
+    pub aliases: std::collections::BTreeMap<String, usize>,
+    /// Package-shaped specifiers no manifest declares: runtime builtins
+    /// written without `node:`, undeclared dependencies, and a `baseUrl`-style
+    /// alias set only in bundler code. Counted, not listed: the common members
+    /// are builtins, which are not a loss.
+    pub undeclared_packages: usize,
+}
+
+impl UnresolvedImports {
+    fn record(&mut self, specifier: &str) {
+        match specifier_kind(specifier) {
+            SpecifierKind::Scheme => {}
+            SpecifierKind::Package => self.undeclared_packages += 1,
+            SpecifierKind::Alias => *self.aliases.entry(specifier.to_string()).or_default() += 1,
+        }
+    }
+}
+
+enum SpecifierKind {
+    /// `node:fs`, `npm:x`, `jsr:@std/x`, `https://…`: a runtime or registry
+    /// specifier, resolved outside the repo by design.
+    Scheme,
+    /// A string a registry package could be named by.
+    Package,
+    /// A string no registry package can be named by.
+    Alias,
+}
+
+/// Classify a non-relative specifier by the npm package-name grammar: a
+/// lowercase-or-legacy name of URL-safe characters that does not start with
+/// `.` or `_`, optionally under a non-empty `@scope/`. This is the registry's
+/// own rule, not a list of alias spellings, so a new alias character needs no
+/// change here.
+fn specifier_kind(specifier: &str) -> SpecifierKind {
+    let first = specifier.split('/').next().unwrap_or_default();
+    if first.contains(':') {
+        return SpecifierKind::Scheme;
+    }
+    let valid = |segment: &str| {
+        !segment.is_empty()
+            && !segment.starts_with('.')
+            && !segment.starts_with('_')
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+    };
+    let package = match first.strip_prefix('@') {
+        Some(scope) => valid(scope) && specifier.split('/').nth(1).is_some_and(valid),
+        None => valid(first),
+    };
+    if package {
+        SpecifierKind::Package
+    } else {
+        SpecifierKind::Alias
+    }
 }
 
 /// One entry per called function, reporting its FIRST call site, in a stable
@@ -415,6 +486,8 @@ struct CallResolver<'a> {
     /// carrick#781 records, not a silence.
     origin_resolved: usize,
     origin_conflicts: usize,
+    /// Imports a call needed that resolved to nothing (carrick#1104).
+    unresolved: UnresolvedImports,
 }
 
 impl<'a> CallResolver<'a> {
@@ -430,7 +503,10 @@ impl<'a> CallResolver<'a> {
             per_file,
             workspace,
             repo_root: repo_root.to_path_buf(),
-            bindings: BindingResolver::new(),
+            // Every re-export hop resolves through the same index as the
+            // import that entered it, so a barrel reached through `@/` that
+            // itself re-exports through `@/` is followed (carrick#1104).
+            bindings: BindingResolver::with_workspace(workspace.clone()),
             resolved_imports: HashMap::new(),
             external: HashMap::new(),
             source_map,
@@ -439,6 +515,7 @@ impl<'a> CallResolver<'a> {
             reexport_cache: HashMap::new(),
             origin_resolved: 0,
             origin_conflicts: 0,
+            unresolved: UnresolvedImports::default(),
         }
     }
 
@@ -728,7 +805,7 @@ impl<'a> CallResolver<'a> {
         if !matches!(symbol.kind, SymbolKind::Named) {
             return None;
         }
-        let target = FileOrchestrator::resolve_relative_import(importer, &symbol.source)?;
+        let target = self.resolve_specifier(importer, &symbol.source)?;
         let module = self
             .bindings
             .resolve_namespace_export(&target, &symbol.imported_name)?;
@@ -745,15 +822,15 @@ impl<'a> CallResolver<'a> {
     }
 
     /// The module that declares `symbol` as imported by `importer`, or `None`
-    /// for an external package, a tsconfig path alias (out of scope: reaching
-    /// those needs the sidecar's tsconfig knowledge) or an unresolvable
-    /// export.
+    /// for an external package, a specifier nothing the scan reads resolves,
+    /// or an unresolvable export.
     ///
-    /// A WORKSPACE package specifier is not out of scope: the repo's own
-    /// manifests say which file `@scope/core/v3` names, and the file is in
-    /// this checkout (carrick#776). It is tried only after the relative
-    /// resolver declines, so a relative specifier keeps the answer it always
-    /// had.
+    /// A WORKSPACE package specifier resolves: the repo's own manifests say
+    /// which file `@scope/core/v3` names, and the file is in this checkout
+    /// (carrick#776). So does an alias the repo's config declares (tsconfig
+    /// `paths`, package.json `imports`, a Deno import map; carrick#1104). Both
+    /// are tried only after the relative resolver declines, so a relative
+    /// specifier keeps the answer it always had.
     fn resolve_import(
         &mut self,
         importer: &Path,
@@ -780,25 +857,25 @@ impl<'a> CallResolver<'a> {
         resolved
     }
 
-    /// The file a specifier names: relative first, then the workspace package
-    /// the repo's manifests declare.
-    fn resolve_specifier(&self, importer: &Path, specifier: &str) -> Option<PathBuf> {
+    /// The file a specifier names, through the same resolver every re-export
+    /// hop uses ([`WorkspaceIndex::resolve_module_path`]). A non-relative
+    /// specifier that resolves to nothing is counted, not dropped silently.
+    /// The path is canonical when that stays inside the repo: it is what
+    /// `per_file` is keyed by, so an in-service target is found rather than
+    /// re-parsed.
+    fn resolve_specifier(&mut self, importer: &Path, specifier: &str) -> Option<PathBuf> {
         if let Some(target) = FileOrchestrator::resolve_relative_import(importer, specifier) {
             return Some(target);
         }
-        let Resolution::Internal(relative) = self.workspace.resolve(importer, specifier) else {
-            return None;
-        };
-        let target = self.repo_root.join(relative);
-        // Canonical when that stays inside the repo — it is what `per_file` is
-        // keyed by, so an in-service target is found rather than re-parsed.
-        // A package directory that is itself a symlink out of the tree
-        // canonicalizes to a path the cloud boundary cannot strip the repo root
-        // from, and an absolute path in the blob is a locator nothing can
-        // invert; the plain join is under the root by construction.
-        match target.canonicalize() {
-            Ok(canonical) if canonical.starts_with(&self.repo_root) => Some(canonical),
-            _ => target.is_file().then_some(target),
+        match self.workspace.resolve(importer, specifier) {
+            Resolution::Internal(relative) => self.workspace.source_path(&relative),
+            Resolution::External { .. } => None,
+            Resolution::Unresolved => {
+                if !(specifier.starts_with("./") || specifier.starts_with("../")) {
+                    self.unresolved.record(specifier);
+                }
+                None
+            }
         }
     }
 }
@@ -853,6 +930,19 @@ mod tests {
         files: &[(&str, &str)],
         scope: &str,
     ) -> (TempDir, HashMap<String, FunctionDefinition>) {
+        let (dir, definitions, _) = scan_reporting(files, scope);
+        (dir, definitions)
+    }
+
+    /// [`scan_service`], plus the imports the pass reported as unresolved.
+    fn scan_reporting(
+        files: &[(&str, &str)],
+        scope: &str,
+    ) -> (
+        TempDir,
+        HashMap<String, FunctionDefinition>,
+        UnresolvedImports,
+    ) {
         let dir = TempDir::new().expect("tempdir");
         let root = dir.path().canonicalize().expect("canonical tempdir");
         let mut paths = Vec::new();
@@ -905,9 +995,127 @@ mod tests {
             keys,
         } = merge_definitions(per_file_definitions, &root.to_string_lossy());
 
-        let workspace = WorkspaceIndex::build(&root);
-        resolve_call_edges(&mut definitions, &per_file, &keys, &workspace, &root);
-        (dir, definitions)
+        // The index production builds for this pass, aliases included.
+        let workspace = WorkspaceIndex::build_with_aliases(&root, None);
+        let unresolved = resolve_call_edges(&mut definitions, &per_file, &keys, &workspace, &root);
+        (dir, definitions, unresolved)
+    }
+
+    /// A barrel reached through a tsconfig alias that itself re-exports
+    /// through the alias: both hops resolve through the same index, so the
+    /// edge lands on the declaring module (carrick#1104).
+    #[test]
+    fn an_alias_import_through_an_aliased_barrel_records_the_edge() {
+        let (_dir, defs) = scan(&[
+            (
+                "tsconfig.json",
+                "{ // JSONC, as tsconfig allows\n  \"compilerOptions\": { \"paths\": { \"@/*\": [\"./src/*\"] }, },\n}\n",
+            ),
+            (
+                "src/slots/availability.ts",
+                "export function checkSlot(id: string) {\n  return id.length > 0;\n}\n",
+            ),
+            (
+                "src/slots/index.ts",
+                "export { checkSlot } from \"@/slots/availability\";\n",
+            ),
+            (
+                "src/returns/accept.ts",
+                "import { checkSlot } from \"@/slots\";\n\
+                 export function accept(id: string) {\n  return checkSlot(id);\n}\n",
+            ),
+        ]);
+        assert_eq!(callee_names(&defs, "accept"), vec!["checkSlot".to_string()]);
+        assert!(callee_files(&defs, "accept")[0].ends_with("src/slots/availability.ts"));
+    }
+
+    /// `ns.fn()` where `ns` is a namespace re-export imported through an
+    /// alias resolves like the relative form.
+    #[test]
+    fn a_namespace_re_export_imported_through_an_alias_resolves() {
+        let (_dir, defs) = scan(&[
+            ("deno.json", "{ \"imports\": { \"@/\": \"./src/\" } }\n"),
+            (
+                "src/queues/pickup.ts",
+                "export function enqueue(id: string) {\n  return id;\n}\n",
+            ),
+            (
+                "src/queues.ts",
+                "export * as queues from \"./queues/pickup.ts\";\n",
+            ),
+            (
+                "src/worker.ts",
+                "import { queues } from \"@/queues.ts\";\n\
+                 export function work(id: string) {\n  return queues.enqueue(id);\n}\n",
+            ),
+        ]);
+        assert_eq!(callee_names(&defs, "work"), vec!["enqueue".to_string()]);
+    }
+
+    /// An alias no config declares records no edge and is counted by
+    /// specifier; a builtin and a declared package are not aliases.
+    #[test]
+    fn an_undeclared_alias_is_counted_not_dropped_silently() {
+        let (_dir, defs, unresolved) = scan_reporting(
+            &[
+                (
+                    "package.json",
+                    "{ \"name\": \"app\", \"dependencies\": { \"hono\": \"^4\" } }\n",
+                ),
+                (
+                    "src/queue.ts",
+                    "export function enqueue(id: string) {\n  return id;\n}\n",
+                ),
+                (
+                    "src/legacy.ts",
+                    "import { enqueue } from \"~/queue\";\n\
+                     import { readFileSync } from \"fs\";\n\
+                     import { statSync } from \"node:fs\";\n\
+                     import { Hono } from \"hono\";\n\
+                     export function legacy(id: string) {\n  readFileSync(id);\n  statSync(id);\n  new Hono();\n  return enqueue(id);\n}\n",
+                ),
+            ],
+            "",
+        );
+        assert!(callee_names(&defs, "legacy").is_empty());
+        assert_eq!(
+            unresolved.aliases,
+            std::collections::BTreeMap::from([("~/queue".to_string(), 1)])
+        );
+        assert_eq!(unresolved.undeclared_packages, 1, "`fs` without `node:`");
+    }
+
+    #[test]
+    fn specifier_kind_follows_the_package_name_grammar() {
+        for alias in [
+            "@/x",
+            "~/x",
+            "#internal/x",
+            "$lib/x",
+            "@scope",
+            "_private/x",
+            ".hidden",
+        ] {
+            assert!(
+                matches!(specifier_kind(alias), SpecifierKind::Alias),
+                "{alias} cannot name a package"
+            );
+        }
+        for package in [
+            "fs",
+            "lodash/fp",
+            "@scope/pkg",
+            "@scope/pkg/sub",
+            "src/utils",
+        ] {
+            assert!(
+                matches!(specifier_kind(package), SpecifierKind::Package),
+                "{package} can name a package"
+            );
+        }
+        for scheme in ["node:fs", "npm:hono@4", "jsr:@std/path", "https://esm.sh/x"] {
+            assert!(matches!(specifier_kind(scheme), SpecifierKind::Scheme));
+        }
     }
 
     /// The file where a caller's first edge lands, repo-relative-ish (the
