@@ -4666,6 +4666,7 @@ fn discover_files_and_symbols(
                     callees: func_extractor.callee_refs,
                     imports: file_imports,
                     field_types: func_extractor.field_types,
+                    instances: crate::receiver_type::module_scope_types(&module),
                 },
             );
             per_file_definitions.push((file_path.clone(), func_extractor.function_definitions));
