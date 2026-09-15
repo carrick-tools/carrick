@@ -565,9 +565,10 @@ pub enum TransportOrigin {
     Unknown,
 }
 
-/// Every environment variable `file_path` reads: `process.env.NAME` (with
-/// `??`/`||` defaults and bracket access) and `import.meta.env.NAME`. Empty for
-/// a file that does not parse or is not a script, such as a `.graphql` file.
+/// Every environment variable `file_path` reads, in any spelling
+/// [`crate::env_alias::env_read_name`] recognizes (`process.env.NAME`,
+/// `import.meta.env.NAME`, `Deno.env.get("NAME")`). Empty for a file that does
+/// not parse or is not a script, such as a `.graphql` file.
 ///
 /// Used only as the transport tie-break of [`SchemaCatalogue::attribute`], so
 /// the file is parsed on demand rather than on every scan of it.
@@ -604,33 +605,11 @@ struct EnvReads {
 }
 
 impl Visit for EnvReads {
-    fn visit_member_expr(&mut self, node: &swc_ecma_ast::MemberExpr) {
-        let name = crate::env_alias::process_env_name(&Expr::Member(node.clone()))
-            .or_else(|| import_meta_env_name(node));
-        if let Some(name) = name {
+    fn visit_expr(&mut self, node: &Expr) {
+        if let Some(name) = crate::env_alias::env_read_name(node) {
             self.names.insert(name);
         }
         node.visit_children_with(self);
-    }
-}
-
-/// `NAME` of an `import.meta.env.NAME` read.
-fn import_meta_env_name(member: &swc_ecma_ast::MemberExpr) -> Option<String> {
-    let Expr::Member(env) = &*member.obj else {
-        return None;
-    };
-    let is_import_meta = matches!(
-        &*env.obj,
-        Expr::MetaProp(meta) if meta.kind == swc_ecma_ast::MetaPropKind::ImportMeta
-    );
-    let is_env =
-        matches!(&env.prop, swc_ecma_ast::MemberProp::Ident(prop) if prop.sym.as_ref() == "env");
-    if !is_import_meta || !is_env {
-        return None;
-    }
-    match &member.prop {
-        swc_ecma_ast::MemberProp::Ident(prop) => Some(prop.sym.to_string()),
-        _ => None,
     }
 }
 
@@ -2736,7 +2715,7 @@ export const typeDefs = gql`
     }
 
     #[test]
-    fn env_reads_cover_process_env_and_import_meta_env() {
+    fn env_reads_cover_every_runtime_spelling() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("client.ts");
         std::fs::write(
@@ -2745,13 +2724,14 @@ export const typeDefs = gql`
              const b = process.env['LEDGER_URL'];\n\
              const c = import.meta.env.VITE_API_URL;\n\
              const d = import.meta.url;\n\
-             export { a, b, c, d };\n",
+             const e = Deno.env.get('LEDGER_TOKEN');\n\
+             export { a, b, c, d, e };\n",
         )
         .unwrap();
 
         assert_eq!(
             file_env_reads(&file).into_iter().collect::<Vec<_>>(),
-            vec!["CATALOG_URL", "LEDGER_URL", "VITE_API_URL"]
+            vec!["CATALOG_URL", "LEDGER_TOKEN", "LEDGER_URL", "VITE_API_URL"]
         );
         assert!(file_env_reads(&dir.path().join("schema.graphql")).is_empty());
     }
