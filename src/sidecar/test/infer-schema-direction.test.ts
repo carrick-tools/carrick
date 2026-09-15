@@ -213,6 +213,7 @@ describe('schema direction: requests read the input, responses the output', () =
       `array of objects must mix output and input members in: ${type}`
     );
     assert.match(type, /label\s*\?\s*:\s*string\s*;/, `defaulted top-level key must stay optional in: ${type}`);
+    assert.match(type, /offset\s*\?\s*:\s*number\s*;/, `optional coerced key must read as the output in: ${type}`);
     assert.doesNotMatch(type, /\bunknown\b/, `no unknown input may be published: ${type}`);
     assert.deepStrictEqual(
       (inferred.any_provenance ?? []).map(({ path: p, kind, reason }) => ({ path: p, kind, reason })),
@@ -220,6 +221,7 @@ describe('schema direction: requests read the input, responses the output', () =
         { path: 'filter.limit', kind: 'unknown', reason: 'coerced_input' },
         { path: 'ids<0>', kind: 'unknown', reason: 'coerced_input' },
         { path: 'lines<0>.qty', kind: 'unknown', reason: 'coerced_input' },
+        { path: 'offset', kind: 'unknown', reason: 'coerced_input' },
       ],
       `each coerced position is labelled: ${JSON.stringify(inferred.any_provenance)}`
     );

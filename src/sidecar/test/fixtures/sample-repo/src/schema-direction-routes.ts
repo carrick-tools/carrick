@@ -12,7 +12,8 @@
  *  - `POST /mixed`     validator middleware, a coerced member beside a
  *    defaulted one (carrick#1105): each member keeps its own direction.
  *  - `POST /nested`    validator middleware, coerced and defaulted members
- *    inside a nested object, an array, and an array of objects.
+ *    inside a nested object, an array, and an array of objects, plus an
+ *    optional coerced key (its output is a union with `undefined`).
  *  - `POST /pair`      validator middleware, a coerced tuple element the
  *    printer keeps by name, beside a defaulted key.
  *  - `POST /standard`  validator middleware, a schema exposing only Standard Schema.
@@ -60,6 +61,7 @@ const NestedPayload = schema.object({
     })
   ),
   label: schema.defaulted(schema.string(), 'none'),
+  offset: schema.optional(schema.coerce.number()),
 });
 
 const PairPayload = schema.object({

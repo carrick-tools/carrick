@@ -4435,8 +4435,9 @@ export class TypeInferrer {
     const wanted = new Set(coerced);
     const types = new Map<string, Type>();
     const ambiguous = new Set<string>();
-    this.walkTypePositions(output, at, where, (type, position) => {
-      if (wanted.has(position)) {
+    this.walkTypePositions(output, at, where, (type, position, unionPart) => {
+      // A union's parts share its position; the union itself is the type there.
+      if (wanted.has(position) && !unionPart) {
         const seen = types.get(position);
         if (!seen) {
           types.set(position, type);
@@ -4507,8 +4508,9 @@ export class TypeInferrer {
 
   /**
    * Visit every member position of `root`, in the notation `topTypePositions`
-   * documents. `visit` returns false to stop descending below a position.
-   * Callables are not descended into.
+   * documents. `visit` returns false to stop descending below a position;
+   * `unionPart` is true when the type is a union or intersection part visited
+   * at its parent's position. Callables are not descended into.
    *
    * Bounded and cycle-safe. It only has to tell a schema's input apart from its
    * output, so a subtree past the bound is not compared, and that is logged:
@@ -4518,7 +4520,7 @@ export class TypeInferrer {
     root: Type,
     at: Node,
     where: string,
-    visit: (type: Type, position: string) => boolean
+    visit: (type: Type, position: string, unionPart: boolean) => boolean
   ): void {
     const MAX_DEPTH = 8;
     const MAX_VISITED = 512;
@@ -4526,12 +4528,12 @@ export class TypeInferrer {
     let visited = 0;
     let bounded = false;
 
-    const walk = (type: Type, position: string, depth: number): void => {
+    const walk = (type: Type, position: string, depth: number, unionPart: boolean): void => {
       if (depth > MAX_DEPTH || visited > MAX_VISITED) {
         bounded = true;
         return;
       }
-      if (!visit(type, position)) {
+      if (!visit(type, position, unionPart)) {
         return;
       }
       const compilerType = type.compilerType;
@@ -4548,14 +4550,14 @@ export class TypeInferrer {
             : undefined;
         if (parts) {
           for (const part of parts) {
-            walk(part, position, depth + 1);
+            walk(part, position, depth + 1, true);
           }
           return;
         }
         if (type.isArray()) {
           const element = type.getArrayElementType();
           if (element) {
-            walk(element, `${position}<0>`, depth + 1);
+            walk(element, `${position}<0>`, depth + 1, false);
           }
           return;
         }
@@ -4570,14 +4572,19 @@ export class TypeInferrer {
             continue;
           }
           const name = property.getName();
-          walk(propertyType, position === '' ? name : `${position}.${name}`, depth + 1);
+          walk(
+            propertyType,
+            position === '' ? name : `${position}.${name}`,
+            depth + 1,
+            false
+          );
         }
       } finally {
         onPath.delete(compilerType);
       }
     };
 
-    walk(root, '', 0);
+    walk(root, '', 0, false);
     if (bounded) {
       this.log(
         `Schema type at ${where} is deeper or wider than the position walk bound ` +
