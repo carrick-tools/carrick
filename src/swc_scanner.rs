@@ -2605,7 +2605,7 @@ impl CandidateVisitor {
         let (base, base_reads_env) = match unwrap_expr(base_expr) {
             Expr::Ident(ident) => (ident.sym.to_string(), false),
             other => (
-                format!("process.env.{}", crate::env_alias::process_env_name(other)?),
+                format!("process.env.{}", crate::env_alias::env_read_name(other)?),
                 true,
             ),
         };
