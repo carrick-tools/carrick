@@ -24,8 +24,8 @@ use crate::services::{
 use crate::signature_pass::populate_function_signatures;
 use crate::type_manifest::{
     append_missing_aliases, build_manifest_type_alias_with_site_id, build_site_id,
-    dts_alias_is_trivially_unknown, dts_defines_alias, is_http_method, normalize_manifest_method,
-    parse_file_location,
+    dts_alias_is_trivially_unknown, dts_defines_alias, is_http_method, is_producer_method,
+    normalize_manifest_method, parse_file_location,
 };
 use crate::url_normalizer::UrlNormalizer;
 use crate::utils::get_repository_name;
@@ -5007,7 +5007,7 @@ fn build_type_manifest_entries(
     // order this loop saw them in.
     for endpoint in mount_graph.get_resolved_endpoints() {
         let method = normalize_manifest_method(&endpoint.method);
-        if !is_http_method(&method) {
+        if !is_producer_method(&method) {
             continue;
         }
         // Call-site-evidence entries (#379) never anchor Producer types: they

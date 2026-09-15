@@ -59,7 +59,7 @@ use crate::{
     },
     type_manifest::{
         build_manifest_type_alias, build_manifest_type_alias_with_site_id, build_site_id,
-        is_http_method, normalize_manifest_method, parse_file_location,
+        is_http_method, is_producer_method, normalize_manifest_method, parse_file_location,
     },
     url_normalizer::UrlNormalizer,
     visitor::{ImportSymbolExtractor, ImportedSymbol, SymbolKind, TypeSymbolExtractor},
@@ -2823,7 +2823,7 @@ impl FileOrchestrator {
                             .cloned()
                     })
                     .unwrap_or_else(|| (method_fallback.clone(), endpoint.path.clone()));
-                if !is_http_method(&method) || !path.starts_with('/') {
+                if !is_producer_method(&method) || !path.starts_with('/') {
                     continue;
                 }
                 let key = OperationKey::http(&method, path.clone());
@@ -7626,8 +7626,15 @@ impl FileOrchestrator {
         for (file_path, result) in file_results {
             for endpoint in &result.endpoints {
                 let method = endpoint.method.trim().to_uppercase();
-                if !is_http_method(&method) {
-                    continue; // Skip non-HTTP methods (e.g., "use", empty)
+                if !is_producer_method(&method) {
+                    // Middleware registrations (`use`) and empty labels are
+                    // not routes. Logged, never silent: a route dropped here
+                    // is absent from every surface (carrick#1148).
+                    debug!(
+                        "Dropping endpoint {:?} {} at {}:{}: not a method a route is registered under",
+                        endpoint.method, endpoint.path, file_path, endpoint.line_number
+                    );
+                    continue;
                 }
 
                 // #580: a producer path is absolute. Every candidate call the
@@ -8240,7 +8247,7 @@ impl FileOrchestrator {
         for endpoint in &mut graph.endpoints {
             let twinned = graph.data_calls.iter().any(|call| {
                 call.file_location == endpoint.file_location
-                    && call.method.eq_ignore_ascii_case(&endpoint.method)
+                    && carrick_match::method_matches(&endpoint.method, &call.method)
                     && carrick_match::paths_match(&endpoint.full_path, &call.canonical_path)
             });
             if twinned {
@@ -13284,6 +13291,38 @@ export { routes };
         // A whitespace-only or empty path is the root route.
         assert_eq!(FileOrchestrator::canonicalize_route_path(" "), "/");
         assert_eq!(FileOrchestrator::canonicalize_route_path(""), "/");
+    }
+
+    #[test]
+    fn a_route_registered_for_every_method_enters_the_graph() {
+        // carrick#1148: the model states `.all()` registrations as method
+        // ALL. The graph used to drop them with the middleware rows, so the
+        // route was absent from every surface.
+        let mut transport = synthetic_endpoint("ALL", "/rpc");
+        transport.owner_node = "app".to_string();
+        let mut middleware = synthetic_endpoint("USE", "/rpc");
+        middleware.owner_node = "app".to_string();
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/index.ts".to_string(),
+            FileAnalysisResult {
+                endpoints: vec![transport, middleware],
+                data_calls: vec![],
+                ..Default::default()
+            },
+        );
+        let graph = FileOrchestrator::new(AgentService::new()).build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        let routes: Vec<(String, String)> = graph
+            .endpoints
+            .iter()
+            .map(|endpoint| (endpoint.method.clone(), endpoint.full_path.clone()))
+            .collect();
+        assert_eq!(routes, vec![("ALL".to_string(), "/rpc".to_string())]);
     }
 
     #[test]

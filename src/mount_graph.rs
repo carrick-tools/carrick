@@ -358,7 +358,7 @@ impl MountGraph {
         self.endpoints
             .iter()
             .filter(|endpoint| {
-                endpoint.method.eq_ignore_ascii_case(method)
+                carrick_match::method_matches(&endpoint.method, method)
                     && self.paths_match(&endpoint.full_path, path)
             })
             .collect()
@@ -400,7 +400,7 @@ impl MountGraph {
         let scored: Vec<(&ResolvedEndpoint, u32)> = self
             .endpoints
             .iter()
-            .filter(|endpoint| endpoint.method.eq_ignore_ascii_case(method))
+            .filter(|endpoint| carrick_match::method_matches(&endpoint.method, method))
             .filter_map(|endpoint| {
                 carrick_match::match_agreement(&endpoint.full_path, &normalized.path)
                     .map(|agreement| (endpoint, agreement))
@@ -959,6 +959,41 @@ mod tests {
             &normalizer,
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn an_any_method_route_serves_calls_of_every_method() {
+        // carrick#1148: `app.all("/graphql", handler)` answers whatever
+        // method a client sends.
+        let mut graph = MountGraph::new();
+        graph.endpoints.push(ResolvedEndpoint {
+            view_module: false,
+            method: "ALL".to_string(),
+            path: "/rpc".to_string(),
+            full_path: "/rpc".to_string(),
+            handler: Some("handleRpc".to_string()),
+            owner: "app".to_string(),
+            file_location: "src/index.ts:12".to_string(),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
+            dispatch: None,
+        });
+        let normalizer = UrlNormalizer::new(&Config::default());
+        for method in ["GET", "POST"] {
+            let matched = graph
+                .find_matching_endpoints_with_normalizer("/rpc", method, &normalizer)
+                .expect("an internal path");
+            assert_eq!(matched.len(), 1, "{method} /rpc must reach the ALL route");
+            assert_eq!(graph.find_matching_endpoints("/rpc", method).len(), 1);
+        }
+        let other_path = graph
+            .find_matching_endpoints_with_normalizer("/other", "POST", &normalizer)
+            .expect("an internal path");
+        assert!(other_path.is_empty());
     }
 
     #[test]
