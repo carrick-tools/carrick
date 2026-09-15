@@ -12,6 +12,7 @@
 // sits. So it ships in THIS package, beside `node_modules/`, and the binary is
 // told where it is with CARRICK_SIDECAR_DIR (src/main.rs reads it first).
 
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -76,19 +77,28 @@ function defaultExists(target: string): boolean {
   }
 }
 
+/** The one variable that points this package at a scanner binary of your own. */
+export const BINARY_ENV = "CARRICK_BIN";
+
 /**
  * The scanner binary this machine should run.
  *
- * CARRICK_NATIVE_BINARY wins, so a developer can point the shipped CLI at a
- * `cargo build` and the smokes can pin one. Otherwise the platform package
- * that npm installed carries it. A missing platform package is a message, not
- * a crash: the caller decides whether that is fatal (running a scan) or merely
- * silent (a hook that must never fail an edit).
+ * CARRICK_BIN wins, so a developer can point the shipped CLI at a `cargo
+ * build` and the smokes can pin one. It is the same variable the hook, the
+ * language server and `--help` read, so every command a user types runs the
+ * same binary (carrick#1100: `index` and `status` used to read a second name
+ * and quietly ran the installed binary instead). Otherwise the platform
+ * package that npm installed carries it. A missing platform package is a
+ * message, not a crash: the caller decides whether that is fatal (running a
+ * scan) or merely silent (a hook that must never fail an edit).
+ *
+ * An override must name a file. A bare name would be looked up on PATH, and
+ * `carrick` on PATH is usually this shim, which would then run itself forever.
  */
 export function resolveNativeBinary(options: ResolveOptions = {}): NativeLookup {
   const env = options.env ?? process.env;
   const exists = options.exists ?? defaultExists;
-  const override = env["CARRICK_NATIVE_BINARY"];
+  const override = env[BINARY_ENV];
   if (override) {
     if (exists(override)) {
       return { binary: override, problem: null, source: "env" };
@@ -96,7 +106,7 @@ export function resolveNativeBinary(options: ResolveOptions = {}): NativeLookup 
     return {
       binary: null,
       source: "env",
-      problem: `CARRICK_NATIVE_BINARY is set to ${override}, which is not a file on this machine.`,
+      problem: `${BINARY_ENV} is set to ${override}, which is not a file on this machine.`,
     };
   }
 
@@ -115,8 +125,8 @@ export function resolveNativeBinary(options: ResolveOptions = {}): NativeLookup 
       binary: null,
       source: "none",
       problem: supported
-        ? `The carrick binary for ${platform}-${arch} is not installed. It ships as ${specifier}, an optional dependency of this package. Reinstall with 'npm install carrick', or set CARRICK_NATIVE_BINARY to a binary you built.`
-        : `Carrick publishes no binary for ${platform}-${arch}. Supported: ${PLATFORMS.map((entry) => `${entry.platform}-${entry.arch}`).join(", ")}. Set CARRICK_NATIVE_BINARY to a binary you built to use it anyway.`,
+        ? `The carrick binary for ${platform}-${arch} is not installed. It ships as ${specifier}, an optional dependency of this package. Reinstall with 'npm install carrick', or set ${BINARY_ENV} to a binary you built.`
+        : `Carrick publishes no binary for ${platform}-${arch}. Supported: ${PLATFORMS.map((entry) => `${entry.platform}-${entry.arch}`).join(", ")}. Set ${BINARY_ENV} to a binary you built to use it anyway.`,
     };
   }
 
@@ -125,10 +135,35 @@ export function resolveNativeBinary(options: ResolveOptions = {}): NativeLookup 
     return {
       binary: null,
       source: "none",
-      problem: `${specifier} is installed but holds no binary at ${binary}. Reinstall it, or set CARRICK_NATIVE_BINARY.`,
+      problem: `${specifier} is installed but holds no binary at ${binary}. Reinstall it, or set ${BINARY_ENV}.`,
     };
   }
   return { binary, problem: null, source: "platform_package" };
+}
+
+/** Ask a binary which version it is, or null when it does not say. */
+export function binaryVersion(binary: string): string | null {
+  const answer = spawnSync(binary, ["--version"], { encoding: "utf8", timeout: 5000 });
+  if (answer.status !== 0 || typeof answer.stdout !== "string") return null;
+  return answer.stdout.trim() || null;
+}
+
+/**
+ * The line a command run through an overridden binary starts with, or null
+ * when nothing was overridden.
+ *
+ * An override that is set and forgotten, or set and not honoured, reads as a
+ * defect in whichever build the reader thought was running (carrick#1100).
+ * Naming the file and the version it answers with makes the run say which
+ * binary it was before anyone reasons about what it did.
+ */
+export function overrideLine(
+  lookup: NativeLookup,
+  version: (binary: string) => string | null = binaryVersion,
+): string | null {
+  if (lookup.source !== "env" || !lookup.binary) return null;
+  const answered = version(lookup.binary);
+  return `carrick: running ${lookup.binary} (${answered ?? "version unknown"}), set by ${BINARY_ENV}`;
 }
 
 /**

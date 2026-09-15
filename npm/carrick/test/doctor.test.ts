@@ -512,7 +512,7 @@ test("the whole command, on a workspace with exactly two findings", () => {
       XDG_CONFIG_HOME: path.join(home, ".config"),
       CLAUDE_CONFIG_DIR: path.join(home, ".claude-config"),
       APPDATA: path.join(home, "AppData"),
-      CARRICK_NATIVE_BINARY: path.join(packageRoot, "test", "fake-carrick.mjs"),
+      CARRICK_BIN: path.join(packageRoot, "test", "fake-carrick.mjs"),
       CARRICK_FAKE_FIXTURE: fixture,
     },
   });

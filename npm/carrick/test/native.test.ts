@@ -9,10 +9,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import {
   PLATFORMS,
   binaryName,
+  overrideLine,
+  packageRoot,
   platformPackage,
   resolveNativeBinary,
   resolveSidecarDir,
@@ -105,20 +108,70 @@ test("a platform package with no binary in it is a message, not a crash", () => 
   assert.match(lookup.problem ?? "", /holds no binary/);
 });
 
-test("CARRICK_NATIVE_BINARY wins, and is checked", () => {
+test("CARRICK_BIN wins, and is checked", () => {
   const found = resolveNativeBinary({
-    env: { CARRICK_NATIVE_BINARY: "/build/carrick" },
+    env: { CARRICK_BIN: "/build/carrick" },
     exists: (target) => target === "/build/carrick",
   });
   assert.deepEqual(found, { binary: "/build/carrick", problem: null, source: "env" });
 
   const missing = resolveNativeBinary({
-    env: { CARRICK_NATIVE_BINARY: "/build/gone" },
+    env: { CARRICK_BIN: "/build/gone" },
     exists: () => false,
   });
   assert.equal(missing.binary, null);
-  assert.match(missing.problem ?? "", /\/build\/gone/);
+  assert.match(missing.problem ?? "", /CARRICK_BIN is set to \/build\/gone/);
 });
+
+test("an overridden binary is named with its version; an installed one is not", () => {
+  const overridden = { binary: "/build/carrick", problem: null, source: "env" as const };
+  assert.equal(
+    overrideLine(overridden, () => "carrick 0.3.99"),
+    "carrick: running /build/carrick (carrick 0.3.99), set by CARRICK_BIN",
+  );
+  assert.equal(
+    overrideLine(overridden, () => null),
+    "carrick: running /build/carrick (version unknown), set by CARRICK_BIN",
+  );
+  const installed = { binary: "/x/bin/carrick", problem: null, source: "platform_package" as const };
+  assert.equal(overrideLine(installed, () => "carrick 0.3.99"), null);
+});
+
+// carrick#1100: `index`, `status` and the other scanner commands resolved the
+// installed binary and never read CARRICK_BIN, so a run meant for a local build
+// silently ran whatever npm had installed.
+test(
+  "the scanner commands run the binary CARRICK_BIN names, and say which one",
+  { skip: process.platform === "win32" ? "the stand-in binary is a POSIX script" : false },
+  () => {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-bin-")));
+    const calls = path.join(dir, "calls.log");
+    const binary = path.join(dir, "carrick");
+    const script = [
+      "#!/bin/sh",
+      `echo "$*" >> "${calls}"`,
+      'if [ "$1" = "--version" ]; then echo "carrick 0.0.0-local"; exit 0; fi',
+      "echo answered",
+      "",
+    ];
+    fs.writeFileSync(binary, script.join("\n"));
+    fs.chmodSync(binary, 0o755);
+
+    const run = spawnSync(
+      process.execPath,
+      [path.join(packageRoot(), "bin", "carrick.mjs"), "status", "--json"],
+      { encoding: "utf8", env: { ...process.env, CARRICK_BIN: binary } },
+    );
+
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(run.stdout.trim(), "answered", "stdout carries the binary's answer and nothing else");
+    assert.ok(
+      run.stderr.includes(`carrick: running ${binary} (carrick 0.0.0-local), set by CARRICK_BIN`),
+      run.stderr,
+    );
+    assert.deepEqual(fs.readFileSync(calls, "utf8").trim().split("\n"), ["--version", "status --json"]);
+  },
+);
 
 test("every platform in the list has a package name of the same shape", () => {
   for (const { platform, arch } of PLATFORMS) {

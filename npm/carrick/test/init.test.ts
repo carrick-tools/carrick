@@ -240,7 +240,7 @@ globalThis.fetch = async (input, init) => {
     repo,
     env: {
       ...process.env,
-      CARRICK_NATIVE_BINARY: native,
+      CARRICK_BIN: native,
       CARRICK_TOKEN: "test-token",
       XDG_CONFIG_HOME: path.join(root, "config"),
       // The MCP step configures the agent clients this machine has, and the
@@ -466,13 +466,13 @@ const posixNativeFixture = { skip: process.platform === "win32" ? "native sheban
 // (carrick#975), so it has to arrive intact and prefixed once.
 test("a failed derive reaches the caller whole, with the scanner's own prefix removed", posixNativeFixture, () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-derive-"));
-  const previous = process.env["CARRICK_NATIVE_BINARY"];
+  const previous = process.env["CARRICK_BIN"];
   try {
     const native = path.join(dir, "native.mjs");
     const said = "carrick derive: no repos in /code.\\nLooked for: carrick.json, ...\\nFound: none of those manifests in /code. Inside it: no directories.";
     fs.writeFileSync(native, `#!/usr/bin/env node\nprocess.stderr.write("${said}\\n");\nprocess.exit(1);\n`);
     fs.chmodSync(native, 0o755);
-    process.env["CARRICK_NATIVE_BINARY"] = native;
+    process.env["CARRICK_BIN"] = native;
     assert.throws(
       () => deriveWorkspace(dir),
       (error: Error) => {
@@ -484,8 +484,8 @@ test("a failed derive reaches the caller whole, with the scanner's own prefix re
       },
     );
   } finally {
-    if (previous === undefined) delete process.env["CARRICK_NATIVE_BINARY"];
-    else process.env["CARRICK_NATIVE_BINARY"] = previous;
+    if (previous === undefined) delete process.env["CARRICK_BIN"];
+    else process.env["CARRICK_BIN"] = previous;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

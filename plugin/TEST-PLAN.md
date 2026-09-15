@@ -441,7 +441,7 @@ captured; the notes quote it where the wording is the observation.
 | 2.23 | workspace names a missing repo | **pass** | names `./nope`, says it is not indexed, indexes the other two anyway |
 | 2.24 | unknown hook | **pass** | `carrick hook needs one of: post-edit, session-start`, exit 2 |
 | 2.25 | unknown template | **pass** | `carrick templates: no carrick template named nonsense`, exit 2 |
-| 2.26 | platform package missing | **pass** | names the platform package, offers `CARRICK_NATIVE_BINARY`, exit 1, no stack trace |
+| 2.26 | platform package missing | **pass** | names the platform package, offers `CARRICK_BIN`, exit 1, no stack trace |
 | 2.27 | corrupt settings file | **pass** | `skipped .claude/settings.json: it is not valid JSON (...)`, and the file was left exactly as it was |
 | extra | read commands write nothing | **pass** | twenty `check` and twenty `status` calls left the debug log at 275,646 bytes, unchanged |
 | extra | log is bounded | **pass** | with `CARRICK_LOG_MAX_MB=1` and a file past the cap, the run rolled it to one generation and started a new file. The message names the rolled file with a literal `<date>`, which is carrick#858 |
