@@ -320,6 +320,7 @@ fn test_processing_stats_tracking() {
         wrapper_facts_truncated: 0,
         model_calls_without_evidence: 0,
         call_via_stamped: 0,
+        model_base_disagreements: 0,
         total_mounts: 3,
         total_endpoints: 10,
         pubsub_anchor_backfills: 0,

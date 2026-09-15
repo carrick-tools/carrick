@@ -262,6 +262,10 @@ pub struct ProcessingStats {
     /// Rows whose client name was set to the project function the call is
     /// written through (carrick#1155).
     pub call_via_stamped: usize,
+    /// Model data calls at an offered site whose base the model spelled
+    /// differently from the helper it reaches (carrick#1146). The helper's
+    /// spelling is served; each disagreement is logged with both.
+    pub model_base_disagreements: usize,
     pub total_data_calls: usize,
     pub errors: Vec<String>,
 }
@@ -279,6 +283,8 @@ struct FactModuleResolver<'a> {
     request_modules: HashSet<PathBuf>,
     reexport_cache: &'a RefCell<HashMap<PathBuf, Vec<String>>>,
     indexes: RefCell<HashMap<PathBuf, Option<Rc<ModuleIndex>>>>,
+    /// Modules read only for a binding's declaration, not for requests.
+    declarations: RefCell<HashMap<PathBuf, Option<Rc<ModuleIndex>>>>,
     scanner: &'a SwcScanner,
     detection: &'a DetectionResult,
     repo_root: Option<PathBuf>,
@@ -287,6 +293,16 @@ struct FactModuleResolver<'a> {
 }
 
 impl FactModuleResolver<'_> {
+    /// How a module is named in the material: repo-relative where it can be.
+    fn display(&self, module: &Path) -> String {
+        self.repo_root
+            .as_ref()
+            .and_then(|root| module.strip_prefix(root).ok())
+            .unwrap_or(module)
+            .to_string_lossy()
+            .to_string()
+    }
+
     /// The canonical path of the module `specifier` names from `from`.
     fn resolve(from: &Path, specifier: &str) -> Option<PathBuf> {
         if specifier.starts_with("./") || specifier.starts_with("../") {
@@ -358,27 +374,37 @@ impl binding_facts::ModuleResolver for FactModuleResolver<'_> {
                 &self.detection.data_fetchers,
                 &self.detection.messaging_clients,
             );
-            let request_spans: Vec<(u32, u32)> = scan
+            let requests: Vec<((u32, u32), Option<String>)> = scan
                 .candidates
                 .iter()
                 .filter(|candidate| candidate.protocol == Protocol::Http)
-                .map(|candidate| (candidate.span_start, candidate.span_end))
-                .chain(
-                    scan.local_wrapper_calls
-                        .iter()
-                        .map(|call| (call.span_start, call.span_end)),
-                )
+                .map(|candidate| ((candidate.span_start, candidate.span_end), None))
+                .chain(scan.local_wrapper_calls.iter().map(|call| {
+                    (
+                        (call.span_start, call.span_end),
+                        binding_facts::leading_base(&call.target),
+                    )
+                }))
                 .collect();
-            let display = self
-                .repo_root
-                .as_ref()
-                .and_then(|root| module.strip_prefix(root).ok())
-                .unwrap_or(module)
-                .to_string_lossy()
-                .to_string();
-            ModuleIndex::build(module, &display, &content, request_spans).map(Rc::new)
+            ModuleIndex::build(module, &self.display(module), &content, requests).map(Rc::new)
         });
         self.indexes
+            .borrow_mut()
+            .insert(module.to_path_buf(), built.clone());
+        built
+    }
+
+    fn declarations(&self, module: &Path) -> Option<Rc<ModuleIndex>> {
+        if let Some(Some(index)) = self.indexes.borrow().get(module) {
+            return Some(Rc::clone(index));
+        }
+        if let Some(cached) = self.declarations.borrow().get(module) {
+            return cached.clone();
+        }
+        let built = std::fs::read_to_string(module).ok().and_then(|content| {
+            ModuleIndex::build(module, &self.display(module), &content, Vec::new()).map(Rc::new)
+        });
+        self.declarations
             .borrow_mut()
             .insert(module.to_path_buf(), built.clone());
         built
@@ -1276,6 +1302,11 @@ impl FileOrchestrator {
             /// function an imported binding names. Stamped over whatever client
             /// name extraction wrote.
             via_names: HashMap<u32, String>,
+            /// The base every request an offered site reaches opens with, by
+            /// call start offset: the module that reads it and the expression
+            /// as that module spells it (carrick#1146). The served row takes
+            /// its base from here; the model's spelling of it is advisory.
+            site_bases: HashMap<u32, (PathBuf, String)>,
             /// The request shape every wrapper module behind `wrapper_context`
             /// agrees on (carrick-cloud#386): the literal HTTP method, and
             /// whether the request carries a body. `None` — the common case —
@@ -1403,6 +1434,12 @@ impl FileOrchestrator {
             // env-var classification, uploads) sees one normalized
             // form.
             FileOrchestrator::normalize_fallback_targets(adjusted);
+            // The base of a call through an imported declaration is a fact of
+            // the helper's source; the model's spelling of it is advisory
+            // (carrick#1146). Before alias resolution, which reads the
+            // spelling this writes.
+            stats.model_base_disagreements +=
+                FileOrchestrator::settle_offered_site_bases(adjusted, &pf.site_bases, &pf.path_str);
             FileOrchestrator::resolve_target_bases(
                 adjusted,
                 &pf.env_alias_map,
@@ -1869,6 +1906,7 @@ impl FileOrchestrator {
                 fact_literals: Vec::new(),
                 offered_sites,
                 via_names,
+                site_bases: HashMap::new(),
                 wrapper_request_shape: None,
                 pubsub_anchor_ops: scan_result.pubsub_anchor_ops,
                 local_wrapper_calls: scan_result.local_wrapper_calls,
@@ -1926,6 +1964,7 @@ impl FileOrchestrator {
             request_modules: wrapper_map.keys().cloned().collect(),
             reexport_cache: &reexport_cache,
             indexes: RefCell::new(HashMap::new()),
+            declarations: RefCell::new(HashMap::new()),
             scanner: &self.swc_scanner,
             detection: framework_detection,
             repo_root: repo_root.canonicalize().ok(),
@@ -2063,6 +2102,7 @@ impl FileOrchestrator {
                     }
                     pf.offered_sites.extend(offered);
                     pf.via_names.extend(facts.via);
+                    pf.site_bases = facts.bases;
                     pf.wrapper_context = facts.material;
                     pf.fact_literals = facts.literals;
                 }
@@ -2329,6 +2369,7 @@ impl FileOrchestrator {
                 fact_literals: facts.literals,
                 offered_sites: offered,
                 via_names: facts.via,
+                site_bases: facts.bases,
                 wrapper_request_shape: rescued_shape,
                 // Rescued zero-candidate files by definition raised no Signal 7
                 // candidate, so they can carry no anchor ops either.
@@ -2429,6 +2470,53 @@ impl FileOrchestrator {
                     &cm,
                     &handler,
                 );
+            }
+        }
+
+        // PHASE 1c': the base an offered site's request opens with is read in
+        // the HELPER's module, so that module's resolution of it is the one
+        // the site's row must get (carrick#1146). Carry the helper's alias and
+        // literal-base entry for exactly that expression into the consumer's
+        // maps. A consumer that binds the same name to something else keeps
+        // its own, and its sites keep the model's spelling.
+        {
+            let helper_maps: HashMap<PathBuf, (EnvAliasMap, LiteralBaseMap)> = pending
+                .iter()
+                .filter_map(|pf| {
+                    let canonical = Path::new(&pf.path_str).canonicalize().ok()?;
+                    Some((
+                        canonical,
+                        (pf.env_alias_map.clone(), pf.literal_bases.clone()),
+                    ))
+                })
+                .collect();
+            for pf in &mut pending {
+                if pf.site_bases.is_empty() {
+                    continue;
+                }
+                let mut conflicting: Vec<u32> = Vec::new();
+                for (site, (module, base)) in &pf.site_bases {
+                    let Some((aliases, literals)) = helper_maps.get(module) else {
+                        continue;
+                    };
+                    let carried = [
+                        (aliases.get(base), &mut pf.env_alias_map),
+                        (literals.get(base), &mut pf.literal_bases),
+                    ];
+                    for (value, map) in carried {
+                        let Some(value) = value else { continue };
+                        match map.get(base) {
+                            Some(own) if own != value => conflicting.push(*site),
+                            Some(_) => {}
+                            None => {
+                                map.insert(base.clone(), value.clone());
+                            }
+                        }
+                    }
+                }
+                for site in conflicting {
+                    pf.site_bases.remove(&site);
+                }
             }
         }
 
@@ -2799,6 +2887,10 @@ impl FileOrchestrator {
         debug!(
             "  - Rows named after the function they are written through: {}",
             stats.call_via_stamped
+        );
+        debug!(
+            "  - Model bases replaced by the helper's own: {}",
+            stats.model_base_disagreements
         );
 
         // PHASE 5 (carrick#656): state what the member join could not follow.
@@ -6197,6 +6289,73 @@ impl FileOrchestrator {
             }
         });
         dropped
+    }
+
+    /// Serve the helper's base on a model row at an offered site
+    /// (carrick#1146): replace whatever opens the model's target (its own
+    /// `${...}`, an origin it resolved, or nothing) with the base the helper
+    /// reads, keeping everything after it. Returns how many rows the model
+    /// spelled differently.
+    fn settle_offered_site_bases(
+        result: &mut FileAnalysisResult,
+        site_bases: &HashMap<u32, (PathBuf, String)>,
+        file_path: &str,
+    ) -> usize {
+        if site_bases.is_empty() {
+            return 0;
+        }
+        let mut disagreements = 0;
+        for call in &mut result.data_calls {
+            if call.resolution_source != Some(ResolutionSource::Model) {
+                continue;
+            }
+            let Some((_, base)) = call
+                .call_expression_span_start
+                .and_then(|start| site_bases.get(&start))
+            else {
+                continue;
+            };
+            let target = call.target.trim();
+            let rest = if let Some(after) = target.strip_prefix("${") {
+                let mut depth = 1;
+                let mut end = None;
+                for (index, c) in after.char_indices() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(index);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(end) = end else { continue };
+                if after[..end].trim() == base {
+                    continue;
+                }
+                &after[end + 1..]
+            } else if let Some((_, after_scheme)) = target
+                .split_once("://")
+                .filter(|(scheme, _)| scheme.chars().all(|c| c.is_ascii_alphabetic()))
+            {
+                &after_scheme[after_scheme.find('/').unwrap_or(after_scheme.len())..]
+            } else if target.starts_with('/') {
+                target
+            } else {
+                continue;
+            };
+            let settled = format!("${{{base}}}{rest}");
+            debug!(
+                "Serving the helper's base on the model's data call at {}:{}: {:?} -> {:?}",
+                file_path, call.line_number, call.target, settled
+            );
+            call.target = settled;
+            disagreements += 1;
+        }
+        disagreements
     }
 
     /// Name the project function each row is written through (carrick#1155),

@@ -133,6 +133,10 @@ fn an_object_member_called_through_an_alias_import_is_offered_with_its_body() {
         "the helper the member calls, from its own module:\n{facts}"
     );
     assert!(facts.contains("import { settings } from \"./settings\";"));
+    assert!(
+        facts.contains("gatewayUrl: process.env.SHELF_API_URL"),
+        "the declaration of the binding the helper reads, one hop further:\n{facts}"
+    );
     // Only what the page reaches: not the members it never calls, and not the
     // module's type declarations.
     assert!(!facts.contains("\"/v2/shelves\")"), "{facts}");
@@ -156,7 +160,7 @@ fn a_model_row_is_kept_only_when_its_path_is_written_somewhere_it_read() {
             (
                 call["line"].as_i64().expect("line"),
                 call["method"].as_str().expect("method").to_string(),
-                call["path"].as_str().expect("path").to_string(),
+                call["target_url"].as_str().expect("target").to_string(),
             )
         })
         .collect();
@@ -166,10 +170,61 @@ fn a_model_row_is_kept_only_when_its_path_is_written_somewhere_it_read() {
         vec![(
             5,
             "PATCH".to_string(),
-            "/v2/shelves/:shelfId/label".to_string()
+            "${process.env.SHELF_API_URL}/v2/shelves/${shelfId}/label".to_string()
         )],
         "the archive row names `/shelf/` and `/archived`, which nothing the model \
          read contains, so it is dropped: {:#?}",
+        scan.calls
+    );
+}
+
+/// The base is a fact of the helper's source, so every row through `sendJson`
+/// is served the base `sendJson` reads, resolved the way `sendJson`'s own
+/// module resolves it, whatever the model spelled (the stock cassette writes
+/// `${gatewayUrl}`, a name that exists nowhere).
+#[test]
+fn a_row_through_an_imported_helper_is_served_the_helpers_base() {
+    let scan = scan();
+    let mut rows: Vec<(String, i64, String, String)> = scan
+        .calls
+        .iter()
+        .filter(|call| call["file"] != "src/lib/ledger.ts")
+        .map(|call| {
+            (
+                call["file"].as_str().expect("file").to_string(),
+                call["line"].as_i64().expect("line"),
+                call["base"]["env_var"]
+                    .as_str()
+                    .unwrap_or("<none>")
+                    .to_string(),
+                call["target_url"].as_str().expect("target").to_string(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "src/lib/shelves.ts".to_string(),
+                163,
+                "SHELF_API_URL".to_string(),
+                "${process.env.SHELF_API_URL}/v2/shelves/${shelfId}/label".to_string()
+            ),
+            (
+                "src/pages/shelf-page.tsx".to_string(),
+                5,
+                "SHELF_API_URL".to_string(),
+                "${process.env.SHELF_API_URL}/v2/shelves/${shelfId}/label".to_string()
+            ),
+            (
+                "src/pages/stock.ts".to_string(),
+                4,
+                "SHELF_API_URL".to_string(),
+                "${process.env.SHELF_API_URL}/v2/stock".to_string()
+            ),
+        ],
+        "{:#?}",
         scan.calls
     );
 }

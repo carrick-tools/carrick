@@ -5,7 +5,7 @@
     {
       "candidate_id": "@line:4",
       "line_number": 4,
-      "target": "${settings.gatewayUrl}/v2/stock",
+      "target": "${gatewayUrl}/v2/stock",
       "method": "GET",
       "pattern_matched": "sendJson(",
       "call_expression_text": "sendJson(\"GET\", \"/v2/stock\")",

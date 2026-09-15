@@ -147,6 +147,12 @@ pub struct ModuleIndex {
     /// The module's own request calls: its HTTP candidates and its same-file
     /// wrapper sites.
     request_spans: Vec<SpanRange>,
+    /// The base each request's URL opens with, as the source spells it
+    /// (`env.API_URL` for `fetch(`${env.API_URL}/v1${path}`)`), where it opens
+    /// with a plain binding read. See [`leading_base`].
+    request_bases: HashMap<SpanRange, String>,
+    /// The requests whose first argument can be a URL.
+    url_requests: HashSet<SpanRange>,
 }
 
 /// A call in the importing file rooted at an imported binding.
@@ -184,6 +190,12 @@ pub struct ImporterFacts {
     /// The name each bare-function site calls through, by site start offset,
     /// as its declaring module spells it (carrick#1155).
     pub via: HashMap<u32, String>,
+    /// The base every request a site reaches opens with, by site start
+    /// offset: the module that reads it and the expression as that module
+    /// spells it. Present only when all of them agree. The base is a fact of
+    /// the helper's source, so the served row takes it from here and the
+    /// model's spelling of it is advisory.
+    pub bases: HashMap<u32, (PathBuf, String)>,
     /// Declarations cut to [`MAX_DECLARATION_BYTES`] or left out for the
     /// material budget.
     pub truncated: usize,
@@ -360,15 +372,47 @@ impl ModuleIndex {
         path: &Path,
         display_path: &str,
         content: &str,
-        request_spans: Vec<SpanRange>,
+        requests: Vec<(SpanRange, Option<String>)>,
     ) -> Option<Self> {
         let (_, module) = crate::swc_scanner::parse_standalone_module(path, content)?;
+        let request_spans: Vec<SpanRange> = requests.iter().map(|(span, _)| *span).collect();
+        let mut request_bases: HashMap<SpanRange, String> = requests
+            .into_iter()
+            .filter_map(|(span, base)| Some((span, base?)))
+            .collect();
+        let mut reader = BaseReader {
+            content,
+            requests: request_spans.iter().copied().collect(),
+            templates: HashMap::new(),
+            calls: Vec::new(),
+        };
+        module.visit_with(&mut reader);
+        // Which requests state a URL at all, and the base of those that open
+        // with one. A request given a base by the caller (a same-file wrapper
+        // site, whose resolved target is known) is one of them.
+        let mut url_requests: HashSet<SpanRange> = request_bases.keys().copied().collect();
+        for (span, argument) in reader.calls {
+            url_requests.insert(span);
+            if request_bases.contains_key(&span) {
+                continue;
+            }
+            let base = match argument {
+                UrlArgument::Base(base) => Some(base),
+                UrlArgument::Binding(name) => reader.templates.get(&name).cloned().flatten(),
+                UrlArgument::Opaque => None,
+            };
+            if let Some(base) = base {
+                request_bases.insert(span, base);
+            }
+        }
         let mut index = ModuleIndex {
             display_path: display_path.to_string(),
             decls: HashMap::new(),
             exports: HashMap::new(),
             imports: HashMap::new(),
             request_spans,
+            request_bases,
+            url_requests,
         };
         for item in &module.body {
             let item_text = slice(content, item.span());
@@ -560,6 +604,17 @@ impl ModuleIndex {
             .any(|(start, end)| body.span.0 <= *start && *end <= body.span.1)
     }
 
+    /// The bases of the requests inside `body`, one entry per request (`None`
+    /// for a request whose base is not a plain binding read).
+    fn bases_within(&self, body: &Body) -> Vec<Option<&str>> {
+        self.request_spans
+            .iter()
+            .filter(|span| self.url_requests.contains(*span))
+            .filter(|(start, end)| body.span.0 <= *start && *end <= body.span.1)
+            .map(|span| self.request_bases.get(span).map(String::as_str))
+            .collect()
+    }
+
     /// The body an exported name and member path reach in this module, with
     /// the members beside it (for `this.x()` helpers) and the header of the
     /// object or class it sits in.
@@ -598,6 +653,98 @@ impl ModuleIndex {
             }
             _ => None,
         }
+    }
+}
+
+/// The base a URL opens with, when it opens with a plain read of a binding
+/// or of the environment: `${env.API_URL}/v1${path}` -> `env.API_URL`. A read
+/// off `this`, a call, or a template that opens with text states no base a
+/// file other than this one could resolve.
+pub fn leading_base(target: &str) -> Option<String> {
+    let rest = target.trim().strip_prefix("${")?;
+    let end = rest.find('}')?;
+    let base = rest[..end].trim();
+    let plain = !base.is_empty()
+        && !base.starts_with("this.")
+        && base
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '.');
+    plain.then(|| base.to_string())
+}
+
+enum UrlArgument {
+    /// A template opening with a plain binding read.
+    Base(String),
+    /// A binding, which may hold such a template.
+    Binding(String),
+    /// A string, concatenation or other read that opens with no base a
+    /// consumer could resolve.
+    Opaque,
+}
+
+/// Reads, for each request call, the base its URL argument opens with.
+struct BaseReader<'a> {
+    content: &'a str,
+    requests: HashSet<SpanRange>,
+    /// `const url = `${base}...`` declarations by name. A name declared twice
+    /// maps to `None`.
+    templates: HashMap<String, Option<String>>,
+    calls: Vec<(SpanRange, UrlArgument)>,
+}
+
+impl BaseReader<'_> {
+    fn template_base(&self, expr: &Expr) -> Option<String> {
+        let Expr::Tpl(tpl) = unwrap_expr(expr) else {
+            return None;
+        };
+        let first = tpl.quasis.first()?;
+        if !first.raw.is_empty() {
+            return None;
+        }
+        let base = tpl.exprs.first()?;
+        leading_base(&format!("${{{}}}", slice(self.content, base.span())))
+    }
+}
+
+impl Visit for BaseReader<'_> {
+    fn visit_var_declarator(&mut self, node: &VarDeclarator) {
+        if let (Pat::Ident(binding), Some(init)) = (&node.name, &node.init) {
+            let base = self.template_base(init);
+            if base.is_some() {
+                let name = binding.id.sym.to_string();
+                let entry = self.templates.entry(name).or_insert(base.clone());
+                if *entry != base {
+                    *entry = None;
+                }
+            }
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_call_expr(&mut self, node: &CallExpr) {
+        let span = (node.span.lo.0, node.span.hi.0);
+        if self.requests.contains(&span)
+            && let Some(first) = node.args.first()
+            && first.spread.is_none()
+        {
+            // Only an argument that can be a URL makes the call a URL
+            // request here; `res.json()` and `p.catch(() => null)` are
+            // candidates the scanner raised that issue nothing of their own.
+            let argument = match unwrap_expr(&first.expr) {
+                expr if self.template_base(expr).is_some() => {
+                    self.template_base(expr).map(UrlArgument::Base)
+                }
+                Expr::Ident(ident) => Some(UrlArgument::Binding(ident.sym.to_string())),
+                Expr::Tpl(_) | Expr::Lit(Lit::Str(_)) | Expr::Bin(_) | Expr::Member(_) => {
+                    Some(UrlArgument::Opaque)
+                }
+                _ => None,
+            };
+            if let Some(argument) = argument {
+                self.calls.push((span, argument));
+            }
+        }
+        node.visit_children_with(self);
     }
 }
 
@@ -838,7 +985,11 @@ pub fn scan_importer(path: &Path, content: &str) -> Option<ImporterScan> {
 /// modules a re-export barrel stands for), and the declarations of one.
 pub trait ModuleResolver {
     fn modules(&self, from: &Path, specifier: &str) -> Vec<PathBuf>;
+    /// A module whose declarations can issue a request.
     fn index(&self, module: &Path) -> Option<Rc<ModuleIndex>>;
+    /// Any module's declarations, read only for the binding a handed
+    /// declaration reads (a config object), whether or not it issues anything.
+    fn declarations(&self, module: &Path) -> Option<Rc<ModuleIndex>>;
 }
 
 #[derive(Debug)]
@@ -1039,6 +1190,30 @@ pub fn importer_facts(
         if let Some(name) = function_name {
             facts.via.insert(site.span.0, name);
         }
+        let mut bases: Vec<(PathBuf, Option<&str>)> = target
+            .index
+            .bases_within(&target.body)
+            .into_iter()
+            .map(|base| (target.module.clone(), base))
+            .collect();
+        for (helper, _) in &helpers {
+            bases.extend(
+                helper
+                    .index
+                    .bases_within(&helper.body)
+                    .into_iter()
+                    .map(|base| (helper.module.clone(), base)),
+            );
+        }
+        if let Some((module, Some(base))) = bases.first()
+            && bases
+                .iter()
+                .all(|(other_module, other)| other_module == module && *other == Some(*base))
+        {
+            facts
+                .bases
+                .insert(site.span.0, (module.clone(), base.to_string()));
+        }
 
         let receiver = site
             .typed_receiver
@@ -1115,6 +1290,46 @@ pub fn importer_facts(
                     literals: decl.body.literals.clone(),
                 }
             } else if let Some(import) = owner.index.imports.get(name) {
+                // One hop further for an imported binding: what the module it
+                // comes from declares it as, so an interpolation of it
+                // (`${env.API_URL}`) is traceable to its source.
+                let export = match &import.imported {
+                    Imported::Named(export) => Some(export.clone()),
+                    Imported::Default => Some("default".to_string()),
+                    Imported::Namespace => None,
+                };
+                if let Some(export) = export
+                    && let Some((module, declared)) = resolver
+                        .modules(&owner.module, &import.specifier)
+                        .into_iter()
+                        .find_map(|module| {
+                            let index = resolver.declarations(&module)?;
+                            let local = index.exports.get(&export)?;
+                            let decl = index.decls.get(local)?;
+                            matches!(decl.kind, DeclKind::Value | DeclKind::Object(_)).then(|| {
+                                (
+                                    module.clone(),
+                                    (index.display_path.clone(), decl.body.clone()),
+                                )
+                            })
+                        })
+                {
+                    let (display, body) = declared;
+                    push(
+                        &mut entries,
+                        Entry {
+                            priority: 2,
+                            module,
+                            display,
+                            span: body.span,
+                            label: format!(
+                                "declaration of {name}, which a declaration in this section imports"
+                            ),
+                            text: body.text,
+                            literals: body.literals,
+                        },
+                    );
+                }
                 Entry {
                     priority: 2,
                     module: owner.module.clone(),
@@ -1318,6 +1533,9 @@ mod tests {
         fn index(&self, module: &Path) -> Option<Rc<ModuleIndex>> {
             self.1.get(module).cloned()
         }
+        fn declarations(&self, module: &Path) -> Option<Rc<ModuleIndex>> {
+            self.1.get(module).cloned()
+        }
     }
 
     /// Spans of every call in `content` whose source text starts with one of
@@ -1340,6 +1558,10 @@ mod tests {
         calls.2
     }
 
+    fn unbased(spans: Vec<SpanRange>) -> Vec<(SpanRange, Option<String>)> {
+        spans.into_iter().map(|span| (span, None)).collect()
+    }
+
     const CLIENT: &str = r#"import { settings } from "./settings";
 
 const PREFIX = "/catalog/v3";
@@ -1347,6 +1569,7 @@ const PREFIX = "/catalog/v3";
 export async function sendJson(verb: string, path: string, body?: object) {
   const url = `${settings.gatewayUrl}${PREFIX}${path}`;
   const res = await fetch(url, { method: verb, body: JSON.stringify(body) });
+  await res.json();
   return res.json();
 }
 
@@ -1363,18 +1586,45 @@ export const shelvesApi = {
 "#;
 
     fn client_index() -> ModuleIndex {
-        let spans = spans_of(CLIENT, &["fetch("]);
-        ModuleIndex::build(Path::new("client.ts"), "src/client.ts", CLIENT, spans).unwrap()
+        let spans = spans_of(CLIENT, &["fetch(", "res.json("]);
+        ModuleIndex::build(
+            Path::new("client.ts"),
+            "src/client.ts",
+            CLIENT,
+            unbased(spans),
+        )
+        .unwrap()
     }
 
     fn facts_for(consumer: &str) -> (ImporterScan, ImporterFacts) {
         let scan = scan_importer(Path::new("page.tsx"), consumer).unwrap();
+        let settings =
+            "export const settings = {\n  gatewayUrl: process.env.SHELF_GATEWAY ?? \"\",\n};\n";
+        let settings_index = ModuleIndex::build(
+            Path::new("settings.ts"),
+            "src/settings.ts",
+            settings,
+            Vec::new(),
+        )
+        .unwrap();
         let resolver = Fixed(
-            HashMap::from([("./client".to_string(), PathBuf::from("/repo/src/client.ts"))]),
-            HashMap::from([(
-                PathBuf::from("/repo/src/client.ts"),
-                Rc::new(client_index()),
-            )]),
+            HashMap::from([
+                ("./client".to_string(), PathBuf::from("/repo/src/client.ts")),
+                (
+                    "./settings".to_string(),
+                    PathBuf::from("/repo/src/settings.ts"),
+                ),
+            ]),
+            HashMap::from([
+                (
+                    PathBuf::from("/repo/src/client.ts"),
+                    Rc::new(client_index()),
+                ),
+                (
+                    PathBuf::from("/repo/src/settings.ts"),
+                    Rc::new(settings_index),
+                ),
+            ]),
         );
         let facts = importer_facts(Path::new("page.tsx"), &scan, &resolver);
         (scan, facts)
@@ -1407,9 +1657,18 @@ export async function load(id: string) {
         assert!(material.contains("${settings.gatewayUrl}${PREFIX}${path}"));
         assert!(material.contains("binding a declaration in this section reads: PREFIX"));
         assert!(material.contains("import { settings } from \"./settings\";"));
+        assert!(
+            material.contains("gatewayUrl: process.env.SHELF_GATEWAY"),
+            "the imported binding's own declaration, one hop: {material}"
+        );
         // Only what the site reaches: not the sibling members.
         assert!(!material.contains("\"/shelves\")"), "{material}");
         assert!(facts.via.is_empty(), "a member call names no bare function");
+        // `sendJson` builds its URL in a const opening with the settings read,
+        // and `res.json()` beside it states no URL, so the base is settled.
+        let (module, base) = facts.bases.values().next().expect("the site's base");
+        assert_eq!(module, &PathBuf::from("/repo/src/client.ts"));
+        assert_eq!(base, "settings.gatewayUrl");
     }
 
     #[test]
@@ -1455,7 +1714,8 @@ function local(shelvesApi: { list(): void }) {
 export const gateway = new Gateway(`${process.env.VAULT_URL}/v4`);
 "#;
         let spans = spans_of(module, &["fetch("]);
-        let index = ModuleIndex::build(Path::new("g.ts"), "src/g.ts", module, spans).unwrap();
+        let index =
+            ModuleIndex::build(Path::new("g.ts"), "src/g.ts", module, unbased(spans)).unwrap();
         let scan = scan_importer(
             Path::new("p.ts"),
             "import { gateway } from \"./g\";\ngateway.archive(\"x\");\n",
@@ -1497,7 +1757,8 @@ export const gateway = new Gateway(`${process.env.VAULT_URL}/v4`);
 }
 "#;
         let spans = spans_of(module, &["fetch("]);
-        let index = ModuleIndex::build(Path::new("r.ts"), "src/r.ts", module, spans).unwrap();
+        let index =
+            ModuleIndex::build(Path::new("r.ts"), "src/r.ts", module, unbased(spans)).unwrap();
         let scan = scan_importer(
             Path::new("p.ts"),
             "import type { Registry } from \"./r\";\nexport async function f(registry: Registry) {\n  return registry.find(\"x\");\n}\n",
@@ -1524,6 +1785,21 @@ export const gateway = new Gateway(`${process.env.VAULT_URL}/v4`);
         assert!(material.contains("helper a declaration in this section calls: this.post"));
         assert!(material.contains("the constructor that instance runs"));
         assert!(material.contains("`${root}/rpc/registry`"));
+    }
+
+    #[test]
+    fn leading_base_reads_only_a_plain_binding() {
+        assert_eq!(
+            leading_base("${env.API_URL}/v1/x").as_deref(),
+            Some("env.API_URL")
+        );
+        assert_eq!(
+            leading_base("${import.meta.env.VITE_URL}/x").as_deref(),
+            Some("import.meta.env.VITE_URL")
+        );
+        assert_eq!(leading_base("${this.baseUrl}/x"), None);
+        assert_eq!(leading_base("${cfg()}/x"), None);
+        assert_eq!(leading_base("/v1/x"), None);
     }
 
     #[test]

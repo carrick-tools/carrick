@@ -26,9 +26,9 @@ and a same-file wrapper site whose path no structural read can state.
 
 | site | truth |
 |---|---|
-| `shelf-page.tsx:5` | offered; handed `shelves.rename`, `sendJson` and the `settings` import; `PATCH ${settings.gatewayUrl}/v2/shelves/:shelfId/label` |
+| `shelf-page.tsx:5` | offered; handed `shelves.rename`, `sendJson`, the `settings` import and its declaration; `PATCH ${process.env.SHELF_API_URL}/v2/shelves/:shelfId/label` |
 | `shelf-page.tsx:9` | offered; the cassette answers with an invented path (`/v2/shelf/:id/archived`), which is dropped |
-| `stock.ts:4` | offered; the row is written through `sendJson` |
+| `stock.ts:4` | offered; the row is written through `sendJson`; the cassette misspells the base as `${gatewayUrl}`, and the row is served `sendJson`'s own base, `${process.env.SHELF_API_URL}` |
 | `shelves.ts:163` | offered; the row is written through `sendJson` |
 | `ledger.ts:16` | offered as a candidate; the row is written through `ledgerRequest` |
 | `ledger.ts:20` | `GET /ledger/totals`, resolved by the wrapper pass, not offered |
