@@ -64,18 +64,20 @@ pub fn service_manifest(root: &Path, service: &Config) -> Option<PathBuf> {
 
 /// Run only the runtime version command, never application code or tasks.
 pub fn require_runtime(root: &Path, services: &[Config]) -> Result<(), String> {
+    require_runtime_with(root, services, installed_deno_version)
+}
+
+/// [`require_runtime`] with the installed version supplied, so a test can say
+/// "no Deno on PATH" without editing the process's PATH under every other
+/// test that spawns a program. `installed` is asked only when a service is a
+/// Deno one.
+pub(crate) fn require_runtime_with(
+    root: &Path,
+    services: &[Config],
+    installed: impl FnOnce() -> Option<semver::Version>,
+) -> Result<(), String> {
     if let Some(config) = services.iter().find_map(|s| service_manifest(root, s)) {
-        let output = Command::new("deno").arg("--version").output();
-        let supported = output.is_ok_and(|out| {
-            out.status.success()
-                && String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .next()
-                    .and_then(|line| line.strip_prefix("deno "))
-                    .and_then(|version| version.split_whitespace().next())
-                    .and_then(|version| semver::Version::parse(version).ok())
-                    .is_some_and(|version| version >= semver::Version::new(2, 9, 4))
-        });
+        let supported = installed().is_some_and(|version| version >= semver::Version::new(2, 9, 4));
         if !supported {
             return Err(format!(
                 "Deno is required to scan {}. Install or upgrade to Deno 2.9.4 or newer and make `deno` available on PATH. Carrick reads the existing Deno configuration; no generated tsconfig is required.",
@@ -84,6 +86,21 @@ pub fn require_runtime(root: &Path, services: &[Config]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The `deno` on PATH, by its own `--version` line, or `None` when there is
+/// none that answers.
+fn installed_deno_version() -> Option<semver::Version> {
+    let out = Command::new("deno").arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("deno "))
+        .and_then(|version| version.split_whitespace().next())
+        .and_then(|version| semver::Version::parse(version).ok())
 }
 
 pub(crate) fn import_map_path(

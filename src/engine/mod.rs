@@ -289,9 +289,39 @@ async fn report_scan_failure<T: CloudStorage + Sync>(storage: &T, error: &dyn st
         .await;
 }
 
-/// What a fail marker's `reason` carries: the error's own words, with the
-/// home directory replaced by `~` and the whole thing cut to
-/// [`FAIL_REASON_LIMIT`] characters.
+/// Tell the cloud a run died before `start-scan` opened a scan
+/// (carrick#1096).
+///
+/// The caller decides that no scan was opened and passes the stage the run
+/// had reached (`main` reads [`crate::scan_stage::current`]); this names the
+/// rest the same way the fail marker does. `repo` comes from the function `RunContext` reads
+/// it with, so the name the cloud is told is the name `start-scan` would have
+/// been given. Best-effort: nothing here can change what the run returns.
+pub async fn report_preflight_failure<T: CloudStorage + Sync>(
+    storage: &T,
+    repo_path: &str,
+    stage: crate::scan_stage::Stage,
+    error: &dyn std::error::Error,
+) {
+    let repo = crate::git_state::remote_name(std::path::Path::new(repo_path));
+    storage
+        .report_preflight_failed(
+            repo.as_deref(),
+            stage.as_str(),
+            &fail_reason(&error.to_string()),
+        )
+        .await;
+}
+
+/// What a failure event's `reason` carries — `scan-failed` and
+/// `preflight-failed` alike: the error's own words, run through the same
+/// per-line rules as the uploaded run log (home directory to `~`, a line
+/// naming a credential dropped whole), and cut to [`FAIL_REASON_LIMIT`]
+/// characters.
+///
+/// A reason whose every line named a credential is replaced by a sentence
+/// saying so, rather than sent empty: the cloud still learns that the run
+/// died, and in which stage.
 ///
 /// Characters, not bytes, so a multi-byte error message is cut on a boundary
 /// rather than panicking on the way out of a run that is already failing.
@@ -299,7 +329,17 @@ async fn report_scan_failure<T: CloudStorage + Sync>(storage: &T, error: &dyn st
 /// sentence that happens to stop.
 fn fail_reason(error: &str) -> String {
     const ELLIPSIS: &str = "...";
-    let redacted = logging::redact_home_in(error, logging::home_for_redaction().as_deref());
+    const WITHHELD: &str = "(the error named a credential, so its text was not sent)";
+    let home = logging::home_for_redaction();
+    let kept: Vec<String> = error
+        .lines()
+        .filter_map(|line| logging::redact_log_line(line, home.as_deref()))
+        .collect();
+    let redacted = if kept.is_empty() && !error.is_empty() {
+        WITHHELD.to_string()
+    } else {
+        kept.join("\n")
+    };
     if redacted.chars().count() <= FAIL_REASON_LIMIT {
         return redacted;
     }
@@ -5717,6 +5757,84 @@ mod tests {
             )]
         );
         crate::scan_stage::enter(crate::scan_stage::Stage::Unknown);
+    }
+
+    /// A laptop run that stops because Deno is missing reports it once, before
+    /// any scan exists, naming the stage and a reason with the home directory
+    /// taken out (carrick#1096).
+    ///
+    /// The error is the real one `require_runtime` raises for a Deno service
+    /// with no runtime answering, and the service lives under a temporary
+    /// home so the path in it is one the redaction must rewrite. `#[serial]`
+    /// because `HOME` is process-wide.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_run_stopped_by_a_missing_runtime_reports_it_before_any_scan() {
+        let home = tempfile::tempdir().expect("temp home");
+        let repo = home.path().join("work").join("api");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::write(repo.join("deno.json"), "{}").expect("deno manifest");
+        let services = vec![crate::config::Config::default()];
+        let error: Box<dyn std::error::Error> =
+            crate::deno_support::require_runtime_with(&repo, &services, || None)
+                .expect_err("a Deno service with no runtime is refused")
+                .into();
+        assert!(
+            error
+                .to_string()
+                .contains(&home.path().display().to_string()),
+            "the unredacted error names the home: {error}"
+        );
+
+        let previous = std::env::var_os("HOME");
+        // SAFETY: a `#[serial]` test, and the variable is restored below.
+        unsafe { std::env::set_var("HOME", home.path()) };
+        let storage = crate::cloud_storage::MockStorage::new();
+        super::report_preflight_failure(
+            &storage,
+            &repo.display().to_string(),
+            crate::scan_stage::Stage::Discovery,
+            error.as_ref(),
+        )
+        .await;
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        let reported = storage.preflight_failures();
+        assert_eq!(reported.len(), 1, "exactly one event: {reported:?}");
+        let (repo_name, stage, reason) = &reported[0];
+        assert_eq!(repo_name, &None, "a checkout with no origin names no repo");
+        assert_eq!(stage, "discovery");
+        assert!(
+            reason.starts_with("Deno is required to scan ~/work/api/")
+                && reason.contains("deno.json. Install or upgrade to Deno"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains(&home.path().display().to_string()),
+            "{reason}"
+        );
+        assert!(reason.chars().count() <= super::FAIL_REASON_LIMIT);
+        assert!(
+            storage.scan_failures().is_empty(),
+            "no scan was opened, so nothing was marked failed"
+        );
+    }
+
+    /// A reason line naming a credential goes whole, as it would from the run
+    /// log; a reason that was nothing but such lines still says the run died.
+    #[test]
+    fn a_fail_reason_never_carries_a_credential_line() {
+        let mixed = super::fail_reason("start-scan refused\nAuthorization: Bearer carrick_sk_x");
+        assert_eq!(mixed, "start-scan refused");
+
+        let only = super::fail_reason("token carrick_sk_live_abc was rejected");
+        assert!(!only.contains("carrick_sk_"), "{only}");
+        assert!(only.contains("named a credential"), "{only}");
     }
 
     /// What leaves the machine is redacted, and the wiring that does it is

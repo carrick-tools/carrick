@@ -1034,6 +1034,20 @@ pub trait CloudStorage {
     /// no-op, because only the laptop path has a slot to mark.
     async fn report_scan_failed(&self, _stage: &str, _reason: &str) {}
 
+    /// Say that this run died before `start-scan` opened a scan (carrick#1096).
+    ///
+    /// The half [`CloudStorage::report_scan_failed`] cannot cover: a laptop
+    /// run that stops at a missing runtime, a service manifest it cannot
+    /// read, or a repository `start-scan` never accepted holds no slot, so
+    /// there is nothing to mark and the cloud saw nothing at all. This event
+    /// claims no slot and counts against no allowance. `repo` is `owner/repo`
+    /// when the checkout's origin names one; `stage` and `reason` are shaped
+    /// exactly as the fail marker's are.
+    ///
+    /// Best-effort for the same reasons, and a default no-op for the same
+    /// reason: only the laptop credential has anyone to tell.
+    async fn report_preflight_failed(&self, _repo: Option<&str>, _stage: &str, _reason: &str) {}
+
     /// Relay a PR run's structured findings to the cloud, which renders and
     /// posts (and updates in place on later pushes) a single GitHub App
     /// comment + check run on the PR. Only called on `pull_request` runs —
