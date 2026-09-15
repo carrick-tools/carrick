@@ -315,7 +315,10 @@ impl<'a> DocumentReader<'a> {
                 import.imported.clone(),
             )
         } else if local_declarations.contains(root) {
-            (file.to_string_lossy().into_owned(), root.clone())
+            // The same spelling an importer's resolved specifier has, so a
+            // binding declared here and imported elsewhere is one callee.
+            let module = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+            (module.to_string_lossy().into_owned(), root.clone())
         } else {
             return None;
         };
@@ -774,6 +777,55 @@ export function ReportsPage() {
         suppress_document_site_http_rows(&mut results, None);
 
         assert_eq!(targets(&results, &reports_path), vec!["GET /api/reports"]);
+    }
+
+    #[test]
+    fn a_client_declared_in_one_module_is_one_executor_across_its_importers() {
+        // The client is declared where it executes a resolved document, and
+        // imported where it is handed one whose module is not on disk. Both
+        // sites must name the same callee, however the scan spelled the path
+        // (a temp dir is behind a symlink on some systems).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "src/generated/documents.ts", GENERATED_DOCUMENTS);
+        let client = r#"import { createClient } from "@example/gql-client";
+import { OrdersDocument } from "./generated/documents";
+export const api = createClient();
+// Requête initiale — commandes
+export const loadOrders = () => api.query(OrdersDocument);
+"#;
+        let client_path = write(root, "src/client.ts", client);
+        let invoices = r#"import { api } from "./client";
+import { InvoicesDocument } from "./generated/vendor";
+// Factures — chargement
+export const loadInvoices = () => api.query(InvoicesDocument);
+"#;
+        let invoices_path = write(root, "src/invoices.ts", invoices);
+
+        let mut results = HashMap::from([
+            (
+                client_path.clone(),
+                result_with(vec![row_at(
+                    client,
+                    "api.query(OrdersDocument",
+                    "POST",
+                    "/graphql",
+                )]),
+            ),
+            (
+                invoices_path.clone(),
+                result_with(vec![row_at(
+                    invoices,
+                    "api.query(InvoicesDocument",
+                    "POST",
+                    "/graphql",
+                )]),
+            ),
+        ]);
+        let drops = suppress_document_site_http_rows(&mut results, None);
+
+        assert!(targets(&results, &invoices_path).is_empty());
+        assert_eq!(drops.document_executor, 1);
     }
 
     #[test]
