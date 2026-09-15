@@ -49,7 +49,11 @@ import type {
   TypeProvenance,
 } from './types.js';
 import { validateInferRequestItem } from './validators.js';
-import { expandTypeStructural, type MemberOverrides } from './type-structural-expander.js';
+import {
+  expandTypeStructural,
+  type MemberOverrides,
+  type WireFormat,
+} from './type-structural-expander.js';
 
 /**
  * TS/lib globals and primitives that must never be emitted as a deterministic
@@ -226,6 +230,61 @@ const RESPONSE_HELPER_MAX_DEPTH = 4;
  * the branch an error path, whose shape is not the endpoint's contract.
  */
 const STATUS_MEMBER_NAMES = ['status', 'statusCode'] as const;
+
+/**
+ * What a response send's status says about its body (carrick#1161).
+ * `success` (below 300) and `undecided` (no status stated anywhere) send the
+ * route's contract; `error` (400 and up) and `redirect` (3xx) do not; and
+ * `variable` is a status the source computes, which fails open into the
+ * union so no success body is ever guessed away.
+ */
+type ResponseSiteStatus = 'success' | 'error' | 'redirect' | 'variable' | 'undecided';
+
+/** A response payload read out of one or more response sends. */
+interface RecoveredPayload {
+  typeString: string;
+  isExplicit: boolean;
+  /** The first surviving payload node, where the inferred type is located. */
+  node: Node;
+  /** Every payload node that fed `typeString`. */
+  nodes: Node[];
+  anchorType?: Type;
+  statedTypeNode?: Node;
+}
+
+/** `value` when it is an integer in the HTTP status range, else `undefined`. */
+function httpStatus(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599
+    ? value
+    : undefined;
+}
+
+/**
+ * The status codes a TYPE fixes: a numeric literal, or a union made only of
+ * them, every one in the HTTP range. `undefined` for anything else, including
+ * a plain `number`.
+ */
+function statusCodesOfType(type: Type): number[] | undefined {
+  const members = type.isUnion() ? type.getUnionTypes() : [type];
+  const codes: number[] = [];
+  for (const member of members) {
+    if (!member.isNumberLiteral()) return undefined;
+    const code = httpStatus(member.getLiteralValue());
+    if (code === undefined) return undefined;
+    codes.push(code);
+  }
+  return codes.length > 0 ? codes : undefined;
+}
+
+/** One verdict for a set of status codes, or `mixed` when they disagree. */
+function classifyStatusCodes(
+  codes: number[]
+): 'success' | 'error' | 'redirect' | 'mixed' {
+  if (codes.every((code) => code >= 400)) return 'error';
+  if (codes.every((code) => code >= 300 && code < 400)) return 'redirect';
+  if (codes.every((code) => code < 300)) return 'success';
+  return 'mixed';
+}
 
 /**
  * The parts of a request that ARE the body, as validator middleware names them
@@ -586,41 +645,17 @@ export class TypeInferrer {
         this.typeIsOrContainsResponseMachinery(awaitedType);
       const unresolvable = awaitedType.isAny() || awaitedType.isUnknown();
       if (machinery || unresolvable) {
-        const recovered = this.recoverPayloadFromReturnStatements(func, !machinery);
+        const recovered = this.recoverPayloadFromReturnStatements(
+          func,
+          !machinery,
+          this.wireFormatFor(request)
+        );
         if (recovered) {
           this.log(
             `Return type at ${request.file_path}:${request.line_number} carries no ` +
               "contract; recovered the payload from the response helper's argument"
           );
-          const recoveredAnchor = recovered.anchorType
-            ? this.unwrapArrayLevels(recovered.anchorType)
-            : undefined;
-          const resolvedSymbol = recoveredAnchor
-            ? this.primaryTypeSymbol(recoveredAnchor.element)
-            : undefined;
-          // carrick#768: the resolved type of a stated annotation carries no
-          // symbol when the alias resolves to an INSTANTIATED type (the
-          // schema-first `type Body = Infer<typeof Schema>` shape) — the
-          // compiler answers the synthetic `__type` and the route loses the
-          // one name a reader could import. The annotation as WRITTEN still
-          // names it, so read the anchor off the type node when the resolved
-          // type had none. Fallback only: a resolved symbol is the better
-          // answer and keeps its precedence.
-          const stated = recovered.statedTypeNode;
-          const writtenAnchor =
-            resolvedSymbol === undefined && stated
-              ? this.writtenAnchorOf(stated)
-              : undefined;
-          return this.createInferredType(
-            request,
-            recovered.typeString,
-            recovered.isExplicit,
-            this.getNodeLocation(recovered.node),
-            undefined,
-            resolvedSymbol ?? writtenAnchor?.symbol,
-            writtenAnchor ? writtenAnchor.depth : recoveredAnchor?.depth,
-            writtenAnchor?.source
-          );
+          return this.inferredFromRecoveredPayload(request, recovered);
         }
         // Nothing recoverable. Reject a wrapper envelope that IS or CONTAINS
         // framework machinery (carrick#371): `withApiWrapper({ handler: () =>
@@ -661,7 +696,11 @@ export class TypeInferrer {
       // bare name `Payment`, which dangles in the source-less cross-repo bundle.
       // Expand the resolved object structurally so the real members reach the
       // bundle. `unwrapPromise` below is then a no-op on the structural form.
-      typeString = this.expandResolvedTypeStructural(awaitedType, typeString);
+      typeString = this.expandResolvedTypeStructural(
+        awaitedType,
+        typeString,
+        this.wireFormatFor(request)
+      );
     }
 
     typeString = this.unwrapPromise(typeString, returnType);
@@ -902,6 +941,19 @@ export class TypeInferrer {
       }
     }
 
+    // carrick#1161: the locator anchors the HANDLER, not the response. When it
+    // names one send among several, the route's contract is every success
+    // body the handler sends, whichever of them the model happened to report.
+    const fromSites = this.inferFromResponseSites(
+      sourceFile,
+      request,
+      node,
+      extractionConfig
+    );
+    if (fromSites !== undefined) {
+      return fromSites;
+    }
+
     // carrick#1017: the located expression evaluates to the transport wrapper
     // itself — `Response.json(entry)`, `new Response(JSON.stringify(entry))`,
     // `ctx.json(entry)` all have the platform `Response` as their type, and a
@@ -927,33 +979,17 @@ export class TypeInferrer {
           this.unwrapPromiseType(locatedType)
         ));
     if (machineryAnchor) {
-      const recovered = this.recoverPayloadFromResponseExpressions([node], false);
+      const recovered = this.recoverPayloadFromResponseExpressions(
+        [node],
+        false,
+        this.wireFormatFor(request)
+      );
       if (recovered) {
         this.log(
           `Response payload at ${request.file_path}:${request.line_number} is the ` +
             "transport wrapper; recovered the body from the response call's argument"
         );
-        const recoveredAnchor = recovered.anchorType
-          ? this.unwrapArrayLevels(recovered.anchorType)
-          : undefined;
-        const resolvedSymbol = recoveredAnchor
-          ? this.primaryTypeSymbol(recoveredAnchor.element)
-          : undefined;
-        const stated = recovered.statedTypeNode;
-        const writtenAnchor =
-          resolvedSymbol === undefined && stated
-            ? this.writtenAnchorOf(stated)
-            : undefined;
-        return this.createInferredType(
-          request,
-          recovered.typeString,
-          recovered.isExplicit,
-          this.getNodeLocation(recovered.node),
-          undefined,
-          resolvedSymbol ?? writtenAnchor?.symbol,
-          writtenAnchor ? writtenAnchor.depth : recoveredAnchor?.depth,
-          writtenAnchor?.source
-        );
+        return this.inferredFromRecoveredPayload(request, recovered);
       }
       this.log(
         `Response payload at ${request.file_path}:${request.line_number} is the ` +
@@ -1041,7 +1077,11 @@ export class TypeInferrer {
       // `typeText` keeps the bare name `Payment`, which dangles in the
       // source-less cross-repo bundle → `any` → unverifiable. Expand the
       // resolved object structurally so the real members land in the bundle.
-      typeString = this.expandResolvedTypeStructural(resolved, typeString);
+      typeString = this.expandResolvedTypeStructural(
+        resolved,
+        typeString,
+        this.wireFormatFor(request)
+      );
     }
 
     const anchor = this.unwrapArrayLevels(this.unwrapPromiseType(payloadType));
@@ -1054,6 +1094,225 @@ export class TypeInferrer {
       this.primaryTypeSymbol(anchor.element),
       anchor.depth
     );
+  }
+
+  /**
+   * The wire representation a request's printed type takes. A route response
+   * is serialised as JSON by every sender this layer reads a payload out of,
+   * so it prints `toJSON()` results rather than the objects that declare them
+   * (carrick#1163). Everything else prints the declared type.
+   */
+  private wireFormatFor(request: InferRequestItem): WireFormat {
+    return request.infer_kind === 'response_body' ||
+      request.infer_kind === 'function_return'
+      ? 'json'
+      : 'declared';
+  }
+
+  /** An inferred type for a payload read out of response sends. */
+  private inferredFromRecoveredPayload(
+    request: InferRequestItem,
+    recovered: RecoveredPayload
+  ): InferredType {
+    const recoveredAnchor = recovered.anchorType
+      ? this.unwrapArrayLevels(recovered.anchorType)
+      : undefined;
+    const resolvedSymbol = recoveredAnchor
+      ? this.primaryTypeSymbol(recoveredAnchor.element)
+      : undefined;
+    // carrick#768: the resolved type of a stated annotation carries no symbol
+    // when the alias resolves to an INSTANTIATED type (the schema-first
+    // `type Body = Infer<typeof Schema>` shape): the compiler answers the
+    // synthetic `__type` and the route loses the one name a reader could
+    // import. The annotation as WRITTEN still names it, so read the anchor off
+    // the type node when the resolved type had none. Fallback only: a
+    // resolved symbol is the better answer and keeps its precedence.
+    const stated = recovered.statedTypeNode;
+    const writtenAnchor =
+      resolvedSymbol === undefined && stated ? this.writtenAnchorOf(stated) : undefined;
+    return this.createInferredType(
+      request,
+      recovered.typeString,
+      recovered.isExplicit,
+      this.getNodeLocation(recovered.node),
+      undefined,
+      resolvedSymbol ?? writtenAnchor?.symbol,
+      writtenAnchor ? writtenAnchor.depth : recoveredAnchor?.depth,
+      writtenAnchor?.source
+    );
+  }
+
+  /**
+   * carrick#1161: type a route response from every send in the handler the
+   * locator anchors, rather than from the one send it names.
+   *
+   * The analyzer reports one response expression per row, and on a handler
+   * that guards before it succeeds that is the guard's body. So the located
+   * expression selects the HANDLER: the function that contains it, on a row
+   * whose line is a route registration. Its returned sends are enumerated
+   * (conditional branches split), each is classified by the status it states
+   * (`responseSiteStatus`), the error and redirect branches are dropped, and
+   * the success bodies are joined exactly as the payload walk joins return
+   * statements.
+   *
+   * Returns `undefined` when this does not apply, which leaves the caller's
+   * own reading of the located expression untouched:
+   *  - the row's line is not a route registration;
+   *  - the located expression is neither a send nor the argument of one;
+   *  - that send is not one the handler returns;
+   *  - it is a success send and the only one that survives, so the join would
+   *    be the located body anyway;
+   *  - no joined body is the located one (a text body beside JSON ones).
+   *
+   * When the located send is an error or redirect branch and no success body
+   * survives, the route sends no body a contract can describe: an explicit
+   * `unknown` with its reason, so no later locator re-run reads the error body
+   * or the redirect location back in.
+   */
+  private inferFromResponseSites(
+    sourceFile: SourceFile,
+    request: InferRequestItem,
+    located: Node,
+    extractionConfig?: ExtractionConfig
+  ): InferredType | null | undefined {
+    if (!this.registrationAtLine(sourceFile, request.line_number)) return undefined;
+    const func = this.findContainingFunctionForNode(located);
+    if (!func) return undefined;
+
+    const branches = this.responseReturnedExpressions(func).flatMap((expression) =>
+      this.expandResponseBranches(expression, 0)
+    );
+    if (branches.length === 0) return undefined;
+    const serialisers = this.calleesProvenSerialiser(branches);
+    const isSend = (candidate: Node): boolean =>
+      this.isResponseSend(candidate, extractionConfig, serialisers);
+
+    const peeled = this.peelTransparentExpression(located);
+    const site = isSend(peeled) ? peeled : this.sendReceivingArgument(located, isSend);
+    if (!site) return undefined;
+    const contains = (outer: Node, inner: Node): boolean =>
+      outer.getStart() <= inner.getStart() && inner.getEnd() <= outer.getEnd();
+    const locatedBranch = branches.find((branch) => contains(branch, site));
+    if (!locatedBranch) return undefined;
+
+    const dropped = (status: ResponseSiteStatus): boolean =>
+      status === 'error' || status === 'redirect';
+    const siteStatus = this.responseSiteStatus(site);
+    const survivors: Node[] = [];
+    for (const branch of branches) {
+      const status = branch === locatedBranch ? siteStatus : this.responseSiteStatus(branch);
+      if (status === 'variable') {
+        this.log(
+          `Response status at ${request.file_path}:${this.getNodeLocation(branch).start_line} ` +
+            'is not a literal; keeping that send in the route contract'
+        );
+      }
+      if (dropped(status)) continue;
+      if (branch !== locatedBranch && !isSend(branch)) continue;
+      survivors.push(branch);
+    }
+
+    const locatedDropped = dropped(siteStatus);
+    if (!locatedDropped && survivors.length <= 1) return undefined;
+
+    const recovered =
+      survivors.length > 0
+        ? this.recoverPayloadFromResponseExpressions(
+            survivors,
+            false,
+            this.wireFormatFor(request)
+          )
+        : null;
+
+    if (locatedDropped) {
+      if (recovered) {
+        this.log(
+          `Response locator at ${request.file_path}:${request.line_number} names an error ` +
+            'or redirect send; publishing the success sends of its handler instead'
+        );
+        return this.inferredFromRecoveredPayload(request, recovered);
+      }
+      this.log(
+        `Response locator at ${request.file_path}:${request.line_number} names an error ` +
+          'or redirect send and its handler sends no success body; abstaining'
+      );
+      const abstain = this.createInferredType(
+        request,
+        'unknown',
+        false,
+        this.getNodeLocation(site)
+      );
+      abstain.any_provenance = [
+        {
+          path: '',
+          kind: 'unknown',
+          reason: 'no_success_payload',
+          detail:
+            "every response this route's handler sends states an error or redirect status, " +
+            'or carries no body a JSON contract can describe, so it publishes no success body',
+        },
+      ];
+      return abstain;
+    }
+
+    if (recovered && recovered.nodes.some((node) => contains(site, node))) {
+      return this.inferredFromRecoveredPayload(request, recovered);
+    }
+    return undefined;
+  }
+
+  /**
+   * True when `candidate` is a response send: a call or `new` whose result is
+   * transport machinery (by the extraction config's verified rule or the
+   * structural check), or whose callee this handler's own returns prove is a
+   * serialiser (`calleesProvenSerialiser`, which holds on a bare checkout).
+   */
+  private isResponseSend(
+    candidate: Node,
+    extractionConfig: ExtractionConfig | undefined,
+    serialisers: Set<string>
+  ): boolean {
+    const call = this.peelTransparentExpression(candidate);
+    if (!Node.isCallExpression(call) && !Node.isNewExpression(call)) return false;
+    const identity = this.calleeIdentity(call);
+    if (identity !== undefined && serialisers.has(identity)) return true;
+    const result = this.unwrapPromiseType(call.getType());
+    if (result.isAny() || result.isUnknown()) return false;
+    return (
+      this.unwrapTypeWithConfig(result, call, extractionConfig).verifiedMachinery === true ||
+      this.typeIsOrContainsResponseMachinery(result)
+    );
+  }
+
+  /**
+   * The send `node` is an argument of, looking through the wrappers that do
+   * not change a payload (parentheses, `as`, `satisfies`, `!`, `await`) and a
+   * `JSON.stringify` around the body. `undefined` when the parent call is not
+   * a send or `node` is its callee.
+   */
+  private sendReceivingArgument(
+    node: Node,
+    isSend: (candidate: Node) => boolean
+  ): Node | undefined {
+    let current = node;
+    let parent = current.getParent();
+    while (
+      parent &&
+      (Node.isParenthesizedExpression(parent) ||
+        Node.isAsExpression(parent) ||
+        Node.isSatisfiesExpression(parent) ||
+        Node.isNonNullExpression(parent) ||
+        Node.isAwaitExpression(parent) ||
+        (Node.isCallExpression(parent) && this.unwrapJsonStringifyArg(parent) === current))
+    ) {
+      current = parent;
+      parent = current.getParent();
+    }
+    if (!parent || (!Node.isCallExpression(parent) && !Node.isNewExpression(parent))) {
+      return undefined;
+    }
+    if (!parent.getArguments().includes(current)) return undefined;
+    return isSend(parent) ? parent : undefined;
   }
 
   private inferCallResult(
@@ -2516,15 +2775,23 @@ export class TypeInferrer {
    * expanded to a structural form (primitives, library types, unresolvable
    * references), so a non-object annotation behaves exactly as before.
    */
-  private expandAnnotationTypeNode(typeNode: Node): string {
+  private expandAnnotationTypeNode(
+    typeNode: Node,
+    wire: WireFormat = 'declared'
+  ): string {
     const fallback = typeNode.getText();
     try {
       const annotationType = this.unwrapPromiseType(typeNode.getType());
-      const expanded = expandTypeStructural(annotationType);
+      const expanded = expandTypeStructural(annotationType, new Set(), 0, undefined, wire);
       // Only prefer the structural form when expansion actually inlined an
       // object shape; otherwise keep the annotation text (e.g. a bare
-      // primitive or a library type the expander leaves by name).
-      return expanded.startsWith('{') ? expanded : fallback;
+      // primitive or a library type the expander leaves by name). A wire
+      // print that differs from the declared one is a real answer too: a
+      // `Date` annotation sends a string (carrick#1163).
+      if (expanded.startsWith('{')) return expanded;
+      return wire === 'json' && expanded !== expandTypeStructural(annotationType)
+        ? expanded
+        : fallback;
     } catch {
       return fallback;
     }
@@ -2546,9 +2813,22 @@ export class TypeInferrer {
    * `fallback` is the already-computed type text (post Promise/wrapper unwrap),
    * preserved verbatim when expansion does not inline an object.
    */
-  private expandResolvedTypeStructural(type: Type, fallback: string): string {
+  private expandResolvedTypeStructural(
+    type: Type,
+    fallback: string,
+    wire: WireFormat = 'declared'
+  ): string {
     try {
-      const expanded = expandTypeStructural(type);
+      const expanded = expandTypeStructural(type, new Set(), 0, undefined, wire);
+      // A wire print that differs from the declared one is the answer even
+      // without an inlined object: a bare `Date` payload sends a string.
+      if (
+        wire === 'json' &&
+        !expanded.includes('{') &&
+        expanded !== expandTypeStructural(type)
+      ) {
+        return expanded;
+      }
       // Prefer the expanded form whenever an object got inlined, not only when
       // it leads with `{`. `expandTypeStructural` wraps arrays and unions, so a
       // resolved `Payment[]` or `(Payment | null)[]` renders as `{…}[]` or
@@ -2602,17 +2882,13 @@ export class TypeInferrer {
    */
   private recoverPayloadFromReturnStatements(
     func: FunctionLike,
-    statedOnly: boolean
-  ): {
-    typeString: string;
-    isExplicit: boolean;
-    node: Node;
-    anchorType?: Type;
-    statedTypeNode?: Node;
-  } | null {
+    statedOnly: boolean,
+    wire: WireFormat
+  ): RecoveredPayload | null {
     return this.recoverPayloadFromResponseExpressions(
       this.responseReturnedExpressions(func),
-      statedOnly
+      statedOnly,
+      wire
     );
   }
 
@@ -2629,14 +2905,9 @@ export class TypeInferrer {
    */
   private recoverPayloadFromResponseExpressions(
     expressions: Node[],
-    statedOnly: boolean
-  ): {
-    typeString: string;
-    isExplicit: boolean;
-    node: Node;
-    anchorType?: Type;
-    statedTypeNode?: Node;
-  } | null {
+    statedOnly: boolean,
+    wire: WireFormat
+  ): RecoveredPayload | null {
     const candidates: Array<{
       typeString: string;
       isExplicit: boolean;
@@ -2666,7 +2937,7 @@ export class TypeInferrer {
       const stated = this.statedTypeNodeOf(payloadNode);
       if (stated) {
         candidates.push({
-          typeString: this.expandAnnotationTypeNode(stated),
+          typeString: this.expandAnnotationTypeNode(stated, wire),
           isExplicit: true,
           node: payloadNode,
           anchorType: this.unwrapPromiseType(stated.getType()),
@@ -2679,7 +2950,8 @@ export class TypeInferrer {
       candidates.push({
         typeString: this.expandResolvedTypeStructural(
           payloadType,
-          typeText(payloadType, payloadNode)
+          typeText(payloadType, payloadNode),
+          wire
         ),
         isExplicit: false,
         node: payloadNode,
@@ -2712,6 +2984,9 @@ export class TypeInferrer {
     const typeString = distinct.map((c) => c.typeString).join(' | ');
     return {
       typeString,
+      // Every payload node that fed the union, deduped ones included: a
+      // caller asks whether the expression it located is one of them.
+      nodes: kept.map((c) => c.node),
       // Only a contract every surviving branch STATES in source is explicit.
       isExplicit: distinct.every((c) => c.isExplicit),
       node: distinct[0].node,
@@ -2819,7 +3094,7 @@ export class TypeInferrer {
       if (args.length < 2) continue;
       const statesStatus = args
         .slice(1)
-        .some((arg) => this.statedStatusCode(arg) !== undefined);
+        .some((arg) => Array.isArray(this.statedStatusCodes(arg)));
       if (!statesStatus) continue;
       const key = this.calleeIdentity(call);
       if (key) proven.add(key);
@@ -2879,7 +3154,9 @@ export class TypeInferrer {
 
     const args = call.getArguments().map((a) => this.peelTransparentExpression(a));
     if (args.length === 0) return undefined;
-    if (args.slice(1).some((a) => this.statesErrorStatus(a))) return undefined;
+    // An error or redirect branch sends no success body (carrick#1161).
+    const status = this.responseSiteStatus(call);
+    if (status === 'error' || status === 'redirect') return undefined;
 
     const identity = this.calleeIdentity(call);
     const proven = identity !== undefined && serialisers.has(identity);
@@ -2989,82 +3266,138 @@ export class TypeInferrer {
     if (properties.length === 0) return false;
     let statesInit = false;
     for (const property of properties) {
-      if (!Node.isPropertyAssignment(property)) return false;
+      // `{ status: 202, headers }` names its headers by shorthand, which
+      // states init exactly as `headers: headers` does.
+      const shorthand = Node.isShorthandPropertyAssignment(property);
+      if (!shorthand && !Node.isPropertyAssignment(property)) return false;
       const name = property.getName();
       if (!RESPONSE_INIT_MEMBER_NAMES.has(name)) return false;
-      const initializer = property.getInitializer();
-      if (!initializer) return false;
+      const value = shorthand ? property.getNameNode() : property.getInitializer();
+      if (!value) return false;
       if (name === 'headers') {
         statesInit = true;
         continue;
       }
-      if (name === 'status' && Node.isNumericLiteral(initializer)) {
-        const value = initializer.getLiteralValue();
-        if (Number.isInteger(value) && value >= 100 && value <= 599) {
-          statesInit = true;
-        }
+      if (name === 'status' && Array.isArray(this.statedStatusCodes(value))) {
+        statesInit = true;
       }
     }
     return statesInit;
   }
 
   /**
-   * True when an argument states a >= 400 status: an options object carrying
-   * `status`/`statusCode`, or a bare status code (`send(body, 404)`).
+   * What a response send states about its HTTP status (carrick#1161).
    *
-   * Read from the AST first: `{ status: 400 }` in an argument position widens
-   * to `{ status: number }`, so the literal only survives syntactically. The
-   * type check behind it catches `as const` and hoisted option objects.
+   * Read in order, and the first that states anything decides:
+   *
+   *  1. an argument past the body that carries a status: a numeric literal
+   *     (`send(body, 404)`), an options object (`{ status: 401 }`), or any
+   *     expression whose TYPE is a status literal or a union of them
+   *     (`let code: 400 | 500`). A numeric argument whose type is a plain
+   *     `number` states a status the source does not fix, which is
+   *     `variable`: the branch fails open into the union and is logged.
+   *  2. the send call's own RESULT type, when a member of it is typed as a
+   *     status literal. A framework that types its sends records the status
+   *     there, and a redirect helper's default `302` is only visible there.
+   *     A result whose status member spans success and error codes (the
+   *     default of a typed `json(body, status?)`) says nothing either way.
+   *
+   * A status in the FIRST argument is a field of the body and is never read.
+   * No method or framework name is consulted anywhere.
    */
-  private statesErrorStatus(node: Node): boolean {
-    const code = this.statedStatusCode(node);
-    return code !== undefined && code >= 400;
+  private responseSiteStatus(expression: Node): ResponseSiteStatus {
+    const call = this.peelTransparentExpression(expression);
+    if (!Node.isCallExpression(call) && !Node.isNewExpression(call)) {
+      return 'undecided';
+    }
+    const args = call.getArguments().map((a) => this.peelTransparentExpression(a));
+    const stated: number[] = [];
+    let variable = false;
+    for (const arg of args.slice(1)) {
+      const read = this.statedStatusCodes(arg);
+      if (read === 'variable') {
+        variable = true;
+      } else if (read) {
+        stated.push(...read);
+      }
+    }
+    if (stated.length > 0) {
+      const kind = classifyStatusCodes(stated);
+      return kind === 'mixed' ? 'variable' : kind;
+    }
+    if (variable) return 'variable';
+
+    const typed = this.sendResultStatusCodes(call);
+    if (typed) {
+      const kind = classifyStatusCodes(typed);
+      if (kind !== 'mixed') return kind;
+    }
+    return 'undecided';
   }
 
   /**
-   * The HTTP status an argument states, or `undefined`.
+   * The HTTP status codes an argument states, `'variable'` when it is a
+   * status-shaped value the source does not fix, or `undefined` when it says
+   * nothing about a status.
    *
    * Read from the AST first: `{ status: 400 }` in an argument position widens
    * to `{ status: number }`, so the literal only survives syntactically. The
-   * type check behind it catches `as const` and hoisted option objects. Only
-   * values in the HTTP range count — an arbitrary number named `status` on a
-   * domain object (`{ status: 2 }`) states nothing about transport.
+   * type read behind it catches `as const`, hoisted option objects and
+   * literal-typed variables. Only values in the HTTP range count: an
+   * arbitrary number named `status` on a domain object (`{ status: 2 }`)
+   * states nothing about transport.
    */
-  private statedStatusCode(node: Node): number | undefined {
-    const asStatus = (value: unknown): number | undefined =>
-      typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599
-        ? value
-        : undefined;
-
+  private statedStatusCodes(node: Node): number[] | 'variable' | undefined {
     if (Node.isNumericLiteral(node)) {
-      return asStatus(node.getLiteralValue());
+      const code = httpStatus(node.getLiteralValue());
+      return code === undefined ? undefined : [code];
     }
 
     if (Node.isObjectLiteralExpression(node)) {
       for (const name of STATUS_MEMBER_NAMES) {
         const property = node.getProperty(name);
-        if (property && Node.isPropertyAssignment(property)) {
-          const initializer = property.getInitializer();
-          if (initializer && Node.isNumericLiteral(initializer)) {
-            const code = asStatus(initializer.getLiteralValue());
-            if (code !== undefined) return code;
-          }
-        }
+        if (!property || !Node.isPropertyAssignment(property)) continue;
+        const initializer = property.getInitializer();
+        if (!initializer) continue;
+        const read = this.statedStatusCodes(this.peelTransparentExpression(initializer));
+        if (read) return read;
       }
+      return undefined;
     }
 
     const type = node.getType();
+    const fromType = statusCodesOfType(type);
+    if (fromType) return fromType;
+    if (type.isNumber()) return 'variable';
     for (const name of STATUS_MEMBER_NAMES) {
       const property = type.getProperty(name);
       const declaration = property?.getDeclarations()[0];
       if (!property || !declaration) continue;
-      const propertyType = property.getTypeAtLocation(declaration);
-      if (propertyType.isNumberLiteral()) {
-        const code = asStatus(propertyType.getLiteralValue());
-        if (code !== undefined) return code;
-      }
+      const propertyType = property.getTypeAtLocation(declaration).getNonNullableType();
+      const codes = statusCodesOfType(propertyType);
+      if (codes) return codes;
+      if (propertyType.isNumber()) return 'variable';
     }
     return undefined;
+  }
+
+  /**
+   * Status codes a send call's result type records: the members (of the
+   * result, or of each part of an intersection result) typed as a status
+   * literal or a union of them. `undefined` when none is.
+   */
+  private sendResultStatusCodes(call: Node): number[] | undefined {
+    const result = this.unwrapPromiseType(call.getType());
+    const parts = result.isIntersection() ? result.getIntersectionTypes() : [result];
+    const codes: number[] = [];
+    for (const part of parts) {
+      if (part.isAny() || part.isUnknown() || !part.isObject()) continue;
+      for (const property of part.getProperties()) {
+        const codesHere = statusCodesOfType(property.getTypeAtLocation(call));
+        if (codesHere) codes.push(...codesHere);
+      }
+    }
+    return codes.length > 0 ? codes : undefined;
   }
 
   /**

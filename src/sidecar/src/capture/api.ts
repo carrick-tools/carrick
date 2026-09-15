@@ -154,6 +154,10 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    position while its parsed output is concrete, which is what a coercion
  *    declares (carrick#1101). The published type carries the output there, so
  *    this finding describes what a caller may send, not the printed member.
+ *  - `no_success_payload`: a route's handler sends only error or redirect
+ *    responses (by the status each send states), or no success send carries a
+ *    body a JSON contract can describe, so the route publishes no success body
+ *    rather than an error body or a redirect location (carrick#1161).
  *  - `not_recorded`: the position carries a top type and this layer has no
  *    cause for it.
  */
@@ -163,6 +167,7 @@ export type TypeProvenanceReason =
   | 'no_payload_evidence'
   | 'machinery_envelope'
   | 'coerced_input'
+  | 'no_success_payload'
   | 'not_recorded';
 
 /**
