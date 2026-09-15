@@ -166,7 +166,7 @@ router.post('/relay', async (c) => {
 
 router.post('/forward', async (c) => {
   if (unconfigured) {
-    return c.json({ error: 'envelope too large' }, 413);
+    return c.json({ error: 'payload rejected' }, 422);
   }
   const headers: Record<string, string> = {};
   return new Response(null, { status: 202, headers });
@@ -348,7 +348,7 @@ describe('carrick#1161 response sites in the anchored handler', () => {
   });
 
   it('never reads a response init object as the success body', async () => {
-    const inferred = await inferResponse('ForwardFromError', '/forward', "{ error: 'envelope too large' }");
+    const inferred = await inferResponse('ForwardFromError', '/forward', "{ error: 'payload rejected' }");
     assert.ok(inferred, 'the abstain is reported');
     assert.strictEqual(
       collapse(inferred.type_string),
