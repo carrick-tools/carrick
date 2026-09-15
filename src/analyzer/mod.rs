@@ -3269,7 +3269,7 @@ impl Analyzer {
             .get_resolved_endpoints()
             .iter()
             .filter(|endpoint| {
-                endpoint.method.eq_ignore_ascii_case(method)
+                carrick_match::method_matches(&endpoint.method, method)
                     && normalize_compat_path(&endpoint.full_path) == want
             })
             .map(|endpoint| endpoint.provenance)
@@ -3303,7 +3303,7 @@ impl Analyzer {
                 // it is usually a model row — folding it in would demote a
                 // deterministic route that happens to share its key.
                 endpoint.evidence == carrick_match::MatchEvidence::RouteDefinition
-                    && endpoint.method.eq_ignore_ascii_case(method)
+                    && carrick_match::method_matches(&endpoint.method, method)
                     && normalize_compat_path(&endpoint.full_path) == want
             })
             .map(|endpoint| endpoint.resolution_source)

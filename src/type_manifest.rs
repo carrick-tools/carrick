@@ -20,6 +20,17 @@ pub fn is_http_method(method: &str) -> bool {
     )
 }
 
+/// Whether a producer may be registered under `method`: any HTTP method, or
+/// the any-method label a route registered with `.all()` carries
+/// ([`carrick_match::ANY_METHOD`], carrick#1148). Consumer-side gates keep
+/// [`is_http_method`]: no request is ever sent with `ALL`.
+pub fn is_producer_method(method: &str) -> bool {
+    is_http_method(method)
+        || method
+            .trim()
+            .eq_ignore_ascii_case(carrick_match::ANY_METHOD)
+}
+
 pub fn build_display_name(key: &OperationKey, type_kind: &str) -> String {
     let kind = if type_kind.is_empty() {
         type_kind.to_string()
@@ -463,6 +474,17 @@ mod tests {
         assert!(is_http_method("delete"));
         assert!(!is_http_method("unknown"));
         assert!(!is_http_method(".json()"));
+        // No request is sent with ALL: it is a producer label only.
+        assert!(!is_http_method("ALL"));
+    }
+
+    #[test]
+    fn an_any_method_route_is_a_producer_method() {
+        assert!(is_producer_method("ALL"));
+        assert!(is_producer_method("all"));
+        assert!(is_producer_method("GET"));
+        assert!(!is_producer_method("USE"));
+        assert!(!is_producer_method(""));
     }
 
     #[test]
