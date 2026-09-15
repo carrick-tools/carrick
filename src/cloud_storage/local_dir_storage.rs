@@ -184,6 +184,15 @@ impl CloudStorage for LocalDirStorage {
         Ok(())
     }
 
+    /// Nothing to ship: this backend is the offline harness and the local
+    /// join, and neither has a cloud to send a log to. Saying so here stops the
+    /// engine at its gate, where it used to call the no-op above and then log
+    /// "Uploaded run logs to S3" for a run that sent nothing, which read as
+    /// the join having uploaded the laptop's log.
+    fn uploads_run_logs(&self) -> bool {
+        false
+    }
+
     async fn upload_type_file(
         &self,
         repo_name: &str,
@@ -235,5 +244,15 @@ mod tests {
             store.cache_path("a/b", Some("c\\d")),
             dir.path().join("a_b__c_d.json")
         );
+    }
+
+    /// The local join runs after every laptop scan, in the same log file. When
+    /// it claimed a run log it never sent, that line was the only "Uploaded
+    /// run logs" a reader of the laptop's log could find.
+    #[test]
+    fn local_storage_does_not_claim_to_ship_run_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalDirStorage::new(dir.path().to_path_buf(), false).unwrap();
+        assert!(!store.uploads_run_logs());
     }
 }
