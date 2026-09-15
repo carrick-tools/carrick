@@ -1286,6 +1286,200 @@ fn a_detached_scan_outlives_the_command_that_started_it() {
     );
 }
 
+/// The field report behind carrick#1132: `carrick index` run in the foreground
+/// for fifteen minutes, and `carrick status` from a second terminal answered
+/// every minute that there was no index and to run `carrick index`.
+///
+/// So the foreground build is started here the way a terminal starts it — in
+/// a process group of its own, which is what a Ctrl-C is delivered to — and
+/// asked about while it runs. Then it gets the Ctrl-C, and the record it leaves
+/// has to say that, not `running` with a pid that is gone.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn a_foreground_scan_is_named_by_status_and_says_it_was_interrupted() {
+    use std::os::unix::process::CommandExt;
+
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    for repo in ["catalog-web", "inventory-svc"] {
+        std::fs::write(root.join(repo).join("carrick.json"), "{}\n").expect("write a config");
+    }
+    let output = std::fs::File::create(root.join("foreground.out")).expect("output file");
+    let mut build = Command::new(carrick())
+        .args(["index", "--workspace", "."])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env("CARRICK_MOCK_ALL", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(output.try_clone().expect("output file"))
+        .stderr(output)
+        .process_group(0)
+        .spawn()
+        .expect("start carrick index");
+    let pid = build.id();
+    let printed = || std::fs::read_to_string(root.join("foreground.out")).unwrap_or_default();
+
+    // The record appears as the build starts, before `.carrick` holds anything
+    // else; wait on it rather than on a clock.
+    let index_dir = root.join(".carrick");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let record = loop {
+        let found = std::fs::read_dir(&index_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("scan-") && name.ends_with(".json"))
+            })
+            .filter_map(|path| std::fs::read_to_string(&path).ok().map(|text| (path, text)))
+            .filter_map(|(path, text)| {
+                serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .map(|body| (path, body))
+            })
+            .find(|(_, body)| body["pid"] == serde_json::json!(pid));
+        if let Some(found) = found {
+            break found;
+        }
+        assert!(
+            build.try_wait().expect("poll the build").is_none(),
+            "the build ended without ever recording its scan:\n{}",
+            printed()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "no scan record for the foreground build:\n{}",
+            printed()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let (state, body) = record;
+    let scan_id = body["scan_id"].as_str().expect("a scan id").to_string();
+    assert_eq!(scan_id.len(), 8, "{body:#}");
+
+    // A mocked build is over in about a second, which is not long enough to
+    // ask it anything or to Ctrl-C it at a known moment. So it is held: the
+    // group is stopped at a moment the build has a scan subprocess out, and
+    // only the build is let go again. It then waits on a scan that is not
+    // moving, which is a fifteen-minute scan as far as anything here can tell.
+    let group = libc::pid_t::try_from(pid).expect("a pid that fits");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        // SAFETY: signals to the process group this test created.
+        unsafe { libc::kill(-group, libc::SIGSTOP) };
+        // A child of the build that is stopped, not one that has exited and
+        // is waiting to be reaped: the build is past a zombie.
+        let table = Command::new("ps")
+            .args(["-A", "-o", "ppid=,stat="])
+            .output()
+            .expect("ps");
+        let holding = String::from_utf8_lossy(&table.stdout).lines().any(|row| {
+            let mut columns = row.split_whitespace();
+            columns.next() == Some(pid.to_string().as_str())
+                && columns.next().is_some_and(|stat| stat.starts_with('T'))
+        });
+        if holding {
+            unsafe { libc::kill(group, libc::SIGCONT) };
+            break;
+        }
+        unsafe { libc::kill(-group, libc::SIGCONT) };
+        assert!(
+            build.try_wait().expect("poll the build").is_none(),
+            "the build ended before it could be held:\n{}",
+            printed()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the build never ran a scan:\n{}",
+            printed()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let held: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).expect("the record"))
+            .expect("the record is JSON");
+    assert_eq!(held["status"], serde_json::json!("running"), "{held:#}");
+
+    // What the second terminal reads. The build may have written an index by
+    // now or not, so the whole output is read, and neither half may tell the
+    // user to start the scan that is running.
+    let asked = Command::new(carrick())
+        .args(["status", "--workspace", "."])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .output()
+        .expect("carrick status");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&asked.stdout),
+        String::from_utf8_lossy(&asked.stderr)
+    );
+    assert!(
+        said.contains(&format!("scan {scan_id} running for")),
+        "status names the foreground scan:\n{said}"
+    );
+    assert!(
+        !said.contains("Run `carrick index"),
+        "and never orders the scan that is running:\n{said}"
+    );
+    assert!(
+        !said.contains(&format!("scan-{scan_id}.log")) && !said.contains("scan-<id>.log"),
+        "a foreground scan wrote no log in .carrick to point at:\n{said}"
+    );
+    let text = run(root, &["status", "--workspace", ".", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("status --json was not JSON: {e}\n{text}"));
+    assert_eq!(
+        json["running_scans"][0]["scan_id"],
+        serde_json::json!(scan_id),
+        "{json:#}"
+    );
+
+    // Ctrl-C, to the whole group, as a terminal sends it.
+    // SAFETY: a signal to the process group this test created.
+    unsafe { libc::kill(-group, libc::SIGINT) };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let exit = loop {
+        if let Some(exit) = build.try_wait().expect("poll the build") {
+            break exit;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the build ignored the Ctrl-C:\n{}",
+            printed()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // Whatever of the group is still going is not under test; it must not
+    // outlive the workspace it is writing into.
+    // SAFETY: as above.
+    unsafe { libc::kill(-group, libc::SIGKILL) };
+    assert_eq!(exit.code(), Some(130), "{}", printed());
+
+    let ended: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).expect("the record is kept"))
+            .expect("the record is JSON");
+    assert_eq!(ended["status"], serde_json::json!("failed"), "{ended:#}");
+    assert!(
+        ended["error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("interrupted by SIGINT")),
+        "{ended:#}"
+    );
+    let rendered = run(root, &["status", "--workspace", "."]);
+    assert!(
+        rendered.contains(&format!("scan {scan_id} failed after"))
+            && rendered.contains("interrupted by SIGINT"),
+        "status says the scan was interrupted, not that it stopped:\n{rendered}"
+    );
+}
+
 /// A scan killed part-way is the case the flag exists for, so it is the one
 /// `carrick status` must name rather than going quiet (carrick#992).
 ///
