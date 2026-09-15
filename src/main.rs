@@ -43,6 +43,7 @@ mod phase_timing;
 mod progress;
 mod receiver_origin;
 mod receiver_type;
+mod retry_budget;
 mod scan_health;
 mod scan_spend;
 mod scan_stage;

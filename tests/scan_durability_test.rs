@@ -241,6 +241,7 @@ fn offline_env() {
         std::env::set_var("CARRICK_MOCK_ALL", "1");
         std::env::set_var("CARRICK_SKIP_INTENTS", "1");
         std::env::set_var(carrick::engine::durability::RETRY_DELAY_ENV, "0");
+        std::env::remove_var(carrick::retry_budget::BUDGET_ENV);
         std::env::remove_var("CARRICK_MOCK_FIXTURE_DIR");
         std::env::remove_var(carrick::scan_health::ALLOW_PARTIAL_ENV);
         std::env::remove_var("GITHUB_EVENT_NAME");
@@ -248,12 +249,20 @@ fn offline_env() {
     }
 }
 
-fn detect_requests() -> usize {
+fn requests_to(route: &str) -> usize {
     carrick::agent_service::request_counts()
-        .get("/framework-detect")
+        .get(route)
         .copied()
         .unwrap_or(0)
 }
+
+fn detect_requests() -> usize {
+    requests_to("/framework-detect")
+}
+
+/// Matches the one `general` guidance request each service makes, and none of
+/// the pattern or extraction-config requests beside it.
+const GENERAL_GUIDANCE: &str = "\"task\":\"general\"";
 
 /// One exhausted detection call is absorbed by the retry at the end of the
 /// run: every service lands, service 2 with its detection cached, and the
@@ -440,4 +449,147 @@ async fn on_a_laptop_a_held_back_service_keeps_its_served_generation() {
     let markers = rescan.scan_failed.lock().unwrap().clone();
     assert_eq!(markers.len(), 1, "{markers:?}");
     assert!(markers[0].1.contains("beta"), "{markers:?}");
+}
+
+/// A spent run-wide retry budget skips the in-run retry (carrick#1126): one
+/// detection failure that the retry would have absorbed leaves the service
+/// pending instead, and the run finishes without asking again.
+#[tokio::test]
+#[serial]
+async fn a_spent_retry_budget_leaves_the_owed_service_pending_without_a_retry() {
+    offline_env();
+    // SAFETY: `#[serial]`, as in `offline_env`.
+    unsafe {
+        std::env::set_var(carrick::retry_budget::BUDGET_ENV, "0");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = three_service_repo(tmp.path());
+    let storage = StubStorage::laptop(&[]);
+
+    carrick::agent_service::inject_mock_failure("/framework-detect", BETA_ONLY_DEPENDENCY, 1);
+    let before = detect_requests();
+    let outcome =
+        run_analysis_engine_with_sidecar(storage.clone(), repo.to_str().unwrap(), None, false)
+            .await;
+    // The budget knob is reset before any assertion can leave it set.
+    offline_env();
+    outcome.expect("a laptop run with a pending service exits 0");
+
+    assert_eq!(
+        detect_requests() - before,
+        3,
+        "no in-run retry once the budget is spent"
+    );
+    assert_eq!(storage.uploaded_services(), ["alpha", "beta", "gamma"]);
+    let beta = storage.latest("beta").unwrap();
+    assert!(beta.cached_detection.is_none() && beta.cached_guidance.is_none());
+    assert!(storage.uploads().iter().all(|u| !u.final_in_run));
+    let markers = storage.scan_failed.lock().unwrap().clone();
+    assert_eq!(markers.len(), 1, "{markers:?}");
+    assert!(markers[0].1.contains("beta"), "{markers:?}");
+}
+
+/// A guidance failure keeps the detection that answered (carrick#1126). Alpha's
+/// guidance fails and the budget skips the in-run retry, so alpha lands
+/// pending with its detection cached and no guidance; the rescan asks alpha's
+/// guidance again and nobody's detection.
+#[tokio::test]
+#[serial]
+async fn a_guidance_failure_keeps_the_detection_and_the_rescan_asks_guidance_only() {
+    offline_env();
+    // SAFETY: `#[serial]`, as in `offline_env`.
+    unsafe {
+        std::env::set_var(carrick::retry_budget::BUDGET_ENV, "0");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = three_service_repo(tmp.path());
+    let storage = StubStorage::laptop(&[]);
+
+    // Alpha is analysed first, so its general guidance request is the first
+    // one this matches.
+    carrick::agent_service::inject_mock_failure("/framework-guidance", GENERAL_GUIDANCE, 1);
+    let outcome =
+        run_analysis_engine_with_sidecar(storage.clone(), repo.to_str().unwrap(), None, false)
+            .await;
+    offline_env();
+    outcome.expect("a laptop run with a pending service exits 0");
+
+    let alpha = storage.latest("alpha").unwrap();
+    assert!(
+        alpha.cached_detection.is_some(),
+        "the detection that answered is kept"
+    );
+    assert!(
+        alpha.cached_guidance.is_none(),
+        "the guidance that failed is still owed"
+    );
+    assert!(
+        alpha.file_results.as_ref().is_none_or(|r| r.is_empty()),
+        "a guidance-deferred service is analysed facts-only"
+    );
+    for service in ["beta", "gamma"] {
+        let data = storage.latest(service).unwrap();
+        assert!(data.cached_guidance.is_some(), "{service} is complete");
+    }
+    let markers = storage.scan_failed.lock().unwrap().clone();
+    assert_eq!(markers.len(), 1, "{markers:?}");
+    assert!(markers[0].1.contains("alpha"), "{markers:?}");
+    assert!(markers[0].1.contains("framework guidance"), "{markers:?}");
+
+    let rescan = StubStorage {
+        indexed: Some(vec!["alpha".into(), "beta".into(), "gamma".into()]),
+        ..storage.clone()
+    };
+    let already = storage.uploads().len();
+    let detect_before = detect_requests();
+    let guidance_before = requests_to("/framework-guidance");
+    run_analysis_engine_with_sidecar(rescan.clone(), repo.to_str().unwrap(), None, false)
+        .await
+        .expect("the rescan succeeds");
+    assert_eq!(
+        detect_requests() - detect_before,
+        0,
+        "no detection is asked again"
+    );
+    // One service's guidance: four pattern categories and the general
+    // request. Its extraction config answered the first time and is replayed.
+    assert_eq!(
+        requests_to("/framework-guidance") - guidance_before,
+        5,
+        "alpha's guidance, and nothing else, is asked again"
+    );
+    let alpha = rescan.latest("alpha").unwrap();
+    assert!(alpha.cached_detection.is_some() && alpha.cached_guidance.is_some());
+    assert!(
+        rescan.uploads()[already..].last().unwrap().final_in_run,
+        "a complete rescan closes its scan"
+    );
+}
+
+/// The in-run retry of a guidance failure asks guidance only: three detection
+/// requests in all, and every service lands complete (carrick#1126).
+#[tokio::test]
+#[serial]
+async fn the_in_run_retry_of_a_guidance_failure_does_not_ask_detection_again() {
+    offline_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = three_service_repo(tmp.path());
+    let storage = StubStorage::laptop(&[]);
+
+    carrick::agent_service::inject_mock_failure("/framework-guidance", GENERAL_GUIDANCE, 1);
+    let before = detect_requests();
+    run_analysis_engine_with_sidecar(storage.clone(), repo.to_str().unwrap(), None, false)
+        .await
+        .expect("a recovered guidance failure must not fail the run");
+
+    assert_eq!(detect_requests() - before, 3);
+    for service in ["alpha", "beta", "gamma"] {
+        let data = storage.latest(service).unwrap();
+        assert!(
+            data.cached_detection.is_some() && data.cached_guidance.is_some(),
+            "{service} is complete"
+        );
+    }
+    assert!(storage.uploads().last().unwrap().final_in_run);
+    assert!(storage.scan_failed.lock().unwrap().is_empty());
 }

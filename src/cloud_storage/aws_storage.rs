@@ -2649,6 +2649,37 @@ mod tests {
         );
     }
 
+    /// The interrupt path's marker (carrick#1126): `main` posts it through a
+    /// fresh storage that never opened the scan, naming the id the process
+    /// kept. Same envelope, the id it was given, the laptop credential; and a
+    /// CI storage sends nothing, since no slot was ever claimed.
+    #[tokio::test]
+    async fn an_interrupted_scan_is_marked_by_the_id_it_was_handed() {
+        let (storage, server) =
+            bearer_storage(vec![(200, serde_json::json!({ "ok": true }).to_string())]);
+
+        storage
+            .report_scan_failed_for("scan_kept", "definitions", "interrupted")
+            .await;
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        let body = body_of(&requests[0]);
+        assert_eq!(body["action"], "scan-failed");
+        assert_eq!(body["scan_id"], "scan_kept");
+        assert_eq!(body["stage"], "definitions");
+        assert_eq!(body["reason"], "interrupted");
+        assert!(
+            has_header(&requests[0], "authorization", "Bearer carrick_sk_live_test"),
+            "{}",
+            requests[0]
+        );
+
+        let ci = AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Oidc, false);
+        ci.report_scan_failed_for("scan_kept", "definitions", "interrupted")
+            .await;
+    }
+
     /// A cloud deployed before `scan-failed` existed answers 4xx, and the run
     /// carries on: the marker is bookkeeping about a failure, never a second
     /// failure of its own. One attempt, so the refusal is not retried either.

@@ -43,6 +43,7 @@ pub mod phase_timing;
 pub mod progress;
 pub mod receiver_origin;
 pub mod receiver_type;
+pub mod retry_budget;
 pub mod scan_health;
 pub mod scan_spend;
 pub mod scan_stage;
