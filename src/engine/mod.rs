@@ -10,7 +10,7 @@ use crate::cloud_storage::{
 use crate::config::Config;
 use crate::file_finder::find_service_files;
 use crate::framework_detector::{DetectionResult, FrameworkDetector};
-use crate::intent_generator::{IntentsInFlight, intents_by_hash};
+use crate::intent_generator::{IntentsInFlight, PreviousIntents, RunIntentMemo};
 use crate::logging;
 use crate::mount_graph::MountGraph;
 use crate::multi_agent_orchestrator::MultiAgentOrchestrator;
@@ -486,6 +486,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // question about the same tree, and rebuilding it per service was the
     // largest fixed cost in the analysis phase (carrick#767).
     let mut workspace_scan = crate::external_call_candidates::WorkspaceScan::new();
+    // One intent memo for the whole scan, so a function several services hold
+    // is described once (carrick#1080).
+    let run_intents = RunIntentMemo::default();
     for (index, service) in services.iter().enumerate() {
         // One line per service, at info, before the work starts. A scan of a
         // large monorepo spends most of its wall clock inside this loop, and
@@ -536,6 +539,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             sidecar,
             previous_data.as_ref(),
             &mut workspace_scan,
+            &run_intents,
         )
         .await?;
 
@@ -1858,6 +1862,7 @@ async fn analyze_current_repo_incremental(
     sidecar: Option<&TypeSidecar>,
     previous_data: Option<&CloudRepoData>,
     workspace: &mut crate::external_call_candidates::WorkspaceScan,
+    run_intents: &RunIntentMemo,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     let start = Instant::now();
 
@@ -1921,7 +1926,8 @@ async fn analyze_current_repo_incremental(
             let intents = IntentsInFlight::start(
                 AgentService::new(),
                 function_definitions,
-                intents_by_hash(&prev.function_definitions),
+                PreviousIntents::from_definitions(&prev.function_definitions),
+                run_intents.clone(),
             );
 
             let prev_file_results = prev.file_results.as_ref().unwrap();
@@ -2285,7 +2291,7 @@ async fn analyze_current_repo_incremental(
     // scan's intents so a full re-analysis re-pays /generate-intent only for
     // functions whose content actually changed.
     let prev_intents = previous_data
-        .map(|prev| intents_by_hash(&prev.function_definitions))
+        .map(|prev| PreviousIntents::from_definitions(&prev.function_definitions))
         .unwrap_or_default();
     let cloud_data = analyze_current_repo(
         repo_path,
@@ -2294,6 +2300,7 @@ async fn analyze_current_repo_incremental(
         sidecar,
         prev_intents,
         workspace,
+        run_intents,
     )
     .await?;
 
@@ -4986,8 +4993,9 @@ async fn analyze_current_repo(
     service: &Config,
     packages: &Packages,
     sidecar: Option<&TypeSidecar>,
-    prev_intents_by_hash: HashMap<String, String>,
+    previous_intents: PreviousIntents,
     workspace: &mut crate::external_call_candidates::WorkspaceScan,
+    run_intents: &RunIntentMemo,
 ) -> Result<CloudRepoData, Box<dyn std::error::Error>> {
     // Canonicalize repo_path for consistent path normalization between runs
     let canonical = std::fs::canonicalize(repo_path)
@@ -5020,7 +5028,8 @@ async fn analyze_current_repo(
     let intents = IntentsInFlight::start(
         AgentService::new(),
         function_definitions,
-        prev_intents_by_hash,
+        previous_intents,
+        run_intents.clone(),
     );
 
     // 3. Create MultiAgentOrchestrator (auth is via GitHub Actions OIDC)
@@ -8238,11 +8247,8 @@ mod tests {
         assert_eq!(def.intent_input_hash.as_deref(), Some("deadbeef"));
 
         // And the map feeding the cache is rebuilt correctly from that blob.
-        let by_hash = crate::intent_generator::intents_by_hash(&deserialized.function_definitions);
-        assert_eq!(
-            by_hash.get("deadbeef").map(String::as_str),
-            Some("fetches a user by id")
-        );
+        let previous = PreviousIntents::from_definitions(&deserialized.function_definitions);
+        assert_eq!(previous.for_hash("deadbeef"), Some("fetches a user by id"));
     }
 
     #[test]

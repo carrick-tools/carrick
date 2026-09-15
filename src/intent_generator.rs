@@ -48,23 +48,99 @@ fn compute_intent_hash(body: &str, called_intents: &[String]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Build a `content_hash -> intent` map from a previous scan's function
-/// definitions, keeping only entries that carry both an intent and the hash of
-/// the inputs that produced it. Passed into [`generate_function_intents`] so an
-/// unchanged function (same body + same callee intents) reuses its prior intent
-/// without another `/generate-intent` call. Definitions from a scan that
-/// predates content hashing simply lack `intent_input_hash` and are skipped
-/// (treated as cache misses).
-pub fn intents_by_hash(
-    function_definitions: &HashMap<String, FunctionDefinition>,
-) -> HashMap<String, String> {
-    function_definitions
-        .values()
-        .filter_map(|def| match (&def.intent_input_hash, &def.intent) {
-            (Some(hash), Some(intent)) => Some((hash.clone(), intent.clone())),
-            _ => None,
-        })
-        .collect()
+/// What the previous scan of a service left for the intent pass.
+///
+/// `by_hash` is the content-addressed cache: a function whose freshly computed
+/// hash is in it (same body, same callee intents) reuses that intent without a
+/// `/generate-intent` call. Only entries carrying both an intent and the hash
+/// that produced it go in; a row the cloud carried forward has no hash and is a
+/// miss.
+///
+/// `by_key` is each function's previous intent by definition key, for a
+/// function this run defers (carrick#1080): one whose callee got no intent is
+/// not keyed at all, and keeps what it had. The key is the whole identity: a
+/// name two files define is keyed with its repo-relative path (#582), so a
+/// key names the same symbol on both scans.
+#[derive(Debug, Clone, Default)]
+pub struct PreviousIntents {
+    by_hash: HashMap<String, String>,
+    by_key: HashMap<String, PreviousIntent>,
+}
+
+#[derive(Debug, Clone)]
+struct PreviousIntent {
+    intent: String,
+    hash: Option<String>,
+}
+
+impl PreviousIntents {
+    /// Read a previous scan's function definitions.
+    pub fn from_definitions(function_definitions: &HashMap<String, FunctionDefinition>) -> Self {
+        let mut previous = Self::default();
+        for (key, def) in function_definitions {
+            let Some(intent) = &def.intent else {
+                continue;
+            };
+            if let Some(hash) = &def.intent_input_hash {
+                previous.by_hash.insert(hash.clone(), intent.clone());
+            }
+            previous.by_key.insert(
+                key.clone(),
+                PreviousIntent {
+                    intent: intent.clone(),
+                    hash: def.intent_input_hash.clone(),
+                },
+            );
+        }
+        previous
+    }
+
+    /// The intent a previous scan generated from exactly these inputs.
+    pub fn for_hash(&self, hash: &str) -> Option<&str> {
+        self.by_hash.get(hash).map(String::as_str)
+    }
+
+    /// The previous intent of the function at `key`, with the hash that
+    /// produced it if it has one.
+    fn for_function(&self, key: &str) -> Option<&PreviousIntent> {
+        self.by_key.get(key)
+    }
+}
+
+/// Intents described earlier in this run, shared across the services of one
+/// scan (carrick#1080 D6).
+///
+/// Keyed on the request's `name` and the content hash, which covers the body
+/// and the callee intents: exactly what the cloud's intent cache key reads, so
+/// a hit is a request another service already made or replayed from its own
+/// previous scan. A workspace whose members hold the same function describes
+/// it once, and its callers then see the same callee intent in every member,
+/// so they dedupe too. The key material itself is unchanged.
+///
+/// Services are analysed one after another, so a later service reads what an
+/// earlier one settled; only described intents are recorded, never failures,
+/// so a later service still asks for a function an earlier one failed on.
+#[derive(Debug, Clone, Default)]
+pub struct RunIntentMemo {
+    described: std::sync::Arc<std::sync::Mutex<HashMap<(String, String), String>>>,
+}
+
+impl RunIntentMemo {
+    fn get(&self, name: &str, hash: &str) -> Option<String> {
+        self.described
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(name.to_string(), hash.to_string()))
+            .cloned()
+    }
+
+    fn record(&self, name: &str, hash: &str, intent: &str) {
+        self.described
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry((name.to_string(), hash.to_string()))
+            .or_insert_with(|| intent.to_string());
+    }
 }
 
 /// Bodies at or under this size, on a single line, are trivial
@@ -433,15 +509,52 @@ where
 /// - Each function's `calls` is populated with references to local callees
 /// - `body_source` is stripped from ALL functions (source stays in GitHub, not AWS)
 ///
-/// `prev_intents_by_hash` is a `content_hash -> intent` map from the previous
-/// scan (see [`intents_by_hash`]). A function whose freshly-computed hash is
-/// present in the map reuses that intent without calling `/generate-intent`.
-/// Pass an empty map for a full (non-incremental) scan.
+/// `previous` is what the previous scan of this service left (see
+/// [`PreviousIntents`]): a function whose freshly computed hash it holds reuses
+/// that intent without calling `/generate-intent`. Pass
+/// `PreviousIntents::default()` when there is no previous scan. `memo` holds
+/// what earlier services in this run described, so a function two members
+/// share is asked for once.
+///
+/// A function none of whose callees failed is hashed and asked exactly as it
+/// always was. A function with a callee that got no intent this run (a failed,
+/// refused, aborted or discarded answer, or a callee itself deferred) is
+/// deferred: it is not hashed, no request is sent for it, it keeps its previous
+/// intent and hash when it has one, and it is asked on the next scan, when the
+/// callee is. A caller is never keyed on a missing callee, so one failed call
+/// does not re-key its callers on the scan after (carrick#1080 D7).
 pub async fn generate_function_intents(
     agent_service: &AgentService,
     function_definitions: &mut HashMap<String, FunctionDefinition>,
-    prev_intents_by_hash: &HashMap<String, String>,
+    previous: &PreviousIntents,
+    memo: &RunIntentMemo,
 ) {
+    describe_functions(function_definitions, previous, memo, |payload| async move {
+        // The mock seed only picks a canned answer in mock mode.
+        let seed = payload
+            .get("name")
+            .and_then(|name| name.as_str())
+            .unwrap_or("batch")
+            .to_string();
+        agent_service
+            .post_to_lambda("/generate-intent", &payload, &seed)
+            .await
+    })
+    .await
+}
+
+/// [`generate_function_intents`] over any `/generate-intent` transport: `send`
+/// takes one request body and returns the lambda's answer text. The public
+/// function passes the real lambda; tests pass a recorder.
+async fn describe_functions<S, SFut>(
+    function_definitions: &mut HashMap<String, FunctionDefinition>,
+    previous: &PreviousIntents,
+    memo: &RunIntentMemo,
+    send: S,
+) where
+    S: Fn(serde_json::Value) -> SFut,
+    SFut: std::future::Future<Output = Result<String, AgentCallError>>,
+{
     // Process every function with a body source, skipping trivial
     // single-line bodies (see TRIVIAL_BODY_MAX_CHARS): no lambda call,
     // no intent, permanently cheap. There is no export gate. Non-exported
@@ -521,11 +634,21 @@ pub async fn generate_function_intents(
     let mut intents: HashMap<String, String> = HashMap::new();
     let mut hashes: HashMap<String, String> = HashMap::new();
     let mut reused = 0usize;
+    let mut shared = 0usize;
     let mut generated = 0usize;
+    // Functions that ended their level without an intent: their own call
+    // failed, or a callee's did. A caller of any of them is deferred rather
+    // than keyed without it (carrick#1080 D7).
+    let mut undescribed: HashSet<String> = HashSet::new();
+    // The subset whose own request failed. Those get no intent this run, as a
+    // failed call always gave; every other undescribed function keeps its
+    // previous one.
+    let mut failed_calls: HashSet<String> = HashSet::new();
+    let mut deferred = 0usize;
     // Intents are one call per eligible function and the long phase of a
     // hosted scan, so this is the count a waiting parent renders
     // (carrick#955). A function is counted once it is settled, whether that
-    // took a call or a cache hit.
+    // took a call, a cache hit or a deferral.
     let mut describing =
         crate::progress::Ticker::new(crate::progress::Phase::Intents, eligible.len());
 
@@ -533,6 +656,9 @@ pub async fn generate_function_intents(
         // Compute each function's called_intents context and content hash, then
         // split into cache hits (reuse) and misses (call the lambda).
         let mut to_generate: Vec<Pending> = Vec::new();
+        // Merged into `undescribed` only after the level, so a deferral in the
+        // cycle level never depends on the order that level is walked in.
+        let mut deferred_here: Vec<String> = Vec::new();
 
         for name in level {
             let Some(def) = function_definitions.get(name) else {
@@ -541,6 +667,15 @@ pub async fn generate_function_intents(
             let Some(body) = def.body_source.as_ref() else {
                 continue;
             };
+
+            if deps
+                .get(name)
+                .is_some_and(|called| called.iter().any(|callee| undescribed.contains(callee)))
+            {
+                deferred_here.push(name.clone());
+                describing.item();
+                continue;
+            }
 
             let called_intents: Vec<String> = deps
                 .get(name)
@@ -558,11 +693,18 @@ pub async fn generate_function_intents(
 
             let hash = compute_intent_hash(body, &called_intents);
 
-            if let Some(prev_intent) = prev_intents_by_hash.get(&hash) {
+            if let Some(prev_intent) = previous.for_hash(&hash) {
                 // Identical body + callee context as a prior scan — reuse.
-                intents.insert(name.clone(), prev_intent.clone());
+                memo.record(name, &hash, prev_intent);
+                intents.insert(name.clone(), prev_intent.to_string());
                 hashes.insert(name.clone(), hash);
                 reused += 1;
+                describing.item();
+            } else if let Some(intent) = memo.get(name, &hash) {
+                // The same request another service in this run already made.
+                intents.insert(name.clone(), intent);
+                hashes.insert(name.clone(), hash);
+                shared += 1;
                 describing.item();
             } else {
                 to_generate.push(Pending {
@@ -574,6 +716,17 @@ pub async fn generate_function_intents(
                 });
             }
         }
+
+        if !deferred_here.is_empty() {
+            debug!(
+                "Intent level {}/{}: deferred {} function(s) to the next scan, behind a callee that got no intent",
+                level_idx + 1,
+                levels.len(),
+                deferred_here.len()
+            );
+        }
+        deferred += deferred_here.len();
+        undescribed.extend(deferred_here);
 
         if to_generate.is_empty() {
             continue;
@@ -592,20 +745,10 @@ pub async fn generate_function_intents(
         let attempted = to_generate.len();
         let units = batch_units(to_generate, batch_size);
         let state = &batch_state;
+        let send = &send;
         let outcomes: Vec<(Pending, Result<String, AgentCallError>)> =
             generate_level(units, intent_concurrency(), |unit| async move {
-                describe_unit(unit, state, |payload| async move {
-                    // The mock seed only picks a canned answer in mock mode.
-                    let seed = payload
-                        .get("name")
-                        .and_then(|name| name.as_str())
-                        .unwrap_or("batch")
-                        .to_string();
-                    agent_service
-                        .post_to_lambda("/generate-intent", &payload, &seed)
-                        .await
-                })
-                .await
+                describe_unit(unit, state, send).await
             })
             .await
             .into_iter()
@@ -623,27 +766,32 @@ pub async fn generate_function_intents(
                 Ok(intent) => {
                     let intent = intent.trim().to_string();
                     if !intent.is_empty() && intent.len() < 500 {
+                        memo.record(&name, &hash, &intent);
                         hashes.insert(name.clone(), hash);
                         intents.insert(name, intent);
                         generated += 1;
                         succeeded += 1;
                     } else {
                         // Empty or over-long response: drop it. The function
-                        // keeps `intent = None`, so it (and its callers) retry
-                        // next scan. Log it — otherwise this is a silent,
-                        // permanent cache miss.
+                        // keeps `intent = None` and its callers are deferred,
+                        // so all of them are asked next scan. Log it —
+                        // otherwise this is a silent, permanent cache miss.
                         warn!(
                             "Discarding intent for {} ({} chars, expected 1..500)",
                             name,
                             intent.len()
                         );
+                        undescribed.insert(name.clone());
+                        failed_calls.insert(name);
                         failed += 1;
                     }
                 }
                 Err(e) => {
                     // Degrade gracefully: no intent and no content hash is
-                    // written, so the next scan retries exactly this function
-                    // and replays the rest from cache.
+                    // written, its callers are deferred, and the next scan
+                    // asks exactly these and replays the rest from cache.
+                    undescribed.insert(name.clone());
+                    failed_calls.insert(name.clone());
                     if e.is_quota_abort() {
                         aborted += 1;
                     } else {
@@ -690,6 +838,32 @@ pub async fn generate_function_intents(
         }
     }
 
+    // Every eligible function that is not described and whose own call did not
+    // fail was deferred: behind a failed callee, or unreached because the quota
+    // breaker stopped the pass. It keeps what the previous scan gave it, with
+    // the hash that produced it, so the next scan reuses it only if its inputs
+    // come out the same once its callees are described.
+    let mut kept = 0usize;
+    for name in &eligible {
+        if intents.contains_key(name) || failed_calls.contains(name) {
+            continue;
+        }
+        let Some(def) = function_definitions.get_mut(name) else {
+            continue;
+        };
+        if let Some(prev) = previous.for_function(name) {
+            def.intent = Some(prev.intent.clone());
+            def.intent_input_hash = prev.hash.clone();
+            kept += 1;
+        }
+    }
+    if deferred > 0 {
+        warn!(
+            "Deferred {} function(s) to the next scan because a function they call got no intent; {} kept their previous intent",
+            deferred, kept
+        );
+    }
+
     // Write resolved intents and their content hashes back to the definitions.
     let total = intents.len();
     for (name, intent) in intents {
@@ -700,9 +874,10 @@ pub async fn generate_function_intents(
     }
 
     debug!(
-        "Intents: {} total ({} reused from content-hash cache, {} freshly generated; batch size {}, {} sent again on their own after a batch left them unanswered)",
+        "Intents: {} total ({} reused from content-hash cache, {} described earlier in this run, {} freshly generated; batch size {}, {} sent again on their own after a batch left them unanswered)",
         total,
         reused,
+        shared,
         generated,
         batch_size,
         batch_state
@@ -735,15 +910,12 @@ impl IntentsInFlight {
     pub fn start(
         agent_service: AgentService,
         mut function_definitions: HashMap<String, FunctionDefinition>,
-        prev_intents_by_hash: HashMap<String, String>,
+        previous: PreviousIntents,
+        memo: RunIntentMemo,
     ) -> Self {
         let task = tokio::spawn(async move {
-            generate_function_intents(
-                &agent_service,
-                &mut function_definitions,
-                &prev_intents_by_hash,
-            )
-            .await;
+            generate_function_intents(&agent_service, &mut function_definitions, &previous, &memo)
+                .await;
             function_definitions
         });
         Self {
@@ -1142,12 +1314,18 @@ mod tests {
             },
         );
 
-        let map = intents_by_hash(&defs);
-        assert_eq!(map.len(), 1);
-        assert_eq!(
-            map.get("abc123").map(String::as_str),
-            Some("does the thing")
-        );
+        let previous = PreviousIntents::from_definitions(&defs);
+        assert_eq!(previous.by_hash.len(), 1);
+        assert_eq!(previous.for_hash("abc123"), Some("does the thing"));
+
+        // By function, an intent is kept with or without its hash.
+        assert_eq!(previous.by_key.len(), 2);
+        let complete = previous.for_function("complete").unwrap();
+        assert_eq!(complete.hash.as_deref(), Some("abc123"));
+        let no_hash = previous.for_function("no_hash").unwrap();
+        assert_eq!(no_hash.intent, "does another thing");
+        assert!(no_hash.hash.is_none());
+        assert!(previous.for_function("no_intent").is_none());
     }
 
     /// Env vars are process-global and tests run in parallel: every test in
@@ -1157,6 +1335,14 @@ mod tests {
     /// guarantee). Tokio's mutex, so the guard may be held across await
     /// points.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A previous scan that holds only these content hashes.
+    fn previous_by_hash(by_hash: HashMap<String, String>) -> PreviousIntents {
+        PreviousIntents {
+            by_hash,
+            by_key: HashMap::new(),
+        }
+    }
 
     fn call_ref(name: &str, file: &str, line: u32, call_site: u32) -> FunctionCallRef {
         FunctionCallRef {
@@ -1224,7 +1410,13 @@ mod tests {
         prev.insert(main_hash.clone(), "calls the helper".to_string());
 
         let agent = AgentService::new();
-        generate_function_intents(&agent, &mut defs, &prev).await;
+        generate_function_intents(
+            &agent,
+            &mut defs,
+            &previous_by_hash(prev),
+            &RunIntentMemo::default(),
+        )
+        .await;
 
         // Both intents came from the cache, with their hashes recorded.
         assert_eq!(defs["helper"].intent.as_deref(), Some(helper_intent));
@@ -1272,7 +1464,13 @@ mod tests {
         defs.insert("getId".to_string(), def_with_body("getId", "return x.id;"));
 
         let agent = AgentService::new();
-        generate_function_intents(&agent, &mut defs, &HashMap::new()).await;
+        generate_function_intents(
+            &agent,
+            &mut defs,
+            &PreviousIntents::default(),
+            &RunIntentMemo::default(),
+        )
+        .await;
 
         assert!(defs["getId"].intent.is_none());
         assert!(defs["getId"].intent_input_hash.is_none());
@@ -1320,7 +1518,13 @@ mod tests {
             std::env::set_var("CARRICK_SKIP_INTENTS", "1");
         }
         let mut defs = make_defs();
-        generate_function_intents(&agent, &mut defs, &HashMap::new()).await;
+        generate_function_intents(
+            &agent,
+            &mut defs,
+            &PreviousIntents::default(),
+            &RunIntentMemo::default(),
+        )
+        .await;
         unsafe {
             std::env::remove_var("CARRICK_SKIP_INTENTS");
         }
@@ -1339,7 +1543,13 @@ mod tests {
 
         // Control: with the flag unset (MOCK_ALL still on), intents flow.
         let mut defs = make_defs();
-        generate_function_intents(&agent, &mut defs, &HashMap::new()).await;
+        generate_function_intents(
+            &agent,
+            &mut defs,
+            &PreviousIntents::default(),
+            &RunIntentMemo::default(),
+        )
+        .await;
 
         // Restore whatever the environment had before the test.
         unsafe {
@@ -1725,7 +1935,13 @@ mod tests {
         }
         let before = crate::agent_service::request_counts();
         let agent = AgentService::new();
-        generate_function_intents(&agent, &mut defs, &HashMap::new()).await;
+        generate_function_intents(
+            &agent,
+            &mut defs,
+            &PreviousIntents::default(),
+            &RunIntentMemo::default(),
+        )
+        .await;
         let after = crate::agent_service::request_counts();
         unsafe {
             match prev_mock {
@@ -1911,7 +2127,12 @@ mod tests {
         let hash = compute_intent_hash(body, &[]);
         let prev = HashMap::from([(hash.clone(), "applies a regional rate".to_string())]);
 
-        let in_flight = IntentsInFlight::start(AgentService::new(), defs, prev);
+        let in_flight = IntentsInFlight::start(
+            AgentService::new(),
+            defs,
+            previous_by_hash(prev),
+            RunIntentMemo::default(),
+        );
         let defs = in_flight.finish().await;
 
         assert_eq!(
@@ -1923,6 +2144,358 @@ mod tests {
             Some(hash.as_str())
         );
         assert!(defs["helper"].body_source.is_none());
+    }
+
+    // ------------------------------------- key material pinned (#1080)
+
+    /// A recording `/generate-intent` transport for [`describe_functions`]:
+    /// every request body it was sent, in send order, and an answer per
+    /// function named `describes <name>`, batched or single. A name in `fail`
+    /// is refused, alone or as part of any batch that carries it.
+    #[derive(Clone, Default)]
+    struct Recorder {
+        sent: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        fail: std::sync::Arc<HashSet<String>>,
+    }
+
+    impl Recorder {
+        fn failing(names: &[&str]) -> Self {
+            Self {
+                fail: std::sync::Arc::new(names.iter().map(|n| n.to_string()).collect()),
+                ..Self::default()
+            }
+        }
+
+        fn send(
+            &self,
+            payload: serde_json::Value,
+        ) -> impl std::future::Future<Output = Result<String, AgentCallError>> + use<> {
+            let recorder = self.clone();
+            async move {
+                recorder.sent.lock().unwrap().push(payload.clone());
+                let names: Vec<String> = match payload.get("functions") {
+                    Some(_) => batch_names(&payload),
+                    None => vec![payload["name"].as_str().unwrap().to_string()],
+                };
+                if payload.get("functions").is_some() {
+                    let rows: Vec<(String, Option<String>)> = names
+                        .iter()
+                        .map(|n| {
+                            let intent =
+                                (!recorder.fail.contains(n)).then(|| format!("describes {n}"));
+                            (n.clone(), intent)
+                        })
+                        .collect();
+                    let rows: Vec<(&str, Option<&str>)> = rows
+                        .iter()
+                        .map(|(n, i)| (n.as_str(), i.as_deref()))
+                        .collect();
+                    Ok(answer(&rows))
+                } else if recorder.fail.contains(&names[0]) {
+                    Err(AgentCallError {
+                        code: "model_error".to_string(),
+                        message: "retries exhausted".to_string(),
+                        retriable: true,
+                    })
+                } else {
+                    Ok(format!("describes {}", names[0]))
+                }
+            }
+        }
+
+        /// Every function name this recorder was asked to describe, in send
+        /// order, whether it went alone or in a batch.
+        fn asked(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|p| match p.get("functions") {
+                    Some(_) => batch_names(p),
+                    None => vec![p["name"].as_str().unwrap().to_string()],
+                })
+                .collect()
+        }
+    }
+
+    /// Three levels over two files: leaves `a1`, `a2` (a.ts) and `b1` (b.ts),
+    /// `mid` calling `a1` and `b1`, and `top` calling `mid` and `a2`.
+    fn layered_fixture() -> HashMap<String, FunctionDefinition> {
+        let in_file = |name: &str, file: &str, body: &str, calls: Vec<FunctionCallRef>| {
+            let def = FunctionDefinition {
+                file_path: file.into(),
+                ..def_with_body(name, body)
+            };
+            (name.to_string(), with_calls(def, calls))
+        };
+        HashMap::from([
+            in_file("a1", "a.ts", "const x = load(id);\nreturn x.total;", vec![]),
+            in_file(
+                "a2",
+                "a.ts",
+                "const y = parse(raw);\nreturn y.items;",
+                vec![],
+            ),
+            in_file(
+                "b1",
+                "b.ts",
+                "const r = await fetch(url);\nreturn r.json();",
+                vec![],
+            ),
+            in_file(
+                "mid",
+                "b.ts",
+                "const t = a1(id);\nconst u = b1(url);\nreturn { t, u };",
+                vec![call_ref("a1", "a.ts", 1, 1), call_ref("b1", "b.ts", 1, 2)],
+            ),
+            in_file(
+                "top",
+                "c.ts",
+                "const m = mid(id, url);\nreturn a2(m.raw);",
+                vec![call_ref("mid", "b.ts", 4, 1), call_ref("a2", "a.ts", 2, 2)],
+            ),
+        ])
+    }
+
+    /// Run [`describe_functions`] with no previous scan, returning each
+    /// request body as sent (sorted, since requests in a level race) and each
+    /// function's `(name, intent, hash)`.
+    async fn describe_layered_fixture(
+        defs: &mut HashMap<String, FunctionDefinition>,
+        recorder: &Recorder,
+    ) -> (Vec<String>, Vec<(String, Option<String>, Option<String>)>) {
+        describe_functions(
+            defs,
+            &PreviousIntents::default(),
+            &RunIntentMemo::default(),
+            |payload| recorder.send(payload),
+        )
+        .await;
+        let mut bodies: Vec<String> = recorder
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        bodies.sort();
+        let mut rows: Vec<(String, Option<String>, Option<String>)> = defs
+            .iter()
+            .map(|(k, d)| (k.clone(), d.intent.clone(), d.intent_input_hash.clone()))
+            .collect();
+        rows.sort();
+        (bodies, rows)
+    }
+
+    /// The key material the scanner cache and the cloud `intentCacheKey` read
+    /// is byte-identical to what main sent before carrick#1080: the same
+    /// request bodies and the same content hashes, on a normal run through
+    /// batching and three dependency levels. Every literal below was captured
+    /// from main before the change.
+    #[tokio::test]
+    async fn a_normal_run_sends_the_request_bodies_and_hashes_main_sent() {
+        let _env = ENV_LOCK.lock().await;
+        assert_eq!(INTENT_CACHE_VERSION, 2);
+        let mut defs = layered_fixture();
+        let recorder = Recorder::default();
+        let (bodies, rows) = describe_layered_fixture(&mut defs, &recorder).await;
+
+        assert_eq!(
+            bodies,
+            vec![
+                r#"{"body":"const m = mid(id, url);\nreturn a2(m.raw);","called_intents":["- mid: describes mid","- a2: describes a2"],"name":"top"}"#,
+                r#"{"body":"const t = a1(id);\nconst u = b1(url);\nreturn { t, u };","called_intents":["- a1: describes a1","- b1: describes b1"],"name":"mid"}"#,
+                r#"{"functions":[{"body":"const x = load(id);\nreturn x.total;","called_intents":[],"name":"a1"},{"body":"const y = parse(raw);\nreturn y.items;","called_intents":[],"name":"a2"},{"body":"const r = await fetch(url);\nreturn r.json();","called_intents":[],"name":"b1"}]}"#,
+            ]
+        );
+        let row = |name: &str, hash: &str| {
+            (
+                name.to_string(),
+                Some(format!("describes {name}")),
+                Some(hash.to_string()),
+            )
+        };
+        assert_eq!(
+            rows,
+            vec![
+                row(
+                    "a1",
+                    "caf526315c7adeef18ea44a90ca74e8a7149a0cd9783ffd290537b81bb26c59a"
+                ),
+                row(
+                    "a2",
+                    "ab79db251f5dea5aba9b0fcc7e4293f6e22bfc560cf5b9d6b2044bedb9732777"
+                ),
+                row(
+                    "b1",
+                    "1658b50668d7b279da90f2b55b43267bbd5e1e02ca1bd72afde41d3a76e842cf"
+                ),
+                row(
+                    "mid",
+                    "63345450bd79e3a36e8c2e7312615a1017912bb7ae3a908a082db0b9b4e48810"
+                ),
+                row(
+                    "top",
+                    "aeed9070a2b8c8d7cba07ac583751857def81412865b6e7d8bb6333917559f1b"
+                ),
+            ]
+        );
+    }
+
+    /// The blob a scan would upload for `defs`: file paths as they were, bodies
+    /// already stripped, which is all [`PreviousIntents`] reads.
+    fn previous_scan(defs: &HashMap<String, FunctionDefinition>) -> PreviousIntents {
+        PreviousIntents::from_definitions(defs)
+    }
+
+    /// carrick#1080 D7. `a1` fails. `mid` calls it and `top` calls `mid`, so
+    /// both are deferred: no request carries either of them, `mid` keeps the
+    /// intent and hash the previous scan gave it, and `top`, which had none,
+    /// stays without one. `a2` and `b1` are unaffected.
+    #[tokio::test]
+    async fn a_failed_callee_defers_every_transitive_caller() {
+        let _env = ENV_LOCK.lock().await;
+        let mut prev_defs = layered_fixture();
+        let mid = prev_defs.get_mut("mid").unwrap();
+        mid.intent = Some("combines a total and a fetched body".to_string());
+        mid.intent_input_hash = Some("hash-of-mid-last-scan".to_string());
+        let previous = previous_scan(&prev_defs);
+
+        let mut defs = layered_fixture();
+        let recorder = Recorder::failing(&["a1"]);
+        describe_functions(&mut defs, &previous, &RunIntentMemo::default(), |p| {
+            recorder.send(p)
+        })
+        .await;
+
+        // The batch left `a1` unanswered, so it was sent again alone and
+        // refused; neither caller was ever sent.
+        assert_eq!(recorder.asked(), vec!["a1", "a2", "b1", "a1"]);
+
+        assert!(defs["a1"].intent.is_none());
+        assert!(defs["a1"].intent_input_hash.is_none());
+        assert_eq!(
+            defs["mid"].intent.as_deref(),
+            Some("combines a total and a fetched body")
+        );
+        assert_eq!(
+            defs["mid"].intent_input_hash.as_deref(),
+            Some("hash-of-mid-last-scan")
+        );
+        assert!(defs["top"].intent.is_none());
+        assert!(defs["top"].intent_input_hash.is_none());
+        assert_eq!(defs["a2"].intent.as_deref(), Some("describes a2"));
+        assert_eq!(defs["b1"].intent.as_deref(), Some("describes b1"));
+        assert!(defs.values().all(|d| d.body_source.is_none()));
+    }
+
+    /// carrick#1080 D7, the scan after. The callee answers now: it is asked
+    /// first, then each deferred caller once, in dependency order, and every
+    /// caller is keyed on the callee's intent. The functions described last
+    /// scan replay from cache. The hashes are the ones a run with no failure
+    /// writes, so nothing was keyed on the missing callee along the way.
+    #[tokio::test]
+    async fn the_scan_after_asks_the_callee_then_its_callers_once() {
+        let _env = ENV_LOCK.lock().await;
+        let mut first = layered_fixture();
+        let failing = Recorder::failing(&["a1"]);
+        describe_functions(
+            &mut first,
+            &PreviousIntents::default(),
+            &RunIntentMemo::default(),
+            |p| failing.send(p),
+        )
+        .await;
+        // The first index had no previous scan, so nothing was kept.
+        assert!(first["mid"].intent.is_none());
+        assert!(first["top"].intent.is_none());
+
+        let mut second = layered_fixture();
+        let recorder = Recorder::default();
+        describe_functions(
+            &mut second,
+            &previous_scan(&first),
+            &RunIntentMemo::default(),
+            |p| recorder.send(p),
+        )
+        .await;
+
+        let asked = recorder.asked();
+        let position = |name: &str| {
+            let hits: Vec<usize> = asked
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.as_str() == name)
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "{name} asked {} times in {asked:?}",
+                hits.len()
+            );
+            hits[0]
+        };
+        assert!(position("a1") < position("mid"));
+        assert!(position("mid") < position("top"));
+        assert_eq!(asked.len(), 3, "a2 and b1 replay from cache: {asked:?}");
+        assert!(failing.asked().iter().all(|n| n != "mid" && n != "top"));
+
+        // Exactly the rows a run with no failure writes.
+        let mut clean = layered_fixture();
+        let (_, clean_rows) = describe_layered_fixture(&mut clean, &Recorder::default()).await;
+        let mut rows: Vec<(String, Option<String>, Option<String>)> = second
+            .iter()
+            .map(|(k, d)| (k.clone(), d.intent.clone(), d.intent_input_hash.clone()))
+            .collect();
+        rows.sort();
+        assert_eq!(rows, clean_rows);
+    }
+
+    /// carrick#1080 D6. Two workspace members hold the same functions. The
+    /// first member describes them; the second sends nothing, and its rows
+    /// carry the same intents and hashes, callers included.
+    #[tokio::test]
+    async fn a_function_two_members_share_is_described_once() {
+        let _env = ENV_LOCK.lock().await;
+        let memo = RunIntentMemo::default();
+        let recorder = Recorder::default();
+
+        let mut member_a = layered_fixture();
+        describe_functions(&mut member_a, &PreviousIntents::default(), &memo, |p| {
+            recorder.send(p)
+        })
+        .await;
+        let after_a = recorder.asked().len();
+        assert_eq!(after_a, 5);
+
+        // The second member's copies live under its own directory; the
+        // request carries only name, body and callee intents, so they are the
+        // same requests.
+        let mut member_b: HashMap<String, FunctionDefinition> = layered_fixture()
+            .into_iter()
+            .map(|(key, mut def)| {
+                def.file_path = std::path::Path::new("packages/b").join(&def.file_path);
+                for call in &mut def.calls {
+                    call.file_path = format!("packages/b/{}", call.file_path);
+                }
+                (key, def)
+            })
+            .collect();
+        describe_functions(&mut member_b, &PreviousIntents::default(), &memo, |p| {
+            recorder.send(p)
+        })
+        .await;
+
+        assert_eq!(recorder.asked().len(), after_a, "member b sent a request");
+        for (key, def) in &member_b {
+            assert_eq!(def.intent, member_a[key].intent, "{key}");
+            assert!(def.intent.is_some(), "{key}");
+            assert_eq!(
+                def.intent_input_hash, member_a[key].intent_input_hash,
+                "{key}"
+            );
+        }
     }
 
     /// A service whose analysis fails returns before it collects its intents;
