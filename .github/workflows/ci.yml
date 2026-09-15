@@ -68,6 +68,7 @@ jobs:
           --test file_based_routing_test
           --test file_centric_analysis_test
           --test framework_coverage_test
+          --test graphql_document_call_sites_test
           --test graphql_extraction_test
           --test graphql_schema_identity_test
           --test graphql_schemas_setting_test

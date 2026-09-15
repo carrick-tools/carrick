@@ -2503,10 +2503,11 @@ async fn analyze_current_repo_incremental(
             // the GraphQL consumer file set folds transport data calls out of
             // the graph (#307) so every downstream surface (cloud projection,
             // type manifest, type requests) sees the same call set.
-            let mut protocol_extractions =
+            let (mut protocol_extractions, document_sites) =
                 scan_protocol_extractions(repo_path, service, &files, &merged_results);
             settle_graphql_documents(
                 &mut protocol_extractions.graphql,
+                document_sites,
                 &mut mount_graph,
                 service,
                 graphql_schemas,
@@ -2926,12 +2927,19 @@ fn service_graphql_roots(repo_path: &str, service: &Config) -> Vec<PathBuf> {
 /// `append_deterministic_protocol_operations` so the extractions exist BEFORE
 /// the mount graph is projected into cloud data — the GraphQL consumer file
 /// set drives `fold_graphql_transport_calls` on the graph first (#307).
+///
+/// The calls that execute a GraphQL document are read here too, and placed
+/// in the extraction by [`settle_graphql_documents`] once the transport fold
+/// has run (carrick#1157).
 fn scan_protocol_extractions(
     repo_path: &str,
     service: &Config,
     files: &[PathBuf],
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
-) -> ProtocolExtractions {
+) -> (
+    ProtocolExtractions,
+    crate::graphql_document_sites::DocumentSiteConsumers,
+) {
     let scan_roots = service_graphql_roots(repo_path, service);
     // The printed schemas the service declares it serves (carrick#1099). What
     // they failed to declare is reported once the run's rows are built
@@ -2941,13 +2949,23 @@ fn scan_protocol_extractions(
     let mut graphql = crate::graphql::scan_repo(&scan_roots, &declared.files, files);
     merge_graphql_resolver_locations(&mut graphql, file_results);
     merge_graphql_consumer_locations(&mut graphql, file_results);
+    // Aliases resolve here as they do for the HTTP-twin drop: a page imports
+    // its generated documents through the repo's path aliases as often as
+    // through a relative specifier.
+    let workspace =
+        crate::workspace_resolver::WorkspaceIndex::build_with_aliases(Path::new(repo_path), None);
+    let document_sites =
+        crate::graphql_document_sites::collect_document_site_consumers(files, Some(&workspace));
     let sockets = crate::socket_io::scan_files(files);
     let event_bus = crate::event_emitter::scan_files(files, &sockets);
-    ProtocolExtractions {
-        graphql,
-        sockets,
-        event_bus,
-    }
+    (
+        ProtocolExtractions {
+            graphql,
+            sockets,
+            event_bus,
+        },
+        document_sites,
+    )
 }
 
 /// Attribute a service's GraphQL documents to schema identities, fold the
@@ -2963,17 +2981,23 @@ fn scan_protocol_extractions(
 /// internal base URL.
 ///
 /// The fold runs on the full document set, before the drop, so a vendor
-/// document's transport POST does not come back as an HTTP call.
+/// document's transport POST does not come back as an HTTP call. It runs
+/// before the rows at executing calls are placed (carrick#1157): a page that
+/// passes a generated document to a hook is not a document file, and folding
+/// its HTTP calls would drop the REST requests it also makes. Those rows are
+/// attributed like any other document.
 fn settle_graphql_documents(
     graphql: &mut crate::graphql::GraphqlExtraction,
+    document_sites: crate::graphql_document_sites::DocumentSiteConsumers,
     mount_graph: &mut crate::mount_graph::MountGraph,
     service: &Config,
     catalogue: &crate::graphql::SchemaCatalogue,
 ) {
+    fold_graphql_transport_calls(mount_graph, graphql);
+    document_sites.apply(graphql);
     let attribution = catalogue.attribute(graphql, |document_file| {
         graphql_document_transport(service, document_file)
     });
-    fold_graphql_transport_calls(mount_graph, graphql);
     let summary = attribution.apply(graphql);
     let label = service.service_name.as_deref().unwrap_or("(root)");
     if !summary.is_empty() {
@@ -5786,11 +5810,12 @@ async fn analyze_current_repo(
     // GraphQL consumer file set folds transport data calls out of the mount
     // graph (#307) so every downstream surface (cloud projection, type
     // manifest, type requests) sees the same call set.
-    let mut protocol_extractions =
+    let (mut protocol_extractions, document_sites) =
         scan_protocol_extractions(repo_path, service, &files, &analysis_result.file_results);
     let mut analysis_result = analysis_result;
     settle_graphql_documents(
         &mut protocol_extractions.graphql,
+        document_sites,
         &mut analysis_result.mount_graph,
         service,
         graphql_schemas,
@@ -10405,6 +10430,7 @@ mod tests {
 
         settle_graphql_documents(
             &mut graphql,
+            Default::default(),
             &mut mount_graph,
             &Config::default(),
             &catalogue,
