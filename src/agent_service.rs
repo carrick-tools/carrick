@@ -784,6 +784,11 @@ impl AgentService {
                                 sleep(wait_time).await;
                                 continue;
                             }
+                            // Out of attempts: the throttle still says the
+                            // scan is sending too fast.
+                            if is_gateway_throttle(status.as_u16()) {
+                                self.pacer.throttled(reservation.epoch);
+                            }
                             let message = format!(
                                 "Agent proxy returned status {} with unparseable body ({}): {}",
                                 status,
@@ -865,6 +870,12 @@ impl AgentService {
                         continue;
                     }
 
+                    // Out of attempts, the refusal is still a verdict on the
+                    // model: the call that waited longest must not be the one
+                    // the limit never hears about.
+                    if call_err.retriable && is_model_busy(status.as_u16(), retry_after) {
+                        route_slot.overloaded();
+                    }
                     return Err(call_err);
                 }
                 Err(e) => {
