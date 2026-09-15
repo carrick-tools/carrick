@@ -229,6 +229,60 @@ fn documents_are_indexed_as_calls_only_when_their_schema_is_served_here() {
         scan.stdout
     );
 
+    // Each GraphQL call row says which identity its document is bound to
+    // (`calls[].schema_binding`): only the document with no field in any local
+    // schema is `no_local_schema`.
+    let bindings: BTreeSet<(String, String, String)> = scan.blob("storefront")["calls"]
+        .as_array()
+        .expect("storefront calls")
+        .iter()
+        .filter(|row| row["key"]["protocol"] == "graphql")
+        .map(|row| {
+            (
+                row["key"]["field"].as_str().unwrap_or_default().to_string(),
+                row["file_path"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .split(':')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+                row["schema_binding"]
+                    .as_str()
+                    .unwrap_or("<absent>")
+                    .to_string(),
+            )
+        })
+        .collect();
+    let binding = |field: &str, file: &str, value: &str| {
+        (field.to_string(), file.to_string(), value.to_string())
+    };
+    assert_eq!(
+        bindings,
+        [
+            binding("addProduct", catalog_doc, "served"),
+            binding("products", catalog_doc, "served"),
+            binding("retiredListing", catalog_doc, "served"),
+            binding("product", "apps/web/src/graphql/nested.gql", "served"),
+            binding(
+                "discontinuedQuery",
+                "apps/web/src/graphql/retired.gql",
+                "no_local_schema"
+            ),
+            binding("viewer", "apps/web/src/account.ts", "served"),
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert!(
+        scan.blob("catalog-api")["endpoints"]
+            .as_array()
+            .expect("catalog-api endpoints")
+            .iter()
+            .all(|row| row.get("schema_binding").is_none()),
+        "producers carry no binding"
+    );
+
     // Neither transport comes back as an HTTP call. Here both calls name their
     // document binding, so the #361 repair rewrites them to the operation key
     // and they never reach the graph; the fold-before-drop ordering for a
