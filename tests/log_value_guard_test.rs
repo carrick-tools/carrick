@@ -2,8 +2,8 @@
 //! (carrick#1063).
 //!
 //! The laptop run log is uploaded now, so what the file layer writes is what
-//! leaves a developer's machine. `redact_log` handles credentials and the home
-//! directory; it cannot handle a `debug!` that formats a model response, a
+//! leaves a developer's machine. `logging::Redaction` handles credentials, the
+//! home directory, machine paths and the account name; it cannot handle a `debug!` that formats a model response, a
 //! prompt, or a file's source text, because those are not recognisable as
 //! anything once they are in a line.
 //!

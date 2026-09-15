@@ -1568,7 +1568,7 @@ impl CloudStorage for AwsStorage {
     /// nothing to read. What changed is the file: it now carries this crate's
     /// debug lines and nobody else's, and the upload path redacts the home
     /// directory and drops any line naming a credential before a byte leaves
-    /// (`crate::logging::redact_log`). The CI behaviour is exactly what it
+    /// (`crate::logging::Redaction`). The CI behaviour is exactly what it
     /// was.
     fn uploads_run_logs(&self) -> bool {
         true

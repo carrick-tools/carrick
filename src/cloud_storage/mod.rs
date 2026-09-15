@@ -1015,7 +1015,7 @@ pub trait CloudStorage {
     /// at debug — so the one run whose log anyone needed, a first index that
     /// died at minute 66, left the cloud nothing to read (carrick#1063). The
     /// file is now filtered to this crate's own debug lines, and what leaves
-    /// the machine is redacted first ([`crate::logging::redact_log`]).
+    /// the machine is redacted first ([`crate::logging::Redaction`]).
     fn uploads_run_logs(&self) -> bool {
         true
     }
