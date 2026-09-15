@@ -50,9 +50,9 @@ test("the lockfile agrees with the manifest about the version and the five pins"
   //
   // Only the manifest-level fields are compared. The `node_modules/...`
   // entries hold whatever the registry held when the lock was last written,
-  // which for a version that is not published yet is a stub with no version
-  // at all; the workflows regenerate the lock before `npm ci` for exactly
-  // that reason.
+  // which for a version that is not published yet is nothing at all; the
+  // workflows run `npm install` rather than `npm ci` in this package for
+  // exactly that reason (carrick#906).
   const lock = readJson(path.join(packageRoot, "package-lock.json"));
   assert.equal(lock["version"], pkg["version"], "package-lock.json version");
   assert.equal(lock["packages"][""]["version"], pkg["version"], "lock root package version");

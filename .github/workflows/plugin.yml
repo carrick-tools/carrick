@@ -54,19 +54,21 @@ jobs:
 
       - name: Install
         working-directory: npm/carrick
-        run: |
-          # The lockfile cannot be correct for the version being released, so it is
-          # regenerated rather than trusted. `optionalDependencies` pins the five
-          # platform packages to this exact version, and when release-please writes
-          # the release commit those tarballs do not exist yet — no committed
-          # lockfile can hold an integrity hash for a package that has not been
-          # published. npm records `{"optional": true}` stubs instead, and `npm ci`
-          # rejects them the moment the version does exist ("lock file's ...@ does
-          # not satisfy ...@0.3.54", release 0.3.54). Regenerating first is right in
-          # both states: real entries when the pins resolve, stubs when they do not,
-          # and `npm ci` accepts either.
-          npm install --package-lock-only --ignore-scripts
-          npm ci
+        # `npm install`, not `npm ci`, for the reason release.yml's publish step
+        # gives (carrick#906). `optionalDependencies` pins the five platform
+        # packages to this package's exact version, and release-please bumps
+        # that pin in a commit made before the version is published, so no
+        # committed lockfile can resolve it: on a release branch, and on the
+        # push of the release commit to main, the version does not exist yet;
+        # on every other commit the lock's resolved entries are a release
+        # behind. `npm ci` refuses both ("Missing: ...@ from lock file",
+        # "Invalid: lock file's ...@0.3.65 does not satisfy ...@0.3.69").
+        # Regenerating the lock first worked only while npm wrote a stub for an
+        # unresolvable optional package; npm 11.19 omits it, and `npm ci` reads
+        # the gap as a desync. `npm install` resolves fresh and skips an optional
+        # package the registry does not have. The lock is not what this job
+        # tests: the published package carries no lock.
+        run: npm install --ignore-scripts --no-audit --no-fund
 
       - name: Typecheck and unit tests
         working-directory: npm/carrick
@@ -210,9 +212,10 @@ jobs:
         working-directory: src/sidecar
         run: npm ci && npm run build
 
+      # `npm install`, not `npm ci`: see the `plugin` job's Install step.
       - name: Install
         working-directory: npm/carrick
-        run: npm install --package-lock-only --ignore-scripts && npm ci
+        run: npm install --ignore-scripts --no-audit --no-fund
 
       - name: Pack
         run: |
