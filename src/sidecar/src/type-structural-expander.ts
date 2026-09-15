@@ -101,6 +101,18 @@ function childCursor(
 }
 
 /**
+ * The representation a type is printed in.
+ *
+ * `'declared'` prints the type the source declares. `'json'` prints what a
+ * JSON serialiser puts on the wire for a value of that type (carrick#1163):
+ * `JSON.stringify` calls a value's `toJSON()` and serialises its RESULT, so a
+ * `Date` travels as the string its `toJSON` returns, and so does any other
+ * type that declares one. The mapping is read from the compiler's own
+ * signature, never from a list of type names.
+ */
+export type WireFormat = 'declared' | 'json';
+
+/**
  * Recursively render a `Type` as fully-inlined structural text.
  *
  * Named object/interface types are expanded to their member structure;
@@ -108,20 +120,49 @@ function childCursor(
  * functions stay by name. The `seen` set (object type ids on the current
  * branch) breaks reference cycles; `depth` is a hard backstop. `overrides`
  * substitutes a type at named member positions (`MemberOverrides`); without
- * it the print is unchanged.
+ * it the print is unchanged. `wire` picks the representation (`WireFormat`).
  */
 export function expandTypeStructural(
   type: Type,
   seen: Set<number> = new Set(),
   depth = 0,
   overrides?: MemberOverrides,
+  wire: WireFormat = 'declared',
 ): string {
   return expandAt(
     type,
     seen,
     depth,
     overrides ? { overrides, position: '' } : undefined,
+    wire,
   );
+}
+
+/**
+ * The type `JSON.stringify` serialises in place of a value of `type`: the
+ * return type of the value's own `toJSON()`, or `undefined` when it declares
+ * none (carrick#1163).
+ *
+ * Only a callable `toJSON` member counts, and only a return type that says
+ * something: an `any` return describes nothing, and a `toJSON` that returns
+ * its own type again maps nothing either.
+ */
+export function jsonWireType(type: Type): Type | undefined {
+  if (!type.isObject() || type.isArray() || isTuple(type)) return undefined;
+  const member = type.getProperty('toJSON');
+  if (!member) return undefined;
+  const declaration = member.getValueDeclaration() ?? member.getDeclarations()[0];
+  const memberType = declaration
+    ? member.getTypeAtLocation(declaration)
+    : member.getDeclaredType();
+  const signature = memberType.getCallSignatures()[0];
+  if (!signature) return undefined;
+  const serialised = signature.getReturnType();
+  if (serialised.isAny() || serialised.isUnknown()) return undefined;
+  const id = (type.compilerType as { id?: number }).id;
+  const serialisedId = (serialised.compilerType as { id?: number }).id;
+  if (id != null && id === serialisedId) return undefined;
+  return serialised;
 }
 
 function expandAt(
@@ -129,6 +170,7 @@ function expandAt(
   seen: Set<number>,
   depth: number,
   at: OverrideCursor | undefined,
+  wire: WireFormat,
 ): string {
   if (depth > MAX_EXPANSION_DEPTH) return backstopText(type);
 
@@ -137,7 +179,7 @@ function expandAt(
     const replacement = cursor.overrides.types.get(cursor.position);
     if (replacement) {
       cursor.overrides.applied.add(cursor.position);
-      return expandAt(replacement, seen, depth, undefined);
+      return expandAt(replacement, seen, depth, undefined, wire);
     }
     // Nothing to substitute below here: print exactly as without overrides.
     if (!hasOverrideBelow(cursor)) cursor = undefined;
@@ -164,9 +206,13 @@ function expandAt(
 
   // Unions / intersections: expand each member, in canonical order.
   if (type.isUnion()) {
-    return canonicalMembers(type.getUnionTypes(), seen, depth, cursor).join(
-      ' | ',
-    );
+    return canonicalMembers(
+      type.getUnionTypes(),
+      seen,
+      depth,
+      cursor,
+      wire,
+    ).join(' | ');
   }
   if (type.isIntersection()) {
     return canonicalMembers(
@@ -174,6 +220,7 @@ function expandAt(
       seen,
       depth,
       cursor,
+      wire,
     ).join(' & ');
   }
 
@@ -191,6 +238,7 @@ function expandAt(
       seen,
       depth + 1,
       childCursor(cursor, '<0>'),
+      wire,
     );
     // Parenthesise a union/intersection element so `(A | B)[]` doesn't misparse
     // as `A | B[]`. Decide from the TYPE, not the string: a single object
@@ -198,6 +246,13 @@ function expandAt(
     // and a union led by an object literal (`{ a: string } | null`) MUST be.
     const needsParens = element.isUnion() || element.isIntersection();
     return needsParens ? `(${inner})[]` : `${inner}[]`;
+  }
+
+  // On the JSON wire a value with `toJSON()` is its serialised form, library
+  // type or not, so this runs before the by-name bail-out below.
+  if (wire === 'json') {
+    const serialised = jsonWireType(type);
+    if (serialised) return expandAt(serialised, seen, depth + 1, undefined, wire);
   }
 
   // Library / built-in types (Date, Promise, RegExp, …): keep by name, unless
@@ -225,7 +280,7 @@ function expandAt(
     if (props.length === 0) return namedText(type);
 
     const parts = props.map((prop) =>
-      expandProperty(prop, nextSeen, depth, cursor),
+      expandProperty(prop, nextSeen, depth, cursor, wire),
     );
     return `{ ${parts.join('; ')}; }`;
   }
@@ -293,9 +348,10 @@ function canonicalMembers(
   seen: Set<number>,
   depth: number,
   cursor: OverrideCursor | undefined,
+  wire: WireFormat,
 ): string[] {
   return orderMembers(members, (member) =>
-    expandAt(member, seen, depth + 1, cursor),
+    expandAt(member, seen, depth + 1, cursor, wire),
   );
 }
 
@@ -326,6 +382,7 @@ function expandProperty(
   seen: Set<number>,
   depth: number,
   at: OverrideCursor | undefined,
+  wire: WireFormat,
 ): string {
   const optional = (prop.getFlags() & ts.SymbolFlags.Optional) !== 0;
 
@@ -360,14 +417,18 @@ function expandProperty(
     if (nonUndefined.length === 1) {
       propType = nonUndefined[0];
     } else if (nonUndefined.length > 1) {
-      const inner = canonicalMembers(nonUndefined, seen, depth, cursor).join(
-        ' | ',
-      );
+      const inner = canonicalMembers(
+        nonUndefined,
+        seen,
+        depth,
+        cursor,
+        wire,
+      ).join(' | ');
       return `${name}?: ${inner}`;
     }
   }
 
-  const inner = expandAt(propType, seen, depth + 1, cursor);
+  const inner = expandAt(propType, seen, depth + 1, cursor, wire);
   return `${name}${optional ? '?' : ''}: ${inner}`;
 }
 
