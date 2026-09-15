@@ -335,7 +335,7 @@ fn scan_repo(
     let command = scan_command(exe, repo, blobs, previous, infer);
     run_scan(
         command,
-        &format!("scan of {}", repo.display()),
+        &format!("scan of {label}"),
         Reporting {
             working: format!("indexing {label}"),
             done: format!("indexed {label}"),
@@ -493,6 +493,11 @@ fn run_scan(
     // pending. A scan in that state exits 0, so its output would otherwise be
     // dropped with the rest, and this is the sentence that says to re-run.
     let mut pending: Vec<String> = Vec::new();
+    // Why the scan failed, in the one sentence it states on the same channel.
+    // It leads the error, so every reader that shows a failure in one line
+    // (`carrick status`, the SessionStart hook) shows that sentence rather
+    // than the first line of the scan's log (carrick#1103).
+    let mut failure: Option<crate::progress::Failure> = None;
     // The child's stderr is read on a thread of its own so that this loop can
     // wake up when the child says NOTHING. A scan's quiet stretches are its
     // long ones — a model call, a type check — and the log's pulse used to be
@@ -531,6 +536,10 @@ fn run_scan(
             pending.push(statement);
             continue;
         }
+        if let Some(stated) = crate::progress::parse_failure(&line) {
+            failure = Some(stated);
+            continue;
+        }
         // Kept clean from here on: what this loop keeps is read back by a
         // JSON reader and by a log file, neither of which renders escapes
         // (carrick#1023 item 6).
@@ -567,8 +576,12 @@ fn run_scan(
         return Ok(spend);
     }
     bar.finish_and_clear();
+    let reason = match failure {
+        Some(failure) => failure.reason,
+        None => format!("it exited ({status}) without saying why"),
+    };
     Err(format!(
-        "the {what} failed:\n{}",
+        "the {what} failed: {reason}\n{}",
         failure_excerpt(head, causes, tail, dropped)
     ))
 }
@@ -1440,6 +1453,63 @@ mod tests {
             "an OSC title runs to its terminator, not to the end of the line"
         );
         assert_eq!(strip_ansi("plain"), "plain", "text is left alone");
+    }
+
+    /// The sentence a failing scan states on the progress channel leads the
+    /// error, ahead of its log, and the marker line itself is not part of the
+    /// excerpt (carrick#1103).
+    #[test]
+    fn a_failed_scan_leads_with_the_reason_it_stated() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            "echo 'Using TeeStorage (laptop scan: cloud upload + local cache)' >&2; \
+             echo '@carrick-failure {\"stage\":\"discovery\",\"reason\":\"A scan of acme/api is already running.\"}' >&2; \
+             exit 1",
+        );
+        let error = run_scan(
+            command,
+            "scan of api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+            HEARTBEAT,
+        )
+        .expect_err("the child exited non-zero");
+        assert_eq!(
+            error.lines().next(),
+            Some("the scan of api failed: A scan of acme/api is already running.")
+        );
+        assert!(
+            error.contains("TeeStorage"),
+            "the excerpt is kept for --json: {error}"
+        );
+        assert!(!error.contains("@carrick-failure"), "{error}");
+
+        // A scan that dies without stating a reason still leads with a sentence.
+        let mut silent = Command::new("sh");
+        silent
+            .arg("-c")
+            .arg("echo 'thread main panicked at x' >&2; exit 101");
+        let error = run_scan(
+            silent,
+            "scan of api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+            HEARTBEAT,
+        )
+        .expect_err("the child exited non-zero");
+        let first = error.lines().next().unwrap_or_default();
+        assert!(
+            first.starts_with("the scan of api failed: it exited ("),
+            "{error}"
+        );
+        assert!(first.ends_with(") without saying why"), "{error}");
     }
 
     /// A failure short enough to state in full is stated in full: nothing is

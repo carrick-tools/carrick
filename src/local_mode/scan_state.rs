@@ -170,8 +170,17 @@ impl ScanState {
     }
 
     /// The one line `carrick status` prints for this scan.
+    ///
+    /// Each line opens `scan <id> <running|finished|failed|stopped>`, which is
+    /// what the scaffold tells an agent polling a detached scan to read, and
+    /// then says when it started, how long it ran and, for a failure, the one
+    /// sentence of why. A failure's `error` also carries an excerpt of the
+    /// scan's own log; that is for `--json` and for whoever opens the log, and
+    /// never printed here: its lines name internals a user cannot act on
+    /// (carrick#1103).
     pub fn line(&self) -> String {
         let elapsed = human_duration(self.elapsed_secs());
+        let started = self.started_label();
         let counts = match &self.progress {
             Some(update) => format!(" — {}", update.render()),
             None => String::new(),
@@ -179,7 +188,7 @@ impl ScanState {
         let paid = if self.infer { ", paid" } else { "" };
         if self.is_running() {
             return format!(
-                "scan {} running for {elapsed}{paid}: {}{counts}",
+                "scan {} running for {elapsed} (started {started}{paid}): {}{counts}",
                 self.scan_id, self.phase
             );
         }
@@ -188,30 +197,120 @@ impl ScanState {
         // (carrick#1007 item 4).
         if self.status == ScanStatus::Finished {
             return format!(
-                "scan {} finished after {elapsed}{paid}. The index is written.",
+                "scan {} finished after {elapsed} (started {started}{paid}). The index is written.",
                 self.scan_id
             );
         }
-        match &self.error {
-            Some(error) => format!("scan {} failed after {elapsed}: {error}", self.scan_id),
+        match self.reason() {
+            Some(reason) => format!(
+                "scan {} failed after {elapsed} (started {started}): {reason}",
+                self.scan_id
+            ),
             // What a killed run left behind depends on how far it got: a
             // multi-repo build uploads each repo as it finishes it, and every
             // upload that came back with a figure was paid for. Saying
             // "nothing was uploaded" over the top of that would be false.
             None => match self.spend.as_ref().map(|spend| spend.scans.len()) {
                 Some(paid) if paid > 0 => format!(
-                    "scan {} stopped without finishing after {elapsed}, in {}{counts}. It had \
-                     uploaded {paid} repo(s) and paid for them; run the command again.",
+                    "scan {} stopped without finishing after {elapsed} (started {started}), in \
+                     {}{counts}. It had uploaded {paid} repo(s) and paid for them; run the \
+                     command again.",
                     self.scan_id, self.phase
                 ),
                 _ => format!(
-                    "scan {} stopped without finishing after {elapsed}, in {}{counts}. Nothing \
-                     was uploaded by it; run the command again.",
+                    "scan {} stopped without finishing after {elapsed} (started {started}), in \
+                     {}{counts}. Nothing was uploaded by it; run the command again.",
                     self.scan_id, self.phase
                 ),
             },
         }
     }
+
+    /// Why a failed scan failed, in the sentence its error leads with.
+    ///
+    /// Every writer of `error` puts that sentence first: a scan subprocess
+    /// states it on the progress channel and the build leads with it
+    /// (`index::run_scan`), and a build that fails before any scan has a
+    /// one-line error to begin with. What follows the first line is the log
+    /// excerpt.
+    pub fn reason(&self) -> Option<&str> {
+        let error = self.error.as_deref()?;
+        Some(
+            error
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("no reason was recorded"),
+        )
+    }
+
+    /// When the scan started, on this machine's clock: the time alone for a
+    /// scan started today, the date with it otherwise.
+    fn started_label(&self) -> String {
+        let Ok(started) = chrono::DateTime::parse_from_rfc3339(&self.started_at) else {
+            return self.started_at.clone();
+        };
+        let local = started.with_timezone(&chrono::Local);
+        if local.date_naive() == chrono::Local::now().date_naive() {
+            local.format("%H:%M").to_string()
+        } else {
+            local.format("%Y-%m-%d %H:%M").to_string()
+        }
+    }
+
+    /// A scan that failed within a minute of starting: a refusal, which a
+    /// re-run repeats word for word.
+    fn failed_at_once(&self) -> bool {
+        !self.is_running() && self.status == ScanStatus::Failed && self.elapsed_secs() < 60
+    }
+}
+
+/// What `carrick status` prints for the scans a workspace has records of.
+///
+/// One line per scan, the running scan first and then newest first. A run of
+/// scans that each failed within a minute with the same reason is one line
+/// naming every id: three re-runs refused because a scan was still in flight
+/// are one fact, and each printed whole was a screen of the same sentence
+/// (carrick#1103). The log directory is named once, at the end, for the
+/// reader who wants more than the sentence.
+pub fn status_lines(scans: &[ScanState], index_dir: &Path) -> Vec<String> {
+    if scans.is_empty() {
+        return Vec::new();
+    }
+    let mut ordered: Vec<&ScanState> = scans.iter().collect();
+    // Stable, so scans of the same kind keep `read_all`'s newest-first order.
+    ordered.sort_by_key(|scan| !scan.is_running());
+
+    let mut lines = Vec::new();
+    let mut index = 0;
+    while index < ordered.len() {
+        let scan = ordered[index];
+        let mut same: Vec<&str> = Vec::new();
+        if scan.failed_at_once() {
+            while let Some(next) = ordered.get(index + 1 + same.len()) {
+                if next.failed_at_once() && next.reason() == scan.reason() {
+                    same.push(&next.scan_id);
+                } else {
+                    break;
+                }
+            }
+        }
+        let mut line = scan.line();
+        if !same.is_empty() {
+            line.push_str(&format!(
+                " The same happened to {} earlier scan(s): {}.",
+                same.len(),
+                same.join(", ")
+            ));
+        }
+        lines.push(line);
+        index += 1 + same.len();
+    }
+    lines.push(format!(
+        "Each scan's full output is in {}.",
+        log_file(index_dir, "<id>").display()
+    ));
+    lines
 }
 
 /// `3m12s`, `41s`, `1h04m`.
@@ -491,15 +590,137 @@ mod tests {
         assert!(line.contains("run the command again"), "{line}");
     }
 
-    /// A failure keeps its reason, because the log is long and the reason is
-    /// one line of it.
+    /// A failure states its reason, because the log is long and the reason is
+    /// one line of it; the excerpt of the log that rides beside it in `error`
+    /// is not printed (carrick#1103).
     #[test]
-    fn a_failed_scan_states_why() {
+    fn a_failed_scan_states_why_and_nothing_of_its_log() {
         let mut failed = state(ScanStatus::Failed, std::process::id());
-        failed.error = Some("Carrick Cloud did not open this scan".to_string());
+        failed.error = Some(
+            "the scan of api failed: Carrick Cloud did not open this scan\n\
+             Using TeeStorage (laptop scan: cloud upload + local cache)\n\
+             ... 2756 line(s) not shown, except ..."
+                .to_string(),
+        );
         let line = failed.line();
-        assert!(line.contains("failed after 3m12s"), "{line}");
-        assert!(line.contains("did not open this scan"), "{line}");
+        assert!(
+            line.starts_with("scan 5089ed60 failed after 3m12s (started "),
+            "{line}"
+        );
+        assert!(
+            line.ends_with("the scan of api failed: Carrick Cloud did not open this scan"),
+            "{line}"
+        );
+        assert!(!line.contains("TeeStorage"), "{line}");
+        assert!(!line.contains('\n'), "{line}");
+    }
+
+    /// A scan that failed within a minute of starting, with `reason` as the
+    /// sentence and the scanner's own log after it.
+    fn refused(id: &str, seconds_ago: i64, reason: &str) -> ScanState {
+        let started = chrono::Utc::now() - chrono::Duration::seconds(seconds_ago);
+        let mut scan = state(ScanStatus::Failed, std::process::id());
+        scan.scan_id = id.to_string();
+        scan.started_at = started.to_rfc3339();
+        scan.finished_at = Some((started + chrono::Duration::seconds(1)).to_rfc3339());
+        scan.progress = None;
+        scan.error = Some(format!(
+            "the scan of api failed: {reason}\n\
+             Carrick run continuing run_id=4f2a\n\
+             Initializing sidecar...\n\
+             [FileOrchestrator] Type resolution warnings: [\"/Users/ada/api/src/a.ts\"]\n\
+             Gateway status 429 with non-envelope body (missing field `success`)\n\
+             ... 2756 line(s) not shown, except ..."
+        ));
+        scan
+    }
+
+    /// The report from the field: a running scan, three re-runs refused
+    /// because it was running, and an older failure. One line each, the
+    /// running scan on top, the refusals as one line naming every id, the
+    /// log directory once, and none of the scanner's internals (carrick#1103).
+    #[test]
+    fn status_prints_one_line_per_scan_in_user_terms() {
+        let busy = "A scan of acme/api from this workspace is already running. \
+                    (laptop_scan_in_flight, HTTP 409)";
+        let mut running = state(ScanStatus::Running, std::process::id());
+        running.scan_id = "runs0001".to_string();
+        running.started_at = (chrono::Utc::now() - chrono::Duration::seconds(600)).to_rfc3339();
+        let mut older = refused(
+            "old00001",
+            7200,
+            "No JS/TS source files found under the repository root.",
+        );
+        older.finished_at =
+            Some((chrono::Utc::now() - chrono::Duration::seconds(6000)).to_rfc3339());
+        // Newest first, as `read_all` returns them.
+        let scans = vec![
+            refused("ref00003", 30, busy),
+            refused("ref00002", 90, busy),
+            refused("ref00001", 150, busy),
+            running,
+            older,
+        ];
+
+        let lines = status_lines(&scans, Path::new("/repos/.carrick"));
+
+        assert_eq!(lines.len(), 4, "{lines:#?}");
+        assert!(
+            lines[0].starts_with("scan runs0001 running for 10m00s (started "),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[1].starts_with("scan ref00003 failed after 1s (started "),
+            "{lines:#?}"
+        );
+        assert!(lines[1].contains(busy), "{lines:#?}");
+        assert!(
+            lines[1].ends_with("The same happened to 2 earlier scan(s): ref00002, ref00001."),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[2].starts_with("scan old00001 failed after "),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[2].contains("No JS/TS source files found"),
+            "{lines:#?}"
+        );
+        assert_eq!(
+            lines[3],
+            "Each scan's full output is in /repos/.carrick/scan-<id>.log."
+        );
+        for internal in [
+            "TeeStorage",
+            "sidecar",
+            "FileOrchestrator",
+            "non-envelope",
+            "not shown",
+            "run_id",
+            "/Users/ada",
+        ] {
+            assert!(
+                lines.iter().all(|line| !line.contains(internal)),
+                "{internal} reached the terminal: {lines:#?}"
+            );
+        }
+    }
+
+    /// A long failure is not a refusal, so two of them with the same reason are
+    /// still two lines; and a workspace with no records prints nothing at all.
+    #[test]
+    fn only_quick_failures_with_the_same_reason_collapse() {
+        let mut slow = refused("slow0002", 900, "the model quota was exhausted");
+        slow.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        let mut slower = refused("slow0001", 1900, "the model quota was exhausted");
+        slower.finished_at =
+            Some((chrono::Utc::now() - chrono::Duration::seconds(1000)).to_rfc3339());
+        let lines = status_lines(
+            &[slow, slower, refused("fast0001", 3000, "something else")],
+            Path::new("/w/.carrick"),
+        );
+        assert_eq!(lines.len(), 4, "{lines:#?}");
+        assert!(status_lines(&[], Path::new("/w/.carrick")).is_empty());
     }
 
     /// A detached run's output goes to its log, so what it paid is kept here

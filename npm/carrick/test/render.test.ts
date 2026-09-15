@@ -382,10 +382,19 @@ test("a session that starts while a scan is running is told so, not told there i
   const withIndex = renderSessionStart({
     ...statusFixture("status-workspace.json"),
     running_scans: [
-      { scan_id: "abc12345", pid: 1, started_at: "2026-09-12T10:00:00Z", status: "failed", error: "the scan of /repos/api failed" },
+      {
+        scan_id: "abc12345",
+        pid: 1,
+        started_at: "2026-09-12T10:00:00Z",
+        status: "failed",
+        error: "the scan of api failed: A scan of acme/api is already running.\nUsing TeeStorage (laptop scan)\n... 12 line(s) not shown ...",
+      },
     ],
   });
-  assert.match(withIndex, /- scan abc12345 failed: the scan of \/repos\/api failed/);
+  // The reason the error leads with, and none of the log excerpt after it
+  // (carrick#1103).
+  assert.match(withIndex, /- scan abc12345 failed: the scan of api failed: A scan of acme\/api is already running\.$/m);
+  assert.doesNotMatch(withIndex, /TeeStorage|not shown/);
 
   // The word the scaffold's poll loop waits for (carrick#1007 item 4).
   const done = renderSessionStart({
