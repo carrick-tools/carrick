@@ -2296,7 +2296,7 @@ fn extract_call_context(call: &CallExpr) -> Option<(String, Option<String>)> {
 /// e.g. ("get", Some("/users/:id")) → "get_users_id_handler"
 /// e.g. ("on", Some("data")) → "on_data_handler"
 /// e.g. ("use", None) → "use_handler"
-fn derive_handler_name(method: &str, first_arg: Option<&str>) -> String {
+pub(crate) fn derive_handler_name(method: &str, first_arg: Option<&str>) -> String {
     let base = match first_arg {
         Some(arg) => {
             let cleaned: String = arg

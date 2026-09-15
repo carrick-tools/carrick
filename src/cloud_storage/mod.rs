@@ -807,6 +807,7 @@ pub fn mount_graph_to_api_details(
             // it, nine operations behind one route are one row on the wire.
             dispatch: endpoint.dispatch.clone(),
             schema_binding: None,
+            handler_span: endpoint.handler_span,
         })
         .collect();
 
@@ -834,6 +835,8 @@ pub fn mount_graph_to_api_details(
             // on (carrick#831): the consumer half of the same identity.
             dispatch: call.dispatch.clone(),
             schema_binding: None,
+            // A call has no handler.
+            handler_span: None,
         })
         .collect();
 
@@ -1369,6 +1372,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
 
         let (endpoints, _calls) = mount_graph_to_api_details(&graph);
@@ -1404,6 +1408,7 @@ mod tests {
             resolution_source: Some(ResolutionSource::FileBasedRoute),
             view_module: false,
             dispatch: None,
+            handler_span: None,
         });
         // A route whose module also renders a view (carrick#704).
         graph.endpoints.push(ResolvedEndpoint {
@@ -1421,6 +1426,7 @@ mod tests {
             resolution_source: Some(ResolutionSource::FileBasedRoute),
             view_module: true,
             dispatch: None,
+            handler_span: None,
         });
         graph.data_calls.push(DataFetchingCall {
             method: "POST".to_string(),
@@ -1489,6 +1495,7 @@ mod tests {
             resolution_source: None,
             view_module: false,
             dispatch,
+            handler_span: None,
         };
         graph.endpoints.push(route(Some(case("search-by-intent"))));
         graph.endpoints.push(route(None));
@@ -1609,6 +1616,7 @@ mod tests {
             resolution_source: Some(ResolutionSource::FileBasedRoute),
             view_module,
             dispatch: None,
+            handler_span: None,
         };
         graph
             .endpoints
@@ -2048,6 +2056,7 @@ mod tests {
             view_module: false,
             dispatch: None,
             schema_binding: binding,
+            handler_span: None,
         };
         let mut data = empty_repo("org/web", Some("web"));
         data.calls = vec![

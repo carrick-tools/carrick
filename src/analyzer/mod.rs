@@ -296,6 +296,12 @@ pub struct ApiEndpointDetails {
     /// (cloud#946). Wire path: `calls[].schema_binding`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_binding: Option<crate::graphql::SchemaBinding>,
+    /// Where the handler function sits in `file_path`'s file, 1-based and
+    /// inclusive (cloud#948). Carried from the mount-graph row an HTTP endpoint
+    /// is projected from; `None` on calls, on non-HTTP operations, on a handler
+    /// the scan could not place, and on rows written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler_span: Option<crate::mount_graph::HandlerSpan>,
 }
 
 pub struct ApiAnalysisResult {
@@ -4086,6 +4092,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         }
     }
 
@@ -4448,6 +4455,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         });
 
         // 2. Unclassified env var (not in internal/external list)
@@ -4468,6 +4476,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         });
 
         // 3. Process.env pattern (should be detected as env var)
@@ -4488,6 +4497,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         });
 
         // 4. Raw code pattern with UPPERCASE var (common in legacy code)
@@ -4509,6 +4519,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         });
 
         let mount_graph = MountGraph::new(); // Empty graph
@@ -4585,6 +4596,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: None,
                 schema_binding: None,
+                handler_span: None,
             });
         }
 
@@ -4655,6 +4667,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: None,
                 schema_binding: None,
+                handler_span: None,
             });
         }
 
@@ -4704,6 +4717,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -4722,6 +4736,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
 
         let (findings, verified, _edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -4791,6 +4806,7 @@ mod tests {
                 resolution_source: consumer_source,
                 dispatch: None,
                 schema_binding: None,
+                handler_span: None,
             });
 
             let mut mount_graph = MountGraph::new();
@@ -4809,6 +4825,7 @@ mod tests {
                 evidence: carrick_match::MatchEvidence::RouteDefinition,
                 resolution_source: producer_source,
                 dispatch: None,
+                handler_span: None,
             });
             mount_graph.data_calls.push(DataFetchingCall {
                 method: "GET".to_string(),
@@ -4870,6 +4887,7 @@ mod tests {
             resolution_source: Some(ResolutionSource::ImportedMember),
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -4898,6 +4916,7 @@ mod tests {
                 evidence,
                 resolution_source: source,
                 dispatch: None,
+                handler_span: None,
             });
         }
         mount_graph.data_calls.push(DataFetchingCall {
@@ -4953,6 +4972,7 @@ mod tests {
                 evidence: carrick_match::MatchEvidence::RouteDefinition,
                 resolution_source: None,
                 dispatch: None,
+                handler_span: None,
             });
         }
 
@@ -5017,6 +5037,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: value.map(&case),
                 schema_binding: None,
+                handler_span: None,
             });
         };
         call(Some("search-by-intent"), 115);
@@ -5040,6 +5061,7 @@ mod tests {
                 evidence: carrick_match::MatchEvidence::RouteDefinition,
                 resolution_source: None,
                 dispatch: Some(case(value)),
+                handler_span: None,
             });
         }
 
@@ -5094,6 +5116,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -5116,6 +5139,7 @@ mod tests {
                 field: "action".to_string(),
                 value: "search-by-intent".to_string(),
             }),
+            handler_span: None,
         });
 
         let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -5155,6 +5179,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -5173,6 +5198,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
 
         let (findings, _, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -5216,6 +5242,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -5234,6 +5261,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
 
         let (findings, _, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -5277,6 +5305,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         });
 
         let mut mount_graph = MountGraph::new();
@@ -5296,6 +5325,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
         // An unmatched mock producer: must orphan WITH the mock tag.
         mount_graph.endpoints.push(ResolvedEndpoint {
@@ -5313,6 +5343,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
             method: "GET".to_string(),
@@ -5424,6 +5455,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::CallSite,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
         // repo-beta: the identical call to the same external endpoint.
         mount_graph.data_calls.push(DataFetchingCall {
@@ -5506,6 +5538,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
             method: "POST".to_string(),
@@ -5570,6 +5603,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::CallSite,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
             method: "POST".to_string(),
@@ -5625,6 +5659,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         }
     }
 

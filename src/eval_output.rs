@@ -713,6 +713,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         }
     }
 
@@ -734,6 +735,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         }
     }
 
@@ -1114,6 +1116,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         };
 
         let result = ApiAnalysisResult {
@@ -1198,6 +1201,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: None,
                 schema_binding: None,
+                handler_span: None,
             }],
             findings: vec![],
             dependency_conflicts: vec![],
@@ -1356,6 +1360,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         };
         let result = ApiAnalysisResult {
             endpoints: vec![],
@@ -1428,6 +1433,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         };
         let result = ApiAnalysisResult {
             endpoints: vec![],
