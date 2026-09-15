@@ -22,7 +22,9 @@
 //!   (a 503 envelope, or any envelope carrying `Retry-After`) halves the
 //!   limit, down to a floor. Only once per epoch: the requests already in
 //!   flight when the limit was cut were admitted under the old width, so
-//!   their refusals are one signal, not twenty.
+//!   their refusals are one signal, not twenty. The file-analyzer's lease
+//!   wait (`analysis_in_flight`) is not a refusal whatever its status and
+//!   headers: the caller releases its slot with no verdict (carrick#1131).
 //! - **Additive increase.** After as many successes in a row as the current
 //!   limit (one round at that width), the limit rises by one, back towards the
 //!   configured maximum.

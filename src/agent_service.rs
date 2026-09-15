@@ -187,6 +187,27 @@ pub const QUOTA_ABORT_CODE: &str = "quota_exhausted";
 /// C1 of carrick-cloud `docs/internal/reference/laptop-scan-seam.md`).
 pub const LLM_DISABLED_CODE: &str = "llm_disabled";
 
+/// The cloud's answer to a re-sent file whose first request is still running
+/// (carrick#1131): an earlier request for the same prompt holds the
+/// file-analyzer's lease, its answer had not landed when this caller's gateway
+/// budget ran out, and the next request collects it from the cache. The lease
+/// exists because the API Gateway cuts `/analyze-file` at 30 s while a large
+/// file's model call runs longer (carrick-cloud#874).
+///
+/// It is a wait, not a refusal. The model was not asked by this request and
+/// said nothing about its capacity, so the reply holds no slot, cuts no limit
+/// and costs no attempt (see [`MAX_IN_FLIGHT_WAITS`]). The cloud sends it as
+/// `409` with this code; a cloud deployed before that sent `503 model_error`
+/// with `details.reason` set to the same string, and both are read the same
+/// way ([`is_analysis_in_flight`]).
+pub const ANALYSIS_IN_FLIGHT_CODE: &str = "analysis_in_flight";
+
+/// Whether an error envelope is the lease wait ([`ANALYSIS_IN_FLIGHT_CODE`]),
+/// in either wire shape: the code itself, or the reason on a `model_error`.
+fn is_analysis_in_flight(err: &AgentError) -> bool {
+    err.code == ANALYSIS_IN_FLIGHT_CODE || err.reason() == Some(ANALYSIS_IN_FLIGHT_CODE)
+}
+
 /// The error returned for an individual call once the breaker is open. Scoped
 /// to what's true at the call level (this call fails fast); the engine holds
 /// back every service a failed-fast call belonged to (see
@@ -454,6 +475,29 @@ fn retry_wait_within(
     backoff.max(hint + spread)
 }
 
+/// How many lease waits ([`ANALYSIS_IN_FLIGHT_CODE`]) one call sits out
+/// without spending an attempt. Each wait is a request the cloud held for
+/// most of the gateway's 30 s before answering, plus a short sleep, and the
+/// lease lives no longer than the holder's invocation (120 s). Four waits
+/// outlast any holder; eight is twice that. Past the cap a wait is retried
+/// like any retriable error, spending attempts, so a lease that never clears
+/// (a cloud bug) still ends the call.
+const MAX_IN_FLIGHT_WAITS: u32 = 8;
+
+/// The sleep before collecting an in-flight answer when the reply carried no
+/// `Retry-After`. Short on purpose: the cloud has already waited server-side,
+/// and the next request waits again or finds the answer cached.
+const IN_FLIGHT_DEFAULT_WAIT: Duration = Duration::from_secs(2);
+
+/// How long to sleep before re-sending after a lease wait: the cloud's
+/// `Retry-After` when it sent one, else [`IN_FLIGHT_DEFAULT_WAIT`], capped at
+/// the policy's ceiling and jittered by up to half again. Not the exponential
+/// backoff: no attempt was spent, and nothing is overloaded.
+fn in_flight_wait(jitter: u32, retry_after: Option<Duration>, max_delay: Duration) -> Duration {
+    let hint = retry_after.unwrap_or(IN_FLIGHT_DEFAULT_WAIT).min(max_delay);
+    hint + (hint / 2).mul_f64(f64::from(jitter) / f64::from(u32::MAX))
+}
+
 /// Jitter source: the sub-second component of the wall clock. Enough entropy
 /// to decorrelate wakers that are milliseconds apart, and avoids taking a
 /// direct dependency on `rand` for a sleep length.
@@ -569,7 +613,8 @@ fn global_pacer() -> Arc<RatePacer> {
 /// the model's own retries ran out, and that is per model, so it cuts the
 /// route's concurrency. A 429 envelope never reaches here (`rate_limited`
 /// trips the breaker first), and anything else retriable says nothing about
-/// capacity.
+/// capacity. Neither does a lease wait, whatever its status and headers, so
+/// callers rule [`is_analysis_in_flight`] out first (carrick#1131).
 fn is_model_busy(status: u16, retry_after: Option<Duration>) -> bool {
     status == 503 || retry_after.is_some()
 }
@@ -750,7 +795,12 @@ impl AgentService {
         // What this call has slept so far, against the policy's wait budget.
         let mut waited = Duration::ZERO;
         let route_limit = self.limits.for_route(path);
-        for attempt in 1..=max_retries {
+        // Lease waits sat out so far, against [`MAX_IN_FLIGHT_WAITS`]. Counted
+        // by hand, with `attempt`, so a wait can hand its attempt back.
+        let mut in_flight_waits: u32 = 0;
+        let mut attempt: u32 = 0;
+        while attempt < max_retries {
+            attempt += 1;
             // A sibling call (any phase, any `AgentService`) may have already
             // hit the backend quota wall. Re-checked each attempt so a worker
             // mid-backoff aborts after its current sleep instead of firing a
@@ -1041,11 +1091,45 @@ impl AgentService {
                         return Err(rate_limit_abort_error());
                     }
 
+                    // The lease wait (carrick#1131): an earlier request for
+                    // this prompt is still being analysed. Named by its own
+                    // code whichever wire shape carried it, so a call that
+                    // does run out says what it waited on.
+                    let in_flight = is_analysis_in_flight(&err);
                     let call_err = AgentCallError {
-                        code: err.code,
+                        code: if in_flight {
+                            ANALYSIS_IN_FLIGHT_CODE.to_string()
+                        } else {
+                            err.code
+                        },
                         message: err.message,
                         retriable: err.retriable,
                     };
+
+                    // Sat out as a pure wait: both slots released with no
+                    // verdict, as a gateway timeout releases them, the
+                    // cloud's Retry-After honoured, and the attempt handed
+                    // back. The model was not asked, so `X-Carrick-Attempt`
+                    // does not advance either: a re-send that finds the lease
+                    // gone and becomes the holder keeps the chain it had.
+                    if in_flight && call_err.retriable && in_flight_waits < MAX_IN_FLIGHT_WAITS {
+                        in_flight_waits += 1;
+                        let wait_time =
+                            in_flight_wait(jitter_seed(), retry_after, policy.max_delay);
+                        debug!(
+                            "An earlier request for this {} call is still being analysed; \
+                             collecting its answer in {:?} (wait {}/{})",
+                            path, wait_time, in_flight_waits, MAX_IN_FLIGHT_WAITS
+                        );
+                        drop(permit);
+                        drop(route_slot);
+                        sleep(wait_time).await;
+                        attempt -= 1;
+                        continue;
+                    }
+                    // Past the cap, a lease wait is retried like any retriable
+                    // error below, but it is still no verdict on capacity.
+                    let model_busy = !in_flight && is_model_busy(status.as_u16(), retry_after);
 
                     // The cloud's Retry-After on a 503 `model_error` is the
                     // floor: re-firing after one or two seconds lands in the
@@ -1060,7 +1144,7 @@ impl AgentService {
                             call_err.code, wait_time, attempt, max_retries, call_err.message
                         );
                         drop(permit);
-                        if is_model_busy(status.as_u16(), retry_after) {
+                        if model_busy {
                             // One aggregated terminal line comes from the
                             // limiter; each refusal is file-log detail.
                             debug!("{line}");
@@ -1079,7 +1163,7 @@ impl AgentService {
                     // Out of attempts, the refusal is still a verdict on the
                     // model: the call that waited longest must not be the one
                     // the limit never hears about.
-                    if call_err.retriable && is_model_busy(status.as_u16(), retry_after) {
+                    if call_err.retriable && model_busy {
                         route_slot.overloaded();
                     }
                     return Err(call_err);
@@ -1244,6 +1328,19 @@ struct AgentError {
     code: String,
     message: String,
     retriable: bool,
+    /// Whatever extra context the cloud attached: a `requestId` to quote, and
+    /// on some codes a `reason` that says which of several causes it was
+    /// (`llm_disabled`, the lease wait). Absent on most envelopes, and never a
+    /// fixed shape, so it stays JSON and is read through accessors.
+    #[serde(default)]
+    details: Option<serde_json::Value>,
+}
+
+impl AgentError {
+    /// `details.reason`, when the cloud sent one as a string.
+    fn reason(&self) -> Option<&str> {
+        self.details.as_ref()?.get("reason")?.as_str()
+    }
 }
 
 /// The mock `/generate-intent` answer: the canned sentence for a single
@@ -2420,7 +2517,92 @@ pub(crate) mod tests {
             code: code.to_string(),
             message: "boom".to_string(),
             retriable: true,
+            details: None,
         }
+    }
+
+    /// The lease wait as the cloud sends it since carrick#1131.
+    const IN_FLIGHT_409: &str = r#"{"success":false,"error":{"code":"analysis_in_flight","message":"still being analysed","retriable":true,"details":{"requestId":"r1","reason":"analysis_in_flight"}}}"#;
+    /// The lease wait as a cloud deployed before carrick#1131 sends it.
+    const IN_FLIGHT_503: &str = r#"{"success":false,"error":{"code":"model_error","message":"still being analysed","retriable":true,"details":{"requestId":"r1","reason":"analysis_in_flight"}}}"#;
+    /// A real capacity refusal: the model's own retries ran out.
+    const MODEL_BUSY_503: &str = r#"{"success":false,"error":{"code":"model_error","message":"model busy","retriable":true,"details":{"requestId":"r2"}}}"#;
+
+    fn envelope_error(body: &str) -> AgentError {
+        serde_json::from_str::<AgentResponse>(body)
+            .unwrap()
+            .error
+            .unwrap()
+    }
+
+    /// `details` is read off every envelope, and an envelope without it (or
+    /// with one of a shape nobody expected) still parses.
+    #[test]
+    fn an_error_envelope_keeps_its_details() {
+        let err = envelope_error(IN_FLIGHT_409);
+        assert_eq!(err.reason(), Some("analysis_in_flight"));
+        assert_eq!(
+            err.details.as_ref().and_then(|d| d.get("requestId")),
+            Some(&serde_json::json!("r1"))
+        );
+
+        let bare = envelope_error(
+            r#"{"success":false,"error":{"code":"internal_error","message":"x","retriable":false}}"#,
+        );
+        assert!(bare.details.is_none());
+        assert_eq!(bare.reason(), None);
+
+        let odd = envelope_error(
+            r#"{"success":false,"error":{"code":"x","message":"x","retriable":false,"details":{"reason":7}}}"#,
+        );
+        assert_eq!(odd.reason(), None);
+        let scalar = envelope_error(
+            r#"{"success":false,"error":{"code":"x","message":"x","retriable":false,"details":"text"}}"#,
+        );
+        assert_eq!(scalar.reason(), None);
+    }
+
+    /// Both wire shapes of the lease wait are recognised, and nothing else is:
+    /// a plain `model_error` is a capacity refusal, and another reason on
+    /// another code says nothing about a lease.
+    #[test]
+    fn the_lease_wait_is_recognised_in_both_wire_shapes_and_nothing_else_is() {
+        assert!(is_analysis_in_flight(&envelope_error(IN_FLIGHT_409)));
+        assert!(is_analysis_in_flight(&envelope_error(IN_FLIGHT_503)));
+        assert!(is_analysis_in_flight(&err_with_code(
+            ANALYSIS_IN_FLIGHT_CODE
+        )));
+        assert!(!is_analysis_in_flight(&envelope_error(MODEL_BUSY_503)));
+        assert!(!is_analysis_in_flight(&envelope_error(
+            r#"{"success":false,"error":{"code":"llm_disabled","message":"x","retriable":false,"details":{"reason":"daily_cap"}}}"#,
+        )));
+    }
+
+    #[test]
+    fn a_lease_wait_sleeps_for_the_hint_or_a_short_default_never_the_backoff() {
+        let hint = Some(Duration::from_secs(2));
+        assert_eq!(
+            in_flight_wait(0, hint, RETRY_MAX_DELAY),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            in_flight_wait(u32::MAX, hint, RETRY_MAX_DELAY),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            in_flight_wait(0, None, RETRY_MAX_DELAY),
+            IN_FLIGHT_DEFAULT_WAIT
+        );
+        // The old cloud's 10 s floor is honoured as sent.
+        assert_eq!(
+            in_flight_wait(0, Some(Duration::from_secs(10)), RETRY_MAX_DELAY),
+            Duration::from_secs(10)
+        );
+        // Capped at the policy's ceiling before the jitter, like any hint.
+        assert_eq!(
+            in_flight_wait(0, Some(RETRY_AFTER_CAP), RETRY_MAX_DELAY),
+            RETRY_MAX_DELAY
+        );
     }
 
     /// File analysis and intents run side by side on separately constructed
@@ -3104,6 +3286,234 @@ pub(crate) mod tests {
             recovered_at.expect("pace vanished") > paced_at,
             "the pace did not climb once the gateway let requests through"
         );
+    }
+
+    /// A retry policy with the standard shape and millisecond sleeps, so a
+    /// test can walk a whole attempt chain.
+    fn quick_policy(max_attempts: u32) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            max_delay: Duration::from_millis(20),
+            wait_budget: Duration::from_secs(60),
+            run_budgeted: false,
+        }
+    }
+
+    /// carrick#1131: a lease wait, in either wire shape, is sat out without
+    /// spending an attempt. With a policy of two attempts, eight waits then
+    /// an answer still succeed, every request says it is attempt 1 because
+    /// the model was never asked, and the route's limit never moves.
+    #[tokio::test]
+    async fn a_lease_wait_costs_no_attempt_and_leaves_the_limit_alone() {
+        let mut responses: Vec<StubResponse> = (0..MAX_IN_FLIGHT_WAITS)
+            .map(|i| {
+                let body = if i % 2 == 0 {
+                    IN_FLIGHT_409
+                } else {
+                    IN_FLIGHT_503
+                };
+                let status = if i % 2 == 0 { 409 } else { 503 };
+                (
+                    status,
+                    body.to_string(),
+                    vec![("Retry-After", "0".to_string())],
+                )
+            })
+            .collect();
+        responses.push((
+            200,
+            r#"{"success":true,"text":"analysed"}"#.to_string(),
+            Vec::new(),
+        ));
+        let (api_base, server) = stub_server_with_headers(responses);
+
+        let service = service_with(4, 4).with_retry_policy(quick_policy(2));
+        let limit = service.limits.for_route("/analyze-file");
+        let result = service
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &api_base,
+                "/analyze-file",
+                &serde_json::json!({}),
+            )
+            .await;
+        assert_eq!(result.unwrap().text, "analysed");
+        assert_eq!(limit.limit(), 4, "a lease wait cut the route's limit");
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), MAX_IN_FLIGHT_WAITS as usize + 1);
+        for request in &requests {
+            assert_eq!(
+                header_of(request, "x-carrick-attempt").as_deref(),
+                Some("1")
+            );
+        }
+    }
+
+    /// Past [`MAX_IN_FLIGHT_WAITS`], a lease that never clears spends attempts
+    /// like any retriable error, so the call still ends. It ends named for
+    /// what it waited on, even when the old wire shape carried it, and the
+    /// limit still hears nothing.
+    #[tokio::test]
+    async fn a_lease_that_never_clears_ends_the_call_once_the_waits_and_attempts_are_spent() {
+        const ATTEMPTS: u32 = 3;
+        let total = MAX_IN_FLIGHT_WAITS + ATTEMPTS;
+        let responses: Vec<StubResponse> = (0..total)
+            .map(|_| {
+                (
+                    503,
+                    IN_FLIGHT_503.to_string(),
+                    vec![("Retry-After", "0".to_string())],
+                )
+            })
+            .collect();
+        let (api_base, server) = stub_server_with_headers(responses);
+
+        let service = service_with(4, 4).with_retry_policy(quick_policy(ATTEMPTS));
+        let limit = service.limits.for_route("/analyze-file");
+        let err = service
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &api_base,
+                "/analyze-file",
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ANALYSIS_IN_FLIGHT_CODE);
+        assert!(err.retriable);
+        assert_eq!(limit.limit(), 4, "a lease wait cut the route's limit");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), total as usize);
+        assert_eq!(
+            header_of(requests.last().unwrap(), "x-carrick-attempt").as_deref(),
+            Some(ATTEMPTS.to_string().as_str()),
+            "the waits past the cap are the ones that spend attempts"
+        );
+    }
+
+    /// What a released scanner (0.3.70 and earlier) does with the new reply,
+    /// and the rule the cloud relies on for it: a retriable envelope is
+    /// retried on `retriable` whatever its status and code, and a 4xx with no
+    /// `Retry-After` says nothing about capacity.
+    #[tokio::test]
+    async fn a_retriable_envelope_with_an_unknown_code_on_a_4xx_is_retried_without_a_cut() {
+        let (api_base, server) = stub_server(vec![
+            (
+                409,
+                r#"{"success":false,"error":{"code":"some_future_wait","message":"later","retriable":true}}"#
+                    .to_string(),
+            ),
+            (200, r#"{"success":true,"text":"analysed"}"#.to_string()),
+        ]);
+        let service = service_with(4, 4).with_retry_policy(quick_policy(2));
+        let limit = service.limits.for_route("/analyze-file");
+        let result = service
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &api_base,
+                "/analyze-file",
+                &serde_json::json!({}),
+            )
+            .await;
+        assert_eq!(result.unwrap().text, "analysed");
+        assert_eq!(limit.limit(), 4);
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    /// carrick#1131 under load: forty calls start together under a route limit
+    /// of sixteen, and the first request of each call is answered with a
+    /// lease wait (alternating the two wire shapes, each with a `Retry-After`,
+    /// as the scale test saw). The limit must never move. Then the same load
+    /// against a model that refuses for capacity, carrying the same
+    /// `Retry-After`, must still cut it: the fix narrows what counts as a
+    /// refusal and leaves real refusals alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lease_waits_never_cut_the_limit_while_capacity_refusals_still_do() {
+        use std::sync::atomic::AtomicUsize;
+        const MAX: usize = 16;
+        const CALLS: usize = 40;
+
+        async fn run_phase(
+            body_for_first: &'static str,
+            status_for_first: u16,
+        ) -> (usize, usize, usize) {
+            let seen = Arc::new(Mutex::new(std::collections::HashSet::<String>::new()));
+            let waits = Arc::new(AtomicUsize::new(0));
+            let shared_waits = Arc::clone(&waits);
+            let base = concurrent_stub(move |request| {
+                let seen = Arc::clone(&seen);
+                let waits = Arc::clone(&shared_waits);
+                async move {
+                    // Each call sends its index in the body; its first request
+                    // gets the refusal, every later one the answer.
+                    let id = request.rsplit("\r\n\r\n").next().unwrap_or("").to_string();
+                    let first = seen.lock().unwrap().insert(id);
+                    if first {
+                        let n = waits.fetch_add(1, Ordering::SeqCst);
+                        let (status, body) = if body_for_first == IN_FLIGHT_409 && n % 2 == 1 {
+                            (503, IN_FLIGHT_503)
+                        } else {
+                            (status_for_first, body_for_first)
+                        };
+                        return (
+                            status,
+                            body.to_string(),
+                            vec![("Retry-After", "0".to_string())],
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    (
+                        200,
+                        r#"{"success":true,"text":"analysed"}"#.to_string(),
+                        Vec::new(),
+                    )
+                }
+            })
+            .await;
+
+            let service = service_with(MAX, MAX).with_retry_policy(quick_policy(4));
+            let limit = service.limits.for_route("/analyze-file");
+            let lowest = Arc::new(AtomicUsize::new(MAX));
+            let sampler = tokio::spawn({
+                let limit = Arc::clone(&limit);
+                let lowest = Arc::clone(&lowest);
+                async move {
+                    loop {
+                        lowest.fetch_min(limit.limit(), Ordering::SeqCst);
+                        sleep(Duration::from_millis(1)).await;
+                    }
+                }
+            });
+            let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
+            let bodies: Vec<serde_json::Value> = (0..CALLS)
+                .map(|i| serde_json::json!({ "call": i }))
+                .collect();
+            let results = futures::future::join_all(
+                bodies
+                    .iter()
+                    .map(|body| service.post_with_retry(&auth, &base, "/analyze-file", body)),
+            )
+            .await;
+            sampler.abort();
+            let lowest = lowest.load(Ordering::SeqCst).min(limit.limit());
+            let failed = results.iter().filter(|r| r.is_err()).count();
+            (lowest, failed, waits.load(Ordering::SeqCst))
+        }
+
+        let (lowest, failed, waits) = run_phase(IN_FLIGHT_409, 409).await;
+        eprintln!("lease waits: {waits} replies, lowest limit {lowest} of {MAX}, {failed} failed");
+        assert_eq!(waits, CALLS);
+        assert_eq!(failed, 0);
+        assert_eq!(lowest, MAX, "a lease wait cut the route's limit");
+
+        let (lowest, failed, refusals) = run_phase(MODEL_BUSY_503, 503).await;
+        eprintln!(
+            "capacity refusals: {refusals} replies, lowest limit {lowest} of {MAX}, {failed} failed"
+        );
+        assert_eq!(refusals, CALLS);
+        assert_eq!(failed, 0);
+        assert!(lowest < MAX, "a capacity refusal no longer cuts the limit");
     }
 
     /// carrick-cloud#869 end to end, against a mock lambda that refuses every
