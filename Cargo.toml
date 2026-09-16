@@ -18,6 +18,12 @@ base64 = "0.22"
 carrick-match = { path = "crates/carrick-match", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
+# The dispatch bundle is gzipped, which is a requirement rather than an
+# economy: the raw newline-delimited stream on a large monorepo is hundreds of
+# megabytes against a hard per-object ceiling (carrick#1229). Pure Rust
+# (miniz_oxide), and already in the graph through reqwest's `gzip` feature, so
+# it adds no build cost and nothing to cross-compile.
+flate2 = "1"
 futures = "0.3.32"
 glob = "0.3"
 graphql-parser = "0.4.1"
@@ -62,7 +68,3 @@ serial_test = "3.0"
 # The upload's landed-check waits half a minute for a handler that may still be
 # committing (carrick#1067), and no test should.
 tokio = { version = "1", features = ["test-util"] }
-# Test-only gzip encoder, so the cloud-client test can serve a real
-# `Content-Encoding: gzip` response. Adds nothing to the dependency graph:
-# reqwest's `gzip` feature already pulls flate2 in transitively.
-flate2 = "1"
