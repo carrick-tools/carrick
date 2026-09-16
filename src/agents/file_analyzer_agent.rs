@@ -624,9 +624,24 @@ pub struct FileAnalysisResult {
 /// analyzer sends it with the guidance id so the cloud can key the guidance by
 /// identity instead of by text (carrick-cloud#871). Nothing about it reaches
 /// the model: `text` is what is sent.
-struct AnalysisPrompt {
-    text: String,
-    guidance_prefix_bytes: usize,
+pub struct AnalysisPrompt {
+    pub text: String,
+    pub guidance_prefix_bytes: usize,
+}
+
+impl AnalysisPrompt {
+    /// The shared front block: the bytes a dispatched job carries once in its
+    /// header instead of once per file.
+    pub fn guidance_block(&self) -> &str {
+        &self.text[..self.guidance_prefix_bytes]
+    }
+
+    /// The bytes that vary per file — what the cloud's cache key hashes, and
+    /// what a dispatched row carries and a resume re-derives to join on
+    /// (carrick#1229).
+    pub fn body(&self) -> &str {
+        &self.text[self.guidance_prefix_bytes..]
+    }
 }
 
 /// The target the per-file prompt fingerprint is logged under, so a reader can
@@ -749,11 +764,7 @@ impl FileAnalyzerAgent {
         wrapper_context: &[String],
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
         // Skip empty files
-        if file_content.trim().is_empty() {
-            return Ok(FileAnalysisResult::default());
-        }
-
-        let prompt = self.build_user_message_with_candidates(
+        let Some(prompt) = self.prompt_for(
             file_path,
             file_content,
             guidance,
@@ -763,8 +774,56 @@ impl FileAnalyzerAgent {
             graphql_producer_hints,
             graphql_consumer_hints,
             wrapper_context,
-        );
-        let user_message = prompt.text;
+        ) else {
+            return Ok(FileAnalysisResult::default());
+        };
+        self.analyze_prompt(file_path, &prompt, guidance).await
+    }
+
+    /// This file's prompt, built and not sent.
+    ///
+    /// The bytes are the same ones [`Self::analyze_prompt`] would put on the
+    /// wire, which is the whole point: a dispatched scan ships them and a
+    /// resume re-derives them to join an answer by content (carrick#1229).
+    /// `None` for a file with nothing in it — the same skip the live path
+    /// makes, stated once so both paths skip the same files.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prompt_for(
+        &self,
+        file_path: &str,
+        file_content: &str,
+        guidance: &FrameworkGuidance,
+        candidate_hints: &[String],
+        candidate_contexts: &[String],
+        imported_symbols: &HashMap<String, ImportedSymbol>,
+        graphql_producer_hints: &[String],
+        graphql_consumer_hints: &[String],
+        wrapper_context: &[String],
+    ) -> Option<AnalysisPrompt> {
+        if file_content.trim().is_empty() {
+            return None;
+        }
+        Some(self.build_user_message_with_candidates(
+            file_path,
+            file_content,
+            guidance,
+            candidate_hints,
+            candidate_contexts,
+            imported_symbols,
+            graphql_producer_hints,
+            graphql_consumer_hints,
+            wrapper_context,
+        ))
+    }
+
+    /// Send one built prompt and read the answer back.
+    pub async fn analyze_prompt(
+        &self,
+        file_path: &str,
+        prompt: &AnalysisPrompt,
+        guidance: &FrameworkGuidance,
+    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
+        let user_message = prompt.text.clone();
         // Present only when every guidance answer carried an id; without one
         // the cloud keys the whole message, exactly as it did before
         // (carrick-cloud#871).
@@ -800,12 +859,7 @@ impl FileAnalyzerAgent {
 
         debug!("=== FILE ANALYZER AGENT (AST-GATED) ===");
         debug!("Analyzing file: {}", file_path);
-        debug!(
-            "File size: {} chars, {} lines",
-            file_content.len(),
-            file_content.lines().count()
-        );
-        debug!("Candidate targets: {}", candidate_hints.len());
+        debug!("Prompt size: {} bytes", user_message.len());
 
         let schema = AgentSchemas::file_analysis_schema();
         let response = self
@@ -826,7 +880,21 @@ impl FileAnalyzerAgent {
         // model actually emitted, not by guesswork. Off unless the env is set.
         Self::dump_eval_artifact(file_path, &user_message, &response);
 
-        let mut result: FileAnalysisResult = serde_json::from_str(&response).map_err(|e| {
+        Ok(Self::result_from_answer(file_path, &response)?)
+    }
+
+    /// Read one model answer into the rows the join folds onto.
+    ///
+    /// Apart from the live call: an answer that arrives through a dispatched
+    /// job's answer bundle is the same bytes `/analyze-file` would have
+    /// returned, so it must take the same path into a result — including the
+    /// sanitising below, which is what keeps a "+null" out of the index
+    /// whichever way the answer reached this machine (carrick#1229).
+    pub fn result_from_answer(
+        file_path: &str,
+        response: &str,
+    ) -> Result<FileAnalysisResult, String> {
+        let mut result: FileAnalysisResult = serde_json::from_str(response).map_err(|e| {
             format!(
                 "Failed to parse file analysis response: {}. Raw response: {}",
                 e, response

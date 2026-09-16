@@ -1,5 +1,6 @@
 pub mod agent_service;
 pub mod agents;
+pub mod analysis_channel;
 pub mod analysis_job;
 pub mod analyzer;
 pub mod app_context;
