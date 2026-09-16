@@ -600,8 +600,10 @@ async fn describe_functions<S, SFut>(
     // A dispatched run skips them for a different reason and on the same line:
     // it is building prompts, not answering them, and it writes no index for an
     // intent to live in. The machine that resumes generates them
-    // (carrick#1229).
-    if std::env::var("CARRICK_SKIP_INTENTS").is_ok() || crate::analysis_channel::dispatching() {
+    // (carrick#1229). A run asked to dispatch that has built no prompt is not
+    // that run — it is finishing here, and its intents are part of the index
+    // it writes.
+    if std::env::var("CARRICK_SKIP_INTENTS").is_ok() || crate::analysis_channel::has_prompts() {
         debug!(
             "Skipping intent generation for {} function(s)",
             eligible.len()

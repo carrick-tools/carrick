@@ -567,6 +567,14 @@ pub fn finish(error: Option<&str>) {
     let Some(active) = guard.as_mut() else {
         return;
     };
+    // A build that handed its analysis over has already said how it ended, and
+    // the sentence this would write over the top of it — "the index is
+    // written" — is false (carrick#1229). The record is closed; drop the slot
+    // and leave it alone.
+    if active.state.status == ScanStatus::Dispatched {
+        *guard = None;
+        return;
+    }
     active.state.status = match error {
         None => ScanStatus::Finished,
         Some(error) => {
@@ -646,7 +654,10 @@ pub fn forget_finished(index_dir: &Path) {
 /// this runs — and any concurrent scan's.
 pub fn forget_superseded(index_dir: &Path) {
     for state in read_all(index_dir) {
-        if !state.is_running() {
+        // A dispatched record is not history: the analysis it names is still
+        // being done, and the index this build wrote does not contain it
+        // (carrick#1229). It is kept for the same reason a running one is.
+        if !state.is_running() && state.status != ScanStatus::Dispatched {
             let _ = std::fs::remove_file(state_file(index_dir, &state.scan_id));
         }
     }

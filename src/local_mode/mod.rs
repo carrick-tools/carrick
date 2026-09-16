@@ -72,7 +72,12 @@ pub fn no_model() -> bool {
 /// Whether this process composes signatures without asking the sidecar to
 /// infer the slots the source left unannotated. See [`SKIP_SIGNATURES_ENV`].
 pub fn skip_signature_inference() -> bool {
+    // A dispatched run composes no signatures for the same reason it generates
+    // no intents: it writes no index for them to live in, and inferring the
+    // slots the source left unannotated is a sidecar pass over every function
+    // in the service (carrick#1229).
     std::env::var(SKIP_SIGNATURES_ENV).as_deref() == Ok("1")
+        || crate::analysis_channel::has_prompts()
 }
 
 /// The guidance map a no-model run analyses with: one entry per LLM-routed

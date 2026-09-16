@@ -1762,6 +1762,33 @@ fn a_dispatched_index_records_its_jobs_and_says_the_analysis_is_elsewhere() {
         !stdout.contains('$') && !stdout.to_lowercase().contains("paid"),
         "what the analysis costs us is never a customer's line (carrick#1236):\n{stdout}"
     );
+    assert!(
+        !stdout.contains("The index is written"),
+        "no index was written, and the record must not say one was:\n{stdout}"
+    );
+
+    // The scan record says what happened to it. Written by the build rather
+    // than by the scan, and not rewritten as "finished" on the way out.
+    let record = std::fs::read_dir(root.join(".carrick"))
+        .expect(".carrick")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("scan-") && name.ends_with(".json"))
+        })
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .expect("the build recorded its scan");
+    let state: serde_json::Value = serde_json::from_str(&record).expect("scan record is json");
+    assert_eq!(
+        state["status"], "dispatched",
+        "the record says the analysis went elsewhere:\n{record}"
+    );
+    assert!(
+        !state["jobs"].as_array().unwrap_or(&Vec::new()).is_empty(),
+        "and names the job it is waiting on:\n{record}"
+    );
 
     let recorded = std::fs::read_to_string(root.join(".carrick/jobs.json"))
         .expect("the jobs outlive the command that dispatched them");

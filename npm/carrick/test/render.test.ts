@@ -6,6 +6,7 @@ import {
   itemLine,
   renderPostToolUse,
   renderSessionStart,
+  runningScanLine,
   serviceLine,
   shortHash,
   typedMismatchClause,
@@ -531,4 +532,31 @@ test("a payload with no types keeps the sentence it had", () => {
     }),
     null,
   );
+});
+
+// carrick#1229: a workspace whose analysis is being done in the cloud is not a
+// workspace with no index and nothing happening. The hook renders this on
+// every session start.
+test("a session that starts while Carrick Cloud is analysing is told so", () => {
+  const building = renderSessionStart({
+    schema: "carrick.status/0",
+    error: "not_indexed",
+    message: "no index",
+    services: [],
+    analysing: [
+      "Carrick Cloud is still analysing owner/api — 64% (8570 of 13389 files). Run `carrick resume` when it is done.",
+    ],
+  });
+  assert.match(building, /a scan is building one/);
+  assert.match(building, /still analysing owner\/api/);
+  assert.match(building, /carrick resume/);
+
+  const handed = runningScanLine({
+    scan_id: "5089ed60",
+    pid: 1,
+    started_at: "2026-09-16T10:00:00Z",
+    status: "dispatched",
+  });
+  assert.match(handed, /handed this workspace to Carrick Cloud/);
+  assert.doesNotMatch(handed, /is running|\.log/, "it is not still going, and its log ended");
 });

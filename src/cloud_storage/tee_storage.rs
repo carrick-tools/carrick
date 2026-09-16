@@ -40,6 +40,11 @@ pub fn laptop_scan_requested() -> bool {
     std::env::var(LAPTOP_SCAN_ENV).as_deref() == Ok("1")
 }
 
+/// Whether this scan keeps its index to itself (carrick#1229).
+fn skip_upload() -> bool {
+    std::env::var(crate::local_mode::SKIP_UPLOAD_ENV).as_deref() == Ok("1")
+}
+
 pub struct TeeStorage {
     cloud: AwsStorage,
     local: LocalDirStorage,
@@ -69,6 +74,19 @@ impl CloudStorage for TeeStorage {
         final_in_run: bool,
     ) -> Result<UploadOutcome, StorageError> {
         self.local.upload_repo_data(data, final_in_run).await?;
+        // A resume finishing at an older commit than the one the cloud already
+        // serves writes the local half and stops there (carrick#1229). Local
+        // first and cloud never, rather than "do not upload": the read model
+        // this build writes is the point of finishing at all, and a run that
+        // wrote nothing locally would leave the repo out of the index
+        // entirely.
+        if skip_upload() {
+            tracing::info!(
+                "Not replacing the stored index for {}: it moved on while this analysis ran",
+                data.repo_name
+            );
+            return Ok(UploadOutcome::default());
+        }
         self.cloud.upload_repo_data(data, final_in_run).await
     }
 
@@ -94,6 +112,10 @@ impl CloudStorage for TeeStorage {
         data: &CloudRepoData,
         written_after: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, StorageError> {
+        // Nothing was sent, so nothing can have failed to land.
+        if skip_upload() {
+            return Ok(true);
+        }
         self.cloud.index_landed(data, written_after).await
     }
 

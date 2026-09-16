@@ -589,7 +589,6 @@ fn resume(root: Option<&Path>) -> Result<(), String> {
                 repo.clone(),
                 super::index::Resumption {
                     answers: None,
-                    dispatched_at: String::new(),
                     superseded: false,
                 },
             )
@@ -605,13 +604,27 @@ fn resume(root: Option<&Path>) -> Result<(), String> {
             ),
             Ok(status) if !status.is_ready() => println!("{}", waiting_line(job, &status)),
             Ok(_) => match super::jobs::download(job, &index_dir.join("jobs")) {
-                Ok(answers) => {
+                Ok(ready) => {
+                    // The cloud decides this, not the laptop: a stored index
+                    // row carries no commit, and nothing in a check-or-upload
+                    // response says when one landed or what wrote it
+                    // (carrick-cloud#1006). So the message says what moved and
+                    // never which commit.
+                    println!(
+                        "Collected the analysis of {} ({} file(s)).",
+                        job.repo, ready.rows
+                    );
+                    if ready.superseded {
+                        println!(
+                            "{}",
+                            superseded_line(&job.repo, ready.superseded_by.as_deref())
+                        );
+                    }
                     resuming.insert(
                         PathBuf::from(&job.path),
                         super::index::Resumption {
-                            answers: Some(answers),
-                            dispatched_at: job.submitted_at.clone(),
-                            superseded: false,
+                            answers: Some(ready.answers),
+                            superseded: ready.superseded,
                         },
                     );
                     collected.push(job.job_id.clone());
@@ -643,6 +656,25 @@ fn resume(root: Option<&Path>) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// What a resume says when the index it is finishing is not the one the cloud
+/// should serve.
+///
+/// The local read model is still worth writing — it is what `carrick check`
+/// answers from — and it is not durable against the next `carrick refresh`,
+/// which brings down the newer one. Both halves are said, and neither claims a
+/// commit: the cloud decided this from the job's start time and what wrote the
+/// row, and index rows carry no commit at all.
+fn superseded_line(repo: &str, by: Option<&str>) -> String {
+    let who = match by {
+        Some(source) if !source.is_empty() => format!("A {source} index of {repo} landed"),
+        _ => format!("{repo} was indexed again"),
+    };
+    format!(
+        "{who} while this analysis ran. Finishing it here so `carrick check` can answer now; \
+         `carrick refresh` will bring down the newer index."
+    )
 }
 
 /// What `resume` and `status` say about a job that is still being analysed.

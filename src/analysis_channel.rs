@@ -80,6 +80,19 @@ pub fn dispatching() -> bool {
     COLLECTOR.lock().is_ok_and(|collector| collector.is_some())
 }
 
+/// Whether this run has collected anything yet.
+///
+/// The difference between "asked to dispatch" and "has something to hand
+/// over", and it decides two things: a service that built no prompt runs its
+/// remaining phases and its intents like any other scan, and a run that built
+/// none at all finishes as an ordinary scan rather than handing over nothing
+/// (carrick#1229).
+pub fn has_prompts() -> bool {
+    COLLECTOR
+        .lock()
+        .is_ok_and(|collector| collector.as_ref().is_some_and(|c| !c.rows.is_empty()))
+}
+
 /// Keep one file's prompt for the bundle.
 ///
 /// The row carries the body and the two keys; the block and the schema are
@@ -198,17 +211,11 @@ fn load(path: &Path) -> Option<AnswerBundle> {
         }
         Ok(bundle) => {
             tracing::info!(
-                "Resuming with {} collected answer(s), {} of them already held by the cloud{}",
+                "Resuming with {} collected answer(s), {} of them already held by the cloud; {} \
+                 row(s) the job could not answer",
                 bundle.len(),
                 bundle.cached_count(),
-                if bundle.complete {
-                    String::new()
-                } else {
-                    format!(
-                        ", {} of which the job could not produce",
-                        bundle.failure_count()
-                    )
-                }
+                bundle.failure_count(),
             );
             Some(bundle)
         }

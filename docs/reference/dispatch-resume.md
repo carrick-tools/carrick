@@ -40,14 +40,24 @@ header  { schema: "carrick.analysis-job/0", scan_id, repo, commit,
           guidance: { <guidance_key>: <rendered block, VERBATIM> },
           schemas:  { <schema_sha>:   <response schema value> },
           counts: { analyze_file, intent_functions, intent_levels } }
-analyze { kind: "analyze", id, service, guidance_key, body, schema_sha }
+row     { t: "analyze" | "intent", ... }
+analyze { t: "analyze", id, service, guidance_key, body, schema_sha }
 ```
 
+The answers come back as **one object per driver pass, with no header line**
+(carrick-cloud#1006): a pass writes what it has before it hands on, so nothing
+holds the whole job at once and a header written before the last pass would
+state a total that was not true yet.
+
 ```
-header  { schema: "carrick.analysis-answers/0", complete, ... }
-answer  { id, text, cached, truncated }
-failure { kind: "failure", id, code }
+answer  { t: "answer",  id, text, cached, truncated }
+failure { t: "failure", id, code }
 ```
+
+What the parts amount to is the `analysis-job-answers` response, not a line in
+a file: `{ schema, parts: [{ part, url, bytes, rows }], superseded,
+current_index }`. `carrick resume` folds every part into one file for the scan
+that replays them.
 
 `body` is the prompt AFTER the guidance prefix, byte-exact. The guidance block
 and the response schema are carried once each in the header and re-attached by
@@ -113,7 +123,7 @@ pipeline.
 | A service whose guidance carries no id | The job is refused rather than sent: without the id the cloud keys the whole message and the block carried once would be paid for once per file |
 | Nothing for the model | No job. The repo is indexed here, in the seconds it takes to state facts nobody has to be asked about |
 | A job still running | `carrick status` and `carrick resume` say how far it has got. Nothing is scanned |
-| The stored index moved while the job ran | The resume finishes locally and does not upload: a newer index is not replaced by an older one. `carrick refresh` brings the newer one down |
+| The stored index moved while the job ran | The resume finishes locally and does not upload: a newer index is not replaced by an older one. `carrick refresh` brings the newer one down. **The cloud decides this**, from the job's start time and the index rows' source, and says so on `analysis-job-answers` as `superseded` — a check-or-upload response says neither when a row landed nor what wrote it, and index rows carry no commit, so nothing on this side may derive it or name a commit |
 
 ## Limits, stated
 

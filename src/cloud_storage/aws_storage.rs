@@ -1494,7 +1494,8 @@ struct AnalysisJobResponse {
     eta_seconds: Option<u64>,
 }
 
-/// The tag `submit-analysis-job` must answer under.
+/// The tag `submit-analysis-job` answers under, which is the bundle's own tag:
+/// the action takes a `carrick.analysis-job/0` and says so back.
 const ANALYSIS_JOB_SCHEMA: &str = "carrick.analysis-job/0";
 
 #[async_trait]

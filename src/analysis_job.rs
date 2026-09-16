@@ -42,7 +42,8 @@ use sha2::{Digest, Sha256};
 /// The tag the job bundle is written under, and the one the cloud reads.
 pub const JOB_SCHEMA: &str = "carrick.analysis-job/0";
 
-/// The tag the answer bundle must carry.
+/// The tag the `analysis-job-answers` RESPONSE carries. The parts themselves
+/// carry no header at all (carrick-cloud#1006).
 pub const ANSWERS_SCHEMA: &str = "carrick.analysis-answers/0";
 
 /// Name the prompt body the way both sides name it.
@@ -147,9 +148,10 @@ impl JobBundle {
 }
 
 /// How a row names itself on the wire, so a reader can tell an analyze row
-/// from an intent row without positional rules.
+/// from an intent row without positional rules. `t`, because the cloud reads
+/// `t` (carrick-cloud#1006).
 #[derive(Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "t", rename_all = "snake_case")]
 enum JobLine<'a> {
     Analyze(&'a AnalyzeRow),
 }
@@ -176,43 +178,29 @@ pub struct AnswerBundle {
     answers: BTreeMap<String, Answer>,
     /// Rows the job could not answer, by id and code. Counted, never replayed.
     failures: BTreeMap<String, String>,
-    /// Whether the cloud says every row was answered. A partial job is still
-    /// worth replaying — every answer in it is one the resume does not buy.
-    pub complete: bool,
 }
 
 impl AnswerBundle {
-    /// Read an answer bundle, gzipped or plain.
+    /// Read one part of a job's answers, gzipped or plain, folding it in.
+    ///
+    /// **No header, and one object per PASS rather than one per job**
+    /// (carrick-cloud#1006). The driver writes what it has before it hands on,
+    /// so re-reading and re-writing every answer to assemble one object would
+    /// fall on the invocation least able to afford it — and a header written
+    /// before the last pass would state a total that was not true yet. What
+    /// the parts amount to is the `analysis-job-answers` response, not a line
+    /// in the file.
     ///
     /// Tolerant by design: a line this scanner does not understand is skipped
     /// rather than failing the resume, because the alternative is discarding
     /// thousands of answers over one unknown row.
-    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+    pub fn absorb(&mut self, bytes: &[u8]) -> Result<(), String> {
         let text = decompress(bytes)?;
-        let mut lines = text.lines().filter(|line| !line.trim().is_empty());
-        let header: AnswerHeader =
-            lines
-                .next()
-                .ok_or("the answer bundle is empty")
-                .and_then(|line| {
-                    serde_json::from_str(line).map_err(|_| "the answer bundle has no header")
-                })?;
-        if header.schema != ANSWERS_SCHEMA {
-            return Err(format!(
-                "the answer bundle is written as '{}'; this scanner reads {ANSWERS_SCHEMA}. \
-                 Update carrick to collect it.",
-                header.schema
-            ));
-        }
-        let mut bundle = Self {
-            complete: header.complete,
-            ..Self::default()
-        };
-        for line in lines {
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
-            match value.get("kind").and_then(|kind| kind.as_str()) {
+            match value.get("t").and_then(|tag| tag.as_str()) {
                 Some("failure") => {
                     let id = value
                         .get("id")
@@ -225,7 +213,7 @@ impl AnswerBundle {
                         .unwrap_or("no code")
                         .to_string();
                     if !id.is_empty() {
-                        bundle.failures.insert(id, code);
+                        self.failures.insert(id, code);
                     }
                 }
                 _ => {
@@ -233,11 +221,18 @@ impl AnswerBundle {
                         continue;
                     };
                     if !answer.id.is_empty() {
-                        bundle.answers.insert(answer.id.clone(), answer);
+                        self.answers.insert(answer.id.clone(), answer);
                     }
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Every part of a job's answers, read as one.
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let mut bundle = Self::default();
+        bundle.absorb(bytes)?;
         Ok(bundle)
     }
 
@@ -275,14 +270,6 @@ impl AnswerBundle {
     }
 }
 
-#[derive(Deserialize)]
-struct AnswerHeader {
-    #[serde(default)]
-    schema: String,
-    #[serde(default)]
-    complete: bool,
-}
-
 /// Gzipped or not: the cloud says which by the bytes, and a reader that
 /// insisted would fail a whole resume over a codec.
 fn decompress(bytes: &[u8]) -> Result<String, String> {
@@ -298,15 +285,15 @@ fn decompress(bytes: &[u8]) -> Result<String, String> {
 /// What a dispatched scan did, as it crosses from the scan subprocess to the
 /// command that started it.
 ///
-/// `job_id` is absent when the run found nothing for the model to answer. That
-/// is not a failure and not a job: the repo can be indexed here and now, in
-/// the seconds it takes to state facts nobody has to be asked about, and the
-/// command that reads this line does exactly that.
+/// Stated only by a run that actually handed something over. A run asked to
+/// dispatch that found nothing for the model says nothing here and finishes as
+/// an ordinary scan, so the command that reads this line never has to decide
+/// what an empty job means.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Dispatched {
     pub repo: String,
     pub commit: String,
-    pub job_id: Option<String>,
+    pub job_id: String,
     pub analyze_rows: usize,
     pub eta_seconds: Option<u64>,
 }
@@ -411,7 +398,7 @@ mod tests {
         assert_eq!(header["schema"], JOB_SCHEMA);
         assert_eq!(header["counts"]["analyze_file"], 1);
         let row: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
-        assert_eq!(row["kind"], "analyze");
+        assert_eq!(row["t"], "analyze", "the cloud reads `t`");
         assert_eq!(row["body"], "body");
         assert!(lines.next().is_none());
         let (sha, size) = digest(&bytes);
@@ -422,42 +409,47 @@ mod tests {
     #[test]
     fn answers_are_read_back_by_body_id_and_a_truncated_one_is_not_replayed() {
         let text = format!(
-            "{}\n{}\n{}\n{}\n",
-            serde_json::json!({"schema": ANSWERS_SCHEMA, "complete": true}),
-            serde_json::json!({"id": "a", "text": "{}", "cached": true}),
-            serde_json::json!({"id": "b", "text": "{half", "truncated": true}),
-            serde_json::json!({"kind": "failure", "id": "c", "code": "model_refused"}),
+            "{}\n{}\n{}\n",
+            serde_json::json!({"t": "answer", "id": "a", "text": "{}", "cached": true}),
+            serde_json::json!({"t": "answer", "id": "b", "text": "{half", "truncated": true}),
+            serde_json::json!({"t": "failure", "id": "c", "code": "model_refused"}),
         );
         let bundle = AnswerBundle::decode(text.as_bytes()).unwrap();
         assert_eq!(bundle.text_for("a"), Some("{}"));
         assert_eq!(bundle.text_for("b"), None, "truncated answers are misses");
         assert_eq!(bundle.text_for("c"), None);
         assert_eq!(bundle.failure_count(), 1);
-        assert!(bundle.complete);
+        assert_eq!(bundle.cached_count(), 1);
+    }
+
+    /// One object per pass, and no header in any of them
+    /// (carrick-cloud#1006): what the job amounts to is the response that
+    /// named the parts, not a line in a file.
+    #[test]
+    fn every_part_of_a_job_folds_into_one_set_of_answers() {
+        let part = |id: &str, text: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({"t": "answer", "id": id, "text": text})
+            )
+        };
+        let mut bundle = AnswerBundle::decode(part("a", "one").as_bytes()).unwrap();
+        bundle.absorb(part("b", "two").as_bytes()).unwrap();
+        assert_eq!(bundle.len(), 2);
+        assert_eq!(bundle.text_for("a"), Some("one"));
+        assert_eq!(bundle.text_for("b"), Some("two"));
     }
 
     #[test]
-    fn an_answer_bundle_from_a_newer_cloud_is_refused_by_name() {
+    fn a_gzipped_part_reads_the_same_as_a_plain_one() {
         let text = format!(
             "{}\n",
-            serde_json::json!({"schema": "carrick.analysis-answers/9"})
-        );
-        let error = AnswerBundle::decode(text.as_bytes()).unwrap_err();
-        assert!(error.contains("carrick.analysis-answers/9"), "{error}");
-    }
-
-    #[test]
-    fn a_gzipped_answer_bundle_reads_the_same_as_a_plain_one() {
-        let text = format!(
-            "{}\n{}\n",
-            serde_json::json!({"schema": ANSWERS_SCHEMA, "complete": false}),
-            serde_json::json!({"id": "a", "text": "answer"}),
+            serde_json::json!({"t": "answer", "id": "a", "text": "answer"})
         );
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(text.as_bytes()).unwrap();
         let bundle = AnswerBundle::decode(&encoder.finish().unwrap()).unwrap();
         assert_eq!(bundle.text_for("a"), Some("answer"));
-        assert!(!bundle.complete);
         assert_eq!(bundle.len(), 1);
     }
 }

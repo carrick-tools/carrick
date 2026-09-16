@@ -25,10 +25,18 @@ const JOBS_FILE: &str = "jobs.json";
 /// The tag the file is written under.
 const JOBS_SCHEMA: &str = "carrick.jobs/0";
 
-/// How long either network read may take before the local answer stands on its
-/// own. A status read is one DynamoDB lookup; a user waiting on `carrick
-/// status` is not waiting on the cloud.
-const READ_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long the status read may take before the local answer stands on its
+/// own.
+///
+/// Short on purpose. `carrick status` is what the session-start hook renders,
+/// so this is on the path of every editor open once a job is recorded, and a
+/// job status is one lookup. A machine with no network must cost the reader a
+/// few seconds, not half a minute.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the download may take. Not the same budget: this is the object a
+/// resume is for, and the command that asks for it is doing nothing else.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// One repo's dispatched job.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -161,11 +169,22 @@ pub struct JobReader {
 }
 
 impl JobReader {
-    pub fn new() -> Result<Self, String> {
+    /// A reader for `carrick status`: bounded so a machine with no network
+    /// costs the reader seconds.
+    pub fn for_status() -> Result<Self, String> {
+        Self::new(STATUS_TIMEOUT, Duration::from_secs(3))
+    }
+
+    /// A reader for `carrick resume`, which is collecting an object.
+    pub fn for_collecting() -> Result<Self, String> {
+        Self::new(DOWNLOAD_TIMEOUT, Duration::from_secs(10))
+    }
+
+    fn new(timeout: Duration, connect: Duration) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(READ_TIMEOUT)
-            .connect_timeout(Duration::from_secs(10))
+            .timeout(timeout)
+            .connect_timeout(connect)
             .gzip(true)
             .build()
             .map_err(|_| "Could not reach Carrick Cloud")?;
@@ -214,31 +233,76 @@ impl JobReader {
             .map_err(|_| "Carrick Cloud sent a job status this version cannot read".to_string())
     }
 
-    /// Download the answers, returning where they were written.
+    /// Download the answers, and say what came with them.
     ///
-    /// To a file rather than into memory: the bundle is large, the scan
-    /// subprocess is the thing that reads it, and a path is what crosses that
-    /// boundary.
+    /// To a file rather than into memory: the answers are large, the scan
+    /// subprocess is the thing that reads them, and a path is what crosses
+    /// that boundary.
     pub async fn answers(
         &self,
         credential: &Credential,
         job: &Job,
         into: &Path,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<Collected, String> {
         let value = self
             .post(
                 credential,
                 serde_json::json!({"action": "analysis-job-answers", "job_id": job.job_id}),
             )
             .await?;
-        let url = value
-            .get("url")
-            .and_then(|url| url.as_str())
-            .ok_or("Carrick Cloud did not say where this job's answers are")?;
+        let response: AnswersResponse = serde_json::from_value(value).map_err(|_| {
+            "Carrick Cloud sent an answer list this version cannot read".to_string()
+        })?;
+        if response.schema != crate::analysis_job::ANSWERS_SCHEMA {
+            return Err(format!(
+                "Carrick Cloud answered with schema '{}'; this scanner reads {}. Update carrick \
+                 to collect this analysis.",
+                response.schema,
+                crate::analysis_job::ANSWERS_SCHEMA
+            ));
+        }
+        if response.parts.is_empty() {
+            return Err("Carrick Cloud did not say where this job's answers are".to_string());
+        }
+        // One object per PASS, not one per job (carrick-cloud#1006): a pass
+        // writes what it has before it hands on, so nothing anywhere holds the
+        // whole job at once. They are folded into one file here, and the scan
+        // that replays them is handed a path and knows nothing about how the
+        // work was divided up.
+        let _ = std::fs::create_dir_all(into);
+        let path = into.join(format!("answers-{}.ndjson.gz", job.job_id));
+        let mut writer = flate2::write::GzEncoder::new(
+            std::fs::File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?,
+            flate2::Compression::default(),
+        );
+        for part in &response.parts {
+            let text = self.download(&part.url).await?;
+            std::io::Write::write_all(&mut writer, text.as_bytes())
+                .and_then(|()| {
+                    if text.ends_with('\n') {
+                        Ok(())
+                    } else {
+                        std::io::Write::write_all(&mut writer, b"\n")
+                    }
+                })
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        writer
+            .finish()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Collected {
+            answers: path,
+            rows: response.parts.iter().map(|part| part.rows).sum(),
+            superseded: response.superseded,
+            superseded_by: response.current_index.and_then(|index| index.source),
+        })
+    }
+
+    /// GET one part, with the three conditions a link this machine follows
+    /// without asking has to meet: https, no credentials of its own, and a
+    /// host. The same three the hosted read applies to a staged URL.
+    async fn download(&self, url: &str) -> Result<String, String> {
         let url = reqwest::Url::parse(url).map_err(|_| "Carrick Cloud sent an unusable link")?;
-        // The same three conditions the hosted read applies to a staged URL: a
-        // link this machine follows with no question asked must be https, must
-        // carry no credentials of its own, and must name a host.
         if url.scheme() != "https"
             || !url.username().is_empty()
             || url.password().is_some()
@@ -255,11 +319,61 @@ impl JobReader {
             .bytes()
             .await
             .map_err(|_| "Could not download the analysis")?;
-        let _ = std::fs::create_dir_all(into);
-        let path = into.join(format!("answers-{}.ndjson.gz", job.job_id));
-        std::fs::write(&path, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(path)
+        if bytes.starts_with(&[0x1f, 0x8b]) {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&bytes[..]), &mut text)
+                .map_err(|_| "Could not read the analysis")?;
+            return Ok(text);
+        }
+        String::from_utf8(bytes.to_vec()).map_err(|_| "Could not read the analysis".to_string())
     }
+}
+
+/// What a collected job amounts to, once its parts are on disk.
+#[derive(Debug)]
+pub struct Collected {
+    /// Every part, folded into one file for the scan that replays them.
+    pub answers: PathBuf,
+    /// How many answers the cloud says it handed over.
+    pub rows: usize,
+    /// The stored index moved on while this job ran, so the index this resume
+    /// writes is not the one the cloud should serve.
+    ///
+    /// **The cloud's answer, not a derived one.** A check-or-upload response
+    /// says neither when a stored index landed nor what wrote it, and index
+    /// rows carry no commit at all — so it is decided from the job's start
+    /// time and the rows' source, on the side that holds both (R8, corrected
+    /// on carrick-cloud#1006). Nothing on this side may claim a commit.
+    pub superseded: bool,
+    /// What wrote the index that moved past this one, when the cloud says.
+    pub superseded_by: Option<String>,
+}
+
+/// The `analysis-job-answers` 200 body.
+#[derive(Deserialize, Debug, Default)]
+struct AnswersResponse {
+    #[serde(default)]
+    schema: String,
+    #[serde(default)]
+    parts: Vec<AnswerPart>,
+    #[serde(default)]
+    superseded: bool,
+    #[serde(default)]
+    current_index: Option<CurrentIndex>,
+}
+
+#[derive(Deserialize, Debug)]
+struct AnswerPart {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    rows: usize,
+}
+
+#[derive(Deserialize, Debug)]
+struct CurrentIndex {
+    #[serde(default)]
+    source: Option<String>,
 }
 
 /// Ask the cloud how far each job has got.
@@ -287,7 +401,7 @@ pub fn ask(jobs: &[Job]) -> Vec<Result<JobStatus, String>> {
             Ok(runtime) => runtime,
             Err(_) => return asked.iter().map(|_| Err(UNREACHABLE.to_string())).collect(),
         };
-        let reader = match JobReader::new() {
+        let reader = match JobReader::for_status() {
             Ok(reader) => reader,
             Err(error) => return asked.iter().map(|_| Err(error.clone())).collect(),
         };
@@ -304,7 +418,7 @@ pub fn ask(jobs: &[Job]) -> Vec<Result<JobStatus, String>> {
 }
 
 /// Download one job's answers, and say where they landed.
-pub fn download(job: &Job, into: &Path) -> Result<PathBuf, String> {
+pub fn download(job: &Job, into: &Path) -> Result<Collected, String> {
     let credential = Credential::load()?.ok_or(SIGNED_OUT)?;
     let job = job.clone();
     let into = into.to_path_buf();
@@ -313,7 +427,7 @@ pub fn download(job: &Job, into: &Path) -> Result<PathBuf, String> {
             .enable_all()
             .build()
             .map_err(|_| UNREACHABLE.to_string())?;
-        let reader = JobReader::new()?;
+        let reader = JobReader::for_collecting()?;
         runtime.block_on(reader.answers(&credential, &job, &into))
     })
     .join()

@@ -28,7 +28,7 @@ use carrick::agents::framework_guidance_agent::{
     FrameworkGuidance, PatternExample, ProtocolGuidance,
 };
 use carrick::analysis_channel;
-use carrick::analysis_job::{ANSWERS_SCHEMA, body_id};
+use carrick::analysis_job::body_id;
 use carrick::framework_detector::DetectionResult;
 use carrick::operation::Protocol;
 use serial_test::serial;
@@ -102,16 +102,14 @@ async fn analyze(root: &Path) -> carrick::agents::file_orchestrator::FileCentric
         .expect("the analysis ran")
 }
 
-/// One answer bundle, gzipped as the cloud sends it.
+/// One part of a job's answers, gzipped as the cloud writes it: rows only,
+/// each tagged `t`, and no header (carrick-cloud#1006).
 fn answer_bundle(answers: &[(String, String)], into: &Path) -> PathBuf {
-    let mut text = format!(
-        "{}\n",
-        serde_json::json!({"schema": ANSWERS_SCHEMA, "complete": true})
-    );
+    let mut text = String::new();
     for (id, body) in answers {
         text.push_str(&format!(
             "{}\n",
-            serde_json::json!({"id": id, "text": body, "cached": true})
+            serde_json::json!({"t": "answer", "id": id, "text": body, "cached": true})
         ));
     }
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());

@@ -54,9 +54,6 @@ pub struct Resumption {
     /// ordinary way, because the index the resume writes covers the workspace
     /// and a repo left out of it reads as a repo with nothing in it.
     pub answers: Option<PathBuf>,
-    /// When the prompts were handed over, so this build can tell whether the
-    /// stored index moved while the job ran.
-    pub dispatched_at: String,
     /// The cloud already serves a newer index for this repo — CI indexed it
     /// while the job ran. The scan still builds the local read model, because
     /// that is what `carrick check` answers from, but it does not replace a
@@ -218,30 +215,6 @@ fn run_generation(
     // these writes no index: it has nothing to write one from, and a thinner
     // index over the top of the last one would read as an answer.
     let mut handed_over: Vec<(PathBuf, crate::analysis_job::Dispatched)> = Vec::new();
-    // Somebody else may have indexed a repo while its job ran — a push to main
-    // is exactly how an index is meant to arrive. The answers are still worth
-    // collecting, and the read model this build writes is what `carrick check`
-    // answers from; what must not happen is an older index replacing a newer
-    // one in the cloud (carrick#1229, R8).
-    let pass = &match pass {
-        Pass::Resume(resuming) => {
-            let mut resuming = resuming.clone();
-            for (repo, resumption) in resuming.iter_mut() {
-                if !indexed_since(hosted, repo, &resumption.dispatched_at) {
-                    continue;
-                }
-                resumption.superseded = true;
-                eprintln!(
-                    "carrick: {} was indexed again while this analysis ran. Finishing it here so \
-                     `carrick check` can answer now; `carrick refresh` will bring down the newer \
-                     index.",
-                    repo_label(repo)
-                );
-            }
-            Pass::Resume(resuming)
-        }
-        other => other.clone(),
-    };
     for (position, repo) in targets.iter().enumerate() {
         let name = repo_label(repo);
         let previous = generation.join("previous.json");
@@ -254,22 +227,23 @@ fn run_generation(
         // scanner in its own directory so user labels cannot overwrite a
         // retained or hosted blob in the join input.
         let scan_dir = generation.join(format!("scan-{position}"));
-        let mut report = scan_repo(&exe, repo, &scan_dir, &previous, &name, pass)?;
-        // A repo asked to dispatch that found nothing for the model has no job
-        // to wait for, and the facts it does have take seconds to state. Scan
-        // it here rather than leaving a gap in the index nobody will collect.
-        if report
-            .dispatched
-            .as_ref()
-            .is_some_and(|dispatched| dispatched.job_id.is_none())
-        {
-            report = scan_repo(&exe, repo, &scan_dir, &previous, &name, &Pass::Infer)?;
-        }
-        if let Some(dispatched) = report.dispatched.filter(|d| d.job_id.is_some()) {
+        let report = scan_repo(&exe, repo, &scan_dir, &previous, &name, pass)?;
+        // A repo that handed its prompts over wrote no blob. One that was
+        // asked to and found nothing for the model says nothing here: it
+        // indexed itself, in the seconds it takes to state facts nobody has to
+        // be asked about.
+        if let Some(dispatched) = report.dispatched {
             handed_over.push((repo.clone(), dispatched));
             continue;
         }
-        if pass.infers() {
+        // "Uploaded" drives the enrichment this repo's services are shown
+        // with, so a resume that deliberately kept its index to itself must
+        // not claim one.
+        let kept_local = match pass {
+            Pass::Resume(resuming) => resuming.get(repo).is_some_and(|r| r.superseded),
+            _ => false,
+        };
+        if pass.infers() && !kept_local {
             uploaded.insert(repo.clone());
         }
         if let Some(paid) = report.spend {
@@ -298,7 +272,7 @@ fn run_generation(
                 super::jobs::Job {
                     repo: dispatched.repo.clone(),
                     path: repo.to_string_lossy().into_owned(),
-                    job_id: dispatched.job_id.clone().unwrap_or_default(),
+                    job_id: dispatched.job_id.clone(),
                     commit: dispatched.commit.clone(),
                     analyze_rows: dispatched.analyze_rows,
                     submitted_at: chrono::Utc::now().to_rfc3339(),
@@ -418,21 +392,6 @@ fn run_generation(
         elapsed_secs: started.elapsed().as_secs_f64(),
         hosted_download: hosted.download_line(),
     })))
-}
-
-/// Whether the stored index for `repo` moved after `since`.
-///
-/// Read off the hosted snapshot this build already downloaded, so it costs no
-/// extra round trip. Absent rows read as "no", which is the safe answer: a
-/// repo the cloud holds nothing for cannot have a newer index than this one.
-fn indexed_since(hosted: &super::hosted::HostedInput, repo: &Path, since: &str) -> bool {
-    let Ok(since) = chrono::DateTime::parse_from_rfc3339(since) else {
-        return false;
-    };
-    hosted
-        .local_blobs(repo)
-        .iter()
-        .any(|blob| blob.last_updated > since.with_timezone(&chrono::Utc))
 }
 
 /// The repo holding a named service, for `refresh --service`. The blobs know
@@ -1514,6 +1473,73 @@ mod tests {
         );
         assert_eq!(env.get(super::super::NO_MODEL_ENV), Some(&None));
         assert_eq!(env.get("CARRICK_SKIP_INTENTS"), Some(&None));
+    }
+
+    /// The three passes that are not the ordinary one, read back from the
+    /// environment they hand the scan. The difference between them is entirely
+    /// here, which is why this file tests it (carrick#1229).
+    #[test]
+    fn each_pass_asks_the_scan_for_exactly_what_it_is() {
+        let dispatch = scan_env(&Pass::Dispatch);
+        assert_eq!(
+            dispatch.get(crate::analysis_channel::DISPATCH_ENV),
+            Some(&Some("1".into()))
+        );
+        assert_eq!(
+            dispatch.get(crate::analysis_channel::ANSWERS_ENV),
+            Some(&None),
+            "a dispatch has no answers to replay"
+        );
+        assert_eq!(
+            dispatch.get(crate::cloud_storage::LAPTOP_SCAN_ENV),
+            Some(&Some("1".into())),
+            "and it still asks the model for detection and guidance"
+        );
+
+        let resume = scan_env(&Pass::Resume(BTreeMap::from([(
+            PathBuf::from("/repos/api"),
+            Resumption {
+                answers: Some(PathBuf::from("/build/answers.ndjson.gz")),
+                superseded: true,
+            },
+        )])));
+        assert_eq!(
+            resume.get(crate::analysis_channel::ANSWERS_ENV),
+            Some(&Some("/build/answers.ndjson.gz".into()))
+        );
+        assert_eq!(
+            resume.get(super::super::SKIP_UPLOAD_ENV),
+            Some(&Some("1".into())),
+            "a resume the cloud has moved past keeps its index to itself"
+        );
+        assert_eq!(
+            resume.get(crate::analysis_channel::DISPATCH_ENV),
+            Some(&None)
+        );
+
+        // A repo in the same resume that was never handed over is scanned the
+        // ordinary way: no answers, and its index is uploaded.
+        let untouched = scan_env(&Pass::Resume(BTreeMap::new()));
+        assert_eq!(
+            untouched.get(crate::analysis_channel::ANSWERS_ENV),
+            Some(&None)
+        );
+        assert_eq!(untouched.get(super::super::SKIP_UPLOAD_ENV), Some(&None));
+
+        for pass in [Pass::Facts, Pass::Infer] {
+            let env = scan_env(&pass);
+            for key in [
+                crate::analysis_channel::DISPATCH_ENV,
+                crate::analysis_channel::ANSWERS_ENV,
+                super::super::SKIP_UPLOAD_ENV,
+            ] {
+                assert_eq!(
+                    env.get(key),
+                    Some(&None),
+                    "{key} is cleared, not merely absent, on {pass:?}"
+                );
+            }
+        }
     }
 
     /// Both variants strip the ambient CI context. On a laptop scan that is

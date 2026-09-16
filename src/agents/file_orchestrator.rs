@@ -2315,6 +2315,7 @@ impl FileOrchestrator {
         // is content and not a commit diff: a resume has to work on a dirty
         // tree and in a shallow clone, where a diff answers nothing.
         let mut collected: Vec<(PendingFile, FileAnalysisResult)> = Vec::new();
+        let mut collecting = false;
         if crate::analysis_channel::dispatching() {
             let schema = crate::agents::schemas::AgentSchemas::file_analysis_schema();
             let service = crate::current_service::name();
@@ -2338,6 +2339,7 @@ impl FileOrchestrator {
                     &pf.wrapper_context,
                 ) {
                     crate::analysis_channel::record(service.as_deref(), key, &prompt, &schema);
+                    collecting = true;
                 }
             }
             not_asked.append(&mut to_dispatch);
@@ -2383,13 +2385,17 @@ impl FileOrchestrator {
             to_dispatch = unanswered;
         }
 
-        // A dispatched run's product is the bundle, and every phase from here
-        // on works on model answers it does not have. Ending here rather than
-        // walking them with an empty map saves a service's worth of parsing, a
-        // workspace index rebuilt from disk and a sidecar pass over a tree
-        // nothing will be said about. The caller ends the run at the same
-        // point and submits what was collected.
-        if crate::analysis_channel::dispatching() {
+        // A dispatched service's product is the bundle, and every phase from
+        // here on works on model answers it does not have. Ending here rather
+        // than walking them with an empty map saves a service's worth of
+        // parsing, a workspace index rebuilt from disk and a sidecar pass over
+        // a tree nothing will be said about. The caller ends the run at the
+        // same point and submits what was collected.
+        //
+        // A service that built no prompt is not dispatched and does not end
+        // here: it has nothing to hand over, so it finishes the way it would
+        // have without the flag, and its rows reach the index.
+        if collecting {
             debug!(
                 "Dispatching: {} prompt(s) built for this service, no index will be written",
                 not_asked.len()
