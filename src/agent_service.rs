@@ -3944,6 +3944,305 @@ pub(crate) mod tests {
         );
     }
 
+    // ---------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // carrick-cloud#869 measurement harness. These print a table and assert
+    // nothing, so they are `#[ignore]`d; they are what `QUIET_RESTORE` was
+    // chosen from. Run one with
+    //   cargo test --lib agent_service::tests::probe_869 -- --ignored --nocapture
+    // ---------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct DsqCounts {
+        /// Requests the stub answered.
+        requests: std::sync::atomic::AtomicUsize,
+        /// Requests answered 503 `model_error` because every in-lambda try was
+        /// refused. What a scan pays for twice: once in wall clock, once
+        /// against the caller's daily request bucket.
+        exhausted: std::sync::atomic::AtomicUsize,
+        /// Individual model tries, the thing a refusal is drawn against.
+        tries: std::sync::atomic::AtomicUsize,
+    }
+
+    /// A lambda in front of a model on dynamic shared quota: whether a try is
+    /// refused is drawn against a probability that depends only on how long
+    /// the run has been going, never on how many requests are in flight.
+    ///
+    /// That is the shape the 2026-09-14 first index measured
+    /// (carrick-cloud#869): two windows of about twenty minutes in which 13.4%
+    /// of model calls came back exhausted, 0.3% between them, and no relation
+    /// to the scan's own model-call rate — its highest minute of the window,
+    /// 171 calls, was refused nothing. The lambda's own chain is modelled
+    /// too: three tries on `X-Carrick-Attempt` 1, one on later attempts
+    /// (carrick-cloud#875).
+    async fn dsq_lambda(
+        dip: std::ops::Range<Duration>,
+        p_dip: f64,
+        p_clear: f64,
+        hold: Duration,
+    ) -> (String, Arc<DsqCounts>) {
+        let counts = Arc::new(DsqCounts::default());
+        let started = std::time::Instant::now();
+        let draws = Arc::new(std::sync::atomic::AtomicU64::new(0x9E37_79B9_7F4A_7C15));
+        let shared = Arc::clone(&counts);
+        let base = concurrent_stub(move |request| {
+            let counts = Arc::clone(&shared);
+            let draws = Arc::clone(&draws);
+            let dip = dip.clone();
+            async move {
+                counts.requests.fetch_add(1, Ordering::SeqCst);
+                let attempt = header_of(&request, "x-carrick-attempt")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(1);
+                let in_lambda_tries = if attempt <= 1 { 3 } else { 1 };
+                let p = if dip.contains(&started.elapsed()) {
+                    p_dip
+                } else {
+                    p_clear
+                };
+                let mut served = false;
+                for _ in 0..in_lambda_tries {
+                    counts.tries.fetch_add(1, Ordering::SeqCst);
+                    if draw(&draws) >= p {
+                        served = true;
+                        break;
+                    }
+                }
+                if !served {
+                    counts.exhausted.fetch_add(1, Ordering::SeqCst);
+                    return (
+                        503,
+                        r#"{"success":false,"error":{"code":"model_error","message":"RESOURCE_EXHAUSTED","retriable":true}}"#
+                            .to_string(),
+                        vec![("Retry-After", "0".to_string())],
+                    );
+                }
+                tokio::time::sleep(hold).await;
+                (
+                    200,
+                    r#"{"success":true,"text":"analysed"}"#.to_string(),
+                    Vec::new(),
+                )
+            }
+        })
+        .await;
+        (base, counts)
+    }
+
+    /// A uniform in `[0, 1)` from a shared counter, xorshift64*: every arm
+    /// draws from the same stream, and a run is reproducible.
+    fn draw(state: &std::sync::atomic::AtomicU64) -> f64 {
+        let mut x = state
+            .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::SeqCst)
+            .wrapping_add(0x9E37_79B9);
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// The probe's backoff, scaled down with everything else: the shape of
+    /// the chain is the scanner's, the numbers are a fraction of it.
+    fn probe_policy() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: MAX_RETRIES,
+            max_delay: Duration::from_millis(200),
+            wait_budget: Duration::from_secs(600),
+            run_budgeted: false,
+        }
+    }
+
+    fn service_with_quiet(permits: usize, route_max: usize, quiet: Duration) -> AgentService {
+        AgentService {
+            client: Client::builder().no_proxy().build().unwrap(),
+            semaphore: Arc::new(Semaphore::new(permits)),
+            limits: Arc::new(RouteLimits::with_quiet(route_max, quiet)),
+            pacer: Arc::new(RatePacer::new()),
+            retry: probe_policy(),
+        }
+    }
+
+    async fn drive(service: &AgentService, api_base: &str, calls: usize) -> (Duration, usize) {
+        let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
+        let body = serde_json::json!({});
+        let at = std::time::Instant::now();
+        let results = futures::future::join_all(
+            (0..calls).map(|_| service.post_with_retry(&auth, api_base, "/generate-intent", &body)),
+        )
+        .await;
+        (at.elapsed(), results.iter().filter(|r| r.is_err()).count())
+    }
+
+    /// The quiet spells to compare, as multiples of one call's latency, so a
+    /// probe on a fast route and a probe on a slow one can be read together.
+    ///
+    /// The shipped spell is a minute, which is about 18 call latencies on
+    /// file analysis (3.4 s p50) and about 40 on the intent route (1.5 s), so
+    /// the slow-route table brackets it closely and the fast-route table
+    /// brackets it only from below. That is enough to read it, because the
+    /// arms converge on the old rule's numbers as the spell lengthens: a
+    /// spell longer than the longest arm is no less safe than that arm.
+    const PROBE_ARMS: [(&str, u32); 5] = [
+        ("run at width only (the old rule)", 0),
+        ("quiet spell = 20 call latencies", 20),
+        ("quiet spell = 9 call latencies", 9),
+        ("quiet spell = 4 call latencies", 4),
+        ("quiet spell = 0 (no cut kept)", 1),
+    ];
+
+    /// The intent route's shape: many short calls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "probe: prints a table and takes about two minutes"]
+    async fn probe_869_dsq_shape_fast_route() {
+        let hold = Duration::from_millis(150);
+        dsq_arms(1500, hold, &quiet_arms(hold)).await;
+    }
+
+    /// The file-analysis shape: fewer, slower calls, where a limit that climbs
+    /// back one slot per round of successes at that width is minutes of
+    /// climbing (2026-09-15 scale test).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "probe: prints a table and takes about two minutes"]
+    async fn probe_869_dsq_shape_slow_route() {
+        let hold = Duration::from_millis(800);
+        dsq_arms(450, hold, &quiet_arms(hold)).await;
+    }
+
+    fn quiet_arms(hold: Duration) -> Vec<(String, Duration)> {
+        PROBE_ARMS
+            .iter()
+            .map(|(name, latencies)| {
+                let quiet = match latencies {
+                    0 => Duration::MAX,
+                    n => hold * *n - hold,
+                };
+                ((*name).to_string(), quiet)
+            })
+            .collect()
+    }
+
+    const PROBE_MAX: usize = DEFAULT_CONCURRENCY_LIMIT;
+
+    async fn dsq_arms(calls: usize, hold: Duration, arms: &[(String, Duration)]) {
+        const CAP: usize = PROBE_MAX;
+        let dip = Duration::from_secs(2)..Duration::from_secs(8);
+
+        println!(
+            "arm | wall clock | requests | exhausted 503 | model tries | failed | back to max \
+             after the dip | time below max"
+        );
+        for (name, quiet) in arms {
+            let (api_base, counts) = dsq_lambda(dip.clone(), 0.53, 0.02, hold).await;
+            let service = service_with_quiet(28, CAP, *quiet);
+            let limit = service.limits.for_route("/generate-intent");
+            let stop = Arc::new(AtomicBool::new(false));
+            let samples = Arc::new(Mutex::new(Vec::<(f64, usize)>::new()));
+            let sampler = {
+                let limit = Arc::clone(&limit);
+                let stop = Arc::clone(&stop);
+                let samples = Arc::clone(&samples);
+                let at = std::time::Instant::now();
+                tokio::spawn(async move {
+                    while !stop.load(Ordering::SeqCst) {
+                        samples
+                            .lock()
+                            .unwrap()
+                            .push((at.elapsed().as_secs_f64(), limit.limit()));
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+            };
+            let (wall, failed) = drive(&service, &api_base, calls).await;
+            stop.store(true, Ordering::SeqCst);
+            let _ = sampler.await;
+            let samples = samples.lock().unwrap().clone();
+            let back = samples
+                .iter()
+                .find(|(t, l)| *t >= dip.end.as_secs_f64() && *l == CAP)
+                .map(|(t, _)| *t - dip.end.as_secs_f64());
+            let below = samples.iter().filter(|(_, l)| *l < CAP).count() as f64
+                / samples.len().max(1) as f64;
+            println!(
+                "{name} | {:.2}s | {} | {} | {} | {} | {} | {:.0}%",
+                wall.as_secs_f64(),
+                counts.requests.load(Ordering::SeqCst),
+                counts.exhausted.load(Ordering::SeqCst),
+                counts.tries.load(Ordering::SeqCst),
+                failed,
+                back.map_or_else(|| "never".to_string(), |s| format!("{s:.2}s")),
+                below * 100.0,
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    /// The capacity shape the cut was built for (carrick#1119's control): the
+    /// backend really does have room for a fixed number at once, so this
+    /// scan's own rate is what produces the refusals. The quiet spell must
+    /// not undo the cut here — and it cannot, because under this shape the
+    /// refusals never stop for one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "probe: prints a table and takes about a minute"]
+    async fn probe_869_capacity_shape() {
+        let hold = Duration::from_millis(150);
+        // Room for four at once: the edge is far below half the maximum.
+        capacity_arms(4, hold, &quiet_arms(hold)).await;
+        // Room for twenty: the edge is inside the top half of the maximum,
+        // where a restore has the furthest to overshoot.
+        capacity_arms(20, hold, &quiet_arms(hold)).await;
+    }
+
+    async fn capacity_arms(threshold: usize, hold: Duration, arms: &[(String, Duration)]) {
+        const CALLS: usize = 300;
+        println!("--- backend with room for {threshold} at once, maximum {PROBE_MAX} ---");
+        println!("arm | wall clock | refused | failed calls");
+        for (name, quiet) in arms {
+            let threshold = Arc::new(std::sync::atomic::AtomicUsize::new(threshold));
+            let (api_base, counts) = busy_lambda(Arc::clone(&threshold), hold).await;
+            let service = service_with_quiet(28, PROBE_MAX, *quiet);
+            let (wall, failed) = drive(&service, &api_base, CALLS).await;
+            println!(
+                "{name} | {:.2}s | {} | {}",
+                wall.as_secs_f64(),
+                counts.refused.load(Ordering::SeqCst),
+                failed,
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    /// A clean run: nothing is refused, so no limit ever leaves its maximum
+    /// and the quiet spell has nothing to restore. The arms must match.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "probe: prints a table"]
+    async fn probe_869_clean_run() {
+        const CAP: usize = 20;
+        const CALLS: usize = 1500;
+        let hold = Duration::from_millis(150);
+
+        println!("arm | wall clock | requests");
+        for (name, quiet) in [
+            ("run at width only (the old rule)", Duration::MAX),
+            ("quiet spell = 20 call latencies", hold * 19),
+        ] {
+            let (api_base, counts) = dsq_lambda(
+                Duration::from_secs(0)..Duration::from_secs(0),
+                0.0,
+                0.0,
+                hold,
+            )
+            .await;
+            let service = service_with_quiet(28, CAP, quiet);
+            let (wall, _) = drive(&service, &api_base, CALLS).await;
+            println!(
+                "{name} | {:.2}s | {}",
+                wall.as_secs_f64(),
+                counts.requests.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
     fn unix_now() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
