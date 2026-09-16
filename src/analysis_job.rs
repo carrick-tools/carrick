@@ -31,7 +31,7 @@
 //! rather than an economy: the raw stream on a large monorepo is hundreds of
 //! megabytes against a hard per-object ceiling.
 //!
-//! Reference: `docs/dispatch-resume.md`.
+//! Reference: `docs/reference/dispatch-resume.md`.
 
 use std::collections::BTreeMap;
 use std::io::Write;

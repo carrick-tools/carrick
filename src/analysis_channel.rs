@@ -21,6 +21,8 @@
 //! repos that is a few hundred megabytes for the length of one dispatch, which
 //! is a scan that is doing nothing else; streaming them to disk as they are
 //! built is carrick#1238.
+//!
+//! Reference: `docs/reference/dispatch-resume.md`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
