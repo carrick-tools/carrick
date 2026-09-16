@@ -4075,8 +4075,13 @@ pub(crate) mod tests {
 
     /// The quiet spells to compare, as multiples of one call's latency, so a
     /// probe on a fast route and a probe on a slow one can be read together.
-    /// [`QUIET_RESTORE`] is 30 s, which is about 20 call latencies on the
-    /// intent route (1.5 s) and about 9 on file analysis (3.4 s p50).
+    ///
+    /// The shipped spell is a minute, which is about 18 call latencies on
+    /// file analysis (3.4 s p50) and about 40 on the intent route (1.5 s), so
+    /// the slow-route table brackets it closely and the fast-route table
+    /// brackets it only from below. That is enough to read it, because the
+    /// arms converge on the old rule's numbers as the spell lengthens: a
+    /// spell longer than the longest arm is no less safe than that arm.
     const PROBE_ARMS: [(&str, u32); 5] = [
         ("run at width only (the old rule)", 0),
         ("quiet spell = 20 call latencies", 20),

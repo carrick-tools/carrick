@@ -76,11 +76,11 @@ const TERMINAL_LINE_GAP: Duration = Duration::from_secs(15);
 /// increase underneath it: the climb re-probes, meets the backend's edge, and
 /// that refusal restarts the spell, so the spell never elapses while the
 /// backend is still refusing. A spell has to be long enough for that probe to
-/// get there. Against a fixed-capacity stub, a spell of four call latencies
-/// is too short and costs 585 refusals and 18 calls lost against the old
-/// rule's 49 and none; at nine and at twenty it is 49 and none, the old
-/// rule's numbers exactly, whether the backend's edge sits below or above
-/// half the maximum.
+/// get there. Against a fixed-capacity stub with room for four at a maximum
+/// of 28, a spell of four call latencies is too short and costs 562 refusals
+/// and 8 calls lost against the old rule's 64 and none; at nine and at twenty
+/// it is 64 and none, the old rule's numbers exactly, and the same holds with
+/// the backend's edge at 20, inside the top half of the maximum.
 ///
 /// A minute, then: several times the climb back on the slowest route
 /// (file analysis, 3.4 s p50), and nothing against the tens of minutes of
@@ -91,7 +91,9 @@ const TERMINAL_LINE_GAP: Duration = Duration::from_secs(15);
 ///
 /// The rule rejected: restoring once the climb passes a fraction of the
 /// maximum, which needs no clock. On a fixed-capacity backend whose edge sits
-/// in the top half it oscillates — 188 refusals against the old rule's 12.
+/// in the top half it oscillates — measured at 188 refusals against the old
+/// rule's 12, on an arm that is no longer in the probe, so reproducing it
+/// means putting the fraction rule back.
 ///
 /// The measurements are `probe_869_capacity_shape` and `probe_869_dsq_shape*`
 /// in `agent_service`'s tests, `#[ignore]`d because they print a table rather
@@ -575,10 +577,12 @@ mod tests {
     /// 28 would otherwise cost.
     #[tokio::test]
     async fn a_quiet_spell_without_a_refusal_restores_the_limit_in_one_step() {
+        // A spell wide enough that a stalled runner cannot drift the two
+        // successes below out of it (carrick#1139).
         let limit = Arc::new(AdaptiveLimit::with_quiet(
             "/generate-intent",
             16,
-            Duration::from_millis(30),
+            Duration::from_millis(300),
         ));
         limit.acquire().await.overloaded();
         limit.acquire().await.overloaded();
@@ -590,7 +594,7 @@ mod tests {
         limit.acquire().await.succeeded();
         assert_eq!(limit.limit(), 3);
 
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
         limit.acquire().await.succeeded();
         assert_eq!(
             limit.limit(),
