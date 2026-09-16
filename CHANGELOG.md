@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.74](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.73...carrick-v0.3.74) (2026-09-16)
+
+
+### Features
+
+* **agent:** fingerprint every analyze-file prompt in the run log ([#1220](https://github.com/carrick-tools/carrick/issues/1220)) ([#1225](https://github.com/carrick-tools/carrick/issues/1225)) ([dc45419](https://github.com/carrick-tools/carrick/commit/dc45419333b70af3e7f789527551e7bf99451b88))
+* **agent:** send X-Carrick-Service on prompt-lambda calls ([#1230](https://github.com/carrick-tools/carrick/issues/1230)) ([8e39e96](https://github.com/carrick-tools/carrick/commit/8e39e96da530a08ec853358982090689ecda743c))
+
+
+### Bug Fixes
+
+* **cache:** key the analysis cache on content, not on where the scan ran ([#1233](https://github.com/carrick-tools/carrick/issues/1233)) ([f447218](https://github.com/carrick-tools/carrick/commit/f447218a9516d40a5fec531a0ff6ad486d82a05b))
+* **cli:** stop printing our inference cost to the customer's terminal ([#1237](https://github.com/carrick-tools/carrick/issues/1237)) ([d2e9195](https://github.com/carrick-tools/carrick/commit/d2e919594eca314d7c6427943a91dfb24b45dc66)), closes [#1236](https://github.com/carrick-tools/carrick/issues/1236)
+* **limiter:** restore a route's concurrency after a quiet spell ([#1226](https://github.com/carrick-tools/carrick/issues/1226)) ([649052b](https://github.com/carrick-tools/carrick/commit/649052b02b6c83b77d7476cfa07c78b71b82662a))
+
+
+### CI/CD
+
+* ratchet guard against our inference cost in customer-facing strings ([#1241](https://github.com/carrick-tools/carrick/issues/1241)) ([178bea2](https://github.com/carrick-tools/carrick/commit/178bea267afb2c1c370b77f4815d4732ea4b8010))
+
 ## [0.3.73](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.72...carrick-v0.3.73) (2026-09-15)
 
 
