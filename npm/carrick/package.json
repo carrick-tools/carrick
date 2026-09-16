@@ -41,7 +41,7 @@
     "LICENSE.md"
   ],
   "scripts": {
-    "test": "tsc --noEmit && npm run build && node --test 'test/**/*.test.ts'",
+    "test": "tsc --noEmit && npm run build && node --test --import=./test/no-update-check.mjs 'test/**/*.test.ts'",
     "typecheck": "tsc --noEmit",
     "selftest": "node test/selftest.ts",
     "bundle": "node scripts/bundle-sidecar.mjs",

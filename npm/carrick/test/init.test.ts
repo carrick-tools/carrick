@@ -243,6 +243,9 @@ globalThis.fetch = async (input, init) => {
       CARRICK_BIN: native,
       CARRICK_TOKEN: "test-token",
       XDG_CONFIG_HOME: path.join(root, "config"),
+      // No registry lookup and no detached child for a test that only wants to
+      // watch `init` write files (src/update.ts).
+      CARRICK_NO_UPDATE_CHECK: "1",
       // The MCP step configures the agent clients this machine has, and the
       // detection is each client's own directory under the home directory.
       // A test that did not state one would edit the developer's own clients.
