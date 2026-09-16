@@ -20,7 +20,7 @@
 //! The collector holds the rows in memory until the run ends. On the largest
 //! repos that is a few hundred megabytes for the length of one dispatch, which
 //! is a scan that is doing nothing else; streaming them to disk as they are
-//! built is carrick#1238.
+//! built is carrick#1244.
 //!
 //! Reference: `docs/reference/dispatch-resume.md`.
 
