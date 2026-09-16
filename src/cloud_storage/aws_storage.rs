@@ -1397,12 +1397,24 @@ impl AwsStorage {
     ) -> Result<JobSubmission, StorageError> {
         let bytes = bundle.encode().map_err(StorageError::SerializationError)?;
         let (payload_sha256, payload_size) = crate::analysis_job::digest(&bytes);
+        // Both calls below carry it, and the cloud validates it first on each.
+        // Answering here rather than letting the cloud 400 keeps the reason in
+        // the user's own terms: a dispatch is part of a scan, and without one
+        // there is nothing for the job to belong to.
+        let scan_id = self.scan_id().ok_or_else(|| {
+            StorageError::ConnectionError(
+                "This dispatch is not part of an open scan, so Carrick Cloud has nothing to \
+                 attach the job to. Run the scan again so it can open with start-scan."
+                    .to_string(),
+            )
+        })?;
 
         let opened: AnalysisJobResponse = self
             .call_lambda_generic(
                 "submit-analysis-job",
                 &SubmitAnalysisJobRequest {
                     action: "submit-analysis-job",
+                    scan_id: &scan_id,
                     repo: &bundle.header.repo,
                     commit: &bundle.header.commit,
                     scanner_version: &bundle.header.scanner_version,
@@ -1457,6 +1469,7 @@ impl AwsStorage {
                 "submit-analysis-job",
                 &SubmitAnalysisJobRequest {
                     action: "submit-analysis-job",
+                    scan_id: &scan_id,
                     repo: &bundle.header.repo,
                     commit: &bundle.header.commit,
                     scanner_version: &bundle.header.scanner_version,
@@ -1513,6 +1526,12 @@ fn already_running(error: StorageError) -> StorageError {
 #[derive(Serialize)]
 struct SubmitAnalysisJobRequest<'a> {
     action: &'a str,
+    /// The scan this job belongs to. The cloud reads the row it names and
+    /// refuses a submission that is not part of a scan this workspace opened
+    /// with `start-scan`, so this is the live scan id, never a fresh one.
+    /// Required: `analysis_job_actions.js` rejects a body without it before
+    /// it looks at anything else (carrick#1257).
+    scan_id: &'a str,
     repo: &'a str,
     commit: &'a str,
     scanner_version: &'a str,
@@ -2151,6 +2170,7 @@ mod tests {
         };
         let asking = SubmitAnalysisJobRequest {
             action: "submit-analysis-job",
+            scan_id: "scan_1",
             repo: "owner/api",
             commit: "abc",
             scanner_version: "0.0.0",
@@ -2163,6 +2183,19 @@ mod tests {
         };
         let body: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&asking).unwrap()).unwrap();
+        // Every field the cloud refuses the body for not having, on EITHER
+        // call. Asserting the names we send are spelled right is not the same
+        // check: carrick#1257 shipped a request that spelled all of them
+        // correctly and simply never sent `scan_id`, which this list would
+        // have caught and the assertions below would not.
+        for required in ["action", "scan_id", "repo", "commit", "scanner_version"] {
+            assert!(
+                body.get(required).is_some(),
+                "submit-analysis-job refuses a body with no `{required}`; \
+                 see carrick-cloud lambdas/check-or-upload/analysis_job_actions.js"
+            );
+        }
+        assert_eq!(body["scan_id"], "scan_1");
         assert_eq!(body["wants_upload_url"], true);
         assert!(body.get("job_id").is_none(), "the cloud mints it");
         assert!(body.get("payload_sha256").is_none());
@@ -2185,6 +2218,9 @@ mod tests {
             body.get("wants_upload_url").is_none(),
             "asking again would mint a second job"
         );
+        // The second call is validated by the same guard as the first, so it
+        // carries the scan too.
+        assert_eq!(body["scan_id"], "scan_1");
     }
 
     /// And the names it answers with. `upload_url` is the exact place the
