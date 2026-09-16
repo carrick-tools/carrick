@@ -232,8 +232,8 @@ pub fn relogin_hint() -> Option<String> {
     }
     match consented_scope() {
         Some(scope) if scope != CLI_SCOPE => Some(format!(
-            "This credential was consented under scope '{scope}'; uploading and paid analysis \
-             need '{CLI_SCOPE}', which a fresh carrick login requests."
+            "This credential was consented under scope '{scope}'; uploading and analysis need \
+             '{CLI_SCOPE}', which a fresh carrick login requests."
         )),
         _ => None,
     }

@@ -40,9 +40,6 @@ pub struct IndexOutcome {
     pub index: LocalIndex,
     pub scanned: Vec<String>,
     pub elapsed_secs: f64,
-    /// What this run paid Carrick Cloud, one entry per repo `carrick index`
-    /// scanned. Empty after `refresh`, the pass that pays for nothing.
-    pub spend: crate::scan_spend::RunSpend,
     /// What the hosted read downloaded and what it reused unchanged. `None`
     /// when no hosted metadata was read at all.
     pub hosted_download: Option<String>,
@@ -149,9 +146,10 @@ fn run_generation(
     // the cloud's error, so a refused upload fails the scan — and that is the
     // one fact the pre-scan hosted snapshot cannot know (carrick#1007 item 1).
     let mut uploaded: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    // The receipt, written as each figure lands rather than at the end: the
-    // money is spent at the upload, so a run killed after paying still leaves
-    // the record of it behind (carrick#995).
+    // The receipt, written as each block lands rather than at the end: a run
+    // killed after an upload has still uploaded that repo, and this is the
+    // record of it (carrick#995). Nothing printed reads it; `carrick status
+    // --json` carries it for whoever parses that (carrick#1236).
     let mut spend = crate::scan_spend::RunSpend::default();
     for (position, repo) in targets.iter().enumerate() {
         let name = repo_label(repo);
@@ -288,7 +286,6 @@ fn run_generation(
         index,
         scanned,
         elapsed_secs: started.elapsed().as_secs_f64(),
-        spend,
         hosted_download: hosted.download_line(),
     })
 }

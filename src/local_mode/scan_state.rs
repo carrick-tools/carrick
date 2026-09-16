@@ -106,11 +106,12 @@ pub struct ScanState {
     pub notice: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// What this scan has paid Carrick Cloud so far, once a repo's upload has
-    /// come back with a figure (carrick#995). A detached scan's own output
-    /// goes to its log, so this file is where a reader of a run nobody watched
-    /// finds what it cost — a killed one included, because the money was spent
-    /// at the upload. Absent on the free pass and before the first upload.
+    /// What Carrick Cloud has answered this scan so far, one entry per repo
+    /// whose upload has come back (carrick#995). How many entries it holds is
+    /// how many repos a killed run got through, which is the one thing its
+    /// record can say about it; the figures inside ride `status --json` for
+    /// whoever parses that and are printed nowhere (carrick#1236). Absent on
+    /// the free pass and before the first upload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend: Option<crate::scan_spend::RunSpend>,
 }
@@ -192,14 +193,13 @@ impl ScanState {
             Some(update) => format!(" — {}", update.render()),
             None => String::new(),
         };
-        let paid = if self.infer { ", paid" } else { "" };
         if self.is_running() {
             let notice = match &self.notice {
                 Some(notice) => format!(" ({notice})"),
                 None => String::new(),
             };
             return format!(
-                "scan {} running for {elapsed} (started {started}{paid}): {}{counts}{notice}",
+                "scan {} running for {elapsed} (started {started}): {}{counts}{notice}",
                 self.scan_id, self.phase
             );
         }
@@ -208,7 +208,7 @@ impl ScanState {
         // (carrick#1007 item 4).
         if self.status == ScanStatus::Finished {
             return format!(
-                "scan {} finished after {elapsed} (started {started}{paid}). The index is written.",
+                "scan {} finished after {elapsed} (started {started}). The index is written.",
                 self.scan_id
             );
         }
@@ -218,14 +218,13 @@ impl ScanState {
                 self.scan_id
             ),
             // What a killed run left behind depends on how far it got: a
-            // multi-repo build uploads each repo as it finishes it, and every
-            // upload that came back with a figure was paid for. Saying
-            // "nothing was uploaded" over the top of that would be false.
+            // multi-repo build uploads each repo as it finishes it, and the
+            // ones it got through are indexed. Saying "nothing was uploaded"
+            // over the top of that would be false.
             None => match self.spend.as_ref().map(|spend| spend.scans.len()) {
-                Some(paid) if paid > 0 => format!(
+                Some(uploaded) if uploaded > 0 => format!(
                     "scan {} stopped without finishing after {elapsed} (started {started}), in \
-                     {}{counts}. It had uploaded {paid} repo(s) and paid for them; run the \
-                     command again.",
+                     {}{counts}. It had uploaded {uploaded} repo(s); run the command again.",
                     self.scan_id, self.phase
                 ),
                 _ => format!(
@@ -485,11 +484,12 @@ fn log_line(line: &str) {
     }
 }
 
-/// Record what this scan has paid so far. A no-op in a build that records no
-/// scan, like every other writer here.
+/// Record what this scan has reported so far. A no-op in a build that records
+/// no scan, like every other writer here.
 ///
 /// Written on the spot rather than at the end: a scan that is killed after an
-/// upload has already spent the money, and this file is what it leaves behind.
+/// upload has already uploaded that repo, and this file is what it leaves
+/// behind.
 pub fn spent(spend: &crate::scan_spend::RunSpend) {
     let Ok(mut guard) = ACTIVE.lock() else {
         return;
@@ -539,8 +539,8 @@ pub fn finish(error: Option<&str>) {
 ///
 /// Without it a Ctrl-C left `running` with a dead pid, which `carrick status`
 /// can only call "stopped without finishing". The signal is the reason, and so
-/// is what the scan had already paid for: a multi-repo build uploads each repo
-/// as it finishes it, and the money for those is spent.
+/// is how far the scan got: a multi-repo build uploads each repo as it
+/// finishes it, and the ones it got through are indexed.
 pub fn interrupted(signal: &str) {
     let reason = {
         let Ok(guard) = ACTIVE.lock() else {
@@ -557,9 +557,9 @@ pub fn interrupted(signal: &str) {
 /// The sentence an interrupted scan's record leads with.
 fn interruption_reason(signal: &str, spend: Option<&crate::scan_spend::RunSpend>) -> String {
     match spend.map(|spend| spend.scans.len()) {
-        Some(paid) if paid > 0 => format!(
-            "interrupted by {signal}, after uploading {paid} repo(s) and paying for them; run \
-             the command again."
+        Some(uploaded) if uploaded > 0 => format!(
+            "interrupted by {signal}, after uploading {uploaded} repo(s); run the command \
+             again."
         ),
         _ => {
             format!("interrupted by {signal} before anything was uploaded; run the command again.")
@@ -675,7 +675,9 @@ mod tests {
         assert!(line.contains("scan 5089ed60 running for 3m12s"), "{line}");
         assert!(line.contains("indexing gateway"), "{line}");
         assert!(line.contains("118 of 240 files"), "{line}");
-        assert!(line.contains("paid"), "the paid pass says so: {line}");
+        // A scan line says what is happening, never what it costs us
+        // (carrick#1236).
+        assert!(!line.contains("paid") && !line.contains("US$"), "{line}");
     }
 
     /// A running scan the model is slowing says why, after its counts
@@ -868,10 +870,11 @@ mod tests {
         );
     }
 
-    /// An interrupted scan says what ended it, and whether it had already
-    /// paid for anything before it did (carrick#1132).
+    /// An interrupted scan says what ended it, and how many repos it had
+    /// already uploaded before it did (carrick#1132). Repos, not money:
+    /// what the run cost us is ours (carrick#1236).
     #[test]
-    fn an_interrupted_scan_names_the_signal_and_what_it_paid() {
+    fn an_interrupted_scan_names_the_signal_and_what_it_uploaded() {
         let nothing = interruption_reason("SIGINT", None);
         assert_eq!(
             nothing,
@@ -887,27 +890,28 @@ mod tests {
                 ..Default::default()
             },
         );
-        let paid = interruption_reason("SIGTERM", Some(&spend));
+        let uploaded = interruption_reason("SIGTERM", Some(&spend));
         assert_eq!(
-            paid,
-            "interrupted by SIGTERM, after uploading 1 repo(s) and paying for them; run the \
-             command again."
+            uploaded,
+            "interrupted by SIGTERM, after uploading 1 repo(s); run the command again."
         );
         let mut failed = state(ScanStatus::Failed, std::process::id());
-        failed.error = Some(paid);
+        failed.error = Some(uploaded);
         assert!(
-            failed.line().ends_with("interrupted by SIGTERM, after uploading 1 repo(s) and paying for them; run the command again."),
+            failed.line().ends_with(
+                "interrupted by SIGTERM, after uploading 1 repo(s); run the command again."
+            ),
             "{}",
             failed.line()
         );
     }
 
-    /// A detached run's output goes to its log, so what it paid is kept here
-    /// as it is paid — and a scan that was killed after uploading a repo did
-    /// spend that money. "Nothing was uploaded by it" would be false.
+    /// A detached run's output goes to its log, so what each repo reported is
+    /// kept here as it lands — and a scan killed after uploading a repo did
+    /// upload it. "Nothing was uploaded by it" would be false.
     #[test]
     #[cfg(unix)]
-    fn a_killed_scan_that_had_already_paid_does_not_claim_it_uploaded_nothing() {
+    fn a_killed_scan_that_had_already_uploaded_does_not_claim_it_uploaded_nothing() {
         let mut killed = state(ScanStatus::Running, i32::MAX as u32);
         let mut spend = crate::scan_spend::RunSpend::default();
         spend.record(
@@ -921,14 +925,11 @@ mod tests {
         );
         killed.spend = Some(spend);
         let line = killed.line();
-        assert!(
-            line.contains("uploaded 1 repo(s) and paid for them"),
-            "{line}"
-        );
+        assert!(line.contains("uploaded 1 repo(s)"), "{line}");
         assert!(!line.contains("Nothing \\\nwas uploaded"), "{line}");
-        // The figure itself is not on this line: `carrick status` prints the
-        // receipt once, and a scan line that repeated it would say it twice.
-        assert!(!line.contains("US$"), "{line}");
+        // Not the figure, and not the word: what a run costs us never
+        // reaches a customer's terminal (carrick#1236).
+        assert!(!line.contains("US$") && !line.contains("paid"), "{line}");
     }
 
     /// A state file written before the field existed is still a scan this
@@ -972,7 +973,7 @@ mod tests {
         );
         let line = finished.line();
         assert!(line.contains("scan 5089ed60 finished after 58s"), "{line}");
-        assert!(line.contains("paid"), "{line}");
+        assert!(!line.contains("paid") && !line.contains("US$"), "{line}");
         assert!(line.contains("The index is written"), "{line}");
         // Not "stopped without finishing", which is what every non-running
         // record said before this state existed.

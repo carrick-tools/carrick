@@ -417,7 +417,7 @@ export function runningScanLine(scan: RunningScan): string {
     return `- scan ${scan.scan_id} failed${reason ? `: ${reason}` : ""}`;
   }
   if (scan.status === "finished") {
-    return `- scan ${scan.scan_id} finished${scan.infer ? ", paid" : ""}. The index is written.`;
+    return `- scan ${scan.scan_id} finished. The index is written.`;
   }
   const slow = scan.notice ? ` (${scan.notice})` : "";
   return `- scan ${scan.scan_id} is running${where}${counts}${slow}. Its output is in .carrick/scan-${scan.scan_id}.log`;
