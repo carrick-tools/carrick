@@ -96,7 +96,10 @@ pub struct FrameworkGuidance {
     ///
     /// Skipped when absent, and defaulted on read, because this struct is
     /// persisted in the index blob (`CloudRepoData::cached_guidance`) and a
-    /// blob written before this field must still deserialise.
+    /// blob written before this field must still deserialise. Such a blob is
+    /// not replayed: the engine asks for guidance again rather than scan under
+    /// an id-less answer forever, because the gate that guards the replay does
+    /// not move on an ordinary scan (carrick#1224, `guidance_is_keyed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guidance_key: Option<String>,
 }

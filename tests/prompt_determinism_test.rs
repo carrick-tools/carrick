@@ -39,6 +39,12 @@ fn fixture_dir() -> PathBuf {
 
 /// One scan's prompts, keyed by the file they were built for.
 fn capture(dump: &Path) -> BTreeMap<String, String> {
+    capture_from(dump, &fixture_dir())
+}
+
+/// As [`capture`], over a copy of the corpus at `corpus` — the same content at
+/// a different absolute path.
+fn capture_from(dump: &Path, corpus: &Path) -> BTreeMap<String, String> {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
     // No cassettes: the generated mock answers every call, and only the
@@ -46,7 +52,7 @@ fn capture(dump: &Path) -> BTreeMap<String, String> {
     let cassettes = tempfile::tempdir().expect("temp cassette dir");
 
     let mut cmd = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_carrick")));
-    cmd.arg(fixture_dir())
+    cmd.arg(corpus)
         .env("CARRICK_EVAL_DUMP_DIR", dump)
         .env("CARRICK_LOCAL_STORAGE_DIR", storage.path())
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
@@ -186,4 +192,73 @@ fn the_corpus_exercises_every_collection_backed_section() {
         with("### CANDIDATE CONTEXT (Structured JSON)") > 0,
         "no prompt carries structured candidate contexts"
     );
+}
+
+/// The prompt names every file the way the index does, so identical content
+/// scanned from a different directory renders identical bytes (carrick#1223).
+///
+/// The cloud's analysis cache is content-addressed and deliberately keys
+/// nothing about where a scan ran, but the scanner used to write ABSOLUTE
+/// paths into the message it hashes — the file's own header, the imported
+/// wrapper snippets, the GraphQL consumer hints — so every entry was private
+/// to one checkout: two developers on one commit shared nothing, a laptop and
+/// CI shared nothing, and moving or re-cloning a tree re-paid the whole repo.
+/// None of that is visible as an error; it reads as a normal first index. Two
+/// copies of one corpus at different paths is the assertion that says so.
+#[test]
+fn the_same_tree_at_two_paths_renders_the_same_prompts() {
+    let one = tempfile::tempdir().expect("temp corpus dir");
+    let two = tempfile::tempdir().expect("temp corpus dir");
+    // Different depths as well as different names: a path length that happens
+    // to match would hide a leak that shifted no byte counts.
+    let left = one.path().join("checkout");
+    let right = two.path().join("nested/deeper/checkout-with-a-longer-name");
+    copy_dir(&fixture_dir(), &left);
+    copy_dir(&fixture_dir(), &right);
+
+    let left_dump = tempfile::tempdir().expect("temp dump dir");
+    let right_dump = tempfile::tempdir().expect("temp dump dir");
+    let from_left = capture_from(left_dump.path(), &left);
+    let from_right = capture_from(right_dump.path(), &right);
+
+    assert!(
+        !from_left.is_empty(),
+        "the copied corpus dispatched no files, so the comparison has nothing to compare"
+    );
+    // Named one pair at a time: printing two 34-path lists says nothing about
+    // WHICH name moved, and an absolute path moves all of them at once.
+    for (mine, theirs) in from_left.keys().zip(from_right.keys()) {
+        assert_eq!(
+            mine, theirs,
+            "the two checkouts named this file differently: a path in the prompt is still absolute"
+        );
+    }
+    assert_eq!(
+        from_left.len(),
+        from_right.len(),
+        "the two checkouts dispatched different numbers of files"
+    );
+    for (file, message) in &from_left {
+        let other = &from_right[file];
+        assert!(
+            message == other,
+            "the prompt for {file} depends on where the checkout lives; every cache entry it \
+             writes is private to that directory.\n{}",
+            first_difference(message, other)
+        );
+    }
+}
+
+/// Copy a directory tree, so one corpus can be scanned from two paths.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create copy target");
+    for entry in std::fs::read_dir(from).expect("read corpus").flatten() {
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        if source.is_dir() {
+            copy_dir(&source, &target);
+        } else {
+            std::fs::copy(&source, &target).expect("copy corpus file");
+        }
+    }
 }

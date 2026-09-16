@@ -1048,6 +1048,11 @@ impl FileOrchestrator {
         // long as the cache lives (#478).
         let mut raw_model_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         let mut stats = ProcessingStats::default();
+        // Every path that reaches a prompt is reduced against this (see
+        // `PendingFile::prompt_path`). The engine canonicalizes `repo_path`
+        // before discovery, so the files and the root are in the same form and
+        // the reduction cannot silently fail to a leading `/Users/...`.
+        let repo_root_str = repo_root.to_string_lossy().to_string();
         let cm: Lrc<SourceMap> = Default::default();
         let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
 
@@ -1066,6 +1071,16 @@ impl FileOrchestrator {
         // the LLM calls themselves are then dispatched concurrently.
         struct PendingFile {
             path_str: String,
+            /// The same file as `path_str`, reduced to the form the index
+            /// stores as a row's `file`, and the ONLY form that reaches the
+            /// model's prompt (carrick#1223). The cloud's analysis cache hashes
+            /// the prompt bytes and deliberately keys nothing about where the
+            /// scan ran, so an absolute path in there makes every entry private
+            /// to one checkout: two developers on one commit, or a laptop and
+            /// CI, never share a hit, and a moved or freshly cloned tree
+            /// re-pays the whole repo. `path_str` stays absolute because it
+            /// keys `file_results` and reads files off disk.
+            prompt_path: String,
             content: String,
             candidate_hints: Vec<String>,
             candidate_contexts: Vec<String>,
@@ -1689,6 +1704,8 @@ impl FileOrchestrator {
             let symbols = Self::extract_symbol_table(file_path, &cm, &handler);
 
             pending.push(PendingFile {
+                prompt_path: crate::utils::repo_relative_source_path(&path_str, &repo_root_str)
+                    .to_string(),
                 path_str,
                 content,
                 route_module_claimed,
@@ -1744,7 +1761,7 @@ impl FileOrchestrator {
             let Ok(canonical) = path.canonicalize() else {
                 continue;
             };
-            let mut snippet = format!("--- wrapper module: {} ---\n", pf.path_str);
+            let mut snippet = format!("--- wrapper module: {} ---\n", pf.prompt_path);
             if pf.content.len() > WRAPPER_SNIPPET_MAX {
                 let mut end = WRAPPER_SNIPPET_MAX;
                 while end > 0 && !pf.content.is_char_boundary(end) {
@@ -2085,6 +2102,11 @@ impl FileOrchestrator {
             };
             let symbols = Self::extract_symbol_table(&deferred.file_path, &cm, &handler);
             pending.push(PendingFile {
+                prompt_path: crate::utils::repo_relative_source_path(
+                    &deferred.path_str,
+                    &repo_root_str,
+                )
+                .to_string(),
                 path_str: deferred.path_str,
                 content,
                 route_module_claimed: deferred.route_module_claimed,
@@ -2301,7 +2323,7 @@ impl FileOrchestrator {
                 let result = self
                     .file_analyzer
                     .analyze_file_with_candidates(
-                        &pf.path_str,
+                        &pf.prompt_path,
                         &pf.content,
                         guidance,
                         &pf.candidate_hints,

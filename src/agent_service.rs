@@ -1,6 +1,7 @@
 use crate::oidc::OidcProvider;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -726,7 +727,7 @@ impl AgentService {
             }
             return Ok(LambdaOutcome {
                 text: generate_mock_for_task(task_path, body, mock_seed),
-                guidance_key: None,
+                guidance_key: mock_guidance_key(task_path, body),
             });
         }
 
@@ -1199,6 +1200,29 @@ impl AgentService {
             "Maximum retry attempts exceeded".to_string(),
         ))
     }
+}
+
+/// The `guidance_key` an offline `/framework-guidance` answer carries.
+///
+/// The cloud derives this id from the REQUEST — its prompt, model, task and
+/// the detected framework inventory — never from the words that come back, so
+/// guidance regenerating into different words under the same id does not
+/// re-analyse a repo's files (carrick-cloud#871). The mock has to model that,
+/// because the scanner now refuses to replay guidance that carries no id
+/// (carrick#1224): a mock that returned `None` would make every warm offline
+/// scan ask for guidance again and hide the replay path from every test that
+/// covers it.
+///
+/// Hashing the serialized request body is the same relation in miniature:
+/// deterministic across processes, and different for a different framework set.
+fn mock_guidance_key<B: Serialize + ?Sized>(task_path: &str, body: &B) -> Option<String> {
+    if task_path != "/framework-guidance" {
+        return None;
+    }
+    let material = serde_json::to_string(body).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(material.as_bytes());
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 /// A failure an offline run answers instead of the mock response, for the
