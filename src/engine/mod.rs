@@ -2575,6 +2575,11 @@ async fn analyze_current_repo_incremental(
             // producer list is complete; empty for non-GraphQL services.
             let graphql_producer_hints = crate::graphql::GraphqlProducerHints::collect(
                 service_graphql_roots(repo_path, service),
+                &crate::graphql::resolve_declared_schemas(
+                    Path::new(repo_path),
+                    &service.graphql_schemas,
+                )
+                .files,
                 &files,
             );
             // #268: the consumer mirror — document consumers with no
@@ -3336,12 +3341,19 @@ fn append_deterministic_protocol_operations(
             consumers = graphql.consumers.len(),
             "Indexing GraphQL operations"
         );
-        cloud_data.endpoints.extend(
-            graphql
-                .producers
-                .iter()
-                .map(|op| to_details(op.key.clone(), &op.file_path, op.line)),
-        );
+        // A producer is served where its resolver is, when one was located
+        // (carrick#1157): the schema file states the field, the resolver is
+        // the code that changes when the operation does. A field with only a
+        // backing type located has no line to point at and stays on its schema
+        // line.
+        cloud_data
+            .endpoints
+            .extend(graphql.producers.iter().map(|op| {
+                match (&op.resolver_file, op.resolver_line) {
+                    (Some(file), Some(line)) => to_details(op.key.clone(), file, line),
+                    _ => to_details(op.key.clone(), &op.file_path, op.line),
+                }
+            }));
         cloud_data
             .calls
             .extend(graphql.consumers.iter().map(|op| ApiEndpointDetails {
@@ -5994,6 +6006,8 @@ async fn analyze_current_repo(
     // later for the operation index; the duplicate parse is acceptable.
     let graphql_producer_hints = crate::graphql::GraphqlProducerHints::collect(
         service_graphql_roots(repo_path, service),
+        &crate::graphql::resolve_declared_schemas(Path::new(repo_path), &service.graphql_schemas)
+            .files,
         &files,
     );
     // #268: the consumer mirror — document consumers with no deterministic

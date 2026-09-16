@@ -1,0 +1,17 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "graphql_operations": [
+    {
+      "kind": "mutation",
+      "field": "dispatchParcel",
+      "resolver_function": "dispatchParcel",
+      "resolver_line": 5,
+      "primary_type_symbol": "Parcel",
+      "type_import_source": "../kit.ts",
+      "backing_type_symbol": null,
+      "backing_type_source": null
+    }
+  ]
+}
