@@ -166,6 +166,29 @@ pub fn parse_pending(line: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The prefix a dispatched scan names its job on.
+const DISPATCHED_MARKER: &str = "@carrick-dispatched ";
+
+/// State, for the parent, that this repo's prompts went to Carrick Cloud as a
+/// job rather than being answered here (carrick#1229).
+///
+/// The scan writes no index when it dispatches, so without this line the
+/// indexer would look for a blob that was never going to exist.
+pub fn report_dispatched(dispatched: &crate::analysis_job::Dispatched) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(payload) = serde_json::to_string(dispatched) {
+        eprintln!("{DISPATCHED_MARKER}{payload}");
+    }
+}
+
+/// Read a dispatch out of a line of a scan's stderr.
+pub fn parse_dispatched(line: &str) -> Option<crate::analysis_job::Dispatched> {
+    let payload = line.trim_start().strip_prefix(DISPATCHED_MARKER)?;
+    serde_json::from_str(payload).ok()
+}
+
 /// Read one update out of a line of a scan's stderr, if that is what it is.
 pub fn parse(line: &str) -> Option<Update> {
     let payload = line.trim_start().strip_prefix(MARKER)?;

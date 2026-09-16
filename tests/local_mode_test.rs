@@ -1731,3 +1731,104 @@ fn a_successful_index_supersedes_the_record_of_the_scan_before_it() {
         "and `status` stops leading with it:\n{rendered}"
     );
 }
+
+/// `carrick index --dispatch` hands the analysis over and says so, and the
+/// workspace remembers the jobs (carrick#1229).
+///
+/// The scan that dispatches writes no index — that is the point of it — so the
+/// two things that must survive the command are the record of what is being
+/// analysed and a line telling the user how it arrives. The offline storage
+/// takes the job in place of the cloud, so this runs on a machine with no
+/// credential and no network.
+#[test]
+#[serial]
+fn a_dispatched_index_records_its_jobs_and_says_the_analysis_is_elsewhere() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    for repo in ["catalog-web", "inventory-svc"] {
+        std::fs::write(root.join(repo).join("carrick.json"), "{}\n").expect("write a config");
+    }
+
+    let stdout = run_mocked(root, &["index", "--dispatch", "--workspace", "."]);
+    assert!(
+        stdout.contains("Carrick Cloud is analysing"),
+        "the command says who is doing the work:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("carrick resume"),
+        "and how the index arrives:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains('$') && !stdout.to_lowercase().contains("paid"),
+        "what the analysis costs us is never a customer's line (carrick#1236):\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("The index is written"),
+        "no index was written, and the record must not say one was:\n{stdout}"
+    );
+
+    // The scan record says what happened to it. Written by the build rather
+    // than by the scan, and not rewritten as "finished" on the way out.
+    let record = std::fs::read_dir(root.join(".carrick"))
+        .expect(".carrick")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("scan-") && name.ends_with(".json"))
+        })
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .expect("the build recorded its scan");
+    let state: serde_json::Value = serde_json::from_str(&record).expect("scan record is json");
+    assert_eq!(
+        state["status"], "dispatched",
+        "the record says the analysis went elsewhere:\n{record}"
+    );
+    assert!(
+        !state["jobs"].as_array().unwrap_or(&Vec::new()).is_empty(),
+        "and names the job it is waiting on:\n{record}"
+    );
+
+    let recorded = std::fs::read_to_string(root.join(".carrick/jobs.json"))
+        .expect("the jobs outlive the command that dispatched them");
+    let jobs: serde_json::Value = serde_json::from_str(&recorded).expect("jobs.json is json");
+    let jobs = jobs["jobs"]
+        .as_array()
+        .expect("one entry per repo handed over");
+    // One per repo that had anything for the model. A repo whose files raise
+    // no candidate has no job to wait for and was indexed here instead, which
+    // is why this is a floor and not an equality.
+    assert!(!jobs.is_empty(), "something was handed over:\n{recorded}");
+    for job in jobs {
+        // `/private/var` on macOS against the `/var` the test built: compare
+        // the tail, which is what says this is that repo.
+        let path = job["path"].as_str().unwrap_or_default();
+        assert!(
+            std::path::Path::new(path).ends_with(job["repo"].as_str().unwrap_or("nothing")),
+            "each names the tree a resume rebuilds the prompts from:\n{recorded}"
+        );
+        assert!(
+            !job["job_id"].as_str().unwrap_or_default().is_empty(),
+            "each names the job to collect:\n{recorded}"
+        );
+        assert!(
+            job["analyze_rows"].as_u64().unwrap_or_default() > 0,
+            "and how many files it carries:\n{recorded}"
+        );
+    }
+
+    // And `status` leads with it. Without the record this reads "no index
+    // here", which is the wrong answer while the work that builds it is
+    // running somewhere else. The cloud cannot be asked on this machine, so
+    // the line says that rather than pretending.
+    let rendered = run(root, &["status", "--workspace", "."]);
+    assert!(
+        rendered.contains("Carrick Cloud is analysing"),
+        "status names the analysis in flight:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("could not ask"),
+        "and says it could not reach the cloud rather than inventing progress:\n{rendered}"
+    );
+}

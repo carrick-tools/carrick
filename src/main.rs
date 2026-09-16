@@ -1,5 +1,7 @@
 mod agent_service;
 mod agents;
+mod analysis_channel;
+mod analysis_job;
 mod analyzer;
 mod app_context;
 mod boundary;

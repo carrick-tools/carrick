@@ -2287,7 +2287,7 @@ impl FileOrchestrator {
         // `raw_model_results`: an empty answer cached there would read as "the
         // model said nothing about this file" and freeze the skip for as long
         // as the cache lives (#478).
-        let (to_dispatch, not_asked): (Vec<PendingFile>, Vec<PendingFile>) =
+        let (mut to_dispatch, mut not_asked): (Vec<PendingFile>, Vec<PendingFile>) =
             if crate::local_mode::no_model() || self.model_deferred {
                 (Vec::new(), to_dispatch)
             } else {
@@ -2299,7 +2299,118 @@ impl FileOrchestrator {
                 not_asked.len()
             );
         }
-        stats.files_model_reused = reused.len();
+
+        // Dispatch and resume both turn on the same bytes, so both build the
+        // prompt here rather than inside the call (carrick#1229).
+        //
+        // Dispatching, the prompt is collected and the file is treated exactly
+        // as local mode treats one: not asked, not a loss, nothing cached. The
+        // run ends without an index and the bundle is what it produced.
+        //
+        // Resuming, the prompt's BODY names the answer: the hash of those bytes
+        // is the id the job answered under, so a match is this file's answer
+        // wherever and whenever it was produced, and everything else — a file
+        // edited since the dispatch, an answer the job could not produce, a
+        // truncated one — simply goes to the model below. That is why the join
+        // is content and not a commit diff: a resume has to work on a dirty
+        // tree and in a shallow clone, where a diff answers nothing.
+        let mut collected: Vec<(PendingFile, FileAnalysisResult)> = Vec::new();
+        let mut collecting = false;
+        if crate::analysis_channel::dispatching() {
+            let schema = crate::agents::schemas::AgentSchemas::file_analysis_schema();
+            let service = crate::current_service::name();
+            for pf in &to_dispatch {
+                let Some(key) = guidance.guidance_key.as_deref() else {
+                    // Without a guidance id the cloud keys the whole message,
+                    // so the block this bundle carries once is re-keyed for
+                    // every file. Refuse the job rather than ship that.
+                    crate::analysis_channel::degrade(service.as_deref().unwrap_or("this service"));
+                    break;
+                };
+                if let Some(prompt) = self.file_analyzer.prompt_for(
+                    &pf.prompt_path,
+                    &pf.content,
+                    guidance,
+                    &pf.candidate_hints,
+                    &pf.candidate_contexts,
+                    &pf.symbol_table.imported_symbols,
+                    &pf.graphql_producer_hints,
+                    &pf.graphql_consumer_hints,
+                    &pf.wrapper_context,
+                ) {
+                    crate::analysis_channel::record(service.as_deref(), key, &prompt, &schema);
+                    collecting = true;
+                }
+            }
+            not_asked.append(&mut to_dispatch);
+        } else if let Some(answers) = crate::analysis_channel::answers() {
+            let mut unanswered: Vec<PendingFile> = Vec::with_capacity(to_dispatch.len());
+            for pf in to_dispatch.drain(..) {
+                let replay = self
+                    .file_analyzer
+                    .prompt_for(
+                        &pf.prompt_path,
+                        &pf.content,
+                        guidance,
+                        &pf.candidate_hints,
+                        &pf.candidate_contexts,
+                        &pf.symbol_table.imported_symbols,
+                        &pf.graphql_producer_hints,
+                        &pf.graphql_consumer_hints,
+                        &pf.wrapper_context,
+                    )
+                    .and_then(|prompt| {
+                        answers.text_for(&crate::analysis_job::body_id(prompt.body()))
+                    })
+                    .map(|text| FileAnalyzerAgent::result_from_answer(&pf.prompt_path, text));
+                match replay {
+                    Some(Ok(result)) => collected.push((pf, result)),
+                    Some(Err(error)) => {
+                        // An answer this scanner cannot read is a miss, not a
+                        // failure: the model can be asked the same question.
+                        warn!(
+                            "A collected answer for {} could not be read ({error}); asking the model for it",
+                            pf.prompt_path
+                        );
+                        unanswered.push(pf);
+                    }
+                    None => unanswered.push(pf),
+                }
+            }
+            debug!(
+                "Collected answers joined onto {} file(s); {} go to the model",
+                collected.len(),
+                unanswered.len()
+            );
+            to_dispatch = unanswered;
+        }
+
+        // A dispatched service's product is the bundle, and every phase from
+        // here on works on model answers it does not have. Ending here rather
+        // than walking them with an empty map saves a service's worth of
+        // parsing, a workspace index rebuilt from disk and a sidecar pass over
+        // a tree nothing will be said about. The caller ends the run at the
+        // same point and submits what was collected.
+        //
+        // A service that built no prompt is not dispatched and does not end
+        // here: it has nothing to hand over, so it finishes the way it would
+        // have without the flag, and its rows reach the index.
+        if collecting {
+            debug!(
+                "Dispatching: {} prompt(s) built for this service, no index will be written",
+                not_asked.len()
+            );
+            return Ok(FileCentricAnalysisResult {
+                file_results: HashMap::new(),
+                raw_model_results: HashMap::new(),
+                mount_graph: MountGraph::new(),
+                stats,
+                bundled_types: None,
+                type_resolution: None,
+            });
+        }
+
+        stats.files_model_reused = reused.len() + collected.len();
         stats.files_model_dispatched = to_dispatch.len();
         stats.files_model_not_asked = not_asked.len();
         if !reused.is_empty() {
@@ -2370,6 +2481,14 @@ impl FileOrchestrator {
                     .expect("partitioned on this key being present");
                 (pf, ModelAnswer::Answered(cached))
             })
+            // A collected answer is the model's answer, and enters phase 3 as
+            // one: it is cached, joined and uploaded exactly as a fresh one is,
+            // which is what makes a resume a replay (carrick#1229).
+            .chain(
+                collected
+                    .into_iter()
+                    .map(|(pf, result)| (pf, ModelAnswer::Answered(result))),
+            )
             .chain(dispatched.into_iter().map(|(pf, result)| match result {
                 Ok(model) => (pf, ModelAnswer::Answered(model)),
                 Err(e) => (pf, ModelAnswer::Failed(e)),

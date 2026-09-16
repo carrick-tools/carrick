@@ -114,6 +114,10 @@ pub struct ScanState {
     /// the free pass and before the first upload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend: Option<crate::scan_spend::RunSpend>,
+    /// The jobs a dispatched scan handed over, one per repo. Empty on every
+    /// other kind of record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<crate::analysis_job::Dispatched>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +126,10 @@ pub enum ScanStatus {
     Running,
     Finished,
     Failed,
+    /// The prompts went to Carrick Cloud and the analysis is happening there
+    /// (carrick#1229). Not running — this process is gone — and not finished:
+    /// the index arrives when `carrick resume` collects the answers.
+    Dispatched,
 }
 
 impl ScanState {
@@ -189,6 +197,22 @@ impl ScanState {
     pub fn line(&self) -> String {
         let elapsed = human_duration(self.elapsed_secs());
         let started = self.started_label();
+        // Answered first: this record has no living process, so every arm
+        // below would read it as a scan that stopped part-way — which is the
+        // opposite of what happened (carrick#1229).
+        if self.status == ScanStatus::Dispatched {
+            let repos: Vec<&str> = self.jobs.iter().map(|job| job.repo.as_str()).collect();
+            return format!(
+                "scan {} handed {} to Carrick Cloud to analyse (started {started}). \
+                 `carrick resume` builds the index when it is done.",
+                self.scan_id,
+                if repos.is_empty() {
+                    "this workspace".to_string()
+                } else {
+                    repos.join(", ")
+                }
+            );
+        }
         let counts = match &self.progress {
             Some(update) => format!(" — {}", update.render()),
             None => String::new(),
@@ -381,6 +405,7 @@ pub fn begin(index_dir: &Path, scan_id: &str, workspace: &Path, infer: bool) {
         notice: None,
         error: None,
         spend: None,
+        jobs: Vec::new(),
     };
     let _ = std::fs::create_dir_all(index_dir);
     let file = state_file(index_dir, scan_id);
@@ -503,6 +528,31 @@ pub fn spent(spend: &crate::scan_spend::RunSpend) {
     active.last_write = Some(Instant::now());
 }
 
+/// The prompts went to Carrick Cloud: this scan is over and the index is not
+/// written, which is neither of the two outcomes below (carrick#1229).
+///
+/// The record is what `carrick status` reads to say so. The durable half — the
+/// job ids a resume collects — is `.carrick/jobs.json`, because this file is
+/// cleared by the next build and a job outlives a build.
+pub fn dispatched(jobs: &[crate::analysis_job::Dispatched]) {
+    let Ok(mut guard) = ACTIVE.lock() else {
+        return;
+    };
+    let Some(active) = guard.as_mut() else {
+        return;
+    };
+    active.state.status = ScanStatus::Dispatched;
+    active.state.jobs = jobs.to_vec();
+    active.state.phase = "handed over to Carrick Cloud".to_string();
+    active.state.progress = None;
+    active.state.notice = None;
+    let now = timestamp();
+    active.state.finished_at = Some(now.clone());
+    active.state.updated_at = now;
+    write(&active.file, &active.state);
+    active.last_write = Some(Instant::now());
+}
+
 /// The scan is over, and the record says which way and how long it took.
 ///
 /// Neither outcome removes the file. The scaffold has an agent poll `carrick
@@ -517,6 +567,14 @@ pub fn finish(error: Option<&str>) {
     let Some(active) = guard.as_mut() else {
         return;
     };
+    // A build that handed its analysis over has already said how it ended, and
+    // the sentence this would write over the top of it — "the index is
+    // written" — is false (carrick#1229). The record is closed; drop the slot
+    // and leave it alone.
+    if active.state.status == ScanStatus::Dispatched {
+        *guard = None;
+        return;
+    }
     active.state.status = match error {
         None => ScanStatus::Finished,
         Some(error) => {
@@ -596,7 +654,10 @@ pub fn forget_finished(index_dir: &Path) {
 /// this runs — and any concurrent scan's.
 pub fn forget_superseded(index_dir: &Path) {
     for state in read_all(index_dir) {
-        if !state.is_running() {
+        // A dispatched record is not history: the analysis it names is still
+        // being done, and the index this build wrote does not contain it
+        // (carrick#1229). It is kept for the same reason a running one is.
+        if !state.is_running() && state.status != ScanStatus::Dispatched {
             let _ = std::fs::remove_file(state_file(index_dir, &state.scan_id));
         }
     }
@@ -655,6 +716,7 @@ mod tests {
             finished_at: None,
             phase: "indexing gateway".to_string(),
             spend: None,
+            jobs: Vec::new(),
             progress: Some(Update {
                 service: "gateway".to_string(),
                 service_index: 1,

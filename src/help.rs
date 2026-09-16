@@ -29,7 +29,11 @@ WORKSPACE:
     index      Scan every repo in the workspace and build <workspace>/.carrick/.
                Carrick Cloud classifies what the deterministic passes could
                not, so this is the scan that builds the index, and the one a
-               first run makes.
+               first run makes. With --dispatch it builds every prompt and
+               hands them to Carrick Cloud. The analysis then runs whether or
+               not this machine is on, and `carrick resume` collects it.
+    resume     Collect a dispatched analysis and finish the index. Files that
+               changed since the hand-off are analysed now.
     refresh    Re-scan one service, or every repo, and re-join the index.
                What the session-start hook runs; it asks no model.
     status     Every service the workspace holds, the commit each was indexed at,

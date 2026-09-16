@@ -117,6 +117,11 @@ pub struct ErrorOutput {
     /// inference cost is ours (carrick#1236).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_scan: Option<crate::scan_spend::RunSpend>,
+    /// The same as [`StatusOutput::analysing`], carried on the error body too:
+    /// "there is no index" and "the analysis that builds it is running in the
+    /// cloud" are different answers (carrick#1229).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub analysing: Vec<String>,
 }
 
 impl ErrorOutput {
@@ -129,6 +134,7 @@ impl ErrorOutput {
             error: failure.error.wire().to_string(),
             message: failure.message().to_string(),
             running_scans: Vec::new(),
+            analysing: Vec::new(),
             last_scan: None,
         }
     }
@@ -517,6 +523,11 @@ pub struct StatusOutput {
     /// parses `--json`; the human render states none of it (carrick#1236).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_scan: Option<crate::scan_spend::RunSpend>,
+    /// Analysis Carrick Cloud is doing for this workspace right now, one entry
+    /// per repo handed over (carrick#1229). Empty in the ordinary case, and
+    /// the only part of any read command that touches the network.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub analysing: Vec<String>,
     pub services: Vec<StatusService>,
 }
 
@@ -533,6 +544,15 @@ impl StatusOutput {
             out.push('\n');
         }
         if !self.running_scans.is_empty() {
+            out.push('\n');
+        }
+        // Above the index for the same reason: an analysis in flight is about
+        // now, and the index below it is about the last build that finished.
+        for line in &self.analysing {
+            out.push_str(line);
+            out.push('\n');
+        }
+        if !self.analysing.is_empty() {
             out.push('\n');
         }
         out.push_str(&format!(
@@ -869,6 +889,7 @@ mod hosted_wire_tests {
     /// a time against.
     fn status_output() -> StatusOutput {
         StatusOutput {
+            analysing: Vec::new(),
             repos_detected_by: None,
             repos_added: Vec::new(),
             repos_excluded: Vec::new(),
