@@ -136,6 +136,12 @@ fn should_upload_data() -> bool {
         return false;
     }
 
+    // A resume finishing at an older commit than the one the cloud already
+    // serves builds the local read model and stops there (carrick#1229).
+    if env::var(crate::local_mode::SKIP_UPLOAD_ENV).as_deref() == Ok("1") {
+        return false;
+    }
+
     // LocalDirStorage (the offline cross-repo eval harness, Phase A) writes
     // CloudRepoData to a local cache dir, never the real cloud — so the
     // PR/branch anti-pollution guards below do not apply. Without this, a CI

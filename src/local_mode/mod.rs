@@ -22,6 +22,7 @@ pub mod cli;
 mod contract;
 pub(crate) mod hosted;
 pub(crate) mod index;
+pub(crate) mod jobs;
 mod join;
 pub(crate) mod query;
 mod read_model;
@@ -37,6 +38,14 @@ pub use join::LocalJoin;
 /// not dispatched is not a file that failed, so `scan_health` records nothing
 /// and the run does not report a partial index.
 pub const NO_MODEL_ENV: &str = "CARRICK_NO_MODEL";
+
+/// Set to `1` to stop a scan uploading the index it builds.
+///
+/// One caller: a resume that found the cloud holding a NEWER index than the
+/// commit it is finishing at. The local read model is worth building — it is
+/// what `carrick check` answers from — but replacing a newer stored index with
+/// an older one is not (carrick#1229).
+pub const SKIP_UPLOAD_ENV: &str = "CARRICK_SKIP_UPLOAD";
 
 /// Set to a path to make a cross-repo run write [`LocalJoin`] there and exit
 /// instead of printing the report. The local indexer's join phase.

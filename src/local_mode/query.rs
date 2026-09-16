@@ -293,6 +293,7 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadFailure> {
         // beside the index, not a read of it (carrick#992, carrick#995).
         running_scans: Vec::new(),
         last_scan: None,
+        analysing: Vec::new(),
         services,
     })
 }

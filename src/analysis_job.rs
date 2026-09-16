@@ -252,12 +252,22 @@ impl AnswerBundle {
             .map(|answer| answer.text.as_str())
     }
 
+    /// How many answers are in hand. `is_empty` beside it because a bundle
+    /// with no answers is a real case: a job that failed before its first pass.
     pub fn len(&self) -> usize {
         self.answers.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.answers.is_empty()
+    }
+
+    /// How many of these the cloud already held rather than asking the model
+    /// for. Read by the run log: on a re-dispatch after a job died, most of a
+    /// bundle is answers somebody already produced, and that is the fact that
+    /// explains a job finishing in minutes.
+    pub fn cached_count(&self) -> usize {
+        self.answers.values().filter(|answer| answer.cached).count()
     }
 
     pub fn failure_count(&self) -> usize {

@@ -38,6 +38,16 @@ pub enum LocalCommand {
         /// scan outlives that shell, its output lands in
         /// `.carrick/scan-<id>.log`, and `carrick status` says where it is.
         detach: bool,
+        /// Build every prompt, hand them to Carrick Cloud as one job, and
+        /// return without an index (carrick#1229).
+        ///
+        /// A first index of a large monorepo is thousands of model calls, and
+        /// every one of them has to survive on this machine: a closed laptop
+        /// or a dropped connection loses the run. Handed over, the analysis
+        /// happens whether or not this machine is on, and `carrick resume`
+        /// collects it. Composes with `--detach`: the work before the hand-off
+        /// is still a few minutes of parsing.
+        dispatch: bool,
     },
     /// What is on the other side of this file.
     Touch {
@@ -55,6 +65,14 @@ pub enum LocalCommand {
         /// The post-edit hook asks for this; nothing else does.
         recheck: bool,
     },
+    /// Collect a dispatched job's analysis and finish the index.
+    ///
+    /// Reads the answers, rebuilds each file's prompt locally and takes the
+    /// answer whose id matches the body it just built. A file that changed
+    /// since the hand-off simply has no match and is analysed now, which is
+    /// why this works at a later commit, on a dirty tree and on a machine that
+    /// never ran the dispatch.
+    Resume { workspace: Option<PathBuf> },
     /// Re-scan one service (or every repo) and re-join.
     Refresh {
         service: Option<String>,
@@ -74,14 +92,16 @@ impl LocalCommand {
     pub fn writes(&self) -> bool {
         matches!(
             self,
-            LocalCommand::Index { .. } | LocalCommand::Refresh { .. }
+            LocalCommand::Index { .. } | LocalCommand::Refresh { .. } | LocalCommand::Resume { .. }
         )
     }
 }
 
 /// Every subcommand the binary answers. `carrick --help` names each one with a
 /// description, and the test in `src/help.rs` holds it to this list.
-pub const LOCAL_COMMANDS: [&str; 6] = ["derive", "index", "refresh", "status", "check", "touch"];
+pub const LOCAL_COMMANDS: [&str; 7] = [
+    "derive", "index", "refresh", "resume", "status", "check", "touch",
+];
 
 /// Read a local command from the argument list, or `None` when the first
 /// argument is not one of those names.
@@ -98,6 +118,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     let mut service: Option<String> = None;
     let mut json = false;
     let mut detach = false;
+    let mut dispatch = false;
     let mut recheck = false;
     let mut positional: Vec<String> = Vec::new();
 
@@ -132,6 +153,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
                 );
             }
             "--detach" => detach = true,
+            "--dispatch" => dispatch = true,
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -148,6 +170,11 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     // anyway would be a promise nobody kept.
     if detach && name != "index" {
         return Err(format!("unknown option for `carrick {name}`: --detach"));
+    }
+    // `refresh` asks no model, so it has no prompts to hand over, and `resume`
+    // is the other end of a hand-off that has already happened.
+    if dispatch && name != "index" {
+        return Err(format!("unknown option for `carrick {name}`: --dispatch"));
     }
     // `touch` states no verdict, so re-judging for it would buy a scan and
     // print nothing new.
@@ -170,9 +197,21 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             {
                 workspace = Some(PathBuf::from(first));
             }
-            Ok(LocalCommand::Index { workspace, detach })
+            Ok(LocalCommand::Index {
+                workspace,
+                detach,
+                dispatch,
+            })
         }
         "refresh" => Ok(LocalCommand::Refresh { service, workspace }),
+        "resume" => {
+            if workspace.is_none()
+                && let Some(first) = positional.first()
+            {
+                workspace = Some(PathBuf::from(first));
+            }
+            Ok(LocalCommand::Resume { workspace })
+        }
         "status" => {
             if workspace.is_none()
                 && let Some(first) = positional.first()
@@ -225,7 +264,8 @@ pub fn run(command: LocalCommand) -> i32 {
         LocalCommand::Index {
             workspace,
             detach: true,
-        } => match start_detached(workspace.as_deref()) {
+            dispatch,
+        } => match start_detached(workspace.as_deref(), dispatch) {
             Ok(()) => 0,
             Err(message) => {
                 eprintln!("carrick index: {message}");
@@ -235,10 +275,28 @@ pub fn run(command: LocalCommand) -> i32 {
         // Always inferred: the index a developer reads is the one the model
         // classified, and a facts-only form of this command had no user
         // (carrick#1008). `refresh` is the pass that runs no model.
-        LocalCommand::Index { workspace, .. } => match build(workspace.as_deref(), None, true) {
+        LocalCommand::Index {
+            workspace,
+            dispatch,
+            ..
+        } => {
+            let pass = if dispatch {
+                super::index::Pass::Dispatch
+            } else {
+                super::index::Pass::Infer
+            };
+            match build(workspace.as_deref(), None, &pass) {
+                Ok(()) => 0,
+                Err(message) => {
+                    eprintln!("carrick index: {message}");
+                    1
+                }
+            }
+        }
+        LocalCommand::Resume { workspace } => match resume(workspace.as_deref()) {
             Ok(()) => 0,
             Err(message) => {
-                eprintln!("carrick index: {message}");
+                eprintln!("carrick resume: {message}");
                 1
             }
         },
@@ -246,7 +304,11 @@ pub fn run(command: LocalCommand) -> i32 {
             // Never inferred. `refresh` runs from a session-start hook, and a
             // hook that spends real money every time an editor opens is not a
             // feature.
-            match build(workspace.as_deref(), service.as_deref(), false) {
+            match build(
+                workspace.as_deref(),
+                service.as_deref(),
+                &super::index::Pass::Facts,
+            ) {
                 Ok(()) => 0,
                 Err(message) => {
                     eprintln!("carrick refresh: {message}");
@@ -330,10 +392,16 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
     // (carrick#995).
     let last_scan =
         crate::scan_spend::RunSpend::read(&super::workspace::last_scan_file(&index_dir));
+    // The one network read any read-only command makes, and only when this
+    // workspace handed an analysis over: without it the answer to "is anything
+    // happening" is "no index here", which is exactly wrong while the work
+    // that builds it is running somewhere else (carrick#1229).
+    let analysing = analysing_lines(&index_dir);
     match super::query::status(&root) {
         Ok(mut output) => {
             output.running_scans = scans;
             output.last_scan = last_scan;
+            output.analysing = analysing.clone();
             if json {
                 match serde_json::to_string_pretty(&output) {
                     Ok(text) => println!("{text}"),
@@ -362,6 +430,9 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
                 for line in super::scan_state::status_lines(&scans, &index_dir) {
                     println!("{line}");
                 }
+                for line in &analysing {
+                    println!("{line}");
+                }
             }
             // `status` takes no file and cannot be told to run a scan that is
             // already running: the refusal is rewritten here rather than in
@@ -378,20 +449,74 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
                 super::contract::STATUS_SCHEMA,
                 scans,
                 last_scan,
+                analysing,
             )
         }
     }
 }
 
-/// `index` and `refresh`: scan, join, write, and print the map.
+/// What Carrick Cloud is analysing for this workspace, in a line each.
 ///
-/// `infer` makes each repo's scan a laptop scan: the model classifies what the
-/// deterministic passes could not, the result is uploaded, and the same
-/// payload is written to this build's cache directory so the read model comes
-/// from the run that produced it (carrick#956 §8.3). `index` always infers;
-/// `refresh` never does, which is the whole difference between them.
-fn build(root: Option<&Path>, service: Option<&str>, infer: bool) -> Result<(), String> {
+/// Empty — and silent, and offline — unless a job is recorded here. A job that
+/// is ready and has been sitting uncollected is the case this exists for: the
+/// answers do not expire for months, so the risk is nobody being told, not
+/// anything being lost.
+fn analysing_lines(index_dir: &Path) -> Vec<String> {
+    let jobs = super::jobs::read(index_dir);
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for (job, status) in jobs.iter().zip(super::jobs::ask(&jobs)) {
+        lines.push(match status {
+            Err(error) => format!(
+                "Carrick Cloud is analysing {}, and this machine could not ask how far it has \
+                 got ({error}).",
+                job.repo
+            ),
+            Ok(status) if status.has_failed() => format!(
+                "The analysis of {} did not finish. Run `carrick index` to index it here.",
+                job.repo
+            ),
+            Ok(status) if status.is_ready() => {
+                let waited = super::jobs::since(&job.submitted_at)
+                    .map(|ago| format!(" It was handed over {ago} ago."))
+                    .unwrap_or_default();
+                // Only when the cloud said one. An expiry this machine
+                // invented would be a deadline nobody set.
+                let until = status
+                    .expires_at
+                    .as_deref()
+                    .and_then(super::jobs::until)
+                    .map(|left| format!(" It stays available for another {left}."))
+                    .unwrap_or_default();
+                format!(
+                    "The analysis of {} is ready and nothing has collected it.{waited}{until} \
+                     Run `carrick resume` to build the index.",
+                    job.repo
+                )
+            }
+            Ok(status) => waiting_line(job, &status),
+        });
+    }
+    lines
+}
+
+/// `index`, `refresh` and `resume`: scan, join, write, and print the map.
+///
+/// An inferring pass makes each repo's scan a laptop scan: the model
+/// classifies what the deterministic passes could not, the result is uploaded,
+/// and the same payload is written to this build's cache directory so the read
+/// model comes from the run that produced it (carrick#956 §8.3). `index`
+/// always infers; `refresh` never does, which is the whole difference between
+/// them.
+fn build(
+    root: Option<&Path>,
+    service: Option<&str>,
+    pass: &super::index::Pass,
+) -> Result<(), String> {
     let workspace = Workspace::load(&resolve_root(root)?)?;
+    let infer = pass.infers();
     // Before anything is printed about a scan that is not going to happen.
     if infer && let Some(refusal) = inference_refusal(&workspace.repos) {
         return Err(refusal);
@@ -410,7 +535,7 @@ fn build(root: Option<&Path>, service: Option<&str>, infer: bool) -> Result<(), 
             infer,
         );
     }
-    let outcome = build_workspace(&workspace, service, infer);
+    let outcome = build_workspace(&workspace, service, pass);
     // An index has just been written, so every record of a scan that is over
     // describes an older world — including the failed one a re-run was ordered
     // because of, which `carrick status` was still leading with (carrick#1023
@@ -427,6 +552,96 @@ fn build(root: Option<&Path>, service: Option<&str>, infer: bool) -> Result<(), 
         super::scan_state::finish(outcome.as_ref().err().map(String::as_str));
     }
     outcome
+}
+
+/// `resume`: collect what Carrick Cloud analysed, and finish the index.
+///
+/// One job per repo. A job that is still running is reported and left alone; a
+/// job that is ready is downloaded and the repo is scanned again with its
+/// answers in hand, which is an ordinary scan whose model stage is mostly
+/// already answered. Files that changed since the hand-off have no matching
+/// answer and are analysed now — that is the join working, not a fallback.
+fn resume(root: Option<&Path>) -> Result<(), String> {
+    let workspace = Workspace::load(&resolve_root(root)?)?;
+    let index_dir = workspace.index_dir();
+    let jobs = super::jobs::read(&index_dir);
+    if jobs.is_empty() {
+        println!(
+            "Nothing from this workspace is being analysed. `carrick index` builds the index \
+             here, and `carrick index --dispatch` hands the analysis to Carrick Cloud."
+        );
+        return Ok(());
+    }
+
+    let mut resuming = std::collections::BTreeMap::new();
+    let mut collected = Vec::new();
+    for (job, status) in jobs.iter().zip(super::jobs::ask(&jobs)) {
+        match status {
+            Err(error) => println!("Could not ask about {}: {error}", job.repo),
+            Ok(status) if status.has_failed() => println!(
+                "The analysis of {} did not finish. Run `carrick index` to index it here.",
+                job.repo
+            ),
+            Ok(status) if !status.is_ready() => println!("{}", waiting_line(job, &status)),
+            Ok(_) => match super::jobs::download(job, &index_dir.join("jobs")) {
+                Ok(answers) => {
+                    resuming.insert(
+                        PathBuf::from(&job.path),
+                        super::index::Resumption {
+                            answers,
+                            dispatched_at: job.submitted_at.clone(),
+                            superseded: false,
+                        },
+                    );
+                    collected.push(job.job_id.clone());
+                }
+                Err(error) => println!("Could not collect the analysis of {}: {error}", job.repo),
+            },
+        }
+    }
+    if resuming.is_empty() {
+        return Ok(());
+    }
+
+    build(
+        Some(&workspace.root),
+        None,
+        &super::index::Pass::Resume(resuming),
+    )?;
+    // Only once the index is written. A resume that died half way through
+    // leaves the job where it was, so running it again collects the same
+    // answers rather than asking for them all over again.
+    super::jobs::forget(&index_dir, &collected)?;
+    for id in &collected {
+        let _ = std::fs::remove_file(
+            index_dir
+                .join("jobs")
+                .join(format!("answers-{id}.ndjson.gz")),
+        );
+    }
+    Ok(())
+}
+
+/// What `resume` and `status` say about a job that is still being analysed.
+///
+/// How far and how long, and nothing else: the wait is the only thing the
+/// person in front of the terminal can act on.
+fn waiting_line(job: &super::jobs::Job, status: &super::jobs::JobStatus) -> String {
+    let progress = match (status.percent(), status.total) {
+        (Some(percent), total) if total > 0 => {
+            format!(" — {percent}% ({} of {} files)", status.done, total)
+        }
+        _ => String::new(),
+    };
+    let left = match status.eta_seconds {
+        Some(seconds) => format!(" About {} left.", super::jobs::duration(seconds)),
+        None => String::new(),
+    };
+    format!(
+        "Carrick Cloud is still analysing {}{progress}.{left} Run `carrick resume` when it is \
+         done.",
+        job.repo
+    )
 }
 
 /// A signal is ending the build this process is running: close its scan
@@ -457,8 +672,9 @@ fn resolve_root(root: Option<&Path>) -> Result<PathBuf, String> {
 fn build_workspace(
     workspace: &Workspace,
     service: Option<&str>,
-    infer: bool,
+    pass: &super::index::Pass,
 ) -> Result<(), String> {
+    let infer = pass.infers();
     if let Some(proposal) = &workspace.parent_proposal {
         eprintln!("carrick: {}", proposal.description());
     }
@@ -487,7 +703,19 @@ fn build_workspace(
              could not, and uploads the result. It runs the analysis; later scans read it."
         );
     }
-    let outcome = super::index::run(workspace, service, infer)?;
+    let outcome = match super::index::run(workspace, service, pass)? {
+        super::index::Built::Indexed(outcome) => outcome,
+        // Handed over: there is no index yet and no map to print. What there is
+        // is one line per repo saying who is analysing it and how to collect it
+        // (carrick#1229).
+        super::index::Built::Dispatched(jobs) => {
+            super::scan_state::dispatched(&jobs);
+            for line in dispatched_lines(&jobs) {
+                println!("{line}");
+            }
+            return Ok(());
+        }
+    };
     // A project whose services all carry the hash the cached blobs already
     // hold is not downloaded again, and a download that failed also leaves the
     // cached blobs in place. Saying how many rows each of those was is what
@@ -497,6 +725,33 @@ fn build_workspace(
     }
     print_map(&outcome);
     Ok(())
+}
+
+/// What a `--dispatch` build says when it returns.
+///
+/// Time, and where the index will come from. Not how much work it is in any
+/// other unit: the wait is ours to explain and the user's only question is
+/// when to come back.
+fn dispatched_lines(jobs: &[crate::analysis_job::Dispatched]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for job in jobs {
+        let when = match job.eta_seconds {
+            Some(seconds) => format!(
+                " It usually takes about {}.",
+                super::jobs::duration(seconds)
+            ),
+            None => String::new(),
+        };
+        lines.push(format!(
+            "Carrick Cloud is analysing {} ({} file(s)).{when}",
+            job.repo, job.analyze_rows
+        ));
+    }
+    lines.push(
+        "This machine does not have to stay on. `carrick status` says how far it has got, and          `carrick resume` builds the index when it is done."
+            .to_string(),
+    );
+    lines
 }
 
 /// `index --detach`: start the build in its own session and answer at once.
@@ -509,7 +764,7 @@ fn build_workspace(
 /// The child is put in a session of its own, so that killing the shell that
 /// started it — which is what an agent's tool timeout does — does not take the
 /// scan with it. That is the whole point of the flag (carrick#992).
-fn start_detached(root: Option<&Path>) -> Result<(), String> {
+fn start_detached(root: Option<&Path>, dispatch: bool) -> Result<(), String> {
     let workspace = Workspace::load(&resolve_root(root)?)?;
     if let Some(refusal) = inference_refusal(&workspace.repos) {
         return Err(refusal);
@@ -528,8 +783,14 @@ fn start_detached(root: Option<&Path>) -> Result<(), String> {
         .map_err(|e| format!("could not find the carrick binary to run the scan with: {e}"))?;
 
     let mut command = std::process::Command::new(exe);
+    command.arg("index");
+    // The two compose: the hand-off happens after this machine has parsed
+    // every file and asked the type sidecar, which on a large monorepo is
+    // itself longer than an agent's shell will wait (carrick#1229).
+    if dispatch {
+        command.arg("--dispatch");
+    }
     command
-        .arg("index")
         .arg("--workspace")
         .arg(&workspace.root)
         // One run id across the parent, the detached build and every scan it
@@ -774,7 +1035,7 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode, freshness: Fre
 /// A caller that has decided a refusal of its own is worth an exit code says
 /// so itself; see [`read`].
 fn report(failure: ReadFailure, json: bool, schema: &str) -> i32 {
-    report_with_scans(failure, json, schema, Vec::new(), None)
+    report_with_scans(failure, json, schema, Vec::new(), None, Vec::new())
 }
 
 /// The same, carrying any scan that is building the thing the caller asked
@@ -786,15 +1047,17 @@ fn report_with_scans(
     schema: &str,
     scans: Vec<super::scan_state::ScanState>,
     last_scan: Option<crate::scan_spend::RunSpend>,
+    analysing: Vec<String>,
 ) -> i32 {
     // One sentence, on stderr and on the wire: the surfaces that read the JSON
     // body could not say what the terminal says until this carried it
     // (carrick#1009).
     eprintln!("carrick: {}", failure.message());
     if json {
-        let body = ErrorOutput::new(&failure, schema)
+        let mut body = ErrorOutput::new(&failure, schema)
             .with_scans(scans)
             .with_last_scan(last_scan);
+        body.analysing = analysing;
         if let Ok(text) = serde_json::to_string(&body) {
             println!("{text}");
         }
@@ -808,7 +1071,8 @@ fn print_help() {
 
 USAGE:
     carrick derive  [--workspace <dir>] --json
-    carrick index   [--workspace <dir>] [--detach]
+    carrick index   [--workspace <dir>] [--detach] [--dispatch]
+    carrick resume  [--workspace <dir>]
     carrick status  [--workspace <dir>] [--json]
     carrick touch   <file> [--workspace <dir>] [--json]
     carrick check   <file> [--workspace <dir>] [--json] [--recheck]
@@ -827,6 +1091,17 @@ USAGE:
                deterministic passes could not and the result is uploaded. It
                needs a carrick.json in every repo, which it refuses without,
                and a machine `carrick login` has signed in.
+    --dispatch on `index` builds every prompt, hands them to Carrick Cloud as
+    one job and returns without an index. The analysis then runs whether or not
+    this machine is on. A first index of a large monorepo is thousands of model
+    calls, and a closed laptop otherwise loses the run. Compose it with --detach
+    when even the parsing before the hand-off is longer than the shell will wait.
+
+    resume     Collect a dispatched analysis and finish the index. Each file's
+               prompt is rebuilt here and the answer with the same content is
+               taken, so a file that changed since the hand-off is simply
+               analysed now, and a job can be collected at a later commit, on a
+               dirty tree, or on another machine holding the same repository.
     status     What the workspace holds: every service, the commit it was
                indexed at, how far its repo has moved since, and its boundary.
     touch      The routes and calls in one file, and their counterparts in
@@ -962,6 +1237,7 @@ mod tests {
             LocalCommand::Index {
                 workspace: Some(PathBuf::from("/w")),
                 detach: false,
+                dispatch: false,
             }
         );
     }
@@ -1001,6 +1277,7 @@ mod tests {
             LocalCommand::Index {
                 workspace: Some(PathBuf::from("/w")),
                 detach: true,
+                dispatch: false,
             }
         );
         assert_eq!(
@@ -1008,6 +1285,7 @@ mod tests {
             LocalCommand::Index {
                 workspace: None,
                 detach: true,
+                dispatch: false,
             }
         );
         assert_eq!(

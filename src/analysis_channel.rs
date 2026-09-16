@@ -168,10 +168,22 @@ pub fn answers() -> Option<&'static AnswerBundle> {
                 .map_err(|e| format!("{}: {e}", path.display()))
                 .and_then(|bytes| AnswerBundle::decode(&bytes))
             {
+                // A job that died before its first pass hands back a header and
+                // nothing else. Treat it as no bundle at all, so the scan does
+                // not report itself as a resume of nothing.
+                Ok(bundle) if bundle.is_empty() => {
+                    tracing::warn!(
+                        "The collected analysis holds no answers; this scan analyses every file \
+                         itself"
+                    );
+                    None
+                }
                 Ok(bundle) => {
                     tracing::info!(
-                        "Resuming with {} collected answer(s){}",
+                        "Resuming with {} collected answer(s), {} of them already held by the \
+                         cloud{}",
                         bundle.len(),
+                        bundle.cached_count(),
                         if bundle.complete {
                             String::new()
                         } else {
