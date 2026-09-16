@@ -54,8 +54,6 @@ pub struct Job {
     pub analyze_rows: usize,
     /// RFC 3339.
     pub submitted_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub eta_seconds: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -122,19 +120,29 @@ fn write(index_dir: &Path, jobs: Vec<Job>) -> Result<(), String> {
 
 /// How far a job has got, as the cloud says it.
 ///
-/// Every field is optional on the wire: this is read by `carrick status`,
-/// which must answer something whatever the cloud says, and a status line that
-/// failed to parse is worse than one that says less.
+/// The field names are the deployed ones (`jobStatusBody` in `carrick-cloud`
+/// `lambdas/check-or-upload/analysis_job.js`). Every one is optional on the
+/// wire: this is read by `carrick status`, which must answer something
+/// whatever the cloud says, and a status line that failed to parse is worse
+/// than one that says less.
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct JobStatus {
+    /// `queued`, `running`, `ready`, `partial`, `failed` or `cancelled`. The
+    /// last four are terminal.
     #[serde(default)]
     pub state: String,
     #[serde(default)]
-    pub done: usize,
+    pub total_rows: usize,
     #[serde(default)]
-    pub total: usize,
+    pub answered: usize,
+    /// The cloud's own figure, rather than one derived from two counts that
+    /// can disagree with it.
     #[serde(default)]
-    pub eta_seconds: Option<u64>,
+    pub percent: Option<usize>,
+    /// Why a job stopped, when it stopped: `driver_stopped` for one whose
+    /// driver is no longer renewing.
+    #[serde(default)]
+    pub failure_reason: Option<String>,
     /// When the answers stop being available to download. The answers
     /// themselves are content-addressed and outlive it, so this is about one
     /// download, not about the work.
@@ -143,18 +151,21 @@ pub struct JobStatus {
 }
 
 impl JobStatus {
-    /// Whether there is something to collect.
+    /// Whether there is something to collect. `partial` counts: every answer
+    /// in it is one the resume does not have to ask for.
     pub fn is_ready(&self) -> bool {
         self.state == "ready" || self.state == "partial"
     }
 
+    /// Whether nothing more is coming. `cancelled` is somebody's decision and
+    /// `failed` is the driver's, and neither leaves anything to wait for.
     pub fn has_failed(&self) -> bool {
-        self.state == "failed"
+        self.state == "failed" || self.state == "cancelled"
     }
 
-    /// How far through, when the cloud gave both halves of the fraction.
+    /// How far through, as the cloud states it.
     pub fn percent(&self) -> Option<usize> {
-        (self.total > 0).then(|| self.done * 100 / self.total)
+        self.percent
     }
 }
 
@@ -452,12 +463,6 @@ pub fn until(timestamp: &str) -> Option<String> {
     (seconds > 0).then(|| plural(seconds))
 }
 
-/// The same units, for a duration the cloud states rather than one measured
-/// from a timestamp.
-pub fn duration(seconds: u64) -> String {
-    plural(seconds as i64)
-}
-
 fn plural(seconds: i64) -> String {
     let seconds = seconds.max(0);
     let (count, unit) = match seconds {
@@ -481,7 +486,6 @@ mod tests {
             commit: "abc1234".to_string(),
             analyze_rows: 10,
             submitted_at: "2026-09-16T10:00:00Z".to_string(),
-            eta_seconds: Some(600),
         }
     }
 
@@ -527,12 +531,15 @@ mod tests {
 
     #[test]
     fn a_status_says_whether_there_is_anything_to_collect() {
-        let running: JobStatus = serde_json::from_value(
-            serde_json::json!({"state": "running", "done": 8570, "total": 13389}),
-        )
+        // The deployed body's own field names, and its own percentage.
+        let running: JobStatus = serde_json::from_value(serde_json::json!({
+            "state": "running", "answered": 8570, "total_rows": 13389, "percent": 64
+        }))
         .unwrap();
         assert!(!running.is_ready());
         assert_eq!(running.percent(), Some(64));
+        assert_eq!(running.answered, 8570);
+        assert_eq!(running.total_rows, 13389);
 
         let ready: JobStatus =
             serde_json::from_value(serde_json::json!({"state": "ready"})).unwrap();
@@ -543,15 +550,32 @@ mod tests {
             serde_json::from_value(serde_json::json!({"state": "partial"})).unwrap();
         assert!(partial.is_ready(), "what landed is still worth collecting");
 
+        let cancelled: JobStatus =
+            serde_json::from_value(serde_json::json!({"state": "cancelled"})).unwrap();
+        assert!(cancelled.has_failed(), "nothing more is coming for it");
+
+        let stopped: JobStatus = serde_json::from_value(
+            serde_json::json!({"state": "failed", "failure_reason": "driver_stopped"}),
+        )
+        .unwrap();
+        assert_eq!(stopped.failure_reason.as_deref(), Some("driver_stopped"));
+
         let unknown: JobStatus = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(!unknown.is_ready() && !unknown.has_failed());
     }
 
     #[test]
-    fn durations_read_as_a_person_would_say_them() {
-        assert_eq!(duration(30), "1 minute");
-        assert_eq!(duration(600), "10 minutes");
-        assert_eq!(duration(7200), "2 hours");
-        assert_eq!(duration(518_400), "6 days");
+    fn how_long_ago_reads_as_a_person_would_say_it() {
+        let ago = |seconds: i64| {
+            since(&(chrono::Utc::now() - chrono::Duration::seconds(seconds)).to_rfc3339()).unwrap()
+        };
+        assert_eq!(ago(30), "1 minute");
+        assert_eq!(ago(600), "10 minutes");
+        assert_eq!(ago(7200), "2 hours");
+        assert_eq!(ago(518_400), "6 days");
+        assert_eq!(
+            until(&(chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339()),
+            None
+        );
     }
 }

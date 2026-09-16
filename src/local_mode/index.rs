@@ -276,7 +276,6 @@ fn run_generation(
                     commit: dispatched.commit.clone(),
                     analyze_rows: dispatched.analyze_rows,
                     submitted_at: chrono::Utc::now().to_rfc3339(),
-                    eta_seconds: dispatched.eta_seconds,
                 },
             )?;
         }

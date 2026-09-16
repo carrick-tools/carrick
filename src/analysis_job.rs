@@ -295,7 +295,6 @@ pub struct Dispatched {
     pub commit: String,
     pub job_id: String,
     pub analyze_rows: usize,
-    pub eta_seconds: Option<u64>,
 }
 
 /// Hex sha256 and byte length of an object, for the integrity check the cloud

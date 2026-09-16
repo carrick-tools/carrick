@@ -420,9 +420,12 @@ pub struct JobSubmission {
     pub job_id: String,
     /// How many prompts the job carries, so the command that dispatched it can
     /// say what is being worked on.
+    ///
+    /// No estimate of how long it will take: the cloud states none, and a
+    /// figure this side invented would be a promise nobody made. What a
+    /// dispatched run can honestly say is that the machine does not have to
+    /// stay on, and that `carrick status` answers how far it has got.
     pub analyze_rows: usize,
-    /// Roughly how long the cloud expects to take, when it says. Seconds.
-    pub eta_seconds: Option<u64>,
 }
 
 impl RunStart {

@@ -55,9 +55,34 @@ failure { t: "failure", id, code }
 ```
 
 What the parts amount to is the `analysis-job-answers` response, not a line in
-a file: `{ schema, parts: [{ part, url, bytes, rows }], superseded,
-current_index }`. `carrick resume` folds every part into one file for the scan
-that replays them.
+a file: `{ schema, state, complete, total_rows, answered, parts: [{ part, url,
+bytes, rows }], superseded, current_index }`. `carrick resume` folds every part
+into one file for the scan that replays them.
+
+## The three actions, as deployed
+
+`submit-analysis-job` is sent twice, the shape payload staging already uses
+(carrick#486), because the object is too large to inline and a presigned PUT
+carries no integrity condition:
+
+1. `{ action, repo, commit, scanner_version, cache_version, counts,
+   wants_upload_url: true }` — the cloud **mints the job id** and answers
+   `{ schema, job_id, upload_url, max_bytes }`;
+2. PUT the gzipped object at exactly that URL. The cloud heads the key it
+   derived itself, so anywhere else is `409 analysis_bundle_missing`;
+3. `{ action, …, job_id, payload_sha256, payload_size }` — hex sha256 and byte
+   length of the **compressed** object, each validated with its own 400. The
+   200 carries `state`, which is `failed` when the driver could not be started.
+
+A second bundle for a repo whose job is still open is `409
+analysis_job_in_flight` with the job id in the body. That is not a fault: the
+move is `carrick status`, not another dispatch, and the scanner re-states it
+rather than reporting a failed scan.
+
+`analysis-job-status` answers `{ state, total_rows, answered, percent,
+failure_reason, expires_at }`. States are `queued`, `running`, `ready`,
+`partial`, `failed`, `cancelled`; the last four are terminal, and `partial` is
+worth collecting. There is **no ETA on the wire**, so nothing prints one.
 
 `body` is the prompt AFTER the guidance prefix, byte-exact. The guidance block
 and the response schema are carried once each in the header and re-attached by

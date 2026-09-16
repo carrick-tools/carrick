@@ -1537,7 +1537,6 @@ async fn dispatch_analysis_job<T: CloudStorage + Sync>(
         commit: run.commit.clone(),
         job_id: submission.job_id,
         analyze_rows: submission.analyze_rows,
-        eta_seconds: submission.eta_seconds,
     })
 }
 

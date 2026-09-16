@@ -122,7 +122,6 @@ impl CloudStorage for LocalDirStorage {
         Ok(Some(JobSubmission {
             job_id: crate::analysis_job::digest(&bytes).0[..12].to_string(),
             analyze_rows: bundle.analyze.len(),
-            eta_seconds: None,
         }))
     }
 

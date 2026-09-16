@@ -474,10 +474,7 @@ fn analysing_lines(index_dir: &Path) -> Vec<String> {
                  got ({error}).",
                 job.repo
             ),
-            Ok(status) if status.has_failed() => format!(
-                "The analysis of {} did not finish. Run `carrick index` to index it here.",
-                job.repo
-            ),
+            Ok(status) if status.has_failed() => stopped_line(job, &status),
             Ok(status) if status.is_ready() => {
                 let waited = super::jobs::since(&job.submitted_at)
                     .map(|ago| format!(" It was handed over {ago} ago."))
@@ -598,10 +595,7 @@ fn resume(root: Option<&Path>) -> Result<(), String> {
     for (job, status) in jobs.iter().zip(super::jobs::ask(&jobs)) {
         match status {
             Err(error) => println!("Could not ask about {}: {error}", job.repo),
-            Ok(status) if status.has_failed() => println!(
-                "The analysis of {} did not finish. Run `carrick index` to index it here.",
-                job.repo
-            ),
+            Ok(status) if status.has_failed() => println!("{}", stopped_line(job, &status)),
             Ok(status) if !status.is_ready() => println!("{}", waiting_line(job, &status)),
             Ok(_) => match super::jobs::download(job, &index_dir.join("jobs")) {
                 Ok(ready) => {
@@ -677,24 +671,43 @@ fn superseded_line(repo: &str, by: Option<&str>) -> String {
     )
 }
 
+/// What both say about a job that is not going to finish.
+///
+/// A cancelled job was somebody's decision and needs no explanation; a failed
+/// one is ours, and the move is the same either way — index the repo here.
+fn stopped_line(job: &super::jobs::Job, status: &super::jobs::JobStatus) -> String {
+    if status.state == "cancelled" {
+        return format!(
+            "The analysis of {} was cancelled. Run `carrick index` to index it here.",
+            job.repo
+        );
+    }
+    // `driver_stopped` is a job nothing is working on any more, which reads
+    // the same to the user as one that failed outright and is worth separating
+    // only in what we log.
+    if status.failure_reason.as_deref() == Some("driver_stopped") {
+        tracing::debug!("Job {} stopped being worked on", job.job_id);
+    }
+    format!(
+        "The analysis of {} did not finish. Run `carrick index` to index it here.",
+        job.repo
+    )
+}
+
 /// What `resume` and `status` say about a job that is still being analysed.
 ///
 /// How far and how long, and nothing else: the wait is the only thing the
 /// person in front of the terminal can act on.
 fn waiting_line(job: &super::jobs::Job, status: &super::jobs::JobStatus) -> String {
-    let progress = match (status.percent(), status.total) {
+    let progress = match (status.percent(), status.total_rows) {
         (Some(percent), total) if total > 0 => {
-            format!(" — {percent}% ({} of {} files)", status.done, total)
+            format!(" — {percent}% ({} of {} files)", status.answered, total)
         }
+        (Some(percent), _) => format!(" — {percent}%"),
         _ => String::new(),
     };
-    let left = match status.eta_seconds {
-        Some(seconds) => format!(" About {} left.", super::jobs::duration(seconds)),
-        None => String::new(),
-    };
     format!(
-        "Carrick Cloud is still analysing {}{progress}.{left} Run `carrick resume` when it is \
-         done.",
+        "Carrick Cloud is still analysing {}{progress}. Run `carrick resume` when it is done.",
         job.repo
     )
 }
@@ -784,21 +797,14 @@ fn build_workspace(
 
 /// What a `--dispatch` build says when it returns.
 ///
-/// Time, and where the index will come from. Not how much work it is in any
-/// other unit: the wait is ours to explain and the user's only question is
-/// when to come back.
+/// Who is doing the work and where the index will come from. No estimate of
+/// how long: the cloud states none, and one invented here would be a promise
+/// nobody made. `carrick status` answers it from the job itself.
 fn dispatched_lines(jobs: &[crate::analysis_job::Dispatched]) -> Vec<String> {
     let mut lines = Vec::new();
     for job in jobs {
-        let when = match job.eta_seconds {
-            Some(seconds) => format!(
-                " It usually takes about {}.",
-                super::jobs::duration(seconds)
-            ),
-            None => String::new(),
-        };
         lines.push(format!(
-            "Carrick Cloud is analysing {} ({} file(s)).{when}",
+            "Carrick Cloud is analysing {} ({} file(s)).",
             job.repo, job.analyze_rows
         ));
     }
