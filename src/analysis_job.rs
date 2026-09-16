@@ -285,6 +285,22 @@ fn decompress(bytes: &[u8]) -> Result<String, String> {
     String::from_utf8(bytes.to_vec()).map_err(|_| "the answer bundle is not text".to_string())
 }
 
+/// What a dispatched scan did, as it crosses from the scan subprocess to the
+/// command that started it.
+///
+/// `job_id` is absent when the run found nothing for the model to answer. That
+/// is not a failure and not a job: the repo can be indexed here and now, in
+/// the seconds it takes to state facts nobody has to be asked about, and the
+/// command that reads this line does exactly that.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Dispatched {
+    pub repo: String,
+    pub commit: String,
+    pub job_id: Option<String>,
+    pub analyze_rows: usize,
+    pub eta_seconds: Option<u64>,
+}
+
 /// Hex sha256 and byte length of an object, for the integrity check the cloud
 /// performs on what it was told to expect.
 pub fn digest(bytes: &[u8]) -> (String, usize) {

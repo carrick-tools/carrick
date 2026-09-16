@@ -162,6 +162,19 @@ impl CloudStorage for TeeStorage {
     ) -> Result<(), StorageError> {
         self.cloud.post_pr_result(payload).await
     }
+
+    fn accepts_analysis_job(&self) -> bool {
+        self.cloud.accepts_analysis_job()
+    }
+
+    /// The cloud's, not the cache's: an analysis job is work the cloud does,
+    /// and a run that dispatches writes no index for this tee to copy.
+    async fn submit_analysis_job(
+        &self,
+        bundle: &crate::analysis_job::JobBundle,
+    ) -> Result<Option<crate::cloud_storage::JobSubmission>, StorageError> {
+        self.cloud.submit_analysis_job(bundle).await
+    }
 }
 
 #[cfg(test)]
