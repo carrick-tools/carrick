@@ -1,0 +1,100 @@
+name: Cost Copy Guard
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "src/**"
+      - "npm/carrick/src/**"
+      - ".github/cost-copy-baseline.txt"
+      - ".github/workflows/cost-copy-guard.yml"
+
+jobs:
+  guard:
+    name: Guard against our inference cost in customer-facing strings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate current counts
+        id: counts
+        run: |
+          # What a run costs us is our figure. Customers are on a monthly
+          # subscription or a free tier and never pay per scan, so a dollar
+          # amount, a per-run transaction, or the economics behind either has
+          # no place in a string they read (carrick#1236).
+          #
+          # The house-style pass is not this guard: it sweeps for staccato,
+          # verbless apposition and instructed emotion, and it passed a
+          # dashboard headline whose whole subject was our Vertex spend.
+          #
+          # "per scan" is anchored to a cost word on purpose. Bare, it matches
+          # "built once per scan" in a doc comment, which is a frequency and
+          # not a price; a guard that fails on those gets its baseline edited
+          # to pass, and a ratchet nobody trusts is not a ratchet.
+          PATTERN='US\$|\bpaid\b|allowance_usd|(cost|costs|price|priced|charge|charged|pay|pays|paying|billed)[[:space:]]+per[[:space:]]+scan'
+
+          # Both halves of what a person sees: the Rust CLI's own output and
+          # the npm wrapper that renders the JSON it emits. Tests are out of
+          # scope — an assertion that a string is ABSENT has to name it.
+          : > current.txt
+          while IFS= read -r file; do
+            # -oE counts occurrences rather than lines, so two hits on one
+            # line cannot slip past the ratchet as one.
+            count=$(grep -oE "$PATTERN" "$file" 2>/dev/null | wc -l | tr -d ' ')
+            if [ "${count:-0}" -gt 0 ]; then
+              echo "$file:$count" >> current.txt
+            fi
+          done < <(
+            find src npm/carrick/src \
+              -type f \( -name '*.rs' -o -name '*.ts' \) \
+              -not -path '*/node_modules/*' \
+              -not -path '*/target/*' \
+              2>/dev/null | sort
+          )
+
+          echo "Current counts:"
+          cat current.txt
+
+      - name: Compare against baseline
+        run: |
+          BASELINE=.github/cost-copy-baseline.txt
+          CURRENT=current.txt
+
+          if [ ! -f "$BASELINE" ]; then
+            echo "ERROR: $BASELINE missing. Commit it alongside the guard."
+            exit 1
+          fi
+
+          fail=0
+
+          # A file may hold no more than its baseline allows, and a file with
+          # no baseline line may hold none at all.
+          while IFS=: read -r file count; do
+            [ -z "$file" ] && continue
+            baseline_line=$(grep "^${file}:" "$BASELINE" || true)
+            if [ -z "$baseline_line" ]; then
+              echo "FAIL: $file has $count cost-copy match(es) and is not in the baseline."
+              echo "      Customers never pay per scan, so a dollar figure, a per-run"
+              echo "      transaction or the economics behind either does not belong in a"
+              echo "      string they read. Say what is happening, or say nothing."
+              fail=1
+              continue
+            fi
+            baseline_count=$(echo "$baseline_line" | cut -d: -f2)
+            if [ "$count" -gt "$baseline_count" ]; then
+              echo "FAIL: $file has $count match(es), baseline allows $baseline_count."
+              fail=1
+            fi
+          done < "$CURRENT"
+
+          if [ "$fail" -eq 0 ]; then
+            echo ""
+            echo "Cost copy guard passed. Counts are at or below baseline."
+            echo ""
+            echo "The baseline is a ratchet: when a removal takes a count down,"
+            echo "lower .github/cost-copy-baseline.txt in the same PR so it can"
+            echo "never come back."
+          else
+            exit 1
+          fi
