@@ -23,8 +23,8 @@
 //! built is carrick#1238.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::agents::file_analyzer_agent::AnalysisPrompt;
 use crate::analysis_job::{AnalyzeRow, AnswerBundle, body_id, value_sha};
@@ -55,7 +55,8 @@ struct Collector {
 }
 
 static COLLECTOR: Mutex<Option<Collector>> = Mutex::new(None);
-static ANSWERS: OnceLock<Option<AnswerBundle>> = OnceLock::new();
+/// The bundle in hand, and the path it was read from.
+static ANSWERS: Mutex<Option<(PathBuf, Option<&'static AnswerBundle>)>> = Mutex::new(None);
 
 /// Whether this run was ASKED to dispatch. Answered from the environment, so
 /// it is readable before the cloud has been asked anything.
@@ -156,51 +157,67 @@ pub fn take() -> Option<Collected> {
     })
 }
 
-/// The answers this run is resuming with, read once from [`ANSWERS_ENV`].
+/// The answers this run is resuming with, read from [`ANSWERS_ENV`].
+///
+/// Read once per bundle and kept for the life of the process: a monorepo runs
+/// this once per service, and re-reading a bundle of thousands of answers for
+/// each of them would be the slowest thing in a resume. Keyed by path rather
+/// than read once outright, so a process that is handed a second bundle reads
+/// the second one instead of silently replaying the first.
 ///
 /// A bundle that cannot be read is not a failed scan: the run says so and asks
 /// the model for everything, which is what it would have done without one.
 pub fn answers() -> Option<&'static AnswerBundle> {
-    ANSWERS
-        .get_or_init(|| {
-            let path = PathBuf::from(std::env::var_os(ANSWERS_ENV)?);
-            match std::fs::read(&path)
-                .map_err(|e| format!("{}: {e}", path.display()))
-                .and_then(|bytes| AnswerBundle::decode(&bytes))
-            {
-                // A job that died before its first pass hands back a header and
-                // nothing else. Treat it as no bundle at all, so the scan does
-                // not report itself as a resume of nothing.
-                Ok(bundle) if bundle.is_empty() => {
-                    tracing::warn!(
-                        "The collected analysis holds no answers; this scan analyses every file \
-                         itself"
-                    );
-                    None
+    let path = PathBuf::from(std::env::var_os(ANSWERS_ENV)?);
+    let mut guard = ANSWERS.lock().ok()?;
+    if let Some((read, bundle)) = guard.as_ref()
+        && read == &path
+    {
+        return *bundle;
+    }
+    let bundle = load(&path).map(|bundle| &*Box::leak(Box::new(bundle)));
+    *guard = Some((path, bundle));
+    bundle
+}
+
+fn load(path: &Path) -> Option<AnswerBundle> {
+    match std::fs::read(path)
+        .map_err(|e| format!("{}: {e}", path.display()))
+        .and_then(|bytes| AnswerBundle::decode(&bytes))
+    {
+        // A job that died before its first pass hands back a header and
+        // nothing else. Treat it as no bundle at all, so the scan does not
+        // report itself as a resume of nothing.
+        Ok(bundle) if bundle.is_empty() => {
+            tracing::warn!(
+                "The collected analysis holds no answers; this scan analyses every file itself"
+            );
+            None
+        }
+        Ok(bundle) => {
+            tracing::info!(
+                "Resuming with {} collected answer(s), {} of them already held by the cloud{}",
+                bundle.len(),
+                bundle.cached_count(),
+                if bundle.complete {
+                    String::new()
+                } else {
+                    format!(
+                        ", {} of which the job could not produce",
+                        bundle.failure_count()
+                    )
                 }
-                Ok(bundle) => {
-                    tracing::info!(
-                        "Resuming with {} collected answer(s), {} of them already held by the \
-                         cloud{}",
-                        bundle.len(),
-                        bundle.cached_count(),
-                        if bundle.complete {
-                            String::new()
-                        } else {
-                            format!(", {} of which the job could not produce", bundle.failure_count())
-                        }
-                    );
-                    Some(bundle)
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "Could not read the collected answers ({error}); this scan analyses every file itself"
-                    );
-                    None
-                }
-            }
-        })
-        .as_ref()
+            );
+            Some(bundle)
+        }
+        Err(error) => {
+            tracing::warn!(
+                "Could not read the collected answers ({error}); this scan analyses every file \
+                 itself"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]

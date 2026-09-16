@@ -615,7 +615,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // the cloud is holding a slot for the job rather than for this process, so
     // the run exits 0 and the machine is free.
     if let Some(collected) = crate::analysis_channel::take() {
-        let submitted = dispatch_analysis_job(storage, collected, &run_context).await?;
+        let submitted = dispatch_analysis_job(storage, collected, &run_context, repo_path).await?;
         crate::progress::report_dispatched(&submitted);
         match submitted.job_id.as_deref() {
             Some(_) => logging::finish_spinner(
@@ -1487,11 +1487,15 @@ async fn dispatch_analysis_job<T: CloudStorage + Sync>(
     storage: &T,
     collected: crate::analysis_channel::Collected,
     run: &crate::cloud_storage::RunContext,
+    repo_path: &str,
 ) -> Result<crate::analysis_job::Dispatched, Box<dyn std::error::Error>> {
+    // The name the cloud authorised the scan with, and this tree's own name
+    // when it has no remote: never the working directory, which in a
+    // multi-repo build is the workspace and is the same for every repo in it.
     let repo = run
         .repo_full_name
         .clone()
-        .unwrap_or_else(|| get_repository_name("."));
+        .unwrap_or_else(|| get_repository_name(repo_path));
     if !collected.degraded.is_empty() {
         return Err(format!(
             "Carrick could not read the framework guidance for {}, so this scan cannot be handed \

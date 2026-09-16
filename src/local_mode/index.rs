@@ -49,8 +49,11 @@ pub struct IndexOutcome {
 /// and whether the index it builds is worth uploading.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resumption {
-    /// The answer bundle this repo's scan joins by content.
-    pub answers: PathBuf,
+    /// The answer bundle this repo's scan joins by content. `None` for a repo
+    /// that was never handed over: it has no job to collect and is scanned the
+    /// ordinary way, because the index the resume writes covers the workspace
+    /// and a repo left out of it reads as a repo with nothing in it.
+    pub answers: Option<PathBuf>,
     /// When the prompts were handed over, so this build can tell whether the
     /// stored index moved while the job ran.
     pub dispatched_at: String,
@@ -129,9 +132,10 @@ pub fn run(workspace: &Workspace, only: Option<&str>, pass: &Pass) -> Result<Bui
                 == workspace.repos
     });
     let targets = match pass {
-        // A resume scans the repos whose answers are in hand and no others: a
-        // repo whose job is still running must not be analysed here, which is
-        // the whole reason its prompts were handed over.
+        // A resume scans what the caller listed and nothing else: the repos
+        // whose answers are in hand, and the repos that were never handed
+        // over. A repo whose job is still running is absent from the map and
+        // is not analysed here, which is the whole reason it was handed over.
         Pass::Resume(resuming) => workspace
             .repos
             .iter()
@@ -538,7 +542,9 @@ pub(super) fn scan_command(
         }
         Pass::Resume(resuming) => {
             if let Some(resumption) = resuming.get(repo) {
-                command.env(crate::analysis_channel::ANSWERS_ENV, &resumption.answers);
+                if let Some(answers) = &resumption.answers {
+                    command.env(crate::analysis_channel::ANSWERS_ENV, answers);
+                }
                 if resumption.superseded {
                     command.env(super::SKIP_UPLOAD_ENV, "1");
                 }

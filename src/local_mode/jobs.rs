@@ -74,9 +74,13 @@ pub fn read(index_dir: &Path) -> Vec<Job> {
 /// Record a job, replacing whatever this repo had recorded before: one repo
 /// waits on one job, and a second dispatch of the same repo supersedes the
 /// first rather than queueing behind it.
+///
+/// Keyed on the path rather than the name. The path is what a resume needs and
+/// what this machine can be sure is one repo; a name is what a tree with no
+/// remote has to be given.
 pub fn record(index_dir: &Path, job: Job) -> Result<(), String> {
     let mut jobs = read(index_dir);
-    jobs.retain(|existing| existing.repo != job.repo);
+    jobs.retain(|existing| existing.path != job.path);
     jobs.push(job);
     write(index_dir, jobs)
 }
@@ -384,6 +388,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         record(dir.path(), job("owner/api", "j1")).unwrap();
         record(dir.path(), job("owner/api", "j2")).unwrap();
+        // Two trees whose remotes name them the same thing are still two jobs:
+        // the path is the key.
         let read_back = read(dir.path());
         assert_eq!(read_back.len(), 1);
         assert_eq!(read_back[0].job_id, "j2");

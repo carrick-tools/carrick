@@ -62,6 +62,7 @@ jobs:
           --test alias_import_callers_test
           --test analysis_failure_keeps_deterministic_rows_test
           --test dependency_analysis_test
+          --test dispatch_resume_test
           --test env_var_template_call_segment_test
           --test eval_xrepo
           --test extraction_config_test

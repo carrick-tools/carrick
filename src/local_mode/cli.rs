@@ -573,7 +573,28 @@ fn resume(root: Option<&Path>) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut resuming = std::collections::BTreeMap::new();
+    // Every repo of the workspace that is not waiting on an unfinished job,
+    // because this build writes the whole index: the ones with answers to
+    // collect, and the ones that were never handed over.
+    let mut resuming: std::collections::BTreeMap<PathBuf, super::index::Resumption> = workspace
+        .repos
+        .iter()
+        .filter(|repo| {
+            !jobs
+                .iter()
+                .any(|job| Path::new(&job.path) == repo.as_path())
+        })
+        .map(|repo| {
+            (
+                repo.clone(),
+                super::index::Resumption {
+                    answers: None,
+                    dispatched_at: String::new(),
+                    superseded: false,
+                },
+            )
+        })
+        .collect();
     let mut collected = Vec::new();
     for (job, status) in jobs.iter().zip(super::jobs::ask(&jobs)) {
         match status {
@@ -588,7 +609,7 @@ fn resume(root: Option<&Path>) -> Result<(), String> {
                     resuming.insert(
                         PathBuf::from(&job.path),
                         super::index::Resumption {
-                            answers,
+                            answers: Some(answers),
                             dispatched_at: job.submitted_at.clone(),
                             superseded: false,
                         },
@@ -599,7 +620,9 @@ fn resume(root: Option<&Path>) -> Result<(), String> {
             },
         }
     }
-    if resuming.is_empty() {
+    // Nothing was collected: every job is still running, and a build now would
+    // write an index missing the repos they cover.
+    if collected.is_empty() {
         return Ok(());
     }
 
