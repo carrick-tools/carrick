@@ -19,6 +19,7 @@ use crate::{
     visitor::{ImportedSymbol, SymbolKind},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tracing::{debug, trace, warn};
 
@@ -628,6 +629,22 @@ struct AnalysisPrompt {
     guidance_prefix_bytes: usize,
 }
 
+/// The target the per-file prompt fingerprint is logged under, so a reader can
+/// pull every one of them out of a run log with a single filter and join two
+/// runs on `file`.
+pub const PROMPT_FINGERPRINT_TARGET: &str = "carrick::prompt_fingerprint";
+
+/// Name the prompt bytes without reproducing them.
+///
+/// Hex sha256 of the whole rendered message — the same digest shape the cloud's
+/// analysis cache keys on, so two runs whose fingerprints match for a file
+/// cannot have keyed differently on the message, and two that differ did.
+fn prompt_fingerprint(user_message: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(user_message.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 /// Agent that performs file-centric analysis using framework-agnostic patterns.
 ///
 /// This agent sends the full content of a file to the LLM along with patterns
@@ -755,6 +772,31 @@ impl FileAnalyzerAgent {
             key,
             prefix_bytes: prompt.guidance_prefix_bytes,
         });
+
+        // The one fact a cache-miss investigation needs and no log has carried.
+        //
+        // The cloud keys its analysis cache on these exact bytes, so a run that
+        // re-pays for work an earlier run already did differs HERE and nowhere
+        // else a log can show: the cloud never records a prompt (by design) and
+        // the scanner never recorded what it sent. Two runs' logs now join on
+        // `file` and answer it per file, offline, for free — instead of
+        // inferring from byte sizes, which cannot say WHICH file moved, or
+        // whether anything moved at all when two files happen to share a length
+        // (carrick#1220 spent five rounds on exactly that).
+        //
+        // Both lengths are here because they localise the difference: a
+        // `guidance_prefix` that moved is the shared front block regenerating
+        // for the whole service, and a body that moved is this file's own
+        // inputs. The digest names the bytes without putting a line of the
+        // scanned repo into a log file the run uploads (#61).
+        debug!(
+            target: PROMPT_FINGERPRINT_TARGET,
+            "analyze-file prompt file={} sha256={} bytes={} guidance_prefix_bytes={}",
+            file_path,
+            prompt_fingerprint(&user_message),
+            user_message.len(),
+            prompt.guidance_prefix_bytes,
+        );
 
         debug!("=== FILE ANALYZER AGENT (AST-GATED) ===");
         debug!("Analyzing file: {}", file_path);
@@ -2851,4 +2893,32 @@ const data = await fetch('/api/users').then(resp => resp.json());
     // test_system_message_is_framework_agnostic was deleted: the system
     // prompt now lives in carrick-cloud/lambdas/file-analyzer/system_prompt.txt
     // and is no longer accessible from this Rust crate.
+
+    /// The fingerprint has to answer "are these the same bytes the cloud would
+    /// key on" — so equal messages share it and a single byte splits it. A
+    /// digest that missed a one-byte change would report a cache-missing run
+    /// as a matching one, which is the exact failure carrick#1220 chased.
+    #[test]
+    fn the_prompt_fingerprint_names_the_bytes() {
+        let message = "### FILE CONTENT\nconst a = 1;\n";
+        assert_eq!(prompt_fingerprint(message), prompt_fingerprint(message));
+        assert_ne!(
+            prompt_fingerprint(message),
+            prompt_fingerprint("### FILE CONTENT\nconst a = 2;\n")
+        );
+        // A trailing byte is the drift a byte-size comparison is blindest to
+        // when two files happen to share a length.
+        assert_ne!(
+            prompt_fingerprint(message),
+            prompt_fingerprint(&format!("{message} "))
+        );
+        assert_eq!(prompt_fingerprint("").len(), 64, "hex sha256 is 64 chars");
+    }
+
+    /// The target is what a reader filters a run log on, so it is part of the
+    /// diagnostic's contract with whoever is reading two logs side by side.
+    #[test]
+    fn the_fingerprint_target_is_the_documented_one() {
+        assert_eq!(PROMPT_FINGERPRINT_TARGET, "carrick::prompt_fingerprint");
+    }
 }
