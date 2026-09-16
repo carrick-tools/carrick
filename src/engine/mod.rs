@@ -1479,7 +1479,7 @@ fn previous_generation(
 ///
 /// * some service could not be carried — its framework guidance has no id, so
 ///   the cloud would key the whole message and the block this bundle carries
-///   once would be paid for once per file. The job is not sent;
+///   once is re-keyed for every file. The job is not sent;
 /// * nothing needed the model at all, so there is no job to send and the repo
 ///   can simply be indexed here;
 /// * the ordinary case: one object, one job id.

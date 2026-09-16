@@ -13,7 +13,7 @@ src/engine/mod.rs:4
 src/local_mode/cli.rs:9
 src/local_mode/contract.rs:4
 src/local_mode/hosted.rs:4
-src/local_mode/index.rs:11
+src/local_mode/index.rs:10
 src/local_mode/query.rs:3
 src/local_mode/scan_state.rs:8
 src/local_mode/workspace.rs:3

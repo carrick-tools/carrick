@@ -2321,8 +2321,8 @@ impl FileOrchestrator {
             for pf in &to_dispatch {
                 let Some(key) = guidance.guidance_key.as_deref() else {
                     // Without a guidance id the cloud keys the whole message,
-                    // so the block this bundle carries once would be paid for
-                    // once per file. Refuse the job rather than ship that.
+                    // so the block this bundle carries once is re-keyed for
+                    // every file. Refuse the job rather than ship that.
                     crate::analysis_channel::degrade(service.as_deref().unwrap_or("this service"));
                     break;
                 };
