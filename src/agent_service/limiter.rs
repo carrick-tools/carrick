@@ -28,6 +28,12 @@
 //! - **Additive increase.** After as many successes in a row as the current
 //!   limit (one round at that width), the limit rises by one, back towards the
 //!   configured maximum.
+//! - **Restore after a quiet spell.** A route that has gone
+//!   [`QUIET_RESTORE`] without a refusal goes back to its maximum in one
+//!   step. AIMD's climb assumes the backend's capacity is a level this scan
+//!   is probing for; a model on dynamic shared quota refuses by the window a
+//!   request lands in, and when the window passes there is nothing left to
+//!   probe for. Without this the scan keeps paying for a dip that is over.
 //!
 //! The maximum is `CARRICK_CONCURRENCY_LIMIT`, so the env knob still caps
 //! every route. A retry waiting out its backoff holds no slot here either
@@ -50,6 +56,48 @@ pub(crate) const LIMIT_FLOOR: usize = 2;
 /// a line, not a line per refused request.
 const TERMINAL_LINE_GAP: Duration = Duration::from_secs(15);
 
+/// How long a route must go without a capacity refusal before its limit
+/// returns to the maximum in one step.
+///
+/// The decrease answers a busy model; this answers the model going quiet
+/// again. A refusal on dynamic shared quota is a property of the window the
+/// request landed in, not of how fast this scan is sending (carrick-cloud#869,
+/// measured on the 2026-09-14 first index: refusals ran at 13.4% of model
+/// calls inside two dips of about twenty minutes and 0.3% between them, while
+/// the scan's own model-call rate varied by less than a third across both).
+/// A scan that keeps climbing back one slot at a time after the window has
+/// passed pays for a dip long after it ended: from 14 back to 28 is 294
+/// consecutive successes, and on a route whose calls are slow that is minutes
+/// (2026-09-15 scale test: file analysis sat between 3 and 8 for three
+/// minutes and had reached only 23 of 28 when the run ended).
+///
+/// What keeps this safe on a backend that really does have a fixed number of
+/// slots — where the refusals ARE this scan's own doing — is the additive
+/// increase underneath it: the climb re-probes, meets the backend's edge, and
+/// that refusal restarts the spell, so the spell never elapses while the
+/// backend is still refusing. A spell has to be long enough for that probe to
+/// get there. Against a fixed-capacity stub, a spell of four call latencies
+/// is too short and costs 585 refusals and 18 calls lost against the old
+/// rule's 49 and none; at nine and at twenty it is 49 and none, the old
+/// rule's numbers exactly, whether the backend's edge sits below or above
+/// half the maximum.
+///
+/// A minute, then: several times the climb back on the slowest route
+/// (file analysis, 3.4 s p50), and nothing against the tens of minutes of
+/// scan that follow a dip. It is also far longer than the gap between two
+/// refusals inside a dip — at the floor of two and the 15% per-call refusal
+/// rate of 2026-09-14, about 11 s on that route and 5 s on the intent route
+/// — so a dip cannot restore into itself.
+///
+/// The rule rejected: restoring once the climb passes a fraction of the
+/// maximum, which needs no clock. On a fixed-capacity backend whose edge sits
+/// in the top half it oscillates — 188 refusals against the old rule's 12.
+///
+/// The measurements are `probe_869_capacity_shape` and `probe_869_dsq_shape*`
+/// in `agent_service`'s tests, `#[ignore]`d because they print a table rather
+/// than assert one.
+const QUIET_RESTORE: Duration = Duration::from_secs(60);
+
 #[derive(Debug)]
 struct State {
     limit: usize,
@@ -59,6 +107,9 @@ struct State {
     epoch: u64,
     /// Successes since the last change to `limit`.
     run: usize,
+    /// When this route was last refused for capacity. `None` until the first
+    /// refusal, and again once a quiet spell has restored the limit.
+    last_refusal: Option<Instant>,
     /// When the terminal last heard this route was busy, and at what limit.
     /// `None` while the route runs at its maximum.
     announced: Option<(Instant, usize)>,
@@ -70,22 +121,28 @@ pub(crate) struct AdaptiveLimit {
     route: String,
     max: usize,
     floor: usize,
+    quiet: Duration,
     state: Mutex<State>,
     notify: Notify,
 }
 
 impl AdaptiveLimit {
-    pub(crate) fn new(route: &str, max: usize) -> Self {
+    /// One route's limit, with the quiet spell that restores it passed in:
+    /// [`RouteLimits`] passes [`QUIET_RESTORE`], and a test passes a spell it
+    /// does not have to wait a minute for.
+    pub(crate) fn with_quiet(route: &str, max: usize, quiet: Duration) -> Self {
         let max = max.max(1);
         Self {
             route: route.to_string(),
             max,
             floor: LIMIT_FLOOR.min(max),
+            quiet,
             state: Mutex::new(State {
                 limit: max,
                 in_flight: 0,
                 epoch: 0,
                 run: 0,
+                last_refusal: None,
                 announced: None,
             }),
             notify: Notify::new(),
@@ -133,6 +190,18 @@ impl AdaptiveLimit {
             let mut state = self.state.lock().unwrap();
             if state.limit >= self.max {
                 None
+            } else if state
+                .last_refusal
+                .is_some_and(|at| Instant::now().duration_since(at) >= self.quiet)
+            {
+                // Nothing has been refused for a whole quiet spell, so the
+                // window that refused this route has passed. Climbing back a
+                // slot at a time from here would go on paying for it.
+                state.limit = self.max;
+                state.run = 0;
+                state.last_refusal = None;
+                state.announced = None;
+                Some(state.limit)
             } else {
                 state.run += 1;
                 if state.run >= state.limit {
@@ -154,7 +223,7 @@ impl AdaptiveLimit {
             route = %self.route,
             limit,
             max = self.max,
-            "model requests: limit raised after a run of successes"
+            "model requests: limit raised"
         );
         if limit == self.max {
             crate::progress::announce(&format!(
@@ -171,6 +240,10 @@ impl AdaptiveLimit {
     fn overloaded(&self, admitted_in: u64) {
         let (before, after, in_flight, announce) = {
             let mut state = self.state.lock().unwrap();
+            // Every refusal restarts the quiet spell, even one this epoch has
+            // already answered: the spell measures how long the model has
+            // gone without refusing anything, not how long since the last cut.
+            state.last_refusal = Some(Instant::now());
             if admitted_in != state.epoch {
                 return;
             }
@@ -248,13 +321,22 @@ impl Drop for Slot {
 #[derive(Debug)]
 pub(crate) struct RouteLimits {
     max: usize,
+    quiet: Duration,
     routes: Mutex<BTreeMap<String, Arc<AdaptiveLimit>>>,
 }
 
 impl RouteLimits {
     pub(crate) fn new(max: usize) -> Self {
+        Self::with_quiet(max, QUIET_RESTORE)
+    }
+
+    /// [`Self::new`] with the quiet spell that restores a route's limit set
+    /// explicitly. A test on its own timescale passes its own spell, and
+    /// `Duration::MAX` leaves the additive increase as the only way back.
+    pub(crate) fn with_quiet(max: usize, quiet: Duration) -> Self {
         Self {
             max,
+            quiet,
             routes: Mutex::new(BTreeMap::new()),
         }
     }
@@ -265,9 +347,9 @@ impl RouteLimits {
     pub(crate) fn for_route(&self, route: &str) -> Arc<AdaptiveLimit> {
         let mut routes = self.routes.lock().unwrap();
         Arc::clone(
-            routes
-                .entry(route.to_string())
-                .or_insert_with(|| Arc::new(AdaptiveLimit::new(route, self.max))),
+            routes.entry(route.to_string()).or_insert_with(|| {
+                Arc::new(AdaptiveLimit::with_quiet(route, self.max, self.quiet))
+            }),
         )
     }
 }
@@ -440,9 +522,15 @@ mod tests {
         slots
     }
 
+    /// A limit carrying the quiet spell the scanner ships, which no test here
+    /// stays still long enough to reach.
+    fn limit_of(route: &str, max: usize) -> Arc<AdaptiveLimit> {
+        Arc::new(AdaptiveLimit::with_quiet(route, max, QUIET_RESTORE))
+    }
+
     #[tokio::test]
     async fn a_refusal_halves_the_limit_once_per_epoch_down_to_the_floor() {
-        let limit = Arc::new(AdaptiveLimit::new("/analyze-file", 16));
+        let limit = limit_of("/analyze-file", 16);
         let slots = take(&limit, 16).await;
         assert_eq!(limit.limit(), 16);
 
@@ -463,7 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_run_of_successes_as_long_as_the_limit_raises_it_by_one_up_to_the_max() {
-        let limit = Arc::new(AdaptiveLimit::new("/generate-intent", 4));
+        let limit = limit_of("/generate-intent", 4);
         limit.acquire().await.overloaded();
         assert_eq!(limit.limit(), 2);
 
@@ -481,9 +569,80 @@ mod tests {
         assert_eq!(limit.limit(), 4, "grew past the configured maximum");
     }
 
+    /// carrick-cloud#869: once a route has gone a whole quiet spell without a
+    /// refusal, the next success puts it straight back at its maximum, rather
+    /// than buying the 2 + 3 + ... + 27 successes the climb from the floor to
+    /// 28 would otherwise cost.
+    #[tokio::test]
+    async fn a_quiet_spell_without_a_refusal_restores_the_limit_in_one_step() {
+        let limit = Arc::new(AdaptiveLimit::with_quiet(
+            "/generate-intent",
+            16,
+            Duration::from_millis(30),
+        ));
+        limit.acquire().await.overloaded();
+        limit.acquire().await.overloaded();
+        limit.acquire().await.overloaded();
+        assert_eq!(limit.limit(), LIMIT_FLOOR);
+
+        // Inside the spell, only the additive increase is on offer.
+        limit.acquire().await.succeeded();
+        limit.acquire().await.succeeded();
+        assert_eq!(limit.limit(), 3);
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        limit.acquire().await.succeeded();
+        assert_eq!(
+            limit.limit(),
+            16,
+            "the quiet spell did not restore the limit"
+        );
+
+        // Restoring clears the spell, so a fresh refusal still cuts.
+        limit.acquire().await.overloaded();
+        assert_eq!(limit.limit(), 8);
+    }
+
+    /// A backend that keeps refusing keeps the limit down: every refusal
+    /// restarts the quiet spell, including one this epoch has already
+    /// answered, so a spell only elapses when the refusals really have
+    /// stopped.
+    #[tokio::test]
+    async fn a_refusal_inside_the_quiet_spell_restarts_it() {
+        let limit = Arc::new(AdaptiveLimit::with_quiet(
+            "/analyze-file",
+            8,
+            Duration::from_millis(60),
+        ));
+        // Taken before the cut, so each one's epoch is stale afterwards: a
+        // refusal the limit has already answered, which must still count as
+        // the model having refused something.
+        let mut stale = Vec::new();
+        for _ in 0..3 {
+            stale.push(limit.acquire().await);
+        }
+        limit.acquire().await.overloaded();
+        assert_eq!(limit.limit(), 4);
+
+        for slot in stale {
+            tokio::time::sleep(Duration::from_millis(45)).await;
+            slot.overloaded();
+            limit.acquire().await.succeeded();
+            assert_eq!(
+                limit.limit(),
+                4,
+                "restored while refusals were still coming"
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        limit.acquire().await.succeeded();
+        assert_eq!(limit.limit(), 8);
+    }
+
     #[tokio::test]
     async fn a_cut_restarts_the_run_of_successes() {
-        let limit = Arc::new(AdaptiveLimit::new("/analyze-file", 8));
+        let limit = limit_of("/analyze-file", 8);
         limit.acquire().await.overloaded();
         assert_eq!(limit.limit(), 4);
         for _ in 0..3 {
@@ -505,7 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_waits_while_in_flight_is_over_a_cut_limit() {
-        let limit = Arc::new(AdaptiveLimit::new("/analyze-file", 8));
+        let limit = limit_of("/analyze-file", 8);
         let mut held = take(&limit, 8).await;
         // Cut to 4 with 7 still in flight.
         held.pop().unwrap().overloaded();
@@ -529,7 +688,7 @@ mod tests {
     /// some other request finishes.
     #[tokio::test]
     async fn growth_wakes_every_waiter_that_now_fits() {
-        let limit = Arc::new(AdaptiveLimit::new("/analyze-file", 3));
+        let limit = limit_of("/analyze-file", 3);
         limit.acquire().await.overloaded();
         assert_eq!(limit.limit(), 2);
         let first = limit.acquire().await;
@@ -623,7 +782,7 @@ mod tests {
 
     #[test]
     fn a_maximum_below_the_floor_is_its_own_floor() {
-        let limit = AdaptiveLimit::new("/framework-detect", 1);
+        let limit = limit_of("/framework-detect", 1);
         assert_eq!(limit.floor, 1);
         assert_eq!(limit.limit(), 1);
     }
