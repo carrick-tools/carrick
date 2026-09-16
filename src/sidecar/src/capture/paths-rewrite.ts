@@ -7,14 +7,16 @@
  * producer's own resolution context -- `paths` cannot be fixed at check time
  * (program-global, and namespaces collide across stubs).
  *
- * Specifiers that map outside the emitted tree are left untouched: the
- * per-alias self-check classifies them as dangling internals with a recorded
- * reason, which is the honest outcome.
+ * An absolute path into an installed package becomes that package's bare
+ * specifier (installed-package.ts). Other specifiers that map outside the
+ * emitted tree are left untouched: the per-alias self-check classifies them
+ * as dangling internals with a recorded reason, which is the honest outcome.
  */
 
 import ts from 'typescript';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { installedPackageSpecifier } from './installed-package.js';
 import {
   isRelative,
   matchPathsPattern,
@@ -84,23 +86,70 @@ function relativeSpecifier(fromFile: string, toFile: string): string {
   return rel;
 }
 
+export interface RewriteResult {
+  /** Specifiers rewritten across every emitted file. */
+  rewrites: number;
+  /**
+   * Installed packages an absolute specifier was rewritten into, with their
+   * installed versions: the stub must pin them for the bare specifier to
+   * resolve at check time.
+   */
+  pins: Record<string, string>;
+  /**
+   * The same packages' real install directories, for the self-check's
+   * resolution only. Absolute paths: never written into the stub.
+   */
+  installs: Record<string, string>;
+}
+
 /**
- * Rewrite paths-mapped and absolute-internal specifiers in every emitted
- * file. Returns the number of specifiers rewritten.
+ * `import("<absolute>").Name` occurrences: the absolute specifier and the
+ * first name read off it, so an installed-package rewrite can find the entry
+ * that exports that name.
  */
-export function rewriteEmittedSpecifiers(args: RewriteArgs): number {
+const ABSOLUTE_IMPORT_TYPE = /(import\s*\(\s*)(["'])(\/[^"']+)\2(\s*\))(\s*\.\s*)([A-Za-z_$][\w$]*)/g;
+
+/**
+ * Rewrite paths-mapped, absolute-internal and absolute installed-package
+ * specifiers in every emitted file (carrick#1174 for the last: a path into
+ * `node_modules` or a runtime npm cache becomes the package's bare specifier).
+ */
+export function rewriteEmittedSpecifiers(args: RewriteArgs): RewriteResult {
   const patterns = parsePathsPatterns(args.options, args.configPath);
   const emitted = new Set(args.files);
+  const pins: Record<string, string> = {};
+  const installs: Record<string, string> = {};
   let total = 0;
+
+  const installed = (spec: string, importedName?: string): string | undefined => {
+    const mapped = installedPackageSpecifier(spec, importedName);
+    if (!mapped) return undefined;
+    installs[mapped.install.name] = mapped.install.root;
+    if (mapped.pin) pins[mapped.pin.name] = mapped.pin.version;
+    return mapped.specifier;
+  };
 
   for (const file of args.files) {
     const absFile = path.join(args.typesDir, file);
-    const text = fs.readFileSync(absFile, 'utf8');
+    const original = fs.readFileSync(absFile, 'utf8');
+    let importTypeRewrites = 0;
+    // Import types first, while the member name is still attached to its
+    // specifier; an in-tree target is left for the general pass below.
+    const text = original.replace(
+      ABSOLUTE_IMPORT_TYPE,
+      (whole, open: string, quote: string, spec: string, close: string, dot: string, name: string) => {
+        if (treeFileFor(spec, args.entryDir, emitted)) return whole;
+        const replacement = installed(spec, name);
+        if (replacement === undefined) return whole;
+        importTypeRewrites++;
+        return `${open}${quote}${replacement}${quote}${close}${dot}${name}`;
+      }
+    );
     const { text: rewritten, rewrites } = rewriteSpecifiers(text, (spec) => {
-      // Absolute internal paths (node-builder import types).
+      // Absolute paths: an emitted tree file, else an installed package.
       if (spec.startsWith('/')) {
         const target = treeFileFor(spec, args.entryDir, emitted);
-        return target ? relativeSpecifier(file, target) : undefined;
+        return target ? relativeSpecifier(file, target) : installed(spec);
       }
       if (isRelative(spec)) return undefined;
       // tsconfig-paths patterns, first matching target that exists in-tree
@@ -119,10 +168,10 @@ export function rewriteEmittedSpecifiers(args: RewriteArgs): number {
       }
       return undefined;
     });
-    if (rewrites > 0) {
+    if (rewrites + importTypeRewrites > 0) {
       fs.writeFileSync(absFile, rewritten);
-      total += rewrites;
+      total += rewrites + importTypeRewrites;
     }
   }
-  return total;
+  return { rewrites: total, pins, installs };
 }

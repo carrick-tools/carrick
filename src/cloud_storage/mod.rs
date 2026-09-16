@@ -412,6 +412,22 @@ pub struct RunStart {
     pub indexed_services: Option<Vec<String>>,
 }
 
+/// What the cloud said when it took a dispatched analysis job (carrick#1229).
+#[derive(Debug, Clone)]
+pub struct JobSubmission {
+    /// The name the job answers to afterwards, for `carrick status` and
+    /// `carrick resume`.
+    pub job_id: String,
+    /// How many prompts the job carries, so the command that dispatched it can
+    /// say what is being worked on.
+    ///
+    /// No estimate of how long it will take: the cloud states none, and a
+    /// figure this side invented would be a promise nobody made. What a
+    /// dispatched run can honestly say is that the machine does not have to
+    /// stay on, and that `carrick status` answers how far it has got.
+    pub analyze_rows: usize,
+}
+
 impl RunStart {
     /// Whether this run is a laptop scan.
     ///
@@ -603,7 +619,28 @@ pub struct CloudRepoData {
 /// Version of the v2 capture stub artifact schema. Bumped on incompatible
 /// changes; the check phase treats a peer scanned with a different version as
 /// having no surface (its pairs are unverifiable with a re-scan reason).
-pub const CAPTURE_ARTIFACT_VERSION: u32 = 1;
+///
+/// This is the capture half of the cache story, and it is NOT `CACHE_VERSION`.
+/// A service's own stub is rebuilt from the AST on every scan and nothing reads
+/// the previous blob's copy, so a capture change needs no analysis-cache bump.
+/// What IS read back is a PEER's stored artifact: [`crate::engine::type_compat_v2`]
+/// materialises the files of every other service's `capture_stub` into the
+/// check workspace, and the sidecar reads each one's `carrick-manifest.json`
+/// (`capture/check.ts`, `readStubAliasRecords`) to pre-gate pairs. A stale
+/// artifact therefore answers today's gate with yesterday's record.
+///
+/// 2 (0.3.73): three changes to what an artifact says, in one release.
+/// carrick#1174 rewrites absolute installed-package specifiers in the
+/// declaration text and carrick#1204 scrubs any machine path the rewrite
+/// missed, so a version-1 artifact can name a path that exists only on the
+/// machine that captured it — materialised anywhere else, those imports
+/// resolve to nothing. carrick#1165 and carrick#1164 added the record fields
+/// the publish gate and the provenance labels read (`dangling_specifiers`,
+/// `undeclared_names`, `unresolved_import`), and a version-1 manifest carries
+/// none of them, so its aliases pre-gate exactly as they did before the gate
+/// existed. Rather than judge against either, a peer still on version 1 is
+/// unverifiable until it re-scans.
+pub const CAPTURE_ARTIFACT_VERSION: u32 = 2;
 
 /// The v2 capture stub package as it travels between scan time and check
 /// time: a types-only npm package (package.json + tsconfig.snapshot.json +
@@ -807,6 +844,7 @@ pub fn mount_graph_to_api_details(
             // it, nine operations behind one route are one row on the wire.
             dispatch: endpoint.dispatch.clone(),
             schema_binding: None,
+            handler_span: endpoint.handler_span,
         })
         .collect();
 
@@ -834,6 +872,8 @@ pub fn mount_graph_to_api_details(
             // on (carrick#831): the consumer half of the same identity.
             dispatch: call.dispatch.clone(),
             schema_binding: None,
+            // A call has no handler.
+            handler_span: None,
         })
         .collect();
 
@@ -973,6 +1013,29 @@ pub trait CloudStorage {
     /// and the whole CI path keep doing.
     async fn begin_run(&self, _run: &RunContext) -> Result<RunStart, StorageError> {
         self.health_check().await.map(|()| RunStart::default())
+    }
+
+    /// Whether this cloud takes a whole scan's prompts as one job.
+    ///
+    /// Asked after the run is open, because it is `start-scan` that answers
+    /// it. Not async, so the default puts no `Sync` bound on generic callers
+    /// (carrick#956).
+    fn accepts_analysis_job(&self) -> bool {
+        false
+    }
+
+    /// Hand the cloud every prompt this run built, instead of asking them one
+    /// at a time and waiting (carrick#1229).
+    ///
+    /// `None` means this backend, or this cloud, does not take analysis jobs —
+    /// in which case the run scans synchronously, which is what it did before
+    /// this existed. So a scanner that can dispatch in front of a cloud that
+    /// cannot is not a broken install, it is an ordinary scan.
+    async fn submit_analysis_job(
+        &self,
+        _bundle: &crate::analysis_job::JobBundle,
+    ) -> Result<Option<JobSubmission>, StorageError> {
+        Ok(None)
     }
 
     /// Keep `data`, the generation the index already serves for a service this
@@ -1369,6 +1432,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
 
         let (endpoints, _calls) = mount_graph_to_api_details(&graph);
@@ -1404,6 +1468,7 @@ mod tests {
             resolution_source: Some(ResolutionSource::FileBasedRoute),
             view_module: false,
             dispatch: None,
+            handler_span: None,
         });
         // A route whose module also renders a view (carrick#704).
         graph.endpoints.push(ResolvedEndpoint {
@@ -1421,6 +1486,7 @@ mod tests {
             resolution_source: Some(ResolutionSource::FileBasedRoute),
             view_module: true,
             dispatch: None,
+            handler_span: None,
         });
         graph.data_calls.push(DataFetchingCall {
             method: "POST".to_string(),
@@ -1489,6 +1555,7 @@ mod tests {
             resolution_source: None,
             view_module: false,
             dispatch,
+            handler_span: None,
         };
         graph.endpoints.push(route(Some(case("search-by-intent"))));
         graph.endpoints.push(route(None));
@@ -1609,6 +1676,7 @@ mod tests {
             resolution_source: Some(ResolutionSource::FileBasedRoute),
             view_module,
             dispatch: None,
+            handler_span: None,
         };
         graph
             .endpoints
@@ -2048,6 +2116,7 @@ mod tests {
             view_module: false,
             dispatch: None,
             schema_binding: binding,
+            handler_span: None,
         };
         let mut data = empty_repo("org/web", Some("web"));
         data.calls = vec![

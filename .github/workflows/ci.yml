@@ -62,6 +62,7 @@ jobs:
           --test alias_import_callers_test
           --test analysis_failure_keeps_deterministic_rows_test
           --test dependency_analysis_test
+          --test dispatch_resume_test
           --test env_var_template_call_segment_test
           --test eval_xrepo
           --test extraction_config_test
@@ -69,9 +70,11 @@ jobs:
           --test file_centric_analysis_test
           --test framework_coverage_test
           --test graphql_code_first_resolvers_test
+          --test graphql_document_call_sites_test
           --test graphql_extraction_test
           --test graphql_schema_identity_test
           --test graphql_schemas_setting_test
+          --test graphql_walked_schema_evidence_test
           --test incremental_raw_cache_test
           --test intent_incremental_test
           --test jsx_component_callers_test
@@ -83,6 +86,7 @@ jobs:
           --test new_url_target_test
           --test object_export_surface_test
           --test output_contract_test
+          --test prompt_determinism_test
           --test receiver_type_classification_test
           --test route_request_anchor_test
           --test scan_durability_test

@@ -168,7 +168,7 @@ function demotedRecord(anchor: ResolvedAnchor): CaptureAliasRecord {
     alias: anchor.request.alias,
     anchor_kind: anchor.request.kind,
     symbol_name: 'symbol_name' in anchor.request ? anchor.request.symbol_name : undefined,
-    source_file: 'source_file' in anchor.request ? anchor.request.source_file : '<inline>',
+    source_file: anchor.request.kind === 'literal' ? '<inline>' : anchor.request.source_file,
     anchor_origin: anchor.request.anchor_origin,
     serialization: 'structural_fallback',
     self_check: 'decayed_internal',
@@ -240,11 +240,13 @@ function checkedRecord(
 
   let blamedExternal: string | undefined;
   let internalFailure: string | undefined;
+  const danglingSpecifiers = new Set<string>();
   for (const file of closure) {
     const failures = ctx.failuresByFile.get(file);
     if (!failures) continue;
     if (!blamedExternal) blamedExternal = [...failures.externalPinned][0];
     if (!internalFailure) internalFailure = [...failures.internal][0];
+    for (const specifier of failures.internal) danglingSpecifiers.add(specifier);
   }
 
   // Classification consults the closure failures REGARDLESS of the root
@@ -322,7 +324,7 @@ function checkedRecord(
     alias,
     anchor_kind: anchor.request.kind,
     symbol_name: 'symbol_name' in anchor.request ? anchor.request.symbol_name : undefined,
-    source_file: 'source_file' in anchor.request ? anchor.request.source_file : '<inline>',
+    source_file: anchor.request.kind === 'literal' ? '<inline>' : anchor.request.source_file,
     anchor_origin: anchor.request.anchor_origin,
     serialization: anchor.serialization,
     self_check: outcome,
@@ -340,6 +342,10 @@ function checkedRecord(
           ),
         }
       : {}),
+    ...(danglingSpecifiers.size > 0
+      ? { dangling_specifiers: [...danglingSpecifiers].sort() }
+      : {}),
+    ...(anchor.undeclaredNames ? { undeclared_names: anchor.undeclaredNames } : {}),
   };
 }
 

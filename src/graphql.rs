@@ -120,6 +120,33 @@ pub struct GraphqlOp {
     /// (`calls[].schema_binding`). `None` for producers and before
     /// attribution runs.
     pub schema_binding: Option<SchemaBinding>,
+    /// PRODUCER-only: the root field's argument list as the SDL declares it
+    /// (carrick#1158), the request half of the operation's contract. `None`
+    /// for a field with no arguments and for every consumer.
+    pub arguments: Option<SdlArguments>,
+}
+
+/// A schema root field's arguments, printed from the SDL (carrick#1158).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdlArguments {
+    /// The field and its argument list, as SDL:
+    /// `createInvoice(input: CreateInvoiceInput!, dryRun: Boolean = false)`.
+    pub signature: String,
+    /// The named types the arguments reference, list and non-null markers
+    /// stripped, in argument order and deduplicated.
+    pub named_types: Vec<String>,
+}
+
+/// An `input`, `enum` or `scalar` declaration an argument list can reference,
+/// printed from the SDL it is declared in (carrick#1158).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdlInputDeclaration {
+    /// The declaration as SDL, descriptions included.
+    pub text: String,
+    /// Whether this is an `input` object, the kind a request type is named by.
+    pub input_object: bool,
+    /// The named types an `input` object's fields reference, in field order.
+    pub references: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -128,6 +155,11 @@ pub struct GraphqlExtraction {
     pub producers: Vec<GraphqlOp>,
     /// Top-level fields of executable documents this service sends.
     pub consumers: Vec<GraphqlOp>,
+    /// Every `input`, `enum` and `scalar` declaration in the schemas this
+    /// service reads, by name, so an argument list declared in one SDL file
+    /// can be printed with the input types another file declares. First
+    /// declaration wins.
+    pub input_declarations: BTreeMap<String, SdlInputDeclaration>,
 }
 
 impl GraphqlExtraction {
@@ -138,6 +170,9 @@ impl GraphqlExtraction {
     fn merge(&mut self, other: GraphqlExtraction) {
         self.producers.extend(other.producers);
         self.consumers.extend(other.consumers);
+        for (name, declaration) in other.input_declarations {
+            self.input_declarations.entry(name).or_insert(declaration);
+        }
     }
 }
 
@@ -285,7 +320,7 @@ impl GraphqlConsumerHints {
     /// the deterministic pass already anchored (`TaggedTplVisitor::capture_request_call`
     /// matched an explicit generic) needs no hint — there is nothing left to
     /// locate.
-    pub fn collect(scan_roots: Vec<PathBuf>, service_files: &[PathBuf]) -> Self {
+    pub fn collect(scan_roots: Vec<PathBuf>, service_files: &[PathBuf], repo_root: &str) -> Self {
         let extraction = scan_repo(&scan_roots, &[], service_files);
         let mut lines = Vec::new();
         let mut files = std::collections::HashSet::new();
@@ -293,7 +328,7 @@ impl GraphqlConsumerHints {
             if op.payload_type_symbol.is_some() {
                 continue;
             }
-            let Some(line) = Self::format_consumer(op) else {
+            let Some(line) = Self::format_consumer(op, repo_root) else {
                 continue;
             };
             lines.push(line);
@@ -305,7 +340,13 @@ impl GraphqlConsumerHints {
     /// Format a single unanchored consumer op as `"{kind}|{field} @ {file}"`
     /// (e.g. `"subscription|orderUpdated @ lib/graphql.ts"`). `None` if the op
     /// is not a GraphQL consumer key (should never happen for `.consumers`).
-    fn format_consumer(op: &GraphqlOp) -> Option<String> {
+    ///
+    /// The file is named repo-relative, as every path that reaches a prompt
+    /// is: these lines sit in the repo-global front block of EVERY analysed
+    /// file's message, and the cloud hashes those bytes as its analysis-cache
+    /// key, so one absolute path here made every entry in the service private
+    /// to the checkout that produced it (carrick#1223).
+    fn format_consumer(op: &GraphqlOp, repo_root: &str) -> Option<String> {
         let OperationKey::Graphql { kind, field } = &op.key else {
             return None;
         };
@@ -313,7 +354,7 @@ impl GraphqlConsumerHints {
             "{}|{} @ {}",
             kind.as_str(),
             field,
-            op.file_path.display()
+            crate::utils::repo_relative_source_path(&op.file_path.to_string_lossy(), repo_root)
         ))
     }
 
@@ -406,9 +447,14 @@ pub fn scan_repo(
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;
         };
-        extraction
-            .producers
-            .extend(extract_from_document_text(&content, path, 1).producers);
+        let declared = extract_from_document_text(&content, path, 1);
+        extraction.producers.extend(declared.producers);
+        for (name, declaration) in declared.input_declarations {
+            extraction
+                .input_declarations
+                .entry(name)
+                .or_insert(declaration);
+        }
     }
     for path in graphql_files_under(scan_roots) {
         if !seen_sdl.insert(path.clone()) {
@@ -560,8 +606,9 @@ pub enum SchemaBinding {
 /// Whether a schema file is one a service in this scan serves (carrick#1134).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaOrigin {
-    /// A service's own SDL walk reads the file, or a service names it in
-    /// `graphqlSchemas`.
+    /// A service names the file in `graphqlSchemas`, or its own SDL walk reads
+    /// the file and the service shows it serves a schema
+    /// ([`SchemaCatalogue::settle_walked_schemas`], carrick#1189).
     Served,
     /// The repository tracks the file but no service serves it: a copy of a
     /// schema someone else serves, kept so documents can be checked against
@@ -608,9 +655,29 @@ pub struct ServedSchemaSources {
 ///
 /// Built once per scan. The tally records what each service's attribution
 /// removed, for the report.
+///
+/// A file a service's SDL walk finds, and no service declares, is served only
+/// when that service shows it serves a schema (carrick#1189). A client app
+/// often commits a copy of a third-party API's schema in its own tree for
+/// codegen, and location alone would make it that API's server. The evidence
+/// is known only once the service's rows are built, so each walked file is
+/// served until [`Self::settle_walked_schemas`] has heard from a service that
+/// walks it.
 #[derive(Debug, Default)]
 pub struct SchemaCatalogue {
     schemas: Vec<KnownSchema>,
+    repo_root: PathBuf,
+    /// `repo_root` canonicalized: each service is scanned under this form, so
+    /// its rows' paths start with it when the given root is relative or runs
+    /// through a symlink.
+    canonical_root: PathBuf,
+    /// Repository-relative files some service names in `graphqlSchemas`.
+    declared: BTreeSet<PathBuf>,
+    /// Walked, undeclared file -> whether a service that walks it serves a
+    /// schema. Absent until such a service is settled.
+    walked_verdicts: std::sync::Mutex<BTreeMap<PathBuf, bool>>,
+    /// Service -> what its walk read that it does not serve, for the report.
+    unserved: std::sync::Mutex<BTreeMap<String, BTreeMap<PathBuf, usize>>>,
     tally: std::sync::Mutex<BTreeMap<String, AttributionSummary>>,
 }
 
@@ -746,14 +813,16 @@ impl SchemaCatalogue {
     /// or external. `services` are this scan's services.
     pub fn build(repo_root: &Path, services: &[ServedSchemaSources]) -> Self {
         let mut served: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut declared: BTreeSet<PathBuf> = BTreeSet::new();
         for service in services {
-            for path in graphql_files_under(&service.roots)
-                .iter()
-                .chain(&service.declared)
-            {
-                served.insert(repo_relative(repo_root, path));
+            for path in graphql_files_under(&service.roots) {
+                served.insert(repo_relative(repo_root, &path));
+            }
+            for path in &service.declared {
+                declared.insert(repo_relative(repo_root, path));
             }
         }
+        served.extend(declared.iter().cloned());
         let tracked: BTreeSet<PathBuf> = match crate::git_state::tracked_paths(
             repo_root,
             &["*.graphql", "*.gql"],
@@ -810,8 +879,90 @@ impl SchemaCatalogue {
         );
         Self {
             schemas,
+            repo_root: repo_root.to_path_buf(),
+            canonical_root: repo_root
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf()),
+            declared,
+            walked_verdicts: Default::default(),
+            unserved: Default::default(),
             tally: Default::default(),
         }
+    }
+
+    /// Decide whether the schema files `service`'s own walk read are schemas it
+    /// serves, and drop its producers from the ones it does not (carrick#1189).
+    ///
+    /// `serves_schema` is the service's evidence: it names a schema in
+    /// `graphqlSchemas`, serves HTTP routes, or has a resolver or backing type
+    /// joined to one of its fields. Without it, every producer the walk read is
+    /// removed, and each file it came from counts as external for every
+    /// service settled after this one, unless another service that walks the
+    /// same file serves a schema. A file some service declares keeps its
+    /// origin. Returns how many producers were removed.
+    pub fn settle_walked_schemas(
+        &self,
+        service: &str,
+        extraction: &mut GraphqlExtraction,
+        serves_schema: bool,
+    ) -> usize {
+        let files: BTreeSet<PathBuf> = extraction
+            .producers
+            .iter()
+            .map(|op| self.scanned_relative(&op.file_path))
+            .filter(|file| !self.declared.contains(file))
+            .collect();
+        {
+            let mut verdicts = self
+                .walked_verdicts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for file in &files {
+                let verdict = verdicts.entry(file.clone()).or_insert(serves_schema);
+                *verdict |= serves_schema;
+            }
+        }
+        let mut removed: BTreeMap<PathBuf, usize> = BTreeMap::new();
+        if !serves_schema {
+            extraction.producers.retain(|op| {
+                let file = self.scanned_relative(&op.file_path);
+                if self.declared.contains(&file) {
+                    return true;
+                }
+                *removed.entry(file).or_default() += 1;
+                false
+            });
+        }
+        let count = removed.values().sum();
+        let mut unserved = self.unserved.lock().unwrap_or_else(|e| e.into_inner());
+        if removed.is_empty() {
+            unserved.remove(service);
+        } else {
+            unserved.insert(service.to_string(), removed);
+        }
+        count
+    }
+
+    /// Repository-relative form of a path from a service's scan, which runs
+    /// under the canonical root rather than the root the catalogue was given.
+    fn scanned_relative(&self, path: &Path) -> PathBuf {
+        if path.starts_with(&self.canonical_root) {
+            repo_relative(&self.canonical_root, path)
+        } else {
+            repo_relative(&self.repo_root, path)
+        }
+    }
+
+    /// Whether `schema` is served, with the walked files' verdicts applied.
+    fn is_served(&self, schema: &KnownSchema) -> bool {
+        if schema.origin != SchemaOrigin::Served || self.declared.contains(&schema.file) {
+            return schema.origin == SchemaOrigin::Served;
+        }
+        let verdicts = self
+            .walked_verdicts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        verdicts.get(&schema.file).copied().unwrap_or(true)
     }
 
     /// Attribute each of `extraction`'s documents to a schema identity.
@@ -867,11 +1018,11 @@ impl SchemaCatalogue {
                     || self
                         .schemas
                         .iter()
-                        .any(|s| s.origin == SchemaOrigin::Served && covers(&s.root_keys));
+                        .any(|s| self.is_served(s) && covers(&s.root_keys));
                 let external: Vec<PathBuf> = self
                     .schemas
                     .iter()
-                    .filter(|s| s.origin == SchemaOrigin::External && covers(&s.root_keys))
+                    .filter(|s| !self.is_served(s) && covers(&s.root_keys))
                     .map(|s| s.file.clone())
                     .collect::<BTreeSet<_>>()
                     .into_iter()
@@ -906,8 +1057,22 @@ impl SchemaCatalogue {
     /// The report lines for every service whose attribution removed an
     /// operation, in service order.
     pub fn notices(&self) -> Vec<String> {
-        let tally = self.tally.lock().unwrap_or_else(|e| e.into_inner());
         let mut lines = Vec::new();
+        let unserved = self.unserved.lock().unwrap_or_else(|e| e.into_inner());
+        for (service, files) in unserved.iter() {
+            for (file, count) in files {
+                lines.push(format!(
+                    "Service '{service}': {count} GraphQL schema field(s) in '{}' are not \
+                     indexed as operations it serves. The file sits in its directory, but the \
+                     service serves no HTTP route and no resolver was found for its fields, so \
+                     it is read as another API's schema. If this service serves it, name the \
+                     file in its `graphqlSchemas`.",
+                    file.display()
+                ));
+            }
+        }
+        drop(unserved);
+        let tally = self.tally.lock().unwrap_or_else(|e| e.into_inner());
         for (service, summary) in tally.iter() {
             for (files, count) in &summary.external {
                 let files = files
@@ -1086,9 +1251,17 @@ pub fn extract_from_document_text(
                     has_type_system_definitions = true;
                     (&ext.name, &ext.fields)
                 }
-                Definition::TypeDefinition(_)
-                | Definition::TypeExtension(_)
-                | Definition::DirectiveDefinition(_) => {
+                Definition::TypeDefinition(other) => {
+                    has_type_system_definitions = true;
+                    if let Some((name, declaration)) = input_declaration(other) {
+                        extraction
+                            .input_declarations
+                            .entry(name)
+                            .or_insert(declaration);
+                    }
+                    continue;
+                }
+                Definition::TypeExtension(_) | Definition::DirectiveDefinition(_) => {
                     has_type_system_definitions = true;
                     continue;
                 }
@@ -1122,6 +1295,7 @@ pub fn extract_from_document_text(
                     consumer_located_type_symbol: None,
                     consumer_located_type_source: None,
                     schema_binding: None,
+                    arguments: sdl_arguments(field),
                 });
             }
         }
@@ -1189,12 +1363,130 @@ pub fn extract_from_document_text(
                     consumer_located_type_symbol: None,
                     consumer_located_type_source: None,
                     schema_binding: None,
+                    arguments: None,
                 });
             }
         }
     }
 
     extraction
+}
+
+/// A root field's argument list, or `None` when it declares no argument.
+fn sdl_arguments(field: &graphql_parser::schema::Field<'_, String>) -> Option<SdlArguments> {
+    if field.arguments.is_empty() {
+        return None;
+    }
+    let arguments: Vec<String> = field
+        .arguments
+        .iter()
+        .map(|argument| {
+            let mut text = format!(
+                "{}: {}",
+                argument.name,
+                render_sdl_type(&argument.value_type)
+            );
+            if let Some(default) = &argument.default_value {
+                text.push_str(&format!(" = {default}"));
+            }
+            text
+        })
+        .collect();
+    let mut named_types: Vec<String> = Vec::new();
+    for argument in &field.arguments {
+        let name = sdl_named_type(&argument.value_type);
+        if !named_types.iter().any(|seen| seen == name) {
+            named_types.push(name.to_string());
+        }
+    }
+    Some(SdlArguments {
+        signature: format!("{}({})", field.name, arguments.join(", ")),
+        named_types,
+    })
+}
+
+/// The declaration a request can reference, for the three kinds an argument
+/// can name: `input`, `enum` and `scalar`. Output types cannot be arguments.
+fn input_declaration(
+    definition: &graphql_parser::schema::TypeDefinition<'_, String>,
+) -> Option<(String, SdlInputDeclaration)> {
+    use graphql_parser::schema::TypeDefinition;
+    let (name, input_object, references) = match definition {
+        TypeDefinition::InputObject(input) => (
+            input.name.clone(),
+            true,
+            input
+                .fields
+                .iter()
+                .map(|field| sdl_named_type(&field.value_type).to_string())
+                .collect(),
+        ),
+        TypeDefinition::Enum(enumeration) => (enumeration.name.clone(), false, Vec::new()),
+        TypeDefinition::Scalar(scalar) => (scalar.name.clone(), false, Vec::new()),
+        _ => return None,
+    };
+    Some((
+        name,
+        SdlInputDeclaration {
+            text: definition.to_string().trim().to_string(),
+            input_object,
+            references,
+        },
+    ))
+}
+
+/// The named type inside a type expression: `[Order!]!` -> `Order`.
+fn sdl_named_type<'t>(ty: &'t graphql_parser::schema::Type<'_, String>) -> &'t str {
+    use graphql_parser::schema::Type;
+    match ty {
+        Type::NamedType(name) => name,
+        Type::ListType(inner) | Type::NonNullType(inner) => sdl_named_type(inner),
+    }
+}
+
+/// A producer's request contract, printed from the SDL (carrick#1158): the
+/// field's argument list, then every `input`, `enum` and `scalar` declaration
+/// it reaches through its arguments and their input fields, in the order they
+/// are first reached. Built-in scalars and types no schema this service reads
+/// declares are named in the list and not printed.
+///
+/// The second element is the type an agent names this request by: the one
+/// `input` object the arguments reference directly, when there is exactly one
+/// (`createInvoice(input: CreateInvoiceInput!)` -> `CreateInvoiceInput`).
+pub fn request_definition(
+    arguments: &SdlArguments,
+    declarations: &BTreeMap<String, SdlInputDeclaration>,
+) -> (String, Option<String>) {
+    let mut reached: Vec<&str> = Vec::new();
+    let mut queue: std::collections::VecDeque<&str> =
+        arguments.named_types.iter().map(String::as_str).collect();
+    while let Some(name) = queue.pop_front() {
+        if reached.contains(&name) {
+            continue;
+        }
+        let Some(declaration) = declarations.get(name) else {
+            continue;
+        };
+        reached.push(name);
+        queue.extend(declaration.references.iter().map(String::as_str));
+    }
+
+    let mut definition = arguments.signature.clone();
+    for name in &reached {
+        definition.push_str("\n\n");
+        definition.push_str(&declarations[*name].text);
+    }
+
+    let direct_inputs: Vec<&String> = arguments
+        .named_types
+        .iter()
+        .filter(|name| declarations.get(*name).is_some_and(|d| d.input_object))
+        .collect();
+    let symbol = match direct_inputs.as_slice() {
+        [only] => Some((*only).clone()),
+        _ => None,
+    };
+    (definition, symbol)
 }
 
 /// Render an SDL field type to its canonical GraphQL type expression
@@ -1690,6 +1982,98 @@ mod tests {
         );
     }
 
+    /// A root field's arguments are the request half of its contract
+    /// (carrick#1158): the signature as SDL, then every input, enum and scalar
+    /// declaration the arguments reach, including ones another SDL file of the
+    /// same service declares. Built-in scalars are named, never printed.
+    #[test]
+    fn sdl_arguments_print_the_request_with_the_input_types_they_reach() {
+        let operations = r#"
+            type Mutation {
+              createInvoice(input: CreateInvoiceInput!, dryRun: Boolean = false): Invoice!
+            }
+            type Query {
+              invoice(id: ID!): Invoice
+              invoices(filter: InvoiceFilter, first: Int, after: String): [Invoice!]!
+              health: String!
+            }
+        "#;
+        let inputs = r#"
+            "A new invoice."
+            input CreateInvoiceInput {
+              customerId: ID!
+              lines: [InvoiceLineInput!]!
+              currency: Currency = EUR
+            }
+            input InvoiceLineInput { sku: String!, amount: Money! }
+            input InvoiceFilter { status: InvoiceStatus }
+            enum Currency { EUR USD }
+            enum InvoiceStatus { DRAFT PAID }
+            scalar Money
+        "#;
+        let mut extraction = extract_from_document_text(operations, Path::new("ops.graphql"), 1);
+        extraction.merge(extract_from_document_text(
+            inputs,
+            Path::new("inputs.graphql"),
+            1,
+        ));
+
+        let producer = |field: &str| {
+            extraction
+                .producers
+                .iter()
+                .find(|op| op.key.graphql_field() == Some(field))
+                .unwrap_or_else(|| panic!("no producer {field}"))
+        };
+        assert_eq!(producer("health").arguments, None);
+
+        let create = producer("createInvoice").arguments.as_ref().unwrap();
+        assert_eq!(
+            create.signature,
+            "createInvoice(input: CreateInvoiceInput!, dryRun: Boolean = false)"
+        );
+        let (definition, symbol) = request_definition(create, &extraction.input_declarations);
+        assert_eq!(symbol.as_deref(), Some("CreateInvoiceInput"));
+        let blocks: Vec<&str> = definition.split("\n\n").collect();
+        assert_eq!(
+            blocks[0],
+            "createInvoice(input: CreateInvoiceInput!, dryRun: Boolean = false)"
+        );
+        assert!(
+            blocks[1].contains("input CreateInvoiceInput {")
+                && blocks[1].contains("lines: [InvoiceLineInput!]!")
+                && blocks[1].contains("A new invoice."),
+            "got: {definition}"
+        );
+        assert!(
+            blocks[2].starts_with("input InvoiceLineInput {"),
+            "got: {definition}"
+        );
+        assert!(
+            blocks[3].starts_with("enum Currency {"),
+            "got: {definition}"
+        );
+        assert_eq!(blocks[4], "scalar Money");
+        assert_eq!(blocks.len(), 5, "got: {definition}");
+
+        // One input object among several arguments still names the request.
+        let listing = producer("invoices").arguments.as_ref().unwrap();
+        let (definition, symbol) = request_definition(listing, &extraction.input_declarations);
+        assert_eq!(symbol.as_deref(), Some("InvoiceFilter"));
+        assert!(
+            definition.contains("enum InvoiceStatus"),
+            "got: {definition}"
+        );
+
+        // Only built-in scalars: the signature is the whole request, and no
+        // input type names it.
+        let single = producer("invoice").arguments.as_ref().unwrap();
+        assert_eq!(
+            request_definition(single, &extraction.input_declarations),
+            ("invoice(id: ID!)".to_string(), None)
+        );
+    }
+
     /// `file_within_scan_roots` gates the don't-skip routing: only files under an
     /// SDL scan root (schema-co-located) are eligible, so a resolver in the
     /// schema package is routed while an unrelated exported-function file is not.
@@ -1842,7 +2226,11 @@ function subscribe(cb) {
         )
         .unwrap();
 
-        let hints = GraphqlConsumerHints::collect(vec![], std::slice::from_ref(&file));
+        let hints = GraphqlConsumerHints::collect(
+            vec![],
+            std::slice::from_ref(&file),
+            &dir.to_string_lossy(),
+        );
         std::fs::remove_dir_all(&dir).ok();
 
         // Only the unanchored subscription produces a hint line.
@@ -1856,7 +2244,7 @@ function subscribe(cb) {
         assert!(hints.file_has_hint(&file));
 
         // A file with no unanchored consumers yields no hints at all.
-        let empty = GraphqlConsumerHints::collect(vec![], &[]);
+        let empty = GraphqlConsumerHints::collect(vec![], &[], &dir.to_string_lossy());
         assert!(empty.is_empty());
         assert!(!empty.file_has_hint(&file));
     }
@@ -2520,6 +2908,151 @@ export const typeDefs = gql`
         assert!(warned.hints.is_empty());
     }
 
+    /// carrick#1189: a schema a service's walk finds is served only when that
+    /// service shows it serves a schema. Without the evidence its producers go
+    /// and the file is another API's schema for every service settled after.
+    #[test]
+    fn a_walked_schema_is_served_only_by_a_service_with_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        write(
+            "api/src/schema.graphql",
+            "type Query { accounts: [String] }",
+        );
+        write(
+            "web/src/vendor/ledger.graphql",
+            "type Query { balance: Int statements: [String] }",
+        );
+        let wallet = write("web/src/wallet.gql", "query Wallet { balance }");
+        let audit = write("ops/src/audit.gql", "query Audit { statements }");
+        let roots = |dir: &str| vec![root.join(dir)];
+        let catalogue = SchemaCatalogue::build(
+            root,
+            &[
+                ServedSchemaSources {
+                    roots: roots("api"),
+                    declared: vec![],
+                },
+                ServedSchemaSources {
+                    roots: roots("web"),
+                    declared: vec![],
+                },
+                ServedSchemaSources {
+                    roots: roots("ops"),
+                    declared: vec![],
+                },
+            ],
+        );
+
+        // The server: its routes are its evidence, and its fields stay.
+        let mut api = scan_repo(&roots("api"), &[], &[]);
+        assert_eq!(catalogue.settle_walked_schemas("api", &mut api, true), 0);
+        assert_eq!(api.producers.len(), 1);
+
+        // The client with a vendor copy in its tree: no evidence.
+        let mut web = scan_repo(&roots("web"), &[], &[]);
+        assert_eq!(web.producers.len(), 2);
+        assert_eq!(catalogue.settle_walked_schemas("web", &mut web, false), 2);
+        assert!(web.producers.is_empty(), "the client serves none of it");
+        let vendor = vec![PathBuf::from("web/src/vendor/ledger.graphql")];
+        let attribution = catalogue.attribute(&web, |_| TransportOrigin::Unknown);
+        assert_eq!(
+            identity_of(&attribution, &web, &wallet.to_string_lossy()),
+            &DocumentIdentity::External(vendor.clone())
+        );
+
+        // A service settled afterwards reads the copy as external too.
+        let ops = scan_repo(&roots("ops"), &[], &[]);
+        let attribution = catalogue.attribute(&ops, |_| TransportOrigin::Unknown);
+        assert_eq!(
+            identity_of(&attribution, &ops, &audit.to_string_lossy()),
+            &DocumentIdentity::External(vendor)
+        );
+
+        assert_eq!(
+            catalogue.notices(),
+            vec![
+                "Service 'web': 2 GraphQL schema field(s) in 'web/src/vendor/ledger.graphql' are \
+                 not indexed as operations it serves. The file sits in its directory, but the \
+                 service serves no HTTP route and no resolver was found for its fields, so it is \
+                 read as another API's schema. If this service serves it, name the file in its \
+                 `graphqlSchemas`."
+                    .to_string()
+            ]
+        );
+    }
+
+    /// A second service that walks the same file and serves a schema keeps it
+    /// served, whichever of the two is settled first.
+    #[test]
+    fn a_walked_schema_stays_served_when_any_service_that_walks_it_serves_a_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        std::fs::write(
+            root.join("shared/schema.graphql"),
+            "type Query { accounts: [String] }",
+        )
+        .unwrap();
+        let sources = ServedSchemaSources {
+            roots: vec![root.join("shared")],
+            declared: vec![],
+        };
+        let catalogue = SchemaCatalogue::build(root, &[sources.clone(), sources]);
+
+        let mut first = scan_repo(&[root.join("shared")], &[], &[]);
+        catalogue.settle_walked_schemas("tooling", &mut first, false);
+        let mut second = scan_repo(&[root.join("shared")], &[], &[]);
+        catalogue.settle_walked_schemas("api", &mut second, true);
+
+        assert!(first.producers.is_empty());
+        assert_eq!(second.producers.len(), 1);
+        let schema = &catalogue.schemas[0];
+        assert!(catalogue.is_served(schema));
+    }
+
+    /// The engine builds the catalogue from the repository path as given, and
+    /// scans each service under its canonical form. A checkout reached
+    /// through a symlink (or given as `.`) must still settle its walked files.
+    #[cfg(unix)]
+    #[test]
+    fn a_walked_schema_settles_when_the_scan_root_is_the_canonical_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("checkout");
+        std::fs::create_dir_all(real.join("web/src/vendor")).unwrap();
+        std::fs::write(
+            real.join("web/src/vendor/ledger.graphql"),
+            "type Query { balance: Int }",
+        )
+        .unwrap();
+        std::fs::write(real.join("web/src/wallet.gql"), "query Wallet { balance }").unwrap();
+        let link = tmp.path().join("linked");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let catalogue = SchemaCatalogue::build(
+            &link,
+            &[ServedSchemaSources {
+                roots: vec![link.join("web")],
+                declared: vec![],
+            }],
+        );
+
+        let canonical = real.canonicalize().unwrap();
+        let mut web = scan_repo(&[canonical.join("web")], &[], &[]);
+        assert_eq!(catalogue.settle_walked_schemas("web", &mut web, false), 1);
+        let attribution = catalogue.attribute(&web, |_| TransportOrigin::Unknown);
+        let wallet = canonical.join("web/src/wallet.gql");
+        assert_eq!(
+            identity_of(&attribution, &web, &wallet.to_string_lossy()),
+            &DocumentIdentity::External(vec![PathBuf::from("web/src/vendor/ledger.graphql")])
+        );
+    }
+
     fn known(file: &str, origin: SchemaOrigin, sdl: &str) -> KnownSchema {
         KnownSchema {
             file: PathBuf::from(file),
@@ -2549,7 +3082,7 @@ export const typeDefs = gql`
                     "type Query { balance: Int statements: [String] viewer: String }",
                 ),
             ],
-            tally: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -2655,7 +3188,7 @@ export const typeDefs = gql`
                 SchemaOrigin::Served,
                 "type Query { products: [String] }",
             )],
-            tally: Default::default(),
+            ..Default::default()
         };
         for catalogue in [served_only, two_schema_catalogue()] {
             let mut extraction = documents(&[("retired.gql", "query A { retiredListing }")]);

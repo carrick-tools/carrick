@@ -1,0 +1,20 @@
+query Orders {
+  orders {
+    id
+  }
+  zones: shippingZones {
+    code
+  }
+}
+
+mutation PlaceOrder($id: ID!) {
+  placeOrder(id: $id) {
+    id
+  }
+}
+
+query Carriers {
+  carriers {
+    name
+  }
+}

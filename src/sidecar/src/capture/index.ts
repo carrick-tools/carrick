@@ -45,6 +45,7 @@ import { entryRelativeSpecifier, resolveAnchor, type ResolvedAnchor } from './an
 import { findAugmentationFiles } from './augmentations.js';
 import { installedVersions, lockfileVersions } from './lockfile.js';
 import { rewriteEmittedSpecifiers } from './paths-rewrite.js';
+import { typesPackageOf, withInstalledPackages } from './installed-package.js';
 import { selfCheckStub } from './self-check.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
 import { DenoProject, findDenoConfig } from './deno-project.js';
@@ -334,13 +335,14 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   }
-  const specifierRewrites = denoRewrites + rewriteEmittedSpecifiers({
+  const rewritten = rewriteEmittedSpecifiers({
     typesDir,
     files: emittedFiles,
     options: parsed.options,
     configPath,
     entryDir,
   });
+  const specifierRewrites = denoRewrites + rewritten.rewrites;
 
   // ---- Pin external deps: installed node_modules first, lockfile fallback ----
   // Externals are collected AFTER the rewrite pass: a rewritten paths
@@ -365,12 +367,19 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   const installed = installedVersions(repoRoot, externalSpecs);
   const lockVersions = lockfileVersions(repoRoot);
   for (const name of Object.keys(deno?.pinned ?? {})) externalSpecs.add(name);
+  // A package an absolute specifier was rewritten into carries the version
+  // installed at that path (#1174); it may be a transitive the repo root
+  // neither installs by name nor locks.
+  for (const name of Object.keys(rewritten.pins)) externalSpecs.add(name);
   const pinned: Record<string, string> = {};
   const unpinned: string[] = [];
   for (const name of [...externalSpecs].sort()) {
-    const version = deno?.pinned[name] ?? installed.get(name) ?? lockVersions.get(name);
+    const version =
+      deno?.pinned[name] ?? rewritten.pins[name] ?? installed.get(name) ?? lockVersions.get(name);
     if (version) pinned[name] = version;
-    else unpinned.push(name);
+    // A runtime name whose declarations come from a rewritten `@types/*`
+    // package resolves through that pin.
+    else if (!rewritten.pins[typesPackageOf(name)]) unpinned.push(name);
   }
 
   const dependencyRoot = deno?.config.workspaceRoot ?? repoRoot;
@@ -416,7 +425,11 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     pinned,
     bareCheckout,
     repoRoot: dependencyRoot,
-    compilerHost: deno ? options => deno.host(options) : undefined,
+    compilerHost:
+      deno || Object.keys(rewritten.installs).length > 0
+        ? (options) =>
+            withInstalledPackages(options, rewritten.installs, deno ? deno.host(options) : undefined)
+        : undefined,
   });
   const fidelity = computeFidelity(aliases);
 
@@ -553,8 +566,7 @@ function resolveAnchors(
     const anchorSources = [
       ...new Set(
         opts.anchors
-          .filter((a) => a.kind !== 'literal')
-          .map((a) => path.join(ctx.repoRoot, a.source_file))
+          .flatMap((a) => (a.source_file ? [path.join(ctx.repoRoot, a.source_file)] : []))
       ),
     ].filter((f) => fs.existsSync(f));
     const options = {

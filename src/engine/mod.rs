@@ -1,6 +1,6 @@
 use crate::agent_service::{AgentService, RetryPolicy};
 use crate::agents::file_orchestrator::FileOrchestrator;
-use crate::agents::framework_guidance_agent::FrameworkGuidanceAgent;
+use crate::agents::framework_guidance_agent::{FrameworkGuidanceAgent, ProtocolGuidance};
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{
     CACHE_DIR_ENV, CloudRepoData, CloudStorage, INLINE_PAYLOAD_LIMIT_BYTES, ManifestRole,
@@ -49,6 +49,7 @@ use swc_ecma_visit::VisitWith;
 pub mod durability;
 pub(crate) mod served_paths;
 pub(crate) mod type_compat_v2;
+pub(crate) mod upload_boundary;
 
 /// Current cache format version.
 ///
@@ -371,6 +372,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     no_cache: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let should_upload = should_upload_data();
+    // What every upload of this run passes through last (carrick#1204).
+    let boundary = upload_boundary::UploadBoundary::for_scan(repo_path);
     debug!(upload = should_upload, "Running Carrick in CI mode");
     // The run's one ceiling on waiting out a refusing model (carrick#1126).
     crate::retry_budget::reset();
@@ -432,6 +435,22 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // fifteen minutes not refreshing them.
     if let Some(sentence) = &run_start.allowance_sentence {
         warn!("{sentence}");
+    }
+
+    // Dispatch, decided here because this is the first moment both halves of
+    // the question are answerable: the indexer asked for it in the
+    // environment, and `start-scan` has just said whether this cloud runs
+    // analysis jobs (carrick#1229). A cloud that does not is not an error —
+    // this run scans the way every run did before, and the user waits.
+    if crate::analysis_channel::dispatch_requested() {
+        if storage.accepts_analysis_job() {
+            crate::analysis_channel::begin_dispatch();
+        } else {
+            info!(
+                "Carrick Cloud is not running analysis jobs yet, so this scan analyses the repo \
+                 here and now."
+            );
+        }
     }
 
     // 2. Download all repos (moved earlier for incremental cache lookup)
@@ -573,12 +592,41 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                             git_state.dirty,
                             unchanged_at_start.as_ref(),
                         );
-                        upload_service_payloads(storage, &payloads, no_cache, false).await;
+                        upload_service_payloads(storage, &payloads, no_cache, false, &boundary)
+                            .await;
                     }
                 }
                 return Err(error);
             }
         }
+    }
+
+    // 4a. A dispatched run ends here, and this is its whole product: every
+    // prompt every service built, shipped as one job (carrick#1229).
+    //
+    // Nothing below this point has anything to work on — the model answers it
+    // would join, cache, type-check and upload are what the job is for — and
+    // the cloud is holding a slot for the job rather than for this process, so
+    // the run exits 0 and the machine is free.
+    //
+    // A run asked to dispatch that built no prompt at all is not that run. It
+    // has nothing to hand over, every service went through the ordinary phases
+    // (see `analyze_files`), and it finishes here the way any other scan does:
+    // it writes its index, closes its scan and leaves nobody waiting for
+    // answers that were never asked for.
+    if let Some(collected) = crate::analysis_channel::take()
+        && !collected.rows.is_empty()
+    {
+        let submitted = dispatch_analysis_job(storage, collected, &run_context, repo_path).await?;
+        crate::progress::report_dispatched(&submitted);
+        logging::finish_spinner(
+            &sp,
+            &format!(
+                "Carrick Cloud is analysing {} file(s) of {}",
+                submitted.analyze_rows, submitted.repo
+            ),
+        );
+        return Ok(());
     }
 
     // 4b. The work the run still owes gets one more try before it ends: a
@@ -1006,28 +1054,29 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
 
     crate::scan_stage::enter(crate::scan_stage::Stage::CrossRepoCheck);
     let sp = logging::spinner("Running cross-repo analysis...");
-    let analyzer =
-        match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar).await {
-            Ok(analyzer) => analyzer,
-            Err(e) => {
-                // Cross-repo analysis (which is what runs the type check) failed. Close
-                // the spinner with a warning first so the upload's own spinner
-                // and log lines don't interleave with an unfinished one in
-                // non-TTY CI logs, then preserve the prior behavior where the
-                // per-repo index upload happened BEFORE cross-repo analysis:
-                // still upload this run's data — verdict-less — so the index
-                // stays fresh, then propagate the failure.
-                logging::finish_spinner_warn(&sp, "Cross-repo analysis failed");
-                if let Some(payloads) = &upload_payloads {
-                    // Whatever the upload could not confirm has already been
-                    // named in its own summary line and annotation; the error
-                    // this path returns is the analysis failure that brought it
-                    // here, which is the one worth raising (carrick#1067).
-                    upload_service_payloads(storage, payloads, no_cache, !incomplete).await;
-                }
-                return Err(e);
+    let analyzer = match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar)
+        .await
+    {
+        Ok(analyzer) => analyzer,
+        Err(e) => {
+            // Cross-repo analysis (which is what runs the type check) failed. Close
+            // the spinner with a warning first so the upload's own spinner
+            // and log lines don't interleave with an unfinished one in
+            // non-TTY CI logs, then preserve the prior behavior where the
+            // per-repo index upload happened BEFORE cross-repo analysis:
+            // still upload this run's data — verdict-less — so the index
+            // stays fresh, then propagate the failure.
+            logging::finish_spinner_warn(&sp, "Cross-repo analysis failed");
+            if let Some(payloads) = &upload_payloads {
+                // Whatever the upload could not confirm has already been
+                // named in its own summary line and annotation; the error
+                // this path returns is the analysis failure that brought it
+                // here, which is the one worth raising (carrick#1067).
+                upload_service_payloads(storage, payloads, no_cache, !incomplete, &boundary).await;
             }
-        };
+            return Err(e);
+        }
+    };
     logging::finish_spinner(&sp, "Cross-repo analysis complete");
 
     let mut results = analyzer.get_results();
@@ -1152,7 +1201,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             first_index_open.is_empty() || storage.name_pending_on_final_write(&first_index_open);
         closed_by_final_write = closes_run && !payloads.is_empty();
         unconfirmed_uploads =
-            upload_service_payloads(storage, &payloads, no_cache, closes_run).await;
+            upload_service_payloads(storage, &payloads, no_cache, closes_run, &boundary).await;
     }
 
     let topology = crate::findings::Topology {
@@ -1328,6 +1377,13 @@ impl ServiceScan<'_> {
         crate::progress::service_started(label, index + 1, self.total);
         // Every loss from here on is this service's.
         crate::scan_health::enter_service(service.service_name.as_deref());
+        // And so is every prompt-lambda call: they all happen inside this
+        // function, and each one carries this name so the cloud's logs can
+        // say which tree of a monorepo spent the money (carrick#1221). The
+        // guard is bound, not dropped on this line: the scope has to outlive
+        // the analysis below and end with it, so that the cross-repo phase,
+        // the upload and a service that failed mid-loop name nobody.
+        let _service_scope = crate::current_service::enter(service.service_name.as_deref());
         let quota_aborts_before = crate::agent_service::quota_abort_count();
         let service_started = Instant::now();
 
@@ -1414,6 +1470,74 @@ fn previous_generation(
         .iter()
         .find(|r| r.repo_name == repo_name && r.service_name == service.service_name)
         .cloned()
+}
+
+/// Ship a dispatched run's prompts and say what came back (carrick#1229).
+///
+/// One thing can stop it: a service whose framework guidance has no id. The
+/// cloud keys the whole message without one, so the block this bundle carries
+/// once is re-keyed for every file, and the job is not sent.
+async fn dispatch_analysis_job<T: CloudStorage + Sync>(
+    storage: &T,
+    collected: crate::analysis_channel::Collected,
+    run: &crate::cloud_storage::RunContext,
+    repo_path: &str,
+) -> Result<crate::analysis_job::Dispatched, Box<dyn std::error::Error>> {
+    // The name the cloud authorised the scan with, and this tree's own name
+    // when it has no remote: never the working directory, which in a
+    // multi-repo build is the workspace and is the same for every repo in it.
+    let repo = run
+        .repo_full_name
+        .clone()
+        .unwrap_or_else(|| get_repository_name(repo_path));
+    if !collected.degraded.is_empty() {
+        return Err(format!(
+            "Carrick could not read the framework guidance for {}, so this scan cannot be handed \
+             over. Run `carrick index` and it will analyse the repo here.",
+            collected.degraded.join(", ")
+        )
+        .into());
+    }
+    let analyze_rows = collected.rows.len();
+    let bundle = crate::analysis_job::JobBundle {
+        header: crate::analysis_job::JobHeader {
+            schema: crate::analysis_job::JOB_SCHEMA.to_string(),
+            scan_id: crate::credentials::scan_id()
+                .unwrap_or_default()
+                .to_string(),
+            repo: repo.clone(),
+            commit: run.commit.clone(),
+            scanner_version: env!("CARGO_PKG_VERSION").to_string(),
+            cache_version: CACHE_VERSION,
+            services: collected.services,
+            guidance: collected.guidance,
+            schemas: collected.schemas,
+            counts: crate::analysis_job::JobCounts {
+                analyze_file: analyze_rows,
+                // Intents are generated by the machine that resumes: they are a
+                // small fraction of a scan's calls once batched, and their
+                // prompts embed answers that do not exist until the level below
+                // them has been answered (carrick#1245).
+                intent_functions: 0,
+                intent_levels: 0,
+            },
+        },
+        analyze: collected.rows,
+    };
+    let submission = storage
+        .submit_analysis_job(&bundle)
+        .await?
+        .ok_or("Carrick Cloud did not take this analysis job")?;
+    info!(
+        "Carrick Cloud took job {} for {} file(s)",
+        submission.job_id, submission.analyze_rows
+    );
+    Ok(crate::analysis_job::Dispatched {
+        repo,
+        commit: run.commit.clone(),
+        job_id: submission.job_id,
+        analyze_rows: submission.analyze_rows,
+    })
 }
 
 /// The upload payloads for `services`, stripped and stamped with the state
@@ -1867,6 +1991,7 @@ async fn upload_service_payloads<T: CloudStorage>(
     // Whether the last write closes the scan. False when the run leaves a
     // service incomplete, which is closed by its fail marker instead.
     closes_run: bool,
+    boundary: &upload_boundary::UploadBoundary,
 ) -> Vec<UnconfirmedUpload> {
     crate::scan_stage::enter(crate::scan_stage::Stage::Upload);
     let sp = logging::spinner("Uploading results...");
@@ -1892,7 +2017,12 @@ async fn upload_service_payloads<T: CloudStorage>(
         // from the one it replaced — a forced run rewrites a row that already
         // carries this commit (carrick#1067).
         let attempted_at = chrono::Utc::now();
-        match storage.upload_repo_data(payload, final_in_run).await {
+        // Defence in depth for machine paths (carrick#1204): whatever an
+        // upstream pass left holding the checkout root or home goes up as a
+        // placeholder. The payload in memory is not touched.
+        let scrubbed = boundary.scrub(payload, service);
+        let outgoing = scrubbed.as_ref().unwrap_or(payload);
+        match storage.upload_repo_data(outgoing, final_in_run).await {
             Ok(outcome) => {
                 outcomes.push(outcome);
                 confirmed.push(service);
@@ -2390,7 +2520,12 @@ async fn analyze_current_repo_incremental(
                     )
                 }
             } else if !pkg_changed {
-                if let (Some(det), Some(guid)) = (&prev.cached_detection, &prev.cached_guidance) {
+                if let (Some(det), Some(guid)) = (
+                    &prev.cached_detection,
+                    prev.cached_guidance
+                        .as_ref()
+                        .filter(|g| guidance_is_keyed(g)),
+                ) {
                     debug!("Reusing cached framework detection and guidance");
                     // A missing cached config (older cache entry, or an earlier
                     // failed generation) is regenerated on its own.
@@ -2403,10 +2538,16 @@ async fn analyze_current_repo_incremental(
                     };
                     ModelSetup::ready(det.clone(), guid.clone(), extraction)
                 } else {
-                    // Something is missing: a first scan's cache entry, or the
-                    // service a previous scan deferred. A detection that
-                    // landed without its guidance is kept, and only the
-                    // guidance is asked again (carrick#1126).
+                    // Something is missing: a first scan's cache entry, the
+                    // service a previous scan deferred, or a blob whose
+                    // guidance predates the guidance id (carrick#1224). A
+                    // detection that landed without usable guidance is kept,
+                    // and only the guidance is asked again (carrick#1126).
+                    if prev.cached_guidance.is_some() {
+                        debug!(
+                            "Cached guidance carries no id (written before the id existed); asking for guidance again so the analysis cache keys it by identity, not by its text"
+                        );
+                    }
                     model_setup(
                         packages,
                         &all_import_facts,
@@ -2448,6 +2589,7 @@ async fn analyze_current_repo_incremental(
             let graphql_consumer_hints = crate::graphql::GraphqlConsumerHints::collect(
                 service_graphql_roots(repo_path, service),
                 &files,
+                repo_path,
             );
 
             let normalizer = UrlNormalizer::new(config);
@@ -2508,10 +2650,11 @@ async fn analyze_current_repo_incremental(
             // the GraphQL consumer file set folds transport data calls out of
             // the graph (#307) so every downstream surface (cloud projection,
             // type manifest, type requests) sees the same call set.
-            let mut protocol_extractions =
+            let (mut protocol_extractions, document_sites) =
                 scan_protocol_extractions(repo_path, service, &files, &merged_results);
             settle_graphql_documents(
                 &mut protocol_extractions.graphql,
+                document_sites,
                 &mut mount_graph,
                 service,
                 graphql_schemas,
@@ -2674,12 +2817,15 @@ async fn analyze_current_repo_incremental(
                 repo_path,
                 &served_paths::PathScrub::for_scan(repo_path),
             );
+            let placed = crate::handler_span::attach_handler_spans(&mut cloud_data);
+            debug!("Handler spans placed on endpoint rows: {placed}");
 
             // Same last step as the full branch: the boundary is read off the
             // finished payload once its paths are repo-relative (carrick#705).
             cloud_data.boundary = Some(crate::boundary::ServiceBoundary::collect(
                 &cloud_data,
                 &analysis.stats,
+                &merged_results,
                 repo_path,
             ));
             if crate::local_mode::no_model() {
@@ -2764,14 +2910,34 @@ struct SettledDetection {
     extraction_config: Option<crate::services::type_sidecar::ExtractionConfig>,
 }
 
+/// Whether a persisted guidance can be replayed instead of asked for again.
+///
+/// The id is the whole test. `/analyze-file` sends it so the cloud's analysis
+/// cache can key the guidance block by identity rather than by its text, and a
+/// guidance without one puts its TEXT in the key instead — so every file in the
+/// service re-pays whenever the words move, which is the recurring cost the id
+/// was built to remove (carrick-cloud#871).
+///
+/// A blob written before the id existed carries none, and the
+/// `package_json_hash` gate around the replay does not move on an ordinary
+/// scan: without this check such a repo replays keyless guidance on every scan
+/// from here on and never self-heals (carrick#1224). Asking again costs the
+/// five guidance calls once — the cloud serves them from its own guidance
+/// cache — and the answer that comes back carries the id, which the blob then
+/// persists.
+fn guidance_is_keyed(guidance: &ProtocolGuidance) -> bool {
+    !guidance.is_empty() && guidance.values().all(|g| g.guidance_key.is_some())
+}
+
 impl SettledDetection {
     /// The detection `prev` kept when its guidance was deferred
-    /// ([`ModelSetup::guidance_deferred`]): there is a cached detection and no
+    /// ([`ModelSetup::guidance_deferred`]) or cannot be replayed
+    /// ([`guidance_is_keyed`]): there is a cached detection and no usable
     /// cached guidance, from this cache version and these manifests. A
     /// complete previous generation returns `None`; the incremental branch
     /// reuses it whole, and a full analysis asks again as it always has.
     fn kept_by(prev: &CloudRepoData, current_pkg_hash: &str) -> Option<Self> {
-        if prev.cached_guidance.is_some()
+        if prev.cached_guidance.as_ref().is_some_and(guidance_is_keyed)
             || prev.cache_version != Some(CACHE_VERSION)
             || prev.package_json_hash.as_deref() != Some(current_pkg_hash)
         {
@@ -2928,12 +3094,19 @@ fn service_graphql_roots(repo_path: &str, service: &Config) -> Vec<PathBuf> {
 /// `append_deterministic_protocol_operations` so the extractions exist BEFORE
 /// the mount graph is projected into cloud data — the GraphQL consumer file
 /// set drives `fold_graphql_transport_calls` on the graph first (#307).
+///
+/// The calls that execute a GraphQL document are read here too, and placed
+/// in the extraction by [`settle_graphql_documents`] once the transport fold
+/// has run (carrick#1157).
 fn scan_protocol_extractions(
     repo_path: &str,
     service: &Config,
     files: &[PathBuf],
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
-) -> ProtocolExtractions {
+) -> (
+    ProtocolExtractions,
+    crate::graphql_document_sites::DocumentSiteConsumers,
+) {
     let scan_roots = service_graphql_roots(repo_path, service);
     // The printed schemas the service declares it serves (carrick#1099). What
     // they failed to declare is reported once the run's rows are built
@@ -2943,13 +3116,23 @@ fn scan_protocol_extractions(
     let mut graphql = crate::graphql::scan_repo(&scan_roots, &declared.files, files);
     merge_graphql_resolver_locations(&mut graphql, file_results);
     merge_graphql_consumer_locations(&mut graphql, file_results);
+    // Aliases resolve here as they do for the HTTP-twin drop: a page imports
+    // its generated documents through the repo's path aliases as often as
+    // through a relative specifier.
+    let workspace =
+        crate::workspace_resolver::WorkspaceIndex::build_with_aliases(Path::new(repo_path), None);
+    let document_sites =
+        crate::graphql_document_sites::collect_document_site_consumers(files, Some(&workspace));
     let sockets = crate::socket_io::scan_files(files);
     let event_bus = crate::event_emitter::scan_files(files, &sockets);
-    ProtocolExtractions {
-        graphql,
-        sockets,
-        event_bus,
-    }
+    (
+        ProtocolExtractions {
+            graphql,
+            sockets,
+            event_bus,
+        },
+        document_sites,
+    )
 }
 
 /// Attribute a service's GraphQL documents to schema identities, fold the
@@ -2965,19 +3148,47 @@ fn scan_protocol_extractions(
 /// internal base URL.
 ///
 /// The fold runs on the full document set, before the drop, so a vendor
-/// document's transport POST does not come back as an HTTP call.
+/// document's transport POST does not come back as an HTTP call. It runs
+/// before the rows at executing calls are placed (carrick#1157): a page that
+/// passes a generated document to a hook is not a document file, and folding
+/// its HTTP calls would drop the REST requests it also makes. Those rows are
+/// attributed like any other document.
 fn settle_graphql_documents(
     graphql: &mut crate::graphql::GraphqlExtraction,
+    document_sites: crate::graphql_document_sites::DocumentSiteConsumers,
     mount_graph: &mut crate::mount_graph::MountGraph,
     service: &Config,
     catalogue: &crate::graphql::SchemaCatalogue,
 ) {
+    fold_graphql_transport_calls(mount_graph, graphql);
+    document_sites.apply(graphql);
+    let label = service.service_name.as_deref().unwrap_or("(root)");
+    // A schema the service's walk found is one it serves only with evidence
+    // that it serves a schema at all (carrick#1189): it declares one, it serves
+    // HTTP routes, or the model joined a resolver or backing type to a field.
+    // A client app with a vendor schema copied into its tree has none of
+    // these. Any HTTP route is broader than a GraphQL server (a backend-for-
+    // frontend with a vendor copy has one), but it keeps an SDL-first server's
+    // own fields when its resolver join was dropped; carrick#1213 replaces it
+    // with a detected GraphQL-server signal.
+    let serves_schema = !service.graphql_schemas.is_empty()
+        || !mount_graph.endpoints.is_empty()
+        || graphql
+            .producers
+            .iter()
+            .any(|producer| producer.resolver_file.is_some());
+    let unserved = catalogue.settle_walked_schemas(label, graphql, serves_schema);
+    if unserved > 0 {
+        info!(
+            "GraphQL schema fields in {label}: {unserved} walked from its directory are not \
+             served by it (no graphqlSchemas, no HTTP route, no resolver); read as another \
+             API's schema"
+        );
+    }
     let attribution = catalogue.attribute(graphql, |document_file| {
         graphql_document_transport(service, document_file)
     });
-    fold_graphql_transport_calls(mount_graph, graphql);
     let summary = attribution.apply(graphql);
-    let label = service.service_name.as_deref().unwrap_or("(root)");
     if !summary.is_empty() {
         info!(
             "GraphQL documents in {label}: {} operation(s) written against schemas no service \
@@ -3118,6 +3329,9 @@ fn append_deterministic_protocol_operations(
         // switches on a request field to reach them.
         dispatch: None,
         schema_binding: None,
+        // The handler span is placed from an HTTP route's registration
+        // (cloud#948); these rows have none.
+        handler_span: None,
     };
 
     let graphql = &extractions.graphql;
@@ -3780,9 +3994,11 @@ fn merge_graphql_consumer_locations(
 /// Each op gets a single Response-kind entry keyed by its real `OperationKey`
 /// (so `OperationKey::canonical()` joins it in the cloud index and eval
 /// projection). Listeners / SDL producers are `Producer`; emitters / document
-/// consumers are `Consumer`. Only the Response kind is emitted: a phantom
-/// Request alias would never resolve and would drag a second `Unknown` entry
-/// into the manifest for ops that have no request body concept.
+/// consumers are `Consumer`. Every op gets a Response-kind entry. A Request
+/// entry is emitted only where the request is stated: an SDL root field that
+/// declares arguments ([`add_graphql_request_entry`], carrick#1158). Anywhere
+/// else a Request alias would never resolve and would drag a second `Unknown`
+/// entry into the manifest.
 ///
 /// Socket entries carry `primary_type_symbol` directly (the payload type the
 /// extractor captured), which the sidecar then resolves through the existing
@@ -3807,6 +4023,14 @@ fn append_protocol_manifest_entries(
             op.primary_type_symbol.clone(),
             None,
         );
+        if let Some(arguments) = &op.arguments {
+            add_graphql_request_entry(
+                entries,
+                op,
+                arguments,
+                &extractions.graphql.input_declarations,
+            );
+        }
     }
     for op in &extractions.graphql.consumers {
         add_protocol_manifest_entry(
@@ -3855,6 +4079,59 @@ fn append_protocol_manifest_entries(
             None,
         );
     }
+}
+
+/// The Request-kind entry for an SDL root field that declares arguments
+/// (carrick#1158).
+///
+/// The definition is the schema's own statement of the request, so it is
+/// written here rather than asked of the type sidecar: the field's argument
+/// list and the `input`, `enum` and `scalar` declarations it reaches, printed as
+/// SDL ([`crate::graphql::request_definition`]). The entry is `Explicit` because
+/// the schema declares it. No capture anchor is emitted for it, so the capture
+/// never answers for its alias and the definition stands. GraphQL consumers
+/// carry no Request entry, so no compatibility pair forms on it.
+///
+/// `primary_type_symbol` is the one `input` object the arguments name
+/// directly, when there is exactly one, which is the name an agent asks
+/// `get_type_definition` for (`CreateInvoiceInput`).
+fn add_graphql_request_entry(
+    entries: &mut Vec<TypeManifestEntry>,
+    op: &crate::graphql::GraphqlOp,
+    arguments: &crate::graphql::SdlArguments,
+    declarations: &std::collections::BTreeMap<String, crate::graphql::SdlInputDeclaration>,
+) {
+    let (definition, symbol) = crate::graphql::request_definition(arguments, declarations);
+    let role = ManifestRole::Producer;
+    let type_kind = ManifestTypeKind::Request;
+    let file_path = op.file_path.to_string_lossy().to_string();
+    entries.push(TypeManifestEntry {
+        key: op.key.clone(),
+        role,
+        type_kind,
+        type_alias: crate::type_manifest::build_manifest_type_alias_with_site_id(
+            &op.key, role, type_kind, None,
+        ),
+        file_path: file_path.clone(),
+        line_number: op.line,
+        is_explicit: true,
+        type_state: ManifestTypeState::Explicit,
+        evidence: crate::cloud_storage::TypeEvidence {
+            file_path,
+            span_start: None,
+            span_end: None,
+            line_number: op.line,
+            infer_kind: infer_kind_for_manifest(role, type_kind),
+            is_explicit: true,
+            type_state: ManifestTypeState::Explicit,
+        },
+        resolved_definition: Some(definition.clone()),
+        expanded_definition: Some(definition),
+        primary_type_symbol: symbol,
+        defined_in: None,
+        any_provenance: Vec::new(),
+        v1_unresolved: false,
+    });
 }
 
 /// Add a single Response-kind manifest entry for a non-HTTP operation. Shared
@@ -4985,7 +5262,8 @@ fn resolve_per_endpoint_definitions(
     // the ones whose `type_state` is Unknown and therefore print no definition
     // at all: "no type here, and here is why" is the answer a reader needs, and
     // it is exactly the entry the definition resolution below skips.
-    stamp_capture_provenance(manifest, stub_dir);
+    let records = read_capture_records(stub_dir);
+    stamp_capture_provenance(manifest, &records);
 
     let aliases = aliases_to_resolve(manifest);
 
@@ -5000,7 +5278,7 @@ fn resolve_per_endpoint_definitions(
 
     match sidecar.resolve_definitions(&stub_dir.to_string_lossy(), &aliases) {
         Ok(resolved) => {
-            let count = apply_resolved_definitions(manifest, resolved);
+            let count = apply_resolved_definitions(manifest, resolved, &records);
             debug!("Resolved {} type definition(s)", count);
         }
         Err(e) => {
@@ -5051,6 +5329,13 @@ fn aliases_to_resolve(manifest: &[TypeManifestEntry]) -> Vec<String> {
 ///    non-answer is not worth publishing whoever asked for it, and the readers
 ///    that count typed operations count `resolved_definition.is_some()`
 ///    (carrick#852).
+///
+///    Nor is an answer whose capture record says it names something that does
+///    not resolve (carrick#1165): an identifier nothing declares, a declaration
+///    whose own import is missing, or a top type with no pinned external to
+///    heal it. Those print as a confident name (`Row`,
+///    `Shape<Options>`) where the truth is that the stub cannot say what the
+///    name is, and publishing them counts the operation typed.
 ///  - **does it settle the state?** Only a shape with no disqualifying top type
 ///    anywhere in it, the same notion the check phase uses. That promotion is
 ///    scoped to entries the v1 side abstained on; `type_state` reflecting the
@@ -5061,6 +5346,7 @@ fn aliases_to_resolve(manifest: &[TypeManifestEntry]) -> Vec<String> {
 fn apply_resolved_definitions(
     manifest: &mut [TypeManifestEntry],
     resolved: Vec<crate::services::type_sidecar::ResolvedDefinitionResult>,
+    records: &HashMap<String, crate::services::type_sidecar::CaptureAliasRecord>,
 ) -> usize {
     let lookup: HashMap<String, _> = resolved
         .into_iter()
@@ -5090,6 +5376,16 @@ fn apply_resolved_definitions(
         {
             continue;
         }
+        if let Some(reason) = records
+            .get(&entry.type_alias)
+            .and_then(|record| record.unpublishable_reason())
+        {
+            debug!(
+                "Not publishing the capture's answer for {}: {reason}",
+                entry.type_alias
+            );
+            continue;
+        }
 
         entry.resolved_definition = Some(r.definition.clone());
         entry.expanded_definition = Some(r.expanded.clone());
@@ -5104,18 +5400,19 @@ fn apply_resolved_definitions(
     lookup.len()
 }
 
-/// Join the capture self-check's `any`/`unknown` findings onto the manifest.
+/// The capture's per-alias records, keyed by alias.
 ///
 /// The stub's own `carrick-manifest.json` is the record of what the emitted
-/// declaration tree actually says, which is what the index publishes — so it is
-/// the right source for "which fields of this endpoint's type are `any`".
-/// Non-fatal throughout: no manifest, unreadable manifest, or an alias with no
-/// record all leave the entry as it was. Absence is never a claim of
-/// cleanliness.
-fn stamp_capture_provenance(manifest: &mut [TypeManifestEntry], stub_dir: &Path) {
+/// declaration tree actually says, which is what the index publishes. Non-fatal
+/// throughout: no manifest or an unreadable one reads as no records, and every
+/// reader treats an alias with no record as "the capture said nothing", never
+/// as a claim of cleanliness.
+fn read_capture_records(
+    stub_dir: &Path,
+) -> HashMap<String, crate::services::type_sidecar::CaptureAliasRecord> {
     let path = stub_dir.join(CAPTURE_MANIFEST_FILE);
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return;
+        return HashMap::new();
     };
     #[derive(serde::Deserialize)]
     struct StubManifest {
@@ -5127,15 +5424,24 @@ fn stamp_capture_provenance(manifest: &mut [TypeManifestEntry], stub_dir: &Path)
             "capture manifest at {} could not be parsed for provenance",
             path.display()
         );
-        return;
+        return HashMap::new();
     };
-    let by_alias: HashMap<&str, &crate::services::type_sidecar::CaptureAliasRecord> = parsed
+    parsed
         .aliases
-        .iter()
-        .map(|record| (record.alias.as_str(), record))
-        .collect();
+        .into_iter()
+        .map(|record| (record.alias.clone(), record))
+        .collect()
+}
+
+/// Join the capture self-check's `any`/`unknown` findings onto the manifest:
+/// the capture record is the right source for "which fields of this endpoint's
+/// type are `any`". An alias with no record leaves its entry as it was.
+fn stamp_capture_provenance(
+    manifest: &mut [TypeManifestEntry],
+    records: &HashMap<String, crate::services::type_sidecar::CaptureAliasRecord>,
+) {
     for entry in manifest.iter_mut() {
-        let Some(record) = by_alias.get(entry.type_alias.as_str()) else {
+        let Some(record) = records.get(&entry.type_alias) else {
             continue;
         };
         if record.any_provenance.is_empty() {
@@ -5531,7 +5837,15 @@ fn enrich_manifest_with_type_resolution(
         // capture is the layer that resolves what v1 could not). An alias the
         // bundle says NOTHING about is a different fact: no v1 request was ever
         // built for it, so there is nothing for it to have abstained from.
-        entry.v1_unresolved = dts_trivially_unknown(&entry.type_alias);
+        //
+        // A v1 answer that is itself a bare `any`/`unknown` is the same
+        // abstention without the marker (carrick#1165): it describes nothing,
+        // so the capture is asked too, and its shape is published if it has
+        // one.
+        entry.v1_unresolved = dts_trivially_unknown(&entry.type_alias)
+            || resolved_types
+                .get(&entry.type_alias)
+                .is_some_and(|(type_string, _)| type_compat_v2::text_is_bare_top_type(type_string));
 
         // Fill the deterministic anchor ONLY when the LLM left it unset, so the
         // ops where the model already emitted a correct symbol (POST /payments,
@@ -5702,6 +6016,7 @@ async fn analyze_current_repo(
     let graphql_consumer_hints = crate::graphql::GraphqlConsumerHints::collect(
         service_graphql_roots(repo_path, service),
         &files,
+        repo_path,
     );
 
     // 3b. Settle the model stages for this service: detection and guidance
@@ -5757,11 +6072,12 @@ async fn analyze_current_repo(
     // GraphQL consumer file set folds transport data calls out of the mount
     // graph (#307) so every downstream surface (cloud projection, type
     // manifest, type requests) sees the same call set.
-    let mut protocol_extractions =
+    let (mut protocol_extractions, document_sites) =
         scan_protocol_extractions(repo_path, service, &files, &analysis_result.file_results);
     let mut analysis_result = analysis_result;
     settle_graphql_documents(
         &mut protocol_extractions.graphql,
+        document_sites,
         &mut analysis_result.mount_graph,
         service,
         graphql_schemas,
@@ -5928,6 +6244,10 @@ async fn analyze_current_repo(
         repo_path,
         &served_paths::PathScrub::for_scan(repo_path),
     );
+    // Each route's handler function, placed once paths are relative so a row's
+    // file and a definition's file compare (cloud#948).
+    let placed = crate::handler_span::attach_handler_spans(&mut cloud_data);
+    debug!("Handler spans placed on endpoint rows: {placed}");
 
     // 9. What this scan could not classify, stated beside what it did
     // (carrick#705). Collected last, off the finished payload and the stats of
@@ -5937,6 +6257,7 @@ async fn analyze_current_repo(
     cloud_data.boundary = Some(crate::boundary::ServiceBoundary::collect(
         &cloud_data,
         &analysis_result.stats,
+        &analysis_result.file_results,
         repo_path,
     ));
     crate::phase_timing::mark(crate::phase_timing::Phase::Other);
@@ -6771,6 +7092,8 @@ mod tests {
         uploads: std::sync::Mutex<std::collections::VecDeque<Result<UploadOutcome, StorageError>>>,
         landed: std::sync::Mutex<std::collections::VecDeque<Result<bool, StorageError>>>,
         uploaded: std::sync::Mutex<Vec<String>>,
+        /// The serialized body of each upload, as the wire would carry it.
+        uploaded_bodies: std::sync::Mutex<Vec<String>>,
         landed_asks: std::sync::Mutex<Vec<String>>,
     }
 
@@ -6783,12 +7106,17 @@ mod tests {
                 uploads: std::sync::Mutex::new(uploads.into()),
                 landed: std::sync::Mutex::new(landed.into()),
                 uploaded: std::sync::Mutex::new(Vec::new()),
+                uploaded_bodies: std::sync::Mutex::new(Vec::new()),
                 landed_asks: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         fn uploaded(&self) -> Vec<String> {
             self.uploaded.lock().unwrap().clone()
+        }
+
+        fn uploaded_bodies(&self) -> Vec<String> {
+            self.uploaded_bodies.lock().unwrap().clone()
         }
 
         fn landed_asks(&self) -> Vec<String> {
@@ -6810,6 +7138,10 @@ mod tests {
             _final_in_run: bool,
         ) -> Result<UploadOutcome, StorageError> {
             self.uploaded.lock().unwrap().push(scripted_service(data));
+            self.uploaded_bodies
+                .lock()
+                .unwrap()
+                .push(serde_json::to_string(data).expect("payload serializes"));
             self.uploads
                 .lock()
                 .unwrap()
@@ -6868,6 +7200,62 @@ mod tests {
         })
     }
 
+    /// A boundary with no machine prefixes: the upload tests that are about
+    /// delivery, not paths.
+    fn no_boundary() -> upload_boundary::UploadBoundary {
+        upload_boundary::UploadBoundary::new("", None)
+    }
+
+    /// carrick#1204. A stub file an upstream pass left holding the checkout
+    /// root and the home directory goes up with placeholders, the upload is
+    /// not refused, and the payload the run keeps in memory is untouched.
+    #[tokio::test]
+    async fn the_upload_boundary_scrubs_a_machine_path_an_upstream_pass_missed() {
+        let root = "/home/user/work/acme-app";
+        let home = "/home/user";
+        let mut leaking = service_data("acme-app", Some("orders"));
+        leaking.capture_stub = Some(crate::cloud_storage::CaptureStubArtifact {
+            artifact_version: 1,
+            package_name: "@carrick/orders".to_string(),
+            ts_version: "5.8.2".to_string(),
+            bare_checkout: false,
+            files: std::collections::BTreeMap::from([(
+                "types/surface.d.ts".to_string(),
+                format!(
+                    "export type A = import(\"{root}/node_modules/.store/kit@1.0.0/node_modules/kit/index\").T;\n\
+                     export type B = import(\"{home}/.cache/runtime/npm/registry.example.org/kit/1.0.0/index\").T;\n"
+                ),
+            )]),
+        });
+        let payloads = vec![leaking];
+        let storage = ScriptedStorage::new(vec![Ok(UploadOutcome::default())], vec![]);
+
+        let unconfirmed = upload_service_payloads(
+            &storage,
+            &payloads,
+            false,
+            true,
+            &upload_boundary::UploadBoundary::new(root, Some(home)),
+        )
+        .await;
+
+        assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
+        let bodies = storage.uploaded_bodies();
+        assert_eq!(bodies.len(), 1, "the upload is never refused");
+        assert!(
+            !bodies[0].contains(home),
+            "uploaded body holds a machine path: {}",
+            bodies[0]
+        );
+        assert!(bodies[0].contains("<checkout>/node_modules/.store/kit@1.0.0"));
+        assert!(bodies[0].contains("<home>/.cache/runtime/npm"));
+        let kept = &payloads[0].capture_stub.as_ref().unwrap().files["types/surface.d.ts"];
+        assert!(
+            kept.contains(root),
+            "the in-memory payload is not rewritten"
+        );
+    }
+
     fn two_services() -> Vec<CloudRepoData> {
         vec![
             service_data("api-server", Some("orders")),
@@ -6886,7 +7274,8 @@ mod tests {
             vec![Ok(true)],
         );
 
-        let unconfirmed = upload_service_payloads(&storage, &two_services(), false, true).await;
+        let unconfirmed =
+            upload_service_payloads(&storage, &two_services(), false, true, &no_boundary()).await;
 
         assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
         assert_eq!(storage.uploaded(), vec!["orders", "billing"]);
@@ -6903,7 +7292,8 @@ mod tests {
             vec![Ok(false)],
         );
 
-        let unconfirmed = upload_service_payloads(&storage, &two_services(), false, true).await;
+        let unconfirmed =
+            upload_service_payloads(&storage, &two_services(), false, true, &no_boundary()).await;
 
         assert_eq!(unconfirmed.len(), 1);
         assert_eq!(unconfirmed[0].service, "orders");
@@ -6926,7 +7316,8 @@ mod tests {
             vec![],
         );
 
-        let unconfirmed = upload_service_payloads(&storage, &two_services(), false, true).await;
+        let unconfirmed =
+            upload_service_payloads(&storage, &two_services(), false, true, &no_boundary()).await;
 
         assert_eq!(unconfirmed.len(), 1);
         assert!(
@@ -6948,7 +7339,8 @@ mod tests {
             vec![Ok(false), Ok(false), Ok(true)],
         );
 
-        let unconfirmed = upload_service_payloads(&storage, &two_services(), false, true).await;
+        let unconfirmed =
+            upload_service_payloads(&storage, &two_services(), false, true, &no_boundary()).await;
 
         assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
         assert_eq!(storage.landed_asks().len(), 3);
@@ -6965,7 +7357,8 @@ mod tests {
         );
 
         let unconfirmed =
-            upload_service_payloads(&storage, &two_services()[..1], false, true).await;
+            upload_service_payloads(&storage, &two_services()[..1], false, true, &no_boundary())
+                .await;
 
         assert_eq!(unconfirmed.len(), 1);
     }
@@ -7093,6 +7486,7 @@ mod tests {
                     file_path: "/home/runner/work/acme/acme/src/lib/helper.ts".to_string(),
                     line_number: 9,
                     call_site_line: 4,
+                    call_count: 1,
                 }],
                 tokens: vec![],
                 return_type: None,
@@ -7158,12 +7552,17 @@ mod tests {
     /// root or the home directory, anywhere in it: printed TypeScript embeds
     /// both mid-string (`import("/abs/path").Name`), and a package store or a
     /// runtime cache under home is the account name on a served row
-    /// (carrick#1160). The one exemption is the capture stub's declaration
-    /// files, which are compiled again at check time and deliberately left
-    /// untouched by the pass (see `relativize_cloud_paths`); the test asserts
-    /// that exemption holds rather than assuming it.
+    /// (carrick#1160). The sweep covers every file of the capture stub too.
+    /// The pass leaves the stub's declaration files byte-identical, because
+    /// they are compiled again at check time (see `relativize_cloud_paths`);
+    /// the capture itself writes them without absolute specifiers
+    /// (carrick#1174, guarded behaviourally by the sidecar's
+    /// `capture-v2-installed-package-specifier` test). This test fails if the
+    /// payload's stub carries a path, or if the pass starts editing it.
     #[test]
     fn relativize_cloud_paths_leaves_no_absolute_path_in_the_payload() {
+        const STUB_SURFACE: &str = "import type { Order } from \"./src/types/order\";\n\
+            export type Endpoint_Response = { order: Order; ctx: import(\"web-kit\").Context };\n";
         use crate::external_call_candidates::{CallMechanism, ExternalCallCandidate};
         use crate::mount_graph::{DataFetchingCall, GraphNode, NodeType, ResolvedEndpoint};
         use crate::packages::PackageInfo;
@@ -7205,6 +7604,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         };
 
         let mut graph = MountGraph::new();
@@ -7232,6 +7632,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         });
         graph.data_calls.push(DataFetchingCall {
             method: "GET".to_string(),
@@ -7401,8 +7802,21 @@ mod tests {
                         .to_string(),
                     ),
                     (
+                        // What the capture emits since carrick#1174: an in-tree
+                        // relative specifier and a bare package specifier.
                         "types/surface.d.ts".to_string(),
-                        format!("export type Endpoint_Response = import(\"{}\").Order;\n", abs("src/types/order")),
+                        STUB_SURFACE.to_string(),
+                    ),
+                    (
+                        // A path the capture's rewrite did not recognise slips
+                        // through (carrick#1204): only the upload boundary
+                        // stands between it and the index.
+                        "types/slipped.d.ts".to_string(),
+                        format!(
+                            "export type Slipped = import(\"{}\").T | import(\"{}\").U;\n",
+                            abs("node_modules/.unknown-layout/kit/index"),
+                            cached("kit/1.0.0")
+                        ),
                     ),
                 ]),
             }),
@@ -7502,32 +7916,52 @@ mod tests {
             "source file not in program: packages/utils/id.ts"
         );
         assert_eq!(record["aliases"][0]["source_file"], "@/features/types");
-        // The compiled tree is exempt, byte for byte.
-        assert_eq!(
-            stub.files["types/surface.d.ts"],
-            format!(
-                "export type Endpoint_Response = import(\"{}\").Order;\n",
-                abs("src/types/order")
-            )
-        );
+        // The pass never edits a compiled declaration file, byte for byte.
+        assert_eq!(stub.files["types/surface.d.ts"], STUB_SURFACE);
 
-        // Then the exhaustive sweep over the serialized payload.
-        let mut sweep = data.clone();
-        if let Some(stub) = sweep.capture_stub.as_mut() {
-            stub.files.retain(|name, _| !name.ends_with(".d.ts"));
-        }
-        let json = serde_json::to_value(&sweep).expect("payload serializes");
-        let mut offenders: Vec<String> = Vec::new();
-        walk_json_strings(&json, &mut |s| {
-            if s.contains(repo_path) || s.contains(home) {
-                offenders.push(s.to_string());
-            }
-        });
+        let offenders_in = |payload: &CloudRepoData| {
+            let json = serde_json::to_value(payload).expect("payload serializes");
+            let mut offenders: Vec<String> = Vec::new();
+            walk_json_strings(&json, &mut |s| {
+                if s.contains(repo_path) || s.contains(home) {
+                    offenders.push(s.to_string());
+                }
+            });
+            offenders
+        };
+        // The served-text pass alone leaves exactly the slipped stub file, so
+        // it is the upload boundary below that makes the sweep pass.
+        let after_relativize = offenders_in(&data);
+        assert_eq!(after_relativize.len(), 1, "{after_relativize:?}");
+        assert!(after_relativize[0].starts_with("export type Slipped"));
+
+        // Then the upload boundary, and the exhaustive sweep over what it
+        // hands the upload: every string and key, every stub file included.
+        let outgoing = upload_boundary::UploadBoundary::new(repo_path, Some(home))
+            .scrub(&data, "acme-app")
+            .expect("the boundary rewrites the slipped file");
+        let offenders = offenders_in(&outgoing);
         assert!(
             offenders.is_empty(),
             "uploaded payload still carries absolute paths: {:?}",
             offenders
         );
+        let outgoing_stub = outgoing.capture_stub.as_ref().expect("capture stub");
+        assert_eq!(
+            outgoing_stub.files["types/slipped.d.ts"],
+            "export type Slipped = import(\"<checkout>/node_modules/.unknown-layout/kit/index\").T \
+             | import(\"<home>/.cache/runtime/npm/registry.npmjs.org/kit/1.0.0/dist/types\").U;\n"
+        );
+        assert_eq!(
+            outgoing_stub.files["types/surface.d.ts"], STUB_SURFACE,
+            "a file with no machine path is uploaded as it is"
+        );
+        // The boundary rebuilt the payload from its own wire format; nothing
+        // else in it moved.
+        let mut expected = serde_json::to_value(&data).unwrap();
+        expected["capture_stub"]["files"]["types/slipped.d.ts"] =
+            serde_json::Value::String(outgoing_stub.files["types/slipped.d.ts"].clone());
+        assert_eq!(serde_json::to_value(&outgoing).unwrap(), expected);
     }
 
     /// Visit every string in a JSON value, keys included: an absolute path can
@@ -7582,6 +8016,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         };
 
         let test_data = CloudRepoData {
@@ -7725,6 +8160,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         };
 
         let test_data = vec![CloudRepoData {
@@ -7958,6 +8394,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         };
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints = vec![
@@ -8035,6 +8472,7 @@ mod tests {
             evidence: carrick_match::MatchEvidence::CallSite,
             resolution_source: None,
             dispatch: None,
+            handler_span: None,
         }];
         mount_graph.data_calls = vec![crate::mount_graph::DataFetchingCall {
             method: "POST".to_string(),
@@ -9505,7 +9943,7 @@ mod tests {
 
         let mut manifest = vec![consumer_entry("OrderView"), consumer_entry("Untouched")];
         assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
-        stamp_capture_provenance(&mut manifest, dir.path());
+        stamp_capture_provenance(&mut manifest, &read_capture_records(dir.path()));
 
         assert_eq!(manifest[0].any_provenance.len(), 1);
         assert_eq!(manifest[0].any_provenance[0].path, "meta");
@@ -9839,6 +10277,7 @@ mod tests {
         let count = apply_resolved_definitions(
             &mut manifest,
             vec![captured("OrderView", "{ bulkActionId: string; }")],
+            &HashMap::new(),
         );
 
         assert_eq!(count, 1);
@@ -9856,7 +10295,11 @@ mod tests {
         let mut manifest = vec![consumer_entry("OrderView")];
         manifest[0].v1_unresolved = true;
 
-        apply_resolved_definitions(&mut manifest, vec![captured("OrderView", "any")]);
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured("OrderView", "any")],
+            &HashMap::new(),
+        );
 
         assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
         assert_eq!(
@@ -9878,7 +10321,11 @@ mod tests {
         manifest[0].is_explicit = false;
         assert!(!manifest[0].v1_unresolved, "v1 answered for this one");
 
-        apply_resolved_definitions(&mut manifest, vec![captured("OrderView", "unknown")]);
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured("OrderView", "unknown")],
+            &HashMap::new(),
+        );
 
         assert_eq!(
             manifest[0].resolved_definition, None,
@@ -9904,6 +10351,7 @@ mod tests {
         apply_resolved_definitions(
             &mut manifest,
             vec![captured("OrderView", "{ id: string; payload: any; }")],
+            &HashMap::new(),
         );
 
         assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
@@ -9925,6 +10373,7 @@ mod tests {
         apply_resolved_definitions(
             &mut manifest,
             vec![captured("OrderView", "{ id: string; }")],
+            &HashMap::new(),
         );
 
         assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
@@ -9932,6 +10381,185 @@ mod tests {
             manifest[0].resolved_definition.as_deref(),
             Some("{ id: string; }")
         );
+    }
+
+    // ---- carrick#1165: answers that name what does not resolve -------------
+
+    /// A capture record as the sidecar writes it, read through the same
+    /// function the scan uses, so the wire shape of the new fields is covered.
+    fn records_from(
+        records: serde_json::Value,
+    ) -> HashMap<String, crate::services::type_sidecar::CaptureAliasRecord> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("carrick-manifest.json"),
+            serde_json::json!({ "aliases": records }).to_string(),
+        )
+        .expect("write manifest");
+        read_capture_records(dir.path())
+    }
+
+    fn record_json(alias: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut record = serde_json::json!({
+            "alias": alias,
+            "anchor_kind": "infer",
+            "source_file": "lib/api.ts",
+            "anchor_origin": "deterministic-infer",
+            "serialization": "node_builder",
+            "self_check": "ok",
+            "top_type_at_self_check": false
+        });
+        for (key, value) in extra.as_object().expect("object").iter() {
+            record[key] = value.clone();
+        }
+        record
+    }
+
+    fn answered_entry() -> TypeManifestEntry {
+        let mut entry = consumer_entry("OrderView");
+        entry.type_state = ManifestTypeState::Implicit;
+        entry
+    }
+
+    /// A shape that names an identifier nothing declares reads as a type and
+    /// is not one: the reader cannot resolve `ParcelRow`, and the boundary
+    /// counted the operation typed.
+    #[test]
+    fn an_answer_naming_an_undeclared_identifier_is_not_published() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({ "undeclared_names": ["ParcelRow"] }),
+        )]));
+        let mut manifest = vec![answered_entry()];
+
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured("OrderView", "{ id: string; parcel: ParcelRow; }")],
+            &records,
+        );
+
+        assert_eq!(manifest[0].resolved_definition, None);
+        assert_eq!(manifest[0].expanded_definition, None);
+    }
+
+    /// An answer whose declaration imports a module the checkout does not
+    /// have prints the missing module's names (`Shape<Options>`, a builder's
+    /// field reference over `any`) with nothing behind them.
+    #[test]
+    fn an_answer_whose_declaration_imports_a_missing_module_is_not_published() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({
+                "self_check": "decayed_internal",
+                "dangling_specifiers": ["./generated/client"]
+            }),
+        )]));
+        let mut manifest = vec![answered_entry()];
+
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured("OrderView", "Shape<Options>")],
+            &records,
+        );
+
+        assert_eq!(manifest[0].resolved_definition, None);
+    }
+
+    /// A top type with nothing to heal it is not published under a name; one a
+    /// pinned external explains is, because the check phase installs the pin
+    /// and the name then means something.
+    #[test]
+    fn a_top_type_answer_is_published_only_when_a_pinned_external_explains_it() {
+        let records = records_from(serde_json::json!([
+            record_json(
+                "OrderView",
+                serde_json::json!({
+                    "self_check": "decayed_internal",
+                    "top_type_at_self_check": true
+                }),
+            ),
+            record_json(
+                "Healable",
+                serde_json::json!({
+                    "self_check": "allowlisted_external",
+                    "top_type_at_self_check": true
+                }),
+            ),
+        ]));
+        let mut healable = answered_entry();
+        healable.type_alias = "Healable".to_string();
+        let mut manifest = vec![answered_entry(), healable];
+
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![
+                captured("OrderView", "ParcelRow"),
+                captured("Healable", "import(\"kit\").Context"),
+            ],
+            &records,
+        );
+
+        assert_eq!(manifest[0].resolved_definition, None);
+        assert_eq!(
+            manifest[1].expanded_definition.as_deref(),
+            Some("import(\"kit\").Context")
+        );
+    }
+
+    /// A record without the new fields (a stub written before them) publishes
+    /// exactly as before.
+    #[test]
+    fn a_record_without_the_new_fields_publishes_as_before() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({}),
+        )]));
+        let mut manifest = vec![answered_entry()];
+
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured("OrderView", "{ id: string; }")],
+            &records,
+        );
+
+        assert_eq!(
+            manifest[0].expanded_definition.as_deref(),
+            Some("{ id: string; }")
+        );
+    }
+
+    /// A v1 answer that is a bare `any` describes nothing, the same abstention
+    /// as the marked placeholder. The capture is asked, and its shape is
+    /// published; with `any` members inside, it does not settle the state.
+    #[test]
+    fn a_bare_any_v1_answer_asks_the_capture() {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        let mut resolution = empty_resolution();
+        let mut inferred = inferred_with_symbol("OrderView");
+        inferred.type_string = "any".to_string();
+        inferred.primary_type_symbol = None;
+        resolution.inferred_types.push(inferred);
+
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+        assert!(manifest[0].v1_unresolved, "a bare `any` is an abstention");
+        assert_eq!(aliases_to_resolve(&manifest), vec!["OrderView".to_string()]);
+
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured(
+                "OrderView",
+                "{ id: any; status: \"open\" | \"done\"; }",
+            )],
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            manifest[0].expanded_definition.as_deref(),
+            Some("{ id: any; status: \"open\" | \"done\"; }")
+        );
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
     }
 
     // ---- #245 Phase 1: protocol op manifest entries -------------------------
@@ -9971,6 +10599,7 @@ mod tests {
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
             schema_binding: None,
+            arguments: None,
         }
     }
 
@@ -9996,6 +10625,7 @@ mod tests {
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
             schema_binding: None,
+            arguments: None,
         }
     }
 
@@ -10039,6 +10669,7 @@ mod tests {
                 "src/gql.ts",
                 None,
             )],
+            input_declarations: Default::default(),
         };
 
         fold_graphql_transport_calls(&mut mount_graph, &graphql);
@@ -10082,6 +10713,7 @@ mod tests {
                 "src/gql.ts",
                 None,
             )],
+            input_declarations: Default::default(),
         };
 
         fold_graphql_transport_calls(&mut mount_graph, &graphql);
@@ -10109,6 +10741,7 @@ mod tests {
                 "./src/gql.ts",
                 None,
             )],
+            input_declarations: Default::default(),
         };
 
         fold_graphql_transport_calls(&mut mount_graph, &graphql);
@@ -10132,6 +10765,7 @@ mod tests {
                 Some("Order"),
             )],
             consumers: vec![],
+            input_declarations: Default::default(),
         };
 
         fold_graphql_transport_calls(&mut mount_graph, &graphql);
@@ -10172,10 +10806,12 @@ mod tests {
                 "src/gql.ts",
                 None,
             )],
+            input_declarations: Default::default(),
         };
 
         settle_graphql_documents(
             &mut graphql,
+            Default::default(),
             &mut mount_graph,
             &Config::default(),
             &catalogue,
@@ -10221,6 +10857,7 @@ mod tests {
             consumer_located_type_symbol: None,
             consumer_located_type_source: None,
             schema_binding: None,
+            arguments: None,
         }
     }
 
@@ -10264,6 +10901,7 @@ mod tests {
                 graphql_op(GraphqlOperationKind::Query, "orders", Some("[Order!]!")),
             ],
             consumers: vec![],
+            input_declarations: Default::default(),
         };
 
         // file_results keyed by path, carrying the matching LLM graphql_operation
@@ -10367,6 +11005,7 @@ mod tests {
                 Some("[Order!]!"),
             )],
             consumers: vec![],
+            input_declarations: Default::default(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -10431,6 +11070,7 @@ mod tests {
                 Some("[Order!]!"),
             )],
             consumers: vec![],
+            input_declarations: Default::default(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -10489,6 +11129,7 @@ mod tests {
                 graphql_op(GraphqlOperationKind::Query, "orders", Some("[Order!]!")),
             ],
             consumers: vec![],
+            input_declarations: Default::default(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -10618,6 +11259,7 @@ mod tests {
                 Some("Ticket"),
             )],
             consumers: vec![],
+            input_declarations: Default::default(),
         };
 
         let claim = |function: &str, line: i32| GraphqlOperation {
@@ -10694,6 +11336,7 @@ mod tests {
                 Some("Ticket"),
             )],
             consumers: vec![],
+            input_declarations: Default::default(),
         };
 
         let claim = |function: &str, line: i32| GraphqlOperation {
@@ -10747,6 +11390,7 @@ mod tests {
                 Some("Ticket"),
             )],
             consumers: vec![],
+            input_declarations: Default::default(),
         };
         let mut agreeing_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         agreeing_results.insert(
@@ -10781,6 +11425,7 @@ mod tests {
         let mut graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],
             consumers: vec![anchored],
+            input_declarations: Default::default(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -10841,6 +11486,7 @@ mod tests {
         let mut graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],
             consumers: vec![consumer_a, consumer_b],
+            input_declarations: Default::default(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -10910,6 +11556,7 @@ mod tests {
         let mut graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],
             consumers: vec![consumer],
+            input_declarations: Default::default(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -10955,6 +11602,7 @@ mod tests {
                     Some("Order"),
                 )],
                 consumers: vec![graphql_op(GraphqlOperationKind::Query, "order", None)],
+                input_declarations: Default::default(),
             },
             sockets: crate::socket_io::SocketExtraction {
                 listeners: vec![],
@@ -11012,6 +11660,73 @@ mod tests {
             })
             .expect("graphql consumer manifest entry");
         assert_eq!(graphql_consumer.primary_type_symbol, None);
+    }
+
+    /// An SDL root field that declares arguments gets a Request-kind producer
+    /// entry carrying the schema's own statement of the request (carrick#1158):
+    /// the definition `get_type_definition` serves by alias, and by the input
+    /// type's name through `primary_type_symbol`. A field without arguments and
+    /// a document consumer still get no Request entry.
+    #[test]
+    fn sdl_arguments_become_a_request_manifest_entry_on_the_wire() {
+        let sdl = r#"
+            type Mutation { createInvoice(input: CreateInvoiceInput!): Invoice! }
+            type Query { health: String! }
+            input CreateInvoiceInput { customerId: ID!, total: Int! }
+        "#;
+        let mut graphql =
+            crate::graphql::extract_from_document_text(sdl, Path::new("schema.graphql"), 1);
+        graphql.consumers = crate::graphql::extract_from_document_text(
+            "mutation { createInvoice(input: $i) { id } }",
+            Path::new("web/q.graphql"),
+            1,
+        )
+        .consumers;
+        let extractions = ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction::default(),
+            graphql,
+            sockets: crate::socket_io::SocketExtraction::default(),
+        };
+
+        let mut entries = Vec::new();
+        append_protocol_manifest_entries(&mut entries, &extractions);
+
+        let requests: Vec<&TypeManifestEntry> = entries
+            .iter()
+            .filter(|e| e.type_kind == ManifestTypeKind::Request)
+            .collect();
+        assert_eq!(requests.len(), 1, "got: {entries:#?}");
+        let request = requests[0];
+        assert_eq!(request.role, ManifestRole::Producer);
+        assert_eq!(request.type_state, ManifestTypeState::Explicit);
+        assert_eq!(
+            request.type_alias,
+            crate::type_manifest::build_manifest_type_alias_with_site_id(
+                &request.key,
+                ManifestRole::Producer,
+                ManifestTypeKind::Request,
+                None,
+            )
+        );
+
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["protocol"], "graphql");
+        assert_eq!(json["field"], "createInvoice");
+        assert_eq!(json["type_kind"], "request");
+        assert_eq!(json["role"], "producer");
+        assert_eq!(json["primary_type_symbol"], "CreateInvoiceInput");
+        let definition = json["resolved_definition"].as_str().unwrap().to_string();
+        assert!(
+            definition.starts_with(
+                "createInvoice(input: CreateInvoiceInput!)\n\ninput CreateInvoiceInput {"
+            ),
+            "got: {definition}"
+        );
+
+        // A reader holding this row reads it back unchanged: no field is new,
+        // only the row is.
+        let back: TypeManifestEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(back.resolved_definition, Some(definition));
     }
 
     /// The fragile contract the whole anchor join hinges on: the alias on the
@@ -11449,6 +12164,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             schema_binding: None,
+            handler_span: None,
         };
         append_pubsub_operations(
             &mut cloud_data,
@@ -11814,6 +12530,7 @@ mod tests {
             graphql: crate::graphql::GraphqlExtraction {
                 producers: vec![],
                 consumers: vec![consumer.clone()],
+                input_declarations: Default::default(),
             },
             sockets: crate::socket_io::SocketExtraction::default(),
         };
@@ -11893,6 +12610,7 @@ mod tests {
         let extraction = crate::graphql::GraphqlExtraction {
             producers: vec![],
             consumers: vec![located_only, both, neither],
+            input_declarations: Default::default(),
         };
 
         let orchestrator = FileOrchestrator::new(AgentService::new());
@@ -11944,6 +12662,7 @@ mod tests {
             graphql: crate::graphql::GraphqlExtraction {
                 producers: vec![producer.clone()],
                 consumers: vec![],
+                input_declarations: Default::default(),
             },
             sockets: crate::socket_io::SocketExtraction::default(),
         };
@@ -12003,6 +12722,7 @@ mod tests {
                     Some("Order"),
                 )],
                 consumers: vec![],
+                input_declarations: Default::default(),
             },
             sockets: crate::socket_io::SocketExtraction::default(),
         };

@@ -257,6 +257,7 @@ const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
     alias: z.string().min(1),
     type_text: z.string().min(1),
     anchor_origin: AnchorOriginSchema,
+    source_file: z.string().min(1).optional(),
   }),
 ]);
 

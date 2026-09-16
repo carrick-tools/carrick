@@ -19,6 +19,7 @@ use crate::{
     visitor::{ImportedSymbol, SymbolKind},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tracing::{debug, trace, warn};
 
@@ -623,9 +624,40 @@ pub struct FileAnalysisResult {
 /// analyzer sends it with the guidance id so the cloud can key the guidance by
 /// identity instead of by text (carrick-cloud#871). Nothing about it reaches
 /// the model: `text` is what is sent.
-struct AnalysisPrompt {
-    text: String,
-    guidance_prefix_bytes: usize,
+pub struct AnalysisPrompt {
+    pub text: String,
+    pub guidance_prefix_bytes: usize,
+}
+
+impl AnalysisPrompt {
+    /// The shared front block: the bytes a dispatched job carries once in its
+    /// header instead of once per file.
+    pub fn guidance_block(&self) -> &str {
+        &self.text[..self.guidance_prefix_bytes]
+    }
+
+    /// The bytes that vary per file — what the cloud's cache key hashes, and
+    /// what a dispatched row carries and a resume re-derives to join on
+    /// (carrick#1229).
+    pub fn body(&self) -> &str {
+        &self.text[self.guidance_prefix_bytes..]
+    }
+}
+
+/// The target the per-file prompt fingerprint is logged under, so a reader can
+/// pull every one of them out of a run log with a single filter and join two
+/// runs on `file`.
+pub const PROMPT_FINGERPRINT_TARGET: &str = "carrick::prompt_fingerprint";
+
+/// Name the prompt bytes without reproducing them.
+///
+/// Hex sha256 of the whole rendered message — the same digest shape the cloud's
+/// analysis cache keys on, so two runs whose fingerprints match for a file
+/// cannot have keyed differently on the message, and two that differ did.
+fn prompt_fingerprint(user_message: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(user_message.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// Agent that performs file-centric analysis using framework-agnostic patterns.
@@ -732,11 +764,7 @@ impl FileAnalyzerAgent {
         wrapper_context: &[String],
     ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
         // Skip empty files
-        if file_content.trim().is_empty() {
-            return Ok(FileAnalysisResult::default());
-        }
-
-        let prompt = self.build_user_message_with_candidates(
+        let Some(prompt) = self.prompt_for(
             file_path,
             file_content,
             guidance,
@@ -746,8 +774,56 @@ impl FileAnalyzerAgent {
             graphql_producer_hints,
             graphql_consumer_hints,
             wrapper_context,
-        );
-        let user_message = prompt.text;
+        ) else {
+            return Ok(FileAnalysisResult::default());
+        };
+        self.analyze_prompt(file_path, &prompt, guidance).await
+    }
+
+    /// This file's prompt, built and not sent.
+    ///
+    /// The bytes are the same ones [`Self::analyze_prompt`] would put on the
+    /// wire, which is the whole point: a dispatched scan ships them and a
+    /// resume re-derives them to join an answer by content (carrick#1229).
+    /// `None` for a file with nothing in it — the same skip the live path
+    /// makes, stated once so both paths skip the same files.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prompt_for(
+        &self,
+        file_path: &str,
+        file_content: &str,
+        guidance: &FrameworkGuidance,
+        candidate_hints: &[String],
+        candidate_contexts: &[String],
+        imported_symbols: &HashMap<String, ImportedSymbol>,
+        graphql_producer_hints: &[String],
+        graphql_consumer_hints: &[String],
+        wrapper_context: &[String],
+    ) -> Option<AnalysisPrompt> {
+        if file_content.trim().is_empty() {
+            return None;
+        }
+        Some(self.build_user_message_with_candidates(
+            file_path,
+            file_content,
+            guidance,
+            candidate_hints,
+            candidate_contexts,
+            imported_symbols,
+            graphql_producer_hints,
+            graphql_consumer_hints,
+            wrapper_context,
+        ))
+    }
+
+    /// Send one built prompt and read the answer back.
+    pub async fn analyze_prompt(
+        &self,
+        file_path: &str,
+        prompt: &AnalysisPrompt,
+        guidance: &FrameworkGuidance,
+    ) -> Result<FileAnalysisResult, Box<dyn std::error::Error>> {
+        let user_message = prompt.text.clone();
         // Present only when every guidance answer carried an id; without one
         // the cloud keys the whole message, exactly as it did before
         // (carrick-cloud#871).
@@ -756,14 +832,34 @@ impl FileAnalyzerAgent {
             prefix_bytes: prompt.guidance_prefix_bytes,
         });
 
+        // The one fact a cache-miss investigation needs and no log has carried.
+        //
+        // The cloud keys its analysis cache on these exact bytes, so a run that
+        // re-pays for work an earlier run already did differs HERE and nowhere
+        // else a log can show: the cloud never records a prompt (by design) and
+        // the scanner never recorded what it sent. Two runs' logs now join on
+        // `file` and answer it per file, offline, for free — instead of
+        // inferring from byte sizes, which cannot say WHICH file moved, or
+        // whether anything moved at all when two files happen to share a length
+        // (carrick#1220 spent five rounds on exactly that).
+        //
+        // Both lengths are here because they localise the difference: a
+        // `guidance_prefix` that moved is the shared front block regenerating
+        // for the whole service, and a body that moved is this file's own
+        // inputs. The digest names the bytes without putting a line of the
+        // scanned repo into a log file the run uploads (#61).
+        debug!(
+            target: PROMPT_FINGERPRINT_TARGET,
+            "analyze-file prompt file={} sha256={} bytes={} guidance_prefix_bytes={}",
+            file_path,
+            prompt_fingerprint(&user_message),
+            user_message.len(),
+            prompt.guidance_prefix_bytes,
+        );
+
         debug!("=== FILE ANALYZER AGENT (AST-GATED) ===");
         debug!("Analyzing file: {}", file_path);
-        debug!(
-            "File size: {} chars, {} lines",
-            file_content.len(),
-            file_content.lines().count()
-        );
-        debug!("Candidate targets: {}", candidate_hints.len());
+        debug!("Prompt size: {} bytes", user_message.len());
 
         let schema = AgentSchemas::file_analysis_schema();
         let response = self
@@ -784,7 +880,21 @@ impl FileAnalyzerAgent {
         // model actually emitted, not by guesswork. Off unless the env is set.
         Self::dump_eval_artifact(file_path, &user_message, &response);
 
-        let mut result: FileAnalysisResult = serde_json::from_str(&response).map_err(|e| {
+        Ok(Self::result_from_answer(file_path, &response)?)
+    }
+
+    /// Read one model answer into the rows the join folds onto.
+    ///
+    /// Apart from the live call: an answer that arrives through a dispatched
+    /// job's answer bundle is the same bytes `/analyze-file` would have
+    /// returned, so it must take the same path into a result — including the
+    /// sanitising below, which is what keeps a "+null" out of the index
+    /// whichever way the answer reached this machine (carrick#1229).
+    pub fn result_from_answer(
+        file_path: &str,
+        response: &str,
+    ) -> Result<FileAnalysisResult, String> {
+        let mut result: FileAnalysisResult = serde_json::from_str(response).map_err(|e| {
             format!(
                 "Failed to parse file analysis response: {}. Raw response: {}",
                 e, response
@@ -2851,4 +2961,32 @@ const data = await fetch('/api/users').then(resp => resp.json());
     // test_system_message_is_framework_agnostic was deleted: the system
     // prompt now lives in carrick-cloud/lambdas/file-analyzer/system_prompt.txt
     // and is no longer accessible from this Rust crate.
+
+    /// The fingerprint has to answer "are these the same bytes the cloud would
+    /// key on" — so equal messages share it and a single byte splits it. A
+    /// digest that missed a one-byte change would report a cache-missing run
+    /// as a matching one, which is the exact failure carrick#1220 chased.
+    #[test]
+    fn the_prompt_fingerprint_names_the_bytes() {
+        let message = "### FILE CONTENT\nconst a = 1;\n";
+        assert_eq!(prompt_fingerprint(message), prompt_fingerprint(message));
+        assert_ne!(
+            prompt_fingerprint(message),
+            prompt_fingerprint("### FILE CONTENT\nconst a = 2;\n")
+        );
+        // A trailing byte is the drift a byte-size comparison is blindest to
+        // when two files happen to share a length.
+        assert_ne!(
+            prompt_fingerprint(message),
+            prompt_fingerprint(&format!("{message} "))
+        );
+        assert_eq!(prompt_fingerprint("").len(), 64, "hex sha256 is 64 chars");
+    }
+
+    /// The target is what a reader filters a run log on, so it is part of the
+    /// diagnostic's contract with whoever is reading two logs side by side.
+    #[test]
+    fn the_fingerprint_target_is_the_documented_one() {
+        assert_eq!(PROMPT_FINGERPRINT_TARGET, "carrick::prompt_fingerprint");
+    }
 }

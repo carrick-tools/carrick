@@ -110,11 +110,18 @@ pub struct ErrorOutput {
     /// (carrick#992).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub running_scans: Vec<super::scan_state::ScanState>,
-    /// What the last paid scan of this workspace cost. Carried on the error
-    /// body too: a first run killed before it wrote an index still spent the
-    /// money, and this is the only surface that can say so (carrick#995).
+    /// What the last scan of this workspace reported, for a reader parsing
+    /// `--json`. Carried on the error body too, because a run killed before
+    /// it wrote an index still uploaded the repos it got through
+    /// (carrick#995). Nothing rendered here says anything about it: our
+    /// inference cost is ours (carrick#1236).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_scan: Option<crate::scan_spend::RunSpend>,
+    /// The same as [`StatusOutput::analysing`], carried on the error body too:
+    /// "there is no index" and "the analysis that builds it is running in the
+    /// cloud" are different answers (carrick#1229).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub analysing: Vec<String>,
 }
 
 impl ErrorOutput {
@@ -127,6 +134,7 @@ impl ErrorOutput {
             error: failure.error.wire().to_string(),
             message: failure.message().to_string(),
             running_scans: Vec::new(),
+            analysing: Vec::new(),
             last_scan: None,
         }
     }
@@ -510,11 +518,16 @@ pub struct StatusOutput {
     /// visible through while it runs (carrick#992).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub running_scans: Vec<super::scan_state::ScanState>,
-    /// What the last paid scan of this workspace cost, one entry per repo it
-    /// scanned (carrick#995). Absent until one has run: the free pass pays for
-    /// nothing, and a scan that has not been priced yet states no figure.
+    /// What the last scan of this workspace reported, one entry per repo it
+    /// scanned (carrick#995). Absent until one has run, and read by whoever
+    /// parses `--json`; the human render states none of it (carrick#1236).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_scan: Option<crate::scan_spend::RunSpend>,
+    /// Analysis Carrick Cloud is doing for this workspace right now, one entry
+    /// per repo handed over (carrick#1229). Empty in the ordinary case, and
+    /// the only part of any read command that touches the network.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub analysing: Vec<String>,
     pub services: Vec<StatusService>,
 }
 
@@ -533,17 +546,14 @@ impl StatusOutput {
         if !self.running_scans.is_empty() {
             out.push('\n');
         }
-        // The paid scan prints this when it finishes, and a detached one
-        // prints it into a log nobody is tailing. So it is repeated here,
-        // dated, for the reader who is asking afterwards (carrick#995).
-        if let Some(spend) = &self.last_scan {
-            for line in spend.lines(Some(&spend.updated_at)) {
-                out.push_str(&line);
-                out.push('\n');
-            }
-            if !spend.is_empty() {
-                out.push('\n');
-            }
+        // Above the index for the same reason: an analysis in flight is about
+        // now, and the index below it is about the last build that finished.
+        for line in &self.analysing {
+            out.push_str(line);
+            out.push('\n');
+        }
+        if !self.analysing.is_empty() {
+            out.push('\n');
         }
         out.push_str(&format!(
             "{} — {} service(s), indexed at {} by carrick {}\n\n",
@@ -879,6 +889,7 @@ mod hosted_wire_tests {
     /// a time against.
     fn status_output() -> StatusOutput {
         StatusOutput {
+            analysing: Vec::new(),
             repos_detected_by: None,
             repos_added: Vec::new(),
             repos_excluded: Vec::new(),
@@ -944,11 +955,11 @@ mod hosted_wire_tests {
         assert!(text.contains("changed  tools/release.ts"), "{text}");
     }
 
-    /// `carrick status` repeats the last paid scan's line, because the scan
-    /// that paid printed it into a log nobody is tailing (carrick#995). It
-    /// leads the index, which describes a moment that has already passed.
+    /// A spend on the output changes nothing a person reads. What a run costs
+    /// us is our figure, never a line in a customer's terminal (carrick#1236);
+    /// the receipt is on `--json` for whoever parses it.
     #[test]
-    fn the_status_render_repeats_what_the_last_paid_scan_cost() {
+    fn the_status_render_says_nothing_about_what_a_scan_cost() {
         let mut spend = crate::scan_spend::RunSpend::default();
         spend.record(
             "api",
@@ -966,25 +977,14 @@ mod hosted_wire_tests {
             },
         );
         let mut output = status_output();
+        let bare = output.render();
         output.last_scan = Some(spend);
 
         let text = output.render();
-        let line = text.lines().next().expect("the money line leads");
-        assert!(line.starts_with("The last paid scan, "), "{text}");
-        assert!(
-            line.ends_with(
-                "US$4.32. First-index ceiling left: US$10.68. Laptop allowance this month: \
-                 US$10.00 of US$10.00."
-            ),
-            "{text}"
-        );
-    }
-
-    /// A workspace with no paid scan behind it says nothing about money: there
-    /// is no placeholder for a figure that does not exist.
-    #[test]
-    fn the_status_render_says_nothing_about_money_when_nothing_was_paid() {
-        assert!(!status_output().render().contains("US$"));
+        assert_eq!(text, bare, "a spend must not add a line");
+        for banned in ["US$", "4.32", "allowance", "ceiling", "paid"] {
+            assert!(!text.contains(banned), "{banned} in {text}");
+        }
     }
 
     /// The receipt rides the error body too. A first paid run killed before it

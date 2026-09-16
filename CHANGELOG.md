@@ -1,5 +1,74 @@
 # Changelog
 
+## [0.3.75](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.74...carrick-v0.3.75) (2026-09-16)
+
+
+### Features
+
+* **dispatch:** hand a scan's prompts to Carrick Cloud, and collect them later (carrick[#1229](https://github.com/carrick-tools/carrick/issues/1229)) ([#1243](https://github.com/carrick-tools/carrick/issues/1243)) ([089bf49](https://github.com/carrick-tools/carrick/commit/089bf49bb72a453b188e4c2dfd72980a188e987a))
+
+## [0.3.74](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.73...carrick-v0.3.74) (2026-09-16)
+
+
+### Features
+
+* **agent:** fingerprint every analyze-file prompt in the run log ([#1220](https://github.com/carrick-tools/carrick/issues/1220)) ([#1225](https://github.com/carrick-tools/carrick/issues/1225)) ([dc45419](https://github.com/carrick-tools/carrick/commit/dc45419333b70af3e7f789527551e7bf99451b88))
+* **agent:** send X-Carrick-Service on prompt-lambda calls ([#1230](https://github.com/carrick-tools/carrick/issues/1230)) ([8e39e96](https://github.com/carrick-tools/carrick/commit/8e39e96da530a08ec853358982090689ecda743c))
+
+
+### Bug Fixes
+
+* **cache:** key the analysis cache on content, not on where the scan ran ([#1233](https://github.com/carrick-tools/carrick/issues/1233)) ([f447218](https://github.com/carrick-tools/carrick/commit/f447218a9516d40a5fec531a0ff6ad486d82a05b))
+* **cli:** stop printing our inference cost to the customer's terminal ([#1237](https://github.com/carrick-tools/carrick/issues/1237)) ([d2e9195](https://github.com/carrick-tools/carrick/commit/d2e919594eca314d7c6427943a91dfb24b45dc66)), closes [#1236](https://github.com/carrick-tools/carrick/issues/1236)
+* **limiter:** restore a route's concurrency after a quiet spell ([#1226](https://github.com/carrick-tools/carrick/issues/1226)) ([649052b](https://github.com/carrick-tools/carrick/commit/649052b02b6c83b77d7476cfa07c78b71b82662a))
+
+
+### CI/CD
+
+* ratchet guard against our inference cost in customer-facing strings ([#1241](https://github.com/carrick-tools/carrick/issues/1241)) ([178bea2](https://github.com/carrick-tools/carrick/commit/178bea267afb2c1c370b77f4815d4732ea4b8010))
+
+## [0.3.73](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.72...carrick-v0.3.73) (2026-09-15)
+
+
+### Features
+
+* **graphql:** carry each call row's schema binding in the index ([#1195](https://github.com/carrick-tools/carrick/issues/1195)) ([b516312](https://github.com/carrick-tools/carrick/commit/b516312e64867721e460385b56a1a3641334e058)), closes [#1134](https://github.com/carrick-tools/carrick/issues/1134)
+* **graphql:** serve SDL argument lists as request rows (carrick[#1158](https://github.com/carrick-tools/carrick/issues/1158)) ([#1207](https://github.com/carrick-tools/carrick/issues/1207)) ([d9d2eb6](https://github.com/carrick-tools/carrick/commit/d9d2eb68c0f654e205c548dbfe54e7a63a0659f7))
+* **index:** count repeat calls on the folded call edge (carrick[#1159](https://github.com/carrick-tools/carrick/issues/1159) item 1) ([#1202](https://github.com/carrick-tools/carrick/issues/1202)) ([51606f2](https://github.com/carrick-tools/carrick/commit/51606f27cdbf3cede8f477bcefb09f79d2f54831))
+* **index:** place each route's handler function on its endpoint row (cloud[#948](https://github.com/carrick-tools/carrick/issues/948)) ([#1201](https://github.com/carrick-tools/carrick/issues/1201)) ([d33d6a4](https://github.com/carrick-tools/carrick/commit/d33d6a4bdeb776a2446193dda2dd357fde5b644f))
+* **types:** bump the capture artifact schema to 2 for 0.3.73 ([#1216](https://github.com/carrick-tools/carrick/issues/1216)) ([8bbb6a7](https://github.com/carrick-tools/carrick/commit/8bbb6a7bf643c4635c025a84bbdc45f91af982dc))
+
+
+### Bug Fixes
+
+* **call-graph:** record a JSX element as a call to the component it renders ([#1149](https://github.com/carrick-tools/carrick/issues/1149)) ([#1170](https://github.com/carrick-tools/carrick/issues/1170)) ([7a7e4c5](https://github.com/carrick-tools/carrick/commit/7a7e4c5b3dbe1dc05dac6cb2873cffb7ba127df0))
+* **call-graph:** resolve calls through an imported module-scope instance ([#1147](https://github.com/carrick-tools/carrick/issues/1147)) ([#1168](https://github.com/carrick-tools/carrick/issues/1168)) ([99c18b0](https://github.com/carrick-tools/carrick/commit/99c18b051d021180df57dce20f7cca8213b8da46))
+* **engine:** scrub machine paths at the upload boundary ([#1215](https://github.com/carrick-tools/carrick/issues/1215)) ([d9b3614](https://github.com/carrick-tools/carrick/commit/d9b3614e5bc4ecd621b62b089a747c9c895fc95c)), closes [#1204](https://github.com/carrick-tools/carrick/issues/1204)
+* **engine:** strip machine paths from every served type string ([#1176](https://github.com/carrick-tools/carrick/issues/1176)) ([01dd21e](https://github.com/carrick-tools/carrick/commit/01dd21e105e4bc3e60b46ec88887d1508f384f3f)), closes [#1160](https://github.com/carrick-tools/carrick/issues/1160)
+* **graphql:** attribute documents to the schema they are written against ([#1177](https://github.com/carrick-tools/carrick/issues/1177)) ([e0508b6](https://github.com/carrick-tools/carrick/commit/e0508b6ea9b4cbd4c3f67c5e9343f9374eae6b50))
+* **graphql:** drop HTTP rows at call sites that execute a GraphQL document ([#1173](https://github.com/carrick-tools/carrick/issues/1173)) ([40808bb](https://github.com/carrick-tools/carrick/commit/40808bb9eb7d3f86b6ecffe13a47c89b3a7c6a24))
+* **graphql:** index a compiled document's operations at the calls that execute it ([#1198](https://github.com/carrick-tools/carrick/issues/1198)) ([78c95d7](https://github.com/carrick-tools/carrick/commit/78c95d7578fe722af533562cee62b44a87e95005)), closes [#1157](https://github.com/carrick-tools/carrick/issues/1157)
+* **graphql:** serve a walked schema only from a service that shows it serves one ([#1211](https://github.com/carrick-tools/carrick/issues/1211)) ([30a139c](https://github.com/carrick-tools/carrick/commit/30a139cd7248494610cde49c3140c10fd9bd8bee))
+* **index:** own parameter-default calls, count bodiless routes apart, resolve SDK clients through aliases and ternaries ([#1197](https://github.com/carrick-tools/carrick/issues/1197)) ([fe10b6a](https://github.com/carrick-tools/carrick/commit/fe10b6a518f605a53c088ecd9c60916a828b1f36))
+* **local:** stamp this run's row when the cloud re-indexed the same commit ([#1217](https://github.com/carrick-tools/carrick/issues/1217)) ([5981347](https://github.com/carrick-tools/carrick/commit/5981347052bbca1507914934eeee1c58d9352d9c)), closes [#1214](https://github.com/carrick-tools/carrick/issues/1214)
+* **match:** serve routes registered with .all() and match them against every method ([#1178](https://github.com/carrick-tools/carrick/issues/1178)) ([e159ab9](https://github.com/carrick-tools/carrick/commit/e159ab989aabb1f9d6472e07c0d4b87ec9d8f926)), closes [#1148](https://github.com/carrick-tools/carrick/issues/1148)
+* **mount-graph:** stop applying a mount prefix twice when the model copies the mount segment into a route ([#1169](https://github.com/carrick-tools/carrick/issues/1169)) ([d9a2aab](https://github.com/carrick-tools/carrick/commit/d9a2aab9a4d1adb5b047425216d008d7a904acde)), closes [#1145](https://github.com/carrick-tools/carrick/issues/1145)
+* **packages:** resolve pnpm catalog: specifiers from the nearest pnpm-workspace.yaml ([#1193](https://github.com/carrick-tools/carrick/issues/1193)) ([b872966](https://github.com/carrick-tools/carrick/commit/b872966ebe8f86a101c188e6d6020ce63e79ce30)), closes [#1156](https://github.com/carrick-tools/carrick/issues/1156)
+* **release:** treat npm's 409 "previously staged" as published, and wait for carrick itself ([#1143](https://github.com/carrick-tools/carrick/issues/1143)) ([095b7c1](https://github.com/carrick-tools/carrick/commit/095b7c1a4ba370b36981fd69598b941861f9dc4e)), closes [#1140](https://github.com/carrick-tools/carrick/issues/1140)
+* **sidecar,engine:** do not publish capture answers that name unresolved types ([#1190](https://github.com/carrick-tools/carrick/issues/1190)) ([70131da](https://github.com/carrick-tools/carrick/commit/70131dad4b0b980157d7fd8e394b1e12999a3313))
+* **sidecar:** label an any left by an unresolved import as unresolved_import ([#1181](https://github.com/carrick-tools/carrick/issues/1181)) ([509e2ae](https://github.com/carrick-tools/carrick/commit/509e2ae0dfd4b0a4b6e63c096c4580038be7b1af))
+* **sidecar:** read request rows a route declares only in its handler body ([#1186](https://github.com/carrick-tools/carrick/issues/1186)) ([54f6fab](https://github.com/carrick-tools/carrick/commit/54f6fabc5e3532e81ee28a624715df75401fda87)), closes [#1166](https://github.com/carrick-tools/carrick/issues/1166) [#1162](https://github.com/carrick-tools/carrick/issues/1162)
+* **sidecar:** rewrite absolute installed-package specifiers in capture stubs ([#1199](https://github.com/carrick-tools/carrick/issues/1199)) ([9917847](https://github.com/carrick-tools/carrick/commit/99178474ce11c0690c04042bf2d0f21b5a29e1a0))
+* **sidecar:** stop judging consumer types that state no contract, and locate broken member chains ([#1191](https://github.com/carrick-tools/carrick/issues/1191)) ([38af1a0](https://github.com/carrick-tools/carrick/commit/38af1a08e695c4b03997f9c03cd7c9415760453d))
+* **sidecar:** type a route response from every success send in its handler ([#1183](https://github.com/carrick-tools/carrick/issues/1183)) ([14f033b](https://github.com/carrick-tools/carrick/commit/14f033b0dec45154e40ff979124a780e708e0b44))
+* **urls:** resolve call bases read through path consts, imported config objects and imported string consts ([#1172](https://github.com/carrick-tools/carrick/issues/1172)) ([7385ccb](https://github.com/carrick-tools/carrick/commit/7385ccb49f71744a87e8628ed102d9abe7f9995f))
+* **wrappers:** resolve same-file wrapper chains with the URL in a const and the method in an options object ([#1180](https://github.com/carrick-tools/carrick/issues/1180)) ([37e6730](https://github.com/carrick-tools/carrick/commit/37e673086fbbcc3ed56756be63611596baad536a))
+
+
+### CI/CD
+
+* trigger required checks on merge_group events ([#1167](https://github.com/carrick-tools/carrick/issues/1167)) ([e3c2718](https://github.com/carrick-tools/carrick/commit/e3c271858f5318a2ffce8f36deeabb79c4812ca5))
+
 ## [0.3.72](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.71...carrick-v0.3.72) (2026-09-15)
 
 

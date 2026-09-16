@@ -358,7 +358,7 @@ fn the_boundary_block_states_counts_totals_and_the_commit() {
         ..Default::default()
     };
 
-    let boundary = ServiceBoundary::collect(&data, &stats, "/tmp/scan-root");
+    let boundary = ServiceBoundary::collect(&data, &stats, &HashMap::new(), "/tmp/scan-root");
     let json = serde_json::to_value(&boundary).expect("the boundary serializes");
 
     assert_eq!(json["commit_hash"], "0123456789abcdef");
@@ -384,6 +384,9 @@ fn the_boundary_block_states_counts_totals_and_the_commit() {
         "a call with no literal segment is in the index and unclaimable: {json:#?}"
     );
     assert_eq!(json["routes_without_response_type"]["total"], 1);
+    // carrick#1159: routes that send no body are counted apart, and the count
+    // is stated even at zero.
+    assert_eq!(json["routes_without_body"]["total"], 0);
     assert_eq!(json["calls_without_expected_type"]["total"], 1);
     assert_eq!(json["bare_checkout"], false);
 
@@ -399,7 +402,7 @@ fn the_boundary_block_states_counts_totals_and_the_commit() {
     assert_eq!(json["sdk_unresolved"]["total"], 0);
 
     // A count is never mistaken for the whole list.
-    let many = ServiceBoundary::collect(&data, &stats, "/tmp/scan-root");
+    let many = ServiceBoundary::collect(&data, &stats, &HashMap::new(), "/tmp/scan-root");
     assert!(many.unknown_call_paths.reasons.len() <= MAX_REASONS);
 }
 
@@ -429,4 +432,7 @@ fn a_blob_without_a_boundary_reads_as_unstated() {
         .expect("the boundary survived the wire");
     assert_eq!(boundary.commit_hash, "abc1234");
     assert_eq!(boundary.files_attempted, 2);
+    // A boundary that never counted routes without a body (an older scanner)
+    // omits the field on the wire and reads back as unstated, not zero.
+    assert_eq!(boundary.routes_without_body, None);
 }

@@ -151,7 +151,7 @@ function pnpmLockfileVersions(lockPath: string): Map<string, string> {
  * sentinel. A rejected version means "unpinned" (fail-closed abstain
  * downstream), never a pin that would fail the synthetic-workspace install.
  */
-function isPublishedSemver(version: string): boolean {
+export function isPublishedSemver(version: string): boolean {
   return (
     /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version) &&
     !version.startsWith('0.0.0-use.')

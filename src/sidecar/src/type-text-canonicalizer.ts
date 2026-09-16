@@ -164,13 +164,34 @@ function canonicalizeMember(member: string): string {
  * the compiler rendered it.
  */
 function orderTextMembers(members: string[]): string[] {
-  return members
-    .map((text, index) => ({ text: text.trim(), index }))
+  return foldBooleanLiterals(members.map((text) => text.trim()))
+    .map((text, index) => ({ text, index }))
     .sort((a, b) => {
       if (a.text !== b.text) return a.text < b.text ? -1 : 1;
       return a.index - b.index;
     })
     .map((entry) => entry.text);
+}
+
+/**
+ * A union's rendered members with the literal pair `false`, `true` folded into
+ * `boolean` (carrick#1165).
+ *
+ * The compiler stores `boolean` as exactly that pair, and its own printer folds
+ * it back. Anything that renders a union member by member — the structural
+ * walk, and this file's reordering of a compiler print — sees the two literals
+ * separately, and sorting them apart produced `false | null | true` for
+ * `boolean | null`. Folding before the sort gives the one print a reader and a
+ * diff expect. A lone literal is a literal type and is kept. Shared by
+ * `orderMembers` in `type-structural-expander.ts`, so both halves of the normal
+ * form fold the same way.
+ */
+export function foldBooleanLiterals(members: string[]): string[] {
+  const falseAt = members.indexOf('false');
+  const trueAt = members.indexOf('true');
+  if (falseAt === -1 || trueAt === -1) return members;
+  const rest = members.filter((member) => member !== 'false' && member !== 'true');
+  return rest.includes('boolean') ? rest : [...rest, 'boolean'];
 }
 
 /** Half-open range of one piece of a depth-zero split. */

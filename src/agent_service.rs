@@ -1,6 +1,7 @@
 use crate::oidc::OidcProvider;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -439,6 +440,12 @@ const RETRY_AFTER_CAP: Duration = PATIENT_RETRY_MAX_DELAY;
 /// function. With it the worst case is 3 + 6 = 9.
 const ATTEMPT_HEADER: &str = "X-Carrick-Attempt";
 
+/// The request header naming the service whose analysis this call belongs to
+/// (carrick#1221). The cloud logs it beside `run_id` and `scan_id`, which is
+/// what makes a monorepo's model spend attributable to one tree. See
+/// [`crate::current_service`] for when it is present.
+const SERVICE_HEADER: &str = "X-Carrick-Service";
+
 /// A `Retry-After` value in delta-seconds, the only form the cloud sends. The
 /// HTTP-date form and anything unparseable read as no hint, which leaves the
 /// ordinary backoff in charge.
@@ -726,7 +733,7 @@ impl AgentService {
             }
             return Ok(LambdaOutcome {
                 text: generate_mock_for_task(task_path, body, mock_seed),
-                guidance_key: None,
+                guidance_key: mock_guidance_key(task_path, body),
             });
         }
 
@@ -861,6 +868,21 @@ impl AgentService {
                 .header("X-Carrick-Scanner-Version", env!("CARGO_PKG_VERSION"))
                 .header("X-Carrick-Run-Id", crate::logging::run_id())
                 .header(ATTEMPT_HEADER, lambda_attempt.to_string());
+            // Which tree of a monorepo is spending. Log-only on the cloud
+            // side: it is read where `ctx` is built and reaches no cache key,
+            // so two services asking about the same file still share one
+            // cached analysis (carrick-cloud#978). Absent outside the service
+            // loop and for an unnamed service, which read the same there.
+            //
+            // A name that is not a legal header value is dropped rather than
+            // sent: `.header()` would store the error and fail the send, so a
+            // `serviceName` with an accent in it would otherwise stop every
+            // prompt call of the scan over a log field.
+            if let Some(service) = crate::current_service::name()
+                .and_then(|name| reqwest::header::HeaderValue::from_str(&name).ok())
+            {
+                request_builder = request_builder.header(SERVICE_HEADER, service);
+            }
             request_builder = match auth {
                 RequestAuth::Oidc(_) => request_builder.header("X-Carrick-OIDC", &token),
                 RequestAuth::Bearer(_) => {
@@ -1199,6 +1221,29 @@ impl AgentService {
             "Maximum retry attempts exceeded".to_string(),
         ))
     }
+}
+
+/// The `guidance_key` an offline `/framework-guidance` answer carries.
+///
+/// The cloud derives this id from the REQUEST — its prompt, model, task and
+/// the detected framework inventory — never from the words that come back, so
+/// guidance regenerating into different words under the same id does not
+/// re-analyse a repo's files (carrick-cloud#871). The mock has to model that,
+/// because the scanner now refuses to replay guidance that carries no id
+/// (carrick#1224): a mock that returned `None` would make every warm offline
+/// scan ask for guidance again and hide the replay path from every test that
+/// covers it.
+///
+/// Hashing the serialized request body is the same relation in miniature:
+/// deterministic across processes, and different for a different framework set.
+fn mock_guidance_key<B: Serialize + ?Sized>(task_path: &str, body: &B) -> Option<String> {
+    if task_path != "/framework-guidance" {
+        return None;
+    }
+    let material = serde_json::to_string(body).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(material.as_bytes());
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 /// A failure an offline run answers instead of the mock response, for the
@@ -3916,6 +3961,83 @@ pub(crate) mod tests {
         );
     }
 
+    /// One prompt-lambda call against a stub, returning the raw request it
+    /// received. The laptop branch, because it is the shorter one; the
+    /// service header is attached before the credential branches, so both
+    /// carry it.
+    async fn prompt_call_request() -> String {
+        let (api_base, server) = stub_server(vec![(
+            200,
+            r#"{"success":true,"text":"analysed"}"#.to_string(),
+        )]);
+        let result = AgentService::new()
+            .post_with_retry(
+                &RequestAuth::Bearer("carrick_sk_live_test".to_string()),
+                &api_base,
+                "/analyze-file",
+                &serde_json::json!({}),
+            )
+            .await;
+        assert_eq!(result.unwrap().text, "analysed");
+        server.join().unwrap().remove(0)
+    }
+
+    /// The cross-repo phase and the upload belong to no service, so a call
+    /// made outside the scan loop must not be billed to whichever service
+    /// happened to run last.
+    #[tokio::test]
+    #[serial(current_service)]
+    async fn a_call_outside_the_service_loop_sends_no_service_header() {
+        let request = prompt_call_request().await;
+        assert!(
+            header_of(&request, "x-carrick-service").is_none(),
+            "a call outside the loop names no service: {request}"
+        );
+    }
+
+    /// Inside the loop every prompt call carries the name of the service
+    /// being analysed, which is what makes a monorepo's model spend
+    /// attributable to one tree (carrick#1221).
+    #[tokio::test]
+    #[serial(current_service)]
+    async fn a_call_inside_a_service_scope_names_that_service() {
+        let _scope = crate::current_service::enter(Some("api"));
+        let request = prompt_call_request().await;
+        assert_eq!(
+            header_of(&request, "x-carrick-service").as_deref(),
+            Some("api")
+        );
+    }
+
+    /// A single unnamed service sends nothing rather than the `(root)` the
+    /// log lines use: an absent header already says the same thing, and there
+    /// is only one service in that case anyway.
+    #[tokio::test]
+    #[serial(current_service)]
+    async fn an_unnamed_service_sends_no_service_header() {
+        let _scope = crate::current_service::enter(None);
+        let request = prompt_call_request().await;
+        assert!(
+            header_of(&request, "x-carrick-service").is_none(),
+            "an unnamed service sends no name: {request}"
+        );
+    }
+
+    /// `serviceName` is whatever the user wrote in `carrick.json`. A value
+    /// that is not a legal header value costs the call its log field and
+    /// nothing else — handing it to `.header()` would store a builder error
+    /// and fail the send, stopping every prompt call of the scan over a name.
+    #[tokio::test]
+    #[serial(current_service)]
+    async fn a_service_name_that_is_not_a_legal_header_value_is_dropped() {
+        let _scope = crate::current_service::enter(Some("café\nservice"));
+        let request = prompt_call_request().await;
+        assert!(
+            header_of(&request, "x-carrick-service").is_none(),
+            "an illegal name is dropped, not sent: {request}"
+        );
+    }
+
     /// A Bearer credential cannot be re-minted — only a fresh consent replaces
     /// it — so a rejection is a sentence and a stop, not a retry against the
     /// same token (§8.2).
@@ -3942,6 +4064,305 @@ pub(crate) mod tests {
             1,
             "there is no second credential to try"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // carrick-cloud#869 measurement harness. These print a table and assert
+    // nothing, so they are `#[ignore]`d; they are what `QUIET_RESTORE` was
+    // chosen from. Run one with
+    //   cargo test --lib agent_service::tests::probe_869 -- --ignored --nocapture
+    // ---------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct DsqCounts {
+        /// Requests the stub answered.
+        requests: std::sync::atomic::AtomicUsize,
+        /// Requests answered 503 `model_error` because every in-lambda try was
+        /// refused. What a scan pays for twice: once in wall clock, once
+        /// against the caller's daily request bucket.
+        exhausted: std::sync::atomic::AtomicUsize,
+        /// Individual model tries, the thing a refusal is drawn against.
+        tries: std::sync::atomic::AtomicUsize,
+    }
+
+    /// A lambda in front of a model on dynamic shared quota: whether a try is
+    /// refused is drawn against a probability that depends only on how long
+    /// the run has been going, never on how many requests are in flight.
+    ///
+    /// That is the shape the 2026-09-14 first index measured
+    /// (carrick-cloud#869): two windows of about twenty minutes in which 13.4%
+    /// of model calls came back exhausted, 0.3% between them, and no relation
+    /// to the scan's own model-call rate — its highest minute of the window,
+    /// 171 calls, was refused nothing. The lambda's own chain is modelled
+    /// too: three tries on `X-Carrick-Attempt` 1, one on later attempts
+    /// (carrick-cloud#875).
+    async fn dsq_lambda(
+        dip: std::ops::Range<Duration>,
+        p_dip: f64,
+        p_clear: f64,
+        hold: Duration,
+    ) -> (String, Arc<DsqCounts>) {
+        let counts = Arc::new(DsqCounts::default());
+        let started = std::time::Instant::now();
+        let draws = Arc::new(std::sync::atomic::AtomicU64::new(0x9E37_79B9_7F4A_7C15));
+        let shared = Arc::clone(&counts);
+        let base = concurrent_stub(move |request| {
+            let counts = Arc::clone(&shared);
+            let draws = Arc::clone(&draws);
+            let dip = dip.clone();
+            async move {
+                counts.requests.fetch_add(1, Ordering::SeqCst);
+                let attempt = header_of(&request, "x-carrick-attempt")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(1);
+                let in_lambda_tries = if attempt <= 1 { 3 } else { 1 };
+                let p = if dip.contains(&started.elapsed()) {
+                    p_dip
+                } else {
+                    p_clear
+                };
+                let mut served = false;
+                for _ in 0..in_lambda_tries {
+                    counts.tries.fetch_add(1, Ordering::SeqCst);
+                    if draw(&draws) >= p {
+                        served = true;
+                        break;
+                    }
+                }
+                if !served {
+                    counts.exhausted.fetch_add(1, Ordering::SeqCst);
+                    return (
+                        503,
+                        r#"{"success":false,"error":{"code":"model_error","message":"RESOURCE_EXHAUSTED","retriable":true}}"#
+                            .to_string(),
+                        vec![("Retry-After", "0".to_string())],
+                    );
+                }
+                tokio::time::sleep(hold).await;
+                (
+                    200,
+                    r#"{"success":true,"text":"analysed"}"#.to_string(),
+                    Vec::new(),
+                )
+            }
+        })
+        .await;
+        (base, counts)
+    }
+
+    /// A uniform in `[0, 1)` from a shared counter, xorshift64*: every arm
+    /// draws from the same stream, and a run is reproducible.
+    fn draw(state: &std::sync::atomic::AtomicU64) -> f64 {
+        let mut x = state
+            .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::SeqCst)
+            .wrapping_add(0x9E37_79B9);
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// The probe's backoff, scaled down with everything else: the shape of
+    /// the chain is the scanner's, the numbers are a fraction of it.
+    fn probe_policy() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: MAX_RETRIES,
+            max_delay: Duration::from_millis(200),
+            wait_budget: Duration::from_secs(600),
+            run_budgeted: false,
+        }
+    }
+
+    fn service_with_quiet(permits: usize, route_max: usize, quiet: Duration) -> AgentService {
+        AgentService {
+            client: Client::builder().no_proxy().build().unwrap(),
+            semaphore: Arc::new(Semaphore::new(permits)),
+            limits: Arc::new(RouteLimits::with_quiet(route_max, quiet)),
+            pacer: Arc::new(RatePacer::new()),
+            retry: probe_policy(),
+        }
+    }
+
+    async fn drive(service: &AgentService, api_base: &str, calls: usize) -> (Duration, usize) {
+        let auth = RequestAuth::Bearer("carrick_sk_live_test".to_string());
+        let body = serde_json::json!({});
+        let at = std::time::Instant::now();
+        let results = futures::future::join_all(
+            (0..calls).map(|_| service.post_with_retry(&auth, api_base, "/generate-intent", &body)),
+        )
+        .await;
+        (at.elapsed(), results.iter().filter(|r| r.is_err()).count())
+    }
+
+    /// The quiet spells to compare, as multiples of one call's latency, so a
+    /// probe on a fast route and a probe on a slow one can be read together.
+    ///
+    /// The shipped spell is a minute, which is about 18 call latencies on
+    /// file analysis (3.4 s p50) and about 40 on the intent route (1.5 s), so
+    /// the slow-route table brackets it closely and the fast-route table
+    /// brackets it only from below. That is enough to read it, because the
+    /// arms converge on the old rule's numbers as the spell lengthens: a
+    /// spell longer than the longest arm is no less safe than that arm.
+    const PROBE_ARMS: [(&str, u32); 5] = [
+        ("run at width only (the old rule)", 0),
+        ("quiet spell = 20 call latencies", 20),
+        ("quiet spell = 9 call latencies", 9),
+        ("quiet spell = 4 call latencies", 4),
+        ("quiet spell = 0 (no cut kept)", 1),
+    ];
+
+    /// The intent route's shape: many short calls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "probe: prints a table and takes about two minutes"]
+    async fn probe_869_dsq_shape_fast_route() {
+        let hold = Duration::from_millis(150);
+        dsq_arms(1500, hold, &quiet_arms(hold)).await;
+    }
+
+    /// The file-analysis shape: fewer, slower calls, where a limit that climbs
+    /// back one slot per round of successes at that width is minutes of
+    /// climbing (2026-09-15 scale test).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "probe: prints a table and takes about two minutes"]
+    async fn probe_869_dsq_shape_slow_route() {
+        let hold = Duration::from_millis(800);
+        dsq_arms(450, hold, &quiet_arms(hold)).await;
+    }
+
+    fn quiet_arms(hold: Duration) -> Vec<(String, Duration)> {
+        PROBE_ARMS
+            .iter()
+            .map(|(name, latencies)| {
+                let quiet = match latencies {
+                    0 => Duration::MAX,
+                    n => hold * *n - hold,
+                };
+                ((*name).to_string(), quiet)
+            })
+            .collect()
+    }
+
+    const PROBE_MAX: usize = DEFAULT_CONCURRENCY_LIMIT;
+
+    async fn dsq_arms(calls: usize, hold: Duration, arms: &[(String, Duration)]) {
+        const CAP: usize = PROBE_MAX;
+        let dip = Duration::from_secs(2)..Duration::from_secs(8);
+
+        println!(
+            "arm | wall clock | requests | exhausted 503 | model tries | failed | back to max \
+             after the dip | time below max"
+        );
+        for (name, quiet) in arms {
+            let (api_base, counts) = dsq_lambda(dip.clone(), 0.53, 0.02, hold).await;
+            let service = service_with_quiet(28, CAP, *quiet);
+            let limit = service.limits.for_route("/generate-intent");
+            let stop = Arc::new(AtomicBool::new(false));
+            let samples = Arc::new(Mutex::new(Vec::<(f64, usize)>::new()));
+            let sampler = {
+                let limit = Arc::clone(&limit);
+                let stop = Arc::clone(&stop);
+                let samples = Arc::clone(&samples);
+                let at = std::time::Instant::now();
+                tokio::spawn(async move {
+                    while !stop.load(Ordering::SeqCst) {
+                        samples
+                            .lock()
+                            .unwrap()
+                            .push((at.elapsed().as_secs_f64(), limit.limit()));
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+            };
+            let (wall, failed) = drive(&service, &api_base, calls).await;
+            stop.store(true, Ordering::SeqCst);
+            let _ = sampler.await;
+            let samples = samples.lock().unwrap().clone();
+            let back = samples
+                .iter()
+                .find(|(t, l)| *t >= dip.end.as_secs_f64() && *l == CAP)
+                .map(|(t, _)| *t - dip.end.as_secs_f64());
+            let below = samples.iter().filter(|(_, l)| *l < CAP).count() as f64
+                / samples.len().max(1) as f64;
+            println!(
+                "{name} | {:.2}s | {} | {} | {} | {} | {} | {:.0}%",
+                wall.as_secs_f64(),
+                counts.requests.load(Ordering::SeqCst),
+                counts.exhausted.load(Ordering::SeqCst),
+                counts.tries.load(Ordering::SeqCst),
+                failed,
+                back.map_or_else(|| "never".to_string(), |s| format!("{s:.2}s")),
+                below * 100.0,
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    /// The capacity shape the cut was built for (carrick#1119's control): the
+    /// backend really does have room for a fixed number at once, so this
+    /// scan's own rate is what produces the refusals. The quiet spell must
+    /// not undo the cut here — and it cannot, because under this shape the
+    /// refusals never stop for one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "probe: prints a table and takes about a minute"]
+    async fn probe_869_capacity_shape() {
+        let hold = Duration::from_millis(150);
+        // Room for four at once: the edge is far below half the maximum.
+        capacity_arms(4, hold, &quiet_arms(hold)).await;
+        // Room for twenty: the edge is inside the top half of the maximum,
+        // where a restore has the furthest to overshoot.
+        capacity_arms(20, hold, &quiet_arms(hold)).await;
+    }
+
+    async fn capacity_arms(threshold: usize, hold: Duration, arms: &[(String, Duration)]) {
+        const CALLS: usize = 300;
+        println!("--- backend with room for {threshold} at once, maximum {PROBE_MAX} ---");
+        println!("arm | wall clock | refused | failed calls");
+        for (name, quiet) in arms {
+            let threshold = Arc::new(std::sync::atomic::AtomicUsize::new(threshold));
+            let (api_base, counts) = busy_lambda(Arc::clone(&threshold), hold).await;
+            let service = service_with_quiet(28, PROBE_MAX, *quiet);
+            let (wall, failed) = drive(&service, &api_base, CALLS).await;
+            println!(
+                "{name} | {:.2}s | {} | {}",
+                wall.as_secs_f64(),
+                counts.refused.load(Ordering::SeqCst),
+                failed,
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    /// A clean run: nothing is refused, so no limit ever leaves its maximum
+    /// and the quiet spell has nothing to restore. The arms must match.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "probe: prints a table"]
+    async fn probe_869_clean_run() {
+        const CAP: usize = 20;
+        const CALLS: usize = 1500;
+        let hold = Duration::from_millis(150);
+
+        println!("arm | wall clock | requests");
+        for (name, quiet) in [
+            ("run at width only (the old rule)", Duration::MAX),
+            ("quiet spell = 20 call latencies", hold * 19),
+        ] {
+            let (api_base, counts) = dsq_lambda(
+                Duration::from_secs(0)..Duration::from_secs(0),
+                0.0,
+                0.0,
+                hold,
+            )
+            .await;
+            let service = service_with_quiet(28, CAP, quiet);
+            let (wall, _) = drive(&service, &api_base, CALLS).await;
+            println!(
+                "{name} | {:.2}s | {}",
+                wall.as_secs_f64(),
+                counts.requests.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 
     fn unix_now() -> u64 {

@@ -160,7 +160,7 @@ fn inside(
     )
     .map_err(|e| e.to_string())?;
     let scan_dir = generation.join("scan");
-    let mut scan = scan_command(&exe, repo, &scan_dir, &previous, false);
+    let mut scan = scan_command(&exe, repo, &scan_dir, &previous, &super::index::Pass::Facts);
     scan.env(super::SKIP_SIGNATURES_ENV, "1")
         .env_remove(crate::progress::PROGRESS_ENV);
     bounded(scan, "re-scan", deadline)?;

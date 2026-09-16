@@ -16,7 +16,9 @@
 //! `CARRICK_LOCAL_STORAGE_DIR` env var (see `main.rs`). The engine never learns
 //! it is in eval mode — same contract as `MockStorage`.
 
-use crate::cloud_storage::{CloudRepoData, CloudStorage, StorageError, UploadOutcome};
+use crate::cloud_storage::{
+    CloudRepoData, CloudStorage, JobSubmission, StorageError, UploadOutcome,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -89,6 +91,40 @@ impl LocalDirStorage {
 
 #[async_trait]
 impl CloudStorage for LocalDirStorage {
+    /// An offline run takes every job it is handed: there is no deployment to
+    /// wait for, and the harness's whole interest is in the bundle itself.
+    fn accepts_analysis_job(&self) -> bool {
+        true
+    }
+
+    /// Write the dispatched job where an offline run can read it back.
+    ///
+    /// The eval harness and the dispatch tests need the bundle itself — the
+    /// rows, their ids, what the header carries once — and nothing about it is
+    /// a property of the cloud. So this backend takes the job, names it after
+    /// the repo, and answers as the cloud would (carrick#1229).
+    async fn submit_analysis_job(
+        &self,
+        bundle: &crate::analysis_job::JobBundle,
+    ) -> Result<Option<JobSubmission>, StorageError> {
+        let bytes = bundle.encode().map_err(StorageError::SerializationError)?;
+        let path = self
+            .cache_path(&bundle.header.repo, None)
+            .with_extension("analysis-job.ndjson.gz");
+        std::fs::write(&path, &bytes).map_err(|e| {
+            StorageError::ConnectionError(format!("could not write {}: {e}", path.display()))
+        })?;
+        debug!(
+            "Wrote a {} row analysis job to {}",
+            bundle.analyze.len(),
+            path.display()
+        );
+        Ok(Some(JobSubmission {
+            job_id: crate::analysis_job::digest(&bytes).0[..12].to_string(),
+            analyze_rows: bundle.analyze.len(),
+        }))
+    }
+
     async fn upload_repo_data(
         &self,
         data: &CloudRepoData,

@@ -64,6 +64,13 @@ export interface LiteralAnchorRequest {
   /** Verbatim TS type text (a bare symbol name or an inline object type). */
   type_text: string;
   anchor_origin: AnchorOrigin;
+  /**
+   * Repo-root-relative file the text was printed from, when there is one.
+   * It joins the analysis program, so a name the text prints bare (an enum
+   * member, a recursive reference) is found declared (carrick#1165). The
+   * record's `source_file` stays `<inline>`: the answer is still the text.
+   */
+  source_file?: string;
 }
 
 /**
@@ -242,6 +249,22 @@ export interface CaptureAliasRecord {
    * Sorted by `path`; absent (not empty) when the walk found nothing.
    */
   any_provenance?: TypeProvenance[];
+  /**
+   * Internal module specifiers that fail to resolve anywhere in this alias's
+   * closure, as the emitted files write them (carrick#1165). The emitted
+   * tree is missing part of what the alias refers to, so a shape printed from
+   * it can name types nothing declares. Sorted; absent when there are none.
+   */
+  dangling_specifiers?: string[];
+  /**
+   * Identifiers this alias's printed text names that do not resolve where the
+   * surface declares it (carrick#1165): a literal anchor's text naming a type
+   * nothing declares, or a node-builder print reusing a source annotation
+   * whose own import did not resolve. Checked on the producer's program, so a global the
+   * program declares (a runtime or `@types` global) is never listed. Sorted;
+   * absent when there are none.
+   */
+  undeclared_names?: string[];
 }
 
 /** Aggregate fidelity metric, emitted per capture (one service). */

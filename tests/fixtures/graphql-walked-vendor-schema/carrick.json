@@ -1,0 +1,24 @@
+{
+  "services": [
+    {
+      "serviceName": "ledger-api",
+      "directory": "apps/api"
+    },
+    {
+      "serviceName": "directory-api",
+      "directory": "apps/directory"
+    },
+    {
+      "serviceName": "wallet-web",
+      "directory": "apps/web"
+    },
+    {
+      "serviceName": "ops-console",
+      "directory": "apps/ops"
+    },
+    {
+      "serviceName": "storefront-gateway",
+      "directory": "apps/gateway"
+    }
+  ]
+}

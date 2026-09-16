@@ -22,6 +22,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::{HashMap, HashSet};
+
+use crate::agents::file_analyzer_agent::{EmissionStyle, FileAnalysisResult};
 use crate::agents::file_orchestrator::ProcessingStats;
 use crate::cloud_storage::{CloudRepoData, ManifestRole, ManifestTypeKind, TypeDegradation};
 
@@ -145,8 +148,17 @@ pub struct ServiceBoundary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_endpoints_discarded_in_claimed_modules: Option<usize>,
     /// Indexed routes with no resolved response type, so nothing on the
-    /// producer side of a compatibility check.
+    /// producer side of a compatibility check. Routes counted in
+    /// `routes_without_body` are not in this count.
     pub routes_without_response_type: Counted,
+    /// Indexed routes the analysis states send no response body at all (a
+    /// redirect, a 204, a stream handed to the transport, a throw), and which
+    /// have no resolved response type (carrick#1159). They have no body
+    /// contract to resolve, so they are not a shortfall in
+    /// `routes_without_response_type`, and are counted here instead. `None`
+    /// on a blob from a scanner that did not separate them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routes_without_body: Option<Counted>,
     /// Indexed calls with no resolved expected type, the consumer-side mirror
     /// of the line above.
     pub calls_without_expected_type: Counted,
@@ -168,8 +180,20 @@ impl ServiceBoundary {
     /// the leak carrick#599 exists to prevent. `repo_path` is that scan root —
     /// the counters are kept while the scan still speaks in absolute paths, so
     /// the reasons are relativised here rather than trusted.
-    pub fn collect(data: &CloudRepoData, stats: &ProcessingStats, repo_path: &str) -> Self {
+    ///
+    /// `file_results` is the merged per-file analysis the scan built its rows
+    /// from (model and deterministic rows both), keyed absolute or
+    /// repo-relative. It is read only for which routes state no response body.
+    pub fn collect(
+        data: &CloudRepoData,
+        stats: &ProcessingStats,
+        file_results: &HashMap<String, FileAnalysisResult>,
+        repo_path: &str,
+    ) -> Self {
         let prefix = format!("{}/", repo_path.trim_end_matches('/'));
+        let no_body = no_body_sites(file_results, &prefix);
+        let (routes_without_response_type, routes_without_body) =
+            routes_without_a_type(data, &no_body);
         let lost = stats
             .errors
             .iter()
@@ -200,7 +224,8 @@ impl ServiceBoundary {
             model_endpoints_discarded_in_claimed_modules: Some(
                 stats.model_endpoints_discarded_in_claimed_modules,
             ),
-            routes_without_response_type: operations_without_a_type(data, ManifestRole::Producer),
+            routes_without_response_type,
+            routes_without_body: Some(routes_without_body),
             calls_without_expected_type: operations_without_a_type(data, ManifestRole::Consumer),
             types_degraded: data.types_degraded.clone(),
             bare_checkout: data
@@ -254,6 +279,12 @@ impl ServiceBoundary {
             &self.routes_without_response_type,
             "route(s) with no resolved response type",
         );
+        if let Some(no_body) = &self.routes_without_body {
+            push(
+                no_body,
+                "route(s) that send no response body (not counted above)",
+            );
+        }
         push(
             &self.calls_without_expected_type,
             "call(s) with no resolved expected type",
@@ -396,34 +427,83 @@ fn unknown_call_paths(data: &CloudRepoData) -> Counted {
 /// whose type extraction failed — means every operation counts, which is the
 /// honest reading: the index has no type for any of them.
 fn operations_without_a_type(data: &CloudRepoData, role: ManifestRole) -> Counted {
+    Counted::from_reasons(
+        untyped_operations(data, role)
+            .map(|(reason, _)| reason)
+            .collect(),
+    )
+}
+
+/// The producer half of [`operations_without_a_type`], split in two: routes
+/// the analysis states send no body (carrick#1159), and every other untyped
+/// route. A redirect or a 204 has no response contract to resolve, so counting
+/// it as a missing type overstates the shortfall.
+fn routes_without_a_type(
+    data: &CloudRepoData,
+    no_body: &HashSet<(String, u32)>,
+) -> (Counted, Counted) {
+    let (bodiless, rest): (Vec<_>, Vec<_>) = untyped_operations(data, ManifestRole::Producer)
+        .partition(|(_, site)| site.as_ref().is_some_and(|site| no_body.contains(site)));
+    (
+        Counted::from_reasons(rest.into_iter().map(|(reason, _)| reason).collect()),
+        Counted::from_reasons(bodiless.into_iter().map(|(reason, _)| reason).collect()),
+    )
+}
+
+/// Every operation of `role` with no resolved response type, as its reason
+/// line and its `(file, line)` site when the row states one.
+fn untyped_operations(
+    data: &CloudRepoData,
+    role: ManifestRole,
+) -> impl Iterator<Item = (String, Option<(String, u32)>)> + '_ {
     let operations = match role {
         ManifestRole::Producer => &data.endpoints,
         ManifestRole::Consumer => &data.calls,
     };
     let manifest = data.type_manifest.as_deref().unwrap_or_default();
-    let typed: std::collections::HashSet<(String, String)> = manifest
+    let typed: HashSet<(String, String)> = manifest
         .iter()
         .filter(|entry| entry.role == role)
         .filter(|entry| matches!(entry.type_kind, ManifestTypeKind::Response))
         .filter(|entry| entry.resolved_definition.is_some())
         .map(|entry| (entry.key.canonical(), entry.file_path.clone()))
         .collect();
-    let reasons = operations
+    operations.iter().filter_map(move |operation| {
+        let location = operation.file_path.to_string_lossy();
+        let (file, line) = match location.rsplit_once(':') {
+            Some((file, line)) => (file, line.parse::<u32>().ok()),
+            None => (location.as_ref(), None),
+        };
+        if typed.contains(&(operation.key.canonical(), file.to_string())) {
+            return None;
+        }
+        let reason = format!(
+            "{} ({})",
+            operation.key.canonical(),
+            operation.file_path.display()
+        );
+        Some((reason, line.map(|line| (file.to_string(), line))))
+    })
+}
+
+/// The `(repo-relative file, line)` of every route the merged analysis states
+/// sends no response body.
+fn no_body_sites(
+    file_results: &HashMap<String, FileAnalysisResult>,
+    prefix: &str,
+) -> HashSet<(String, u32)> {
+    file_results
         .iter()
-        .filter(|operation| {
-            let location = operation.file_path.to_string_lossy();
-            let file = location.rsplit_once(':').map_or(location.as_ref(), |p| p.0);
-            !typed.contains(&(operation.key.canonical(), file.to_string()))
+        .flat_map(|(file, result)| {
+            let file = file.strip_prefix(prefix).unwrap_or(file);
+            let file = file.strip_prefix("./").unwrap_or(file);
+            result
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.emission_style == Some(EmissionStyle::NoPayload))
+                .map(move |endpoint| (file.to_string(), endpoint.line_number.max(1) as u32))
         })
-        .map(|operation| {
-            format!(
-                "{} ({})",
-                operation.key.canonical(),
-                operation.file_path.display()
-            )
-        })
-        .collect();
-    Counted::from_reasons(reasons)
+        .collect()
 }
 
 #[cfg(test)]
@@ -496,10 +576,90 @@ mod tests {
             ..Default::default()
         };
 
-        let boundary = ServiceBoundary::collect(&data, &stats, repo_path);
+        let boundary = ServiceBoundary::collect(&data, &stats, &HashMap::new(), repo_path);
         assert_eq!(
             boundary.files_lost.reasons,
             vec!["Failed to analyze src/dead.ts: gateway timeout".to_string()]
+        );
+    }
+
+    /// A route the analysis states sends no body (a redirect, a 204) has no
+    /// response contract to resolve. It is counted in `routes_without_body`,
+    /// not as a missing response type (carrick#1159). The file_results key is
+    /// absolute, as the full scan passes it; the operation row is relative.
+    #[test]
+    fn routes_that_send_no_body_are_counted_apart_from_missing_types() {
+        use crate::agents::file_analyzer_agent::FileAnalysisResult;
+        use crate::analyzer::ApiEndpointDetails;
+        use crate::operation::OperationKey;
+
+        let repo_path = "/work/acme";
+        let endpoint = |method: &str, path: &str, site: &str| ApiEndpointDetails {
+            view_module: false,
+            owner: None,
+            key: OperationKey::http(method, path.to_string()),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: std::path::PathBuf::from(site),
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            resolution_source: None,
+            dispatch: None,
+            schema_binding: None,
+            handler_span: None,
+        };
+        let data = CloudRepoData {
+            endpoints: vec![
+                endpoint("GET", "/login", "src/routes.ts:4"),
+                endpoint("GET", "/users", "src/routes.ts:9"),
+            ],
+            ..serde_json::from_value(serde_json::json!({
+                "repo_name": "acme/app", "endpoints": [], "calls": [], "mounts": [],
+                "apps": {}, "imported_handlers": [], "function_definitions": {},
+                "last_updated": "2026-01-01T00:00:00Z", "commit_hash": "abc1234"
+            }))
+            .expect("the blob reads")
+        };
+        let row = |line: u32, style: &str| {
+            serde_json::json!({
+                "candidate_id": format!("span:{line}"), "line_number": line,
+                "owner_node": "app", "method": "GET", "path": "/x",
+                "handler_name": "anonymous", "pattern_matched": ".get(",
+                "payload_expression_text": null, "payload_expression_line": null,
+                "response_expression_text": null, "response_expression_line": null,
+                "primary_type_symbol": null, "type_import_source": null,
+                "emission_style": style
+            })
+        };
+        let result: FileAnalysisResult = serde_json::from_value(serde_json::json!({
+            "mounts": [], "data_calls": [],
+            "endpoints": [row(4, "no-payload"), row(9, "imperative-send")]
+        }))
+        .expect("the analysis reads");
+        let file_results = HashMap::from([(format!("{repo_path}/src/routes.ts"), result)]);
+
+        let boundary =
+            ServiceBoundary::collect(&data, &ProcessingStats::default(), &file_results, repo_path);
+        assert_eq!(
+            boundary.routes_without_response_type.reasons,
+            vec!["http|GET|/users (src/routes.ts:9)".to_string()]
+        );
+        assert_eq!(
+            boundary.routes_without_body,
+            Some(Counted::from_reasons(vec![
+                "http|GET|/login (src/routes.ts:4)".to_string()
+            ]))
+        );
+        assert!(
+            boundary
+                .lines("orders")
+                .iter()
+                .any(|line| line.contains("1 route(s) that send no response body")),
         );
     }
 

@@ -22,9 +22,11 @@ change bumps it to `carrick.check/1` and both are emitted for one release.
 
 | command | reads | writes | budget |
 |---|---|---|---|
-| `carrick index --workspace <dir>` | detected local repos, optional workspace overrides, authenticated hosted indexes, and Carrick Cloud, which classifies what the deterministic passes could not | `<dir>/.carrick/`, plus `.carrick/last-scan.json` | the paid scan; minutes, cold, and it ends by saying what it cost |
+| `carrick index --workspace <dir>` | detected local repos, optional workspace overrides, authenticated hosted indexes, and Carrick Cloud, which classifies what the deterministic passes could not | `<dir>/.carrick/`, plus `.carrick/last-scan.json` | the scan that builds the index, and the one a first run makes; minutes, cold |
 | `carrick index --detach` | the same | the same, plus `.carrick/scan-<id>.log` and `.carrick/scan-<id>.json` | returns at once |
-| `carrick status [--json]` | local index, credential identity | nothing | < 300 ms |
+| `carrick index --dispatch` | the same | `.carrick/jobs.json`, and no index | returns when the prompts are built, minutes on a large repo |
+| `carrick resume` | `.carrick/jobs.json`, Carrick Cloud, local source | `<dir>/.carrick/` | minutes; the analysis is already done |
+| `carrick status [--json]` | local index, credential identity, and Carrick Cloud when a job is recorded | nothing | < 300 ms, plus one network read while a job is in flight |
 | `carrick touch <file> [--json]` | local index, credential identity | nothing | < 300 ms |
 | `carrick check <file> [--json]` | local index, credential identity | nothing | < 300 ms |
 | `carrick check <file> --recheck` | the same, plus this repo's working tree and the blobs already on disk | nothing outside a temp directory it deletes | 10 s budget |
@@ -365,7 +367,8 @@ unclassified in this service.
 | `.carrick/build-*/` | transient per-run blobs and join result, removed when the build finishes |
 | `.carrick/scan-<id>.log` | everything a detached build printed: its banner, its per-service lines, its map, and any error. Kept after the scan ends — it is the record of a run nobody watched |
 | `.carrick/scan-<id>.json` | what that build is doing NOW: phase, service, counts, pid, when it started, and `spend` once an upload has come back with a figure. Removed when the scan finishes; left with `"status": "failed"` when it fails, and left as-is when the process is killed, which is how `carrick status` can say a scan stopped part-way |
-| `.carrick/last-scan.json` | what the last **paid** scan cost: one entry per repo `carrick index` scanned, each carrying the cloud's `carrick.scan-spend/0` block. Written as each figure lands, so a run killed after paying still leaves it. Beside the index rather than in it, because `carrick refresh` rebuilds the read model from scratch and a first paid run may be killed before there is one |
+| `.carrick/jobs.json` | the analysis Carrick Cloud is doing for this workspace: one entry per repo `carrick index --dispatch` handed over, with the job id, the commit the prompts were built at, how many files it carries and when it was submitted. `carrick resume` reads it and removes each entry once its answers are collected; `carrick status` reads it to say what is in flight. Outlives the scan record beside it, because a job outlives a build |
+| `.carrick/last-scan.json` | what the last scan reported: one entry per repo `carrick index` scanned, each carrying the cloud's `carrick.scan-spend/0` block. Written as each block lands, so a run killed part-way still leaves the record of the repos it uploaded. Beside the index rather than in it, because `carrick refresh` rebuilds the read model from scratch and a first run may be killed before there is one. Nothing the CLI prints reads from it |
 
 `index.json` is derived: deleting it and re-running `carrick index` reproduces
 it. Nothing outside `src/local_mode/` reads it, and its internal shape is not
@@ -400,7 +403,7 @@ rules as the other reads: local index and credential identity, under 300 ms,
 and exit 0 whatever it finds — including a refusal, unlike `check`.
 
 Its refusal is written for a command that takes no file, and it never names the
-scan that is already running: a workspace whose first paid scan is in flight is
+scan that is already running: a workspace whose first scan is in flight is
 told that, not told to start one (carrick#1023 item 1). The running scan is
 printed above the sentence, and carried in `running_scans` on the error body.
 
@@ -451,7 +454,8 @@ printed above the sentence, and carried in `running_scans` on the error body.
 | `services[].stale_files` | up to 50 of them, repo-relative; `stale_files_total` is always exact and `stale_files_truncated` says which you are looking at |
 | `repos[]` | one per indexed repo: `changed_since_index` is the whole tree, `outside_every_service` is how many of those no service reads, and `stale_files` is up to 50 of THOSE. A workflow file, a lockfile or an editor's settings belongs here and not to every service in the monorepo |
 | `running_scans[]` | a build happening right now, from `carrick index --detach`: `scan_id`, `pid`, `started_at`, `phase` (`indexing <repo>`, `joining the workspace`), `progress` (service, `files` or `intents`, done of total), `notice` (why a running scan is slow, in the scan's words, cleared by the next phase) and `infer`. `status` is `running`, `finished` or `failed`: a scan that ends rewrites its record rather than removing it, with `finished_at`, so a caller polling until it is over terminates on a word; the next build clears a finished one. A failed record carries `error`, whose first line is the reason in one sentence (the one the scan stated, or why the build refused) and whose later lines are an excerpt of the scan's own log; the human `status` prints the first line only, one line per scan, and names `.carrick/scan-<id>.log` once for the rest. Absent in the ordinary case. A `status` with no index at all still carries it, on the error body, because "no index" and "one is being built" are different answers |
-| `last_scan` | what the last paid scan cost: `updated_at`, and `scans[]` of `{ repo, spend }` where `spend` is the cloud's `carrick.scan-spend/0` block (`usd`, `priced`, `unpriced_models`, token counts, `first_index_ceiling_usd` / `first_index_remaining_usd`, `monthly_allowance_usd` / `monthly_remaining_usd`, `period`). Absent until a paid scan has run, and carried on the error body too — a first paid run killed before it wrote an index still spent the money. Two rules the CLI's own line follows and any other reader should: `priced: false` means print nothing about money at all, because one unpriced model makes every dollar figure in the month an under-count; and a null amount is "not set", not "unlimited", so the clause is left out rather than shown empty |
+| `last_scan` | what the last scan reported: `updated_at`, and `scans[]` of `{ repo, spend }` where `spend` is the cloud's `carrick.scan-spend/0` block (`usd`, `priced`, `unpriced_models`, token counts, `first_index_ceiling_usd` / `first_index_remaining_usd`, `monthly_allowance_usd` / `monthly_remaining_usd`, `period`). Absent until a scan has run, and carried on the error body too, because a run killed before it wrote an index still uploaded the repos it got through. Read by whoever parses the JSON; the CLI itself prints none of it |
+| `analysing[]` | one line per repo whose analysis Carrick Cloud is doing right now, and the only part of any read command that touches the network — present only when `.carrick/jobs.json` names a job. Says how far it has got, that it is ready and nothing has collected it, or that this machine could not ask. Carried on the error body too: "no index" and "the analysis that builds it is running elsewhere" are different answers |
 | `services[].boundary.candidates_awaiting_model` | candidates no model has been asked about, so `0 route(s) 0 call(s)` from a free pass is distinguishable from a service with no API in it. Zero after a scan that ran the model; absent on an index written before the count existed |
 | `services[].boundary_lines` | the same pre-rendered lines `check` and `touch` carry |
 | `services[].hosted`, `services[].hosted_state` | the same provenance and replay state as `check` |

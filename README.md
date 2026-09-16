@@ -292,13 +292,17 @@ Once the schema's fields are known, Carrick also reads the modules that build th
 
 #### GraphQL documents for another team's API
 
-A client's GraphQL documents are indexed as calls only when they are written against a schema this repository serves. Carrick attributes each document (a `.graphql`/`.gql` file, or one `gql` template) to the committed schema file that holds its root fields. A schema file counts as served when it sits under a service's directory or is named in a service's `graphqlSchemas`. Any other committed schema file, such as a vendor schema a codegen step downloaded into `dist/`, marks its documents as calls to an external API, and they are not indexed as calls. The scan output names the schema file and counts the operations, so a schema that is served here but not declared can be added to `graphqlSchemas`.
+A client's GraphQL documents are indexed as calls only when they are written against a schema this repository serves. Carrick attributes each document (a `.graphql`/`.gql` file, or one `gql` template) to the committed schema file that holds its root fields. A schema file counts as served when a service names it in `graphqlSchemas`, or when it sits under a service's directory and that service shows it serves a schema: it serves HTTP routes, or a resolver in its code is linked to one of the schema's fields. Any other committed schema file marks its documents as calls to an external API, and they are not indexed as calls. That includes a vendor schema a codegen step downloaded into `dist/`, or a copy committed inside a client app's own `src/`. The fields of a copy that sits under a service with no such evidence are not indexed as that service's operations, and the scan output names the file. The scan output names the schema file and counts the operations, so a schema that is served here but not declared can be added to `graphqlSchemas`.
 
 Some documents are left out as well:
 - a document whose fields no single schema holds;
 - a document whose fields sit in both a served and an external schema, when the file's environment reads don't settle it. A file that reads only variables from `internalEnvVars` counts as internal, and one that reads only `externalEnvVars` counts as external.
 
 A document whose fields appear in no schema the repository holds stays a call, because its server may be another repository in the project.
+
+#### Where a GraphQL call is indexed
+
+A document written in a `.graphql`/`.gql` file and compiled into a typed declaration (`OrdersDocument`) is sent from the code that passes that declaration to a client, such as `useQuery(OrdersDocument)`. Carrick indexes the operation's fields at each of those calls, resolving the import through relative paths, `tsconfig` path aliases and workspace packages. An operation that no call executes stays indexed at its line in the document file. A `gql` template written in source stays indexed where it is written.
 
 ## How it works
 
