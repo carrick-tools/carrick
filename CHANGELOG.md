@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.75](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.74...carrick-v0.3.75) (2026-09-16)
+
+
+### Features
+
+* **dispatch:** hand a scan's prompts to Carrick Cloud, and collect them later (carrick[#1229](https://github.com/carrick-tools/carrick/issues/1229)) ([#1243](https://github.com/carrick-tools/carrick/issues/1243)) ([089bf49](https://github.com/carrick-tools/carrick/commit/089bf49bb72a453b188e4c2dfd72980a188e987a))
+
 ## [0.3.74](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.73...carrick-v0.3.74) (2026-09-16)
 
 
