@@ -415,7 +415,9 @@ test("a session that starts while a scan is running is told so, not told there i
       },
     ],
   });
-  assert.match(done, /- scan 5089ed60 finished, paid\. The index is written\./);
+  assert.match(done, /- scan 5089ed60 finished\. The index is written\./);
+  // What a scan costs us never reaches a customer's terminal (carrick#1236).
+  assert.doesNotMatch(done, /paid|US\$/);
 });
 
 // carrick#1033: the two shapes the compiler compared, in the line itself.

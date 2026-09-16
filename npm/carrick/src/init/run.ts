@@ -113,7 +113,7 @@ function help(): string {
     "or a folder of repos: the project, the repo connection, the agent hooks,",
     "the MCP connection, and the service proposal your agent turns into",
     "carrick.json. It writes nothing into the repository but the ignored",
-    ".carrick directory and the hook settings, and it runs no paid scan: where",
+    ".carrick directory and the hook settings, and it runs no analysis: where",
     "Carrick already holds an index for these repos, it reads that index into",
     ".carrick so this machine can answer from it.",
     "",

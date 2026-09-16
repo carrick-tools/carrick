@@ -324,9 +324,9 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
     };
     let index_dir = root.join(super::workspace::INDEX_DIR);
     let scans = super::scan_state::read_all(&index_dir);
-    // Read beside the scans and before the index, for the same reason: a first
-    // paid run that was killed before it wrote an index still spent the money,
-    // and the question "what did that cost" has an answer either way
+    // Read beside the scans and before the index, for the same reason: a run
+    // killed before it wrote an index still uploaded the repos it got through,
+    // and a reader parsing `--json` is answered about those either way
     // (carrick#995).
     let last_scan =
         crate::scan_spend::RunSpend::read(&super::workspace::last_scan_file(&index_dir));
@@ -360,12 +360,6 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
             // answer.
             if !json {
                 for line in super::scan_state::status_lines(&scans, &index_dir) {
-                    println!("{line}");
-                }
-                for line in last_scan
-                    .iter()
-                    .flat_map(|spend| spend.lines(Some(&spend.updated_at)))
-                {
                     println!("{line}");
                 }
             }
@@ -490,7 +484,7 @@ fn build_workspace(
     if infer {
         eprintln!(
             "carrick: this scan asks Carrick Cloud to classify what the deterministic passes \
-             could not, and uploads the result. It is the paid analysis; later scans read it."
+             could not, and uploads the result. It runs the analysis; later scans read it."
         );
     }
     let outcome = super::index::run(workspace, service, infer)?;
@@ -502,12 +496,6 @@ fn build_workspace(
         eprintln!("carrick: {line}");
     }
     print_map(&outcome);
-    // Last, because it is the one line about money: what this run cost, and
-    // what is left of each budget it was charged against (carrick#995). A free
-    // pass paid for nothing and prints nothing.
-    for line in outcome.spend.lines(None) {
-        println!("{line}");
-    }
     Ok(())
 }
 
@@ -646,8 +634,8 @@ fn inference_refusal(repos: &[PathBuf]) -> Option<String> {
         .join(", ");
     let rest = missing.len().saturating_sub(5);
     Some(format!(
-        "no carrick.json in {named}{}, and `carrick index` is the paid scan, so it runs \
-         after the config exists. `carrick init` wrote the derived services to \
+        "no carrick.json in {named}{}, and `carrick index` is the scan that builds the \
+         index, so it runs after the config exists. `carrick init` wrote the derived services to \
          .carrick/proposal.json and printed the prompt that has an agent turn it into \
          carrick.json; read it back against the repo, run `carrick login` if this machine \
          is not signed in, and run this command once.",
@@ -836,10 +824,9 @@ USAGE:
 
     index      Detect repositories, apply optional workspace overrides and
                write <dir>/.carrick/. Carrick Cloud classifies what the
-               deterministic passes could not and the result is uploaded, so
-               it is the paid scan: it needs a carrick.json in every repo,
-               which it refuses without, and a machine `carrick login` has
-               signed in.
+               deterministic passes could not and the result is uploaded. It
+               needs a carrick.json in every repo, which it refuses without,
+               and a machine `carrick login` has signed in.
     status     What the workspace holds: every service, the commit it was
                indexed at, how far its repo has moved since, and its boundary.
     touch      The routes and calls in one file, and their counterparts in
