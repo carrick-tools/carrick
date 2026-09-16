@@ -281,7 +281,7 @@ impl GraphqlConsumerHints {
     /// the deterministic pass already anchored (`TaggedTplVisitor::capture_request_call`
     /// matched an explicit generic) needs no hint — there is nothing left to
     /// locate.
-    pub fn collect(scan_roots: Vec<PathBuf>, service_files: &[PathBuf]) -> Self {
+    pub fn collect(scan_roots: Vec<PathBuf>, service_files: &[PathBuf], repo_root: &str) -> Self {
         let extraction = scan_repo(&scan_roots, &[], service_files);
         let mut lines = Vec::new();
         let mut files = std::collections::HashSet::new();
@@ -289,7 +289,7 @@ impl GraphqlConsumerHints {
             if op.payload_type_symbol.is_some() {
                 continue;
             }
-            let Some(line) = Self::format_consumer(op) else {
+            let Some(line) = Self::format_consumer(op, repo_root) else {
                 continue;
             };
             lines.push(line);
@@ -301,7 +301,13 @@ impl GraphqlConsumerHints {
     /// Format a single unanchored consumer op as `"{kind}|{field} @ {file}"`
     /// (e.g. `"subscription|orderUpdated @ lib/graphql.ts"`). `None` if the op
     /// is not a GraphQL consumer key (should never happen for `.consumers`).
-    fn format_consumer(op: &GraphqlOp) -> Option<String> {
+    ///
+    /// The file is named repo-relative, as every path that reaches a prompt
+    /// is: these lines sit in the repo-global front block of EVERY analysed
+    /// file's message, and the cloud hashes those bytes as its analysis-cache
+    /// key, so one absolute path here made every entry in the service private
+    /// to the checkout that produced it (carrick#1223).
+    fn format_consumer(op: &GraphqlOp, repo_root: &str) -> Option<String> {
         let OperationKey::Graphql { kind, field } = &op.key else {
             return None;
         };
@@ -309,7 +315,7 @@ impl GraphqlConsumerHints {
             "{}|{} @ {}",
             kind.as_str(),
             field,
-            op.file_path.display()
+            crate::utils::repo_relative_source_path(&op.file_path.to_string_lossy(), repo_root)
         ))
     }
 
@@ -2135,7 +2141,11 @@ function subscribe(cb) {
         )
         .unwrap();
 
-        let hints = GraphqlConsumerHints::collect(vec![], std::slice::from_ref(&file));
+        let hints = GraphqlConsumerHints::collect(
+            vec![],
+            std::slice::from_ref(&file),
+            &dir.to_string_lossy(),
+        );
         std::fs::remove_dir_all(&dir).ok();
 
         // Only the unanchored subscription produces a hint line.
@@ -2149,7 +2159,7 @@ function subscribe(cb) {
         assert!(hints.file_has_hint(&file));
 
         // A file with no unanchored consumers yields no hints at all.
-        let empty = GraphqlConsumerHints::collect(vec![], &[]);
+        let empty = GraphqlConsumerHints::collect(vec![], &[], &dir.to_string_lossy());
         assert!(empty.is_empty());
         assert!(!empty.file_has_hint(&file));
     }

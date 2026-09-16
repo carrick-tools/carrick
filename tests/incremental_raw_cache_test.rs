@@ -364,6 +364,97 @@ async fn a_previous_format_cache_is_refused_and_the_scan_goes_back_to_the_model(
     );
 }
 
+/// Guidance the blob carries without an id is asked for again, not replayed.
+///
+/// `/analyze-file` sends the guidance id so the cloud's analysis cache can key
+/// the repo-global guidance block by identity instead of by its text; without
+/// one the whole message is the key, and every file in the service re-pays
+/// whenever the guidance regenerates into different words. A blob written
+/// before the id existed carries none, and the `package_json_hash` gate around
+/// the replay does not move on an ordinary scan — so before carrick#1224 such
+/// a repo replayed keyless guidance on every scan from then on and never
+/// recovered. Asking again costs the five guidance calls once.
+#[tokio::test]
+#[serial]
+async fn guidance_without_an_id_is_asked_for_again_instead_of_replayed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (repo_path, cassette) = committed_fixture(tmp.path());
+    mock_env(&cassette);
+
+    let storage = StubStorage::default();
+    run_analysis_engine_with_sidecar(storage.clone(), repo_path.to_str().unwrap(), None, false)
+        .await
+        .expect("scan #1 failed");
+    assert!(
+        guidance_ids(&latest_upload(&storage))
+            .iter()
+            .all(Option::is_some),
+        "scan #1 must persist an id for every protocol's guidance"
+    );
+
+    // The control: nothing about the tree changed, so the keyed guidance in
+    // the blob is replayed and no guidance call goes out.
+    let before_replay = requests_to("/framework-guidance");
+    run_analysis_engine_with_sidecar(storage.clone(), repo_path.to_str().unwrap(), None, false)
+        .await
+        .expect("scan #2 failed");
+    assert_eq!(
+        requests_to("/framework-guidance") - before_replay,
+        0,
+        "guidance carrying an id is replayed, not asked for again"
+    );
+
+    // Age the stored payload to a blob written before the id existed. Nothing
+    // else about it moves: same cache version, same manifests, same commit.
+    {
+        let mut repos = storage.repos.lock().unwrap();
+        let prev = repos.last_mut().expect("no prior upload to mutate");
+        let guidance = prev
+            .cached_guidance
+            .as_mut()
+            .expect("scan #2 must have persisted guidance");
+        for answer in guidance.values_mut() {
+            answer.guidance_key = None;
+        }
+    }
+
+    let before_reask = requests_to("/framework-guidance");
+    run_analysis_engine_with_sidecar(storage.clone(), repo_path.to_str().unwrap(), None, false)
+        .await
+        .expect("scan #3 failed");
+    assert!(
+        requests_to("/framework-guidance") - before_reask > 0,
+        "keyless guidance must be asked for again, or the repo keys the whole message forever"
+    );
+    assert!(
+        guidance_ids(&latest_upload(&storage))
+            .iter()
+            .all(Option::is_some),
+        "the scan that re-asked must persist the id, so the next scan replays again"
+    );
+}
+
+/// The guidance id each protocol's persisted answer carries, `None` for an
+/// answer that has none.
+fn guidance_ids(data: &CloudRepoData) -> Vec<Option<String>> {
+    data.cached_guidance
+        .as_ref()
+        .expect("the payload carries guidance")
+        .values()
+        .map(|answer| answer.guidance_key.clone())
+        .collect()
+}
+
+/// How many requests this process has made to `route` so far. The counter is a
+/// process-global, which is why every test here is `#[serial]` and reads it as
+/// a delta.
+fn requests_to(route: &str) -> usize {
+    carrick::agent_service::request_counts()
+        .get(route)
+        .copied()
+        .unwrap_or(0)
+}
+
 /// HEAD of the fixture copy, so a test can tell the stored payload which
 /// commit its cache was written against.
 fn git_head(dir: &Path) -> String {

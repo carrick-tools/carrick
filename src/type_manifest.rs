@@ -68,24 +68,6 @@ pub fn build_manifest_type_alias(
     format!("Endpoint_{:016x}_{}", hash, type_label)
 }
 
-/// Reduce a source path to its repo-relative form for hashing: strip the
-/// repo-root prefix when present, then any leading `./`. Mirrors the cache-key
-/// normalization in `normalize_file_results_keys` so a full-scan absolute key
-/// (`/abs/repo/src/api.ts`) and an incremental repo-relative key (`src/api.ts`)
-/// reduce to the same string. A path outside the root passes through unchanged.
-fn repo_relative_source_path<'a>(file_path: &'a str, repo_root: &str) -> &'a str {
-    let root = repo_root.trim_end_matches('/');
-    let stripped = if root.is_empty() || root == "." {
-        file_path
-    } else {
-        file_path
-            .strip_prefix(root)
-            .and_then(|rest| rest.strip_prefix('/'))
-            .unwrap_or(file_path)
-    };
-    stripped.strip_prefix("./").unwrap_or(stripped)
-}
-
 /// Hash a consumer call site into the 16-hex id embedded in
 /// site-suffixed aliases. The id is a join key across the manifest,
 /// SymbolRequest, and infer-request sides, so every producer of it must call
@@ -112,7 +94,7 @@ pub fn build_site_id(
     key: &OperationKey,
     repo_root: &str,
 ) -> String {
-    let relative = repo_relative_source_path(file_path, repo_root);
+    let relative = crate::utils::repo_relative_source_path(file_path, repo_root);
     let hash_input = format!("{}|{}|{}", relative, line_number, key.canonical());
     format!("{:016x}", fnv1a_hash(&hash_input))
 }
@@ -445,26 +427,6 @@ mod tests {
         assert_eq!(from_abs_a, from_abs_b);
         assert_eq!(from_abs_a, from_rel);
         assert_eq!(from_abs_a, from_dot_rel);
-    }
-
-    /// A path outside the repo root must pass through unchanged, never be
-    /// mangled by a partial prefix match (`/repo` vs `/repo-other`).
-    #[test]
-    fn test_repo_relative_source_path_prefix_safety() {
-        assert_eq!(
-            repo_relative_source_path("/a/repo-other/src/x.ts", "/a/repo"),
-            "/a/repo-other/src/x.ts"
-        );
-        assert_eq!(
-            repo_relative_source_path("/a/repo/src/x.ts", "/a/repo"),
-            "src/x.ts"
-        );
-        assert_eq!(repo_relative_source_path("src/x.ts", "/a/repo"), "src/x.ts");
-        assert_eq!(repo_relative_source_path("./src/x.ts", "."), "src/x.ts");
-        assert_eq!(
-            repo_relative_source_path("/a/repo/src/x.ts", ""),
-            "/a/repo/src/x.ts"
-        );
     }
 
     #[test]

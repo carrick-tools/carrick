@@ -1,6 +1,6 @@
 use crate::agent_service::{AgentService, RetryPolicy};
 use crate::agents::file_orchestrator::FileOrchestrator;
-use crate::agents::framework_guidance_agent::FrameworkGuidanceAgent;
+use crate::agents::framework_guidance_agent::{FrameworkGuidanceAgent, ProtocolGuidance};
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{
     CACHE_DIR_ENV, CloudRepoData, CloudStorage, INLINE_PAYLOAD_LIMIT_BYTES, ManifestRole,
@@ -2401,7 +2401,12 @@ async fn analyze_current_repo_incremental(
                     )
                 }
             } else if !pkg_changed {
-                if let (Some(det), Some(guid)) = (&prev.cached_detection, &prev.cached_guidance) {
+                if let (Some(det), Some(guid)) = (
+                    &prev.cached_detection,
+                    prev.cached_guidance
+                        .as_ref()
+                        .filter(|g| guidance_is_keyed(g)),
+                ) {
                     debug!("Reusing cached framework detection and guidance");
                     // A missing cached config (older cache entry, or an earlier
                     // failed generation) is regenerated on its own.
@@ -2414,10 +2419,16 @@ async fn analyze_current_repo_incremental(
                     };
                     ModelSetup::ready(det.clone(), guid.clone(), extraction)
                 } else {
-                    // Something is missing: a first scan's cache entry, or the
-                    // service a previous scan deferred. A detection that
-                    // landed without its guidance is kept, and only the
-                    // guidance is asked again (carrick#1126).
+                    // Something is missing: a first scan's cache entry, the
+                    // service a previous scan deferred, or a blob whose
+                    // guidance predates the guidance id (carrick#1224). A
+                    // detection that landed without usable guidance is kept,
+                    // and only the guidance is asked again (carrick#1126).
+                    if prev.cached_guidance.is_some() {
+                        debug!(
+                            "Cached guidance carries no id (written before the id existed); asking for guidance again so the analysis cache keys it by identity, not by its text"
+                        );
+                    }
                     model_setup(
                         packages,
                         &all_import_facts,
@@ -2454,6 +2465,7 @@ async fn analyze_current_repo_incremental(
             let graphql_consumer_hints = crate::graphql::GraphqlConsumerHints::collect(
                 service_graphql_roots(repo_path, service),
                 &files,
+                repo_path,
             );
 
             let normalizer = UrlNormalizer::new(config);
@@ -2774,14 +2786,34 @@ struct SettledDetection {
     extraction_config: Option<crate::services::type_sidecar::ExtractionConfig>,
 }
 
+/// Whether a persisted guidance can be replayed instead of asked for again.
+///
+/// The id is the whole test. `/analyze-file` sends it so the cloud's analysis
+/// cache can key the guidance block by identity rather than by its text, and a
+/// guidance without one puts its TEXT in the key instead — so every file in the
+/// service re-pays whenever the words move, which is the recurring cost the id
+/// was built to remove (carrick-cloud#871).
+///
+/// A blob written before the id existed carries none, and the
+/// `package_json_hash` gate around the replay does not move on an ordinary
+/// scan: without this check such a repo replays keyless guidance on every scan
+/// from here on and never self-heals (carrick#1224). Asking again costs the
+/// five guidance calls once — the cloud serves them from its own guidance
+/// cache — and the answer that comes back carries the id, which the blob then
+/// persists.
+fn guidance_is_keyed(guidance: &ProtocolGuidance) -> bool {
+    !guidance.is_empty() && guidance.values().all(|g| g.guidance_key.is_some())
+}
+
 impl SettledDetection {
     /// The detection `prev` kept when its guidance was deferred
-    /// ([`ModelSetup::guidance_deferred`]): there is a cached detection and no
+    /// ([`ModelSetup::guidance_deferred`]) or cannot be replayed
+    /// ([`guidance_is_keyed`]): there is a cached detection and no usable
     /// cached guidance, from this cache version and these manifests. A
     /// complete previous generation returns `None`; the incremental branch
     /// reuses it whole, and a full analysis asks again as it always has.
     fn kept_by(prev: &CloudRepoData, current_pkg_hash: &str) -> Option<Self> {
-        if prev.cached_guidance.is_some()
+        if prev.cached_guidance.as_ref().is_some_and(guidance_is_keyed)
             || prev.cache_version != Some(CACHE_VERSION)
             || prev.package_json_hash.as_deref() != Some(current_pkg_hash)
         {
@@ -5851,6 +5883,7 @@ async fn analyze_current_repo(
     let graphql_consumer_hints = crate::graphql::GraphqlConsumerHints::collect(
         service_graphql_roots(repo_path, service),
         &files,
+        repo_path,
     );
 
     // 3b. Settle the model stages for this service: detection and guidance
