@@ -9,6 +9,7 @@ mod call_site_extractor;
 mod cloud_storage;
 mod config;
 mod credentials;
+mod current_service;
 mod deno_support;
 mod dispatch;
 mod engine;

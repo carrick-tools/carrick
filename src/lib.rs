@@ -9,6 +9,7 @@ pub mod call_site_extractor;
 pub mod cloud_storage;
 pub mod config;
 pub mod credentials;
+pub mod current_service;
 pub mod deno_support;
 pub mod dispatch;
 pub mod engine;

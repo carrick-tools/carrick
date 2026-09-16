@@ -1333,6 +1333,13 @@ impl ServiceScan<'_> {
         crate::progress::service_started(label, index + 1, self.total);
         // Every loss from here on is this service's.
         crate::scan_health::enter_service(service.service_name.as_deref());
+        // And so is every prompt-lambda call: they all happen inside this
+        // function, and each one carries this name so the cloud's logs can
+        // say which tree of a monorepo spent the money (carrick#1221). The
+        // guard is bound, not dropped on this line: the scope has to outlive
+        // the analysis below and end with it, so that the cross-repo phase,
+        // the upload and a service that failed mid-loop name nobody.
+        let _service_scope = crate::current_service::enter(service.service_name.as_deref());
         let quota_aborts_before = crate::agent_service::quota_abort_count();
         let service_started = Instant::now();
 
