@@ -84,6 +84,7 @@ jobs:
           --test new_url_target_test
           --test object_export_surface_test
           --test output_contract_test
+          --test prompt_determinism_test
           --test receiver_type_classification_test
           --test route_request_anchor_test
           --test scan_durability_test
