@@ -99,6 +99,19 @@ old version**. CI's contract is that the workflow decides what runs; a scanner
 that refused to start because a newer one exists would be a worse outage than
 the stale build.
 
+The annotation names one of two different fixes, and naming the wrong one sends
+a reader to a line their workflow does not contain. The runner sets
+`GITHUB_ACTION_REPOSITORY` for a step belonging to an action, so a run through
+the Carrick action is told to move its `uses:` ref to `@v1`; a workflow that
+calls the CLI directly wrote a version string, and that is what it changes.
+
+The notice itself never mentions `CARRICK_NO_UPDATE_CHECK`. The session-start
+line goes on stdout, straight into an agent's context, and the failure this
+subsystem exists for is an agent that does not upgrade — handing it an off
+switch in the same sentence as the fix invites the wrong one. The variable is
+documented in `carrick --help` and in the package README, where a person reads
+it.
+
 ## Fail open, always
 
 Every one of these ends in silence and an unchanged exit code: no network, a

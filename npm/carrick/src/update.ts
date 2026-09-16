@@ -277,18 +277,32 @@ export function updateNotice(
   if (!current || !latest) return null;
   if (!isNewer(latest, current)) return null;
   if (env["GITHUB_ACTIONS"]) {
-    return (
+    const head =
       `::warning::Carrick ${current} is running here and ${latest} is published. ` +
-      `This run continues on ${current} — nothing was changed. ` +
-      `Pin this workflow to \`carrick@latest\`, or to ${latest}, so the next run is not on a build with defects already fixed.`
-    );
+      `This run continues on ${current} — nothing was changed. `;
+    // Two different fixes, and naming the wrong one sends a reader to a line
+    // their workflow does not contain. The runner sets
+    // GITHUB_ACTION_REPOSITORY for a step that belongs to an action, so a run
+    // through the Carrick action says so: there, the version comes from the
+    // action checkout's own Cargo.toml, and the ref is the only thing the
+    // workflow chose. A workflow that calls the CLI directly wrote a version
+    // string, and that is what it has to change.
+    if ((env["GITHUB_ACTION_REPOSITORY"] ?? "").endsWith("/carrick")) {
+      return `${head}This workflow pins the Carrick action to a ref that does not move; use \`carrick-tools/carrick@v1\`, which moves to each release.`;
+    }
+    return `${head}Run \`carrick@latest\`, or ${latest}, so the next run is not on a build with defects already fixed.`;
   }
   const shape = installShape(options.root ?? packageRoot(), env);
   const where = shape.manifest ? ` (pinned in ${shape.manifest})` : "";
+  // No mention of CARRICK_NO_UPDATE_CHECK here. This line is read by agents as
+  // well as people — the session-start hook puts it on stdout, straight into
+  // the session — and the failure this exists for is an agent that does not
+  // upgrade. Handing it an off switch in the same sentence as the fix invites
+  // the wrong one. The variable is documented in `carrick --help` and in the
+  // package README, where a person reads it.
   return (
     `carrick ${current} is installed${where} and ${latest} is published. ` +
-    `Update with \`${shape.command}\` — a scan on an older build can fail on defects that are already fixed. ` +
-    `Set CARRICK_NO_UPDATE_CHECK=1 to stop checking.`
+    `Update with \`${shape.command}\` — a scan on an older build can fail on defects that are already fixed.`
   );
 }
 
@@ -336,7 +350,10 @@ export function scheduleUpdateCheck(
     const child = spawnImpl(
       process.execPath,
       [fileURLToPath(new URL("./update-check.js", import.meta.url))],
-      { detached: true, stdio: "ignore", env },
+      // `windowsHide` because a detached child on Windows gets its own console
+      // window otherwise, and win32-x64 is a platform this package publishes:
+      // a window flashing up once every four hours is not a version notice.
+      { detached: true, stdio: "ignore", env, windowsHide: true },
     );
     child.unref();
     return true;
@@ -360,34 +377,48 @@ export function updateNoticeFromCache(env: NodeJS.ProcessEnv = process.env): str
 }
 
 /**
- * Commands that are not a scan.
+ * Every command name this CLI answers: the binary's own
+ * (`src/local_mode/cli.rs`, `LOCAL_COMMANDS`) and this package's.
  *
- * Only used to decide whether CI pays for a synchronous check: a two-second
- * bound in front of a multi-minute scan is invisible, and in front of
- * `carrick status` it is the whole command. Anything not named here — including
- * a bare path, which is how the scanner is asked to scan a directory — counts
- * as a scan.
+ * Needed only to tell a command from a path. The scanner reads a first
+ * argument it does not recognise as a directory to scan, and that is the
+ * invocation this list exists to identify.
  */
-const NOT_A_SCAN = new Set([
+const COMMANDS = new Set([
+  // The binary's.
+  "derive",
+  "index",
+  "refresh",
   "status",
   "check",
   "touch",
-  "refresh",
-  "lsp",
-  "hook",
+  // This package's.
   "login",
   "logout",
+  "lsp",
+  "hook",
   "init",
   "remove",
   "doctor",
   "templates",
 ]);
 
+/** The commands that pay for a model and take minutes. */
+const SCAN_COMMANDS = new Set(["index"]);
+
+/**
+ * Whether this invocation is a scan.
+ *
+ * Only used to decide whether CI pays for a synchronous check: a two-second
+ * bound in front of a multi-minute scan is invisible, and in front of
+ * `carrick status` it is the whole command.
+ */
 export function isScanInvocation(argv: string[]): boolean {
   const first = argv[0];
   if (first === undefined) return false;
   if (first.startsWith("-")) return false;
-  return !NOT_A_SCAN.has(first);
+  if (SCAN_COMMANDS.has(first)) return true;
+  return !COMMANDS.has(first);
 }
 
 /**

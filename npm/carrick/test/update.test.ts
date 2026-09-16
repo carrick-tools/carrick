@@ -204,7 +204,10 @@ test("the notice carries both versions and a runnable command, or is not printed
   assert.match(line, /carrick 0\.3\.68 is installed/);
   assert.match(line, /0\.3\.73 is published/);
   assert.match(line, /npm install -g carrick@latest/);
-  assert.match(line, /CARRICK_NO_UPDATE_CHECK=1/);
+  // No off switch in the line itself: the session-start hook puts this on
+  // stdout, straight into an agent's context, and the failure it exists for is
+  // an agent that does not upgrade.
+  assert.doesNotMatch(line, /CARRICK_NO_UPDATE_CHECK/);
 });
 
 test("on GitHub Actions the notice is an annotation that says the run continues", () => {
@@ -214,6 +217,20 @@ test("on GitHub Actions the notice is an annotation that says the run continues"
   assert.match(line, /This run continues on 0\.3\.68/);
   // CI is never told to install anything: the workflow decides what runs.
   assert.doesNotMatch(line, /npm install/);
+  // A workflow that calls the CLI directly wrote a version string of its own.
+  assert.match(line, /carrick@latest/);
+});
+
+test("a run inside the Carrick action is told about the ref, not about a version string", () => {
+  const line = updateNotice("0.3.68", "0.3.73", {
+    env: { GITHUB_ACTIONS: "true", GITHUB_ACTION_REPOSITORY: "carrick-tools/carrick" },
+    root: "/anywhere",
+  });
+  assert.ok(line);
+  assert.match(line, /pins the Carrick action to a ref that does not move/);
+  assert.match(line, /carrick-tools\/carrick@v1/);
+  // The user's workflow contains no `carrick@<version>` line to change.
+  assert.doesNotMatch(line, /Run `carrick@latest`/);
 });
 
 test("fetchLatest answers null for every unhappy registry", async () => {
@@ -251,8 +268,10 @@ test("fetchLatest answers null for every unhappy registry", async () => {
 test("the background check is started at most once a TTL, and never in CI", () => {
   const box = sandbox();
   const started: string[][] = [];
-  const spawnImpl = ((command: string, args: string[]) => {
+  const options: Array<Record<string, unknown>> = [];
+  const spawnImpl = ((command: string, args: string[], opts: Record<string, unknown>) => {
     started.push([command, ...args]);
+    options.push(opts);
     return { unref: () => {} };
   }) as unknown as typeof import("node:child_process").spawn;
   try {
@@ -269,6 +288,11 @@ test("the background check is started at most once a TTL, and never in CI", () =
     assert.equal(scheduleUpdateCheck(box.env, spawnImpl), true, "first run, nothing cached");
     assert.equal(started.length, 1);
     assert.ok(started[0]![1]!.endsWith("update-check.js"), started[0]![1]);
+    // A detached child on Windows gets its own console window without this,
+    // and win32-x64 is a platform this package publishes.
+    assert.equal(options[0]!["windowsHide"], true);
+    assert.equal(options[0]!["detached"], true);
+    assert.equal(options[0]!["stdio"], "ignore");
 
     // The parent stamped the cache before spawning, so the next invocation in
     // the same window does not fork a second child even though the child has
@@ -329,7 +353,23 @@ test("which invocations count as a scan", () => {
   assert.equal(isScanInvocation(["packages/api"]), true);
   assert.equal(isScanInvocation([]), false);
   assert.equal(isScanInvocation(["--help"]), false);
-  for (const command of ["status", "check", "touch", "refresh", "lsp", "hook", "init", "doctor"]) {
+  // Every name either half of the CLI answers, including the binary's own
+  // LOCAL_COMMANDS (src/local_mode/cli.rs).
+  for (const command of [
+    "derive",
+    "refresh",
+    "status",
+    "check",
+    "touch",
+    "login",
+    "logout",
+    "lsp",
+    "hook",
+    "init",
+    "remove",
+    "doctor",
+    "templates",
+  ]) {
     assert.equal(isScanInvocation([command]), false, command);
   }
 });
