@@ -1642,22 +1642,48 @@ mod tests {
         }
     }
 
+    /// A closure the call addresses (`on("ready", …)`) keeps its row and owns
+    /// its calls, however deeply it is nested (carrick#931). An unaddressed
+    /// callback inside a function that has a row is part of that function's
+    /// body (carrick#58): it gets no row, and its calls belong to the function.
     #[test]
-    fn indexed_callbacks_own_their_calls_and_unindexed_callbacks_are_retained() {
+    fn addressed_callbacks_own_their_calls_and_nested_callbacks_fold_into_their_function() {
         let (_dir, defs) = scan(&[(
             "app.ts",
             "function target() {}\n\
+             function other() {}\n\
              export function outer() {\n\
-               register(() => target());\n\
-               register(function () { target(); });\n\
+               events.on(\"ready\", () => target());\n\
+               register(() => other());\n\
+               register(function () { other(); });\n\
              }\n",
         )]);
-        // The existing extractor names the first callback register_handler;
-        // the second callback has no indexed row because that key is taken.
-        assert_eq!(callee_names(&defs, "register_handler"), vec!["target"]);
-        assert_eq!(defs["register_handler"].calls[0].call_site_line, 3);
-        assert_eq!(callee_names(&defs, "outer"), vec!["target"]);
-        assert_eq!(defs["outer"].calls[0].call_site_line, 4);
+        assert_eq!(callee_names(&defs, "on_ready_handler"), vec!["target"]);
+        assert_eq!(defs["on_ready_handler"].calls[0].call_site_line, 4);
+        assert!(
+            !defs.keys().any(|key| key.starts_with("register_handler")),
+            "unaddressed nested callbacks have no row: {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(callee_names(&defs, "outer"), vec!["other"]);
+        assert_eq!(defs["outer"].calls[0].call_site_line, 5);
+    }
+
+    /// A callback with no indexed function around it keeps its row: at module
+    /// scope it is the only named unit its calls can belong to.
+    #[test]
+    fn top_level_callbacks_keep_their_rows_and_own_their_calls() {
+        let (_dir, defs) = scan(&[(
+            "app.ts",
+            "function target() {}\n\
+             function inner() {}\n\
+             register(() => { target(); items.map((item) => inner()); });\n",
+        )]);
+        assert_eq!(
+            callee_names(&defs, "register_handler"),
+            vec!["inner", "target"]
+        );
+        assert!(!defs.contains_key("map_handler"));
     }
 
     /// A call written in a parameter default runs as part of the function, so
