@@ -756,6 +756,50 @@ mod hosted_wire_tests {
         );
     }
 
+    /// The three provenance fields ride INSIDE `hosted`, in these exact
+    /// spellings, and only when the row carries them.
+    ///
+    /// `dirty` is the one a reader acts on — it is what says the generation was
+    /// built from bytes no commit describes — and carrick#1255 made the scanner
+    /// stamp it from the blob as well as the stored row, so a generation
+    /// written before the field existed now reads as dirty. This pins both
+    /// halves: `true` is carried and spelled `dirty`, and a hosted object
+    /// without the key parses and re-serialises without it rather than as a
+    /// `null` a consumer has to interpret.
+    #[test]
+    fn the_hosted_provenance_fields_are_sparse_and_exactly_spelled() {
+        let mut value = serde_json::to_value(super::tests::output()).unwrap();
+        value["hosted"] = serde_json::json!({
+            "commit":"abc123","indexed_at":"2026-09-10T10:00:00Z",
+            "scanner_version":"0.3.58","project":"fixture",
+            "source":"laptop","uploaded_by":"ihor","dirty":true
+        });
+        value["hosted_state"] = serde_json::json!("read_failed");
+        let parsed: CheckOutput = serde_json::from_value(value.clone()).unwrap();
+        let hosted = parsed.hosted.clone().expect("a hosted row");
+        assert_eq!(hosted.dirty, Some(true));
+        assert_eq!(hosted.source.as_deref(), Some("laptop"));
+        assert_eq!(hosted.uploaded_by.as_deref(), Some("ihor"));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+
+        for field in ["source", "uploaded_by", "dirty"] {
+            value["hosted"].as_object_mut().unwrap().remove(field);
+        }
+        let older: CheckOutput = serde_json::from_value(value.clone()).unwrap();
+        let hosted = older.hosted.clone().expect("a hosted row");
+        assert_eq!(hosted.dirty, None);
+        assert_eq!(hosted.source, None);
+        assert_eq!(hosted.uploaded_by, None);
+        let written = serde_json::to_value(older).unwrap();
+        for field in ["source", "uploaded_by", "dirty"] {
+            assert!(
+                !written["hosted"].as_object().unwrap().contains_key(field),
+                "{field} was written onto a row that never carried it"
+            );
+        }
+        assert_eq!(written, value);
+    }
+
     /// The three carrick#1033 fields ride on the ITEM, in these exact
     /// spellings, and a payload written before they existed still parses with
     /// all three absent rather than empty.
