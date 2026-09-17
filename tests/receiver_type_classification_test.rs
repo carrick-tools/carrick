@@ -120,6 +120,7 @@ fn detection() -> DetectionResult {
         frameworks: vec!["server-fw".to_string()],
         data_fetchers: vec!["http-fetcher".to_string()],
         messaging_clients: vec![],
+        socket_clients: vec![],
         notes: String::new(),
     }
 }

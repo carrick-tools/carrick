@@ -19,6 +19,23 @@ pub struct DetectionResult {
     /// files that produce no SWC candidates.
     #[serde(default)]
     pub messaging_clients: Vec<String>,
+    /// Packages that carry named events over a socket or realtime connection
+    /// (`ws`, `socket.io`/`socket.io-client`, channel clients, SignalR-style
+    /// hubs, ...), enumerated by the framework-detect LLM. Package names, matched
+    /// against a file's import specifiers exactly as `messaging_clients` is
+    /// (exact or `<entry>/` prefix), and DISJOINT from it: a package listed here
+    /// must not also appear in `messaging_clients`, or its files gate into the
+    /// LLM pub/sub path as well and produce `pubsub|…` rows for sites this pass
+    /// already keys as `socket|…`.
+    ///
+    /// The gate for the general socket pass in [`crate::socket_io`]: a binding
+    /// constructed from — or declared with a type imported from — one of these
+    /// packages is a socket root whose direction is unknown. Empty until the
+    /// carrick-cloud /framework-detect prompt and response schema emit the field
+    /// (carrick-cloud#1043), and empty in local mode; the pass is inert either
+    /// way, and Socket.IO's own rules do not depend on it.
+    #[serde(default)]
+    pub socket_clients: Vec<String>,
     pub notes: String,
 }
 

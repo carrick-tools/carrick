@@ -89,6 +89,7 @@ fn create_express_detection() -> DetectionResult {
         frameworks: vec!["express".to_string()],
         data_fetchers: vec!["axios".to_string()],
         messaging_clients: vec![],
+        socket_clients: vec![],
         notes: "Test detection result".to_string(),
     }
 }

@@ -2669,8 +2669,13 @@ async fn analyze_current_repo_incremental(
             // the GraphQL consumer file set folds transport data calls out of
             // the graph (#307) so every downstream surface (cloud projection,
             // type manifest, type requests) sees the same call set.
-            let (mut protocol_extractions, document_sites) =
-                scan_protocol_extractions(repo_path, service, &files, &merged_results);
+            let (mut protocol_extractions, document_sites) = scan_protocol_extractions(
+                repo_path,
+                service,
+                &files,
+                &merged_results,
+                &setup.detection.socket_clients,
+            );
             settle_graphql_documents(
                 &mut protocol_extractions.graphql,
                 document_sites,
@@ -3122,6 +3127,7 @@ fn scan_protocol_extractions(
     service: &Config,
     files: &[PathBuf],
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    socket_clients: &[String],
 ) -> (
     ProtocolExtractions,
     crate::graphql_document_sites::DocumentSiteConsumers,
@@ -3142,7 +3148,9 @@ fn scan_protocol_extractions(
         crate::workspace_resolver::WorkspaceIndex::build_with_aliases(Path::new(repo_path), None);
     let document_sites =
         crate::graphql_document_sites::collect_document_site_consumers(files, Some(&workspace));
-    let sockets = crate::socket_io::scan_files(files);
+    // The detected socket clients gate the pass's unknown-direction half; its
+    // Socket.IO rules are independent of them (carrick#1281).
+    let sockets = crate::socket_io::scan_files(files, socket_clients);
     let event_bus = crate::event_emitter::scan_files(files, &sockets);
     (
         ProtocolExtractions {
@@ -6132,8 +6140,13 @@ async fn analyze_current_repo(
     // GraphQL consumer file set folds transport data calls out of the mount
     // graph (#307) so every downstream surface (cloud projection, type
     // manifest, type requests) sees the same call set.
-    let (mut protocol_extractions, document_sites) =
-        scan_protocol_extractions(repo_path, service, &files, &analysis_result.file_results);
+    let (mut protocol_extractions, document_sites) = scan_protocol_extractions(
+        repo_path,
+        service,
+        &files,
+        &analysis_result.file_results,
+        &setup.detection.socket_clients,
+    );
     let mut analysis_result = analysis_result;
     settle_graphql_documents(
         &mut protocol_extractions.graphql,
@@ -8972,6 +8985,7 @@ mod tests {
                     frameworks: vec!["express".to_string()],
                     data_fetchers: vec![],
                     messaging_clients: vec![],
+                    socket_clients: vec![],
                     notes: String::new(),
                 }),
                 cached_guidance: None,
@@ -9266,6 +9280,7 @@ mod tests {
                 frameworks: vec!["express".to_string()],
                 data_fetchers: vec!["fetch".to_string()],
                 messaging_clients: vec![],
+                socket_clients: vec![],
                 notes: "test".to_string(),
             }),
             cached_guidance: None,

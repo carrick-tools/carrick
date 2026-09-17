@@ -115,7 +115,11 @@ const PUBLISH_METHOD: &str = "emit";
 /// [`crate::socket_io::RESERVED_EVENTS`], because the socket pass DECLINES
 /// those sites (they are reserved there too) and so leaves no claim on the span
 /// for this pass to see.
-const RUNTIME_EVENTS: &[&str] = &[
+///
+/// The socket pass reads this list back for its unknown-direction roots
+/// (`crate::socket_io::is_transport_event`): a raw socket's `message`/`close`
+/// is the same runtime vocabulary reaching user code down a different pipe.
+pub(crate) const RUNTIME_EVENTS: &[&str] = &[
     // Process lifecycle and signals.
     "SIGBREAK",
     "SIGHUP",
@@ -464,7 +468,7 @@ mod tests {
         fs::write(&file, source).unwrap();
         let files = vec![file.clone()];
 
-        let sockets = crate::socket_io::scan_files(&files);
+        let sockets = crate::socket_io::scan_files(&files, &[]);
         assert_eq!(
             sockets.listeners.len(),
             1,

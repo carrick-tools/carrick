@@ -2156,9 +2156,12 @@ struct CandidateVisitor {
     /// for Signal 7 (pub/sub call-site surfacing): the publish/subscribe shape
     /// (`obj.method("topic", payload)`) is indistinguishable from
     /// `socket.emit('x')` / `logger.info('x')`, so surfacing it unconditionally
-    /// broke the socket-skip invariant and risked corpus-1. socket.io is *not* a
-    /// messaging client, so socket files never gate in and the signal stays inert
-    /// there. Empty `messaging_clients` → always false → Signal 7 never fires.
+    /// broke the socket-skip invariant and risked corpus-1. Socket libraries are
+    /// listed in `socket_clients`, NOT here — that list gates the deterministic
+    /// socket pass (`crate::socket_io`) and the two are disjoint by contract, so
+    /// socket files never gate in and this signal stays inert there
+    /// (carrick#1281). Empty `messaging_clients` → always false → Signal 7 never
+    /// fires.
     file_imports_messaging_client: bool,
     /// Top-level `const <id> = "<literal>"` bindings (name -> literal value),
     /// so a pub/sub call whose topic is referenced by name (`const SUBJECT =

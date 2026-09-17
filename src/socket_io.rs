@@ -1,14 +1,33 @@
-//! Deterministic Socket.IO contract extraction.
+//! Deterministic socket contract extraction.
 //!
-//! Socket.IO has a real operation key — event name plus message-flow
+//! A socket event has a real operation key — event name plus message-flow
 //! direction — and event names are string literals in idiomatic code, so
 //! extraction is AST-based with no LLM. Listeners (`socket.on("x", ...)`)
 //! are producers of the key for the direction they receive; emitters
 //! (`socket.emit("x", ...)`) are consumers for the direction they send.
-//! Which side of the wire a call site is on is derived from imports:
-//! `socket.io-client` factories make client sockets, `new Server(...)` from
-//! `socket.io` makes server roots, and the first parameter of a
-//! `connection` handler is a per-connection server socket.
+//!
+//! Two rules admit a socket root, and the difference between them is the whole
+//! shape of this module (carrick#1281):
+//!
+//! - **Socket.IO**, whose imports say which side of the wire a binding is on:
+//!   `socket.io-client` factories make client sockets, `new Server(...)` from
+//!   `socket.io` makes server roots, and the first parameter of a `connection`
+//!   handler is a per-connection server socket. The direction is derived from
+//!   the side, and the key is precise.
+//! - **Any package the framework-detect step labels a socket client**
+//!   (`DetectionResult::socket_clients` — `ws`, channel clients, hub clients),
+//!   whose imports say nothing about sides because the same symbol is used on
+//!   both. A binding constructed from one of those imports, declared with a
+//!   type imported from one, or returned by a method OF one, is a socket root
+//!   of unknown direction, and its ops are keyed `SocketDirection::Unknown`.
+//!   An unknown-direction listener and emitter share that key, so the two
+//!   sides of one contract still match; they cannot match a Socket.IO row for
+//!   the same event name, which is correct — they are not the same transport.
+//!
+//! Nothing here reads a package NAME except `socket.io` / `socket.io-client`,
+//! whose two extra rules buy the direction. Every other library reaches this
+//! pass through the detector's list, so no library is special-cased and none
+//! has to be recognised in Rust.
 //!
 //! The key carries the event name and the direction, and nothing else. A
 //! custom namespace is therefore not part of operation identity here, and
@@ -64,6 +83,36 @@
 //! - socket identity is tracked by binding name (`this.<field>` for fields),
 //!   not full scope analysis, and is flat per file: two classes in one file
 //!   with same-named socket fields share a root.
+//!
+//! What the unknown-direction half adds, and what it accepts:
+//! - the call vocabulary widens to the protocol's own words — registration is
+//!   `on`/`once`/`addListener`/`bind`/`subscribe` AND a function-valued second
+//!   argument, sending is `emit`/`send`/`publish`/`trigger`. The callback
+//!   requirement is what tells `channel.subscribe("orders", handler)` (a
+//!   registration) from `client.subscribe("orders")` (a channel handle), which
+//!   no name list could,
+//! - a method-return IS traced, for unknown roots only: a channel client hands
+//!   its channel back from a call (`const channel = client.subscribe("orders")`)
+//!   and there is no other way to reach it. Socket.IO keeps its no-method-return
+//!   rule, where a typed field is the idiom instead,
+//! - the runtime's own event vocabulary is excluded as well as Socket.IO's
+//!   reserved names ([`crate::event_emitter::RUNTIME_EVENTS`]), because a
+//!   `ws` socket's `message`/`close`/`open` are the transport's lifecycle, not
+//!   a contract, and a row on a name that generic would match any unrelated
+//!   row sharing it,
+//! - one shape reads a payload rather than an argument: `send(JSON.stringify({
+//!   type: "x", … }))`, the plain-WebSocket idiom, where the event name is a
+//!   discriminator field of the sent object. `type` and `event` are accepted as
+//!   the discriminator key. That is a convention, not a structure, and it is
+//!   the only place in this module where one is used; it earns its place
+//!   because on a raw socket there is no other literal to key on,
+//! - the RECEIVING side of that idiom (`switch (msg.type)` inside a `message`
+//!   handler) is not extracted, so a plain-WebSocket service produces emitter
+//!   rows whose listeners are invisible, and they surface as unmatched socket
+//!   calls (carrick#1287),
+//! - an unknown-direction listener and emitter for one event in ONE service
+//!   match each other, because the key cannot express that they are the same
+//!   side. Socket.IO's directional key does not have this exposure.
 
 use crate::import_bindings::BindingResolver;
 use crate::operation::{OperationKey, SocketDirection};
@@ -144,8 +193,32 @@ pub(crate) const RESERVED_EVENTS: &[&str] = &[
     "removeListener",
 ];
 
-/// Extract Socket.IO operations from the service's TS/JS files.
-pub fn scan_files(service_files: &[PathBuf]) -> SocketExtraction {
+/// Handler-registration vocabulary for unknown-direction roots. This is the
+/// protocol's own words, not a library list — the same footing
+/// `crate::event_emitter::SUBSCRIBE_METHODS` stands on. A call only counts as a
+/// registration when it ALSO passes a handler (see
+/// [`OpCollector::handler_argument`]), which is what separates
+/// `channel.subscribe("orders", handler)` from `client.subscribe("orders")`.
+const UNKNOWN_SUBSCRIBE_METHODS: &[&str] = &["on", "once", "addListener", "bind", "subscribe"];
+
+/// Sending vocabulary for unknown-direction roots, with the event name as the
+/// first argument.
+const UNKNOWN_PUBLISH_METHODS: &[&str] = &["emit", "send", "publish", "trigger"];
+
+/// Object keys accepted as the event discriminator of a serialized envelope
+/// (`send(JSON.stringify({ type: "order.created", … }))`). A convention rather
+/// than a structure, and deliberately the only one in this module: a raw socket
+/// carries no other literal to key on.
+const ENVELOPE_EVENT_KEYS: &[&str] = &["type", "event"];
+
+/// Extract socket operations from the service's TS/JS files.
+///
+/// `socket_clients` is `DetectionResult::socket_clients` — the packages the
+/// framework-detect step labelled socket/realtime clients. Socket.IO's rules do
+/// not consult it; it is the gate for every other library, so an empty slice
+/// (local mode, a repo whose detection predates the field) leaves this pass
+/// extracting exactly what it extracted before.
+pub fn scan_files(service_files: &[PathBuf], socket_clients: &[String]) -> SocketExtraction {
     let mut extraction = SocketExtraction::default();
     // One resolver for the whole service: it caches each module's export
     // table, and a module that declares a shared socket type is read by every
@@ -159,17 +232,21 @@ pub fn scan_files(service_files: &[PathBuf]) -> SocketExtraction {
         if !is_script {
             continue;
         }
-        extraction.merge(extract_from_ts_file(file, &mut resolver));
+        extraction.merge(extract_from_ts_file(file, &mut resolver, socket_clients));
     }
     debug!(
         listeners = extraction.listeners.len(),
         emitters = extraction.emitters.len(),
-        "Socket.IO extraction complete"
+        "Socket extraction complete"
     );
     extraction
 }
 
-fn extract_from_ts_file(file_path: &Path, resolver: &mut AliasResolver) -> SocketExtraction {
+fn extract_from_ts_file(
+    file_path: &Path,
+    resolver: &mut AliasResolver,
+    socket_clients: &[String],
+) -> SocketExtraction {
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
 
@@ -180,7 +257,7 @@ fn extract_from_ts_file(file_path: &Path, resolver: &mut AliasResolver) -> Socke
         };
 
         // Pass A: collect socket-rooted binding names, to fixpoint.
-        let mut roots = SocketRoots::default();
+        let mut roots = SocketRoots::for_clients(socket_clients);
         collect_roots(&module, &mut roots);
 
         // Pass A2 (carrick#670): a field whose declared type is a socket alias
@@ -230,6 +307,7 @@ impl AliasResolver {
         importer: &Path,
         specifier: &str,
         exported_name: &str,
+        socket_clients: &[String],
     ) -> Option<SocketKind> {
         if !specifier.starts_with('.') {
             return None;
@@ -241,7 +319,7 @@ impl AliasResolver {
         if let Some(verdict) = self.verdicts.get(&key) {
             return *verdict;
         }
-        let verdict = declaring_module_kind(&declaring, exported_name);
+        let verdict = declaring_module_kind(&declaring, exported_name, socket_clients);
         self.verdicts.insert(key, verdict);
         verdict
     }
@@ -249,18 +327,24 @@ impl AliasResolver {
 
 /// Read the module that declares the alias with the module-local rules and ask
 /// what its own collector made of the name.
-fn declaring_module_kind(file: &Path, exported_name: &str) -> Option<SocketKind> {
+fn declaring_module_kind(
+    file: &Path,
+    exported_name: &str,
+    socket_clients: &[String],
+) -> Option<SocketKind> {
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
     let globals = Globals::new();
     GLOBALS.set(&globals, || {
         let module = parse_file(file, &cm, &handler)?;
-        let mut roots = SocketRoots::default();
+        let mut roots = SocketRoots::for_clients(socket_clients);
         collect_roots(&module, &mut roots);
         if roots.client_socket_types.contains(exported_name) {
             Some(SocketKind::Client)
         } else if roots.server_socket_types.contains(exported_name) {
             Some(SocketKind::Server)
+        } else if roots.unknown_socket_types.contains(exported_name) {
+            Some(SocketKind::Unknown)
         } else {
             None
         }
@@ -310,18 +394,23 @@ fn resolve_imported_aliases(
         };
         if roots.client_socket_types.contains(&type_name)
             || roots.server_socket_types.contains(&type_name)
+            || roots.unknown_socket_types.contains(&type_name)
         {
             continue;
         }
         let Some((specifier, exported)) = roots.imported_types.get(&type_name).cloned() else {
             continue;
         };
-        let Some(kind) = resolver.kind_of_imported_type(file_path, &specifier, &exported) else {
+        let socket_clients = roots.socket_clients.clone();
+        let Some(kind) =
+            resolver.kind_of_imported_type(file_path, &specifier, &exported, &socket_clients)
+        else {
             continue;
         };
         match kind {
             SocketKind::Client => roots.client_socket_types.insert(type_name),
             SocketKind::Server => roots.server_socket_types.insert(type_name),
+            SocketKind::Unknown => roots.unknown_socket_types.insert(type_name),
         };
         admitted = true;
     }
@@ -338,7 +427,9 @@ struct UnrootedCallRoots<'a> {
 impl UnrootedCallRoots<'_> {
     fn note(&mut self, member: &MemberExpr, args: &[ExprOrSpread]) {
         if let Some(prop) = member.prop.as_ident()
-            && matches!(prop.sym.as_ref(), "on" | "once" | "emit")
+            && (matches!(prop.sym.as_ref(), "on" | "once" | "emit")
+                || UNKNOWN_SUBSCRIBE_METHODS.contains(&prop.sym.as_ref())
+                || UNKNOWN_PUBLISH_METHODS.contains(&prop.sym.as_ref()))
             && args
                 .first()
                 .is_some_and(|arg| matches!(&*arg.expr, Expr::Lit(Lit::Str(_))))
@@ -376,15 +467,21 @@ impl Visit for UnrootedCallRoots<'_> {
     }
 }
 
-/// Which side of the wire a socket-rooted binding sits on.
+/// Which side of the wire a socket-rooted binding sits on — or `Unknown`, for a
+/// library whose imports do not distinguish the sides (carrick#1281).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SocketKind {
     Client,
     Server,
+    Unknown,
 }
 
 #[derive(Default)]
 struct SocketRoots {
+    /// `DetectionResult::socket_clients`: the packages whose value and type
+    /// imports admit an unknown-direction socket root. Empty → this file's
+    /// unknown-direction rules never fire.
+    socket_clients: Vec<String>,
     /// Local names of `socket.io-client` factories (`io`, `connect`, ...).
     client_factories: HashSet<String>,
     /// Local names of the `socket.io` `Server` class.
@@ -404,12 +501,26 @@ struct SocketRoots {
     /// Local names of the `Socket` TYPE imported from `socket.io` — the
     /// per-connection server socket, not the server root.
     server_socket_types: HashSet<String>,
+    /// Local names imported as VALUES from a `socket_clients` package: the
+    /// constructors and factories that make an unknown-direction socket
+    /// (`new WebSocket(url)`, `createClient(...)`). Both call and `new`
+    /// positions read this set, because a package publishes one or the other
+    /// and nothing structural says which.
+    unknown_constructors: HashSet<String>,
+    /// Local names imported from a `socket_clients` package used in TYPE
+    /// position (`private conn?: WebSocket`). Same names as
+    /// `unknown_constructors` — an import specifier is admitted to both, since
+    /// a value import and a type import are told apart by use, not by shape.
+    unknown_socket_types: HashSet<String>,
     /// Bindings holding client sockets (`const s = io(url)`). Class fields are
     /// keyed `this.<name>` / `this.#<name>`.
     client_sockets: HashSet<String>,
     /// Bindings holding server roots (`const io = new Server(...)`) or
     /// per-connection sockets (`io.on("connection", (socket) => ...)`).
     server_sockets: HashSet<String>,
+    /// Bindings holding a socket from a `socket_clients` package, whose
+    /// direction no rule can derive.
+    unknown_sockets: HashSet<String>,
     /// Imported type symbols → their module specifier. Drives payload-anchor
     /// resolution (#245): an emitted/received payload typed as an imported
     /// named reference gets a `(symbol, source)` pair the SymbolRequest path
@@ -426,6 +537,25 @@ struct SocketRoots {
 }
 
 impl SocketRoots {
+    /// Empty roots that will admit unknown-direction sockets for
+    /// `socket_clients`.
+    fn for_clients(socket_clients: &[String]) -> Self {
+        Self {
+            socket_clients: socket_clients.to_vec(),
+            ..Self::default()
+        }
+    }
+
+    /// Is this import specifier one of the detected socket-client packages?
+    /// Exact or `<entry>/` prefix — the same convention
+    /// `file_imports_messaging_client` uses, so a package gates the same way
+    /// everywhere.
+    fn is_socket_client(&self, specifier: &str) -> bool {
+        self.socket_clients
+            .iter()
+            .any(|pkg| specifier == pkg || specifier.starts_with(&format!("{}/", pkg)))
+    }
+
     fn size(&self) -> usize {
         self.client_factories.len()
             + self.server_classes.len()
@@ -433,6 +563,9 @@ impl SocketRoots {
             + self.server_socket_types.len()
             + self.client_sockets.len()
             + self.server_sockets.len()
+            + self.unknown_constructors.len()
+            + self.unknown_socket_types.len()
+            + self.unknown_sockets.len()
             + self.type_imports.len()
             + self.binding_types.len()
     }
@@ -441,6 +574,7 @@ impl SocketRoots {
         match kind {
             SocketKind::Client => self.client_sockets.insert(key),
             SocketKind::Server => self.server_sockets.insert(key),
+            SocketKind::Unknown => self.unknown_sockets.insert(key),
         };
     }
 
@@ -449,6 +583,8 @@ impl SocketRoots {
             Some(SocketKind::Client)
         } else if self.server_sockets.contains(key) {
             Some(SocketKind::Server)
+        } else if self.unknown_sockets.contains(key) {
+            Some(SocketKind::Unknown)
         } else {
             None
         }
@@ -471,6 +607,8 @@ impl SocketRoots {
                         Some(SocketKind::Client)
                     } else if self.server_socket_types.contains(name) {
                         Some(SocketKind::Server)
+                    } else if self.unknown_socket_types.contains(name) {
+                        Some(SocketKind::Unknown)
                     } else {
                         None
                     }
@@ -530,6 +668,22 @@ impl SocketRoots {
                     {
                         Some(SocketKind::Client)
                     }
+                    Expr::Ident(factory)
+                        if self.unknown_constructors.contains(factory.sym.as_ref()) =>
+                    {
+                        Some(SocketKind::Unknown)
+                    }
+                    // The method-return hop, for unknown roots only: a channel
+                    // client hands the object that carries the events back from
+                    // a call (`const channel = client.subscribe("orders")`), so
+                    // refusing to trace it would make the whole library
+                    // invisible. A Socket.IO root never reaches this arm.
+                    Expr::Member(member) => {
+                        match member_root(member).map(|root| self.kind_of(&root)) {
+                            Some(Some(SocketKind::Unknown)) => Some(SocketKind::Unknown),
+                            _ => None,
+                        }
+                    }
                     _ => None,
                 },
                 _ => None,
@@ -537,6 +691,9 @@ impl SocketRoots {
             Expr::New(NewExpr { callee, .. }) => match &**callee {
                 Expr::Ident(class) if self.server_classes.contains(class.sym.as_ref()) => {
                     Some(SocketKind::Server)
+                }
+                Expr::Ident(class) if self.unknown_constructors.contains(class.sym.as_ref()) => {
+                    Some(SocketKind::Unknown)
                 }
                 _ => None,
             },
@@ -565,6 +722,11 @@ impl SocketRoots {
             } else {
                 SocketDirection::ServerToClient
             })
+        } else if self.unknown_sockets.contains(root) {
+            // Nothing in the library said which side this binding is on, so
+            // neither does the key. Both roles land on one direction, which is
+            // what lets the two sides of the contract still meet.
+            Some(SocketDirection::Unknown)
         } else {
             None
         }
@@ -604,6 +766,25 @@ impl Visit for RootCollector<'_> {
             }
         }
         if source != "socket.io" && source != "socket.io-client" {
+            // Any import from a package the detector labelled a socket client
+            // admits its local names as unknown-direction roots. The specifier
+            // rule above wins: a detection that also lists `socket.io` leaves
+            // Socket.IO's precise directional rules in force, never replaced by
+            // the general ones.
+            if self.roots.is_socket_client(source) {
+                for specifier in &node.specifiers {
+                    let local = match specifier {
+                        ImportSpecifier::Default(default) => default.local.sym.to_string(),
+                        ImportSpecifier::Named(named) => named.local.sym.to_string(),
+                        // `import * as x from "ws"` binds a namespace, not a
+                        // socket: `x.WebSocket` is the constructor and member
+                        // roots are not traced here (see the module docs).
+                        ImportSpecifier::Namespace(_) => continue,
+                    };
+                    self.roots.unknown_constructors.insert(local.clone());
+                    self.roots.unknown_socket_types.insert(local);
+                }
+            }
             return;
         }
         for specifier in &node.specifiers {
@@ -669,6 +850,7 @@ impl Visit for RootCollector<'_> {
             match kind {
                 SocketKind::Client => self.roots.client_socket_types.insert(name),
                 SocketKind::Server => self.roots.server_socket_types.insert(name),
+                SocketKind::Unknown => self.roots.unknown_socket_types.insert(name),
             };
         }
         node.visit_children_with(self);
@@ -893,6 +1075,69 @@ struct OpCollector<'a> {
     extraction: SocketExtraction,
 }
 
+/// Is this event name the transport's own vocabulary rather than the
+/// codebase's? The union of Socket.IO's reserved names and the runtime's
+/// (`message`, `close`, `open`, …): a raw socket's lifecycle events are emitted
+/// AT user code by the transport, so they are not a contract between two parts
+/// of a codebase, and they are generic enough that a row on one would match any
+/// unrelated row sharing the name.
+fn is_transport_event(event: &str) -> bool {
+    RESERVED_EVENTS.contains(&event) || crate::event_emitter::RUNTIME_EVENTS.contains(&event)
+}
+
+/// The event name a serialized envelope carries: the string-literal value of a
+/// `type`/`event` key in `JSON.stringify({ … })`, or in an object literal sent
+/// directly. `None` for a dynamic name, a spread, or any other argument — the
+/// same literal-only rule the rest of the pass applies.
+fn envelope_event_name(expr: &Expr) -> Option<String> {
+    let object = match expr {
+        Expr::Object(object) => object,
+        Expr::Call(call) => {
+            let Callee::Expr(callee) = &call.callee else {
+                return None;
+            };
+            let Expr::Member(member) = &**callee else {
+                return None;
+            };
+            let is_json_stringify = matches!(&*member.obj, Expr::Ident(ident) if ident.sym.as_ref() == "JSON")
+                && member
+                    .prop
+                    .as_ident()
+                    .is_some_and(|prop| prop.sym.as_ref() == "stringify");
+            if !is_json_stringify {
+                return None;
+            }
+            match call.args.first().map(|arg| &*arg.expr) {
+                Some(Expr::Object(object)) => object,
+                _ => return None,
+            }
+        }
+        Expr::Paren(paren) => return envelope_event_name(&paren.expr),
+        Expr::TsAs(as_expr) => return envelope_event_name(&as_expr.expr),
+        _ => return None,
+    };
+    object.props.iter().find_map(|prop| {
+        let swc_ecma_ast::PropOrSpread::Prop(prop) = prop else {
+            return None;
+        };
+        let swc_ecma_ast::Prop::KeyValue(key_value) = &**prop else {
+            return None;
+        };
+        let key = match &key_value.key {
+            PropName::Ident(ident) => ident.sym.to_string(),
+            PropName::Str(name) => name.value.to_string(),
+            _ => return None,
+        };
+        if !ENVELOPE_EVENT_KEYS.contains(&key.as_str()) {
+            return None;
+        }
+        match &*key_value.value {
+            Expr::Lit(Lit::Str(value)) => Some(value.value.to_string()),
+            _ => None,
+        }
+    })
+}
+
 /// Walk a callee chain (`io.to("room").emit`, `socket.broadcast.emit`) back
 /// to the name of its root binding. A chain rooted on `this` yields the field
 /// key (`this.socket`, `this.#socket`) the class-field rules record under.
@@ -973,15 +1218,61 @@ impl OpCollector<'_> {
         let Some(root_name) = chain_root(&member.obj) else {
             return;
         };
-        let is_socket_root = self.roots.kind_of(&root_name).is_some();
+        let Some(kind) = self.roots.kind_of(&root_name) else {
+            return;
+        };
+        let method = prop.sym.as_ref();
 
-        let is_listener = matches!(prop.sym.as_ref(), "on" | "once");
-        let is_emitter = prop.sym.as_ref() == "emit";
-        if is_socket_root
-            && (is_listener || is_emitter)
+        // The vocabulary a root answers to. Socket.IO's two words are the
+        // directional half; an unknown-direction root reads the protocol
+        // vocabulary, because its library's word for "register a handler" is
+        // whatever that library chose.
+        let (is_listener, is_emitter) = match kind {
+            SocketKind::Client | SocketKind::Server => {
+                (matches!(method, "on" | "once"), method == "emit")
+            }
+            SocketKind::Unknown => (
+                UNKNOWN_SUBSCRIBE_METHODS.contains(&method)
+                    && Self::handler_argument(args).is_some(),
+                UNKNOWN_PUBLISH_METHODS.contains(&method),
+            ),
+        };
+
+        // `send(JSON.stringify({ type: "x", … }))`: the raw-WebSocket idiom,
+        // where the event name is a field of the payload rather than an
+        // argument. Emitter only, unknown roots only.
+        if kind == SocketKind::Unknown
+            && is_emitter
+            && !args
+                .first()
+                .is_some_and(|arg| matches!(&*arg.expr, Expr::Lit(Lit::Str(_))))
+        {
+            if let Some(event) = args.first().and_then(|arg| envelope_event_name(&arg.expr))
+                && !is_transport_event(&event)
+            {
+                self.extraction.emitters.push(SocketOp {
+                    key: OperationKey::socket(event, SocketDirection::Unknown),
+                    file_path: self.file_path.to_path_buf(),
+                    line: self.cm.lookup_char_pos(span.lo).line as u32,
+                    payload_type_symbol: None,
+                    payload_type_source: None,
+                });
+            }
+            return;
+        }
+
+        let reserved = |event: &str| match kind {
+            // An unknown-direction root's transport lifecycle (`message`,
+            // `close`, `open`) is not a contract either, and its names are
+            // generic enough to match anything.
+            SocketKind::Unknown => is_transport_event(event),
+            _ => RESERVED_EVENTS.contains(&event),
+        };
+
+        if (is_listener || is_emitter)
             && let Some(first) = args.first()
             && let Expr::Lit(Lit::Str(event)) = &*first.expr
-            && !RESERVED_EVENTS.contains(&event.value.as_ref())
+            && !reserved(event.value.as_ref())
             && let Some(direction) = self.roots.direction_for(&root_name, is_listener)
         {
             let payload_symbol = if is_listener {
@@ -1012,6 +1303,19 @@ impl OpCollector<'_> {
             } else {
                 self.extraction.emitters.push(op);
             }
+        }
+    }
+
+    /// The handler a registration call passes, when it passes one. A function
+    /// expression or a reference to one; anything else (an options bag, a
+    /// missing argument) is not a registration, which is how
+    /// `client.subscribe("orders")` — a call that RETURNS a channel — is told
+    /// from `channel.subscribe("orders", handler)`.
+    fn handler_argument(args: &[ExprOrSpread]) -> Option<&Expr> {
+        let candidate = args.get(1)?;
+        match &*candidate.expr {
+            expr @ (Expr::Arrow(_) | Expr::Fn(_) | Expr::Ident(_)) => Some(expr),
+            _ => None,
         }
     }
 
@@ -1048,6 +1352,14 @@ mod tests {
     use super::*;
 
     fn extract(source: &str) -> SocketExtraction {
+        extract_with_clients(source, &[])
+    }
+
+    /// Extract with a detected socket-client list, for the unknown-direction
+    /// half of the pass (carrick#1281).
+    fn extract_with_clients(source: &str, socket_clients: &[&str]) -> SocketExtraction {
+        let socket_clients: Vec<String> =
+            socket_clients.iter().map(|pkg| pkg.to_string()).collect();
         let dir = std::env::temp_dir().join(format!(
             "carrick-socket-test-{}-{:016x}",
             std::process::id(),
@@ -1064,7 +1376,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("file.ts");
         std::fs::write(&file, source).unwrap();
-        let result = extract_from_ts_file(&file, &mut AliasResolver::default());
+        let result = extract_from_ts_file(&file, &mut AliasResolver::default(), &socket_clients);
         std::fs::remove_dir_all(&dir).ok();
         result
     }
@@ -1090,7 +1402,7 @@ mod tests {
         for (name, source) in files {
             std::fs::write(dir.join(name), source).unwrap();
         }
-        let result = extract_from_ts_file(&dir.join("main.ts"), &mut AliasResolver::default());
+        let result = extract_from_ts_file(&dir.join("main.ts"), &mut AliasResolver::default(), &[]);
         std::fs::remove_dir_all(&dir).ok();
         result
     }
@@ -1844,5 +2156,61 @@ class Client {
             result.is_empty(),
             "a same-named foreign type is not a socket"
         );
+    }
+
+    #[test]
+    fn an_unknown_root_declines_the_transport_vocabulary() {
+        let result = extract_with_clients(
+            r#"
+import { Connection } from "wire-transport";
+const link = new Connection(url);
+link.on("message", handleFrame);
+link.on("close", teardown);
+link.on("order.settled", handleSettled);
+"#,
+            &["wire-transport"],
+        );
+        assert_eq!(
+            keys(&result.listeners),
+            vec!["socket|UNKNOWN|order.settled"],
+            "the runtime's own events are the transport's, not the codebase's"
+        );
+    }
+
+    #[test]
+    fn a_registration_needs_a_handler_and_a_send_needs_a_name() {
+        let result = extract_with_clients(
+            r#"
+import { Hub } from "wire-transport";
+const hub = new Hub(url);
+const room = hub.join("lobby");
+room.subscribe("seat.taken", onSeatTaken);
+room.subscribe("seat.freed");
+room.publish("seat.released", seat);
+room.publish(topicFromConfig, seat);
+"#,
+            &["wire-transport"],
+        );
+        assert_eq!(keys(&result.listeners), vec!["socket|UNKNOWN|seat.taken"]);
+        assert_eq!(keys(&result.emitters), vec!["socket|UNKNOWN|seat.released"]);
+    }
+
+    #[test]
+    fn a_non_socket_object_in_a_gated_file_is_not_a_socket_root() {
+        // The gate is the package a binding CAME FROM, not the file's imports:
+        // an in-process bus beside a socket keeps its own channel, so its rows
+        // still match a subscriber in a file that imports nothing.
+        let result = extract_with_clients(
+            r#"
+import { Connection } from "wire-transport";
+import { EventEmitter } from "node:events";
+const link = new Connection(url);
+const bus = new EventEmitter();
+bus.emit("order.audited", entry);
+link.emit("order.shipped", parcel);
+"#,
+            &["wire-transport"],
+        );
+        assert_eq!(keys(&result.emitters), vec!["socket|UNKNOWN|order.shipped"]);
     }
 }

@@ -1342,6 +1342,7 @@ mod tests {
                 frameworks: vec![],
                 data_fetchers: vec![],
                 messaging_clients: vec![],
+                socket_clients: vec![],
                 notes: String::new(),
             },
             framework_guidance: ProtocolGuidance::new(),

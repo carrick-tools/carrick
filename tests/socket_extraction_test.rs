@@ -14,7 +14,7 @@ fn scan_files_extracts_directional_socket_contract() {
     let root = fixture_root();
     let files = vec![root.join("src/server.ts"), root.join("src/client.ts")];
 
-    let extraction = scan_files(&files);
+    let extraction = scan_files(&files, &[]);
 
     let mut listeners: Vec<String> = extraction
         .listeners
