@@ -20,8 +20,8 @@ pub struct DetectionResult {
     #[serde(default)]
     pub messaging_clients: Vec<String>,
     /// Packages that carry named events over a socket or realtime connection
-    /// (`ws`, `socket.io`/`socket.io-client`, channel clients, SignalR-style
-    /// hubs, ...), enumerated by the framework-detect LLM. Package names, matched
+    /// (raw WebSocket libraries, channel clients, hub clients, Socket.IO),
+    /// enumerated by the framework-detect LLM. Package names, matched
     /// against a file's import specifiers exactly as `messaging_clients` is
     /// (exact or `<entry>/` prefix), and DISJOINT from it: a package listed here
     /// must not also appear in `messaging_clients`, or its files gate into the
