@@ -5035,10 +5035,16 @@ fn report_unresolved_imports(
 /// One line per config mapping whose target is not on disk, worst first
 /// (carrick#1273).
 ///
-/// This is the sentence the whole ticket is for, so it names three things: the
-/// mapping as the user wrote it, the path it points at, and how many imports
-/// went through it. A count with no referent is what the old `debug!` line
-/// was, and it told nobody anything.
+/// Four things and nothing else: how many imports, which mapping, what is
+/// missing, and what to do. A count with no referent is what the old `debug!`
+/// line was and it told nobody anything — but explaining what an unresolved
+/// import costs US is our internals, not their problem (David's ruling,
+/// 2026-09-17).
+///
+/// Whether the target's directory is missing too is the difference between a
+/// build step nobody ran and one import spelled wrong. It is carried by the
+/// instruction rather than by a clause of its own, which is where a reader
+/// needs it and costs no words.
 ///
 /// Capped like its sibling above: a repo with dozens of broken mappings has
 /// one cause, not dozens, and the ranked head names it.
@@ -5051,13 +5057,13 @@ fn missing_mapping_lines(unresolved: &crate::call_graph::UnresolvedImports) -> V
         .take(MAX_NAMED_UNRESOLVED_SPECIFIERS)
         .map(|(declared_by, missing)| {
             format!(
-                "Call graph: {} import(s) go through `{declared_by}`, which this repo's own config maps to {} — {}. Nothing imported through it resolves, so those calls record no caller edge and anything typed through them is `any`. A generated directory that no build step has filled looks exactly like this (carrick#1273)",
+                "Call graph: {} import(s) through `{declared_by}` are unresolved: its target {} does not exist. {}",
                 missing.imports,
                 missing.target.display(),
                 if missing.directory_missing {
-                    "a directory that does not exist"
+                    "Generate it, or fix the mapping."
                 } else {
-                    "a file that is not there"
+                    "Fix the mapping, or the import."
                 },
             )
         })
@@ -6404,12 +6410,15 @@ mod tests {
         );
         let lines = super::missing_mapping_lines(&unresolved);
         assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0],
+            "Call graph: 83 import(s) through `@generated-client/` are unresolved: its target \
+             src/db/generated/client/models.ts does not exist. Generate it, or fix the mapping."
+        );
         assert!(
-            lines[0].starts_with(
-                "Call graph: 83 import(s) go through `@generated-client/`, which this repo's own \
-                 config maps to src/db/generated/client/models.ts — a directory that does not exist."
-            ),
-            "the mapping, the path and the count, in that order:\n{}",
+            lines[0].split_whitespace().count() <= 25,
+            "a log line is read in a terminal, not studied: what an unresolved import costs us is \
+             our internals and does not belong here (David's ruling, 2026-09-17):\n{}",
             lines[0]
         );
 
@@ -6430,8 +6439,9 @@ mod tests {
             "worst first, so the cause leads:\n{lines:#?}"
         );
         assert!(
-            lines[1].contains("a file that is not there"),
-            "and an absent file is not called an absent directory:\n{}",
+            lines[1].ends_with("Fix the mapping, or the import."),
+            "a file missing beside its siblings is not a directory nobody generated, and the \
+             instruction is where that difference reaches a reader:\n{}",
             lines[1]
         );
     }
