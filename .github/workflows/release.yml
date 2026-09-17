@@ -62,8 +62,18 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
+      # With the default GITHUB_TOKEN the release PR is authored by
+      # `app/github-actions`, which has no merged commit of its own, so GitHub's
+      # first-time-contributor approval parks every workflow run on the release
+      # branch at `action_required` until a maintainer approves it by hand
+      # (carrick#1270; it bit 0.3.74 through 0.3.78). A token owned by a
+      # contributor makes the PR theirs and the runs start on their own. Falls
+      # back to GITHUB_TOKEN when the secret is absent, so nothing breaks
+      # before it exists.
       - uses: googleapis/release-please-action@v4
         id: release
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
 
   # The single resolver for both entry points. Everything downstream reads
   # `needs.target.outputs.*` and nothing downstream reads release-please, so the
