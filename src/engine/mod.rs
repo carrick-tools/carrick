@@ -2033,19 +2033,19 @@ async fn upload_service_payloads<T: CloudStorage>(
 ) -> Vec<UnconfirmedUpload> {
     crate::scan_stage::enter(crate::scan_stage::Stage::Upload);
     // Before the first write, because every write action reads it: a run that
-    // paid the analyzer for even one file computed something the stored
+    // sent even one file to the analyzer computed something the stored
     // generation does not hold, and the cloud's freshness guard — which sees
     // (commit, scanner version) and nothing else — would otherwise dedupe the
     // whole upload away at an unchanged commit (carrick#1306). Run-scoped, not
-    // per service: the answer one service bought reaches the others through
-    // the cross-repo join, so a repo where one service was analysed writes a
+    // per service: one service's fresh answers reach the others through the
+    // cross-repo join, so a repo where one service was analysed writes a
     // generation that differs everywhere.
     let analyzed = payloads.iter().any(payload_reached_the_analyzer);
     if analyzed {
         storage.note_analyzed_files();
     }
-    // The diagnostic below asks whether the cloud discarded a re-analysis this
-    // run paid for, so it has to mean the same thing the wire flag means.
+    // The diagnostic below asks whether the cloud discarded analysis this run
+    // had done, so it has to mean the same thing the wire flag means.
     let forced = forced || analyzed;
     let sp = logging::spinner("Uploading results...");
     let mut outcomes: Vec<UploadOutcome> = Vec::with_capacity(payloads.len());
@@ -2182,7 +2182,7 @@ fn upload_finish_message(outcomes: &[UploadOutcome]) -> &'static str {
 /// Said when a run that told the cloud to replace the stored generation had
 /// its answers computed and then discarded by the ingest. Names the one cause
 /// it can have, because the run itself did nothing wrong.
-const FORCED_REANALYSIS_DISCARDED: &str = "The analysis this scan paid for was discarded: the cloud kept the stored index for this \
+const FORCED_REANALYSIS_DISCARDED: &str = "This scan's fresh analysis was discarded: the cloud kept the stored index for this \
      commit. It is deployed without force_reindex support (carrick#885); the answers this \
      run computed were not stored.";
 
@@ -7510,14 +7510,14 @@ mod tests {
         assert!(unconfirmed.is_empty());
         assert!(
             storage.analyzed_noted(),
-            "one analysed service is enough: the answers it bought reach the others through the \
+            "one analysed service is enough: its fresh answers reach the others through the \
              cross-repo join, so the whole run's generation differs"
         );
     }
 
     /// And the other half of the acceptance: a rescan that analysed nothing
-    /// says nothing, so an unchanged repo is still deduped and pays for no
-    /// re-ingest.
+    /// says nothing, so an unchanged repo is still deduped and re-ingests
+    /// nothing.
     #[tokio::test]
     async fn a_run_that_analyzed_nothing_leaves_the_dedupe_alone() {
         let storage = ScriptedStorage::new(
