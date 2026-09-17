@@ -84,6 +84,7 @@ function projectComponents(): ProjectComponents {
       // resolves nothing under `node_modules` (carrick#1260).
       typeInferrer: new TypeInferrer({
         project,
+        repoRoot,
         packageOf: (filePath) => loader.packageOf(filePath),
       }),
       definitionResolver: new DefinitionResolver({ project }),
