@@ -1,0 +1,8 @@
+{
+  "name": "carrick-fixture-nested-root",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "root-lib": "file:./root-lib"
+  }
+}

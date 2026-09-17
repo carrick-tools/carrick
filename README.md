@@ -79,11 +79,11 @@ Pull requests opened from forks are skipped gracefully: GitHub withholds OIDC cr
 
 Package types need their dependencies on disk. Node projects use installed `node_modules`, and Deno projects use the Deno dependency cache. The Action prepares those dependencies before analysis:
 
-- For Node projects, installation runs when a lockfile sits at the path being analyzed. The lockfile picks the manager: `package-lock.json` runs `npm ci`, `pnpm-lock.yaml` runs `pnpm install --frozen-lockfile`, `yarn.lock` runs `yarn install`, `bun.lock`/`bun.lockb` runs `bun install`.
+- For Node projects, installation runs for every service the scan will visit, at that service's own nearest lockfile. A monorepo whose packages carry their own lockfiles is installed package by package; a workspace that hoists to one lockfile at its root is installed once. The lockfile picks the manager: `package-lock.json` runs `npm ci`, `pnpm-lock.yaml` runs `pnpm install --frozen-lockfile`, `yarn.lock` runs `yarn install`, `bun.lock`/`bun.lockb` runs `bun install`.
 - Lifecycle scripts are disabled in every case, so nothing in your repo executes during a scan.
 - Each install command has a five-minute timeout. A failed or timed-out install prints a warning, and the scan that follows refuses any service whose dependencies are still missing (see below).
-- Existing `node_modules` skips the Node install. A Deno manifest at the scan root still triggers Deno cache preparation. In a monorepo preparation happens at the path being scanned.
-- The package manager's download cache is restored between runs, keyed on the lockfile's hash.
+- Existing `node_modules` skips that service's Node install. A Deno manifest still triggers Deno cache preparation, which the separate Deno cache does not get from a Node install.
+- The package managers' download caches are restored between runs, keyed on the hash of every lockfile the run installs from.
 
 For Deno roots the Action runs `deno install --frozen --node-modules-dir=none`.
 This prepares the Deno dependency cache and prevents npm lifecycle scripts from
@@ -124,9 +124,7 @@ working; it just says so.
 Deno services normally omit `tsconfig` and use their nearest Deno manifest.
 An explicit ordinary TypeScript config selects the TypeScript path. An explicit
 Deno config must name that nearest manifest; `deno.json` takes precedence over
-`deno.jsonc` when both exist. Import maps must be local files. Nested Deno roots
-without a Deno manifest at the Action's scan root need dependency preparation
-in their own workspace before the Carrick step.
+`deno.jsonc` when both exist. Import maps must be local files.
 
 Turn it off with:
 

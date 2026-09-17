@@ -15,13 +15,19 @@ inputs:
       Install the scanned repository's dependencies before the scan, so types
       that resolve through a package are real types instead of `any`.
 
-      "auto" (the default) installs when a lockfile sits at the path being
-      analyzed, with lifecycle scripts disabled, and skips otherwise. Set it to
-      "false" to scan the checkout as-is, which also allows the bare scan that
-      leaves. A failed or slow install is not an error in itself, but the scan
-      that follows refuses a service whose dependencies are still missing and
-      names the command that installs them; `allow-unprepared: true` scans it
-      anyway.
+      "auto" (the default) prepares every service this repo holds, with
+      lifecycle scripts disabled, and skips a service that states no install.
+      A service is prepared where its own nearest lockfile sits, so a monorepo
+      whose packages carry lockfiles of their own is installed package by
+      package, and a workspace that hoists to one lockfile is installed once.
+      Set it to "false" to scan the checkout as-is, which also allows the bare
+      scan that leaves.
+
+      A failed or slow install does not fail this step, but it is not scanned
+      past either: the scan that follows refuses a service whose dependencies
+      are still missing and names the command that installs them.
+      `allow-unprepared: true` scans it anyway, with the types that resolve
+      through those packages indexed as `any`.
 
       Private registries use your own auth. Set NPM_TOKEN (or whatever your
       .npmrc references) in the job's `env:` and the install step inherits it.
@@ -223,49 +229,75 @@ runs:
       shell: bash
       run: cd "${{ steps.download.outputs.dist-dir }}/sidecar" && npm ci
 
+    # One name for whichever copy of Carrick this run resolved, so a step that
+    # asks it a question does not branch on the mode again. The installer asks
+    # it which services this repo has, and `npx` is a command rather than a
+    # path, so the name has to be a file either way.
+    #
+    # Deliberately not exported as CARRICK_BIN: to the npm package that
+    # variable names a scanner BINARY to run, so the wrapper would resolve
+    # itself and re-enter forever.
+    - name: Name the resolved Carrick
+      if: steps.fork-check.outputs.skip != 'true' && inputs.install-dependencies != 'false'
+      id: cli
+      shell: bash
+      env:
+        MODE: ${{ steps.resolve.outputs.mode }}
+        VERSION: ${{ steps.version.outputs.version }}
+        DIST_DIR: ${{ steps.download.outputs.dist-dir }}
+      run: |
+        CLI="$RUNNER_TEMP/carrick-cli"
+        if [ "$MODE" = "npx" ]; then
+          printf '%s\n' '#!/usr/bin/env bash' "exec npx --yes \"carrick@$VERSION\" \"\$@\"" > "$CLI"
+        else
+          printf '%s\n' '#!/usr/bin/env bash' "exec \"$DIST_DIR/carrick\" \"\$@\"" > "$CLI"
+        fi
+        chmod +x "$CLI"
+        echo "path=$CLI" >> "$GITHUB_OUTPUT"
+
     # The scanned repo's own dependencies, not Carrick's. Without them every
     # import from a package resolves to the compiler's `error` type and the
     # indexed request/response types degrade to `any`. Node installs are
     # lockfile-gated; Deno prepares its declared dependencies in frozen mode.
-    # Scripts disabled, time-boxed, and tolerant: see
-    # scripts/install-scanned-deps.sh for the posture and why it installs at
-    # the scan root only.
-    - name: Detect the scanned repo's package manager
+    # Scripts disabled and time-boxed: see scripts/install-scanned-deps.sh for
+    # the posture, and for why the set prepared is every service the pre-flight
+    # will check rather than the scan root alone (carrick#1312).
+    - name: Detect what the scanned repo needs installed
       if: steps.fork-check.outputs.skip != 'true' && inputs.install-dependencies != 'false'
       id: deps
       shell: bash
       env:
         SCAN_PATH: ${{ inputs.path }}
+        CARRICK_CLI: ${{ steps.cli.outputs.path }}
       run: |
         "$GITHUB_ACTION_PATH/scripts/install-scanned-deps.sh" detect "$SCAN_PATH" \
           | tee -a "$GITHUB_OUTPUT"
 
-    # Keyed on the lockfile's hash, so a repo whose dependencies did not change
-    # reuses the manager's download store. The store, not node_modules: `npm
-    # ci` deletes node_modules before installing, and a cache written from a
-    # half-finished install would poison the next run.
-    - name: Restore the package manager's store
+    # Keyed on the hash of EVERY lockfile the run installs from, so a repo
+    # whose nested service changed its dependencies does not restore a store
+    # keyed on the root's unchanged lockfile. The store, not node_modules:
+    # `npm ci` deletes node_modules before installing, and a cache written from
+    # a half-finished install would poison the next run.
+    - name: Restore the package managers' stores
       # `continue-on-error` is not supported on a composite action's steps, so
       # this leans on actions/cache's own behaviour: a restore that misses or
       # fails warns, it does not fail the step.
-      if: steps.fork-check.outputs.skip != 'true' && steps.deps.outputs.should_install == 'true' && steps.deps.outputs.cache_dir != ''
+      if: steps.fork-check.outputs.skip != 'true' && steps.deps.outputs.should_install == 'true' && steps.deps.outputs.cache_dirs != ''
       uses: actions/cache@v4
       with:
-        path: |
-          ${{ steps.deps.outputs.cache_dir }}
-          ${{ steps.deps.outputs.deno_cache_dir }}
-        key: carrick-deps-${{ runner.os }}-${{ steps.deps.outputs.manager }}-${{ steps.deps.outputs.lockfile_sha256 }}
+        path: ${{ steps.deps.outputs.cache_dirs }}
+        key: carrick-deps-${{ runner.os }}-${{ steps.deps.outputs.managers }}-${{ steps.deps.outputs.lockfiles_sha256 }}
         restore-keys: |
-          carrick-deps-${{ runner.os }}-${{ steps.deps.outputs.manager }}-
+          carrick-deps-${{ runner.os }}-${{ steps.deps.outputs.managers }}-
 
     - name: Install the scanned repo's dependencies
       if: steps.fork-check.outputs.skip != 'true' && steps.deps.outputs.should_install == 'true'
       shell: bash
       env:
         SCAN_PATH: ${{ inputs.path }}
-        PACKAGE_MANAGER: ${{ steps.deps.outputs.manager }}
+        CARRICK_CLI: ${{ steps.cli.outputs.path }}
       run: |
-        "$GITHUB_ACTION_PATH/scripts/install-scanned-deps.sh" install "$SCAN_PATH" "$PACKAGE_MANAGER"
+        "$GITHUB_ACTION_PATH/scripts/install-scanned-deps.sh" install "$SCAN_PATH"
 
     - name: Run analysis
       if: steps.fork-check.outputs.skip != 'true'

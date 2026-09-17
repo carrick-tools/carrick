@@ -1,11 +1,19 @@
 //! The Action's dependency-install step (carrick#706).
 //!
 //! `scripts/install-scanned-deps.sh` is what `action.yml` runs before "Run
-//! analysis". These cases drive it directly on the three fixtures under
+//! analysis". These cases drive it directly on the fixtures under
 //! `tests/fixtures/action-install`, so the posture is proven without a runner:
 //! no lockfile skips, a lockfile installs with lifecycle scripts disabled, and
 //! a lockfile that cannot install degrades to a `::warning::` while still
 //! exiting 0 so the scan continues.
+//!
+//! WHICH roots it prepares is the other half (carrick#1312), and the three
+//! shapes that differ are here: one lockfile at the root, a service carrying
+//! its own lockfile below one, and a workspace whose members hoist to a single
+//! lockfile. The set has to be the set the pre-flight checks, so the script
+//! asks the real binary (`carrick derive`) for this repo's services and these
+//! cases run it — a fixture that agreed with a second derivation written in
+//! the test would prove nothing about the scan that follows.
 //!
 //! Every case copies its fixture to a scratch directory first: `npm ci` writes
 //! `node_modules`, and a fixture tree that gains one stops being an answer key.
@@ -70,32 +78,61 @@ impl Drop for Scratch {
 }
 
 struct Run {
-    stdout: String,
+    /// What `detect` writes as step outputs, and nothing else: the runner
+    /// fails a step for a GITHUB_OUTPUT line that is not `key=value`.
+    out: String,
+    err: String,
     status: i32,
 }
 
-fn run(args: &[&str]) -> Run {
-    let output = Command::new("bash")
-        .arg(script())
-        .args(args)
-        .output()
-        .expect("run install-scanned-deps.sh");
+impl Run {
+    /// Both streams, for an assertion about what the step SAID rather than
+    /// about what it wrote to `$GITHUB_OUTPUT`.
+    fn text(&self) -> String {
+        format!("{}{}", self.out, self.err)
+    }
+}
+
+/// The Carrick the script asks for this repository's services. The binary
+/// built from this checkout, so a derivation change and this test move
+/// together.
+fn carrick_cli() -> &'static str {
+    env!("CARGO_BIN_EXE_carrick")
+}
+
+fn run_with(args: &[&str], cli: Option<&str>) -> Run {
+    let mut command = Command::new("bash");
+    command.arg(script()).args(args);
+    match cli {
+        Some(path) => command.env("CARRICK_CLI", path),
+        // An inherited one would decide a case that is about not having it.
+        None => command.env_remove("CARRICK_CLI"),
+    };
+    let output = command.output().expect("run install-scanned-deps.sh");
     Run {
-        stdout: format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ),
+        out: String::from_utf8_lossy(&output.stdout).into_owned(),
+        err: String::from_utf8_lossy(&output.stderr).into_owned(),
         status: output.status.code().unwrap_or(-1),
     }
+}
+
+fn run(args: &[&str]) -> Run {
+    run_with(args, Some(carrick_cli()))
 }
 
 fn detect(dir: &Path) -> Run {
     run(&["detect", dir.to_str().expect("utf-8 path")])
 }
 
-fn install(dir: &Path, manager: &str) -> Run {
-    run(&["install", dir.to_str().expect("utf-8 path"), manager])
+/// One root with the manager named, which is how the posture cases drive an
+/// install they have to choose the manager for.
+fn install_one(dir: &Path, manager: &str) -> Run {
+    run(&["install-one", dir.to_str().expect("utf-8 path"), manager])
+}
+
+/// Every root this checkout needs, which is what `action.yml` calls.
+fn install(dir: &Path) -> Run {
+    run(&["install", dir.to_str().expect("utf-8 path")])
 }
 
 #[test]
@@ -103,18 +140,18 @@ fn a_root_without_a_lockfile_installs_nothing() {
     let scratch = Scratch::of("no-lockfile");
     let detected = detect(&scratch.dir);
 
-    assert_eq!(detected.status, 0, "detect exits 0: {}", detected.stdout);
+    assert_eq!(detected.status, 0, "detect exits 0: {}", detected.text());
     assert!(
-        detected.stdout.contains("should_install=false"),
+        detected.text().contains("should_install=false"),
         "no lockfile, no install: {}",
-        detected.stdout
+        detected.text()
     );
     assert!(
         detected
-            .stdout
-            .contains("reason=no lockfile at the scan root"),
+            .out
+            .contains("reason=no service of this repository has a lockfile that is not installed"),
         "the skip says why: {}",
-        detected.stdout
+        detected.text()
     );
     assert!(
         !scratch.dir.join("node_modules").exists(),
@@ -128,19 +165,19 @@ fn a_lockfile_names_its_manager_and_the_key_the_cache_is_keyed_on() {
     let detected = detect(&scratch.dir);
 
     assert!(
-        detected.stdout.contains("should_install=true"),
+        detected.text().contains("should_install=true"),
         "a lockfile at the root installs: {}",
-        detected.stdout
+        detected.text()
     );
     assert!(
-        detected.stdout.contains("manager=npm"),
+        detected.text().contains("managers=npm"),
         "package-lock.json names npm: {}",
-        detected.stdout
+        detected.text()
     );
     let hash = detected
-        .stdout
+        .out
         .lines()
-        .find_map(|line| line.strip_prefix("lockfile_sha256="))
+        .find_map(|line| line.strip_prefix("lockfiles_sha256="))
         .expect("a lockfile hash for the cache key");
     assert_eq!(hash.len(), 64, "sha256 of the lockfile, got {hash:?}");
 }
@@ -152,16 +189,16 @@ fn an_installed_root_is_left_alone() {
 
     let detected = detect(&scratch.dir);
     assert!(
-        detected.stdout.contains("should_install=false"),
+        detected.text().contains("should_install=false"),
         "a workflow that installed already is not installed over: {}",
-        detected.stdout
+        detected.text()
     );
     assert!(
         detected
-            .stdout
-            .contains("reason=node_modules already present at the scan root"),
+            .out
+            .contains("reason=no service of this repository has a lockfile that is not installed"),
         "the skip says why: {}",
-        detected.stdout
+        detected.text()
     );
 }
 
@@ -171,18 +208,18 @@ fn an_installed_root_is_left_alone() {
 #[test]
 fn an_install_runs_with_lifecycle_scripts_disabled() {
     let scratch = Scratch::of("npm-lockfile");
-    let installed = install(&scratch.dir, "npm");
+    let installed = install_one(&scratch.dir, "npm");
 
-    assert_eq!(installed.status, 0, "install exits 0: {}", installed.stdout);
+    assert_eq!(installed.status, 0, "install exits 0: {}", installed.text());
     assert!(
-        !installed.stdout.contains("::warning::"),
+        !installed.text().contains("::warning::"),
         "a clean install warns about nothing: {}",
-        installed.stdout
+        installed.text()
     );
     assert!(
         scratch.dir.join("node_modules/local-lib").exists(),
         "the dependency is on disk, so the type layer is not bare: {}",
-        installed.stdout
+        installed.text()
     );
     assert!(
         !scratch.dir.join("local-lib/postinstall-ran").exists(),
@@ -195,22 +232,23 @@ fn an_install_runs_with_lifecycle_scripts_disabled() {
 #[test]
 fn a_failing_install_warns_and_lets_the_scan_continue() {
     let scratch = Scratch::of("broken-lockfile");
-    let installed = install(&scratch.dir, "npm");
+    let installed = install_one(&scratch.dir, "npm");
 
     assert_eq!(
-        installed.status, 0,
+        installed.status,
+        0,
         "a failed install is not a failed scan: {}",
-        installed.stdout
+        installed.text()
     );
     assert!(
-        installed.stdout.contains("::warning::"),
+        installed.text().contains("::warning::"),
         "the degradation is announced: {}",
-        installed.stdout
+        installed.text()
     );
     assert!(
-        installed.stdout.contains("bare checkout"),
-        "the warning says what the scan loses: {}",
-        installed.stdout
+        installed.text().contains("refuse that service"),
+        "the warning says what the scan does with it: {}",
+        installed.text()
     );
     assert!(
         !scratch.dir.join("node_modules").exists(),
@@ -223,13 +261,13 @@ fn a_failing_install_warns_and_lets_the_scan_continue() {
 #[test]
 fn an_unknown_manager_warns_and_exits_zero() {
     let scratch = Scratch::of("no-lockfile");
-    let installed = install(&scratch.dir, "cargo");
+    let installed = install_one(&scratch.dir, "cargo");
 
-    assert_eq!(installed.status, 0, "{}", installed.stdout);
+    assert_eq!(installed.status, 0, "{}", installed.text());
     assert!(
-        installed.stdout.contains("::warning::"),
+        installed.text().contains("::warning::"),
         "the skip is announced: {}",
-        installed.stdout
+        installed.text()
     );
 }
 
@@ -241,11 +279,11 @@ fn deno_preparation_does_not_skip_existing_node_modules() {
     fs::create_dir(dir.path().join("node_modules")).unwrap();
     let result = detect(dir.path());
     assert_eq!(result.status, 0);
-    assert!(result.stdout.contains("manager=deno"), "{}", result.stdout);
+    assert!(result.text().contains("managers=deno"), "{}", result.text());
     assert!(
-        result.stdout.contains("should_install=true"),
+        result.text().contains("should_install=true"),
         "{}",
-        result.stdout
+        result.text()
     );
 }
 
@@ -275,9 +313,9 @@ fn deno_preparation_never_runs_declared_tasks_or_application_code() {
             .status
             .success()
     );
-    let result = install(dir.path(), "deno");
+    let result = install_one(dir.path(), "deno");
     assert_eq!(result.status, 0);
-    assert!(result.stdout.contains("Installed"), "{}", result.stdout);
+    assert!(result.text().contains("Installed"), "{}", result.text());
     assert!(!dir.path().join("APPLICATION_RAN").exists());
     assert!(!dir.path().join("node_modules").exists());
     assert!(
@@ -299,4 +337,159 @@ fn deno_action_suppresses_config_authorized_npm_lifecycle_scripts() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// A service carrying its own lockfile below one is prepared too
+/// (carrick#1312). This is the live regression: the pre-flight refuses per
+/// service, and an installer that prepared the scan root alone left every
+/// nested service refused for dependencies the Action said it had installed.
+///
+/// The fixture is the shape that broke — `carrick.json` naming services in
+/// their own directories, one of which carries its own `package-lock.json`
+/// and one of which does not — so the set is two: the repository root, and
+/// the service with a lockfile of its own. The hoisted service has none and
+/// is prepared by the root's.
+#[test]
+fn a_service_with_its_own_lockfile_is_prepared_as_well_as_the_root() {
+    let scratch = Scratch::of("nested-services");
+    let detected = detect(&scratch.dir);
+
+    assert!(
+        detected.out.contains("should_install=true"),
+        "two lockfiles state two installs: {}",
+        detected.text()
+    );
+    assert!(
+        detected.out.contains("roots=2"),
+        "the root and the service that carries its own lockfile: {}",
+        detected.text()
+    );
+    assert!(
+        detected
+            .err
+            .contains("Carrick prepares services/api with npm"),
+        "the log names the nested root it prepares: {}",
+        detected.text()
+    );
+
+    let installed = install(&scratch.dir);
+    assert_eq!(installed.status, 0, "install exits 0: {}", installed.text());
+    assert!(
+        scratch.dir.join("node_modules/root-lib").exists(),
+        "the root was installed: {}",
+        installed.text()
+    );
+    assert!(
+        scratch
+            .dir
+            .join("services/api/node_modules/api-lib")
+            .exists(),
+        "the nested service was installed, so the pre-flight does not refuse it: {}",
+        installed.text()
+    );
+}
+
+/// A workspace that hoists is installed once, at the lockfile its members
+/// reach by walking up — not once per member.
+///
+/// Detection only: what is under test is WHICH root the install runs in, and
+/// the fixture states a pnpm workspace whose members depend on each other, so
+/// running pnpm here would prove nothing the plan does not already say.
+#[test]
+fn a_workspace_that_hoists_to_one_lockfile_is_installed_once() {
+    let scratch = Scratch::of("pnpm-workspace");
+    // Both members are services, so the single install below is a fold of two
+    // service roots onto one lockfile and not an empty derivation.
+    let derived = Command::new(carrick_cli())
+        .args([
+            "derive",
+            "--workspace",
+            scratch.dir.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("carrick derive");
+    let derived = String::from_utf8_lossy(&derived.stdout).into_owned();
+    assert!(
+        derived.contains("packages/a") && derived.contains("packages/b"),
+        "the workspace members are the services: {derived}"
+    );
+
+    let detected = detect(&scratch.dir);
+
+    assert!(
+        detected.out.contains("roots=1"),
+        "two members, one lockfile, one install: {}",
+        detected.text()
+    );
+    assert!(
+        detected.out.contains("managers=pnpm"),
+        "pnpm-lock.yaml names pnpm: {}",
+        detected.text()
+    );
+    assert!(
+        detected
+            .err
+            .contains("Carrick prepares the repository root with pnpm"),
+        "the one install runs at the workspace root: {}",
+        detected.text()
+    );
+    assert!(
+        !detected.err.contains("packages/"),
+        "no member is prepared on its own: {}",
+        detected.text()
+    );
+}
+
+/// A repository whose only lockfile is at its root is installed exactly once,
+/// as it was before the set grew past the scan root.
+#[test]
+fn a_single_lockfile_at_the_root_is_one_install() {
+    let scratch = Scratch::of("npm-lockfile");
+    let detected = detect(&scratch.dir);
+
+    assert!(
+        detected.out.contains("roots=1"),
+        "one lockfile, one install: {}",
+        detected.text()
+    );
+}
+
+/// Everything `detect` writes to stdout is a step output, whatever happens to
+/// the derivation.
+///
+/// The runner fails a step for any `$GITHUB_OUTPUT` line that is not
+/// `key=value` or inside a heredoc block, so a warning printed on the path
+/// where the services cannot be derived would turn a degradation the script
+/// is written to survive into a red Action.
+#[test]
+fn a_derivation_that_fails_still_writes_only_step_outputs() {
+    let scratch = Scratch::of("nested-services");
+    let detected = run_with(
+        &["detect", scratch.dir.to_str().expect("utf-8 path")],
+        Some("/nonexistent/carrick"),
+    );
+
+    assert_eq!(detected.status, 0, "detect exits 0: {}", detected.text());
+    assert!(
+        detected.err.contains("::warning::"),
+        "the degradation is announced, on stderr: {}",
+        detected.text()
+    );
+    let mut inside_heredoc = false;
+    for line in detected.out.lines() {
+        if let Some(delimiter) = line.split_once("<<").map(|(_, end)| end) {
+            inside_heredoc = true;
+            assert!(!delimiter.is_empty(), "a heredoc output names its end");
+            continue;
+        }
+        if inside_heredoc {
+            inside_heredoc = !line.starts_with("CARRICK_");
+            continue;
+        }
+        assert!(
+            line.contains('='),
+            "every line of a step output is key=value, got {line:?} in {}",
+            detected.out
+        );
+    }
 }
