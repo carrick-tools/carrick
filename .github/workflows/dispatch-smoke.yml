@@ -12,11 +12,9 @@ name: dispatch-smoke
 # a few cents — so it runs nightly, on demand, and on a PR that asks for it by
 # label. Runner minutes are free on this public repo; the inference is not.
 on:
-  schedule:
-    # Nightly, after the release window. The seam has two sides and the cloud's
-    # moves without any commit here, so this is on a clock rather than on our
-    # pushes.
-    - cron: "0 4 * * *"
+  # No nightly schedule yet: the CARRICK_SMOKE_TOKEN secret and
+  # DISPATCH_SMOKE_REPO variable do not exist, so a scheduled run would fail
+  # every night. Re-add `schedule:` once the owner has ruled on carrick#1259.
   workflow_dispatch:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
