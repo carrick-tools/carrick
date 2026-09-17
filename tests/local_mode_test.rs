@@ -907,10 +907,13 @@ fn a_scan_states_its_progress_to_the_indexer_and_not_to_the_user() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
+    // Every marker, not just the counts: a phase and a summary are gated on
+    // the same flag, and one emitted without it would reach a user as JSON
+    // (carrick#1315).
     for (name, stream) in [("stdout", &stdout), ("stderr", &stderr)] {
         assert!(
-            !stream.contains("@carrick-progress"),
-            "the indexer reads the updates; one reached {name} raw:\n{stream}"
+            !stream.contains("@carrick-"),
+            "nobody asked for markers; one reached {name} raw:\n{stream}"
         );
     }
     // One line per repo either way, because the animated form is a terminal's

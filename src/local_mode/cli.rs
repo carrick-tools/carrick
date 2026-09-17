@@ -1533,6 +1533,20 @@ mod tests {
         }
     }
 
+    /// Every writing command accepts `--verbose`, because the line a rendered
+    /// run closes on tells the reader to type it (carrick#1315).
+    #[test]
+    fn the_writing_commands_accept_the_log_level_flag() {
+        for command in ["index", "refresh", "resume"] {
+            for flag in ["--verbose", "-v"] {
+                assert!(
+                    parse(&args(&[command, flag])).unwrap().is_ok(),
+                    "`carrick {command} {flag}` was refused"
+                );
+            }
+        }
+    }
+
     /// The flag the ruled first run needs, on the one command that can take
     /// minutes. `refresh` runs from a hook and has no shell to outlive, so it
     /// refuses the flag rather than accepting it and running in the foreground
