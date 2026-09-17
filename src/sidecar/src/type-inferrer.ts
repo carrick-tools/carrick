@@ -348,6 +348,14 @@ type FunctionLike =
 export interface TypeInferrerOptions {
   /** The ts-morph Project instance */
   project: Project;
+  /**
+   * The package that owns a declaration file, when the module graph knows it
+   * and the file's path does not say (carrick#1260). A Deno service resolves
+   * npm types out of the Deno cache, whose layout has no `node_modules`
+   * segment, so package identity is a graph question there rather than a path
+   * one. Absent on a Node project, where the path is the answer.
+   */
+  declaringPackageForFile?: (filePath: string) => string | undefined;
 }
 
 /**
@@ -413,9 +421,13 @@ type RuleAttempt =
  */
 export class TypeInferrer {
   private readonly project: Project;
+  private readonly declaringPackageForFile:
+    | ((filePath: string) => string | undefined)
+    | undefined;
 
   constructor(options: TypeInferrerOptions) {
     this.project = options.project;
+    this.declaringPackageForFile = options.declaringPackageForFile;
   }
 
   /**
@@ -3713,14 +3725,23 @@ export class TypeInferrer {
   }
 
   /**
-   * The npm package name that declares a type, read off its declaration's file
-   * path. `undefined` when the type has no declaration to read (a top type, a
-   * primitive, an anonymous object literal) or when its declaration is not
-   * under a `node_modules` tree — a type the workspace itself declares.
+   * The npm package name that declares a type. `undefined` when the type has
+   * no declaration to read (a top type, a primitive, an anonymous object
+   * literal) or when nothing owns its declaration but the workspace itself.
    *
-   * The LAST `node_modules` segment wins, which is what a nested or
-   * content-addressed store (`node_modules/.store/pkg@1.0.0/node_modules/pkg`)
-   * requires. Scoped names keep both segments.
+   * The module graph is asked first, where there is one. A Deno service
+   * resolves npm types out of the Deno cache
+   * (`$DENO_DIR/npm/<registry-host>/<name>/<version>/…`), a path with no
+   * `node_modules` segment anywhere in it, so the path scan below found no
+   * package for ANY dependency-declared type on such a repo and every receiver
+   * the compiler had typed correctly went unclassified (carrick#1260). It runs
+   * before the path scan rather than after it because a mixed checkout has
+   * both, and the graph is what actually resolved the module.
+   *
+   * The path scan is the Node answer: the LAST `node_modules` segment wins,
+   * which is what a nested or content-addressed store
+   * (`node_modules/.store/pkg@1.0.0/node_modules/pkg`) requires. Scoped names
+   * keep both segments.
    */
   private declaringPackageOf(type: Type): string | undefined {
     const symbol = type.getSymbol() ?? type.getAliasSymbol();
@@ -3729,6 +3750,10 @@ export class TypeInferrer {
       return undefined;
     }
     const filePath = declaration.getSourceFile().getFilePath().replace(/\\/g, '/');
+    const fromGraph = this.declaringPackageForFile?.(filePath);
+    if (fromGraph) {
+      return fromGraph;
+    }
     const marker = '/node_modules/';
     const index = filePath.lastIndexOf(marker);
     if (index < 0) {

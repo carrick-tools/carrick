@@ -70,12 +70,23 @@ function projectComponents(): ProjectComponents {
     throw new Error('Sidecar not initialized. Call init first.');
   }
   if (!components) {
-    const project = projectLoader.getProject();
-    const repoRoot = projectLoader.getRepoRoot();
+    // Bound here rather than read from the module slot inside the components:
+    // a re-init drops `components` and points the slot at another service, and
+    // nothing built over this project may follow it there.
+    const loader = projectLoader;
+    const project = loader.getProject();
+    const repoRoot = loader.getRepoRoot();
     components = {
       typeBundler: new TypeBundler({ project, repoRoot }),
       surfaceEmitter: new SurfaceEmitter({ project, repoRoot }),
-      typeInferrer: new TypeInferrer({ project }),
+      // The Deno graph, where there is one, is the only thing that can say
+      // which npm package declares a file: a Deno service has no
+      // `node_modules` tree for the path to be read off (carrick#1260).
+      typeInferrer: new TypeInferrer({
+        project,
+        declaringPackageForFile: (filePath) =>
+          loader.getDenoProject()?.packageNameForFile(filePath),
+      }),
       definitionResolver: new DefinitionResolver({ project }),
     };
   }

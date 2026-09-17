@@ -252,8 +252,18 @@ export class DenoProject {
   }
 
   private npmOwner(file: string): NpmPackage | undefined {
+    const target = path.normalize(file);
     return Object.values(this.npmPackages).find(pkg => pkg.localPath &&
-      (file === pkg.localPath || file.startsWith(pkg.localPath + path.sep)));
+      (target === pkg.localPath || target.startsWith(pkg.localPath + path.sep)));
+  }
+
+  /** The npm package a declaration file belongs to, for a consumer that reads
+   * package identity off a path (carrick#1260). Deno serves npm types from its
+   * own cache, whose layout carries no `node_modules` segment, so the graph is
+   * the only thing that can answer; `undefined` means the workspace declares
+   * the file, exactly as no `node_modules` segment does under Node. */
+  packageNameForFile(file: string): string | undefined {
+    return this.npmOwner(file)?.name;
   }
 
   private isNpmFile(file: string): boolean {

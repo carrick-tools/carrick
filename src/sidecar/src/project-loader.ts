@@ -139,6 +139,12 @@ export class ProjectLoader {
   private project: Project | null = null;
   /** Set by `load()`; builds the ts-morph project on first `getProject()`. */
   private buildProject: (() => Project) | null = null;
+  /**
+   * The Deno module graph the project was built from, on a Deno service.
+   * Populated by the build, so it is available from the first `getProject()`
+   * onwards and is `undefined` on every other project shape.
+   */
+  private denoProject: DenoProject | undefined;
   private readonly repoRoot: string;
   private readonly tsconfigPath: string | undefined;
   private readonly tsconfigSnapshot: TsconfigSnapshot | undefined;
@@ -214,6 +220,7 @@ export class ProjectLoader {
           this.log(`Project will load with Deno config: ${denoConfig.configPath}`);
           this.buildProject = () => {
             const deno = new DenoProject(denoConfig, this.repoRoot);
+            this.denoProject = deno;
             const project = new Project({
               compilerOptions: deno.parsed.options as CompilerOptions,
               skipAddingFilesFromTsConfig: true,
@@ -360,6 +367,15 @@ export class ProjectLoader {
       );
     }
     return this.project;
+  }
+
+  /**
+   * The Deno module graph behind the project, on a Deno service and after the
+   * project has been built. It is what knows which npm package owns a file: a
+   * Deno checkout has no `node_modules` tree to read that off (carrick#1260).
+   */
+  getDenoProject(): DenoProject | undefined {
+    return this.denoProject;
   }
 
   /**
