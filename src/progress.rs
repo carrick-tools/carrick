@@ -189,6 +189,56 @@ pub fn parse_dispatched(line: &str) -> Option<crate::analysis_job::Dispatched> {
     serde_json::from_str(payload).ok()
 }
 
+/// The prefix a scan states a dispatch that was asked for and did not happen
+/// on.
+const NOT_DISPATCHED_MARKER: &str = "@carrick-not-dispatched ";
+
+/// Why a scan that was asked to dispatch analysed the repo here instead
+/// (carrick#1251).
+///
+/// Both are ordinary states rather than failures, and the run that hits one
+/// exits 0 with an index — which is exactly why it has to say so. `--dispatch`
+/// that hands nothing over is otherwise indistinguishable from a flag that was
+/// ignored, misspelled or broken.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotDispatched {
+    /// This Carrick Cloud does not run analysis jobs.
+    CloudDeclined,
+    /// No prompt was built, so there was nothing to hand over.
+    NothingToAnalyse,
+}
+
+impl NotDispatched {
+    /// The half-sentence a reader is told, after the repo has been named.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::CloudDeclined => "Carrick Cloud is not running analysis jobs yet",
+            Self::NothingToAnalyse => "nothing in it needed the analyzer",
+        }
+    }
+}
+
+/// State, for the parent, that this repo was NOT handed over after all.
+///
+/// The scan writes an index in this case, so unlike [`report_dispatched`]
+/// nothing downstream breaks without it — which is the whole reason the
+/// silence lasted (carrick#1251).
+pub fn report_not_dispatched(reason: NotDispatched) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(payload) = serde_json::to_string(&reason) {
+        eprintln!("{NOT_DISPATCHED_MARKER}{payload}");
+    }
+}
+
+/// Read a declined dispatch out of a line of a scan's stderr.
+pub fn parse_not_dispatched(line: &str) -> Option<NotDispatched> {
+    let payload = line.trim_start().strip_prefix(NOT_DISPATCHED_MARKER)?;
+    serde_json::from_str(payload).ok()
+}
+
 /// Read one update out of a line of a scan's stderr, if that is what it is.
 pub fn parse(line: &str) -> Option<Update> {
     let payload = line.trim_start().strip_prefix(MARKER)?;
@@ -349,6 +399,30 @@ mod tests {
         assert!(parse_notice("@carrick-progress {}").is_none());
         assert!(parse(&line).is_none());
         assert!(parse_failure(&line).is_none());
+    }
+
+    /// A dispatch that did not happen crosses the process boundary the same
+    /// way a dispatch that did — and is not mistaken for one, which is the
+    /// whole risk of a marker whose prefix contains another's word
+    /// (carrick#1251).
+    #[test]
+    fn a_declined_dispatch_survives_the_round_trip_and_is_not_a_dispatch() {
+        for reason in [
+            NotDispatched::CloudDeclined,
+            NotDispatched::NothingToAnalyse,
+        ] {
+            let line = format!(
+                "{NOT_DISPATCHED_MARKER}{}",
+                serde_json::to_string(&reason).unwrap()
+            );
+            assert_eq!(parse_not_dispatched(&line), Some(reason));
+            assert!(parse_dispatched(&line).is_none());
+            assert!(parse(&line).is_none());
+            assert!(parse_notice(&line).is_none());
+            assert!(!reason.reason().is_empty());
+        }
+        assert!(parse_not_dispatched("@carrick-dispatched {}").is_none());
+        assert!(parse_not_dispatched("@carrick-not-dispatched not json").is_none());
     }
 
     /// The reason is the error's leading sentence, and it survives the

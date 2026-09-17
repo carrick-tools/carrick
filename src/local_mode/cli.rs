@@ -776,14 +776,27 @@ fn build_workspace(
         // Handed over: there is no index yet and no map to print. What there is
         // is one line per repo saying who is analysing it and how to collect it
         // (carrick#1229).
-        super::index::Built::Dispatched(jobs) => {
+        super::index::Built::Dispatched {
+            jobs,
+            not_dispatched,
+        } => {
             super::scan_state::dispatched(&jobs);
             for line in dispatched_lines(&jobs) {
                 println!("{line}");
             }
+            for (repo, reason) in &not_dispatched {
+                println!("{}", kept_here_line(repo, *reason));
+            }
             return Ok(());
         }
     };
+    // Asked to dispatch, handed nothing over, and built the index here. The
+    // common outcome of `--dispatch` once a repo has been scanned once, and
+    // the one that used to be told apart from a broken flag by nothing at all
+    // (carrick#1251).
+    for (repo, reason) in &outcome.not_dispatched {
+        eprintln!("carrick: {}", indexed_here_line(repo, *reason));
+    }
     // A project whose services all carry the hash the cached blobs already
     // hold is not downloaded again, and a download that failed also leaves the
     // cached blobs in place. Saying how many rows each of those was is what
@@ -813,6 +826,30 @@ fn dispatched_lines(jobs: &[crate::analysis_job::Dispatched]) -> Vec<String> {
             .to_string(),
     );
     lines
+}
+
+/// What a `--dispatch` build says about a repo it handed nothing over for,
+/// when the build indexed anyway (carrick#1251).
+///
+/// A warm cache is the normal state of every scan after the first, so this is
+/// the line `--dispatch` prints most often. It names the repo, says why
+/// nothing was handed over, and says where the index came from — the three
+/// facts that tell this apart from a flag that was ignored or misspelled.
+fn indexed_here_line(repo: &str, reason: crate::progress::NotDispatched) -> String {
+    format!(
+        "nothing was handed to Carrick Cloud for {repo}: {}. The index was built here.",
+        reason.reason()
+    )
+}
+
+/// The same fact about a repo in a build where some OTHER repo was handed
+/// over. This build writes no index, so this repo's scan is thrown away with
+/// it and `carrick resume` scans it again alongside the answers it collects.
+fn kept_here_line(repo: &str, reason: crate::progress::NotDispatched) -> String {
+    format!(
+        "Nothing was handed over for {repo}: {}. `carrick resume` indexes it with the rest.",
+        reason.reason()
+    )
 }
 
 /// `index --detach`: start the build in its own session and answer at once.
@@ -1192,6 +1229,34 @@ mod tests {
 
     fn args(input: &[&str]) -> Vec<String> {
         input.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A `--dispatch` run that handed nothing over says so, and says where the
+    /// index came from instead. The sentences are pinned because the defect
+    /// was their absence: a warm cache is the normal state of every scan after
+    /// the first, so this is what `--dispatch` prints most of the time
+    /// (carrick#1251).
+    #[test]
+    fn a_dispatch_that_handed_nothing_over_says_so() {
+        use crate::progress::NotDispatched;
+
+        assert_eq!(
+            indexed_here_line("api", NotDispatched::NothingToAnalyse),
+            "nothing was handed to Carrick Cloud for api: nothing in it needed the analyzer. The \
+             index was built here."
+        );
+        assert_eq!(
+            indexed_here_line("api", NotDispatched::CloudDeclined),
+            "nothing was handed to Carrick Cloud for api: Carrick Cloud is not running analysis \
+             jobs yet. The index was built here."
+        );
+        // The same repo in a build where another repo WAS handed over: this
+        // build writes no index at all, so it must not claim one.
+        assert_eq!(
+            kept_here_line("web", NotDispatched::NothingToAnalyse),
+            "Nothing was handed over for web: nothing in it needed the analyzer. `carrick resume` \
+             indexes it with the rest."
+        );
     }
 
     #[test]

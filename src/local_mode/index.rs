@@ -43,6 +43,9 @@ pub struct IndexOutcome {
     /// What the hosted read downloaded and what it reused unchanged. `None`
     /// when no hosted metadata was read at all.
     pub hosted_download: Option<String>,
+    /// The repos a `--dispatch` build asked to hand over and did not, and why
+    /// (carrick#1251). Empty on every other pass.
+    pub not_dispatched: Vec<(String, crate::progress::NotDispatched)>,
 }
 
 /// What one repo's scan is doing on a resume: where its collected answers are,
@@ -93,7 +96,13 @@ pub enum Built {
     Indexed(Box<IndexOutcome>),
     /// Nothing was indexed because the analysis is happening elsewhere. One
     /// entry per repo handed over.
-    Dispatched(Vec<crate::analysis_job::Dispatched>),
+    Dispatched {
+        jobs: Vec<crate::analysis_job::Dispatched>,
+        /// The repos in the same build that were not handed over, and why.
+        /// They wrote blobs this build throws away, so they are scanned again
+        /// by the `carrick resume` that collects the jobs (carrick#1251).
+        not_dispatched: Vec<(String, crate::progress::NotDispatched)>,
+    },
 }
 
 /// Index every repo in the workspace, or re-index the one holding `only`.
@@ -215,6 +224,11 @@ fn run_generation(
     // these writes no index: it has nothing to write one from, and a thinner
     // index over the top of the last one would read as an answer.
     let mut handed_over: Vec<(PathBuf, crate::analysis_job::Dispatched)> = Vec::new();
+    // And the repos this build asked to hand over that did not. A warm cache
+    // is the ordinary case for every scan after the first, so this is the
+    // ordinary outcome of `--dispatch` — and it used to be silent, which is
+    // indistinguishable from the flag doing nothing (carrick#1251).
+    let mut not_dispatched: Vec<(String, crate::progress::NotDispatched)> = Vec::new();
     for (position, repo) in targets.iter().enumerate() {
         let name = repo_label(repo);
         let previous = generation.join("previous.json");
@@ -235,6 +249,9 @@ fn run_generation(
         if let Some(dispatched) = report.dispatched {
             handed_over.push((repo.clone(), dispatched));
             continue;
+        }
+        if let Some(reason) = report.not_dispatched {
+            not_dispatched.push((name.clone(), reason));
         }
         // "Uploaded" drives the enrichment this repo's services are shown
         // with, so a resume that deliberately kept its index to itself must
@@ -279,12 +296,13 @@ fn run_generation(
                 },
             )?;
         }
-        return Ok(Built::Dispatched(
-            handed_over
+        return Ok(Built::Dispatched {
+            jobs: handed_over
                 .into_iter()
                 .map(|(_, dispatched)| dispatched)
                 .collect(),
-        ));
+            not_dispatched,
+        });
     }
 
     // Hosted-only repositories enter the existing matcher/type judge, but
@@ -390,6 +408,7 @@ fn run_generation(
         scanned,
         elapsed_secs: started.elapsed().as_secs_f64(),
         hosted_download: hosted.download_line(),
+        not_dispatched,
     })))
 }
 
@@ -568,6 +587,10 @@ pub(super) fn join_command(exe: &Path, repo: &Path, blobs: &Path, out: &Path) ->
 pub(super) struct ScanReport {
     pub spend: Option<crate::scan_spend::ScanSpend>,
     pub dispatched: Option<crate::analysis_job::Dispatched>,
+    /// Set only on a `--dispatch` pass, and only when the scan did not hand
+    /// over: why it did not (carrick#1251). `None` on every other pass, and on
+    /// a dispatch that worked.
+    pub not_dispatched: Option<crate::progress::NotDispatched>,
 }
 
 /// What one phase of a build calls itself while it runs and once it is done.
@@ -624,6 +647,10 @@ fn run_scan(
     // the spend, and for the same reason: this process swallows the scan's
     // output, and a scan that dispatched writes no blob for the caller to find.
     let mut dispatched = None;
+    // And why it did not, when it was asked to and did not. The scan that
+    // reports this exits 0 with an index, so nothing downstream needs the
+    // line — the reader does (carrick#1251).
+    let mut not_dispatched = None;
     // What the scan still owes, when it landed some services and left others
     // pending. A scan in that state exits 0, so its output would otherwise be
     // dropped with the rest, and this is the sentence that says to re-run.
@@ -692,6 +719,10 @@ fn run_scan(
             dispatched = Some(reported);
             continue;
         }
+        if let Some(reason) = crate::progress::parse_not_dispatched(&line) {
+            not_dispatched = Some(reason);
+            continue;
+        }
         if let Some(statement) = crate::progress::parse_pending(&line) {
             pending.push(statement);
             continue;
@@ -733,7 +764,11 @@ fn run_scan(
                 eprintln!("carrick: {statement}");
             }
         }
-        return Ok(ScanReport { spend, dispatched });
+        return Ok(ScanReport {
+            spend,
+            dispatched,
+            not_dispatched,
+        });
     }
     bar.finish_and_clear();
     let reason = match failure {
@@ -1421,6 +1456,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lifted.spend, Some(spend));
+        assert_eq!(lifted.dispatched, None);
+        assert_eq!(lifted.not_dispatched, None);
+    }
+
+    /// The same lift, for the scan that was asked to dispatch and did not.
+    /// That scan exits 0 with an index, so nothing downstream misses this
+    /// line — which is exactly why it was silent for so long. Without this
+    /// branch the marker falls into the failure tail nobody reads, and
+    /// `--dispatch` goes back to being indistinguishable from a flag that does
+    /// nothing (carrick#1251).
+    #[test]
+    fn the_indexer_lifts_out_a_dispatch_that_did_not_happen() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "echo 'indexing' >&2; echo '@carrick-not-dispatched {}' >&2",
+            serde_json::to_string(&crate::progress::NotDispatched::NothingToAnalyse).unwrap()
+        ));
+        let lifted = run_scan(
+            command,
+            "scan of /repos/api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+            HEARTBEAT,
+        )
+        .unwrap();
+        assert_eq!(
+            lifted.not_dispatched,
+            Some(crate::progress::NotDispatched::NothingToAnalyse)
+        );
         assert_eq!(lifted.dispatched, None);
     }
 

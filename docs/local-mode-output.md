@@ -24,7 +24,7 @@ change bumps it to `carrick.check/1` and both are emitted for one release.
 |---|---|---|---|
 | `carrick index --workspace <dir>` | detected local repos, optional workspace overrides, authenticated hosted indexes, and Carrick Cloud, which classifies what the deterministic passes could not | `<dir>/.carrick/`, plus `.carrick/last-scan.json` | the scan that builds the index, and the one a first run makes; minutes, cold |
 | `carrick index --detach` | the same | the same, plus `.carrick/scan-<id>.log` and `.carrick/scan-<id>.json` | returns at once |
-| `carrick index --dispatch` | the same | `.carrick/jobs.json`, and no index | returns when the prompts are built, minutes on a large repo |
+| `carrick index --dispatch` | the same | `.carrick/jobs.json`, and no index — unless there was nothing to hand over, in which case it indexes here and says so (carrick#1251) | returns when the prompts are built, minutes on a large repo |
 | `carrick resume` | `.carrick/jobs.json`, Carrick Cloud, local source | `<dir>/.carrick/` | minutes; the analysis is already done |
 | `carrick status [--json]` | local index, credential identity, and Carrick Cloud when a job is recorded | nothing | < 300 ms, plus one network read while a job is in flight |
 | `carrick touch <file> [--json]` | local index, credential identity | nothing | < 300 ms |
