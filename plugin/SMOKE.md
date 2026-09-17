@@ -68,6 +68,46 @@ in both.
 named; the hook answered in 26 ms from an installed package and 28 ms from the
 checkout; the session line's boundary bytes matched `carrick status`.
 
+**Run on 2026-09-10, `carrick@0.3.58` installed from the npm registry into a
+throwaway probe directory** (`npm install carrick@0.3.58`, no `--pack`, no
+local build; the global `carrick` on this machine is 0.3.53 and was left
+alone), against a scratch copy of `tests/fixtures/local-mode-workspace` (two
+repos, `git init`-ed, `carrick-workspace.json` written by hand: this fixture
+ships no workspace file of its own). `carrick --version` printed `0.3.58`
+before every command below, confirming PATH pointed at the probe install, not
+the global one.
+
+`carrick index --workspace "$WS"` indexed 2 repos in 4.8 s, no `--json`: 2
+routes / 0 calls, then 0 routes / 2 calls, 4 counterpart links, and the same
+"candidates: not classified locally (no model runs on this machine) ... 0
+file(s) sent to the analyzer" boundary line for both services. That line is the
+proof no LLM call happened; the earlier "Carrick run starting ...
+api_endpoint=https://api.carrick.tools" banner is a startup config print, not a
+network call, and every boundary line confirms nothing was sent. `check --json`
+on the producer route and `status --json` both validated against
+`docs/schemas/carrick-check-0.json` and `docs/schemas/carrick-status-0.json`
+(every `required` key present at every level, no key outside `properties`).
+The route came back `resolved` / `compatible`, which is this fixture's
+clean-match state, not a deviation.
+
+`carrick hook post-edit` on the producer file, run with stdout and stderr
+captured to separate files: stdout held exactly one JSON object,
+`hookSpecificOutput.additionalContext`, parsed clean with `json.load`; stderr
+held the one timing line, `carrick-hook: check ... -> context in 30ms`, with no
+env var set. `carrick hook session-start < /dev/null` printed one line per
+service plus the boundary lines last; those boundary lines were
+**byte-identical** to `carrick status` (no `--json`) run straight after.
+
+Then the fixture's own contract break: `export async function loader` renamed
+to `export async function action` in the route module by hand, its documented
+method-mismatch edit, plus `carrick refresh --service catalog-web`. `check
+--json` on the consumer file now returned `verdict.result:
+"method_mismatch"`, `"this call uses GET and the producer serves POST at
+/api/v1/widgets/:widgetId"`, matching the fixture's README answer key. The
+producer side showed `verdict.state: "not_checked"` with an empty
+`counterparts` list: the route is now orphaned (0 counterparts), which is why
+it carries no finding of its own.
+
 ## 1. Headless Claude Code, three arms (about $0.4 sub per arm)
 
 Two traps live in the harness itself, both found on 2026-09-09 and both able to
@@ -229,6 +269,45 @@ one consumer:
 - an information diagnostic at line 1 of each service's file carrying the
   boundary;
 - 35 ms and 27 ms for the two checks, root taken from the client and logged.
+
+**Run on 2026-09-10, `--server` pointed at the shipped
+`carrick@0.3.58`'s `node_modules/carrick/dist/server.js`** (the npm-installed
+package from the run above, not this checkout's `src/server.ts`), `CARRICK_BIN`
+set to that same install so the server's own child process runs the shipped
+binary rather than PATH's 0.3.53 (`cli.js` reads `CARRICK_BIN` before falling
+back to `carrick` on PATH, confirmed by reading the built file). Against the
+same scratch copy of `tests/fixtures/local-mode-workspace`. No editor was
+opened for this run. VS Code, Cursor and Windsurf are not installed on this
+machine, and Zed, the one editor that is, was not launched. This probe stands
+in for the editor rows in TEST-PLAN.md §4, and is not a substitute for actually
+running one.
+
+Clean state (before the fixture's method-mismatch edit), opening both files:
+one row each, `catalog-web/.../$widgetId.ts` and `inventory-svc/src/
+inventory.ts`, one diagnostic apiece: `severity: information`, `code:
+boundary`, no `relatedInformation`. This fixture is a clean producer/consumer
+match (`check` agreed: `resolved` / `compatible`), so the boundary line is the
+only thing there is to publish. Root logged as `root .../ws (client)`, taken
+from the workspace folder the probe sent, as it should be for an editor that
+opens the workspace root. `OK 2 file(s) published`, exit 0.
+
+After the fixture's documented `loader` to `action` edit and `carrick refresh
+--service catalog-web`, opening only the consumer file: 3 diagnostics on
+`inventory-svc/src/inventory.ts`, two `severity: warning`, `code:
+method_mismatch`, `GET /api/v1/widgets/:encoded method_mismatch (no type
+verdict): this call uses GET and the producer serves POST at
+/api/v1/widgets/:widgetId`, one per call site (lines 9 and 17), plus the
+boundary information line. Warning, not error: `severityOf` in
+`npm/carrick/src/diagnostics.ts` demotes a routing finding to warning when the
+other side is not resolvable on disk, and this route now has 0 counterparts,
+so this is the stated policy, not a regression against section 2's "two
+errors" on a different (resolvable) fixture. No `relatedInformation` either:
+the producer's route is orphaned, so there is no counterpart location to
+attach; opened separately, the producer file showed only its own boundary
+line, for the same reason. `OK 1 file(s) published`, exit 0 both times. The
+consumer-side finding matches the fixture's own answer key
+(`tests/fixtures/local-mode-workspace/README.md`) and the method-mismatch
+wording recorded in section 2 above.
 
 Then VS Code itself, which needs a machine with VS Code on it:
 
