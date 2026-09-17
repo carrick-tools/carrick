@@ -5015,6 +5015,9 @@ fn report_unresolved_imports(
             }
         );
     }
+    for line in missing_mapping_lines(unresolved) {
+        info!("{line}");
+    }
     if unresolved.undeclared_packages > 0 {
         debug!(
             "Call graph: {} import(s) name a package no manifest declares (runtime builtins included), so those calls record no edge",
@@ -5027,6 +5030,38 @@ fn report_unresolved_imports(
             unfollowed_extends.join(", ")
         );
     }
+}
+
+/// One line per config mapping whose target is not on disk, worst first
+/// (carrick#1273).
+///
+/// This is the sentence the whole ticket is for, so it names three things: the
+/// mapping as the user wrote it, the path it points at, and how many imports
+/// went through it. A count with no referent is what the old `debug!` line
+/// was, and it told nobody anything.
+///
+/// Capped like its sibling above: a repo with dozens of broken mappings has
+/// one cause, not dozens, and the ranked head names it.
+fn missing_mapping_lines(unresolved: &crate::call_graph::UnresolvedImports) -> Vec<String> {
+    let mut ranked: Vec<(&String, &crate::call_graph::MissingMapping)> =
+        unresolved.missing_mappings.iter().collect();
+    ranked.sort_by(|a, b| b.1.imports.cmp(&a.1.imports).then(a.0.cmp(b.0)));
+    ranked
+        .iter()
+        .take(MAX_NAMED_UNRESOLVED_SPECIFIERS)
+        .map(|(declared_by, missing)| {
+            format!(
+                "Call graph: {} import(s) go through `{declared_by}`, which this repo's own config maps to {} — {}. Nothing imported through it resolves, so those calls record no caller edge and anything typed through them is `any`. A generated directory that no build step has filled looks exactly like this (carrick#1273)",
+                missing.imports,
+                missing.target.display(),
+                if missing.directory_missing {
+                    "a directory that does not exist"
+                } else {
+                    "a file that is not there"
+                },
+            )
+        })
+        .collect()
 }
 
 fn discover_files_and_symbols(
@@ -6350,6 +6385,56 @@ async fn build_cross_repo_analyzer(
 
 #[cfg(test)]
 mod tests {
+
+    /// The sentence is the deliverable of carrick#1273, so it is pinned.
+    ///
+    /// A third bucket that still logged a bare count would be the same defect
+    /// with better bookkeeping: what a user can act on is the mapping they
+    /// wrote, the path it points at, and how many imports went through it.
+    #[test]
+    fn a_mapping_that_points_at_nothing_is_named_with_its_count() {
+        let mut unresolved = crate::call_graph::UnresolvedImports::default();
+        unresolved.missing_mappings.insert(
+            "@generated-client/".to_string(),
+            crate::call_graph::MissingMapping {
+                target: std::path::PathBuf::from("src/db/generated/client/models.ts"),
+                directory_missing: true,
+                imports: 83,
+            },
+        );
+        let lines = super::missing_mapping_lines(&unresolved);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with(
+                "Call graph: 83 import(s) go through `@generated-client/`, which this repo's own \
+                 config maps to src/db/generated/client/models.ts — a directory that does not exist."
+            ),
+            "the mapping, the path and the count, in that order:\n{}",
+            lines[0]
+        );
+
+        // A file missing beside its siblings is a mis-spelled import, not a
+        // build step nobody ran, and the line must not claim otherwise.
+        unresolved.missing_mappings.insert(
+            "@/*".to_string(),
+            crate::call_graph::MissingMapping {
+                target: std::path::PathBuf::from("src/absent.ts"),
+                directory_missing: false,
+                imports: 1,
+            },
+        );
+        let lines = super::missing_mapping_lines(&unresolved);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains("83 import(s)") && lines[1].contains("1 import(s)"),
+            "worst first, so the cause leads:\n{lines:#?}"
+        );
+        assert!(
+            lines[1].contains("a file that is not there"),
+            "and an absent file is not called an absent directory:\n{}",
+            lines[1]
+        );
+    }
 
     /// A blob with only the fields every generation has carried, so the test
     /// states what it is about and nothing else.

@@ -1508,7 +1508,10 @@ impl Resolver<'_> {
         match self.index.resolve(&self.from, specifier) {
             Resolution::External { package, subpath } => Some(Target::External(package, subpath)),
             Resolution::Internal(path) => self.file_index.get(&path).copied().map(Target::Internal),
-            Resolution::Unresolved => None,
+            // A config mapping pointing at nothing names no target here
+            // either. The call graph reports it once for the whole scan
+            // (carrick#1273); the egress pass has no business saying it again.
+            Resolution::AliasTargetMissing(_) | Resolution::Unresolved => None,
         }
     }
 }
