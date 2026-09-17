@@ -176,6 +176,16 @@ fn refusal_message(status: reqwest::StatusCode, body: &str) -> String {
     message
 }
 
+/// The machine code a refusal names, for a log line rather than a message.
+///
+/// The end-of-run markers read this because their status alone is ambiguous:
+/// a 403 is either an action this deploy has never heard of (no envelope, so
+/// no code) or a scan another workspace opened (`scan_not_authorized`), and
+/// the two want opposite things done about them.
+fn refusal_code(body: Option<&str>) -> Option<String> {
+    RefusalBody::of(body?).code
+}
+
 /// Say what the cloud accepted when it took an index that is missing files.
 ///
 /// Only reachable on a first index of this service: once there are rows to
@@ -1309,17 +1319,77 @@ impl AwsStorage {
             reason,
         };
 
-        self.post_failure_once(token, request.action, &request)
+        self.post_run_marker_once(token, request.action, &request)
             .await;
     }
 
-    /// Send one failure event, once, and say what happened at debug only.
+    /// `close-scan`: the run ended, and it replaced no index (carrick#1262).
     ///
-    /// Shared by `scan-failed` and `preflight-failed`: both describe a run
-    /// that is already failing, so neither may retry, wait long, or print a
-    /// second failure — a 4xx from a cloud that predates the action, a 5xx and
-    /// a dead network all end here as one debug line.
-    async fn post_failure_once<B: Serialize + ?Sized>(&self, token: &str, action: &str, body: &B) {
+    /// The counterpart to `scan_final` for a run that writes nothing to the
+    /// cloud. A resume the cloud answered `superseded: true` finishes its
+    /// index locally and sends no write action at all, so the write that
+    /// carries `scan_final` never happens and the scan `start-scan` opened
+    /// stays open: the repo's in-flight slot keeps refusing the user's next
+    /// run for the quiet window, and the cloud's silent-scan sweep alerts
+    /// about a run that did exactly what it was asked to.
+    ///
+    /// Wire contract: the check-or-upload envelope,
+    /// `{ action: "close-scan", scan_id, reason }`, Bearer auth, 200
+    /// `{ ok: true }`. `reason` is a `[a-z_]{1,64}` token that the cloud
+    /// records as `unspecified` rather than refusing, because a 400 here
+    /// would confirm the very scan row the call names.
+    ///
+    /// Exactly the fail marker's delivery, and for the same reason: one
+    /// attempt, the same short timeout, every refusal at debug and none of
+    /// them able to change the run's exit code. The cloud deployed today
+    /// answers 403 from its action gate, which reads here as the nothing that
+    /// was sent before this existed — the slot falls to its TTL.
+    ///
+    /// Laptop credential and an open scan only: a CI run opens no scan, so
+    /// there is no slot to hand back and no `scan_id` to name it with.
+    pub async fn report_scan_closed(&self, reason: &str) {
+        let CloudAuth::Bearer(token) = &self.auth else {
+            return;
+        };
+        let Some(scan_id) = self.scan_id() else {
+            return;
+        };
+
+        #[derive(Serialize)]
+        struct CloseScanRequest<'a> {
+            action: &'a str,
+            scan_id: &'a str,
+            reason: &'a str,
+        }
+
+        let request = CloseScanRequest {
+            action: "close-scan",
+            scan_id: &scan_id,
+            reason,
+        };
+
+        self.post_run_marker_once(token, request.action, &request)
+            .await;
+    }
+
+    /// Send one end-of-run marker, once, and say what happened at debug only.
+    ///
+    /// Shared by `scan-failed`, `preflight-failed` and `close-scan`: all three
+    /// describe a run that is already over, so none of them may retry, wait
+    /// long, or raise a second error — a 4xx from a cloud that predates the
+    /// action, a 5xx and a dead network all end here as one debug line.
+    ///
+    /// That line carries the refusal's `code` when the body has one, because
+    /// the status alone cannot tell an action this deploy does not know (403,
+    /// no code) from a scan belonging to another workspace (403
+    /// `scan_not_authorized`) — and after a deploy those two want opposite
+    /// things done about them.
+    async fn post_run_marker_once<B: Serialize + ?Sized>(
+        &self,
+        token: &str,
+        action: &str,
+        body: &B,
+    ) {
         let sent = self
             .http_client
             .post(&self.lambda_url)
@@ -1333,17 +1403,20 @@ impl AwsStorage {
 
         match sent {
             Ok(response) if response.status().is_success() => {
-                debug!(action = %action, "Reported this run's failure to Carrick Cloud");
+                debug!(action = %action, "Told Carrick Cloud how this run ended");
             }
             Ok(response) => {
+                let status = response.status();
+                let code = refusal_code(response.text().await.ok().as_deref());
                 debug!(
                     action = %action,
-                    status = %response.status(),
-                    "Carrick Cloud did not record this run's failure"
+                    status = %status,
+                    code = %code.as_deref().unwrap_or("none"),
+                    "Carrick Cloud did not record how this run ended"
                 );
             }
             Err(e) => {
-                debug!(action = %action, "Could not report this run's failure: {e}");
+                debug!(action = %action, "Could not tell Carrick Cloud how this run ended: {e}");
             }
         }
     }
@@ -1961,7 +2034,7 @@ impl CloudStorage for AwsStorage {
             reason,
             scanner_version: env!("CARGO_PKG_VERSION"),
         };
-        self.post_failure_once(token, request.action, &request)
+        self.post_run_marker_once(token, request.action, &request)
             .await;
     }
 
@@ -3150,6 +3223,85 @@ mod tests {
         let unopened =
             AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Bearer("t".into()), false);
         unopened.report_scan_failed("discovery", "no remote").await;
+    }
+
+    /// The close marker's wire shape (carrick#1262): the check-or-upload
+    /// envelope with `close-scan`, the slot and the reason — no stage, since
+    /// this is a run that ended rather than one that died — under the laptop
+    /// credential and the run headers.
+    #[tokio::test]
+    async fn a_run_that_replaced_no_index_closes_its_own_scan() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![(200, serde_json::json!({ "ok": true }).to_string())],
+            "scan_01J",
+        );
+
+        storage.report_scan_closed("superseded").await;
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        let body = body_of(&requests[0]);
+        assert_eq!(body["action"], "close-scan");
+        assert_eq!(body["scan_id"], "scan_01J");
+        assert_eq!(body["reason"], "superseded");
+        assert!(body.get("stage").is_none(), "{body}");
+        assert!(
+            has_header(&requests[0], "authorization", "Bearer carrick_sk_live_test"),
+            "{}",
+            requests[0]
+        );
+    }
+
+    /// The cloud deployed today has no `close-scan` and answers 403 from its
+    /// action gate. That is the nothing this run sent before the marker
+    /// existed: one attempt, no retry, no error of its own, and the scan the
+    /// cloud is still holding falls to its TTL exactly as it does now.
+    #[tokio::test]
+    async fn a_refused_close_marker_is_swallowed_and_never_retried() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![(
+                403,
+                serde_json::json!({ "error": "wrong key kind", "code": "wrong_key_kind" })
+                    .to_string(),
+            )],
+            "scan_01J",
+        );
+
+        storage.report_scan_closed("superseded").await;
+
+        assert_eq!(server.join().unwrap().len(), 1, "the marker was retried");
+    }
+
+    /// Nothing to close: a CI run opens no scan, and neither does a laptop run
+    /// whose `start-scan` never answered. Asserted as silence on the wire,
+    /// because a `close-scan` with no `scan_id` is one the cloud answers 404.
+    #[tokio::test]
+    async fn a_run_with_no_scan_sends_no_close_marker() {
+        // Nothing is listening on that port: reaching the network at all would
+        // hang or error, and both of these return instead.
+        let ci = AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Oidc, false);
+        ci.report_scan_closed("superseded").await;
+
+        let unopened =
+            AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Bearer("t".into()), false);
+        unopened.report_scan_closed("superseded").await;
+    }
+
+    /// The refusal code the marker's log line reads. A 403 from an action gate
+    /// carries no envelope; a 403 about someone else's scan carries its code,
+    /// and after the deploy those two want opposite things done about them.
+    #[test]
+    fn a_refusal_names_its_code_when_it_has_one() {
+        assert_eq!(
+            refusal_code(Some(
+                r#"{"error":"another workspace","code":"scan_not_authorized"}"#
+            ))
+            .as_deref(),
+            Some("scan_not_authorized")
+        );
+        assert_eq!(refusal_code(Some(r#"{"message":"Forbidden"}"#)), None);
+        assert_eq!(refusal_code(Some("<html>gateway</html>")), None);
+        assert_eq!(refusal_code(None), None);
     }
 
     /// The pre-scan failure event's wire shape (carrick#1096): the
