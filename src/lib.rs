@@ -47,6 +47,7 @@ pub mod operation;
 pub mod packages;
 pub mod parser;
 pub mod phase_timing;
+pub mod preflight;
 pub mod progress;
 pub mod receiver_origin;
 pub mod receiver_type;

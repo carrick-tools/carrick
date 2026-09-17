@@ -98,6 +98,32 @@ pub(crate) enum AliasTarget {
     Leaves { dir: PathBuf, leaves: Vec<String> },
 }
 
+/// One mapping key, and the directories its targets live in (carrick#1254).
+///
+/// The alternatives are a disjunction, as they are for the compiler: a
+/// `paths` pattern with two targets is satisfied by either, so a caller
+/// reports the mapping only when none of them exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaimedDirectory {
+    /// The key as written in the config.
+    pub declared_by: String,
+    /// Repo-relative directories, sorted, any one of which existing satisfies
+    /// the claim.
+    pub directories: Vec<PathBuf>,
+}
+
+/// The repo-relative directory a mapping target lives in: the target up to
+/// its last separator, with anything from the `*` onward dropped, resolved
+/// against the base the declaring config resolves targets against. A target
+/// that names a file directly in `base` claims `base`.
+fn target_directory(base: &Path, target: &str) -> PathBuf {
+    let literal = target.split('*').next().unwrap_or_default();
+    match literal.rfind('/') {
+        Some(cut) => normalize(&base.join(&literal[..=cut])),
+        None => normalize(base),
+    }
+}
+
 /// One config answer, and the key that gave it (carrick#1273).
 ///
 /// The key is what a reader recognises: it is the line they wrote in their own
@@ -218,6 +244,73 @@ impl ModuleAliases {
     /// `extends` values the chain could not follow, sorted.
     pub(crate) fn unfollowed_extends(&self) -> impl Iterator<Item = &String> {
         self.unfollowed_extends.iter()
+    }
+
+    /// Every mapping these configs declare, as the directory its target lives
+    /// in (carrick#1254).
+    ///
+    /// The same claims [`Self::resolve`] answers a specifier with, read the
+    /// other way round: without a specifier to ask about, so a caller can stat
+    /// them before a scan starts rather than discover them one failed import
+    /// at a time. One entry per key, because every import through a mapping
+    /// fails identically and the key is the line the user wrote.
+    ///
+    /// A DIRECTORY rather than the target itself: which file a target names
+    /// depends on extension and index-file rules that are
+    /// [`crate::workspace_resolver::WorkspaceIndex`]'s, and a caller that
+    /// guessed them here would refuse a mapping that resolves perfectly well.
+    /// A directory that is not there cannot hold any spelling of the file.
+    /// `baseUrl` declares no key and is not a claim, so it is not here.
+    pub(crate) fn claimed_directories(&self) -> Vec<ClaimedDirectory> {
+        let mut claims: BTreeMap<String, BTreeSet<PathBuf>> = BTreeMap::new();
+        for map in &self.deno_maps {
+            for (key, target) in &map.entries {
+                // A key that names a registry package claims no path here.
+                if let Some(target) = target {
+                    claims
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(target_directory(&map.base, target));
+                }
+            }
+        }
+        for (dir, imports) in &self.package_imports {
+            let Some(object) = imports.as_ref().and_then(serde_json::Value::as_object) else {
+                continue;
+            };
+            for (key, value) in object {
+                let mut leaves = Vec::new();
+                collect_string_leaves(value, 0, &mut leaves);
+                for leaf in leaves.iter().filter(|leaf| leaf.starts_with("./")) {
+                    claims
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(target_directory(dir, leaf));
+                }
+            }
+        }
+        let ts = self.ts_configs.values().filter_map(Option::as_ref).chain(
+            self.service_ts
+                .iter()
+                .filter_map(|(_, mapping)| mapping.as_ref()),
+        );
+        for mapping in ts {
+            for (pattern, targets) in &mapping.paths {
+                for target in targets {
+                    claims
+                        .entry(pattern.clone())
+                        .or_default()
+                        .insert(target_directory(&mapping.paths_base, target));
+                }
+            }
+        }
+        claims
+            .into_iter()
+            .map(|(declared_by, directories)| ClaimedDirectory {
+                declared_by,
+                directories: directories.into_iter().collect(),
+            })
+            .collect()
     }
 
     /// What config maps `specifier` to, as written in `from_file`

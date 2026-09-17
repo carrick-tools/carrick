@@ -81,7 +81,7 @@ Package types need their dependencies on disk. Node projects use installed `node
 
 - For Node projects, installation runs when a lockfile sits at the path being analyzed. The lockfile picks the manager: `package-lock.json` runs `npm ci`, `pnpm-lock.yaml` runs `pnpm install --frozen-lockfile`, `yarn.lock` runs `yarn install`, `bun.lock`/`bun.lockb` runs `bun install`.
 - Lifecycle scripts are disabled in every case, so nothing in your repo executes during a scan.
-- Each install command has a five-minute timeout. A failed or timed-out install prints a warning, and analysis continues with the available dependencies; missing type prerequisites are reported by the scanner.
+- Each install command has a five-minute timeout. A failed or timed-out install prints a warning, and the scan that follows refuses any service whose dependencies are still missing (see below).
 - Existing `node_modules` skips the Node install. A Deno manifest at the scan root still triggers Deno cache preparation. In a monorepo preparation happens at the path being scanned.
 - The package manager's download cache is restored between runs, keyed on the lockfile's hash.
 
@@ -92,6 +92,31 @@ with both Node and Deno configuration prepares both dependency stores. Before
 local indexing, install Deno 2.9.4 or newer and run the same preparation command
 from the Deno workspace root. Projects that import generated declarations must
 generate those declarations through their normal build before indexing.
+
+### An unprepared checkout is refused
+
+Carrick refuses to scan a checkout it cannot type, rather than charging for an
+index whose types are `any` and saying nothing about why. The check runs before
+the scan starts, per service, on what is reachable from that service's own
+directory — a monorepo root that is installed says nothing about a nested
+workspace that is not. Two things are refused:
+
+- **Dependencies a lockfile states and the tree has not installed.** The
+  refusal names the service and the exact command, because the lockfile names
+  the package manager. A tree with no lockfile above the service states no
+  install and is scanned as it is. Deno services are asked only when their
+  config sets `nodeModulesDir`, since Deno otherwise caches outside the tree.
+- **A config mapping whose target directory is not on the checkout.** A
+  TypeScript `paths` entry, a `package.json` `imports` key or a Deno import-map
+  entry pointing at, say, a generated client whose generator has not run. The
+  refusal names the mapping and the missing directory and stops there: nothing
+  in the config says what fills a generated directory.
+
+Both are proxies, so there is always a way past: `--allow-unprepared` on the
+command, `CARRICK_ALLOW_UNPREPARED=1` in the environment, or
+`allow-unprepared: true` on the Action (which `install-dependencies: false`
+already implies). A pipeline that scans a bare checkout deliberately keeps
+working; it just says so.
 
 Deno services normally omit `tsconfig` and use their nearest Deno manifest.
 An explicit ordinary TypeScript config selects the TypeScript path. An explicit

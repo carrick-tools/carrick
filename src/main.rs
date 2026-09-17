@@ -47,6 +47,7 @@ mod operation;
 mod packages;
 mod parser;
 mod phase_timing;
+mod preflight;
 mod progress;
 mod receiver_origin;
 mod receiver_type;
@@ -85,6 +86,10 @@ struct CliArgs {
     verbose: bool,
     /// Skip incremental cache and run a full analysis
     no_cache: bool,
+    /// Scan a checkout that is not prepared — dependencies uninstalled, a
+    /// config mapping pointing at a directory that is not there — instead of
+    /// refusing it (carrick#1254).
+    allow_unprepared: bool,
 }
 
 impl CliArgs {
@@ -97,6 +102,7 @@ impl CliArgs {
         let mut repo_path = ".".to_string();
         let mut verbose = false;
         let mut no_cache = false;
+        let mut allow_unprepared = false;
 
         let mut i = 0;
         while i < args.len() {
@@ -117,6 +123,9 @@ impl CliArgs {
                 "--no-cache" => {
                     no_cache = true;
                 }
+                preflight::ALLOW_FLAG => {
+                    allow_unprepared = true;
+                }
                 arg if !arg.starts_with('-') => {
                     repo_path = arg.to_string();
                 }
@@ -133,6 +142,7 @@ impl CliArgs {
             repo_path,
             verbose,
             no_cache,
+            allow_unprepared,
         }
     }
 
@@ -490,6 +500,18 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let services = service_derivation::resolve(Path::new(&args.repo_path))?.services;
     deno_support::require_runtime(Path::new(&args.repo_path), &services)?;
+    // Before the sidecar, before the first model call, and before anything is
+    // charged for: a tree that is not prepared indexes `any` where a package
+    // or a generated module should be, and the user is told nothing
+    // (carrick#1254).
+    preflight::allow(args.allow_unprepared);
+    // Only a run that is going to ask the model about this tree: the join and
+    // the re-check pass over blobs that a scan already wrote, and a `resume`
+    // collects answers the model has already given for it — refusing either
+    // would strand work rather than save any.
+    if !local_mode::no_model() && env::var_os(analysis_channel::ANSWERS_ENV).is_none() {
+        preflight::require_prepared(Path::new(&args.repo_path), &services)?;
+    }
     let initial_service = services.first().cloned().unwrap_or_default();
 
     // =======================================================================

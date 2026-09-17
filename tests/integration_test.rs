@@ -70,6 +70,10 @@ fn test_imported_router_endpoint_resolution() {
     let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
         .arg(test_project_path.to_str().unwrap())
         .env("CARRICK_MOCK_ALL", "1")
+        // The fixture ships a lockfile and no node_modules, which is a bare
+        // checkout on purpose, so the scan is told to scan it as it is
+        // (carrick#1254).
+        .env(carrick::preflight::ALLOW_ENV, "1")
         .output()
         .expect("Failed to execute carrick");
 
@@ -292,6 +296,10 @@ fn test_no_duplicate_processing_regression() {
     let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
         .arg(fixture_path.to_str().unwrap())
         .env("CARRICK_MOCK_ALL", "1")
+        // The fixture ships a lockfile and no node_modules, which is a bare
+        // checkout on purpose, so the scan is told to scan it as it is
+        // (carrick#1254).
+        .env(carrick::preflight::ALLOW_ENV, "1")
         .output()
         .expect("Failed to execute carrick");
 
