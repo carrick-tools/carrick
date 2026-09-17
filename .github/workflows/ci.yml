@@ -95,6 +95,7 @@ jobs:
           --test sidecar_integration_test
           --test socket_class_field_test
           --test socket_extraction_test
+          --test socket_generic_test
           --test socket_namespace_test
           --test socket_type_alias_test
           --test span_locator_units_test

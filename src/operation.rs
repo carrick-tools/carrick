@@ -193,11 +193,22 @@ impl GraphqlOperationKind {
 /// direction are producers of that key; emitters sending in that direction
 /// are consumers — so a server `socket.on("x")` matches a client
 /// `socket.emit("x")` and vice versa.
+///
+/// A direction exists only where the library distinguishes the two sides by
+/// construction: Socket.IO's client factory and `new Server(...)` say which
+/// side a socket is on, and the direction is then derived. Libraries that
+/// expose one symmetric object to both sides (`ws`, channel clients) say
+/// nothing, and their ops carry [`SocketDirection::Unknown`] rather than a
+/// guess — an unknown-direction listener and emitter meet on one key, so the
+/// two sides of such a contract still match each other (carrick#1281).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SocketDirection {
     ClientToServer,
     ServerToClient,
+    /// The library gave no client/server signal. Not a default: it is recorded
+    /// only where no rule could derive a direction.
+    Unknown,
 }
 
 impl SocketDirection {
@@ -205,6 +216,7 @@ impl SocketDirection {
         match self {
             SocketDirection::ClientToServer => "client→server",
             SocketDirection::ServerToClient => "server→client",
+            SocketDirection::Unknown => "direction unknown",
         }
     }
 
@@ -213,6 +225,7 @@ impl SocketDirection {
         match self {
             SocketDirection::ClientToServer => "CLIENT->SERVER",
             SocketDirection::ServerToClient => "SERVER->CLIENT",
+            SocketDirection::Unknown => "UNKNOWN",
         }
     }
 }
@@ -232,10 +245,11 @@ pub enum OperationKey {
         kind: GraphqlOperationKind,
         field: String,
     },
-    /// A Socket.IO event on the default namespace, identified by event name
-    /// plus message-flow direction. Files using custom namespaces
-    /// (`io.of(...)`) are skipped by extraction, so default-namespace
-    /// identity is unambiguous here.
+    /// A socket event, identified by event name plus message-flow direction.
+    /// The namespace or channel the event travels on is not part of identity
+    /// (see the `crate::socket_io` module docs for why it cannot be), and the
+    /// direction is [`SocketDirection::Unknown`] for libraries that expose no
+    /// client/server distinction.
     Socket {
         event: String,
         direction: SocketDirection,

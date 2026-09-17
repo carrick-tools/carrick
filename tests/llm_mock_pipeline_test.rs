@@ -62,6 +62,7 @@ fn express_detection() -> DetectionResult {
         frameworks: vec!["express".to_string()],
         data_fetchers: vec!["fetch".to_string()],
         messaging_clients: vec![],
+        socket_clients: vec![],
         notes: String::new(),
     }
 }
