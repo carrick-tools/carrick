@@ -35,7 +35,12 @@
 # Optional:
 #
 #   CARRICK_BIN              the scanner (default target/release/carrick)
-#   CARRICK_API_ENDPOINT     the cloud (default https://api.carrick.tools)
+#   CARRICK_API_ENDPOINT     where THIS SCRIPT's own job-status reads go
+#                            (default https://api.carrick.tools). Not the
+#                            scanner's: its endpoint is fixed when it is built,
+#                            and the job reads inside it use a const. Pointing
+#                            this at a second cloud would ask one about a job
+#                            the other holds.
 #   CARRICK_SMOKE_TIMEOUT    seconds to wait for the driver (default 900)
 #
 set -euo pipefail
