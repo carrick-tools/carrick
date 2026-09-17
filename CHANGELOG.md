@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.78](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.77...carrick-v0.3.78) (2026-09-17)
+
+
+### Features
+
+* **graphql:** anchor a code-first field's type request at its resolver function ([#1292](https://github.com/carrick-tools/carrick/issues/1292)) ([434fdf2](https://github.com/carrick-tools/carrick/commit/434fdf22fd50fb3b2e125363752bd2663032bb93)), closes [#1256](https://github.com/carrick-tools/carrick/issues/1256)
+* **preflight:** refuse a scan of an unprepared checkout ([#1293](https://github.com/carrick-tools/carrick/issues/1293)) ([cca78ba](https://github.com/carrick-tools/carrick/commit/cca78ba46de3d161a9d94715b92817ed4534e86b))
+
+
+### Bug Fixes
+
+* **call-graph:** cut the undeclared-alias line to what a reader acts on ([#1284](https://github.com/carrick-tools/carrick/issues/1284)) ([3408c14](https://github.com/carrick-tools/carrick/commit/3408c14ef7471a7013fb961371c37b3392c0346a)), closes [#1273](https://github.com/carrick-tools/carrick/issues/1273)
+* **call-graph:** report the mapping's target, not one import's file ([#1296](https://github.com/carrick-tools/carrick/issues/1296)) ([1d3d780](https://github.com/carrick-tools/carrick/commit/1d3d780371dbfd1ddd57bfe2292e85e726831a9f)), closes [#1273](https://github.com/carrick-tools/carrick/issues/1273)
+* **orchestrator:** join a model route row that prefixed the path it registers (carrick[#1288](https://github.com/carrick-tools/carrick/issues/1288)) ([#1297](https://github.com/carrick-tools/carrick/issues/1297)) ([59c86a2](https://github.com/carrick-tools/carrick/commit/59c86a27cc21e66d03aff85fd410001f6230f748))
+* **sidecar:** give each capture its own surface entry file (carrick[#1046](https://github.com/carrick-tools/carrick/issues/1046)) ([#1280](https://github.com/carrick-tools/carrick/issues/1280)) ([9d1fcf5](https://github.com/carrick-tools/carrick/commit/9d1fcf593c3c9a48c70b7ca0d61cd9dcaee5c68e)), closes [#1069](https://github.com/carrick-tools/carrick/issues/1069)
+
 ## [0.3.77](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.76...carrick-v0.3.77) (2026-09-17)
 
 
