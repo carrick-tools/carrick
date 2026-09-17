@@ -431,7 +431,7 @@ pub fn warnings(state: &GitState) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn at_main() -> GitState {
@@ -518,27 +518,8 @@ mod tests {
     /// the change is committed.
     #[test]
     fn inspect_reads_a_real_repository() {
-        let dir = std::env::temp_dir().join(format!("carrick-git-state-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let git = |args: &[&str]| {
-            let ok = Command::new("git")
-                .args(args)
-                .current_dir(&dir)
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_INDEX_FILE")
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
-                .output()
-                .unwrap();
-            assert!(ok.status.success(), "{args:?}");
-        };
-        git(&["init", "-q", "-b", "main"]);
-        std::fs::write(dir.join("a.txt"), "one").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-qm", "one"]);
+        let (repo, _head) = committed_repo(&[("a.txt", "one")]);
+        let dir = repo.path();
 
         let clean = inspect(&dir.to_string_lossy());
         assert!(!clean.dirty, "a committed tree is clean: {clean:?}");
@@ -552,47 +533,70 @@ mod tests {
 
         // An untracked file is a change the commit does not describe, so it
         // counts: its analysis would be cached against a commit it is not in.
-        git(&["checkout", "-q", "--", "a.txt"]);
+        git_in(dir, &["checkout", "-q", "--", "a.txt"]);
         assert!(!inspect(&dir.to_string_lossy()).dirty);
         std::fs::write(dir.join("b.txt"), "new").unwrap();
         assert!(inspect(&dir.to_string_lossy()).dirty);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A repository built for a test, with one committed source file.
-    fn committed_repo() -> (std::path::PathBuf, impl Fn(&[&str])) {
-        let dir = std::env::temp_dir().join(format!("carrick-git-state-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("sub")).unwrap();
-        let at = dir.clone();
-        let git = move |args: &[&str]| {
-            let ok = Command::new("git")
-                .args(args)
-                .current_dir(&at)
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_INDEX_FILE")
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
-                .output()
-                .unwrap();
-            assert!(ok.status.success(), "{args:?}");
-        };
-        git(&["init", "-q", "-b", "main"]);
-        std::fs::write(dir.join("AGENTS.md"), "# Agents\n").unwrap();
-        std::fs::write(dir.join("sub").join("index.ts"), "export {};\n").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-qm", "one"]);
-        (dir, git)
+    /// A throwaway repository on `main` with one commit holding `files`, and
+    /// that commit's hash. The one git fixture for the whole crate: every test
+    /// that asks git about a real tree builds its repository here, so the
+    /// scoping the commands need — an ambient `GIT_DIR` removed, an author git
+    /// will accept — is written once and cannot be half-remembered.
+    ///
+    /// The directory is a `TempDir`, so it is removed when the test drops it,
+    /// including on a failed assertion.
+    pub(crate) fn committed_repo(files: &[(&str, &str)]) -> (tempfile::TempDir, String) {
+        let repo = tempfile::TempDir::new().unwrap();
+        git_in(repo.path(), &["init", "-q", "-b", "main"]);
+        for (relative, contents) in files {
+            let path = repo.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        git_in(repo.path(), &["add", "-A"]);
+        git_in(repo.path(), &["commit", "-qm", "one"]);
+        let head = git_in(repo.path(), &["rev-parse", "HEAD"]);
+        (repo, head)
+    }
+
+    /// One git command against `repo`, and its trimmed stdout.
+    ///
+    /// The environment is cleared of `GIT_DIR`, `GIT_WORK_TREE` and
+    /// `GIT_INDEX_FILE` so the command is scoped to `repo` rather than to a
+    /// repository an ambient variable names — a pre-commit hook running inside
+    /// a worktree sets all three.
+    pub(crate) fn git_in(repo: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
     /// Everything the ruled first run writes before its scan, uncommitted,
     /// and nothing else: the tree is what the commit holds (carrick#1117).
     #[test]
     fn a_tree_whose_only_changes_are_the_scaffold_is_clean() {
-        let (dir, git) = committed_repo();
+        let (repo, _head) = committed_repo(&[
+            ("AGENTS.md", "# Agents\n"),
+            ("sub/index.ts", "export {};\n"),
+        ]);
+        let dir = repo.path();
         for file in [
             "carrick.json",
             ".github/workflows/carrick.yml",
@@ -615,14 +619,12 @@ mod tests {
 
         // Staged as the agent's PR branch would have it: still no change to
         // anything the commit describes.
-        git(&["add", "carrick.json"]);
+        git_in(dir, &["add", "carrick.json"]);
         assert!(!inspect(&root).dirty, "scaffold staged");
 
         // One real change beside it, and the tree is dirty again.
         std::fs::write(dir.join("sub").join("index.ts"), "export const a = 1;\n").unwrap();
         assert!(inspect(&root).dirty, "scaffold plus an edited source file");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An edit to a committed `carrick.json` changes what the scan reads, so
@@ -630,16 +632,20 @@ mod tests {
     /// somewhere else is too.
     #[test]
     fn an_edited_committed_config_and_a_lookalike_path_still_count() {
-        let (dir, git) = committed_repo();
+        let (repo, _head) = committed_repo(&[
+            ("AGENTS.md", "# Agents\n"),
+            ("sub/index.ts", "export {};\n"),
+        ]);
+        let dir = repo.path();
         std::fs::write(dir.join("carrick.json"), "{}").unwrap();
-        git(&["add", "carrick.json"]);
-        git(&["commit", "-qm", "config"]);
+        git_in(dir, &["add", "carrick.json"]);
+        git_in(dir, &["commit", "-qm", "config"]);
         let root = dir.to_string_lossy().into_owned();
         assert!(!inspect(&root).dirty);
 
         std::fs::write(dir.join("carrick.json"), "{\"services\": []}").unwrap();
         assert!(inspect(&root).dirty, "an edited committed carrick.json");
-        git(&["checkout", "-q", "--", "carrick.json"]);
+        git_in(dir, &["checkout", "-q", "--", "carrick.json"]);
 
         std::fs::create_dir_all(dir.join("docs")).unwrap();
         std::fs::write(dir.join("docs").join("CLAUDE.md"), "x").unwrap();
@@ -647,21 +653,21 @@ mod tests {
             inspect(&root).dirty,
             "a CLAUDE.md that is not the scaffold's"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A scan root below the top level: git names the scaffold from the top
     /// (`sub/carrick.json`), and it is still the scaffold of the repo scanned.
     #[test]
     fn a_scan_root_inside_the_repository_finds_its_own_scaffold() {
-        let (dir, _git) = committed_repo();
+        let (repo, _head) = committed_repo(&[
+            ("AGENTS.md", "# Agents\n"),
+            ("sub/index.ts", "export {};\n"),
+        ]);
+        let dir = repo.path();
         std::fs::write(dir.join("sub").join("carrick.json"), "{}").unwrap();
         std::fs::create_dir_all(dir.join("sub").join(".claude")).unwrap();
         std::fs::write(dir.join("sub").join(".claude").join("settings.json"), "{}").unwrap();
         assert!(!inspect(&dir.join("sub").to_string_lossy()).dirty);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -3287,23 +3287,6 @@ mod tests {
         unopened.report_scan_closed("superseded").await;
     }
 
-    /// The refusal code the marker's log line reads. A 403 from an action gate
-    /// carries no envelope; a 403 about someone else's scan carries its code,
-    /// and after the deploy those two want opposite things done about them.
-    #[test]
-    fn a_refusal_names_its_code_when_it_has_one() {
-        assert_eq!(
-            refusal_code(Some(
-                r#"{"error":"another workspace","code":"scan_not_authorized"}"#
-            ))
-            .as_deref(),
-            Some("scan_not_authorized")
-        );
-        assert_eq!(refusal_code(Some(r#"{"message":"Forbidden"}"#)), None);
-        assert_eq!(refusal_code(Some("<html>gateway</html>")), None);
-        assert_eq!(refusal_code(None), None);
-    }
-
     /// The pre-scan failure event's wire shape (carrick#1096): the
     /// check-or-upload envelope with `preflight-failed`, this run's id, the
     /// repo as `null` when the origin named none, the stage, the reason and

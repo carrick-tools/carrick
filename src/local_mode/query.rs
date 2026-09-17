@@ -806,24 +806,16 @@ mod tests {
 #[cfg(test)]
 mod hosted_change_tests {
     use super::*;
+    use crate::git_state::tests::committed_repo;
 
     #[test]
     fn hosted_diff_includes_staged_untracked_deleted_and_unusual_paths() {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, commit) = committed_repo(&[
+            ("staged.ts", "export const value = 1;"),
+            ("deleted.ts", "export const value = 1;"),
+            ("odd\nname.ts", "export const value = 1;"),
+        ]);
         let repo = dir.path();
-        for args in [
-            vec!["init", "-q"],
-            vec!["config", "user.email", "fixture@carrick.test"],
-            vec!["config", "user.name", "fixture"],
-        ] {
-            assert!(git(repo, &args).is_some());
-        }
-        for file in ["staged.ts", "deleted.ts", "odd\nname.ts"] {
-            std::fs::write(repo.join(file), "export const value = 1;").unwrap();
-        }
-        git(repo, &["add", "."]).unwrap();
-        git(repo, &["commit", "-qm", "base"]).unwrap();
-        let commit = git(repo, &["rev-parse", "HEAD"]).unwrap();
         std::fs::write(repo.join("staged.ts"), "export const value = 2;").unwrap();
         git(repo, &["add", "staged.ts"]).unwrap();
         std::fs::remove_file(repo.join("deleted.ts")).unwrap();
@@ -954,6 +946,7 @@ mod hosted_change_tests {
 #[cfg(test)]
 mod drift_tests {
     use super::*;
+    use crate::git_state::tests::committed_repo;
     use crate::local_mode::read_model::{IndexedRepo, IndexedService, LocalIndex};
 
     fn service(directory: Option<&str>, commit: &str) -> IndexedService {
@@ -976,23 +969,8 @@ mod drift_tests {
     /// line against an index a minute old (carrick#1007 item 5).
     #[test]
     fn onboarding_artefacts_are_not_drift_for_a_single_service_repo_either() {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, commit) = committed_repo(&[("src/main.ts", "export const a = 1;")]);
         let repo = dir.path();
-        for args in [
-            vec!["init", "-q"],
-            vec!["config", "user.email", "fixture@carrick.test"],
-            vec!["config", "user.name", "fixture"],
-        ] {
-            assert!(git(repo, &args).is_some());
-        }
-        std::fs::create_dir_all(repo.join("src")).unwrap();
-        std::fs::write(repo.join("src/main.ts"), "export const a = 1;").unwrap();
-        git(repo, &["add", "."]).unwrap();
-        git(repo, &["commit", "-qm", "base"]).unwrap();
-        let commit = git(repo, &["rev-parse", "HEAD"])
-            .unwrap()
-            .trim()
-            .to_string();
 
         std::fs::create_dir_all(repo.join(".github/workflows")).unwrap();
         std::fs::create_dir_all(repo.join(".claude")).unwrap();
@@ -1043,23 +1021,8 @@ mod drift_tests {
     /// indexed row, so none of them can make one stale (carrick#1007 item 5).
     #[test]
     fn onboarding_artefacts_are_not_reported_as_drift() {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, commit) = committed_repo(&[("apps/gateway/main.ts", "export const a = 1;")]);
         let repo = dir.path();
-        for args in [
-            vec!["init", "-q"],
-            vec!["config", "user.email", "fixture@carrick.test"],
-            vec!["config", "user.name", "fixture"],
-        ] {
-            assert!(git(repo, &args).is_some());
-        }
-        std::fs::create_dir_all(repo.join("apps/gateway")).unwrap();
-        std::fs::write(repo.join("apps/gateway/main.ts"), "export const a = 1;").unwrap();
-        git(repo, &["add", "."]).unwrap();
-        git(repo, &["commit", "-qm", "base"]).unwrap();
-        let commit = git(repo, &["rev-parse", "HEAD"])
-            .unwrap()
-            .trim()
-            .to_string();
 
         // What onboarding leaves behind, plus one real source edit outside
         // every service.
