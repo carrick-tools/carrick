@@ -23,6 +23,10 @@ use crate::credentials::{API_BASE, Credential};
 const JOBS_FILE: &str = "jobs.json";
 
 /// The tag the file is written under.
+///
+/// Read outside this binary: `scripts/dispatch-smoke.sh` asserts a dispatch
+/// happened by reading this file's `job_id`, `repo` and `analyze_rows`
+/// (carrick#1259).
 const JOBS_SCHEMA: &str = "carrick.jobs/0";
 
 /// How long the status read may take before the local answer stands on its
@@ -520,6 +524,28 @@ mod tests {
         forget(dir.path(), &["j1".to_string()]).unwrap();
         assert!(read(dir.path()).is_empty());
         assert!(!jobs_file(dir.path()).exists());
+    }
+
+    /// The file is read by something that is not this binary.
+    ///
+    /// `scripts/dispatch-smoke.sh` proves a dispatch happened by reading these
+    /// keys with `jq`: the record is written only from a submission the cloud
+    /// accepted and named, so it is the one artefact that tells a hand-off
+    /// apart from a synchronous scan that exited 0. A rename here would leave
+    /// that smoke passing over a run that dispatched nothing, which is the
+    /// failure it exists to catch — so the names are pinned where a rename
+    /// breaks the ordinary suite instead (carrick#1259).
+    #[test]
+    fn the_record_carries_the_names_the_dispatch_smoke_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        record(dir.path(), job("owner/api", "j1")).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(jobs_file(dir.path())).unwrap()).unwrap();
+        assert_eq!(written["schema"], JOBS_SCHEMA);
+        let job = &written["jobs"][0];
+        assert_eq!(job["job_id"], "j1");
+        assert_eq!(job["repo"], "owner/api");
+        assert_eq!(job["analyze_rows"], 10);
     }
 
     #[test]

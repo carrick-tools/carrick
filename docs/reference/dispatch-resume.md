@@ -160,3 +160,26 @@ pipeline.
 - **Nothing can guarantee a resumer exists.** If no machine ever collects a
   job, its answers sit in the cloud's content-addressed analysis cache until
   they expire. `carrick status` says so; that is a surface, not a mechanism.
+
+## How it is proven
+
+`scripts/dispatch-smoke.sh` runs the whole path live: it copies
+`tests/fixtures/llm-mocked-api` into a tree of its own, appends a line unique
+to the run to every source file so the cloud's content-keyed analysis cache
+has no answer for any of them, commits, dispatches, waits for the driver, and
+resumes. `.github/workflows/dispatch-smoke.yml` runs it nightly and on a PR
+labelled `smoke:dispatch`; it needs a `cli`-scope credential and a repo of its
+own to write to.
+
+Two things make it the only test that can catch this class, and both are easy
+to undo by accident:
+
+- **The cache must be cold.** `--dispatch` submits nothing when every file is
+  already answered (carrick#1251), so a smoke over a warm cache exercises the
+  synchronous path and passes having dispatched nothing. The proof it
+  dispatched is `.carrick/jobs.json`: it is written only from a submission the
+  cloud accepted and named, so the smoke reads that, not the exit code.
+- **It must authenticate as a laptop.** `CloudAuth::detect` prefers OIDC
+  whenever the runner offers it, and an OIDC run opens no scan — so it holds no
+  `scan_id`, which is exactly what `submit-analysis-job` refuses without. The
+  workflow grants `contents: read` and nothing else for that reason.
