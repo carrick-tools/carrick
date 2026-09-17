@@ -349,13 +349,12 @@ export interface TypeInferrerOptions {
   /** The ts-morph Project instance */
   project: Project;
   /**
-   * The package that owns a declaration file, when the module graph knows it
-   * and the file's path does not say (carrick#1260). A Deno service resolves
-   * npm types out of the Deno cache, whose layout has no `node_modules`
-   * segment, so package identity is a graph question there rather than a path
-   * one. Absent on a Node project, where the path is the answer.
+   * The registry package a resolved file belongs to, when the module graph
+   * that built the project names one (carrick#1260). Supplied for a project
+   * whose resolution went through a graph rather than through `node_modules`;
+   * absent otherwise, and the path itself is then the only thing to read.
    */
-  declaringPackageForFile?: (filePath: string) => string | undefined;
+  packageOf?: (filePath: string) => string | undefined;
 }
 
 /**
@@ -421,13 +420,11 @@ type RuleAttempt =
  */
 export class TypeInferrer {
   private readonly project: Project;
-  private readonly declaringPackageForFile:
-    | ((filePath: string) => string | undefined)
-    | undefined;
+  private readonly packageOf: ((filePath: string) => string | undefined) | undefined;
 
   constructor(options: TypeInferrerOptions) {
     this.project = options.project;
-    this.declaringPackageForFile = options.declaringPackageForFile;
+    this.packageOf = options.packageOf;
   }
 
   /**
@@ -3729,14 +3726,16 @@ export class TypeInferrer {
    * no declaration to read (a top type, a primitive, an anonymous object
    * literal) or when nothing owns its declaration but the workspace itself.
    *
-   * The module graph is asked first, where there is one. A Deno service
-   * resolves npm types out of the Deno cache
+   * The module graph is asked first, where there is one, because it is the
+   * only thing that can answer for a project whose resolution does not go
+   * through `node_modules`. Deno resolves an npm dependency's types straight
+   * out of its own cache
    * (`$DENO_DIR/npm/<registry-host>/<name>/<version>/…`), a path with no
-   * `node_modules` segment anywhere in it, so the path scan below found no
-   * package for ANY dependency-declared type on such a repo and every receiver
-   * the compiler had typed correctly went unclassified (carrick#1260). It runs
-   * before the path scan rather than after it because a mixed checkout has
-   * both, and the graph is what actually resolved the module.
+   * `node_modules` segment anywhere in it, so the scan below found no package
+   * for ANY dependency-declared type on such a repo and every receiver the
+   * compiler had typed correctly went unclassified (carrick#1260). It runs
+   * first rather than second because a mixed checkout has both, and the graph
+   * is what actually resolved the module.
    *
    * The path scan is the Node answer: the LAST `node_modules` segment wins,
    * which is what a nested or content-addressed store
@@ -3750,9 +3749,9 @@ export class TypeInferrer {
       return undefined;
     }
     const filePath = declaration.getSourceFile().getFilePath().replace(/\\/g, '/');
-    const fromGraph = this.declaringPackageForFile?.(filePath);
-    if (fromGraph) {
-      return fromGraph;
+    const named = this.packageOf?.(filePath);
+    if (named) {
+      return named;
     }
     const marker = '/node_modules/';
     const index = filePath.lastIndexOf(marker);

@@ -79,13 +79,12 @@ function projectComponents(): ProjectComponents {
     components = {
       typeBundler: new TypeBundler({ project, repoRoot }),
       surfaceEmitter: new SurfaceEmitter({ project, repoRoot }),
-      // The Deno graph, where there is one, is the only thing that can say
-      // which npm package declares a file: a Deno service has no
-      // `node_modules` tree for the path to be read off (carrick#1260).
+      // The module graph, where the project resolved through one, is the only
+      // thing that can name the package a file belongs to: a Deno service
+      // resolves nothing under `node_modules` (carrick#1260).
       typeInferrer: new TypeInferrer({
         project,
-        declaringPackageForFile: (filePath) =>
-          loader.getDenoProject()?.packageNameForFile(filePath),
+        packageOf: (filePath) => loader.packageOf(filePath),
       }),
       definitionResolver: new DefinitionResolver({ project }),
     };

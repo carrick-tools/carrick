@@ -140,9 +140,10 @@ export class ProjectLoader {
   /** Set by `load()`; builds the ts-morph project on first `getProject()`. */
   private buildProject: (() => Project) | null = null;
   /**
-   * The Deno module graph the project was built from, on a Deno service.
-   * Populated by the build, so it is available from the first `getProject()`
-   * onwards and is `undefined` on every other project shape.
+   * The Deno graph this project resolved through, when it did (carrick#1260).
+   * It is the only thing that can name the package a resolved file belongs to,
+   * because a Deno project resolves nothing under `node_modules`. Set by the
+   * build, so it is there from the first `getProject()` onwards.
    */
   private denoProject: DenoProject | undefined;
   private readonly repoRoot: string;
@@ -370,12 +371,12 @@ export class ProjectLoader {
   }
 
   /**
-   * The Deno module graph behind the project, on a Deno service and after the
-   * project has been built. It is what knows which npm package owns a file: a
-   * Deno checkout has no `node_modules` tree to read that off (carrick#1260).
+   * The registry package a resolved file belongs to, when the module graph
+   * names one (carrick#1260). `undefined` for a project that did not resolve
+   * through Deno, and for a file the workspace itself owns.
    */
-  getDenoProject(): DenoProject | undefined {
-    return this.denoProject;
+  packageOf(filePath: string): string | undefined {
+    return this.denoProject?.packageOf(filePath);
   }
 
   /**

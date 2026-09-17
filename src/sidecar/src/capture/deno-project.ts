@@ -49,6 +49,21 @@ function readConfig(file: string): Config {
   return parsed.config as Config;
 }
 
+/** The package a JSR module specifier names, in the form the registry uses
+ * (`@scope/name`). Both the specifier Deno records after resolution
+ * (`https://jsr.io/@scope/name/1.2.3/mod.ts`) and the one an import map writes
+ * (`jsr:@scope/name@1`) name it in their first two segments. Anything else —
+ * a `file:` module, an `https://` module from a host that is not a package
+ * registry — names no package. */
+function jsrPackageName(specifier: string): string | undefined {
+  const tail = /^jsr:\/{0,2}(.*)$/.exec(specifier)?.[1]
+    ?? /^https:\/\/jsr\.io\/(.*)$/.exec(specifier)?.[1];
+  if (!tail) return undefined;
+  const [scope, name] = tail.split('/');
+  if (!scope?.startsWith('@') || !name) return undefined;
+  return `${scope}/${name.split('@')[0]}`;
+}
+
 /** Explicit TS configs keep their existing behaviour, including mixed repos. */
 export function findDenoConfig(repoRoot: string, explicit?: string): DenoConfig | undefined {
   if (explicit && !/^deno\.jsonc?$/.test(path.basename(explicit))) return undefined;
@@ -109,6 +124,7 @@ export class DenoProject {
   readonly pinned: Record<string, string> = {};
   private readonly modules = new Map<string, Module>();
   private readonly localPaths = new Map<string, string>();
+  private readonly specifiersByPath = new Map<string, string>();
   private readonly edges = new Map<string, Map<string, Resolution>>();
   private readonly redirects: Record<string, string>;
   private readonly npmPackages: Record<string, NpmPackage>;
@@ -190,6 +206,7 @@ export class DenoProject {
         fs.copyFileSync(module.local, local);
       }
       this.localPaths.set(module.specifier, path.resolve(local));
+      this.specifiersByPath.set(path.resolve(local), module.specifier);
     }
     for (const module of graph.modules) {
       const local = this.localPaths.get(module.specifier);
@@ -257,13 +274,21 @@ export class DenoProject {
       (target === pkg.localPath || target.startsWith(pkg.localPath + path.sep)));
   }
 
-  /** The npm package a declaration file belongs to, for a consumer that reads
-   * package identity off a path (carrick#1260). Deno serves npm types from its
-   * own cache, whose layout carries no `node_modules` segment, so the graph is
-   * the only thing that can answer; `undefined` means the workspace declares
-   * the file, exactly as no `node_modules` segment does under Node. */
-  packageNameForFile(file: string): string | undefined {
-    return this.npmOwner(file)?.name;
+  /** Which registry package a resolved file belongs to (carrick#1260).
+   *
+   * The inverse of resolution, and the only answer available for a Deno
+   * project: nothing it resolves sits under `node_modules`, so reading a
+   * package name off the path cannot work. An npm dependency is owned by the
+   * graph entry whose cache directory contains the file; a JSR one is named by
+   * its own specifier, since its cached copy is content-addressed and carries
+   * no identity. A file the workspace itself owns belongs to no package and
+   * answers nothing, exactly as a workspace-declared type does under Node. */
+  packageOf(file: string): string | undefined {
+    const resolved = path.resolve(file);
+    const owner = this.npmOwner(resolved);
+    if (owner) return owner.name;
+    const specifier = this.specifiersByPath.get(resolved);
+    return specifier ? jsrPackageName(specifier) : undefined;
   }
 
   private isNpmFile(file: string): boolean {
