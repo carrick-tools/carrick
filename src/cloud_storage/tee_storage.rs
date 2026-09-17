@@ -85,6 +85,19 @@ impl CloudStorage for TeeStorage {
                 "Not replacing the stored index for {}: it moved on while this analysis ran",
                 data.repo_name
             );
+            // The run still opened a scan, so it still has to end one
+            // (carrick#1262). `scan_final` rides on the write above, which is
+            // the write this branch is not sending, so the last service of the
+            // run says so directly: the in-flight slot goes back rather than
+            // refusing the user's next run for the quiet window, and the
+            // cloud records that the run ended rather than sweeping it up as
+            // silent. Best-effort, after the local write, and unable to fail
+            // the run — see `docs/reference/dispatch-resume.md`.
+            if final_in_run {
+                self.cloud
+                    .report_scan_closed(crate::local_mode::SUPERSEDED_REASON)
+                    .await;
+            }
             return Ok(UploadOutcome::default());
         }
         self.cloud.upload_repo_data(data, final_in_run).await
@@ -203,6 +216,64 @@ impl CloudStorage for TeeStorage {
 mod tests {
     use super::*;
     use crate::credentials::CloudAuth;
+    use serial_test::serial;
+
+    /// `CARRICK_SKIP_UPLOAD` is read from the process environment, and every
+    /// test below decides what it does by the value it finds there — so they
+    /// take turns, under one key, and each restores what it found.
+    ///
+    /// The restore is a `Drop` rather than a line at the end of the test: a
+    /// failed assertion unwinds, and a test that left the variable set would
+    /// take the next one with it.
+    struct SkipUpload(Option<std::ffi::OsString>);
+
+    impl SkipUpload {
+        fn on() -> Self {
+            let previous = std::env::var_os(crate::local_mode::SKIP_UPLOAD_ENV);
+            // SAFETY: every test touching this variable holds the same
+            // `#[serial]` key, and the guard restores it.
+            unsafe { std::env::set_var(crate::local_mode::SKIP_UPLOAD_ENV, "1") };
+            Self(previous)
+        }
+    }
+
+    impl Drop for SkipUpload {
+        fn drop(&mut self) {
+            // SAFETY: as above.
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::local_mode::SKIP_UPLOAD_ENV, value),
+                    None => std::env::remove_var(crate::local_mode::SKIP_UPLOAD_ENV),
+                }
+            }
+        }
+    }
+
+    fn start_scan_ok() -> (u16, String) {
+        (
+            200,
+            serde_json::json!({
+                "schema": "carrick.start-scan/0",
+                "scan_id": "scan_01J",
+                "project_id": "proj_1",
+                "project_slug": "acme",
+                "indexed_services": [],
+                "multi_service": true
+            })
+            .to_string(),
+        )
+    }
+
+    async fn begin(storage: &TeeStorage) {
+        storage
+            .begin_run(&RunContext {
+                repo_full_name: Some("acme/api".to_string()),
+                commit: "4f2a1c9".to_string(),
+                dirty: false,
+            })
+            .await
+            .unwrap();
+    }
 
     fn blob() -> CloudRepoData {
         serde_json::from_value(serde_json::json!({
@@ -244,6 +315,7 @@ mod tests {
     /// cache directory the read model is built from, and in the cloud. That is
     /// what removes the upload-then-download round trip (§8.3).
     #[tokio::test]
+    #[serial(skip_upload)]
     async fn an_uploaded_payload_is_also_written_to_the_cache_directory() {
         let dir = tempfile::tempdir().unwrap();
         let (storage, server) = tee(
@@ -270,6 +342,7 @@ mod tests {
     /// with `scan-failed` even on a cloud that reads the list
     /// (carrick-cloud#892).
     #[tokio::test]
+    #[serial(skip_upload)]
     async fn the_pending_list_reaches_the_cloud_through_the_tee() {
         let dir = tempfile::tempdir().unwrap();
         let (storage, server) = tee(
@@ -313,6 +386,7 @@ mod tests {
     /// the cloud's index is not written — but the developer keeps the index
     /// they just bought.
     #[tokio::test]
+    #[serial(skip_upload)]
     async fn a_refused_upload_still_leaves_the_local_index_behind() {
         let dir = tempfile::tempdir().unwrap();
         let (storage, server) = tee(
@@ -343,6 +417,105 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// carrick#1262: a resume the cloud has already moved past writes its
+    /// index locally, sends no write action at all — and ends the scan it
+    /// opened, so the in-flight slot is handed back rather than refusing the
+    /// user's next run for the quiet window.
+    #[tokio::test]
+    #[serial(skip_upload)]
+    async fn a_superseded_resume_closes_the_scan_its_last_service_would_have() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, server) = tee(
+            vec![
+                start_scan_ok(),
+                (200, serde_json::json!({ "ok": true }).to_string()),
+            ],
+            dir.path(),
+        );
+        begin(&storage).await;
+
+        let _skip = SkipUpload::on();
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2, "the index was sent after all");
+        let close = body_of(&requests[1]);
+        assert_eq!(close["action"], "close-scan");
+        assert_eq!(close["scan_id"], "scan_01J");
+        assert_eq!(close["reason"], "superseded");
+        assert!(
+            dir.path().join("api.json").exists(),
+            "the local index this run exists to build was not written"
+        );
+    }
+
+    /// One close per run, on the write that would have carried `scan_final`:
+    /// a multi-service repo skips N uploads, and closing on the first would
+    /// hand the slot back while the rest of the run is still going.
+    #[tokio::test]
+    #[serial(skip_upload)]
+    async fn a_service_that_is_not_the_run_s_last_closes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, server) = tee(vec![start_scan_ok()], dir.path());
+        begin(&storage).await;
+
+        let _skip = SkipUpload::on();
+        storage.upload_repo_data(&blob(), false).await.unwrap();
+
+        assert_eq!(
+            server.join().unwrap().len(),
+            1,
+            "a mid-run service closed the scan"
+        );
+        assert!(dir.path().join("api.json").exists());
+    }
+
+    /// Nothing to close, nothing sent: a run whose `start-scan` never answered
+    /// has no slot held anywhere, and a `close-scan` with no id is one the
+    /// cloud answers 404.
+    #[tokio::test]
+    #[serial(skip_upload)]
+    async fn a_skipped_upload_with_no_scan_open_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, server) = tee(vec![], dir.path());
+
+        let _skip = SkipUpload::on();
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        assert!(server.join().unwrap().is_empty());
+        assert!(dir.path().join("api.json").exists());
+    }
+
+    /// The cloud deployed today refuses the action outright, and the run is
+    /// unchanged by it: the index the developer asked for is on disk and the
+    /// scan finishes successfully. Every other refusal — an id this cloud does
+    /// not know, another workspace's scan, a 5xx, a dead network — ends the
+    /// same way.
+    #[tokio::test]
+    #[serial(skip_upload)]
+    async fn a_refused_close_leaves_the_run_successful() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, server) = tee(
+            vec![
+                start_scan_ok(),
+                (
+                    403,
+                    serde_json::json!({ "error": "wrong key kind", "code": "wrong_key_kind" })
+                        .to_string(),
+                ),
+            ],
+            dir.path(),
+        );
+        begin(&storage).await;
+
+        let _skip = SkipUpload::on();
+        let outcome = storage.upload_repo_data(&blob(), true).await;
+
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(server.join().unwrap().len(), 2, "the close was retried");
+        assert!(dir.path().join("api.json").exists());
+    }
+
     /// The cross-repo read is the local one, so phase 1 stays isolated exactly
     /// as it is on a facts-only pass and no sibling's data reaches a repo's own
     /// scan.
@@ -365,6 +538,7 @@ mod tests {
     /// after the repo, so this only bites a clone given a target name or a
     /// renamed directory, and it bites it after the analysis is paid for.
     #[tokio::test]
+    #[serial(skip_upload)]
     async fn a_clone_in_a_differently_named_folder_uploads_under_the_repo_name() {
         let dir = tempfile::tempdir().unwrap();
         let checkout = dir.path().join("ws");

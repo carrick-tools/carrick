@@ -47,6 +47,14 @@ pub const NO_MODEL_ENV: &str = "CARRICK_NO_MODEL";
 /// an older one is not (carrick#1229).
 pub const SKIP_UPLOAD_ENV: &str = "CARRICK_SKIP_UPLOAD";
 
+/// Why a run that skipped its upload ended: the `reason` on `close-scan`.
+///
+/// The same fact as [`SKIP_UPLOAD_ENV`], which has one setter, so the token
+/// lives beside it rather than at the call site that sends it. A
+/// `[a-z_]{1,64}` token; the cloud records anything else as `unspecified`
+/// (carrick#1262).
+pub const SUPERSEDED_REASON: &str = "superseded";
+
 /// Set to a path to make a cross-repo run write [`LocalJoin`] there and exit
 /// instead of printing the report. The local indexer's join phase.
 pub const JOIN_OUT_ENV: &str = "CARRICK_LOCAL_JOIN_OUT";
