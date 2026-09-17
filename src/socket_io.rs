@@ -100,12 +100,18 @@
 //!   `ws` socket's `message`/`close`/`open` are the transport's lifecycle, not
 //!   a contract, and a row on a name that generic would match any unrelated
 //!   row sharing it,
+//! - a handler argument is what makes a registration, and a bare identifier
+//!   counts as one, so an options bag passed where a callback would go
+//!   (`room.subscribe("orders", opts)`) reads as a registration. The
+//!   alternative — accepting only a literal function expression — loses every
+//!   `bind("evt", handleEvent)`, which is the commoner spelling,
 //! - one shape reads a payload rather than an argument: `send(JSON.stringify({
 //!   type: "x", … }))`, the plain-WebSocket idiom, where the event name is a
 //!   discriminator field of the sent object. `type` and `event` are accepted as
-//!   the discriminator key. That is a convention, not a structure, and it is
-//!   the only place in this module where one is used; it earns its place
-//!   because on a raw socket there is no other literal to key on,
+//!   the discriminator key, and only `send` is read this way. That is a
+//!   convention, not a structure, and it is the only place in this module where
+//!   one is used; it earns its place because on a raw socket there is no other
+//!   literal to key on,
 //! - the RECEIVING side of that idiom (`switch (msg.type)` inside a `message`
 //!   handler) is not extracted, so a plain-WebSocket service produces emitter
 //!   rows whose listeners are invisible, and they surface as unmatched socket
@@ -1240,9 +1246,12 @@ impl OpCollector<'_> {
 
         // `send(JSON.stringify({ type: "x", … }))`: the raw-WebSocket idiom,
         // where the event name is a field of the payload rather than an
-        // argument. Emitter only, unknown roots only.
+        // argument. `send` only — a library whose sending method takes the
+        // event name as an argument has one there, and reading an object it was
+        // handed instead would key on whatever field happened to be called
+        // `type`.
         if kind == SocketKind::Unknown
-            && is_emitter
+            && method == "send"
             && !args
                 .first()
                 .is_some_and(|arg| matches!(&*arg.expr, Expr::Lit(Lit::Str(_))))
@@ -2193,6 +2202,24 @@ room.publish(topicFromConfig, seat);
         );
         assert_eq!(keys(&result.listeners), vec!["socket|UNKNOWN|seat.taken"]);
         assert_eq!(keys(&result.emitters), vec!["socket|UNKNOWN|seat.released"]);
+    }
+
+    #[test]
+    fn only_send_reads_the_event_out_of_an_envelope() {
+        let result = extract_with_clients(
+            r#"
+import { Connection } from "wire-transport";
+const link = new Connection(url);
+link.send(JSON.stringify({ type: "order.packed", parcel }));
+link.trigger({ event: "order.labelled", parcel });
+"#,
+            &["wire-transport"],
+        );
+        assert_eq!(
+            keys(&result.emitters),
+            vec!["socket|UNKNOWN|order.packed"],
+            "a sending method that takes the event as an argument is not read as an envelope"
+        );
     }
 
     #[test]
