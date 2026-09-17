@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.76](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.75...carrick-v0.3.76) (2026-09-17)
+
+
+### Bug Fixes
+
+* **dispatch:** carry the scan id on the job submission the cloud validates it by (carrick[#1257](https://github.com/carrick-tools/carrick/issues/1257)) ([#1258](https://github.com/carrick-tools/carrick/issues/1258)) ([c5ff2b6](https://github.com/carrick-tools/carrick/commit/c5ff2b62936c441d2e2d2ffa233efe413372148b))
+* **graphql:** analyse code-first schema modules and serve fields at their resolvers ([#1206](https://github.com/carrick-tools/carrick/issues/1206)) ([0706fd2](https://github.com/carrick-tools/carrick/commit/0706fd277f2ee45e25510e0ee72f7a1c95b5b4ba)), closes [#1157](https://github.com/carrick-tools/carrick/issues/1157)
+
 ## [0.3.75](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.74...carrick-v0.3.75) (2026-09-16)
 
 
