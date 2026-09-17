@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.80](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.79...carrick-v0.3.80) (2026-09-17)
+
+
+### Bug Fixes
+
+* **action:** prepare every service the pre-flight checks, not the scan root ([#1313](https://github.com/carrick-tools/carrick/issues/1313)) ([041710d](https://github.com/carrick-tools/carrick/commit/041710d9a8347e855235d59e30fec97dbd890e64))
+
 ## [0.3.79](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.78...carrick-v0.3.79) (2026-09-17)
 
 
