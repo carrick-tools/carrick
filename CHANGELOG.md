@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.81](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.80...carrick-v0.3.81) (2026-09-17)
+
+
+### Features
+
+* **cli:** render a build of the index instead of logging it ([#1316](https://github.com/carrick-tools/carrick/issues/1316)) ([2e4dd99](https://github.com/carrick-tools/carrick/commit/2e4dd991e8f61a0fd86e3215603a9db881fbc5ae))
+
 ## [0.3.80](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.79...carrick-v0.3.80) (2026-09-17)
 
 
