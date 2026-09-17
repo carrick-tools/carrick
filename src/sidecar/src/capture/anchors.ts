@@ -273,7 +273,8 @@ export function resolveAnchor(
       request,
       param,
       args.placeholder,
-      undefined
+      undefined,
+      args.repoRoot
     );
   }
   let located = locateNode(sourceFile, request);
@@ -305,7 +306,8 @@ export function resolveAnchor(
     request,
     located,
     args.placeholder,
-    reaimNote
+    reaimNote,
+    args.repoRoot
   );
 }
 
@@ -321,7 +323,8 @@ function finishInferAnchor(
   request: InferAnchorRequest,
   located: ts.Node,
   placeholder: ts.TypeAliasDeclaration | undefined,
-  reaimNote: string | undefined
+  reaimNote: string | undefined,
+  repoRoot: string
 ): ResolvedAnchor {
   const checker = program.getTypeChecker();
   const demote = (reason: string): ResolvedAnchor => ({
@@ -397,7 +400,7 @@ function finishInferAnchor(
   // type. No source locator points at a distinct clean payload here (the payload
   // lives inside the wrapper's response builder), so degrade to `unknown` —
   // abstain, never a concrete verdict off the machinery.
-  if (typeIsOrContainsMachinery(checker, type, located)) {
+  if (typeIsOrContainsMachinery(program, type, located, repoRoot)) {
     return demote(
       'resolved type is or contains framework machinery (Response/Request-shaped); ' +
         'degraded to unknown rather than emit a wrapper envelope as a response contract'

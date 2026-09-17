@@ -9,6 +9,7 @@ import { captureStub, runCheck } from '../src/capture/index.js';
 import ts from 'typescript';
 import { DenoProject, findDenoConfig } from '../src/capture/index.js';
 import { SidecarClient } from './helpers.js';
+import { TypeInferrer, isExternalOrigin } from '../src/type-inferrer.js';
 
 const hasDeno = spawnSync('deno', ['--version']).status === 0;
 
@@ -291,6 +292,87 @@ export const hex = encodeHex(new Uint8Array());
       assert.equal(deno.packageOf(mainPath), undefined);
     } finally {
       await client.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reads a dependency type served from the Deno npm cache as machinery origin (carrick#1264)', () => {
+    // No `node_modules` segment anywhere in the declaring path: the gate can
+    // only answer from the compiler's own record of the graph's verdict.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-deno-origin-npm-'));
+    try {
+      fs.writeFileSync(path.join(root, 'deno.json'), JSON.stringify({ imports: { hono: 'npm:hono@4.12.12' } }));
+      fs.writeFileSync(path.join(root, 'main.ts'), [
+        'import type { HonoRequest } from "hono";',
+        'export interface Payload { id: string }',
+        'export function envelope(): HonoRequest { return null as unknown as HonoRequest; }',
+        'export function payload(): Payload { return { id: "x" }; }',
+        'export const sent = envelope();',
+        'export const body = payload();',
+      ].join('\n'));
+      const installed = spawnSync('deno', ['install', '--node-modules-dir=none'], { cwd: root, encoding: 'utf8' });
+      assert.equal(installed.status, 0, installed.stderr);
+      const loader = new ProjectLoader({ repoRoot: root });
+      assert.equal(loader.load().success, true);
+      const project = loader.getProject();
+      const main = project.getSourceFileOrThrow(path.join(root, 'main.ts'));
+      const declaring = main.getFunctionOrThrow('envelope').getReturnType().getSymbolOrThrow().getDeclarations()[0].getSourceFile();
+      assert.doesNotMatch(declaring.getFilePath(), /\/node_modules\//);
+      assert.match(declaring.getFilePath(), /\/hono\/4\.12\.12\/dist\/types\/request\.d\.ts$/);
+      const program = project.getProgram().compilerObject;
+      assert.equal(isExternalOrigin(program, declaring.compilerNode, root), true);
+      assert.equal(isExternalOrigin(program, main.compilerNode, root), false);
+
+      // Infer: the transport wrapper abstains, the payload beside it publishes.
+      const inferrer = new TypeInferrer({ project, repoRoot: root, packageOf: (file) => loader.packageOf(file) });
+      const inferred = inferrer.infer([
+        { file_path: 'main.ts', line_number: 3, infer_kind: 'function_return', alias: 'Envelope' },
+        { file_path: 'main.ts', line_number: 4, infer_kind: 'function_return', alias: 'Body' },
+      ]);
+      // An abstain is no row at all (the driver pads it to `unknown`); the
+      // reason is only visible in the capture record below.
+      assert.deepEqual((inferred.inferred_types ?? []).map(t => [t.alias, t.type_string]), [['Body', '{ id: string; }']], JSON.stringify(inferred));
+      assert.equal((inferred.errors ?? []).length, 1, JSON.stringify(inferred.errors));
+
+      // Capture: the same gate demotes the wrapper anchor as machinery.
+      const captured = captureStub({ repoRoot: root, serviceName: 'origin', outDir: path.join(root, '.carrick/stub'), anchors: [
+        { kind: 'infer', alias: 'Envelope', source_file: 'main.ts', anchor_origin: 'deterministic-infer', expression_text: 'envelope()' },
+        { kind: 'infer', alias: 'Body', source_file: 'main.ts', anchor_origin: 'deterministic-infer', expression_text: 'payload()' },
+      ] });
+      assert.equal(captured.success, true, captured.errors.join('\n'));
+      const record = (alias: string) => captured.aliases.find(a => a.alias === alias)!;
+      assert.match(record('Envelope').capture_failure_reason ?? '', /framework machinery/, JSON.stringify(record('Envelope')));
+      assert.equal(record('Body').self_check, 'ok', record('Body').self_check_detail);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reads a JSR module type from the copy beside the materialised runtime as machinery origin (carrick#1264)', () => {
+    // A JSR dependency is copied under `.carrick/deno/<hash>/remote/`, so the
+    // artefact clause answers it and the compiler's external flag stays off:
+    // that flag also gates declaration emit, and the copy must still emit.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-deno-origin-jsr-'));
+    try {
+      fs.writeFileSync(path.join(root, 'deno.json'), JSON.stringify({ imports: { '@std/http': 'jsr:@std/http@1' } }));
+      fs.writeFileSync(path.join(root, 'main.ts'), [
+        'import type { ServeDirOptions } from "@std/http/file-server";',
+        'export type Options = ServeDirOptions;',
+      ].join('\n'));
+      const installed = spawnSync('deno', ['install', '--node-modules-dir=none'], { cwd: root, encoding: 'utf8' });
+      assert.equal(installed.status, 0, installed.stderr);
+      const loader = new ProjectLoader({ repoRoot: root });
+      assert.equal(loader.load().success, true);
+      const project = loader.getProject();
+      const main = project.getSourceFileOrThrow(path.join(root, 'main.ts'));
+      const declaring = main.getTypeAliasOrThrow('Options').getType().getSymbolOrThrow().getDeclarations()[0].getSourceFile();
+      assert.match(declaring.getFilePath(), /\/\.carrick\/deno\/[0-9a-f]+\/remote\//);
+      assert.equal(loader.packageOf(declaring.getFilePath()), '@std/http');
+      const program = project.getProgram().compilerObject;
+      assert.equal(program.isSourceFileFromExternalLibrary(declaring.compilerNode), false);
+      assert.equal(isExternalOrigin(program, declaring.compilerNode, root), true);
+      assert.equal(isExternalOrigin(program, main.compilerNode, root), false);
+    } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
