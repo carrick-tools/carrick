@@ -4994,26 +4994,8 @@ fn report_unresolved_imports(
     unresolved: &crate::call_graph::UnresolvedImports,
     unfollowed_extends: &[String],
 ) {
-    if !unresolved.aliases.is_empty() {
-        let imports: usize = unresolved.aliases.values().sum();
-        let mut ranked: Vec<(&String, &usize)> = unresolved.aliases.iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-        let named: Vec<&str> = ranked
-            .iter()
-            .take(MAX_NAMED_UNRESOLVED_SPECIFIERS)
-            .map(|(specifier, _)| specifier.as_str())
-            .collect();
-        info!(
-            "Call graph: {} import(s) through {} aliased specifier(s) resolved to no file, so those calls record no caller edge. No tsconfig, package.json or Deno config declares the alias; one set only in bundler or build code is not read (carrick#1104): {}{}",
-            imports,
-            unresolved.aliases.len(),
-            named.join(", "),
-            if ranked.len() > named.len() {
-                ", ..."
-            } else {
-                ""
-            }
-        );
+    if let Some(line) = undeclared_alias_line(unresolved) {
+        info!("{line}");
     }
     for line in missing_mapping_lines(unresolved) {
         info!("{line}");
@@ -5030,6 +5012,41 @@ fn report_unresolved_imports(
             unfollowed_extends.join(", ")
         );
     }
+}
+
+/// The specifiers no config declares, worst first, capped.
+///
+/// Same four things as [`missing_mapping_lines`] and for the same reason: how
+/// many, which ones, what is missing, and what to do. What this costs the
+/// scanner — that the calls record no caller edge — was half the old line and
+/// is ours to know, not theirs to read (David's ruling, 2026-09-17).
+///
+/// The instruction carries the three config kinds that would fix it, which is
+/// also the answer to the question the old line spent a clause on: an alias
+/// set only in bundler or build code is not one of them, and declaring it in
+/// one of these is what makes it readable.
+fn undeclared_alias_line(unresolved: &crate::call_graph::UnresolvedImports) -> Option<String> {
+    if unresolved.aliases.is_empty() {
+        return None;
+    }
+    let imports: usize = unresolved.aliases.values().sum();
+    let mut ranked: Vec<(&String, &usize)> = unresolved.aliases.iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    let named: Vec<&str> = ranked
+        .iter()
+        .take(MAX_NAMED_UNRESOLVED_SPECIFIERS)
+        .map(|(specifier, _)| specifier.as_str())
+        .collect();
+    Some(format!(
+        "Call graph: {imports} import(s) through {} undeclared alias(es) are unresolved: {}{}. Declare them in tsconfig, package.json or a Deno import map.",
+        unresolved.aliases.len(),
+        named.join(", "),
+        if ranked.len() > named.len() {
+            ", ..."
+        } else {
+            ""
+        }
+    ))
 }
 
 /// One line per config mapping whose target is not on disk, worst first
@@ -6391,6 +6408,29 @@ async fn build_cross_repo_analyzer(
 
 #[cfg(test)]
 mod tests {
+
+    /// The aliased-specifier line, pinned for the same reason as its sibling
+    /// below: it carried the same internals clause and the same stray ticket
+    /// ref, and was the last verbose line in this reporter.
+    #[test]
+    fn undeclared_aliases_are_named_with_their_count_and_what_to_do() {
+        let mut unresolved = crate::call_graph::UnresolvedImports::default();
+        assert_eq!(super::undeclared_alias_line(&unresolved), None);
+
+        unresolved.aliases.insert("~/queue".to_string(), 9);
+        unresolved.aliases.insert("$lib/db".to_string(), 2);
+        let line = super::undeclared_alias_line(&unresolved).expect("a line");
+        assert_eq!(
+            line,
+            "Call graph: 11 import(s) through 2 undeclared alias(es) are unresolved: ~/queue, \
+             $lib/db. Declare them in tsconfig, package.json or a Deno import map."
+        );
+        assert!(
+            line.split_whitespace().count() <= 25,
+            "a log line is read in a terminal, not studied: what an unresolved import costs us is \
+             our internals and does not belong here (David's ruling, 2026-09-17):\n{line}"
+        );
+    }
 
     /// The sentence is the deliverable of carrick#1273, so it is pinned.
     ///
