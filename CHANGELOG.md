@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.79](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.78...carrick-v0.3.79) (2026-09-17)
+
+
+### Bug Fixes
+
+* **preflight:** refuse a missing mapping only when something imports through it (carrick[#1301](https://github.com/carrick-tools/carrick/issues/1301)) ([#1310](https://github.com/carrick-tools/carrick/issues/1310)) ([07f279a](https://github.com/carrick-tools/carrick/commit/07f279a0d2b456ca1f9002bdfdfecfbad325dfc2))
+* **sidecar:** ask the compiler, not the path, whether a declaration is an installed dependency (carrick[#1264](https://github.com/carrick-tools/carrick/issues/1264)) ([#1303](https://github.com/carrick-tools/carrick/issues/1303)) ([1e541be](https://github.com/carrick-tools/carrick/commit/1e541be6e7a70b1a784e242692ded95e99fddc84))
+* **storage:** force a re-index when the run sent files to the analyzer ([#1308](https://github.com/carrick-tools/carrick/issues/1308)) ([2fa713b](https://github.com/carrick-tools/carrick/commit/2fa713b7aa9a00922f58d83746e68ba4bf896b25))
+
+
+### Documentation
+
+* **engine:** put the new helper above the upload loop's own doc block ([#1311](https://github.com/carrick-tools/carrick/issues/1311)) ([1a063c1](https://github.com/carrick-tools/carrick/commit/1a063c172e6aa5504fb281907c1baddf4a846e65)), closes [#1306](https://github.com/carrick-tools/carrick/issues/1306)
+
+
+### CI/CD
+
+* **dogfood:** install the sidecar's dependencies before the scan so pre-flight does not refuse our own checkout (carrick[#1304](https://github.com/carrick-tools/carrick/issues/1304)) ([#1307](https://github.com/carrick-tools/carrick/issues/1307)) ([7895040](https://github.com/carrick-tools/carrick/commit/78950407004151bd59d295afa85f13d971e97a6e))
+* **release:** author the release PR with a contributor's token so its runs are not parked (carrick[#1270](https://github.com/carrick-tools/carrick/issues/1270)) ([#1302](https://github.com/carrick-tools/carrick/issues/1302)) ([5fad22c](https://github.com/carrick-tools/carrick/commit/5fad22cb3d6d0667c666723ce59359f6095b8f9e))
+
 ## [0.3.78](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.77...carrick-v0.3.78) (2026-09-17)
 
 
