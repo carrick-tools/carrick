@@ -135,6 +135,16 @@ impl CloudStorage for TeeStorage {
         self.cloud.index_landed(data, written_after).await
     }
 
+    /// The CLOUD side: the freshness guard this is aimed at is the cloud's,
+    /// and the local copy is overwritten on every write regardless
+    /// (carrick#1306). Forwarded rather than left to the trait's no-op
+    /// default, because this is the storage the laptop scan uses — the path
+    /// the defect was seen on — and a swallowed call here is the defect
+    /// intact.
+    fn note_analyzed_files(&self) {
+        self.cloud.note_analyzed_files();
+    }
+
     /// The cloud side: the first index being kept open is the cloud's, and
     /// the local copy has no scan to close.
     fn name_pending_on_final_write(&self, pending_services: &[String]) -> bool {
@@ -372,6 +382,28 @@ mod tests {
 
         let write = body_of(&server.join().unwrap()[2]);
         assert_eq!(write["pending_services"], serde_json::json!(["billing"]));
+    }
+
+    /// carrick#1306: a laptop run is a tee, so the statement "this run
+    /// analysed files" must reach the cloud through it. A tee that kept the
+    /// trait's no-op default would swallow it on the one path the defect was
+    /// seen on, and every test against `AwsStorage` alone would still pass.
+    #[tokio::test]
+    async fn the_analyzed_statement_reaches_the_cloud_through_the_tee() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, server) = tee(
+            vec![
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            dir.path(),
+        );
+
+        storage.note_analyzed_files();
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        let write = body_of(&server.join().unwrap()[1]);
+        assert_eq!(write["force_reindex"], true, "{write}");
     }
 
     /// The analysis has already been paid for by the time either write

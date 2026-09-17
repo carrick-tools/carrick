@@ -287,6 +287,12 @@ pub struct AwsStorage {
     /// for this commit. Set once from the CLI flag and sent on every write
     /// action; see `force_reindex` on [`LambdaRequest`].
     force_reindex: bool,
+    /// This run sent at least one file to the analyzer, so its answers are not
+    /// the ones the stored generation was built from. Set once by the engine
+    /// before the first write action and folded into `force_reindex`, so a
+    /// scan of a prepared checkout is not deduped at an unchanged commit
+    /// (carrick#1306). See [`CloudStorage::note_analyzed_files`].
+    analyzed: std::sync::atomic::AtomicBool,
     /// The repository this run was authorised to write, as the cloud names it:
     /// the basename of the `owner/repo` `start-scan` opened the scan with.
     /// Present only on the laptop path, where it is the name every action of
@@ -755,6 +761,7 @@ impl AwsStorage {
             auth,
             scan_id: std::sync::OnceLock::new(),
             dirty: std::sync::atomic::AtomicBool::new(false),
+            analyzed: std::sync::atomic::AtomicBool::new(false),
             multi_service: std::sync::atomic::AtomicBool::new(false),
             accepts_pending_services: std::sync::atomic::AtomicBool::new(false),
             accepts_analysis_job: std::sync::atomic::AtomicBool::new(false),
@@ -778,13 +785,23 @@ impl AwsStorage {
         )
     }
 
-    /// Whether the index this run writes describes a tree that did not match
-    /// its commit. Folded into `force_reindex` because the cloud's freshness
-    /// guard reasons about the commit hash, and a dirty run's hash is a claim
-    /// the tree does not support: without this a second scan at the same HEAD
-    /// is told the index is current and the dirty rows survive (C10).
+    /// Whether this run's write actions must replace the stored generation
+    /// instead of being short-circuited on the commit hash.
+    ///
+    /// Three ways a run can know the stored generation is not what it just
+    /// computed, and none of them is visible to the cloud's freshness guard,
+    /// which reasons about (commit, scanner version) alone:
+    ///
+    /// - `--no-cache`: the run re-analyzed every file on purpose.
+    /// - A dirty tree: the run's hash is a claim the tree does not support, so
+    ///   without this a second scan at the same HEAD is told the index is
+    ///   current and the dirty rows survive (C10).
+    /// - A file went to the analyzer: the commit has not moved, but this run's
+    ///   answers are not the stored generation's (carrick#1306).
     fn forces_reindex(&self) -> bool {
-        self.force_reindex || self.dirty.load(std::sync::atomic::Ordering::Relaxed)
+        self.force_reindex
+            || self.dirty.load(std::sync::atomic::Ordering::Relaxed)
+            || self.analyzed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The slot this run holds, for the write actions. `None` on the CI path,
@@ -1650,6 +1667,14 @@ const ANALYSIS_JOB_SCHEMA: &str = "carrick.analysis-job/0";
 
 #[async_trait]
 impl CloudStorage for AwsStorage {
+    /// Folded into every later write action's `force_reindex` — see
+    /// [`AwsStorage::forces_reindex`]. Idempotent: the engine says it once per
+    /// run, and saying it twice is the same statement.
+    fn note_analyzed_files(&self) {
+        self.analyzed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn accepts_analysis_job(&self) -> bool {
         self.accepts_analysis_job
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -3608,6 +3633,38 @@ mod tests {
         storage
             .dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        let requests = server.join().unwrap();
+        assert!(
+            body_of(&requests[0]).get("force_reindex").is_none(),
+            "the existence check supersedes nothing: {}",
+            body_of(&requests[0])
+        );
+        assert_eq!(body_of(&requests[1])["force_reindex"], true);
+    }
+
+    /// carrick#1306's scanner half, on the wire. A user told by the pre-flight
+    /// to prepare the checkout does so, the generated output is gitignored, and
+    /// the rescan runs at the same commit with a clean tree and no
+    /// `--no-cache` — so nothing the cloud's freshness guard can see has moved
+    /// and it keeps the stored generation. The run DID send files to the
+    /// analyzer, which is the fact that says its answers are not the stored
+    /// ones, and that is what rides here.
+    #[tokio::test]
+    async fn a_run_that_analyzed_files_forces_the_reindex_on_its_write_action() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            "scan_01J",
+        );
+        // Neither of the two signals that used to be the only ones.
+        assert!(!storage.force_reindex);
+        assert!(!storage.dirty.load(std::sync::atomic::Ordering::Relaxed));
+        storage.note_analyzed_files();
 
         storage.upload_repo_data(&blob(), true).await.unwrap();
 

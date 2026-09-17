@@ -1049,6 +1049,26 @@ pub trait CloudStorage {
     /// default body puts no `Sync` bound on generic callers (carrick#956).
     fn keep_served_generation(&self, _data: &CloudRepoData) {}
 
+    /// Tell this backend that the run sent at least one file to the analyzer,
+    /// so its write actions must replace the stored generation rather than be
+    /// short-circuited on the commit hash (carrick#1306).
+    ///
+    /// The cloud dedupes a write on (commit, scanner version), and neither
+    /// moves when a user prepares the checkout the way the pre-flight refusal
+    /// told them to: the generated output is gitignored, so the tree is clean
+    /// by git's measure and `--no-cache` was not passed. The scan then pays
+    /// for fresh analysis, reports better numbers locally, and the index every
+    /// agent reads is unchanged. A run that analysed a file knows its answers
+    /// are not the stored generation's, and this is it saying so.
+    ///
+    /// A property of the RUN: called once, before any write action, and every
+    /// write action of the run carries the flag afterwards. Not async, so the
+    /// default body puts no `Sync` bound on generic callers (carrick#956).
+    /// The default does nothing, because only a backend that talks to the
+    /// freshness guard has anything to say to it — but a backend that WRAPS
+    /// one must forward this or the wrapped cloud never hears it.
+    fn note_analyzed_files(&self) {}
+
     /// Ask the run's final write (the one [`Self::upload_repo_data`] gets with
     /// `final_in_run`) to name the services this run leaves pending, and say
     /// whether it will.

@@ -2003,6 +2003,25 @@ async fn upload_landed_anyway<T: CloudStorage>(
 /// Uploads are keyed per (repo, service) and idempotent, so a re-run restores
 /// consistency; until then the index is mixed-generation for this repo, and
 /// the summary says so when some services landed and others did not.
+/// Did this run send any of this service's files to the analyzer?
+///
+/// Read off the payload's own boundary, which every branch of the analysis
+/// builds fresh from this scan's [`crate::agents::file_orchestrator::
+/// ProcessingStats`] before the payload is uploaded — so it is this run's
+/// count, not a number carried over from the generation the index holds. A
+/// held-back service writes no payload at all, so nothing here can be reading
+/// a served generation's boundary (carrick#1306).
+///
+/// A payload with no boundary at all answers `false`: absence is not evidence
+/// that analysis happened, and the alternative is forcing a re-index on every
+/// upload.
+fn payload_reached_the_analyzer(payload: &CloudRepoData) -> bool {
+    payload
+        .boundary
+        .as_ref()
+        .is_some_and(|boundary| boundary.files_attempted > 0)
+}
+
 async fn upload_service_payloads<T: CloudStorage>(
     storage: &T,
     payloads: &[CloudRepoData],
@@ -2013,6 +2032,21 @@ async fn upload_service_payloads<T: CloudStorage>(
     boundary: &upload_boundary::UploadBoundary,
 ) -> Vec<UnconfirmedUpload> {
     crate::scan_stage::enter(crate::scan_stage::Stage::Upload);
+    // Before the first write, because every write action reads it: a run that
+    // sent even one file to the analyzer computed something the stored
+    // generation does not hold, and the cloud's freshness guard — which sees
+    // (commit, scanner version) and nothing else — would otherwise dedupe the
+    // whole upload away at an unchanged commit (carrick#1306). Run-scoped, not
+    // per service: one service's fresh answers reach the others through the
+    // cross-repo join, so a repo where one service was analysed writes a
+    // generation that differs everywhere.
+    let analyzed = payloads.iter().any(payload_reached_the_analyzer);
+    if analyzed {
+        storage.note_analyzed_files();
+    }
+    // The diagnostic below asks whether the cloud discarded analysis this run
+    // had done, so it has to mean the same thing the wire flag means.
+    let forced = forced || analyzed;
     let sp = logging::spinner("Uploading results...");
     let mut outcomes: Vec<UploadOutcome> = Vec::with_capacity(payloads.len());
     let mut confirmed: Vec<&str> = Vec::new();
@@ -2145,12 +2179,12 @@ fn upload_finish_message(outcomes: &[UploadOutcome]) -> &'static str {
     }
 }
 
-/// Said when a `--no-cache` run's answers were computed and then discarded by
-/// the ingest. Names the one cause it can have, because the run itself did
-/// nothing wrong.
-const FORCED_REANALYSIS_DISCARDED: &str = "Full re-analysis was discarded: the cloud kept the stored index for this commit. \
-     It is deployed without force_reindex support (carrick#885); the answers this run \
-     computed were not stored.";
+/// Said when a run that told the cloud to replace the stored generation had
+/// its answers computed and then discarded by the ingest. Names the one cause
+/// it can have, because the run itself did nothing wrong.
+const FORCED_REANALYSIS_DISCARDED: &str = "This scan's fresh analysis was discarded: the cloud kept the stored index for this \
+     commit. It is deployed without force_reindex support (carrick#885); the answers this \
+     run computed were not stored.";
 
 /// Did a forced run pay for a re-analysis the cloud then threw away?
 ///
@@ -2158,8 +2192,9 @@ const FORCED_REANALYSIS_DISCARDED: &str = "Full re-analysis was discarded: the c
 /// exactly one explanation: the deployed cloud predates the reader for that
 /// field, since a cloud that has it never answers current to a forced write.
 /// That is a deploy-order mistake, and it must show as a warning rather than
-/// as the ordinary "already current" line — the whole point of `--no-cache` is
-/// that the run believed the stored answers were stale (carrick#885).
+/// as the ordinary "already current" line — a forced run is one that believed
+/// the stored answers were stale, whether because `--no-cache` said so or
+/// because it sent files to the analyzer (carrick#885, carrick#1306).
 fn forced_reanalysis_was_discarded(outcomes: &[UploadOutcome], forced: bool) -> bool {
     forced && !outcomes.is_empty() && outcomes.iter().all(|o| o.already_current)
 }
@@ -7253,6 +7288,10 @@ mod tests {
         /// The serialized body of each upload, as the wire would carry it.
         uploaded_bodies: std::sync::Mutex<Vec<String>>,
         landed_asks: std::sync::Mutex<Vec<String>>,
+        /// Whether the upload loop told this storage the run had analysed
+        /// files, and so that its write actions must supersede the stored
+        /// generation (carrick#1306).
+        analyzed_noted: std::sync::atomic::AtomicBool,
     }
 
     impl ScriptedStorage {
@@ -7266,7 +7305,13 @@ mod tests {
                 uploaded: std::sync::Mutex::new(Vec::new()),
                 uploaded_bodies: std::sync::Mutex::new(Vec::new()),
                 landed_asks: std::sync::Mutex::new(Vec::new()),
+                analyzed_noted: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+
+        fn analyzed_noted(&self) -> bool {
+            self.analyzed_noted
+                .load(std::sync::atomic::Ordering::Relaxed)
         }
 
         fn uploaded(&self) -> Vec<String> {
@@ -7290,6 +7335,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CloudStorage for ScriptedStorage {
+        fn note_analyzed_files(&self) {
+            self.analyzed_noted
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
         async fn upload_repo_data(
             &self,
             data: &CloudRepoData,
@@ -7419,6 +7469,75 @@ mod tests {
             service_data("api-server", Some("orders")),
             service_data("api-server", Some("billing")),
         ]
+    }
+
+    /// A payload whose boundary says this scan sent `files` to the analyzer.
+    fn analyzed_service(service: &str, files: usize) -> CloudRepoData {
+        let mut data = service_data("api-server", Some(service));
+        data.boundary = Some(crate::boundary::ServiceBoundary {
+            files_attempted: files,
+            ..Default::default()
+        });
+        data
+    }
+
+    /// carrick#1306. The incident: a user did what the pre-flight refusal told
+    /// them to, the generated output was gitignored so the tree stayed clean,
+    /// and the rescan ran at the same commit without `--no-cache`. Nothing the
+    /// cloud's freshness guard reads had moved, so it kept the stored
+    /// generation and the scan's fresh answers were never served. The run
+    /// analysed files, and this is where it has to say so — before the first
+    /// write, since every write action reads the flag.
+    #[tokio::test]
+    async fn a_run_that_analyzed_files_tells_the_storage_before_it_uploads() {
+        let storage = ScriptedStorage::new(
+            vec![Ok(UploadOutcome::default()), Ok(UploadOutcome::default())],
+            vec![],
+        );
+
+        let unconfirmed = upload_service_payloads(
+            &storage,
+            &[
+                analyzed_service("orders", 0),
+                analyzed_service("billing", 3),
+            ],
+            false,
+            true,
+            &no_boundary(),
+        )
+        .await;
+
+        assert!(unconfirmed.is_empty());
+        assert!(
+            storage.analyzed_noted(),
+            "one analysed service is enough: its fresh answers reach the others through the \
+             cross-repo join, so the whole run's generation differs"
+        );
+    }
+
+    /// And the other half of the acceptance: a rescan that analysed nothing
+    /// says nothing, so an unchanged repo is still deduped and re-ingests
+    /// nothing.
+    #[tokio::test]
+    async fn a_run_that_analyzed_nothing_leaves_the_dedupe_alone() {
+        let storage = ScriptedStorage::new(
+            vec![Ok(UploadOutcome::default()), Ok(UploadOutcome::default())],
+            vec![],
+        );
+
+        upload_service_payloads(
+            &storage,
+            &[
+                analyzed_service("orders", 0),
+                analyzed_service("billing", 0),
+            ],
+            false,
+            true,
+            &no_boundary(),
+        )
+        .await;
+
+        assert!(!storage.analyzed_noted());
     }
 
     /// carrick#1067. The incident: the write landed and its response did not,
