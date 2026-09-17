@@ -5887,8 +5887,16 @@ impl FileOrchestrator {
         // With neither list populated nothing can be classified, and the
         // request would be pure cost.
         if detection.frameworks.is_empty() && detection.data_fetchers.is_empty() {
+            debug!("Receiver classification skipped: detection named no package");
             return roles;
         }
+        // The lists a role is decided against. A run where every site comes
+        // back unresolved is ambiguous without them — the package the receiver
+        // resolved to may simply not be on either list (carrick#1260).
+        debug!(
+            "Receiver classification lists: server={:?} client={:?}",
+            detection.frameworks, detection.data_fetchers
+        );
 
         // alias -> (file, span). The alias is the join key on the way back.
         let mut sites: HashMap<String, (String, u32)> = HashMap::new();

@@ -8,6 +8,7 @@ import { ProjectLoader } from '../src/project-loader.js';
 import { captureStub, runCheck } from '../src/capture/index.js';
 import ts from 'typescript';
 import { DenoProject, findDenoConfig } from '../src/capture/index.js';
+import { SidecarClient } from './helpers.js';
 
 const hasDeno = spawnSync('deno', ['--version']).status === 0;
 
@@ -218,5 +219,79 @@ export type Configured = DomainGlobal;
       assert.equal(fs.existsSync(path.join(service, 'package.json')), false);
       assert.equal(fs.existsSync(path.join(service, 'tsconfig.json')), false);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  /**
+   * carrick#1260: a Deno service resolves npm types out of the Deno cache
+   * (`$DENO_DIR/npm/<registry-host>/<name>/<version>/...`), a path that holds
+   * no `node_modules` segment. The receiver-type answer that lets the driver
+   * classify a bare `x.verb("/lit", arg)` site carries the package that
+   * DECLARES the receiver's type, and reading that name off the path found
+   * none for every dependency-typed receiver in a Deno repo — so no site in
+   * such a service could be classified at all, however well its type resolved.
+   *
+   * The graph knows which package owns a file; the path shape is not consulted.
+   */
+  it('names the package that declares a receiver type resolved through the Deno graph, npm or JSR', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-deno-receiver-'));
+    const client = new SidecarClient();
+    const main = `import { z } from "zod";
+import { encodeHex } from "@std/encoding/hex";
+
+const schema = z.object({ id: z.string() });
+const local = { parse(value: unknown): unknown { return value; } };
+
+export const parsed = schema.parse({ id: "1" });
+export const untouched = local.parse({ id: "1" });
+export const hex = encodeHex(new Uint8Array());
+`;
+    const spanOf = (marker: string) => {
+      const start = main.indexOf(marker);
+      assert.ok(start >= 0, `fixture must contain: ${marker}`);
+      return {
+        span_start: start,
+        span_end: start + marker.length,
+        line_number: main.slice(0, start).split('\n').length,
+      };
+    };
+    try {
+      fs.writeFileSync(path.join(root, 'deno.json'), JSON.stringify({
+        imports: { zod: 'npm:zod@4.0.17', '@std/encoding': 'jsr:@std/encoding@1.0.10' },
+      }));
+      fs.writeFileSync(path.join(root, 'main.ts'), main);
+      const installed = spawnSync('deno', ['install', '--node-modules-dir=none'], { cwd: root, encoding: 'utf8' });
+      assert.equal(installed.status, 0, installed.stderr);
+      assert.equal(fs.existsSync(path.join(root, 'node_modules')), false);
+      const mainPath = path.join(root, 'main.ts');
+      await client.start();
+      await client.send({ action: 'init', request_id: 'init', repo_root: root });
+      const response = (await client.send({
+        action: 'infer',
+        request_id: 'receivers',
+        requests: [
+          { file_path: mainPath, ...spanOf('schema.parse({ id: "1" })'), infer_kind: 'receiver_type', alias: 'npm_site' },
+          { file_path: mainPath, ...spanOf('local.parse({ id: "1" })'), infer_kind: 'receiver_type', alias: 'workspace_site' },
+        ],
+      })) as { status: string; errors?: string[]; inferred_types?: Array<{ alias: string; type_string: string; declaring_package?: string }> };
+      assert.equal(response.status, 'success', JSON.stringify(response.errors));
+      const byAlias = new Map((response.inferred_types ?? []).map(entry => [entry.alias, entry]));
+      const npmSite = byAlias.get('npm_site');
+      assert.ok(npmSite, 'the npm-typed receiver produced an answer');
+      assert.equal(npmSite.declaring_package, 'zod');
+      // A type the service itself declares names no package, in a Deno project
+      // exactly as in a Node one.
+      assert.equal(byAlias.get('workspace_site')?.declaring_package, undefined);
+
+      // A JSR module's cached copy is content-addressed, so only its specifier
+      // carries the package it belongs to.
+      const deno = new DenoProject(findDenoConfig(root)!, root);
+      const hex = deno.resolve('@std/encoding/hex', mainPath, deno.parsed.options);
+      assert.ok(hex, 'the JSR module resolved');
+      assert.equal(deno.packageOf(hex.resolvedFileName), '@std/encoding');
+      assert.equal(deno.packageOf(mainPath), undefined);
+    } finally {
+      await client.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
