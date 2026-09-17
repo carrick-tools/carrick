@@ -106,11 +106,14 @@ workspace that is not. Two things are refused:
   the package manager. A tree with no lockfile above the service states no
   install and is scanned as it is. Deno services are asked only when their
   config sets `nodeModulesDir`, since Deno otherwise caches outside the tree.
-- **A config mapping whose target directory is not on the checkout.** A
-  TypeScript `paths` entry, a `package.json` `imports` key or a Deno import-map
-  entry pointing at, say, a generated client whose generator has not run. The
-  refusal names the mapping and the missing directory and stops there: nothing
-  in the config says what fills a generated directory.
+- **A config mapping whose target directory is not on the checkout, that the
+  service imports through.** A TypeScript `paths` entry, a `package.json`
+  `imports` key or a Deno import-map entry pointing at, say, a generated client
+  whose generator has not run. The refusal names the mapping and the missing
+  directory and stops there: nothing in the config says what fills a generated
+  directory. A mapping left behind by a deleted package, that nothing imports,
+  is logged and scanned past — no type can be `any` through a mapping no import
+  uses.
 
 Both are proxies, so there is always a way past: `--allow-unprepared` on the
 command, `CARRICK_ALLOW_UNPREPARED=1` in the environment, or

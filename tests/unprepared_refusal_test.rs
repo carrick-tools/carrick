@@ -84,13 +84,28 @@ fn a_scan_is_refused_when_the_dependencies_are_not_installed() {
 }
 
 /// A config mapping whose target directory is not on the checkout — the
-/// generated client nobody generated. No command is invented for it.
+/// generated client nobody generated — that the service imports through. No
+/// command is invented for it.
+///
+/// Beside it, a second mapping that is equally missing and that nothing
+/// imports: the stale entry a deleted package leaves behind. It is not a
+/// reason to refuse and it must not crowd out the one that is
+/// (carrick#1301).
 #[test]
 fn a_scan_is_refused_when_a_mapping_names_a_directory_that_is_not_there() {
-    let repo = repo(&[(
-        "tsconfig.json",
-        r#"{"compilerOptions":{"paths":{"@db/*":["./src/generated/db/*"]}}}"#,
-    )]);
+    let repo = repo(&[
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"paths":{
+                 "@db/*":["./src/generated/db/*"],
+                 "@parser/*":["./packages/parser/src/*"]
+               }}}"#,
+        ),
+        (
+            "src/db.ts",
+            "import { client } from '@db/client';\nexport const db = client;\n",
+        ),
+    ]);
     let output = scan(repo.path(), false);
     let said = said(&output);
     assert!(
@@ -100,6 +115,14 @@ fn a_scan_is_refused_when_a_mapping_names_a_directory_that_is_not_there() {
     assert!(
         said.contains("maps `@db/*` to src/generated/db"),
         "the refusal names the mapping and the missing directory: {said}"
+    );
+    assert!(
+        !said.contains("maps `@parser/*` to packages/parser/src, and that directory"),
+        "a mapping nothing imports through cannot make a type `any`, so it is not refused: {said}"
+    );
+    assert!(
+        said.contains("nothing this service imports resolves through it"),
+        "it is said once, as the line it is — not as a reason to stop: {said}"
     );
     assert!(
         !said.contains("Run `"),

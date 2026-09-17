@@ -17,21 +17,31 @@
 //!   anywhere from the service root up to that lockfile's directory says it
 //!   does not have one. The refusal names the command, because the lockfile
 //!   names the package manager.
-//! * **A mapping whose target directory is not on disk.** The service's own
-//!   config maps a specifier to a path, and the path is not there. The refusal
-//!   names the mapping and the missing directory and stops: nothing in config
-//!   says what fills a generated directory, and guessing would mean a list of
-//!   generator names.
+//! * **A mapping whose target directory is not on disk, that something
+//!   imports through.** The service's own config maps a specifier to a path,
+//!   the path is not there, and at least one of the service's own imports
+//!   resolves through that mapping. The refusal names the mapping and the
+//!   missing directory and stops: nothing in config says what fills a
+//!   generated directory, and guessing would mean a list of generator names.
+//!
+//!   **The importer is half the claim** (carrick#1301). A stale mapping is
+//!   normal in a real monorepo — a package is deleted and its import-map entry
+//!   is left behind — and no type can be `any` through a mapping nothing uses.
+//!   Refusing on one states something false and buries the mapping that is
+//!   really costing types, so it is an `info!` line and the scan proceeds.
 //!
 //! **Per service, and "reachable from" the service root.** A repo-level check
 //! passes a tree whose root is installed and whose nested workspace is not,
-//! which is the exact shape that produced the measurement above.
+//! which is the exact shape that produced the measurement above. The imports
+//! counted against a mapping are the service's own, over the same files the
+//! scan itself walks.
 //!
 //! **The refusal is the default and [`ALLOW_FLAG`] is the way out.** A CI job
 //! that checks out without installing is a legitimate, deliberate bare scan;
-//! it just has to say so. Both signals are proxies — a declared-but-unused
-//! mapping is refused for nothing, a stale install passes — and neither is
-//! survivable under a check that cannot be overridden.
+//! it just has to say so. Both signals are still proxies — a stale install
+//! passes, and a mapping is read for what imports it rather than for what the
+//! compiler would do with them — and neither is survivable under a check that
+//! cannot be overridden.
 //!
 //! The user-facing statement of all this is the README's "An unprepared
 //! checkout is refused" section, under Dependencies.
@@ -41,11 +51,11 @@
 //! is the same tree the GitHub Action's own installer declines to prepare, and
 //! refusing it would fail a scan for a state Carrick chose not to fix.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::Config;
 
@@ -122,6 +132,15 @@ pub enum Unprepared {
 }
 
 impl Unprepared {
+    /// The service this row is about.
+    pub fn service(&self) -> &str {
+        match self {
+            Unprepared::Dependencies { service, .. } | Unprepared::Mapping { service, .. } => {
+                service
+            }
+        }
+    }
+
     /// Put the repo in front of the service name, for a build that scans more
     /// than one and would otherwise print two unrelated `api`s.
     pub fn in_repo(&mut self, repo: &str) {
@@ -193,10 +212,13 @@ pub fn refusal(found: Vec<Unprepared>) -> Option<String> {
         }
         return None;
     }
+    // The header counts SERVICES, because that is the noun it uses and one
+    // service can be unprepared in two ways at once (carrick#1301).
+    let services: BTreeSet<&str> = found.iter().map(Unprepared::service).collect();
     let mut lines = vec![format!(
         "this checkout is not prepared to be scanned, and a scan of it would index `any` where a \
          package or a generated module should be. {} service(s):",
-        found.len()
+        services.len()
     )];
     lines.extend(found.iter().take(MAX_NAMED).map(|row| {
         let mut line = String::from("  ");
@@ -315,13 +337,17 @@ fn deno_wants_node_modules(config: &Path) -> bool {
 }
 
 /// Mappings the configs governing this service root declare, whose target
-/// directory is not on the checkout.
+/// directory is not on the checkout AND which at least one of the service's
+/// own imports resolves through (carrick#1301).
 ///
 /// The configs read are the ones at or above the service root, which is what
 /// governs the service's own imports; the same [`crate::module_aliases`]
 /// reader the call graph uses answers what each mapping names, so a mapping
 /// here and a mapping in the scan's own unresolved-import report are the same
 /// thing.
+///
+/// The importer walk runs only when a claim is already missing: a prepared
+/// tree asks the filesystem a handful of `stat`s and reads nothing.
 fn missing_mappings(
     repo_root: &Path,
     service: &Config,
@@ -339,7 +365,7 @@ fn missing_mappings(
         &BTreeMap::new(),
         service_tsconfig,
     );
-    aliases
+    let missing: Vec<crate::module_aliases::ClaimedDirectory> = aliases
         .claimed_directories()
         .into_iter()
         .filter(|claim| {
@@ -348,18 +374,110 @@ fn missing_mappings(
                 .iter()
                 .any(|dir| repo_root.join(dir).is_dir())
         })
+        .collect();
+    if missing.is_empty() {
+        return Vec::new();
+    }
+    let imported_through = mappings_imported_through(repo_root, service, &aliases, &missing);
+    missing
+        .into_iter()
         .filter_map(|claim| {
             // The smallest of the claimed directories, so two runs of the same
             // tree print the same sentence whatever order the configs were
             // read in.
-            let target = claim.directories.first()?;
+            let target = display_dir(&claim.directories.first()?.to_string_lossy());
+            if !imported_through.contains(&claim.declared_by) {
+                info!(
+                    "`{name}`: its config maps `{}` to {target}, which is not on this checkout, \
+                     and nothing this service imports resolves through it. A mapping no import \
+                     uses cannot make any type `any`, so the scan proceeds.",
+                    claim.declared_by
+                );
+                return None;
+            }
             Some(Unprepared::Mapping {
                 service: name.to_string(),
                 declared_by: claim.declared_by,
-                target: display_dir(&target.to_string_lossy()),
+                target,
             })
         })
         .collect()
+}
+
+/// Which of `missing`'s mapping keys at least one of the service's own imports
+/// resolves through (carrick#1301).
+///
+/// The files are the ones the scan itself would parse — the service directory
+/// and its `include` roots, under the same skip list — so a mapping is asked
+/// about exactly the source that will be indexed. Each file is read as text
+/// and parsed only when it holds the literal a matching specifier must start
+/// with, the same bound [`crate::service_derivation`] puts on its own import
+/// walk, and the walk stops as soon as every missing mapping has an importer.
+///
+/// [`crate::module_aliases::ModuleAliases::resolve`] answers "through which
+/// mapping", not "to which file": it reports the declared key whether or not
+/// the target is on disk, which is the whole point here — the target is
+/// already known to be missing.
+fn mappings_imported_through(
+    repo_root: &Path,
+    service: &Config,
+    aliases: &crate::module_aliases::ModuleAliases,
+    missing: &[crate::module_aliases::ClaimedDirectory],
+) -> BTreeSet<String> {
+    let mut found: BTreeSet<String> = BTreeSet::new();
+    let literals: Vec<(&str, String)> = missing
+        .iter()
+        .map(|claim| {
+            (
+                claim.declared_by.as_str(),
+                specifier_literal(&claim.declared_by),
+            )
+        })
+        .collect();
+    let (files, _) = crate::file_finder::find_service_files(
+        &repo_root.to_string_lossy(),
+        service,
+        &crate::packages::MANIFEST_SKIP_DIRS,
+    );
+    let mut reader = crate::parser::ModuleReader::default();
+    for file in files {
+        if found.len() == missing.len() {
+            break;
+        }
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        // Nothing can be imported through a mapping from a file that does not
+        // hold the text a specifier under it must start with, so the parse
+        // runs only where an importer is possible.
+        let possible = literals
+            .iter()
+            .any(|(key, literal)| !found.contains(*key) && text.contains(literal.as_str()));
+        if !possible {
+            continue;
+        }
+        let Ok(relative) = file.strip_prefix(repo_root) else {
+            continue;
+        };
+        for specifier in reader.import_specifiers(&file) {
+            for matched in aliases.resolve(relative, &specifier) {
+                let Some(declared) = matched.declared else {
+                    continue;
+                };
+                if literals.iter().any(|(key, _)| *key == declared.key) {
+                    found.insert(declared.key);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The text every specifier matching a mapping key must start with: the key up
+/// to its `*`, which is the key itself when it has none. A key that is nothing
+/// but `*` bounds nothing, and an empty literal is matched by every file.
+fn specifier_literal(key: &str) -> String {
+    key.split('*').next().unwrap_or_default().to_string()
 }
 
 /// Config files at or above the service root, repo-relative, nearest last so
@@ -500,7 +618,8 @@ mod tests {
         );
     }
 
-    /// A tsconfig mapping to a directory the generator never filled.
+    /// A tsconfig mapping to a directory the generator never filled, that the
+    /// service imports through.
     #[test]
     fn a_mapping_to_a_directory_that_is_not_there_is_refused() {
         let repo = TempDir::new().unwrap();
@@ -510,7 +629,14 @@ mod tests {
             "tsconfig.json",
             r#"{"compilerOptions":{"paths":{"@client/*":["./src/generated/client/*"]}}}"#,
         );
-        write(root, "src/app.ts", "export const a = 1;");
+        // The import is half the claim (carrick#1301): what makes this tree
+        // unprepared is a type that would be `any`, and no type resolves
+        // through a mapping nothing imports.
+        write(
+            root,
+            "src/app.ts",
+            "import { db } from '@client/db';\nexport const a = db;",
+        );
 
         let found = unprepared(root, &[service("api", None)]);
         assert_eq!(
@@ -535,6 +661,78 @@ mod tests {
         assert!(
             unprepared(root, &[service("api", None)]).is_empty(),
             "the directory existing is the whole claim"
+        );
+    }
+
+    /// A stale mapping — a package deleted from the tree, its import-map entry
+    /// left behind — is not a reason to refuse a scan, and it must not hide
+    /// the mapping that is really costing types (carrick#1301).
+    ///
+    /// The shape of the reference monorepo that produced the ticket: one
+    /// import map, two targets that are not on disk, one of them imported
+    /// and the other imported by nothing.
+    #[test]
+    fn a_stale_mapping_nothing_imports_through_does_not_refuse() {
+        let repo = TempDir::new().unwrap();
+        let root = repo.path();
+        write(
+            root,
+            "deno.jsonc",
+            r#"{"imports":{
+                 "@pkg/parser": "./packages/parser/src/parse.ts",
+                 "@generated-client/": "./src/generated/client/"
+               }}"#,
+        );
+        write(
+            root,
+            "src/app.ts",
+            "import { db } from '@generated-client/db';\nexport const a = db;",
+        );
+
+        assert_eq!(
+            unprepared(root, &[service("api", None)]),
+            vec![Unprepared::Mapping {
+                service: "api".to_string(),
+                declared_by: "@generated-client/".to_string(),
+                target: "src/generated/client".to_string(),
+            }],
+            "the mapping an import resolves through is refused; the one nothing imports is not"
+        );
+
+        // On its own, the stale mapping refuses nothing at all.
+        write(
+            root,
+            "deno.jsonc",
+            r#"{"imports":{"@pkg/parser":"./packages/parser/src/parse.ts"}}"#,
+        );
+        assert!(
+            unprepared(root, &[service("api", None)]).is_empty(),
+            "a mapping no import resolves through cannot make any type `any`"
+        );
+    }
+
+    /// The header counts services, not findings: one service can be
+    /// unprepared in two ways at once (carrick#1301).
+    #[test]
+    #[serial_test::serial(allow_unprepared)]
+    fn the_header_counts_services_rather_than_findings() {
+        let found = vec![
+            Unprepared::Dependencies {
+                service: "api".to_string(),
+                install_root: "apps/api".to_string(),
+                lockfile: "pnpm-lock.yaml",
+                command: "pnpm install",
+            },
+            Unprepared::Mapping {
+                service: "api".to_string(),
+                declared_by: "@client/*".to_string(),
+                target: "src/generated/client".to_string(),
+            },
+        ];
+        let message = refusal(found).expect("two findings refuse");
+        assert!(
+            message.contains("1 service(s):"),
+            "two findings for one service are one unprepared service: {message}"
         );
     }
 
