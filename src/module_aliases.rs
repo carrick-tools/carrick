@@ -106,15 +106,48 @@ pub(crate) enum AliasTarget {
 /// it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AliasMatch {
-    /// The key as written — an import-map key, a package.json `imports` key,
-    /// or a tsconfig `paths` pattern.
+    /// The mapping that claimed the specifier.
     ///
     /// `None` for the `baseUrl` fallback, which declares no key: `baseUrl` is
     /// a search root rather than a claim that any particular path exists, so a
     /// specifier that misses under it was never claimed by anything and must
     /// not be reported as a mapping whose target is missing.
-    pub declared_by: Option<String>,
+    pub declared: Option<Declared>,
     pub target: AliasTarget,
+}
+
+/// What one config line says, as it is written there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Declared {
+    /// The key: an import-map key, a package.json `imports` key, or a
+    /// tsconfig `paths` pattern.
+    pub key: String,
+    /// The path the key names, before the specifier's own segment is appended
+    /// — the declared target with its `*` removed, so `./src/generated/*`
+    /// roots at `src/generated/`.
+    ///
+    /// The MAPPING's target, not one import's resolved file: every specifier
+    /// under the key shares it, which is what makes it the thing to report a
+    /// missing target against.
+    pub target_root: String,
+}
+
+/// [`Declared::target_root`] for one declared target, relative to the base it
+/// resolves against.
+///
+/// A `String` rather than a `PathBuf` because the trailing separator is what
+/// says the mapping names a directory rather than a file, and a `PathBuf`
+/// drops it.
+fn target_root(base: &Path, declared: &str) -> String {
+    let stripped = declared.split('*').next().unwrap_or(declared);
+    let names_a_directory = stripped.ends_with('/');
+    let mut root = normalize(&base.join(stripped))
+        .to_string_lossy()
+        .replace('\\', "/");
+    if names_a_directory && !root.ends_with('/') {
+        root.push('/');
+    }
+    root
 }
 
 impl ModuleAliases {
@@ -198,15 +231,21 @@ impl ModuleAliases {
     /// exist, ends the lookup. A `paths` pattern whose targets all miss falls
     /// through to `baseUrl`, which is what the compiler does.
     pub(crate) fn resolve(&self, from_file: &Path, specifier: &str) -> Vec<AliasMatch> {
-        if let Some((key, matched)) = self
+        if let Some((key, declared_target, matched)) = self
             .deno_maps
             .iter()
             .filter(|map| from_file.starts_with(&map.scope))
-            .find_map(|map| match_import_map(map, specifier))
+            .find_map(|map| {
+                match_import_map(map, specifier)
+                    .map(|(key, entry, resolved)| (key, (map.base.clone(), entry), resolved))
+            })
         {
             return matched
                 .map(|path| AliasMatch {
-                    declared_by: Some(key.clone()),
+                    declared: Some(Declared {
+                        key: key.clone(),
+                        target_root: target_root(&declared_target.0, &declared_target.1),
+                    }),
                     target: AliasTarget::Paths(vec![path]),
                 })
                 .into_iter()
@@ -231,12 +270,13 @@ impl ModuleAliases {
         if let Some((pattern, substitution)) =
             match_pattern(mapping.paths.iter().map(|(p, _)| p.as_str()), specifier)
         {
-            let candidates = mapping
+            let declared_targets = mapping
                 .paths
                 .iter()
                 .find(|(p, _)| p == pattern)
                 .map(|(_, targets)| targets.as_slice())
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let candidates = declared_targets
                 .iter()
                 .map(|target| {
                     normalize(
@@ -247,13 +287,19 @@ impl ModuleAliases {
                 })
                 .collect();
             targets.push(AliasMatch {
-                declared_by: Some(pattern.to_string()),
+                // The first declared target is the one the pattern is reported
+                // against: a `paths` entry states its targets in preference
+                // order, so it is the one the config says to use.
+                declared: declared_targets.first().map(|declared| Declared {
+                    key: pattern.to_string(),
+                    target_root: target_root(&mapping.paths_base, declared),
+                }),
                 target: AliasTarget::Paths(candidates),
             });
         }
         if let Some(base_url) = &mapping.base_url {
             targets.push(AliasMatch {
-                declared_by: None,
+                declared: None,
                 target: AliasTarget::Paths(vec![normalize(&base_url.join(specifier))]),
             });
         }
@@ -281,14 +327,20 @@ impl ModuleAliases {
         let (key, substitution) = match_pattern(map.keys().map(String::as_str), specifier)?;
         let mut leaves = Vec::new();
         collect_string_leaves(&map[key], 0, &mut leaves);
-        let leaves = leaves
+        let declared_leaves = leaves
             .into_iter()
             // A bare target names a package, not a file in this directory.
             .filter(|leaf| leaf.starts_with("./"))
+            .collect::<Vec<_>>();
+        let leaves = declared_leaves
+            .iter()
             .map(|leaf| leaf.replace('*', &substitution))
             .collect::<Vec<_>>();
         (!leaves.is_empty()).then(|| AliasMatch {
-            declared_by: Some(key.to_string()),
+            declared: declared_leaves.first().map(|declared| Declared {
+                key: key.to_string(),
+                target_root: target_root(dir, declared),
+            }),
             target: AliasTarget::Leaves {
                 dir: dir.to_path_buf(),
                 leaves,
@@ -498,9 +550,13 @@ fn import_map_entries(
 fn match_import_map<'a>(
     map: &'a DenoImportMap,
     specifier: &str,
-) -> Option<(&'a String, Option<PathBuf>)> {
+) -> Option<(&'a String, String, Option<PathBuf>)> {
     if let Some((key, target)) = map.entries.get_key_value(specifier) {
-        return Some((key, target.as_ref().map(|t| normalize(&map.base.join(t)))));
+        return Some((
+            key,
+            target.clone().unwrap_or_default(),
+            target.as_ref().map(|t| normalize(&map.base.join(t))),
+        ));
     }
     let (key, target) = map
         .entries
@@ -509,6 +565,7 @@ fn match_import_map<'a>(
         .max_by_key(|(key, _)| key.len())?;
     Some((
         key,
+        target.clone().unwrap_or_default(),
         target
             .as_ref()
             .filter(|t| t.ends_with('/'))
