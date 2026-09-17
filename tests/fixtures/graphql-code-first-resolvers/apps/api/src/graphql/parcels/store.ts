@@ -15,3 +15,9 @@ export function dispatchParcel(id: string): Parcel {
   parcels.push(parcel);
   return parcel;
 }
+
+export function heaviestParcel(): Parcel | undefined {
+  return [...parcels].sort((a, b) => b.weightGrams - a.weightGrams)[0];
+}
+
+export const listRecentParcels = (): Parcel[] => parcels.slice(-5);

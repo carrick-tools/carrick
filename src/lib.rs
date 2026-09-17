@@ -28,6 +28,7 @@ pub mod framework_detector;
 pub mod git_state;
 pub mod graphql;
 pub mod graphql_document_sites;
+pub mod graphql_resolver_anchor;
 pub mod graphql_schema_builder;
 pub mod handler_span;
 pub mod help;
