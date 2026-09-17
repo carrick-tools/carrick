@@ -1990,6 +1990,25 @@ async fn upload_landed_anyway<T: CloudStorage>(
     false
 }
 
+/// Did this run send any of this service's files to the analyzer?
+///
+/// Read off the payload's own boundary, which every branch of the analysis
+/// builds fresh from this scan's processing stats before the payload is
+/// uploaded — so it is this run's count, not a number carried over from the
+/// generation the index holds. A held-back service writes no payload at all,
+/// so nothing here can be reading a served generation's boundary
+/// (carrick#1306).
+///
+/// A payload with no boundary at all answers `false`: absence is not evidence
+/// that analysis happened, and the alternative is forcing a re-index on every
+/// upload.
+fn payload_reached_the_analyzer(payload: &CloudRepoData) -> bool {
+    payload
+        .boundary
+        .as_ref()
+        .is_some_and(|boundary| boundary.files_attempted > 0)
+}
+
 /// Upload each already-prepared service payload to the cloud index, in order,
 /// and report every service whose index this run could not confirm.
 ///
@@ -2003,25 +2022,6 @@ async fn upload_landed_anyway<T: CloudStorage>(
 /// Uploads are keyed per (repo, service) and idempotent, so a re-run restores
 /// consistency; until then the index is mixed-generation for this repo, and
 /// the summary says so when some services landed and others did not.
-/// Did this run send any of this service's files to the analyzer?
-///
-/// Read off the payload's own boundary, which every branch of the analysis
-/// builds fresh from this scan's [`crate::agents::file_orchestrator::
-/// ProcessingStats`] before the payload is uploaded — so it is this run's
-/// count, not a number carried over from the generation the index holds. A
-/// held-back service writes no payload at all, so nothing here can be reading
-/// a served generation's boundary (carrick#1306).
-///
-/// A payload with no boundary at all answers `false`: absence is not evidence
-/// that analysis happened, and the alternative is forcing a re-index on every
-/// upload.
-fn payload_reached_the_analyzer(payload: &CloudRepoData) -> bool {
-    payload
-        .boundary
-        .as_ref()
-        .is_some_and(|boundary| boundary.files_attempted > 0)
-}
-
 async fn upload_service_payloads<T: CloudStorage>(
     storage: &T,
     payloads: &[CloudRepoData],

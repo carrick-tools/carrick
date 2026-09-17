@@ -1056,10 +1056,10 @@ pub trait CloudStorage {
     /// The cloud dedupes a write on (commit, scanner version), and neither
     /// moves when a user prepares the checkout the way the pre-flight refusal
     /// told them to: the generated output is gitignored, so the tree is clean
-    /// by git's measure and `--no-cache` was not passed. The scan then pays
-    /// for fresh analysis, reports better numbers locally, and the index every
-    /// agent reads is unchanged. A run that analysed a file knows its answers
-    /// are not the stored generation's, and this is it saying so.
+    /// by git's measure and `--no-cache` was not passed. The scan then
+    /// re-analyses, reports better numbers locally, and the index every agent
+    /// reads is unchanged. A run that analysed a file knows its answers are
+    /// not the stored generation's, and this is it saying so.
     ///
     /// A property of the RUN: called once, before any write action, and every
     /// write action of the run carries the flag afterwards. Not async, so the
