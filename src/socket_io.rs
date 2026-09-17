@@ -112,10 +112,34 @@
 //!   convention, not a structure, and it is the only place in this module where
 //!   one is used; it earns its place because on a raw socket there is no other
 //!   literal to key on,
-//! - the RECEIVING side of that idiom (`switch (msg.type)` inside a `message`
-//!   handler) is not extracted, so a plain-WebSocket service produces emitter
-//!   rows whose listeners are invisible, and they surface as unmatched socket
-//!   calls (carrick#1287),
+//! - the RECEIVING side of that idiom is read on the same convention
+//!   (carrick#1287). A raw socket delivers every message through one transport
+//!   event ([`TRANSPORT_RECEIVE_EVENTS`]), so the application's event names are
+//!   not in the registration call at all: they are the literals the handler
+//!   compares the parsed payload's discriminator against. Inside such a
+//!   handler, on a binding taken from `JSON.parse(...)`, three spellings of
+//!   that one comparison each yield a listener on `socket|UNKNOWN|<literal>` —
+//!   `switch (msg.type) { case "x": }`, `msg.type === "x"`, and a table
+//!   indexed by the discriminator (`handlers[msg.type]`) whose literal keys
+//!   name the events and whose handler parameters type the payloads. The
+//!   registration itself stays declined, because `message` is the transport's
+//!   name and not a contract,
+//! - the receive side's guards are what keep that convention honest: the
+//!   handler must be written AT the registration (a handler passed by name is
+//!   a cross-function hop this pass does not take), the discriminator must be
+//!   read off a binding initialized from `JSON.parse(...)` — so the same
+//!   `switch` in a helper elsewhere in the file records nothing — the key must
+//!   be one of [`ENVELOPE_EVENT_KEYS`], the literal must be written at the
+//!   comparison, and a negated comparison (`msg.type !== "x"`) is not read:
+//!   it names an event the branch does NOT handle. A dispatch table must be an
+//!   object literal bound to a file-local binding or written inline, on the
+//!   flat per-file binding rule the rest of the module uses,
+//! - three receive-side spellings are known and not read, each a coverage gap
+//!   rather than a judgement: a destructured discriminator
+//!   (`const { type } = JSON.parse(raw)`) has no member expression to key on,
+//!   `addEventListener("message", …)` is not in the registration vocabulary
+//!   above, and a table held on a class field (`this.handlers[msg.type]`) is
+//!   outside the binding map. They are tracked in carrick#1298,
 //! - an unknown-direction listener and emitter for one event in ONE service
 //!   match each other, because the key cannot express that they are the same
 //!   side. Socket.IO's directional key does not have this exposure.
@@ -128,10 +152,11 @@ use std::path::{Path, PathBuf};
 use swc_common::errors::{ColorConfig, Handler};
 use swc_common::{GLOBALS, Globals, SourceMap, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::{
-    AssignExpr, AssignTarget, Callee, ClassProp, Expr, ExprOrSpread, ImportDecl, ImportSpecifier,
-    Lit, MemberExpr, MemberProp, Module, ModuleExportName, NewExpr, OptChainBase, OptChainExpr,
-    Pat, PrivateProp, PropName, SimpleAssignTarget, TsEntityName, TsParamProp, TsParamPropParam,
-    TsType, TsTypeAliasDecl, TsTypeAnn, TsUnionOrIntersectionType, VarDeclarator,
+    AssignExpr, AssignTarget, BinExpr, BinaryOp, Callee, ClassProp, Expr, ExprOrSpread, Function,
+    ImportDecl, ImportSpecifier, Lit, MemberExpr, MemberProp, Module, ModuleExportName, NewExpr,
+    ObjectLit, OptChainBase, OptChainExpr, Pat, PrivateProp, Prop, PropName, PropOrSpread,
+    SimpleAssignTarget, SwitchStmt, TsEntityName, TsParamProp, TsParamPropParam, TsType,
+    TsTypeAliasDecl, TsTypeAnn, TsUnionOrIntersectionType, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::debug;
@@ -217,6 +242,19 @@ const UNKNOWN_PUBLISH_METHODS: &[&str] = &["emit", "send", "publish", "trigger"]
 /// carries no other literal to key on.
 const ENVELOPE_EVENT_KEYS: &[&str] = &["type", "event"];
 
+/// Transport events that DELIVER an application message to user code, and so
+/// carry an envelope whose discriminator names the real event (carrick#1287).
+///
+/// One name, and the reason it is one: a raw socket is message-framed, so each
+/// `message` is exactly one envelope. The byte-stream spelling (`data`) is not
+/// here — a chunk is not a message, and a discriminator read off an unframed
+/// chunk would be keyed on whatever happened to arrive in it.
+///
+/// These names are also in [`crate::event_emitter::RUNTIME_EVENTS`], so the
+/// registration itself is still declined as transport lifecycle; what this list
+/// adds is the walk INTO the handler.
+const TRANSPORT_RECEIVE_EVENTS: &[&str] = &["message"];
+
 /// Extract socket operations from the service's TS/JS files.
 ///
 /// `socket_clients` is `DetectionResult::socket_clients` — the packages the
@@ -277,11 +315,21 @@ fn extract_from_ts_file(
             return SocketExtraction::default();
         }
 
+        // Pass B0 (carrick#1287): the file's dispatch tables, so a delivery
+        // handler that indexes one by the envelope discriminator can be read
+        // back to the events its keys name.
+        let mut tables = TableCollector {
+            tables: HashMap::new(),
+            cm: cm.clone(),
+        };
+        module.visit_with(&mut tables);
+
         // Pass B: collect ops on socket-rooted identifiers.
         let mut ops = OpCollector {
             cm: cm.clone(),
             file_path,
             roots: &roots,
+            tables: &tables.tables,
             extraction: SocketExtraction::default(),
         };
         module.visit_with(&mut ops);
@@ -1078,6 +1126,9 @@ struct OpCollector<'a> {
     cm: Lrc<SourceMap>,
     file_path: &'a Path,
     roots: &'a SocketRoots,
+    /// File-local dispatch tables, for the receive side of the envelope idiom
+    /// (carrick#1287).
+    tables: &'a HashMap<String, Vec<TableEntry>>,
     extraction: SocketExtraction,
 }
 
@@ -1105,12 +1156,7 @@ fn envelope_event_name(expr: &Expr) -> Option<String> {
             let Expr::Member(member) = &**callee else {
                 return None;
             };
-            let is_json_stringify = matches!(&*member.obj, Expr::Ident(ident) if ident.sym.as_ref() == "JSON")
-                && member
-                    .prop
-                    .as_ident()
-                    .is_some_and(|prop| prop.sym.as_ref() == "stringify");
-            if !is_json_stringify {
+            if !is_json_method(member, "stringify") {
                 return None;
             }
             match call.args.first().map(|arg| &*arg.expr) {
@@ -1142,6 +1188,279 @@ fn envelope_event_name(expr: &Expr) -> Option<String> {
             _ => None,
         }
     })
+}
+
+/// `JSON.<method>` as a callee: the serializer on the way out and the parser on
+/// the way back in are the two ends of one convention, read the same way.
+fn is_json_method(member: &MemberExpr, method: &str) -> bool {
+    matches!(&*member.obj, Expr::Ident(ident) if ident.sym.as_ref() == "JSON")
+        && member
+            .prop
+            .as_ident()
+            .is_some_and(|prop| prop.sym.as_ref() == method)
+}
+
+/// Strip the wrappers that carry an expression through unchanged, so a cast or
+/// a parenthesis never hides a shape this pass reads.
+fn unwrap_expr(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(paren) => unwrap_expr(&paren.expr),
+        Expr::TsAs(as_expr) => unwrap_expr(&as_expr.expr),
+        Expr::TsSatisfies(satisfies) => unwrap_expr(&satisfies.expr),
+        Expr::TsNonNull(non_null) => unwrap_expr(&non_null.expr),
+        Expr::Await(awaited) => unwrap_expr(&awaited.arg),
+        other => other,
+    }
+}
+
+/// Is this expression `JSON.parse(...)`? The argument is not read: what it
+/// establishes is that the binding holds a decoded envelope, not what was
+/// decoded.
+fn is_json_parse(expr: &Expr) -> bool {
+    let Expr::Call(call) = unwrap_expr(expr) else {
+        return false;
+    };
+    let Callee::Expr(callee) = &call.callee else {
+        return false;
+    };
+    matches!(&**callee, Expr::Member(member) if is_json_method(member, "parse"))
+}
+
+/// Is this expression the discriminator of one of `bindings` — `msg.type`,
+/// `payload.event`, `msg?.type` — using the same key convention the sending
+/// side keys on ([`ENVELOPE_EVENT_KEYS`])?
+fn is_envelope_discriminator(expr: &Expr, bindings: &HashSet<String>) -> bool {
+    let member = match unwrap_expr(expr) {
+        Expr::Member(member) => member,
+        // `msg?.type` is the same read with a guard on it.
+        Expr::OptChain(opt) => match &*opt.base {
+            OptChainBase::Member(member) => member,
+            OptChainBase::Call(_) => return false,
+        },
+        _ => return false,
+    };
+    let Some(prop) = member.prop.as_ident() else {
+        return false;
+    };
+    if !ENVELOPE_EVENT_KEYS.contains(&prop.sym.as_ref()) {
+        return false;
+    }
+    matches!(unwrap_expr(&member.obj), Expr::Ident(ident) if bindings.contains(ident.sym.as_ref()))
+}
+
+/// The string a literal expression carries, if it is one.
+fn string_literal(expr: &Expr) -> Option<String> {
+    match unwrap_expr(expr) {
+        Expr::Lit(Lit::Str(value)) => Some(value.value.to_string()),
+        _ => None,
+    }
+}
+
+/// The static name of an object key (`{ "order.created": … }`, `{ ping: … }`).
+/// A computed or numeric key names no event.
+fn prop_name_literal(key: &PropName) -> Option<String> {
+    match key {
+        PropName::Ident(ident) => Some(ident.sym.to_string()),
+        PropName::Str(name) => Some(name.value.to_string()),
+        _ => None,
+    }
+}
+
+/// Payload type symbol of a handler's first parameter, which is where a
+/// dispatch table carries the payload type the switch/comparison spellings do
+/// not have.
+fn first_param_symbol(param: Option<&Pat>) -> Option<String> {
+    match param? {
+        Pat::Ident(ident) => ident.type_ann.as_deref().and_then(named_type_symbol),
+        _ => None,
+    }
+}
+
+/// One entry of a dispatch table: an event name written as a key, the line the
+/// handler is defined on, and the payload type its parameter declares.
+#[derive(Debug, Clone)]
+struct TableEntry {
+    event: String,
+    line: u32,
+    payload_symbol: Option<String>,
+}
+
+/// The entries an object literal contributes when it is dispatched on: every
+/// key whose value is callable. A non-callable value (`{ retries: 3 }`) names
+/// nothing, which is what keeps a settings object indexed by a discriminator
+/// from becoming a row per setting.
+fn table_entries(object: &ObjectLit, cm: &SourceMap) -> Vec<TableEntry> {
+    object
+        .props
+        .iter()
+        .filter_map(|prop| {
+            let PropOrSpread::Prop(prop) = prop else {
+                return None;
+            };
+            let (event, payload_symbol, span) = match &**prop {
+                Prop::KeyValue(key_value) => {
+                    let event = prop_name_literal(&key_value.key)?;
+                    let symbol = match unwrap_expr(&key_value.value) {
+                        Expr::Arrow(arrow) => first_param_symbol(arrow.params.first()),
+                        Expr::Fn(function) => function_first_param_symbol(&function.function),
+                        // A handler referenced by name is callable; its
+                        // parameter type is a hop away and stays unanchored.
+                        Expr::Ident(_) => None,
+                        _ => return None,
+                    };
+                    (event, symbol, key_value.key.span())
+                }
+                Prop::Method(method) => (
+                    prop_name_literal(&method.key)?,
+                    function_first_param_symbol(&method.function),
+                    method.key.span(),
+                ),
+                // `{ handleOrder }`: the key names the event, the binding is
+                // the handler.
+                Prop::Shorthand(ident) => (ident.sym.to_string(), None, ident.span),
+                _ => return None,
+            };
+            Some(TableEntry {
+                event,
+                line: cm.lookup_char_pos(span.lo).line as u32,
+                payload_symbol,
+            })
+        })
+        .collect()
+}
+
+fn function_first_param_symbol(function: &Function) -> Option<String> {
+    first_param_symbol(function.params.first().map(|param| &param.pat))
+}
+
+/// Every file-local `const handlers = { … }`, keyed by binding name, so a
+/// dispatch on `handlers[msg.type]` can be read back. Flat per file, the same
+/// identity rule socket roots use.
+struct TableCollector {
+    tables: HashMap<String, Vec<TableEntry>>,
+    cm: Lrc<SourceMap>,
+}
+
+impl Visit for TableCollector {
+    fn visit_var_declarator(&mut self, node: &VarDeclarator) {
+        if let Pat::Ident(ident) = &node.name
+            && let Some(init) = &node.init
+            && let Expr::Object(object) = unwrap_expr(init)
+        {
+            let entries = table_entries(object, &self.cm);
+            if !entries.is_empty() {
+                self.tables.insert(ident.id.sym.to_string(), entries);
+            }
+        }
+        node.visit_children_with(self);
+    }
+}
+
+/// Bindings inside a delivery handler that hold a decoded envelope
+/// (`const msg = JSON.parse(raw)`). Only a discriminator read off one of these
+/// is read as an event name: without it, any `x.type === "y"` in the handler
+/// would be one.
+#[derive(Default)]
+struct EnvelopeBindings {
+    names: HashSet<String>,
+}
+
+impl Visit for EnvelopeBindings {
+    fn visit_var_declarator(&mut self, node: &VarDeclarator) {
+        if let Pat::Ident(ident) = &node.name
+            && let Some(init) = &node.init
+            && is_json_parse(init)
+        {
+            self.names.insert(ident.id.sym.to_string());
+        }
+        node.visit_children_with(self);
+    }
+}
+
+/// The three spellings of one comparison, collected from a delivery handler's
+/// body. The same shape `crate::swc_scanner`'s method-guard visitor reads for
+/// HTTP verbs: a discriminant, and the literals written against it.
+struct DispatchCollector<'a> {
+    bindings: &'a HashSet<String>,
+    tables: &'a HashMap<String, Vec<TableEntry>>,
+    cm: Lrc<SourceMap>,
+    found: Vec<TableEntry>,
+    seen: HashSet<String>,
+}
+
+impl DispatchCollector<'_> {
+    /// Record one event, once. A handler dispatches on an event once however
+    /// many spellings name it, so the first site wins and a repeat is dropped
+    /// rather than doubling the key.
+    fn record(&mut self, event: String, span: Span, payload_symbol: Option<String>) {
+        if is_transport_event(&event) || !self.seen.insert(event.clone()) {
+            return;
+        }
+        let line = self.cm.lookup_char_pos(span.lo).line as u32;
+        self.found.push(TableEntry {
+            event,
+            line,
+            payload_symbol,
+        });
+    }
+
+    fn record_entry(&mut self, entry: TableEntry) {
+        if is_transport_event(&entry.event) || !self.seen.insert(entry.event.clone()) {
+            return;
+        }
+        self.found.push(entry);
+    }
+}
+
+impl Visit for DispatchCollector<'_> {
+    fn visit_switch_stmt(&mut self, node: &SwitchStmt) {
+        if is_envelope_discriminator(&node.discriminant, self.bindings) {
+            for case in &node.cases {
+                if let Some(test) = case.test.as_deref()
+                    && let Some(event) = string_literal(test)
+                {
+                    self.record(event, case.span, None);
+                }
+            }
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_bin_expr(&mut self, node: &BinExpr) {
+        // Equality only: `msg.type !== "x"` names the event this branch does
+        // NOT handle, and reading it would record a listener for it.
+        if matches!(node.op, BinaryOp::EqEq | BinaryOp::EqEqEq) {
+            let literal = if is_envelope_discriminator(&node.left, self.bindings) {
+                string_literal(&node.right)
+            } else if is_envelope_discriminator(&node.right, self.bindings) {
+                string_literal(&node.left)
+            } else {
+                None
+            };
+            if let Some(event) = literal {
+                self.record(event, node.span, None);
+            }
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_member_expr(&mut self, node: &MemberExpr) {
+        if let MemberProp::Computed(computed) = &node.prop
+            && is_envelope_discriminator(&computed.expr, self.bindings)
+        {
+            let tables = self.tables;
+            let cm = self.cm.clone();
+            let entries = match unwrap_expr(&node.obj) {
+                Expr::Ident(ident) => tables.get(ident.sym.as_ref()).cloned(),
+                Expr::Object(object) => Some(table_entries(object, &cm)),
+                _ => None,
+            };
+            for entry in entries.into_iter().flatten() {
+                self.record_entry(entry);
+            }
+        }
+        node.visit_children_with(self);
+    }
 }
 
 /// Walk a callee chain (`io.to("room").emit`, `socket.broadcast.emit`) back
@@ -1270,6 +1589,24 @@ impl OpCollector<'_> {
             return;
         }
 
+        // The RECEIVING side of that idiom (carrick#1287): one transport event
+        // delivers every message, so the contract names are inside the handler,
+        // not in this call. The registration itself still records nothing — the
+        // rows are the literals the handler discriminates on.
+        if kind == SocketKind::Unknown
+            && UNKNOWN_SUBSCRIBE_METHODS.contains(&method)
+            && let Some(first) = args.first()
+            && let Expr::Lit(Lit::Str(event)) = &*first.expr
+            && TRANSPORT_RECEIVE_EVENTS.contains(&event.value.as_ref())
+        {
+            if let Some(handler) = Self::handler_argument(args)
+                && let Some(direction) = self.roots.direction_for(&root_name, true)
+            {
+                self.record_envelope_listeners(handler, direction);
+            }
+            return;
+        }
+
         let reserved = |event: &str| match kind {
             // An unknown-direction root's transport lifecycle (`message`,
             // `close`, `open`) is not a contract either, and its names are
@@ -1315,6 +1652,45 @@ impl OpCollector<'_> {
         }
     }
 
+    /// Listener rows for every event a delivery handler dispatches on
+    /// (carrick#1287). The handler must be written at the registration: a
+    /// handler passed by name is a cross-function hop this pass does not take,
+    /// the same rule that keeps a socket out of a container invisible.
+    fn record_envelope_listeners(&mut self, handler: &Expr, direction: SocketDirection) {
+        if !matches!(unwrap_expr(handler), Expr::Arrow(_) | Expr::Fn(_)) {
+            return;
+        }
+        let mut bindings = EnvelopeBindings::default();
+        handler.visit_with(&mut bindings);
+        if bindings.names.is_empty() {
+            return;
+        }
+        let mut dispatch = DispatchCollector {
+            bindings: &bindings.names,
+            tables: self.tables,
+            cm: self.cm.clone(),
+            found: Vec::new(),
+            seen: HashSet::new(),
+        };
+        handler.visit_with(&mut dispatch);
+        for entry in dispatch.found {
+            let (payload_type_symbol, payload_type_source) = match entry.payload_symbol {
+                Some(symbol) => {
+                    let source = self.roots.type_imports.get(&symbol).cloned();
+                    (Some(symbol), source)
+                }
+                None => (None, None),
+            };
+            self.extraction.listeners.push(SocketOp {
+                key: OperationKey::socket(entry.event, direction),
+                file_path: self.file_path.to_path_buf(),
+                line: entry.line,
+                payload_type_symbol,
+                payload_type_source,
+            });
+        }
+    }
+
     /// The handler a registration call passes, when it passes one. A function
     /// expression or a reference to one; anything else (an options bag, a
     /// missing argument) is not a registration, which is how
@@ -1337,10 +1713,7 @@ impl OpCollector<'_> {
             Expr::Fn(func) => func.function.params.first().map(|p| &p.pat),
             _ => None,
         };
-        match first_param? {
-            Pat::Ident(ident) => ident.type_ann.as_deref().and_then(named_type_symbol),
-            _ => None,
-        }
+        first_param_symbol(first_param)
     }
 
     /// Payload type symbol of an emitter call — the second argument's binding
@@ -2219,6 +2592,223 @@ link.trigger({ event: "order.labelled", parcel });
             keys(&result.emitters),
             vec!["socket|UNKNOWN|order.packed"],
             "a sending method that takes the event as an argument is not read as an envelope"
+        );
+    }
+
+    #[test]
+    fn a_delivery_handler_discriminating_on_the_envelope_yields_listeners() {
+        let result = extract_with_clients(
+            r#"
+import { Connection } from "wire-transport";
+const link = new Connection(url);
+link.on("message", (raw) => {
+  const msg = JSON.parse(raw);
+  switch (msg.type) {
+    case "order.packed":
+      pack(msg);
+      break;
+    case "order.labelled":
+      label(msg);
+      break;
+  }
+  if (msg.type === "order.shipped") {
+    ship(msg);
+  }
+  if ("order.returned" === msg.type) {
+    unpack(msg);
+  }
+});
+"#,
+            &["wire-transport"],
+        );
+        assert_eq!(
+            keys(&result.listeners),
+            vec![
+                "socket|UNKNOWN|order.labelled",
+                "socket|UNKNOWN|order.packed",
+                "socket|UNKNOWN|order.returned",
+                "socket|UNKNOWN|order.shipped",
+            ],
+            "a case and a comparison are two spellings of one discriminator read, \
+             either way round"
+        );
+        assert!(
+            keys(&result.emitters).is_empty(),
+            "the registration itself is still transport lifecycle"
+        );
+    }
+
+    #[test]
+    fn a_dispatch_table_names_the_events_and_types_their_payloads() {
+        let result = extract_with_clients(
+            r#"
+import { Connection } from "wire-transport";
+import type { Parcel } from "./types/parcel";
+const link = new Connection(url);
+const handlers = {
+  "order.packed": (parcel: Parcel) => pack(parcel),
+  "order.labelled": function (parcel: Parcel) { label(parcel); },
+  "order.returned"(parcel: Parcel) { unpack(parcel); },
+  "order.shipped": onShipped,
+  orderAudited,
+  retries: 3,
+};
+link.on("message", (raw) => {
+  const envelope = JSON.parse(raw);
+  handlers[envelope?.event]?.(envelope.payload);
+});
+"#,
+            &["wire-transport"],
+        );
+        assert_eq!(
+            keys(&result.listeners),
+            vec![
+                "socket|UNKNOWN|order.labelled",
+                "socket|UNKNOWN|order.packed",
+                "socket|UNKNOWN|order.returned",
+                "socket|UNKNOWN|order.shipped",
+                "socket|UNKNOWN|orderAudited",
+            ],
+            "every callable key of the table the handler dispatches on is an event, \
+             written as an arrow, a function, a method or a shorthand binding, and \
+             read through an optional discriminator; a number is not a handler"
+        );
+        let packed = find(&result.listeners, "socket|UNKNOWN|order.packed");
+        assert_eq!(packed.payload_type_symbol.as_deref(), Some("Parcel"));
+        assert_eq!(
+            packed.payload_type_source.as_deref(),
+            Some("./types/parcel"),
+            "the handler's parameter anchors the payload through the same import map \
+             a Socket.IO listener uses"
+        );
+        let shipped = find(&result.listeners, "socket|UNKNOWN|order.shipped");
+        assert_eq!(
+            shipped.payload_type_symbol, None,
+            "a handler referenced by name keeps its parameter type a hop away"
+        );
+    }
+
+    #[test]
+    fn the_discriminator_must_come_from_the_parsed_payload() {
+        let result = extract_with_clients(
+            r#"
+import { Connection } from "wire-transport";
+const link = new Connection(url);
+const route = { "order.packed": pack };
+link.on("message", (frame) => {
+  if (frame.type === "order.packed") {
+    pack(frame);
+  }
+  if (settings.type === "order.labelled") {
+    label(frame);
+  }
+  route[frame.type]?.(frame);
+});
+function replay(raw) {
+  const msg = JSON.parse(raw);
+  switch (msg.type) {
+    case "order.replayed":
+      replayOrder(msg);
+  }
+}
+"#,
+            &["wire-transport"],
+        );
+        assert!(
+            result.listeners.is_empty(),
+            "an undecoded handler argument is not an envelope, and the same switch \
+             outside a delivery handler has no transport to belong to, got {:?}",
+            keys(&result.listeners)
+        );
+    }
+
+    #[test]
+    fn the_receive_side_declines_what_it_cannot_read() {
+        let result = extract_with_clients(
+            r#"
+import { Connection } from "wire-transport";
+const PACKED = "order.packed";
+const link = new Connection(url);
+link.on("message", onFrame);
+link.on("message", (raw) => {
+  const msg = JSON.parse(raw);
+  switch (msg.type) {
+    case PACKED:
+      pack(msg);
+      break;
+    case "order.labelled":
+      label(msg);
+      break;
+  }
+  if (msg.type !== "order.shipped") {
+    return;
+  }
+  if (msg.status === "pending") {
+    hold(msg);
+  }
+  if (msg.type === "message") {
+    ignore(msg);
+  }
+});
+"#,
+            &["wire-transport"],
+        );
+        assert_eq!(
+            keys(&result.listeners),
+            vec!["socket|UNKNOWN|order.labelled"],
+            "a handler passed by name is not followed, a case on a binding has no \
+             literal, `!==` names what the branch does not handle, `status` is not \
+             the discriminator key, and the transport's own name is never a contract"
+        );
+    }
+
+    #[test]
+    fn one_event_named_twice_in_a_handler_is_one_row() {
+        let result = extract_with_clients(
+            r#"
+import { Connection } from "wire-transport";
+const link = new Connection(url);
+link.on("message", (raw) => {
+  const msg = JSON.parse(raw);
+  if (msg.type === "order.packed") {
+    pack(msg);
+  }
+  switch (msg.type) {
+    case "order.packed":
+      packAgain(msg);
+  }
+});
+"#,
+            &["wire-transport"],
+        );
+        assert_eq!(
+            keys(&result.listeners),
+            vec!["socket|UNKNOWN|order.packed"],
+            "a handler dispatches on an event once however many spellings name it"
+        );
+    }
+
+    #[test]
+    fn a_socket_io_root_does_not_read_its_message_handler() {
+        let result = extract(
+            r#"
+import { io } from "socket.io-client";
+const socket = io("https://example.test");
+socket.on("message", (raw) => {
+  const msg = JSON.parse(raw);
+  switch (msg.type) {
+    case "order.packed":
+      pack(msg);
+  }
+});
+"#,
+        );
+        assert_eq!(
+            keys(&result.listeners),
+            vec!["socket|SERVER->CLIENT|message"],
+            "a library whose sides are known names its event in the call — that name, \
+             whatever it is — and the envelope inside the handler is not read: doing \
+             both would key one site twice"
         );
     }
 

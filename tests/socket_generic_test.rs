@@ -37,15 +37,55 @@ fn plain_websocket_envelopes_become_unknown_direction_emitters() {
         "the envelope discriminator is the event name; a dynamic one is skipped, \
          and the in-process EventEmitter in the same file is not a socket root"
     );
+}
 
-    // The receiving side of this idiom (`switch (msg.type)` inside the
-    // `message` handler) is not extracted yet — carrick#1287. `connection`,
-    // `message` and `open` are transport lifecycle and never become contracts,
-    // so the fixture's listeners are all correctly declined.
-    assert!(
-        extraction.listeners.is_empty(),
-        "no listener rows yet on a raw socket, got {:?}",
-        keys(&extraction.listeners)
+#[test]
+fn plain_websocket_message_handlers_become_unknown_direction_listeners() {
+    let root = fixture("socket-ws-service");
+    let files = vec![root.join("src/server.ts"), root.join("src/client.ts")];
+
+    let extraction = scan_files(&files, &clients(&["ws"]));
+
+    // carrick#1287: the receiving side of the same idiom. `connection`,
+    // `message` and `open` are transport lifecycle and stay declined — the rows
+    // are the literals the handler discriminates the parsed envelope on, in all
+    // three spellings: `switch`/`case` and `===` (server.ts), and a dispatch
+    // table indexed by the discriminator (client.ts).
+    assert_eq!(
+        keys(&extraction.listeners),
+        vec![
+            "socket|UNKNOWN|order.accepted",
+            "socket|UNKNOWN|order.amended",
+            "socket|UNKNOWN|order.cancelled",
+            "socket|UNKNOWN|order.created",
+            "socket|UNKNOWN|order.rejected",
+        ],
+        "a case on a binding (`order.replayed`), a comparison against a key that is \
+         not the discriminator (`msg.status`), the same switch outside a delivery \
+         handler (`order.archived`) and a non-callable table value (`retries`) all \
+         name nothing"
+    );
+
+    let anchored = extraction
+        .listeners
+        .iter()
+        .find(|op| op.key.canonical() == "socket|UNKNOWN|order.accepted")
+        .expect("order.accepted listener");
+    assert_eq!(
+        anchored.payload_type_symbol.as_deref(),
+        Some("OrderAccepted"),
+        "a dispatch table's handler parameter types the payload, which the switch \
+         and comparison spellings have nowhere to say"
+    );
+
+    let unanchored = extraction
+        .listeners
+        .iter()
+        .find(|op| op.key.canonical() == "socket|UNKNOWN|order.created")
+        .expect("order.created listener");
+    assert_eq!(
+        unanchored.payload_type_symbol, None,
+        "a `case` carries no payload type, and an honest None beats a guess"
     );
 }
 
@@ -97,16 +137,24 @@ fn the_two_sides_of_an_unknown_direction_contract_match() {
 
     let listener_keys: std::collections::HashSet<_> =
         extraction.listeners.iter().map(|op| &op.key).collect();
-    let matched: Vec<String> = extraction
+    let mut matched: Vec<String> = extraction
         .emitters
         .iter()
         .filter(|op| listener_keys.contains(&op.key))
         .map(|op| op.key.canonical())
         .collect();
+    matched.sort();
     assert_eq!(
         matched,
-        vec!["socket|UNKNOWN|order.created"],
-        "an unknown-direction emitter and listener meet on one key"
+        vec![
+            "socket|UNKNOWN|order.accepted",
+            "socket|UNKNOWN|order.created",
+            "socket|UNKNOWN|order.rejected",
+        ],
+        "an unknown-direction emitter and listener meet on one key, whether the two \
+         sides are in one service (the raw-socket pair) or in two (`order.created`, \
+         sent by the ws client and received by both the ws server and the channel \
+         client)"
     );
 }
 
