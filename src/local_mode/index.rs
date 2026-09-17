@@ -46,6 +46,9 @@ pub struct IndexOutcome {
     /// The repos a `--dispatch` build asked to hand over and did not, and why
     /// (carrick#1251). Empty on every other pass.
     pub not_dispatched: Vec<(String, crate::progress::NotDispatched)>,
+    /// What the scans left for a later run, in their own sentences. Empty on
+    /// a build that finished everything it started (carrick#1315).
+    pub pending: Vec<String>,
 }
 
 /// What one repo's scan is doing on a resume: where its collected answers are,
@@ -229,6 +232,9 @@ fn run_generation(
     // ordinary outcome of `--dispatch` — and it used to be silent, which is
     // indistinguishable from the flag doing nothing (carrick#1251).
     let mut not_dispatched: Vec<(String, crate::progress::NotDispatched)> = Vec::new();
+    // And what they left behind, so the build's closing line can say it
+    // (carrick#1315).
+    let mut pending: Vec<String> = Vec::new();
     for (position, repo) in targets.iter().enumerate() {
         let name = repo_label(repo);
         let previous = generation.join("previous.json");
@@ -242,6 +248,7 @@ fn run_generation(
         // retained or hosted blob in the join input.
         let scan_dir = generation.join(format!("scan-{position}"));
         let report = scan_repo(&exe, repo, &scan_dir, &previous, &name, pass)?;
+        pending.extend(report.pending.iter().cloned());
         // A repo that handed its prompts over wrote no blob. One that was
         // asked to and found nothing for the model says nothing here: it
         // indexed itself, in the seconds it takes to state facts nobody has to
@@ -409,6 +416,7 @@ fn run_generation(
         elapsed_secs: started.elapsed().as_secs_f64(),
         hosted_download: hosted.download_line(),
         not_dispatched,
+        pending,
     })))
 }
 
@@ -600,6 +608,11 @@ pub(super) struct ScanReport {
     /// over: why it did not (carrick#1251). `None` on every other pass, and on
     /// a dispatch that worked.
     pub not_dispatched: Option<crate::progress::NotDispatched>,
+    /// What this scan left for a later run, in the sentence the scan stated.
+    /// Printed as it arrives, and carried out of here so the build's summary
+    /// can end on it: a run that landed six services and deferred a seventh
+    /// has a next step, and it is not the ordinary one (carrick#1315).
+    pub pending: Vec<String>,
 }
 
 /// What one phase of a build calls itself while it runs and once it is done.
@@ -636,6 +649,10 @@ fn run_scan(
         .take()
         .ok_or_else(|| format!("the {what} produced no stderr to read"))?;
     let bar = crate::logging::spinner(&reporting.working);
+    // And to a third, when this build is itself a child: the npm wrapper draws
+    // the terminal, and a spinner rewriting a pipe is what reached a first run
+    // as padded fragments on one line (carrick#1315).
+    crate::progress::report_phase(&reporting.working, crate::progress::PhaseState::Started);
     // The same update, to the two places that can be waiting on it: the
     // spinner a person is watching, and the state file `carrick status` reads
     // for a scan nobody is watching at all (carrick#992). The second is a
@@ -699,6 +716,10 @@ fn run_scan(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if let Some(update) = crate::progress::parse(&line) {
+            // Passed on unchanged when this build has a parent of its own: the
+            // counts a spinner here draws are the counts that renderer draws
+            // (carrick#1315).
+            forward(&line);
             bar.set_message(bar_message(
                 &reporting.working,
                 Some(&update),
@@ -711,6 +732,7 @@ fn run_scan(
         // Why the scan is slow, said by the scan (carrick#1122). It rides
         // beside the counts until the next one replaces it.
         if let Some(text) = crate::progress::parse_notice(&line) {
+            forward(&line);
             bar.set_message(bar_message(
                 &reporting.working,
                 last_update.as_ref(),
@@ -767,8 +789,10 @@ fn run_scan(
     if status.success() {
         if pending.is_empty() {
             crate::logging::finish_spinner(&bar, &reporting.done);
+            crate::progress::report_phase(&reporting.done, crate::progress::PhaseState::Done);
         } else {
             crate::logging::finish_spinner_warn(&bar, &reporting.done);
+            crate::progress::report_phase(&reporting.done, crate::progress::PhaseState::Warned);
             for statement in &pending {
                 eprintln!("carrick: {statement}");
             }
@@ -777,6 +801,7 @@ fn run_scan(
             spend,
             dispatched,
             not_dispatched,
+            pending,
         });
     }
     bar.finish_and_clear();
@@ -788,6 +813,19 @@ fn run_scan(
         "the {what} failed: {reason}\n{}",
         failure_excerpt(head, causes, tail, dropped)
     ))
+}
+
+/// Pass a marker line on to this build's own parent, unchanged.
+///
+/// A build is a parent to its scans and, under the npm wrapper, a child
+/// itself. The counts and notices it renders on a spinner are exactly what
+/// that renderer needs, and re-encoding them here would give the two readers
+/// two different lines to keep in step (carrick#1315). Nothing is written when
+/// nobody is reading.
+fn forward(line: &str) {
+    if crate::progress::parent_is_reading() {
+        eprintln!("{line}");
+    }
 }
 
 /// The spinner's message: the phase, its counts, and why it is slow when the

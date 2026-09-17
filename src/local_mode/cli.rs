@@ -159,6 +159,13 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             }
             "--detach" => detach = true,
             "--dispatch" => dispatch = true,
+            // The log level, which is global: `main` reads it off the argument
+            // list for every command, the scan path included, and it decides
+            // what the terminal layer shows rather than what this command
+            // does. Named here so the parser accepts it — a run told to type
+            // `carrick index --verbose` for the full report must not be
+            // answered with "unknown option" (carrick#1315).
+            "--verbose" | "-v" => {}
             crate::preflight::ALLOW_FLAG => allow_unprepared = true,
             "--help" | "-h" => {
                 print_help();
@@ -817,6 +824,7 @@ fn build_workspace(
             for (repo, reason) in &not_dispatched {
                 println!("{}", kept_here_line(repo, *reason));
             }
+            report_dispatch_summary(&jobs, &not_dispatched);
             return Ok(());
         }
     };
@@ -834,8 +842,62 @@ fn build_workspace(
     if let Some(line) = &outcome.hosted_download {
         eprintln!("carrick: {line}");
     }
+    // What this build amounts to, for a parent that renders it: the counts and
+    // the next step, without the map's per-service diagnostics (carrick#1315).
+    // Stated before the map rather than after it, so a reader of the raw
+    // stream meets the summary where the spinners ended.
+    crate::progress::report_summary(&summary(&outcome));
     print_map(&outcome);
     Ok(())
+}
+
+/// The counts a finished build states to whoever is rendering it.
+///
+/// Read off the same index the map prints, service by service, so the two
+/// cannot disagree. `routes_without_response_type` is the one shortfall
+/// carried: it says how much of this index has a producer side to check a
+/// consumer against, and the rest of the boundary is a diagnostic.
+fn summary(outcome: &super::index::IndexOutcome) -> crate::progress::Summary {
+    let services = outcome
+        .index
+        .repos
+        .iter()
+        .flat_map(|repo| repo.services.iter())
+        .map(|service| crate::progress::ServiceSummary {
+            name: service.name.clone(),
+            routes: service.routes,
+            calls: service.calls,
+            routes_without_response_type: service
+                .boundary
+                .as_ref()
+                .map(|boundary| boundary.routes_without_response_type.total)
+                .unwrap_or(0),
+        })
+        .collect();
+    crate::progress::Summary {
+        services,
+        elapsed_secs: outcome.elapsed_secs,
+        next: outcome.pending.clone(),
+    }
+}
+
+/// The same statement for a build that handed its analysis over: no counts,
+/// because it indexed nothing, and the next step is collecting the job.
+fn report_dispatch_summary(
+    jobs: &[crate::analysis_job::Dispatched],
+    not_dispatched: &[(String, crate::progress::NotDispatched)],
+) {
+    let mut next = dispatched_lines(jobs);
+    next.extend(
+        not_dispatched
+            .iter()
+            .map(|(repo, reason)| kept_here_line(repo, *reason)),
+    );
+    crate::progress::report_summary(&crate::progress::Summary {
+        services: Vec::new(),
+        elapsed_secs: 0.0,
+        next,
+    });
 }
 
 /// What a `--dispatch` build says when it returns.
@@ -946,6 +1008,11 @@ fn start_detached(
         .env("NO_COLOR", "1")
         .env_remove("FORCE_COLOR")
         .env_remove("CLICOLOR_FORCE")
+        // And nothing is rendering it either: a detached build's parent has
+        // already answered and exited. Inherited, the marker request would put
+        // progress JSON in the log file this child writes, which is a log
+        // `carrick status` and a person both read (carrick#1315).
+        .env_remove(crate::progress::PROGRESS_ENV)
         .stdin(std::process::Stdio::null())
         .stdout(
             handle
@@ -1463,6 +1530,20 @@ mod tests {
                 "and no first-run copy sends anyone to the pass that runs no \
                  model (cloud#832): {error}"
             );
+        }
+    }
+
+    /// Every writing command accepts `--verbose`, because the line a rendered
+    /// run closes on tells the reader to type it (carrick#1315).
+    #[test]
+    fn the_writing_commands_accept_the_log_level_flag() {
+        for command in ["index", "refresh", "resume"] {
+            for flag in ["--verbose", "-v"] {
+                assert!(
+                    parse(&args(&[command, flag])).unwrap().is_ok(),
+                    "`carrick {command} {flag}` was refused"
+                );
+            }
         }
     }
 

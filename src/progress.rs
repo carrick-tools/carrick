@@ -245,6 +245,112 @@ pub fn parse(line: &str) -> Option<Update> {
     serde_json::from_str(payload).ok()
 }
 
+/// The prefix a build names the phase it is entering or leaving on.
+const PHASE_MARKER: &str = "@carrick-phase ";
+
+/// Where a phase of a build is: starting, finished, or finished with
+/// something to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhaseState {
+    Started,
+    Done,
+    /// Done, and the build has a sentence about it — a scan that left services
+    /// pending states one.
+    Warned,
+}
+
+/// One phase of a build, as it crosses to the process that started it.
+///
+/// The indexer draws a spinner per phase and a terminal renders it, which is
+/// true of exactly one terminal: the one whose stderr the indexer holds. Under
+/// the npm wrapper that is a pipe, and indicatif's rewrites arrived as padded
+/// fragments sharing a line (carrick#1315). The phase is stated here so
+/// whoever owns the terminal draws it, and the label is the same one the
+/// spinner carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhaseUpdate {
+    /// What the phase is called: `indexing api`, `indexed api`, `joining the
+    /// workspace`. The verb is the state's, so a renderer prints the label as
+    /// it stands.
+    pub label: String,
+    pub state: PhaseState,
+}
+
+/// State, for the parent, that a phase of this build has started or finished.
+pub fn report_phase(label: &str, state: PhaseState) {
+    if !enabled() {
+        return;
+    }
+    let update = PhaseUpdate {
+        label: label.to_string(),
+        state,
+    };
+    if let Ok(line) = serde_json::to_string(&update) {
+        eprintln!("{PHASE_MARKER}{line}");
+    }
+}
+
+/// Read a phase out of a line of a build's stderr, if that is what it is.
+#[allow(dead_code)] // Read by tests through the library. The renderer that
+// consumes the line is the npm wrapper's, and the round-trip test below is
+// what holds this half to the shape that one parses.
+pub fn parse_phase(line: &str) -> Option<PhaseUpdate> {
+    let payload = line.trim_start().strip_prefix(PHASE_MARKER)?;
+    serde_json::from_str(payload).ok()
+}
+
+/// The prefix a finished build states its counts on.
+const SUMMARY_MARKER: &str = "@carrick-summary ";
+
+/// One service's line in a finished build's summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceSummary {
+    pub name: String,
+    pub routes: usize,
+    pub calls: usize,
+    /// Indexed routes with nothing on the producer side of a compatibility
+    /// check. The one shortfall worth a first-run line: it is the number that
+    /// says how much of this index can be checked against a consumer.
+    pub routes_without_response_type: usize,
+}
+
+/// What a finished build amounts to, for the process that started it.
+///
+/// The map a build prints is a diagnostic: a table, a boundary paragraph per
+/// service, and per-package candidate counts. What a person who just ran
+/// `carrick index` needs is how many routes and calls were indexed, how much
+/// of it is untyped, and the one next step (carrick#1315, carrick#1284). The
+/// diagnostics stay on stdout for `--verbose` and for the log; this is what a
+/// renderer shows instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Summary {
+    pub services: Vec<ServiceSummary>,
+    pub elapsed_secs: f64,
+    /// The sentences this build owes the reader beyond its counts: where a
+    /// dispatched repo is being analysed, what a pending scan still owes.
+    /// Empty on the ordinary run, whose next step is the renderer's own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub next: Vec<String>,
+}
+
+/// State, for the parent, what this build indexed.
+pub fn report_summary(summary: &Summary) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(line) = serde_json::to_string(summary) {
+        eprintln!("{SUMMARY_MARKER}{line}");
+    }
+}
+
+/// Read a summary out of a line of a build's stderr, if that is what it is.
+#[allow(dead_code)] // As [`parse_phase`]: the renderer is the npm wrapper's.
+pub fn parse_summary(line: &str) -> Option<Summary> {
+    let payload = line.trim_start().strip_prefix(SUMMARY_MARKER)?;
+    serde_json::from_str(payload).ok()
+}
+
 /// The prefix of the line a scan states a notice on.
 const NOTICE_MARKER: &str = "@carrick-notice ";
 
@@ -447,6 +553,51 @@ mod tests {
             failure("upload", "").reason,
             "the scan stopped without an error message"
         );
+    }
+
+    /// A phase and a summary cross the boundary intact, and neither is read
+    /// as any other marker — the risk of a family of prefixes sharing a word
+    /// (carrick#1315).
+    #[test]
+    fn a_phase_and_a_summary_survive_the_round_trip() {
+        for state in [PhaseState::Started, PhaseState::Done, PhaseState::Warned] {
+            let phase = PhaseUpdate {
+                label: "indexing api".to_string(),
+                state,
+            };
+            let line = format!("{PHASE_MARKER}{}", serde_json::to_string(&phase).unwrap());
+            assert_eq!(parse_phase(&line), Some(phase));
+            assert!(parse(&line).is_none());
+            assert!(parse_summary(&line).is_none());
+        }
+
+        let summary = Summary {
+            services: vec![
+                ServiceSummary {
+                    name: "api".to_string(),
+                    routes: 111,
+                    calls: 10,
+                    routes_without_response_type: 46,
+                },
+                ServiceSummary {
+                    name: "web".to_string(),
+                    routes: 4,
+                    calls: 2,
+                    routes_without_response_type: 1,
+                },
+            ],
+            elapsed_secs: 169.4,
+            next: vec!["Carrick Cloud is analysing acme/api (95 file(s)).".to_string()],
+        };
+        let line = format!(
+            "{SUMMARY_MARKER}{}",
+            serde_json::to_string(&summary).unwrap()
+        );
+        assert_eq!(parse_summary(&line), Some(summary.clone()));
+        assert!(parse_phase(&line).is_none());
+        assert!(parse_notice(&line).is_none());
+        assert_eq!(summary.services.len(), 2);
+        assert!(parse_summary("@carrick-summary not json").is_none());
     }
 
     #[test]
