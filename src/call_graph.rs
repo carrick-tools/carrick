@@ -424,16 +424,12 @@ pub struct UnresolvedImports {
 /// One config mapping that points at nothing, and what went through it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MissingMapping {
-    /// The path the mapping named, repo-relative: one example, so a `*`
-    /// mapping is reported by a path somebody can look for rather than by a
-    /// pattern nobody wrote.
-    ///
-    /// The lexicographically smallest of the paths that missed, which makes
-    /// the reported line a property of the tree rather than of the order its
-    /// files happened to be walked in.
-    pub target: std::path::PathBuf,
-    /// The target's directory is absent too — every import through this
-    /// mapping fails, and a build step that was never run looks like this.
+    /// The path the mapping names, repo-relative, with its `*` removed —
+    /// `src/db/generated/client/`. The MAPPING's target, so it is the same
+    /// for every import through the key and needs no example.
+    pub target_root: String,
+    /// The target is absent entirely — every import through this mapping
+    /// fails, and a build step that was never run looks like this.
     pub directory_missing: bool,
     /// How many imports resolved to nothing through it.
     pub imports: usize,
@@ -444,21 +440,17 @@ impl UnresolvedImports {
     /// specifier is not kept: every specifier under the mapping fails the same
     /// way, and the mapping is the line the user wrote.
     fn record_missing_mapping(&mut self, missing: crate::workspace_resolver::MissingAliasTarget) {
-        let entry = self
-            .missing_mappings
+        // Both facts belong to the mapping rather than to the specifier, so
+        // they are the same whichever import gets here first and the row is
+        // only ever counted up.
+        self.missing_mappings
             .entry(missing.declared_by)
             .or_insert_with(|| MissingMapping {
-                target: missing.target.clone(),
+                target_root: missing.target_root,
                 directory_missing: missing.directory_missing,
                 imports: 0,
-            });
-        entry.imports += 1;
-        // The example is the smallest path, not the first one walked: two runs
-        // over the same tree have to print the same sentence.
-        if missing.target < entry.target {
-            entry.target = missing.target;
-            entry.directory_missing = missing.directory_missing;
-        }
+            })
+            .imports += 1;
     }
 
     fn record(&mut self, specifier: &str) {
@@ -1263,7 +1255,7 @@ mod tests {
             std::collections::BTreeMap::from([(
                 "@generated-client/".to_string(),
                 crate::call_graph::MissingMapping {
-                    target: std::path::PathBuf::from("src/db/generated/client/models.ts"),
+                    target_root: "src/db/generated/client/".to_string(),
                     directory_missing: true,
                     imports: 2,
                 }

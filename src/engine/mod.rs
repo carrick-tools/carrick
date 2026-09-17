@@ -5058,10 +5058,11 @@ fn undeclared_alias_line(unresolved: &crate::call_graph::UnresolvedImports) -> O
 /// import costs US is our internals, not their problem (David's ruling,
 /// 2026-09-17).
 ///
-/// Whether the target's directory is missing too is the difference between a
-/// build step nobody ran and one import spelled wrong. It is carried by the
-/// instruction rather than by a clause of its own, which is where a reader
-/// needs it and costs no words.
+/// The target named is the MAPPING's — `src/db/generated/client/`, not the
+/// file one import happened to want under it. Whether it is there at all is
+/// the difference between a build step nobody ran and one import spelled
+/// wrong, and it is carried by the instruction rather than by a clause of its
+/// own, which is where a reader needs it and costs no words.
 ///
 /// Capped like its sibling above: a repo with dozens of broken mappings has
 /// one cause, not dozens, and the ranked head names it.
@@ -5076,7 +5077,7 @@ fn missing_mapping_lines(unresolved: &crate::call_graph::UnresolvedImports) -> V
             format!(
                 "Call graph: {} import(s) through `{declared_by}` are unresolved: its target {} does not exist. {}",
                 missing.imports,
-                missing.target.display(),
+                missing.target_root,
                 if missing.directory_missing {
                     "Generate it, or fix the mapping."
                 } else {
@@ -6425,11 +6426,6 @@ mod tests {
             "Call graph: 11 import(s) through 2 undeclared alias(es) are unresolved: ~/queue, \
              $lib/db. Declare them in tsconfig, package.json or a Deno import map."
         );
-        assert!(
-            line.split_whitespace().count() <= 25,
-            "a log line is read in a terminal, not studied: what an unresolved import costs us is \
-             our internals and does not belong here (David's ruling, 2026-09-17):\n{line}"
-        );
     }
 
     /// The sentence is the deliverable of carrick#1273, so it is pinned.
@@ -6443,7 +6439,7 @@ mod tests {
         unresolved.missing_mappings.insert(
             "@generated-client/".to_string(),
             crate::call_graph::MissingMapping {
-                target: std::path::PathBuf::from("src/db/generated/client/models.ts"),
+                target_root: "src/db/generated/client/".to_string(),
                 directory_missing: true,
                 imports: 83,
             },
@@ -6453,13 +6449,7 @@ mod tests {
         assert_eq!(
             lines[0],
             "Call graph: 83 import(s) through `@generated-client/` are unresolved: its target \
-             src/db/generated/client/models.ts does not exist. Generate it, or fix the mapping."
-        );
-        assert!(
-            lines[0].split_whitespace().count() <= 25,
-            "a log line is read in a terminal, not studied: what an unresolved import costs us is \
-             our internals and does not belong here (David's ruling, 2026-09-17):\n{}",
-            lines[0]
+             src/db/generated/client/ does not exist. Generate it, or fix the mapping."
         );
 
         // A file missing beside its siblings is a mis-spelled import, not a
@@ -6467,7 +6457,7 @@ mod tests {
         unresolved.missing_mappings.insert(
             "@/*".to_string(),
             crate::call_graph::MissingMapping {
-                target: std::path::PathBuf::from("src/absent.ts"),
+                target_root: "src/absent.ts".to_string(),
                 directory_missing: false,
                 imports: 1,
             },

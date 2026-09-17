@@ -82,11 +82,14 @@ pub struct MissingAliasTarget {
     /// `imports` key, or a tsconfig `paths` pattern. What the reader
     /// recognises, and what the count is reported against.
     pub declared_by: String,
-    /// The repo-relative path the mapping named for this specifier.
-    pub target: PathBuf,
-    /// The target's directory is not there either, so nothing under the
-    /// mapping can resolve. A build step that never ran looks like this; a
-    /// single mis-spelled import does not.
+    /// The repo-relative path the MAPPING names, with its `*` removed and its
+    /// trailing separator kept — `src/db/generated/client/`, not the file one
+    /// import happened to want under it. Every specifier under the key shares
+    /// it, which is what makes it the target to report.
+    pub target_root: String,
+    /// The target is not there at all, so nothing under the mapping can
+    /// resolve. A build step that never ran looks like this; a single
+    /// mis-spelled import does not.
     pub directory_missing: bool,
 }
 
@@ -403,8 +406,8 @@ impl WorkspaceIndex {
             if let Some(file) = resolved {
                 return AliasOutcome::Resolved(file);
             }
-            if let (None, Some(declared_by)) = (&claimed, matched.declared_by) {
-                claimed = self.missing_target(declared_by, &matched.target);
+            if let (None, Some(declared)) = (&claimed, matched.declared) {
+                claimed = Some(self.missing_target(declared));
             }
         }
         match claimed {
@@ -413,33 +416,28 @@ impl WorkspaceIndex {
         }
     }
 
-    /// What a claimed mapping pointed at, for the report. The first candidate
-    /// is the one named: a `paths` entry with several targets states them in
-    /// preference order, so the first is what the config says to use.
+    /// What a claimed mapping pointed at, for the report.
     ///
-    /// Whether the target's DIRECTORY is missing too is the difference between
-    /// a build step nobody ran and a single import spelled wrong, and both are
-    /// answered by a `stat` rather than by anything that has to know what tool
-    /// fills the directory.
-    fn missing_target(
-        &self,
-        declared_by: String,
-        target: &AliasTarget,
-    ) -> Option<MissingAliasTarget> {
-        let path = match target {
-            AliasTarget::Paths(candidates) => candidates.first()?.clone(),
-            AliasTarget::Leaves { dir, leaves } => {
-                dir.join(leaves.first()?.trim_start_matches("./"))
-            }
+    /// Whether the target is there at all is the difference between a build
+    /// step nobody ran and a single import spelled wrong, and it is answered
+    /// by a `stat` rather than by anything that has to know what fills the
+    /// directory. A root that names a directory is asked about directly; one
+    /// that names a file is asked about through its parent, because a file
+    /// beside existing siblings is a mis-spelled import.
+    fn missing_target(&self, declared: crate::module_aliases::Declared) -> MissingAliasTarget {
+        let path = self
+            .repo_root
+            .join(declared.target_root.trim_end_matches('/'));
+        let directory_missing = if declared.target_root.ends_with('/') {
+            !path.is_dir()
+        } else {
+            path.parent().is_some_and(|dir| !dir.is_dir())
         };
-        let directory_missing = path
-            .parent()
-            .is_some_and(|dir| !self.repo_root.join(dir).is_dir());
-        Some(MissingAliasTarget {
-            declared_by,
-            target: path,
+        MissingAliasTarget {
+            declared_by: declared.key,
+            target_root: declared.target_root,
             directory_missing,
-        })
+        }
     }
 
     /// The source file a manifest's `exports` field names for one specifier
@@ -997,7 +995,7 @@ mod tests {
             aliased(&repo, "src/app.ts", "@gen/client"),
             Resolution::AliasTargetMissing(MissingAliasTarget {
                 declared_by: "@gen/*".to_string(),
-                target: PathBuf::from("src/generated/client"),
+                target_root: "src/generated/".to_string(),
                 directory_missing: true,
             }),
             "the mapping is named as written, not the specifier that went through it"
@@ -1022,16 +1020,18 @@ mod tests {
             aliased(&repo, "src/app.ts", "@generated-client/models.ts"),
             Resolution::AliasTargetMissing(MissingAliasTarget {
                 declared_by: "@generated-client/".to_string(),
-                target: PathBuf::from("src/db/generated/client/models.ts"),
+                target_root: "src/db/generated/client/".to_string(),
                 directory_missing: true,
             })
         );
     }
 
-    /// A directory that exists with the file absent is a mis-spelled import,
-    /// not a build step nobody ran, and the report has to tell them apart.
+    /// The mapping's target is reported, not the file one import wanted — so
+    /// a mapping whose target is present reports the target that IS there,
+    /// with `directory_missing` false. That is a mis-spelled import, not a
+    /// build step nobody ran, and the instruction differs accordingly.
     #[test]
-    fn a_target_beside_existing_siblings_is_not_an_ungenerated_directory() {
+    fn a_target_that_exists_is_reported_as_present_when_one_import_misses() {
         let repo = tree(&[
             (
                 "tsconfig.json",
@@ -1043,7 +1043,7 @@ mod tests {
             aliased(&repo, "src/app.ts", "@/absent"),
             Resolution::AliasTargetMissing(MissingAliasTarget {
                 declared_by: "@/*".to_string(),
-                target: PathBuf::from("src/absent"),
+                target_root: "src/".to_string(),
                 directory_missing: false,
             })
         );
