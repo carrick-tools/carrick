@@ -8,6 +8,7 @@ import { ProjectLoader } from '../src/project-loader.js';
 import { captureStub, runCheck } from '../src/capture/index.js';
 import ts from 'typescript';
 import { DenoProject, findDenoConfig } from '../src/capture/index.js';
+import { SidecarClient } from './helpers.js';
 
 const hasDeno = spawnSync('deno', ['--version']).status === 0;
 
@@ -218,5 +219,62 @@ export type Configured = DomainGlobal;
       assert.equal(fs.existsSync(path.join(service, 'package.json')), false);
       assert.equal(fs.existsSync(path.join(service, 'tsconfig.json')), false);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  // carrick#1260: a Deno project resolves a dependency's types out of Deno's
+  // own cache, so no declaration path contains `node_modules` and reading a
+  // package name off the path answers nothing. Every receiver in such a repo
+  // used to look workspace-declared, and no route or call could be classified
+  // from its receiver's type. The graph names the package; the path cannot.
+  it('names the package that declares a dependency type from the module graph', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-deno-package-'));
+    const client = new SidecarClient();
+    try {
+      fs.writeFileSync(path.join(root, 'deno.json'), JSON.stringify({
+        imports: { zod: 'npm:zod@4.0.17', '@std/encoding': 'jsr:@std/encoding@1.0.10' },
+      }));
+      const main = [
+        'import { z } from "zod";',
+        'import { encodeHex } from "@std/encoding/hex";',
+        'const schema = z.object({ count: z.number() });',
+        'export const parsed = schema.parse({ count: 1 });',
+        'export const hex = encodeHex(new Uint8Array());',
+      ].join('\n');
+      const mainPath = path.join(root, 'main.ts');
+      fs.writeFileSync(mainPath, main);
+      const installed = spawnSync('deno', ['install', '--node-modules-dir=none'], { cwd: root, encoding: 'utf8' });
+      assert.equal(installed.status, 0, installed.stderr);
+      assert.equal(fs.existsSync(path.join(root, 'node_modules')), false);
+
+      const marker = 'schema.parse({ count: 1 })';
+      const start = main.indexOf(marker);
+      await client.start();
+      await client.send({ action: 'init', request_id: 'init', repo_root: root });
+      const response = await client.send({
+        action: 'infer',
+        request_id: 'receiver',
+        requests: [{
+          file_path: mainPath,
+          line_number: main.slice(0, start).split('\n').length,
+          span_start: start,
+          span_end: start + marker.length,
+          infer_kind: 'receiver_type',
+          alias: 'schema_site',
+        }],
+      }) as { status: string; errors?: string[]; inferred_types?: Array<{ declaring_package?: string }> };
+      assert.equal(response.status, 'success', JSON.stringify(response.errors));
+      assert.equal(response.inferred_types?.[0]?.declaring_package, 'zod');
+
+      // A JSR module's cached copy is content-addressed, so only its specifier
+      // carries the package it belongs to.
+      const deno = new DenoProject(findDenoConfig(root)!, root);
+      const hex = deno.resolve('@std/encoding/hex', mainPath, deno.parsed.options);
+      assert.ok(hex, 'the JSR module resolved');
+      assert.equal(deno.packageOf(hex.resolvedFileName), '@std/encoding');
+      assert.equal(deno.packageOf(mainPath), undefined);
+    } finally {
+      await client.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

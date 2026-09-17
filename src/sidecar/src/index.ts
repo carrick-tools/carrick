@@ -75,7 +75,10 @@ function projectComponents(): ProjectComponents {
     components = {
       typeBundler: new TypeBundler({ project, repoRoot }),
       surfaceEmitter: new SurfaceEmitter({ project, repoRoot }),
-      typeInferrer: new TypeInferrer({ project }),
+      typeInferrer: new TypeInferrer({
+        project,
+        packageOf: (filePath) => projectLoader?.packageOf(filePath),
+      }),
       definitionResolver: new DefinitionResolver({ project }),
     };
   }

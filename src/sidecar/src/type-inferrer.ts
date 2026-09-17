@@ -348,6 +348,13 @@ type FunctionLike =
 export interface TypeInferrerOptions {
   /** The ts-morph Project instance */
   project: Project;
+  /**
+   * The registry package a resolved file belongs to, when the module graph
+   * that built the project names one (carrick#1260). Supplied for a project
+   * whose resolution went through a graph rather than through `node_modules`;
+   * absent otherwise, and the path itself is then the only thing to read.
+   */
+  packageOf?: (filePath: string) => string | undefined;
 }
 
 /**
@@ -413,9 +420,11 @@ type RuleAttempt =
  */
 export class TypeInferrer {
   private readonly project: Project;
+  private readonly packageOf: ((filePath: string) => string | undefined) | undefined;
 
   constructor(options: TypeInferrerOptions) {
     this.project = options.project;
+    this.packageOf = options.packageOf;
   }
 
   /**
@@ -3713,14 +3722,21 @@ export class TypeInferrer {
   }
 
   /**
-   * The npm package name that declares a type, read off its declaration's file
-   * path. `undefined` when the type has no declaration to read (a top type, a
-   * primitive, an anonymous object literal) or when its declaration is not
-   * under a `node_modules` tree — a type the workspace itself declares.
+   * The package name that declares a type, read off its declaration's file.
+   * `undefined` when the type has no declaration to read (a top type, a
+   * primitive, an anonymous object literal) or when nothing names a package for
+   * it — a type the workspace itself declares.
    *
-   * The LAST `node_modules` segment wins, which is what a nested or
-   * content-addressed store (`node_modules/.store/pkg@1.0.0/node_modules/pkg`)
-   * requires. Scoped names keep both segments.
+   * The module graph is asked first, because it is the only thing that can
+   * answer for a project whose resolution does not go through `node_modules`
+   * (carrick#1260): Deno resolves an npm dependency's types straight out of its
+   * own cache, so every dependency-declared type there used to read as
+   * workspace-owned and no receiver could be classified at all.
+   *
+   * Failing that, the path itself. The LAST `node_modules` segment wins, which
+   * is what a nested or content-addressed store
+   * (`node_modules/.store/pkg@1.0.0/node_modules/pkg`) requires. Scoped names
+   * keep both segments.
    */
   private declaringPackageOf(type: Type): string | undefined {
     const symbol = type.getSymbol() ?? type.getAliasSymbol();
@@ -3729,6 +3745,10 @@ export class TypeInferrer {
       return undefined;
     }
     const filePath = declaration.getSourceFile().getFilePath().replace(/\\/g, '/');
+    const named = this.packageOf?.(filePath);
+    if (named) {
+      return named;
+    }
     const marker = '/node_modules/';
     const index = filePath.lastIndexOf(marker);
     if (index < 0) {
