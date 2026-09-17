@@ -506,7 +506,7 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     preflight::allow(args.allow_unprepared);
     // Only a run that is going to ask the model about this tree: the join and
     // the re-check pass over blobs that a scan already wrote, and a `resume`
-    // is collecting answers this tree was already paid for — refusing either
+    // collects answers the model has already given for it — refusing either
     // would strand work rather than save any.
     if !local_mode::no_model() && env::var_os(analysis_channel::ANSWERS_ENV).is_none() {
         preflight::require_prepared(Path::new(&args.repo_path), &services)?;

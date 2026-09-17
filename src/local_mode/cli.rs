@@ -542,9 +542,9 @@ fn build(
     // And before the first repo's scan spends anything on a tree whose types
     // would be `any` (carrick#1254). Every repo is checked here rather than
     // one at a time in the scans, so a workspace is refused whole instead of
-    // paying for repo one and refusing repo two. Not on `resume`: the answers
-    // it collects were paid for on this tree already, and refusing them would
-    // strand the hand-off rather than save anything.
+    // spending on repo one and refusing repo two. Not on `resume`: the model
+    // has already answered for this tree, and refusing to collect those
+    // answers would strand the hand-off rather than save anything.
     if infer && !matches!(pass, super::index::Pass::Resume(_)) {
         unprepared_refusal(&workspace)?;
     }
