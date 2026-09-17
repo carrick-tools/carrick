@@ -6219,13 +6219,41 @@ impl FileOrchestrator {
             // side has always applied in `fold_model_call`. Before carrick#660
             // the stamp above survived the join, and a file route the model
             // also described reached the index as the model's own reading.
+            //
+            // The path the two rows agree ON is not always the model's own.
+            // Where the model copied the mount segment into the path the
+            // registration states (`/tasks/:taskId` for a `router.get(
+            // '/:taskId', …)` mounted at `/tasks`), carrick#1145 keeps the
+            // model's reading and hands the registration literal on for the
+            // mount chain to judge — and the deterministic row at that same
+            // call holds the LITERAL. Matching on the model's path alone left
+            // those two rows unjoined, so one registration reached the index
+            // twice: once as the structural row with no handler and no type
+            // anchor, once as the model's (carrick#1288). The literal is the
+            // common ground, and it is already canonical.
             let canonical = Self::canonicalize_route_path(&endpoint.path);
+            let literal = endpoint.registration_literal.clone();
             let agreeing = result.endpoints[..deterministic_rows]
                 .iter()
                 .position(|existing| {
-                    existing.resolution_source != Some(ResolutionSource::Model)
-                        && existing.method.eq_ignore_ascii_case(&endpoint.method)
-                        && Self::canonicalize_route_path(&existing.path) == canonical
+                    if existing.resolution_source == Some(ResolutionSource::Model)
+                        || !existing.method.eq_ignore_ascii_case(&endpoint.method)
+                    {
+                        return false;
+                    }
+                    let existing_path = Self::canonicalize_route_path(&existing.path);
+                    if existing_path == canonical {
+                        return true;
+                    }
+                    // Only a row registered at the SAME call can be the twin
+                    // the literal was read off: the literal is that call's own
+                    // first argument, and two routers in one file can register
+                    // the same local path (carrick#1145's own reason for
+                    // keeping the owner on the fold key).
+                    literal.as_deref() == Some(existing_path.as_str())
+                        && existing.call_expression_span_start.is_some()
+                        && existing.call_expression_span_start
+                            == endpoint.call_expression_span_start
                 });
             // A model row that agrees with no deterministic row may still be
             // describing one. A decorator route is stated by a DECLARATION, and
@@ -13883,6 +13911,128 @@ export { routes };
             Some(ResolutionSource::ReceiverType)
         );
         assert_eq!(stats.unemitted_literal_candidates, 0);
+    }
+
+    #[test]
+    fn a_model_row_that_prefixed_the_path_still_joins_the_structural_route() {
+        // carrick#1288. The model reads the route the way the mounted service
+        // serves it (`/tasks/:taskId`) while the registration states only
+        // `/:taskId`, and carrick#1145 keeps the model's reading and hands the
+        // literal on for the mount chain. The deterministic row at the same
+        // call holds the literal, so matching on the model's path alone left
+        // the two unjoined and one registration reached the index twice — once
+        // structurally with no handler and no response anchor, once as the
+        // model's.
+        let candidates = bare_literal_map("router", "/:taskId");
+        let candidate_id = candidates.keys().next().unwrap().clone();
+        let mut reported = endpoint_with_candidate("/tasks/:taskId", &candidate_id);
+        reported.handler_name = "anonymous".to_string();
+        reported.owner_node = "router".to_string();
+        reported.response_expression_text = Some("formatTaskResponse(task)".to_string());
+        reported.response_expression_line = Some(14);
+
+        let (result, stats) = emit_and_join_with_receivers(
+            FileAnalysisResult {
+                endpoints: vec![reported],
+                ..Default::default()
+            },
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/api/tasks/tasks.router.ts",
+            false,
+            &HashMap::from([(100, ReceiverRole::Server)]),
+        );
+
+        assert_eq!(
+            result.endpoints.len(),
+            1,
+            "one registration is one row: {:?}",
+            result
+                .endpoints
+                .iter()
+                .map(|e| (e.resolution_source, e.path.clone()))
+                .collect::<Vec<_>>()
+        );
+        let endpoint = &result.endpoints[0];
+        // The structural layer stated this route, so it keeps the claim.
+        assert_eq!(
+            endpoint.resolution_source,
+            Some(ResolutionSource::ReceiverType)
+        );
+        // The model's reading of the path and the literal both survive: which
+        // of them the mount chain serves is carrick#1145's question.
+        assert_eq!(endpoint.path, "/tasks/:taskId");
+        assert_eq!(endpoint.registration_literal.as_deref(), Some("/:taskId"));
+        // The fields the structural row cannot state — without these the
+        // response type has nothing to anchor on.
+        assert_eq!(endpoint.handler_name, "anonymous");
+        assert_eq!(
+            endpoint.response_expression_text.as_deref(),
+            Some("formatTaskResponse(task)")
+        );
+        assert_eq!(stats.model_rows_joined, 1);
+    }
+
+    #[test]
+    fn a_prefixed_model_row_joins_only_the_registration_it_was_read_off() {
+        // The literal is the first argument of ONE call, so it may only match
+        // the deterministic row at that same call. A second router in the file
+        // registering the same local path is a different operation.
+        // Two routers in one file registering the same local path, mounted at
+        // different prefixes. The earlier one is emitted first, so a literal
+        // match that ignored the call would fold the model's row onto it.
+        let mut first = bare_literal_candidate("v1", "/:taskId");
+        first.span_start = 50;
+        first.span_end = 90;
+        first.candidate_id = "v1-site".to_string();
+        let second = bare_literal_candidate("v2", "/:taskId");
+        let candidates = HashMap::from([
+            (first.candidate_id.clone(), first),
+            (second.candidate_id.clone(), second.clone()),
+        ]);
+
+        let mut reported = endpoint_with_candidate("/tasks/:taskId", &second.candidate_id);
+        reported.handler_name = "anonymous".to_string();
+        reported.owner_node = "v2".to_string();
+
+        let (result, _) = emit_and_join_with_receivers(
+            FileAnalysisResult {
+                endpoints: vec![reported],
+                ..Default::default()
+            },
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/api/tasks/tasks.router.ts",
+            false,
+            &HashMap::from([(50, ReceiverRole::Server), (100, ReceiverRole::Server)]),
+        );
+
+        let rows: Vec<_> = result
+            .endpoints
+            .iter()
+            .map(|e| (e.owner_node.clone(), e.path.clone(), e.handler_name.clone()))
+            .collect();
+        assert_eq!(result.endpoints.len(), 2, "{rows:?}");
+        assert!(
+            rows.contains(&("v1".to_string(), "/:taskId".to_string(), "get".to_string())),
+            "the registration the model did not answer at must survive: {rows:?}"
+        );
+        assert!(
+            rows.contains(&(
+                "v2".to_string(),
+                "/tasks/:taskId".to_string(),
+                "anonymous".to_string()
+            )),
+            "the model's row must fold onto its own registration: {rows:?}"
+        );
     }
 
     #[test]
