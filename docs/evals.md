@@ -7,7 +7,9 @@ is `carrick-cloud/docs/internal/evals/README.md`.
 
 All eval workflows are `workflow_dispatch`-only **monitors, never gates** —
 each run makes real LLM calls, costs money, and is stochastic, so none of them
-sit on the merge/PR path.
+sit on the merge/PR path. The dispatch smoke below is the one exception to the
+trigger, not to the rule: it also runs nightly, because the seam it reads has a
+cloud side that moves without a commit here. It is still not a required check.
 
 ## Local scanner runs
 
@@ -35,6 +37,29 @@ scripts/scan-twice.sh /path/to/probe-dir  # plus a one-service carrick.json tree
 
 `CARRICK_BIN` picks the binary, `SCAN_OUT_DIR` keeps both projections per
 target. The script header lists the exclusions and why.
+
+## Cold-cache dispatch smoke
+
+Hands a fixture's prompts to Carrick Cloud for real and collects them, against
+a deliberately cold analysis cache. It reads the seam, not accuracy: whether a
+dispatch this scanner builds is one the cloud accepts, and whether the answers
+come back and join. carrick#1257 — a dispatch refused for a missing `scan_id` —
+shipped with both repos' CI green because no test crossed that line.
+
+```bash
+cargo build --release
+CARRICK_TOKEN=<cli-scope token> CARRICK_SMOKE_REPO=owner/repo \
+  scripts/dispatch-smoke.sh
+```
+
+Each run makes real model calls over a six-file fixture, a few cents, and
+writes an index on the repo it is given — so give it one that exists for this
+and nothing else. `.github/workflows/dispatch-smoke.yml` runs it nightly, on
+demand, and on a PR labelled `smoke:dispatch`; it needs the
+`CARRICK_SMOKE_TOKEN` secret and the `DISPATCH_SMOKE_REPO` variable. It must
+NOT be given `id-token: write`: the scanner would take the OIDC path, which
+opens no scan and so cannot dispatch at all. Details:
+`docs/reference/dispatch-resume.md`.
 
 ## Tier-A framework evals
 
