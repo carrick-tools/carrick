@@ -46,6 +46,14 @@ permissions:
   contents: write
   pull-requests: write
 
+# One release at a time: a push to main and a `workflow_dispatch` rescue of an
+# older tag would otherwise publish npm packages and move release assets
+# concurrently. Queued rather than cancelled, because an npm publish killed
+# half way through cannot be re-run (carrick#1140).
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release-please:
     if: ${{ github.event_name == 'push' }}

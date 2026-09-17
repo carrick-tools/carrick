@@ -1141,6 +1141,7 @@ pub(super) fn can_read_index(index: &super::read_model::LocalIndex) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git_state::tests::committed_repo;
     use serde_json::json;
     use std::io::{Read, Write};
 
@@ -1906,43 +1907,8 @@ mod tests {
         // A real repository at a real commit: the read path answers
         // `CommitMissing` for a clone that does not hold the hosted commit, and
         // that branch is reached before this one.
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, head) = committed_repo(&[("app.ts", "export const value = 1;")]);
         let repo = dir.path();
-        for args in [
-            vec!["init", "-q"],
-            vec!["config", "user.email", "fixture@carrick.test"],
-            vec!["config", "user.name", "fixture"],
-        ] {
-            assert!(
-                std::process::Command::new("git")
-                    .current_dir(repo)
-                    .args(&args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
-        std::fs::write(repo.join("app.ts"), "export const value = 1;").unwrap();
-        for args in [vec!["add", "."], vec!["commit", "-qm", "base"]] {
-            assert!(
-                std::process::Command::new("git")
-                    .current_dir(repo)
-                    .args(&args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
-        let head = String::from_utf8(
-            std::process::Command::new("git")
-                .current_dir(repo)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap();
-        let head = head.trim().to_string();
 
         let mut metadata = resolution();
         metadata["repos"][0]["services"] = json!([{

@@ -6391,6 +6391,7 @@ async fn build_cross_repo_analyzer(
 
 #[cfg(test)]
 mod tests {
+    use crate::git_state::tests::committed_repo;
 
     /// The sentence is the deliverable of carrick#1273, so it is pinned.
     ///
@@ -8675,41 +8676,6 @@ mod tests {
 
         // Key doesn't match prefix, should be kept as-is
         assert!(normalized.contains_key("src/app.ts"));
-    }
-
-    /// A throwaway repository with one commit holding `files`, for the tests
-    /// that ask git about a real tree.
-    fn committed_repo(files: &[(&str, &str)]) -> (tempfile::TempDir, String) {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let git = |args: &[&str]| {
-            // Clear git env vars so the commands are scoped to the temp repo
-            // rather than an ambient GIT_DIR set by a parent process (e.g. a
-            // pre-commit hook running inside a git worktree).
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(temp_dir.path())
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_INDEX_FILE")
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?} failed");
-            String::from_utf8(out.stdout).unwrap().trim().to_string()
-        };
-        git(&["init", "-q"]);
-        for (relative, contents) in files {
-            let path = temp_dir.path().join(relative);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, contents).unwrap();
-        }
-        git(&["add", "-A"]);
-        git(&["commit", "-qm", "init"]);
-        let head = git(&["rev-parse", "HEAD"]);
-        (temp_dir, head)
     }
 
     /// The reader half of carrick#1079: a file is reusable only while its
