@@ -1,5 +1,5 @@
 import { kit } from '../kit.ts';
-import { findParcel, listParcels } from './store.ts';
+import { findParcel, heaviestParcel, listParcels, listRecentParcels } from './store.ts';
 
 // Colis — lecture
 kit.queryFields((t) => ({
@@ -12,5 +12,14 @@ kit.queryFields((t) => ({
     nullable: true,
     args: { id: t.arg.id({ required: true }) },
     resolve: (_root, args) => findParcel(String(args.id)),
+  }),
+  heaviestWeight: t.int({
+    nullable: true,
+    validate: (_args: unknown) => true,
+    resolve: () => heaviestParcel()?.weightGrams,
+  }),
+  recentParcels: t.field({
+    type: ['Parcel'],
+    resolve: listRecentParcels,
   }),
 }));

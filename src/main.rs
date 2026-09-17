@@ -28,6 +28,7 @@ mod framework_detector;
 mod git_state;
 mod graphql;
 mod graphql_document_sites;
+mod graphql_resolver_anchor;
 mod graphql_schema_builder;
 mod handler_span;
 mod help;

@@ -24,6 +24,8 @@
 //! | `health` | `kit.ts:19` | `kit.ts:19` |
 //! | `parcels` | `parcels/queries.ts:6` | `parcels/queries.ts:6` |
 //! | `parcel` | `parcels/queries.ts:10` | `parcels/queries.ts:10` |
+//! | `heaviestWeight` | `parcels/queries.ts:16` | `parcels/queries.ts:16` |
+//! | `recentParcels` | `parcels/queries.ts:21` | `parcels/queries.ts:21` |
 //! | `dispatchParcel` | `parcels/mutations.ts:5` | `parcels/mutations.ts:5` |
 //! | `recallParcel` | nowhere admitted | `dist/schema.graphql:3` |
 //! | `retireParcel` | nowhere admitted | `dist/schema.graphql:4` |
@@ -132,6 +134,14 @@ fn a_code_first_schema_is_served_where_its_fields_are_resolved() {
             ("query|parcels", "apps/api/src/graphql/parcels/queries.ts:6"),
             ("query|parcel", "apps/api/src/graphql/parcels/queries.ts:10"),
             (
+                "query|heaviestWeight",
+                "apps/api/src/graphql/parcels/queries.ts:16"
+            ),
+            (
+                "query|recentParcels",
+                "apps/api/src/graphql/parcels/queries.ts:21"
+            ),
+            (
                 "mutation|dispatchParcel",
                 "apps/api/src/graphql/parcels/mutations.ts:5"
             ),
@@ -162,8 +172,10 @@ fn without_the_builder_package_in_detection_no_file_is_admitted_for_its_schema()
         scan_graphql_endpoints(cassettes.path()),
         rows(&[
             ("query|health", &format!("{printed}:13")),
-            ("query|parcels", &format!("{printed}:15")),
-            ("query|parcel", &format!("{printed}:14")),
+            ("query|heaviestWeight", &format!("{printed}:14")),
+            ("query|parcels", &format!("{printed}:16")),
+            ("query|parcel", &format!("{printed}:15")),
+            ("query|recentParcels", &format!("{printed}:17")),
             ("mutation|dispatchParcel", &format!("{printed}:2")),
             ("mutation|recallParcel", &format!("{printed}:3")),
             ("mutation|retireParcel", &format!("{printed}:4")),

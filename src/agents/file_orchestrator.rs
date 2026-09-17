@@ -4035,11 +4035,26 @@ impl FileOrchestrator {
     /// Only producers with BOTH `resolver_file` and `resolver_line` set produce a
     /// request; an SDL producer with no matched LLM op stays inferred-from-nothing
     /// (it keeps its SDL anchor, but no expanded response contract).
+    ///
+    /// The line the model names is the FIELD's line. In a schema built in code
+    /// the resolver is a `resolve` function inside the field's config object,
+    /// often many lines below, and a bare line anchor binds to whatever
+    /// function starts within two lines of it: nothing, or the builder
+    /// callback above, or the previous field's resolver (carrick#1256). So the
+    /// request carries the resolver function's own span when
+    /// [`crate::graphql_resolver_anchor`] can read it from the AST, converted
+    /// to the sidecar's UTF-16 numbering at this boundary (carrick#805). A
+    /// field whose resolver the pass sees but cannot span (an identifier)
+    /// gets NO request: the manifest entry stays `Unknown` rather than
+    /// carrying a neighbour's type. A line the pass cannot read at all keeps
+    /// the line-only anchor.
     pub fn collect_graphql_producer_infer_requests(
         &self,
         graphql: &crate::graphql::GraphqlExtraction,
         repo_path: &str,
     ) -> Vec<InferRequestItem> {
+        use crate::graphql_resolver_anchor::{ResolverAnchor, resolver_anchor};
+
         let repo_root = std::path::Path::new(repo_path);
         let repo_root_absolute = if repo_root.is_absolute() {
             repo_root.to_path_buf()
@@ -4053,6 +4068,11 @@ impl FileOrchestrator {
 
         let mut requests: Vec<InferRequestItem> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        // Resolver files are read once each; `None` records a file that could
+        // not be read, whose anchors fall back to the line.
+        let mut file_source: HashMap<String, Option<String>> = HashMap::new();
+        let mut spanned = 0usize;
+        let mut withheld = 0usize;
         for op in &graphql.producers {
             let (Some(resolver_file), Some(resolver_line)) =
                 (op.resolver_file.as_ref(), op.resolver_line)
@@ -4066,13 +4086,42 @@ impl FileOrchestrator {
                 ManifestRole::Producer,
                 ManifestTypeKind::Response,
             );
+            let source = file_source
+                .entry(file_abs.clone())
+                .or_insert_with(|| std::fs::read_to_string(&file_abs).ok());
+            let anchor = match source.as_deref() {
+                Some(content) => {
+                    resolver_anchor(std::path::Path::new(&file_abs), content, resolver_line)
+                }
+                None => ResolverAnchor::Absent,
+            };
+            let (span_start, span_end) = match (anchor, source.as_deref()) {
+                (ResolverAnchor::Function { lo, hi }, Some(content)) => {
+                    spanned += 1;
+                    (
+                        Some(Self::sidecar_position(content, lo)),
+                        Some(Self::sidecar_position(content, hi)),
+                    )
+                }
+                (ResolverAnchor::Unresolvable, _) => {
+                    withheld += 1;
+                    debug!(
+                        op = %op.key.canonical(),
+                        file = %file_abs,
+                        line = resolver_line,
+                        "graphql resolver is not a function literal at its field; sending no type anchor"
+                    );
+                    continue;
+                }
+                _ => (None, None),
+            };
             let dedup_key = format!("{}|{}|{}", file_abs, resolver_line, alias);
             if seen.insert(dedup_key) {
                 requests.push(InferRequestItem {
                     file_path: file_abs,
                     line_number: resolver_line,
-                    span_start: None,
-                    span_end: None,
+                    span_start,
+                    span_end,
                     expression_text: None,
                     expression_line: None,
                     infer_kind: InferKind::FunctionReturn,
@@ -4082,8 +4131,10 @@ impl FileOrchestrator {
             }
         }
         debug!(
-            "[FileOrchestrator] Collected {} graphql producer infer requests",
-            requests.len()
+            "[FileOrchestrator] Collected {} graphql producer infer requests ({} span-anchored at their resolver function, {} withheld: resolver not a function literal)",
+            requests.len(),
+            spanned,
+            withheld,
         );
         requests
     }

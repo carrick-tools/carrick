@@ -11,6 +11,8 @@ type Parcel {
 
 type Query {
   health: String!
+  heaviestWeight: Int
   parcel(id: ID!): Parcel
   parcels: [Parcel!]!
+  recentParcels: [Parcel!]!
 }
