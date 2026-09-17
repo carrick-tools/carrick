@@ -48,6 +48,10 @@ pub enum LocalCommand {
         /// collects it. Composes with `--detach`: the work before the hand-off
         /// is still a few minutes of parsing.
         dispatch: bool,
+        /// Scan a checkout that is not prepared instead of refusing it
+        /// (carrick#1254): dependencies uninstalled, or a config mapping
+        /// pointing at a directory that is not on the tree.
+        allow_unprepared: bool,
     },
     /// What is on the other side of this file.
     Touch {
@@ -120,6 +124,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     let mut detach = false;
     let mut dispatch = false;
     let mut recheck = false;
+    let mut allow_unprepared = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut index = 0;
@@ -154,6 +159,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
             }
             "--detach" => detach = true,
             "--dispatch" => dispatch = true,
+            crate::preflight::ALLOW_FLAG => allow_unprepared = true,
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -181,6 +187,15 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
     if recheck && name != "check" {
         return Err(format!("unknown option for `carrick {name}`: --recheck"));
     }
+    // `index` is the only command that asks the model about this tree, so it
+    // is the only one an unprepared tree is refused for, and the only one with
+    // anything to override.
+    if allow_unprepared && name != "index" {
+        return Err(format!(
+            "unknown option for `carrick {name}`: {}",
+            crate::preflight::ALLOW_FLAG
+        ));
+    }
 
     match name {
         "derive" => {
@@ -201,6 +216,7 @@ fn parse_command(name: &str, rest: &[String]) -> Result<LocalCommand, String> {
                 workspace,
                 detach,
                 dispatch,
+                allow_unprepared,
             })
         }
         "refresh" => Ok(LocalCommand::Refresh { service, workspace }),
@@ -265,7 +281,8 @@ pub fn run(command: LocalCommand) -> i32 {
             workspace,
             detach: true,
             dispatch,
-        } => match start_detached(workspace.as_deref(), dispatch) {
+            allow_unprepared,
+        } => match start_detached(workspace.as_deref(), dispatch, allow_unprepared) {
             Ok(()) => 0,
             Err(message) => {
                 eprintln!("carrick index: {message}");
@@ -278,8 +295,12 @@ pub fn run(command: LocalCommand) -> i32 {
         LocalCommand::Index {
             workspace,
             dispatch,
+            allow_unprepared,
             ..
         } => {
+            // Recorded before the check reads it, and handed to every scan
+            // this build spawns by `scan_command` (carrick#1254).
+            crate::preflight::allow(allow_unprepared);
             let pass = if dispatch {
                 super::index::Pass::Dispatch
             } else {
@@ -517,6 +538,15 @@ fn build(
     // Before anything is printed about a scan that is not going to happen.
     if infer && let Some(refusal) = inference_refusal(&workspace.repos) {
         return Err(refusal);
+    }
+    // And before the first repo's scan spends anything on a tree whose types
+    // would be `any` (carrick#1254). Every repo is checked here rather than
+    // one at a time in the scans, so a workspace is refused whole instead of
+    // paying for repo one and refusing repo two. Not on `resume`: the answers
+    // it collects were paid for on this tree already, and refusing them would
+    // strand the hand-off rather than save anything.
+    if infer && !matches!(pass, super::index::Pass::Resume(_)) {
+        unprepared_refusal(&workspace)?;
     }
     // The paid build records where it is, so `carrick status` can answer for
     // it and a scan that is killed leaves evidence rather than silence
@@ -862,11 +892,17 @@ fn kept_here_line(repo: &str, reason: crate::progress::NotDispatched) -> String 
 /// The child is put in a session of its own, so that killing the shell that
 /// started it — which is what an agent's tool timeout does — does not take the
 /// scan with it. That is the whole point of the flag (carrick#992).
-fn start_detached(root: Option<&Path>, dispatch: bool) -> Result<(), String> {
+fn start_detached(
+    root: Option<&Path>,
+    dispatch: bool,
+    allow_unprepared: bool,
+) -> Result<(), String> {
     let workspace = Workspace::load(&resolve_root(root)?)?;
     if let Some(refusal) = inference_refusal(&workspace.repos) {
         return Err(refusal);
     }
+    crate::preflight::allow(allow_unprepared);
+    unprepared_refusal(&workspace)?;
     let index_dir = workspace.index_dir();
     std::fs::create_dir_all(&index_dir).map_err(|e| format!("{}: {e}", index_dir.display()))?;
     super::workspace::write_self_ignore(&index_dir)
@@ -887,6 +923,11 @@ fn start_detached(root: Option<&Path>, dispatch: bool) -> Result<(), String> {
     // itself longer than an agent's shell will wait (carrick#1229).
     if dispatch {
         command.arg("--dispatch");
+    }
+    // The refusal this process just passed is the detached build's too, and it
+    // re-runs this command from scratch (carrick#1254).
+    if allow_unprepared {
+        command.arg(crate::preflight::ALLOW_FLAG);
     }
     command
         .arg("--workspace")
@@ -1004,6 +1045,34 @@ fn inference_refusal(repos: &[PathBuf]) -> Option<String> {
             String::new()
         }
     ))
+}
+
+/// Why this workspace is not worth scanning yet, if it is not: a service whose
+/// dependencies are not installed, or one whose config maps a specifier to a
+/// directory that is not on the tree (carrick#1254).
+///
+/// A repo whose `carrick.json` cannot be read is skipped rather than reported
+/// here — the scan of that repo says so itself, in the sentence that is about
+/// the config rather than about the tree.
+fn unprepared_refusal(workspace: &Workspace) -> Result<(), String> {
+    let mut found = Vec::new();
+    for repo in &workspace.repos {
+        let Ok(derivation) = crate::service_derivation::resolve(repo) else {
+            continue;
+        };
+        let mut rows = crate::preflight::unprepared(repo, &derivation.services);
+        if workspace.repos.len() > 1 {
+            let label = super::index::repo_label(repo);
+            for row in &mut rows {
+                row.in_repo(&label);
+            }
+        }
+        found.extend(rows);
+    }
+    match crate::preflight::refusal(found) {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
 }
 
 /// The map a build prints: every service, what it holds, and what it could not
@@ -1169,7 +1238,7 @@ fn print_help() {
 
 USAGE:
     carrick derive  [--workspace <dir>] --json
-    carrick index   [--workspace <dir>] [--detach] [--dispatch]
+    carrick index   [--workspace <dir>] [--detach] [--dispatch] [--allow-unprepared]
     carrick resume  [--workspace <dir>]
     carrick status  [--workspace <dir>] [--json]
     carrick touch   <file> [--workspace <dir>] [--json]
@@ -1188,7 +1257,11 @@ USAGE:
                write <dir>/.carrick/. Carrick Cloud classifies what the
                deterministic passes could not and the result is uploaded. It
                needs a carrick.json in every repo, which it refuses without,
-               and a machine `carrick login` has signed in.
+               and a machine `carrick login` has signed in. It also refuses a
+               checkout that is not prepared — a service whose dependencies are
+               not installed, or whose config maps a specifier to a directory
+               that is not there — because the types through either are `any`.
+               --allow-unprepared scans it anyway.
     --dispatch on `index` builds every prompt, hands them to Carrick Cloud as
     one job and returns without an index. The analysis then runs whether or not
     this machine is on. A first index of a large monorepo is thousands of model
@@ -1364,6 +1437,7 @@ mod tests {
                 workspace: Some(PathBuf::from("/w")),
                 detach: false,
                 dispatch: false,
+                allow_unprepared: false,
             }
         );
     }
@@ -1404,6 +1478,7 @@ mod tests {
                 workspace: Some(PathBuf::from("/w")),
                 detach: true,
                 dispatch: false,
+                allow_unprepared: false,
             }
         );
         assert_eq!(
@@ -1412,6 +1487,7 @@ mod tests {
                 workspace: None,
                 detach: true,
                 dispatch: false,
+                allow_unprepared: false,
             }
         );
         assert_eq!(

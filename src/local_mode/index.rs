@@ -529,6 +529,15 @@ pub(super) fn scan_command(
         }
         Pass::Facts | Pass::Infer => {}
     }
+    // The build has already checked every repo for a tree it cannot type, so
+    // a scan it starts must not check again and reach a different answer: the
+    // build's decision travels with the child (carrick#1254). Set either way,
+    // so an inherited variable cannot allow a scan this build refused.
+    if crate::preflight::allowed() {
+        command.env(crate::preflight::ALLOW_ENV, "1");
+    } else {
+        command.env_remove(crate::preflight::ALLOW_ENV);
+    }
     // Always: the ambient CI context would name every repo in the workspace
     // after the one whose shell this ran in, and on a laptop scan its OIDC
     // variables would select the wrong credential entirely.
@@ -1541,6 +1550,27 @@ mod tests {
         );
         assert_eq!(env.get(super::super::NO_MODEL_ENV), Some(&None));
         assert_eq!(env.get("CARRICK_SKIP_INTENTS"), Some(&None));
+    }
+
+    /// A build the flag allowed hands that decision to every scan it starts,
+    /// and a build that was not allowed clears the variable rather than
+    /// letting an inherited one through (carrick#1254).
+    #[test]
+    #[serial_test::serial(allow_unprepared)]
+    fn a_build_hands_its_unprepared_decision_to_the_scans_it_starts() {
+        assert_eq!(
+            scan_env(&Pass::Infer).get(crate::preflight::ALLOW_ENV),
+            Some(&None),
+            "the default is a scan that checks the tree for itself"
+        );
+        // SAFETY: serialised with every other test that reads this variable.
+        unsafe { std::env::set_var(crate::preflight::ALLOW_ENV, "1") };
+        let allowed = scan_env(&Pass::Infer);
+        unsafe { std::env::remove_var(crate::preflight::ALLOW_ENV) };
+        assert_eq!(
+            allowed.get(crate::preflight::ALLOW_ENV),
+            Some(&Some("1".into()))
+        );
     }
 
     /// The three passes that are not the ordinary one, read back from the

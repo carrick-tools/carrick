@@ -54,6 +54,12 @@ OPTIONS:
     -v, --verbose  Enable verbose (debug-level) terminal output
     -V, --version  Print the scanner version
     --no-cache     Skip incremental cache and run a full analysis
+    --allow-unprepared
+                   Scan a checkout whose dependencies are not installed, or
+                   whose config maps a specifier to a directory that is not
+                   there. Both are refused by default: the types through them
+                   are `any`, and the scan costs the same. A CI job that
+                   deliberately checks out without installing passes this.
 
 ENVIRONMENT VARIABLES:
     ACTIONS_ID_TOKEN_REQUEST_URL    GitHub Actions OIDC token endpoint (auto-set
@@ -90,6 +96,9 @@ ENVIRONMENT VARIABLES:
                                     build its TypeScript program (default 180).
                                     Raise it for a large monorepo whose
                                     dependencies are installed
+    CARRICK_ALLOW_UNPREPARED        The --allow-unprepared flag as a variable,
+                                    for a pipeline that sets the scan up rather
+                                    than spelling the command
     CARRICK_ALLOW_MISSING_TYPES     Scan and exit 0 even when the type sidecar
                                     never became ready. Off by default: such a
                                     run would index every endpoint with no

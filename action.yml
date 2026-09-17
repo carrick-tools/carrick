@@ -17,13 +17,31 @@ inputs:
 
       "auto" (the default) installs when a lockfile sits at the path being
       analyzed, with lifecycle scripts disabled, and skips otherwise. Set it to
-      "false" to scan the checkout as-is. A failed or slow install is not an
-      error: Carrick warns and scans the bare checkout.
+      "false" to scan the checkout as-is, which also allows the bare scan that
+      leaves. A failed or slow install is not an error in itself, but the scan
+      that follows refuses a service whose dependencies are still missing and
+      names the command that installs them; `allow-unprepared: true` scans it
+      anyway.
 
       Private registries use your own auth. Set NPM_TOKEN (or whatever your
       .npmrc references) in the job's `env:` and the install step inherits it.
     required: false
     default: "auto"
+  allow-unprepared:
+    description: |
+      Scan a checkout that is not prepared instead of refusing it: a service
+      whose dependencies are not installed, or whose TypeScript or Deno config
+      maps a specifier to a directory that is not on the checkout (a generated
+      client, say, whose generator has not run).
+
+      Carrick refuses those by default, because every type that resolves
+      through a package or a generated module is `any` and the scan costs the
+      same either way. The refusal names the service and, where the lockfile
+      says which package manager to use, the exact command. Setting
+      `install-dependencies: false` implies this, because that input already
+      says the checkout is meant to be scanned as it is.
+    required: false
+    default: "false"
   full-scan:
     description: |
       Re-analyze every file instead of reusing the cached answer for a file
@@ -259,6 +277,10 @@ runs:
         # automatically when the job grants `permissions: id-token: write`) and
         # sends it as X-Carrick-OIDC. No API key required.
         CI: "true"
+        # A pipeline that deliberately scans a bare checkout says so here
+        # rather than being refused (carrick#1254). `install-dependencies:
+        # false` is already that statement, so it carries the same meaning.
+        CARRICK_ALLOW_UNPREPARED: ${{ (inputs.allow-unprepared == 'true' || inputs.install-dependencies == 'false') && '1' || '' }}
       run: |
         # Stream output live (multi-minute scans shouldn't look hung) while
         # still capturing it for the issue-count grep below. The log lives in
