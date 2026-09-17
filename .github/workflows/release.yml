@@ -19,6 +19,13 @@ name: Release
 # Nothing but a real release exercises the jobs below `target`, so the dispatch
 # form takes a `dry_run` input: it resolves the tag, checks the commit carries
 # that version, and stops. That is the way to rehearse this path.
+#
+# The dispatch is ONE step, not two: it needs no run approval. The
+# first-time-contributor policy that holds the release PR's checks at
+# `action_required` — because that PR is authored by `app/github-actions`,
+# which is not a repo contributor — applies to `pull_request` runs only. Every
+# run of this workflow, and every `workflow_dispatch` run in this repo, has
+# started immediately.
 
 on:
   push:
