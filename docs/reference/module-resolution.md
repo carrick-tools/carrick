@@ -75,12 +75,12 @@ Deno maps are pinned by the Deno fixture in `tests/alias_import_callers_test.rs`
 - **A config mapping whose target is not on disk** is a different fact from
   both of those, and has its own outcome
   (`Resolution::AliasTargetMissing`) and its own `info` line naming the
-  mapping as written, the path it points at and how many imports went
-  through it (carrick#1273). The repo STATED where the module lives, so the
+  count, the mapping as written, the path it points at and what to do about
+  it (carrick#1273). The repo STATED where the module lives, so the
   miss is a tree that was not fully prepared — most often a generated
   directory whose generator has not run — rather than a specifier nothing
-  accounts for. The line says whether the target's directory is missing too,
-  which is a `stat` and not an opinion about what fills it. A mapping that
+  accounts for. Whether the target's directory is missing too is a `stat`,
+  and it decides which instruction the line ends on. A mapping that
   misses does not end the lookup: it can shadow a package that is also
   installed, so the claim is carried down and stated only where the lookup
   gives up for good. `baseUrl` declares no key and makes no such claim, so a
