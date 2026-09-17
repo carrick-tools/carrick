@@ -450,6 +450,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 "Carrick Cloud is not running analysis jobs yet, so this scan analyses the repo \
                  here and now."
             );
+            // And on the marker channel, because the indexer swallows this
+            // process's stderr and `--dispatch` would otherwise look like a
+            // flag that did nothing (carrick#1251).
+            crate::progress::report_not_dispatched(crate::progress::NotDispatched::CloudDeclined);
         }
     }
 
@@ -613,20 +617,35 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // has nothing to hand over, every service went through the ordinary phases
     // (see `analyze_files`), and it finishes here the way any other scan does:
     // it writes its index, closes its scan and leaves nobody waiting for
-    // answers that were never asked for.
-    if let Some(collected) = crate::analysis_channel::take()
-        && !collected.rows.is_empty()
-    {
-        let submitted = dispatch_analysis_job(storage, collected, &run_context, repo_path).await?;
-        crate::progress::report_dispatched(&submitted);
-        logging::finish_spinner(
-            &sp,
-            &format!(
-                "Carrick Cloud is analysing {} file(s) of {}",
-                submitted.analyze_rows, submitted.repo
-            ),
-        );
-        return Ok(());
+    // answers that were never asked for. It says so on the way past, which is
+    // the one thing it used not to do (carrick#1251).
+    match crate::analysis_channel::take() {
+        Some(collected) if !collected.rows.is_empty() => {
+            let submitted =
+                dispatch_analysis_job(storage, collected, &run_context, repo_path).await?;
+            crate::progress::report_dispatched(&submitted);
+            logging::finish_spinner(
+                &sp,
+                &format!(
+                    "Carrick Cloud is analysing {} file(s) of {}",
+                    submitted.analyze_rows, submitted.repo
+                ),
+            );
+            return Ok(());
+        }
+        // Asked to dispatch, collected nothing. The cloud that declined the
+        // job never started a collector, so it is not this branch: it said so
+        // where it declined.
+        Some(_) => {
+            info!(
+                "Nothing in this repo needed the analyzer, so there was nothing to hand over: it \
+                 is indexed here."
+            );
+            crate::progress::report_not_dispatched(
+                crate::progress::NotDispatched::NothingToAnalyse,
+            );
+        }
+        None => {}
     }
 
     // 4b. The work the run still owes gets one more try before it ends: a

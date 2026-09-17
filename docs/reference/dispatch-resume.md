@@ -144,9 +144,9 @@ pipeline.
 
 | The run finds | What happens |
 |---|---|
-| The cloud does not offer analysis jobs | The scan runs synchronously. A scanner that can dispatch in front of a cloud that cannot is an ordinary scan, not a broken install |
+| The cloud does not offer analysis jobs | The scan runs synchronously, and the build says which repo was not handed over and why. A scanner that can dispatch in front of a cloud that cannot is an ordinary scan, not a broken install — but a `--dispatch` that hands nothing over and says nothing reads as a flag that did nothing (carrick#1251) |
 | A service whose guidance carries no id | The job is refused rather than sent: without the id the cloud keys the whole message and the block carried once would be paid for once per file |
-| Nothing for the model | No job. The repo is indexed here, in the seconds it takes to state facts nobody has to be asked about |
+| Nothing for the model | No job. The repo is indexed here, in the seconds it takes to state facts nobody has to be asked about — and the build says so, naming the repo. This is the ordinary outcome of every `--dispatch` after the first scan, so it is the line `--dispatch` prints most often (carrick#1251) |
 | A job still running | `carrick status` and `carrick resume` say how far it has got. Nothing is scanned |
 | The stored index moved while the job ran | The resume finishes locally and does not upload: a newer index is not replaced by an older one. `carrick refresh` brings the newer one down. **The cloud decides this**, from the job's start time and the index rows' source, and says so on `analysis-job-answers` as `superseded` — a check-or-upload response says neither when a row landed nor what wrote it, and index rows carry no commit, so nothing on this side may derive it or name a commit |
 

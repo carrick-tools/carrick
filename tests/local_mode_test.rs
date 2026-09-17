@@ -141,6 +141,30 @@ fn run_mocked(workspace: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("stdout was not UTF-8")
 }
 
+/// The same as [`run_mocked`], with the narration the command writes to
+/// stderr. A build states what it did on stderr and prints the index map on
+/// stdout, so a test of what it SAID needs both (carrick#1251).
+fn run_mocked_output(workspace: &Path, args: &[&str]) -> (String, String) {
+    let output = Command::new(carrick())
+        .args(args)
+        .current_dir(workspace)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        .env("CARRICK_MOCK_ALL", "1")
+        .output()
+        .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "carrick {args:?} exited {:?}:\n{stderr}",
+        output.status.code(),
+    );
+    (
+        String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+        stderr,
+    )
+}
+
 /// Build the index with no model and nothing to pay.
 ///
 /// `refresh`, not `index`: since carrick#1008 `carrick index` is the inferred
@@ -1830,5 +1854,54 @@ fn a_dispatched_index_records_its_jobs_and_says_the_analysis_is_elsewhere() {
     assert!(
         rendered.contains("could not ask"),
         "and says it could not reach the cloud rather than inventing progress:\n{rendered}"
+    );
+}
+
+/// `carrick index --dispatch` that has nothing to hand over says so, and says
+/// where the index came from instead (carrick#1251).
+///
+/// This is the ordinary outcome of `--dispatch`, not an edge: a warm analysis
+/// cache is the normal state of every scan after the first, and a repo whose
+/// files raise no candidate never had anything for the model. It used to print
+/// nothing whatever, which is indistinguishable from a flag that was ignored,
+/// misspelled or broken — and it cost a session three unnoticed synchronous
+/// runs.
+///
+/// The repo here is the second kind: sources with no candidate in them, so no
+/// prompt is built and the collector is empty.
+#[test]
+#[serial]
+fn a_dispatch_with_nothing_to_hand_over_says_so() {
+    let workspace = workspace("local-mode-workspace", &["inventory-svc"]);
+    let root = workspace.path();
+    let repo = root.join("inventory-svc");
+    std::fs::write(repo.join("carrick.json"), "{}\n").expect("write a config");
+    // Nothing a model would be asked about: no route, no call, no schema.
+    for file in std::fs::read_dir(repo.join("src")).expect("the fixture's sources") {
+        std::fs::remove_file(file.expect("dir entry").path()).expect("remove it");
+    }
+    std::fs::write(
+        repo.join("src/arithmetic.ts"),
+        "export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+    )
+    .expect("write the one file");
+
+    let (stdout, stderr) = run_mocked_output(root, &["index", "--dispatch", "--workspace", "."]);
+    let said = format!("{stdout}\n{stderr}");
+    assert!(
+        said.contains("nothing was handed to Carrick Cloud for inventory-svc"),
+        "the command names the repo it handed nothing over for:\n{said}"
+    );
+    assert!(
+        said.contains("The index was built here."),
+        "and says where the index came from instead:\n{said}"
+    );
+    assert!(
+        root.join(".carrick/index.json").is_file(),
+        "and it really did build one"
+    );
+    assert!(
+        !root.join(".carrick/jobs.json").exists(),
+        "nothing is waiting to be collected:\n{said}"
     );
 }
