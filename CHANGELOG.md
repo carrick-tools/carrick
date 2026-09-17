@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.77](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.76...carrick-v0.3.77) (2026-09-17)
+
+
+### Bug Fixes
+
+* **call-graph:** cut the missing-mapping line to what a reader acts on ([#1278](https://github.com/carrick-tools/carrick/issues/1278)) ([b232988](https://github.com/carrick-tools/carrick/commit/b232988a162171dbbb0e40d8c634a9cb9b3d078b)), closes [#1273](https://github.com/carrick-tools/carrick/issues/1273)
+* **call-graph:** name the config mapping whose target is not on disk ([#1275](https://github.com/carrick-tools/carrick/issues/1275)) ([64151c9](https://github.com/carrick-tools/carrick/commit/64151c916d5db01d22bfa81c6f0f64c262aab604)), closes [#1273](https://github.com/carrick-tools/carrick/issues/1273) [#1254](https://github.com/carrick-tools/carrick/issues/1254)
+* **local-mode:** say when a scan did not move what an agent reads ([#1272](https://github.com/carrick-tools/carrick/issues/1272)) ([4db4c7f](https://github.com/carrick-tools/carrick/commit/4db4c7fe76bfbb69cf6b76243ff8b9a6245aa6c9))
+* **local:** say when --dispatch hands nothing over ([#1261](https://github.com/carrick-tools/carrick/issues/1261)) ([1f86911](https://github.com/carrick-tools/carrick/commit/1f869118abecfcd5294ee68f7a3ff86592835a6d))
+* **resume:** close the scan a superseded run opened (carrick[#1262](https://github.com/carrick-tools/carrick/issues/1262)) ([#1276](https://github.com/carrick-tools/carrick/issues/1276)) ([ec87f17](https://github.com/carrick-tools/carrick/commit/ec87f174f9112cc20fbc2571e5d538c10249388a))
+* **sidecar:** name the npm package that declares a type on a Deno project (carrick[#1260](https://github.com/carrick-tools/carrick/issues/1260)) ([#1269](https://github.com/carrick-tools/carrick/issues/1269)) ([026a4c9](https://github.com/carrick-tools/carrick/commit/026a4c95f7f41476c8687cb247866c1c45279b84))
+
+
+### CI/CD
+
+* **release:** make a stranded release recoverable by workflow_dispatch ([#1263](https://github.com/carrick-tools/carrick/issues/1263)) ([c9af233](https://github.com/carrick-tools/carrick/commit/c9af2330b3a6a54a4ee05166bc7678cf1bc89cd5))
+
 ## [0.3.76](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.75...carrick-v0.3.76) (2026-09-17)
 
 
