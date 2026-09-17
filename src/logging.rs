@@ -193,13 +193,22 @@ const FILE_FILTER: &str = "info,carrick=debug";
 /// ([`crate::agent_service`]'s retry count), and `--verbose` shows them again.
 pub const RETRY_TARGET: &str = "carrick::retry";
 
+/// The target the run preamble is logged under.
+///
+/// The banner names the run id, the endpoint and eleven CI variables, which on
+/// a laptop are eleven `<unset>`s. It is what a log file is read for and the
+/// first thing a person running `carrick index` sees, before anything has
+/// happened (carrick#1315). The file keeps it — every run-log reader joins on
+/// it — and the terminal shows it only with `--verbose`.
+pub const PREAMBLE_TARGET: &str = "carrick::runlog";
+
 /// What the terminal layer shows: `info` (or `debug` with `--verbose`),
-/// without the per-attempt retry lines unless verbose.
+/// without the per-attempt retry lines or the run preamble unless verbose.
 fn terminal_filter(verbose: bool) -> String {
     if verbose {
         "debug".to_string()
     } else {
-        format!("info,{RETRY_TARGET}=off")
+        format!("info,{RETRY_TARGET}=off,{PREAMBLE_TARGET}=off")
     }
 }
 
@@ -819,6 +828,7 @@ fn emit_run_preamble() {
         && !phase.trim().is_empty()
     {
         info!(
+            target: PREAMBLE_TARGET,
             run_id = run_id(),
             scanner_version = env!("CARGO_PKG_VERSION"),
             phase = %phase,
@@ -828,6 +838,7 @@ fn emit_run_preamble() {
     }
 
     info!(
+        target: PREAMBLE_TARGET,
         run_id = run_id(),
         scanner_version = env!("CARGO_PKG_VERSION"),
         api_endpoint = env!("CARRICK_API_ENDPOINT"),
@@ -1386,6 +1397,55 @@ mod tests {
             file.contains("WARN") && file.contains("attempt 2/5"),
             "{file}"
         );
+    }
+
+    /// The run preamble reaches the file always and the terminal only when
+    /// the run is verbose (carrick#1315).
+    ///
+    /// It is the first thing `carrick index` printed, before anything had
+    /// happened, and on a laptop eleven of its fields are `<unset>`. Every
+    /// run-log reader joins on it, so the file must keep it.
+    #[test]
+    fn the_run_preamble_goes_to_the_file_and_not_the_terminal() {
+        let terminal = Shared::default();
+        let verbose_terminal = Shared::default();
+        let file = Shared::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .with_writer(terminal.clone())
+                    .with_ansi(false)
+                    .with_filter(EnvFilter::new(terminal_filter(false))),
+            )
+            .with(
+                fmt::layer()
+                    .with_writer(verbose_terminal.clone())
+                    .with_ansi(false)
+                    .with_filter(EnvFilter::new(terminal_filter(true))),
+            )
+            .with(
+                fmt::layer()
+                    .with_writer(file.clone())
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_filter(EnvFilter::new(FILE_FILTER)),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: PREAMBLE_TARGET, ci = "<unset>", "Carrick run starting");
+            tracing::info!(target: PREAMBLE_TARGET, "Carrick run continuing");
+            tracing::info!(target: "carrick::local_mode", "indexed api");
+        });
+
+        let terminal = terminal.text();
+        assert!(!terminal.contains("Carrick run starting"), "{terminal}");
+        assert!(!terminal.contains("Carrick run continuing"), "{terminal}");
+        assert!(terminal.contains("indexed api"), "{terminal}");
+        let verbose = verbose_terminal.text();
+        assert!(verbose.contains("Carrick run starting"), "{verbose}");
+        let file = file.text();
+        assert!(file.contains("Carrick run starting"), "{file}");
+        assert!(file.contains("Carrick run continuing"), "{file}");
     }
 
     /// A writer the test can read back.

@@ -931,6 +931,79 @@ fn a_scan_states_its_progress_to_the_indexer_and_not_to_the_user() {
     );
 }
 
+/// A build that has a parent of its own states its phases and its counts as
+/// markers, and the parent renders them (carrick#1315).
+///
+/// The npm wrapper is that parent: it pipes this process's stderr, draws a
+/// spinner per phase and ends on the counts. Everything it draws has to be a
+/// marker, because the alternative is what a first run saw — an indicatif
+/// spinner rewriting a pipe, arriving as padded fragments sharing one line.
+#[test]
+#[serial]
+fn a_build_states_its_phases_and_counts_to_a_parent_that_is_reading() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+
+    let output = Command::new(carrick())
+        .args(["refresh", "--workspace", "."])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env(carrick::progress::PROGRESS_ENV, "1")
+        .output()
+        .expect("carrick refresh");
+    assert!(output.status.success(), "carrick refresh failed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let phases: Vec<carrick::progress::PhaseUpdate> = stderr
+        .lines()
+        .filter_map(carrick::progress::parse_phase)
+        .collect();
+    for repo in ["catalog-web", "inventory-svc"] {
+        for (label, state) in [
+            (
+                format!("indexing {repo}"),
+                carrick::progress::PhaseState::Started,
+            ),
+            (
+                format!("indexed {repo}"),
+                carrick::progress::PhaseState::Done,
+            ),
+        ] {
+            assert!(
+                phases
+                    .iter()
+                    .any(|phase| phase.label == label && phase.state == state),
+                "no phase marker for '{label}':\n{stderr}"
+            );
+        }
+    }
+
+    // The scans' own counts are passed on, not consumed: the spinner a
+    // renderer draws is the one the scan is filling in.
+    assert!(
+        stderr
+            .lines()
+            .any(|line| carrick::progress::parse(line).is_some()),
+        "no scan's progress reached the parent:\n{stderr}"
+    );
+
+    let summary = stderr
+        .lines()
+        .find_map(carrick::progress::parse_summary)
+        .unwrap_or_else(|| panic!("the build stated no summary:\n{stderr}"));
+    assert_eq!(
+        summary.services.len(),
+        2,
+        "one row per indexed service:\n{stderr}"
+    );
+    assert!(
+        summary.services.iter().any(|service| service.routes > 0),
+        "the routes the map prints are the routes the summary carries:\n{stderr}"
+    );
+    assert!(summary.elapsed_secs > 0.0, "{stderr}");
+}
+
 /// Rewrite a file with the bytes it already has, and push its mtime forward so
 /// the write is visible whatever the filesystem's timestamp granularity is.
 ///

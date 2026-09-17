@@ -55,6 +55,17 @@ export const DOCS = "https://docs.carrick.tools/quickstart";
  */
 export type StepReport = { kind: "done" | "warn" | "refuse"; text: string };
 
+/**
+ * Say where a running step has got to, without ending it.
+ *
+ * Handed to the step's work rather than exposed on its own, because only the
+ * step that owns the terminal may write to it: a spinner rewrites one line, so
+ * anything else printing underneath corrupts it. In the plain rendering this
+ * does nothing — one line per step is what a pipe gets, and a scan of a large
+ * repo would otherwise write thousands (carrick#1315).
+ */
+export type StepProgress = (text: string) => void;
+
 /** Everything `init` prints or asks. */
 export type InitOutput = {
   /** A thing this run did. */
@@ -65,6 +76,15 @@ export type InitOutput = {
   refuse(text: string): void;
   /** A line with no state of its own — a browser step, a list, a prompt. */
   say(text: string): void;
+  /**
+   * Open a run: the name and version of what is about to happen.
+   *
+   * `init` prints its lines without one; a rendered scan opens with it, so the
+   * block a first run sees is bounded at both ends (carrick#1315).
+   */
+  intro(text: string): void;
+  /** Close a run with the one next step. */
+  outro(text: string): void;
   /** The closing block: a title and the lines under it. */
   note(title: string, body: string[]): void;
   /**
@@ -74,7 +94,11 @@ export type InitOutput = {
    * the work's value into the line and the marker, and a spinner stops as that
    * marker rather than repeating the label it started with (carrick#1032).
    */
-  step<T>(label: string, work: () => Promise<T>, report: (value: T) => StepReport): Promise<T>;
+  step<T>(
+    label: string,
+    work: (progress: StepProgress) => Promise<T>,
+    report: (value: T) => StepReport,
+  ): Promise<T>;
   /** Yes or no, defaulting to yes, as the old readline prompt did. */
   confirm(question: string): Promise<boolean>;
   /** A typed answer, for the questions whose answer is not yes or no. */
@@ -97,6 +121,8 @@ export function plainOutput(write: (text: string) => void = (text) => process.st
     warn: (text) => line(WARN, text),
     refuse: (text) => line(REFUSE, text),
     say: (text) => write(`${text}\n`),
+    intro: (text) => write(`${text}\n`),
+    outro: (text) => write(`${text}\n`),
     note: (title, body) => {
       write("\n");
       write(`${title}\n`);
@@ -107,7 +133,7 @@ export function plainOutput(write: (text: string) => void = (text) => process.st
     // one line its work reports, which is what the plain rendering already
     // spent on it.
     step: async (_label, work, report) => {
-      const value = await work();
+      const value = await work(() => {});
       const outcome = report(value);
       line(marker(outcome.kind), outcome.text);
       return value;
@@ -156,6 +182,8 @@ export function interactiveOutput(output: Writable = process.stdout): InitOutput
     warn: (text) => clack.log.warn(text, { output }),
     refuse: (text) => clack.log.error(text, { output }),
     say: (text) => clack.log.message(text, { output }),
+    intro: (text) => clack.intro(text, { output }),
+    outro: (text) => clack.outro(text, { output }),
     note: (title, body) => clack.note(body.join("\n"), title, { output }),
     // The spinner's finishers ARE the markers: `stop` prints `◇`, `error`
     // prints `▲` and `cancel` prints `■`, so the step ends on one line with
@@ -167,7 +195,7 @@ export function interactiveOutput(output: Writable = process.stdout): InitOutput
       spinner.start(label);
       let value: Awaited<ReturnType<typeof work>>;
       try {
-        value = await work();
+        value = await work((text) => spinner.message(text));
       } catch (error) {
         // The step did not finish, so it is a refusal: the caller prints why.
         spinner.cancel(label);

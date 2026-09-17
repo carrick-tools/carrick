@@ -43,6 +43,48 @@ const HOOKS = {
 const argv = process.argv.slice(2);
 const [command, ...rest] = argv;
 
+/**
+ * Run a build of the index and render it (carrick#1315).
+ *
+ * The binary writes for a log file as well as for a person: a run banner, a
+ * spinner per phase and a boundary census. Rendered, this holds its streams
+ * and draws the markers it states through the renderer `carrick init` uses.
+ * `--verbose` and `--detach` never reach here — they want the binary's own
+ * output — and a run that draws nothing writes its output through untouched.
+ */
+async function renderNative(args) {
+  const { resolveNativeBinary, nativeEnv, overrideLine } = await import("../dist/native.js");
+  const { renderScan } = await import("../dist/scan.js");
+  const lookup = resolveNativeBinary();
+  if (!lookup.binary) {
+    process.stderr.write(`carrick: ${lookup.problem}\n`);
+    process.exit(1);
+  }
+  const override = overrideLine(lookup);
+  if (override) process.stderr.write(`${override}\n`);
+  const { readFile } = await import("node:fs/promises");
+  const { version } = JSON.parse(
+    await readFile(new URL("../package.json", import.meta.url), "utf8"),
+  );
+  let outcome;
+  try {
+    outcome = await renderScan({
+      binary: lookup.binary,
+      args,
+      env: nativeEnv(),
+      version,
+    });
+  } catch (error) {
+    process.stderr.write(`carrick: could not run ${lookup.binary}: ${error.message}\n`);
+    process.exit(1);
+  }
+  if (outcome.signal) {
+    process.kill(process.pid, outcome.signal);
+    return;
+  }
+  process.exit(outcome.code);
+}
+
 /** Run the scanner binary, streaming its output and answering with its code. */
 async function runNative(args) {
   const { resolveNativeBinary, nativeEnv, overrideLine } = await import("../dist/native.js");
@@ -209,6 +251,9 @@ switch (command) {
     process.stderr.write(extraHelp());
     process.exit(0);
   }
-  default:
-    await runNative(argv);
+  default: {
+    const { isRendered } = await import("../dist/scan.js");
+    if (isRendered(command, rest)) await renderNative(argv);
+    else await runNative(argv);
+  }
 }

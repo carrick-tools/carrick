@@ -167,7 +167,13 @@ async fn main() {
                 if !command.writes() {
                     std::process::exit(local_mode::cli::run(command));
                 }
-                logging::init(false, logging::LogSink::Daily);
+                // `--verbose` is the log level and nothing else, so it is read
+                // off the argument list here rather than carried on every
+                // command that accepts it. Without it the terminal shows the
+                // build's own lines; with it, everything the file records —
+                // the run preamble, the per-attempt retries, our debug
+                // (carrick#1315).
+                logging::init(verbose(&argv), logging::LogSink::Daily);
                 std::process::exit(run_build(command).await);
             }
             Err(message) => {
@@ -453,6 +459,15 @@ fn should_report_preflight(scan_opened: bool, reaches_cloud: bool) -> bool {
 /// disk, and anything WRITTEN as one — a separator, a leading dot. A bare word
 /// that is neither is a command, and there are exactly two kinds: the ones the
 /// npm package serves, which are named rather than denied, and the rest.
+/// Whether this run was asked for the verbose log level.
+///
+/// The scan path reads it through [`CliArgs`]; the local commands have their
+/// own parser, which treats the flag as the global it is and leaves the answer
+/// to this (carrick#1315).
+fn verbose(argv: &[String]) -> bool {
+    argv.iter().any(|arg| arg == "--verbose" || arg == "-v")
+}
+
 fn unknown_command(argv: &[String]) -> Option<String> {
     let word = argv
         .iter()
