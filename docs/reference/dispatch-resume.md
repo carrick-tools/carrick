@@ -79,10 +79,15 @@ analysis_job_in_flight` with the job id in the body. That is not a fault: the
 move is `carrick status`, not another dispatch, and the scanner re-states it
 rather than reporting a failed scan.
 
-`analysis-job-status` answers `{ state, total_rows, answered, percent,
-failure_reason, expires_at }`. States are `queued`, `running`, `ready`,
-`partial`, `failed`, `cancelled`; the last four are terminal, and `partial` is
-worth collecting. There is **no ETA on the wire**, so nothing prints one.
+`analysis-job-status` takes `{ job_id }` **or** `{ repo }` — the repo form
+follows the cloud's repo -> job pointer — and answers `{ job_id, repo, commit,
+state, total_rows, answered, percent, failure_reason, created_at, expires_at }`.
+States are `queued`, `running`, `ready`, `partial`, `failed`, `cancelled`; the
+last four are terminal, and `partial` is worth collecting. A repo it holds no
+job for is a `404`, which is an answer and not a fault. There is **no ETA on
+the wire**, so nothing prints one. `analysis-job-answers` takes `{ job_id }`
+only, which is why the repo form of the status read is the recovery path for a
+lost record: it names the job the answers call needs.
 
 `body` is the prompt AFTER the guidance prefix, byte-exact. The guidance block
 and the response schema are carried once each in the header and re-attached by
@@ -148,6 +153,8 @@ pipeline.
 | A service whose guidance carries no id | The job is refused rather than sent: without the id the cloud keys the whole message and the block carried once would be paid for once per file |
 | Nothing for the model | No job. The repo is indexed here, in the seconds it takes to state facts nobody has to be asked about — and the build says so, naming the repo. This is the ordinary outcome of every `--dispatch` after the first scan, so it is the line `--dispatch` prints most often (carrick#1251) |
 | A job still running | `carrick status` and `carrick resume` say how far it has got. Nothing is scanned |
+| No `.carrick/jobs.json`, and the cloud holds a job | `carrick resume` asks `analysis-job-status` by REPO for every workspace repo that has no record here **and no row in this workspace's index**. The cloud follows its own repo -> job pointer and its body names the job, so the record is rebuilt from it and collected in the ordinary way. The index-row gate is what stops a finished resume recovering the same job forever: the pointer is written by a dispatch and cleared by nothing, and all three ways the record goes missing — a cleared `.carrick`, a second machine, a fresh clone — lose the index with it. A job that is over and answered nothing is not recovered for the same reason: it would be recorded, collected, forgotten and found again on every resume until the pointer expires (carrick#1320) |
+| A job whose repo is not a workspace repo | Named and left alone. The build scans this workspace's repos, so collecting it would download the answers, scan nothing, and then forget the record — leaving the cloud row with no local handle at all. Resume it where that checkout is (carrick#1320) |
 | A job whose driver stopped | `carrick resume` collects it like any other: the cloud serves the answers of a job in every state but queued, running and cancelled, and each pass wrote its part before it was killed, so a job that reads as `failed` usually holds most of its answers. The files it never answered are analysed by the build that collects it. Only a job the cloud answers for with no parts at all is forgotten, and its line says to hand the repo over again rather than to index it here — the machine that dispatched is the machine that could not (carrick#1319) |
 | The stored index moved while the job ran | The resume finishes locally and does not upload: a newer index is not replaced by an older one. `carrick refresh` brings the newer one down. **The cloud decides this**, from the job's start time and the index rows' source, and says so on `analysis-job-answers` as `superseded` — a check-or-upload response says neither when a row landed nor what wrote it, and index rows carry no commit, so nothing on this side may derive it or name a commit. The run still opened a scan, so its last service ends one: `close-scan` with `reason: superseded` instead of the `scan_final` the skipped write would have carried, which hands the in-flight slot back and keeps the run out of the cloud's silent-scan sweep (carrick#1262, `src/cloud_storage/tee_storage.rs`). Best-effort, like the fail marker: a refusal is a debug line and the slot falls to its TTL, exactly as it did before the marker existed |
 

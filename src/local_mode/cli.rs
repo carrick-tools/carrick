@@ -606,7 +606,27 @@ fn build(
 fn resume(root: Option<&Path>) -> Result<(), String> {
     let workspace = Workspace::load(&resolve_root(root)?)?;
     let index_dir = workspace.index_dir();
-    let jobs = super::jobs::read(&index_dir);
+    let mut jobs = super::jobs::read(&index_dir);
+    // A repo with no record here that the cloud is analysing anyway: ask it,
+    // and write the record back (carrick#1320). `.carrick/jobs.json` is the
+    // only local handle on a job, and the three ways it goes missing — a
+    // cleared `.carrick`, a resume on a second machine, a fresh clone — are
+    // exactly the ways a dispatch is used.
+    let unrecorded = unrecorded_repos(&workspace, &jobs);
+    if !unrecorded.is_empty() {
+        let names: Vec<String> = unrecorded.iter().map(|(_, name)| name.clone()).collect();
+        let (recovered, lines) = recovered_jobs(&unrecorded, super::jobs::ask_by_repo(&names));
+        for line in &lines {
+            println!("{line}");
+        }
+        for job in recovered {
+            // Written back before anything is collected, so a resume that dies
+            // here leaves a workspace that can be resumed again — and so
+            // `carrick status` can answer for the job too.
+            super::jobs::record(&index_dir, job.clone())?;
+            jobs.push(job);
+        }
+    }
     if jobs.is_empty() {
         println!(
             "Nothing from this workspace is being analysed. `carrick index` builds the index \
@@ -637,7 +657,7 @@ fn resume(root: Option<&Path>) -> Result<(), String> {
         })
         .collect();
     let answers_dir = index_dir.join("jobs");
-    let collection = collect_jobs(&jobs, super::jobs::ask(&jobs), &mut |job| {
+    let collection = collect_jobs(&jobs, &workspace.repos, &mut super::jobs::ask, &mut |job| {
         super::jobs::download(job, &answers_dir)
     });
     for line in &collection.lines {
@@ -692,6 +712,11 @@ struct Collection {
     stopped: Vec<String>,
 }
 
+/// What one read of a job's status came to. A failed read is that job's
+/// answer, not the command's: a laptop with no network still says what it
+/// knows about the others.
+type JobStatusResult = Result<super::jobs::JobStatus, String>;
+
 /// Decide what to do about each recorded job, given what the cloud said about
 /// it and a way to fetch its answers.
 ///
@@ -704,13 +729,31 @@ struct Collection {
 /// driver that stopped half way through has already written every part it
 /// finished — abandoning them would throw away work the analysis already did,
 /// and the answers are the whole reason the job was handed over.
+///
+/// A job whose repo this workspace no longer holds is a named skip. The build
+/// scans the workspace's repos and nothing else, so collecting one of those
+/// would download the answers, scan nothing, and then forget the record —
+/// leaving the cloud row with no local handle at all (carrick#1320).
 fn collect_jobs(
     jobs: &[super::jobs::Job],
-    statuses: Vec<Result<super::jobs::JobStatus, String>>,
+    repos: &[PathBuf],
+    ask: &mut dyn FnMut(&[super::jobs::Job]) -> Vec<JobStatusResult>,
     download: &mut dyn FnMut(&super::jobs::Job) -> Result<Option<super::jobs::Collected>, String>,
 ) -> Collection {
     let mut collection = Collection::default();
-    for (job, status) in jobs.iter().zip(statuses) {
+    let mut here = Vec::new();
+    for job in jobs {
+        if repos
+            .iter()
+            .any(|repo| repo.as_path() == Path::new(&job.path))
+        {
+            here.push(job.clone());
+        } else {
+            collection.lines.push(moved_repo_line(job));
+        }
+    }
+    let statuses = ask(&here);
+    for (job, status) in here.iter().zip(statuses) {
         let status = match status {
             Ok(status) => status,
             Err(error) => {
@@ -793,6 +836,118 @@ fn collect_jobs(
         }
     }
     collection
+}
+
+/// The repos of this workspace that could be waiting on a job nobody here has
+/// a record of.
+///
+/// Two filters, and the second is the load-bearing one. The cloud's repo -> job
+/// pointer is written by a dispatch and cleared by nothing — it falls to its
+/// own TTL a fortnight later — so a repo whose answers were collected here
+/// still points at that job. Gating on "this workspace has no index row for
+/// the repo" is what keeps a finished resume from recovering, re-collecting
+/// and rebuilding the same job on every later run; and it is true of all three
+/// ways the record goes missing, because each of them loses the index with it.
+///
+/// Named by the git remote, which is the only identity a laptop can offer the
+/// cloud. A repo whose origin names no `owner/repo` cannot be asked about.
+fn unrecorded_repos(workspace: &Workspace, jobs: &[super::jobs::Job]) -> Vec<(PathBuf, String)> {
+    let indexed: std::collections::HashSet<PathBuf> =
+        super::read_model::LocalIndex::read(&workspace.index_file())
+            .map(|index| {
+                index
+                    .repos
+                    .iter()
+                    .map(|repo| PathBuf::from(&repo.path))
+                    .collect()
+            })
+            .unwrap_or_default();
+    workspace
+        .repos
+        .iter()
+        .filter(|repo| {
+            !jobs
+                .iter()
+                .any(|job| Path::new(&job.path) == repo.as_path())
+        })
+        .filter(|repo| !indexed.contains(repo.as_path()))
+        .filter_map(|repo| crate::git_state::remote_name(repo).map(|name| (repo.clone(), name)))
+        .collect()
+}
+
+/// Rebuild the records the cloud can still answer for.
+///
+/// Everything `.carrick/jobs.json` holds is in the status body except the
+/// path, and the path is this machine's own — so a job the cloud names is a
+/// record this machine can write and then resume in the ordinary way.
+fn recovered_jobs(
+    repos: &[(PathBuf, String)],
+    answers: Vec<Result<Option<super::jobs::JobStatus>, String>>,
+) -> (Vec<super::jobs::Job>, Vec<String>) {
+    let mut jobs = Vec::new();
+    let mut lines = Vec::new();
+    // One line per distinct failure rather than one per repo: a signed-out
+    // machine fails identically for every repo of the workspace, and five
+    // copies of one sentence say nothing the first did not.
+    let mut failures: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for ((path, name), answer) in repos.iter().zip(answers) {
+        match answer {
+            Ok(Some(status)) => {
+                let Some(job_id) = status.job_id.clone() else {
+                    continue;
+                };
+                // A job that is over and holds nothing is not worth a record.
+                // The pointer outlives the job it names, so recovering one
+                // would write a record, report it, collect nothing, forget it
+                // — and do the same again on the next resume, for the
+                // fortnight the pointer lives. A stopped job that DID answer
+                // is the case this exists for: it is carrick#1319 seen from a
+                // machine that has no record.
+                if status.state == "cancelled" || (status.has_failed() && status.answered == 0) {
+                    continue;
+                }
+                let repo = status.repo.clone().unwrap_or_else(|| name.clone());
+                lines.push(format!(
+                    "Carrick Cloud has an analysis of {repo} that this workspace had no record \
+                     of. Recorded it here."
+                ));
+                jobs.push(super::jobs::Job {
+                    repo,
+                    path: path.to_string_lossy().into_owned(),
+                    job_id,
+                    commit: status.commit.clone().unwrap_or_default(),
+                    analyze_rows: status.total_rows,
+                    submitted_at: status.created_at.clone().unwrap_or_default(),
+                });
+            }
+            // Nothing is being analysed for this repo, which is the ordinary
+            // answer and says nothing worth a line.
+            Ok(None) => {}
+            Err(error) => failures.entry(error).or_default().push(name.clone()),
+        }
+    }
+    for (error, repos) in failures {
+        lines.push(format!(
+            "Could not ask Carrick Cloud about {}: {error}",
+            repos.join(", ")
+        ));
+    }
+    (jobs, lines)
+}
+
+/// What a resume says about a job it cannot finish here.
+///
+/// The build scans the workspace's repos, so a job dispatched from a checkout
+/// this workspace no longer lists has nothing to be replayed into. Named and
+/// left alone: its record is the only local handle on the cloud row, and
+/// collecting it would have spent the answers on a build that scanned nothing
+/// (carrick#1320).
+fn moved_repo_line(job: &super::jobs::Job) -> String {
+    format!(
+        "The analysis of {} was handed over from {}, which is not a repo of this workspace. \
+         Leaving it alone; resume it where that checkout is.",
+        job.repo, job.path
+    )
 }
 
 /// What a resume says when the index it is finishing is not the one the cloud
@@ -1540,6 +1695,11 @@ mod tests {
         .unwrap()
     }
 
+    /// The workspace `dispatched_job` belongs to.
+    fn workspace_repos() -> Vec<PathBuf> {
+        vec![PathBuf::from("/w/owner/api")]
+    }
+
     fn collected(rows: usize) -> crate::local_mode::jobs::Collected {
         crate::local_mode::jobs::Collected {
             answers: PathBuf::from("/w/.carrick/jobs/answers-j1.ndjson.gz"),
@@ -1563,7 +1723,8 @@ mod tests {
         let mut asked = 0;
         let collection = collect_jobs(
             std::slice::from_ref(&job),
-            vec![Ok(stopped_status())],
+            &workspace_repos(),
+            &mut |_| vec![Ok(stopped_status())],
             &mut |_| {
                 asked += 1;
                 Ok(Some(collected(192)))
@@ -1600,7 +1761,8 @@ mod tests {
         let job = dispatched_job("owner/api", "j1");
         let collection = collect_jobs(
             std::slice::from_ref(&job),
-            vec![Ok(stopped_status())],
+            &workspace_repos(),
+            &mut |_| vec![Ok(stopped_status())],
             &mut |_| Ok(None),
         );
         assert_eq!(collection.stopped, vec!["j1".to_string()]);
@@ -1618,11 +1780,227 @@ mod tests {
         let job = dispatched_job("owner/api", "j1");
         let collection = collect_jobs(
             std::slice::from_ref(&job),
-            vec![Ok(stopped_status())],
+            &workspace_repos(),
+            &mut |_| vec![Ok(stopped_status())],
             &mut |_| Err("Could not reach Carrick Cloud".to_string()),
         );
         assert!(collection.stopped.is_empty(), "{:?}", collection.lines);
         assert!(collection.collected.is_empty());
+    }
+
+    /// A job dispatched from a checkout this workspace no longer holds is
+    /// named, not collected.
+    ///
+    /// The build scans the workspace's repos and nothing else, so the old path
+    /// downloaded the answers, scanned nothing, returned `Ok`, and then forgot
+    /// the record — spending the one local handle on the cloud row on a build
+    /// that replayed none of it (carrick#1320).
+    #[test]
+    fn a_job_whose_repo_left_the_workspace_is_named_not_collected() {
+        let job = dispatched_job("owner/api", "j1");
+        let mut asked = Vec::new();
+        let mut downloads = 0;
+        let collection = collect_jobs(
+            std::slice::from_ref(&job),
+            // The workspace moved on: this path is not one of its repos.
+            &[PathBuf::from("/w/owner/web")],
+            &mut |jobs| {
+                asked.push(jobs.len());
+                jobs.iter().map(|_| Ok(stopped_status())).collect()
+            },
+            &mut |_| {
+                downloads += 1;
+                Ok(Some(collected(192)))
+            },
+        );
+        assert_eq!(
+            asked,
+            vec![0],
+            "a job with nowhere to land is not asked about"
+        );
+        assert_eq!(downloads, 0, "and its answers are not spent");
+        assert!(collection.collected.is_empty());
+        assert!(
+            collection.stopped.is_empty(),
+            "its record is left alone: the cloud row has no other local handle"
+        );
+        assert!(
+            collection.lines[0].contains("/w/owner/api")
+                && collection.lines[0].contains("not a repo of this workspace"),
+            "{:?}",
+            collection.lines
+        );
+    }
+
+    /// A workspace that lost `.carrick/jobs.json` can still find its job.
+    ///
+    /// `analysis-job-status` takes `{ repo }` and follows the cloud's own
+    /// repo -> job pointer, and its body names the job — so everything the
+    /// record held but the path comes back, and the path is this machine's.
+    /// Without this, a cleared `.carrick`, a second machine or a fresh clone
+    /// read as "nothing from this workspace is being analysed" while the cloud
+    /// held the answers (carrick#1320).
+    #[test]
+    fn a_lost_record_is_rebuilt_from_what_the_cloud_holds() {
+        let repos = vec![
+            (PathBuf::from("/w/api"), "owner/api".to_string()),
+            (PathBuf::from("/w/web"), "owner/web".to_string()),
+            (PathBuf::from("/w/jobs"), "owner/jobs".to_string()),
+            (PathBuf::from("/w/old"), "owner/old".to_string()),
+        ];
+        // A job that is over and answered nothing. Its pointer outlives it, so
+        // recovering it would write a record, collect nothing, forget it, and
+        // do the same on every resume for the fortnight the pointer lives.
+        let dead: crate::local_mode::jobs::JobStatus = serde_json::from_value(
+            serde_json::json!({"state": "failed", "failure_reason": "driver_stopped",
+                "job_id": "job_dead", "repo": "owner/old", "answered": 0, "total_rows": 12}),
+        )
+        .unwrap();
+        let running: crate::local_mode::jobs::JobStatus = serde_json::from_value(
+            serde_json::json!({"state": "running", "job_id": "job_abc", "repo": "owner/api",
+                "commit": "abc1234", "total_rows": 1017, "answered": 400,
+                "created_at": "2026-09-17T21:00:00Z"}),
+        )
+        .unwrap();
+        let (jobs, lines) = recovered_jobs(
+            &repos,
+            vec![
+                Ok(Some(running)),
+                // The ordinary answer for a repo nobody dispatched.
+                Ok(None),
+                Err("Could not reach Carrick Cloud".to_string()),
+                Ok(Some(dead)),
+            ],
+        );
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        let recovered = &jobs[0];
+        assert_eq!(recovered.job_id, "job_abc");
+        assert_eq!(recovered.repo, "owner/api");
+        assert_eq!(
+            recovered.path, "/w/api",
+            "the path is this machine's, not the cloud's"
+        );
+        assert_eq!(recovered.commit, "abc1234");
+        assert_eq!(recovered.analyze_rows, 1017);
+        assert_eq!(recovered.submitted_at, "2026-09-17T21:00:00Z");
+        assert!(
+            lines.iter().any(|line| line.contains("owner/api")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("owner/web")),
+            "a repo nothing is being analysed for says nothing: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("owner/jobs") && line.contains("Could not reach")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("owner/old")),
+            "a job that is over and answered nothing is not recovered: {lines:?}"
+        );
+    }
+
+    /// Which repos the recovery read asks about at all.
+    ///
+    /// The cloud's repo -> job pointer is written by a dispatch and cleared by
+    /// nothing, so "ask about every repo with no record" would recover, re-
+    /// collect and rebuild the same job on every run after a successful
+    /// resume. The gate is the local index row, and it is true of all three
+    /// ways the record goes missing (carrick#1320).
+    #[test]
+    fn only_a_repo_this_workspace_never_indexed_is_asked_about_by_name() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        for name in ["api", "web"] {
+            let repo = root.join(name);
+            std::fs::create_dir_all(&repo).unwrap();
+            for args in [
+                vec!["init", "-q"],
+                vec![
+                    "remote",
+                    "add",
+                    "origin",
+                    &format!("https://github.com/owner/{name}.git"),
+                ],
+            ] {
+                assert!(
+                    std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&repo)
+                        .args(&args)
+                        .env_remove("GIT_DIR")
+                        .env_remove("GIT_WORK_TREE")
+                        .output()
+                        .unwrap()
+                        .status
+                        .success()
+                );
+            }
+        }
+        std::fs::write(
+            root.join(super::super::workspace::WORKSPACE_FILE),
+            r#"{"repos": ["api", "web"]}"#,
+        )
+        .unwrap();
+        let workspace = Workspace::load(root).unwrap();
+        assert_eq!(workspace.repos.len(), 2);
+
+        // Nothing recorded and nothing indexed: both are worth asking about,
+        // under the names the cloud knows them by.
+        let asked: Vec<String> = unrecorded_repos(&workspace, &[])
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        assert_eq!(asked, vec!["owner/api", "owner/web"]);
+
+        // One of them has an index row here, so its job was collected and its
+        // pointer is stale.
+        std::fs::create_dir_all(workspace.index_dir()).unwrap();
+        std::fs::write(
+            workspace.index_file(),
+            serde_json::json!({
+                "version": super::super::read_model::READ_MODEL_VERSION,
+                "scanner_version": "0.3.81", "indexed_at": "2026-09-18T09:00:00Z",
+                "repos": [{"path": workspace.repos[0], "name": "api",
+                    "services": [], "files": {}}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let asked: Vec<String> = unrecorded_repos(&workspace, &[])
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        assert_eq!(asked, vec!["owner/web"]);
+
+        // And a repo that already has a record is asked about through it.
+        let mut job = dispatched_job("owner/web", "j1");
+        job.path = workspace.repos[1].to_string_lossy().into_owned();
+        assert!(unrecorded_repos(&workspace, &[job]).is_empty());
+    }
+
+    /// One sentence per failure, not one per repo: a signed-out machine fails
+    /// identically for every repo of the workspace.
+    #[test]
+    fn one_failure_is_reported_once_however_many_repos_share_it() {
+        let repos: Vec<(PathBuf, String)> = ["api", "web", "jobs"]
+            .iter()
+            .map(|name| (PathBuf::from(format!("/w/{name}")), format!("owner/{name}")))
+            .collect();
+        let signed_out = "this machine is not signed in to Carrick Cloud. Run carrick login.";
+        let (jobs, lines) = recovered_jobs(
+            &repos,
+            repos.iter().map(|_| Err(signed_out.to_string())).collect(),
+        );
+        assert!(jobs.is_empty());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("owner/api, owner/web, owner/jobs"),
+            "the repos are named in the order the workspace lists them: {lines:?}"
+        );
     }
 
     /// What a stopped job's lines tell the reader to do.
