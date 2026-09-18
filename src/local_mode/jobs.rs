@@ -152,6 +152,22 @@ pub struct JobStatus {
     /// download, not about the work.
     #[serde(default)]
     pub expires_at: Option<String>,
+    /// Which job this is. Read only when the status was asked for by REPO:
+    /// the cloud follows its own repo -> job pointer, so this names the job a
+    /// workspace that lost `jobs.json` has no other way of learning
+    /// (carrick#1320).
+    #[serde(default)]
+    pub job_id: Option<String>,
+    /// `owner/repo`, as the cloud knows it — the name the job was dispatched
+    /// under, which is what a rebuilt record must carry.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// The commit the prompts were built at.
+    #[serde(default)]
+    pub commit: Option<String>,
+    /// RFC 3339, when the job was dispatched.
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 impl JobStatus {
@@ -209,11 +225,13 @@ impl JobReader {
         })
     }
 
-    async fn post(
+    /// One call, with a 404 answered as `Ok(None)`: a repo the cloud holds no
+    /// job for is an answer, not a fault. Every other refusal is an error.
+    async fn send(
         &self,
         credential: &Credential,
         body: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<Option<serde_json::Value>, String> {
         let response = self
             .client
             .post(&self.endpoint)
@@ -223,6 +241,9 @@ impl JobReader {
             .await
             .map_err(|_| "Could not reach Carrick Cloud")?;
         let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
         if !status.is_success() {
             return Err(if status == reqwest::StatusCode::UNAUTHORIZED {
                 "Carrick Cloud did not accept this machine's credential. Run carrick login.".into()
@@ -233,7 +254,19 @@ impl JobReader {
         response
             .json()
             .await
+            .map(Some)
             .map_err(|_| "Carrick Cloud sent an answer this version cannot read".into())
+    }
+
+    /// The same call for a caller that has nothing to do with "no such job".
+    async fn post(
+        &self,
+        credential: &Credential,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.send(credential, body)
+            .await?
+            .ok_or_else(|| "Carrick Cloud answered HTTP 404".to_string())
     }
 
     /// How far a job has got.
@@ -245,6 +278,33 @@ impl JobReader {
             )
             .await?;
         serde_json::from_value(value)
+            .map_err(|_| "Carrick Cloud sent a job status this version cannot read".to_string())
+    }
+
+    /// The job the cloud holds for a repo, or `None` when it holds none.
+    ///
+    /// `analysis-job-status` takes `{ repo }` as well as `{ job_id }` and
+    /// follows the repo -> job pointer the dispatch wrote, so this answers
+    /// "is anything being analysed for this repo" for a machine that has no
+    /// job id to ask with — a cleared `.carrick`, a second machine, a fresh
+    /// clone. The body names the job, so the record can be rebuilt from it and
+    /// the answers collected in the ordinary way (carrick#1320).
+    pub async fn status_for_repo(
+        &self,
+        credential: &Credential,
+        repo: &str,
+    ) -> Result<Option<JobStatus>, String> {
+        let Some(value) = self
+            .send(
+                credential,
+                serde_json::json!({"action": "analysis-job-status", "repo": repo}),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        serde_json::from_value(value)
+            .map(Some)
             .map_err(|_| "Carrick Cloud sent a job status this version cannot read".to_string())
     }
 
@@ -437,6 +497,44 @@ pub fn ask(jobs: &[Job]) -> Vec<Result<JobStatus, String>> {
     .unwrap_or_else(|_| jobs.iter().map(|_| Err(UNREACHABLE.to_string())).collect())
 }
 
+/// Ask the cloud which job it holds for each of these repos.
+///
+/// The other end of [`ask`], for a workspace that has no record to ask with.
+/// `Ok(None)` is a repo nothing is being analysed for, which is the ordinary
+/// answer and not a fault.
+pub fn ask_by_repo(repos: &[String]) -> Vec<Result<Option<JobStatus>, String>> {
+    let credential = match Credential::load() {
+        Ok(Some(credential)) => credential,
+        Ok(None) => {
+            return repos.iter().map(|_| Err(SIGNED_OUT.to_string())).collect();
+        }
+        Err(error) => return repos.iter().map(|_| Err(error.clone())).collect(),
+    };
+    let asked: Vec<String> = repos.to_vec();
+    std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(_) => return asked.iter().map(|_| Err(UNREACHABLE.to_string())).collect(),
+        };
+        let reader = match JobReader::for_status() {
+            Ok(reader) => reader,
+            Err(error) => return asked.iter().map(|_| Err(error.clone())).collect(),
+        };
+        runtime.block_on(async {
+            let mut answers = Vec::with_capacity(asked.len());
+            for repo in &asked {
+                answers.push(reader.status_for_repo(&credential, repo).await);
+            }
+            answers
+        })
+    })
+    .join()
+    .unwrap_or_else(|_| repos.iter().map(|_| Err(UNREACHABLE.to_string())).collect())
+}
+
 /// Download one job's answers, and say where they landed. `Ok(None)` is a job
 /// that holds none.
 pub fn download(job: &Job, into: &Path) -> Result<Option<Collected>, String> {
@@ -594,6 +692,34 @@ mod tests {
 
         let unknown: JobStatus = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(!unknown.is_ready() && !unknown.has_failed());
+    }
+
+    /// The status body names the job, which is what makes a lost record
+    /// recoverable: asked by repo, it answers with everything
+    /// `.carrick/jobs.json` holds except the path, and the path is this
+    /// machine's own (carrick#1320). The names are the deployed body's
+    /// (`jobStatusBody`); a rename on either side loses the recovery path
+    /// silently, so it fails here instead.
+    #[test]
+    fn a_status_names_the_job_a_lost_record_would_have_held() {
+        let body: JobStatus = serde_json::from_value(serde_json::json!({
+            "schema": "carrick.analysis-job/0", "job_id": "job_abc", "scan_id": null,
+            "repo": "owner/api", "commit": "abc1234", "state": "ready",
+            "total_rows": 1017, "answered": 1017,
+            "created_at": "2026-09-17T21:00:00Z", "expires_at": "2026-10-01T21:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(body.job_id.as_deref(), Some("job_abc"));
+        assert_eq!(body.repo.as_deref(), Some("owner/api"));
+        assert_eq!(body.commit.as_deref(), Some("abc1234"));
+        assert_eq!(body.created_at.as_deref(), Some("2026-09-17T21:00:00Z"));
+        assert_eq!(body.total_rows, 1017);
+        // A body that carries none of them still parses: every field on this
+        // wire is optional, and `carrick status` must answer whatever came.
+        let bare: JobStatus =
+            serde_json::from_value(serde_json::json!({"state": "running", "repo": null})).unwrap();
+        assert_eq!(bare.job_id, None);
+        assert_eq!(bare.repo, None);
     }
 
     #[test]
