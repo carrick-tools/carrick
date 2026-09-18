@@ -309,6 +309,14 @@ pub struct ServiceSummary {
     pub name: String,
     pub routes: usize,
     pub calls: usize,
+    /// Functions this service indexed, whether or not they are exported. The
+    /// largest thing the index holds and the one a summary of routes and calls
+    /// alone hid entirely: 363 of them on a service whose first-run line read
+    /// `111 routes · 1 call` (carrick#1321).
+    pub functions: usize,
+    /// Distinct types the bundled `.d.ts` declares — the request and response
+    /// definitions `get_endpoint_types` serves.
+    pub types: usize,
     /// Indexed routes with nothing on the producer side of a compatibility
     /// check. The one shortfall worth a first-run line: it is the number that
     /// says how much of this index can be checked against a consumer.
@@ -577,12 +585,16 @@ mod tests {
                     name: "api".to_string(),
                     routes: 111,
                     calls: 10,
+                    functions: 363,
+                    types: 175,
                     routes_without_response_type: 46,
                 },
                 ServiceSummary {
                     name: "web".to_string(),
                     routes: 4,
                     calls: 2,
+                    functions: 12,
+                    types: 8,
                     routes_without_response_type: 1,
                 },
             ],

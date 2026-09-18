@@ -58,6 +58,9 @@ export type ServiceSummary = {
   name: string;
   routes: number;
   calls: number;
+  /** Absent on a summary from a binary older than carrick#1321. */
+  functions?: number;
+  types?: number;
   routes_without_response_type: number;
 };
 
@@ -158,22 +161,31 @@ function plural(count: number, noun: string): string {
 }
 
 /**
- * The one line a finished build is worth: how many routes, how many calls,
- * and how many of those routes have nothing on the producer side of a
- * compatibility check.
+ * The one line a finished build is worth: what the index holds, then the one
+ * shortfall in it.
  *
- * The third count is dropped when it is zero. A line states how many, of
- * which thing, and what to do about it; nothing to do is nothing to say
+ * Routes and calls alone were the whole line, and a service of 111 routes,
+ * 363 functions and 175 types read as `111 routes · 1 call` — which to a
+ * developer, and to an agent, is a nearly empty index (carrick#1321). The two
+ * largest things it holds are named before the shortfall, because the line's
+ * subject is what was built.
+ *
+ * The shortfall is dropped when it is zero. A line states how many, of which
+ * thing, and what to do about it; nothing to do is nothing to say
  * (carrick#1284).
  */
 export function summaryLine(summary: Summary): string {
-  const total = (pick: (service: ServiceSummary) => number): number =>
-    summary.services.reduce((sum, service) => sum + pick(service), 0);
+  const total = (pick: (service: ServiceSummary) => number | undefined): number =>
+    summary.services.reduce((sum, service) => sum + (pick(service) ?? 0), 0);
   const untyped = total((service) => service.routes_without_response_type);
-  const parts = [
-    plural(total((service) => service.routes), "route"),
-    plural(total((service) => service.calls), "call"),
-  ];
+  const functions = total((service) => service.functions);
+  const types = total((service) => service.types);
+  const parts = [plural(total((service) => service.routes), "route")];
+  if (functions > 0) parts.push(plural(functions, "function"));
+  if (types > 0) parts.push(plural(types, "type"));
+  // Named for what it is. Every call in the index crosses a service boundary,
+  // and "1 call" beside 363 functions reads as one function call.
+  parts.push(plural(total((service) => service.calls), "external call"));
   if (untyped > 0) parts.push(`${plural(untyped, "route")} without a response type`);
   return parts.join(" · ");
 }

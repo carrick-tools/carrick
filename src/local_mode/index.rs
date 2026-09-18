@@ -1075,6 +1075,12 @@ pub(super) fn build(
                 boundary: blob.boundary.clone(),
                 routes: blob.endpoints.len(),
                 calls: blob.calls.len(),
+                functions: blob.function_definitions.len(),
+                types: blob
+                    .bundled_types
+                    .as_deref()
+                    .map(crate::type_manifest::dts_declared_types)
+                    .unwrap_or(0),
             })
             .collect();
         repos.push(IndexedRepo {

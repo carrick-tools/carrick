@@ -34,7 +34,7 @@ const BUILD = [
   '@carrick-phase {"label":"indexed api","state":"done"}',
   '@carrick-phase {"label":"joining the workspace","state":"started"}',
   '@carrick-phase {"label":"joined the workspace","state":"done"}',
-  '@carrick-summary {"services":[{"name":"pan-api","routes":111,"calls":10,"routes_without_response_type":46}],"elapsed_secs":169.4}',
+  '@carrick-summary {"services":[{"name":"pan-api","routes":111,"calls":10,"functions":363,"types":175,"routes_without_response_type":46}],"elapsed_secs":169.4}',
 ];
 
 /**
@@ -72,7 +72,7 @@ test("a build renders as an intro, one step per phase and the counts", async () 
     [
       "┌  carrick 0.3.81",
       `◇  indexing api  95 files, ${elapsed(0)}`,
-      "◇  111 routes · 10 calls · 46 routes without a response type",
+      "◇  111 routes · 363 functions · 175 types · 10 external calls · 46 routes without a response type",
       "└  Your agents can query it now. `carrick index --verbose` shows the full report.",
     ],
   );
@@ -98,7 +98,7 @@ test("the plain rendering is the same lines, with no banner and no map", async (
   const drawn = written.join("");
   assert.match(drawn, /^carrick 0\.3\.81\n/);
   assert.match(drawn, /◇ indexing api {2}95 files/);
-  assert.match(drawn, /◇ 111 routes · 10 calls · 46 routes without a response type/);
+  assert.match(drawn, /◇ 111 routes · 363 functions · 175 types · 10 external calls/);
   assert.match(drawn, /Your agents can query it now\./);
   assert.ok(!drawn.includes("Carrick run starting"), drawn);
   assert.ok(!drawn.includes("boundary ("), drawn);
@@ -214,20 +214,39 @@ test("counts and durations read the way the line says them", () => {
   assert.equal(
     summaryLine({
       services: [
-        { name: "a", routes: 1, calls: 1, routes_without_response_type: 1 },
-        { name: "b", routes: 110, calls: 9, routes_without_response_type: 45 },
+        { name: "a", routes: 1, calls: 1, functions: 3, types: 5, routes_without_response_type: 1 },
+        {
+          name: "b",
+          routes: 110,
+          calls: 9,
+          functions: 360,
+          types: 170,
+          routes_without_response_type: 45,
+        },
       ],
       elapsed_secs: 1,
     }),
-    "111 routes · 10 calls · 46 routes without a response type",
+    "111 routes · 363 functions · 175 types · 10 external calls · 46 routes without a response type",
   );
-  // Nothing to do about, so nothing said.
+  // Nothing to do about, so nothing said. Calls stay on the line at zero:
+  // "no external calls" is a fact about a service, not a shortfall in it.
   assert.equal(
     summaryLine({
-      services: [{ name: "a", routes: 1, calls: 0, routes_without_response_type: 0 }],
+      services: [
+        { name: "a", routes: 1, calls: 0, functions: 2, types: 1, routes_without_response_type: 0 },
+      ],
       elapsed_secs: 1,
     }),
-    "1 route · 0 calls",
+    "1 route · 2 functions · 1 type · 0 external calls",
+  );
+  // A binary older than carrick#1321 states neither new count, and the line
+  // drops both rather than printing a zero nobody measured.
+  assert.equal(
+    summaryLine({
+      services: [{ name: "a", routes: 4, calls: 2, routes_without_response_type: 0 }],
+      elapsed_secs: 1,
+    }),
+    "4 routes · 2 external calls",
   );
 });
 
@@ -243,7 +262,7 @@ test("the whole stream, end to end, through the spawned binary", async (t) => {
   assert.equal(outcome.code, 0);
   const drawn = written.join("");
   assert.match(drawn, /◇ indexing api {2}95 files/);
-  assert.match(drawn, /◇ 111 routes · 10 calls · 46 routes without a response type/);
+  assert.match(drawn, /◇ 111 routes · 363 functions · 175 types · 10 external calls/);
   assert.ok(!drawn.includes("Carrick run starting"), drawn);
   assert.ok(!drawn.includes("boundary ("), drawn);
   assert.ok(!drawn.includes("SDK call(s) that produced no edge"), drawn);
