@@ -309,12 +309,18 @@ pub fn dts_alias_serves_a_shape(content: &str, alias: &str) -> bool {
     }
 }
 
-/// How many distinct types the bundle declares.
+/// How many distinct types the bundle can be read for.
 ///
-/// Every declaration, placeholder included: the bundle is what
-/// `get_endpoint_types` reads from, and this is its size. Distinct by name,
-/// because an alias appended twice is one type.
-pub fn dts_declared_types(content: &str) -> usize {
+/// Declarations, distinct by name, minus the ones that describe nothing: the
+/// [`MISSING_ALIAS_MARKER`] placeholders, which are Carrick's record that no
+/// shape arrived, and the top-type bodies. A count of every statement in the
+/// bundle would say 175 where 152 can be served, and the number is shown to a
+/// developer as what their agents can read (David's ruling, carrick#1321).
+///
+/// The same predicate the route count uses, for the same reason: a line that
+/// names what the index holds and a line that names what it cannot serve must
+/// not disagree about what counts as a type.
+pub fn dts_servable_types(content: &str) -> usize {
     let Ok(re) =
         regex::Regex::new(r"\b(?:type|interface|class|enum|namespace)\s+([A-Za-z_$][\w$]*)")
     else {
@@ -324,7 +330,9 @@ pub fn dts_declared_types(content: &str) -> usize {
         .filter_map(|found| found.get(1))
         .map(|name| name.as_str())
         .collect::<std::collections::HashSet<_>>()
-        .len()
+        .into_iter()
+        .filter(|name| dts_alias_serves_a_shape(content, name))
+        .count()
 }
 
 /// Append `export type <alias> = <type_string>;` to a bundled `.d.ts`.
@@ -689,23 +697,30 @@ mod tests {
         );
     }
 
-    /// The bundle's size is its distinct declarations, placeholders included:
-    /// it is what `get_endpoint_types` reads from (carrick#1321).
+    /// The bundle counts what a reader can be served, not what it states:
+    /// a placeholder and a top type are declarations that describe nothing,
+    /// and the line is shown to a developer as what their agents can read
+    /// (David's ruling, carrick#1321).
     #[test]
-    fn the_bundle_is_counted_by_distinct_declaration() {
+    fn the_bundle_is_counted_by_the_declarations_worth_reading() {
         let bundle = format!(
             "export type One = {{ a: string }};\n\
              export interface Two {{ b: string }}\n\
              export enum Three {{ A }}\n\
-             export type Four = unknown; {MISSING_ALIAS_MARKER}\n"
+             export type Four = unknown; {MISSING_ALIAS_MARKER}\n\
+             export type Five = any[];\n"
         );
-        assert_eq!(dts_declared_types(&bundle), 4);
+        assert_eq!(
+            dts_servable_types(&bundle),
+            3,
+            "the placeholder and the top type are not types an agent can read"
+        );
         // A name declared twice is one type, and an empty bundle is none.
         assert_eq!(
-            dts_declared_types("export type One = { a: string };\ntype One = number;\n"),
+            dts_servable_types("export type One = { a: string };\ntype One = number;\n"),
             1
         );
-        assert_eq!(dts_declared_types(""), 0);
+        assert_eq!(dts_servable_types(""), 0);
     }
 
     #[test]

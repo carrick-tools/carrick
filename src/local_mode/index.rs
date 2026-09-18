@@ -1079,7 +1079,7 @@ pub(super) fn build(
                 types: blob
                     .bundled_types
                     .as_deref()
-                    .map(crate::type_manifest::dts_declared_types)
+                    .map(crate::type_manifest::dts_servable_types)
                     .unwrap_or(0),
             })
             .collect();

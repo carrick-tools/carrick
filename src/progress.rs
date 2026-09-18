@@ -314,8 +314,11 @@ pub struct ServiceSummary {
     /// alone hid entirely: 363 of them on a service whose first-run line read
     /// `111 routes · 1 call` (carrick#1321).
     pub functions: usize,
-    /// Distinct types the bundled `.d.ts` declares — the request and response
-    /// definitions `get_endpoint_types` serves.
+    /// Distinct types the bundled `.d.ts` can be read for — the request and
+    /// response definitions `get_endpoint_types` serves. Placeholders and
+    /// top-type bodies are declarations that describe nothing, and are not
+    /// counted: the number is shown to a developer as what their agents can
+    /// read (David's ruling, carrick#1321).
     pub types: usize,
     /// Indexed routes with nothing on the producer side of a compatibility
     /// check. The one shortfall worth a first-run line: it is the number that
