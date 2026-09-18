@@ -502,7 +502,15 @@ fn analysing_lines(index_dir: &Path) -> Vec<String> {
                  got ({error}).",
                 job.repo
             ),
-            Ok(status) if status.has_failed() => stopped_line(job, &status),
+            // A stopped job usually holds the answers of every pass that
+            // finished, and `carrick resume` is what collects them. Reported
+            // as "run resume" rather than as a death, so nobody re-dispatches
+            // a repo whose analysis is most of the way done (carrick#1319).
+            Ok(status) if status.state == "cancelled" => cancelled_line(&job.repo),
+            Ok(status) if status.has_failed() && status.answered > 0 => {
+                stopped_with_answers_line(&job.repo, &status)
+            }
+            Ok(status) if status.has_failed() => stopped_line(&job.repo),
             Ok(status) if status.is_ready() => {
                 let waited = super::jobs::since(&job.submitted_at)
                     .map(|ago| format!(" It was handed over {ago} ago."))
@@ -628,45 +636,24 @@ fn resume(root: Option<&Path>) -> Result<(), String> {
             )
         })
         .collect();
-    let mut collected = Vec::new();
-    for (job, status) in jobs.iter().zip(super::jobs::ask(&jobs)) {
-        match status {
-            Err(error) => println!("Could not ask about {}: {error}", job.repo),
-            Ok(status) if status.has_failed() => println!("{}", stopped_line(job, &status)),
-            Ok(status) if !status.is_ready() => println!("{}", waiting_line(job, &status)),
-            Ok(_) => match super::jobs::download(job, &index_dir.join("jobs")) {
-                Ok(ready) => {
-                    // The cloud decides this, not the laptop: a stored index
-                    // row carries no commit, and nothing in a check-or-upload
-                    // response says when one landed or what wrote it
-                    // (carrick-cloud#1006). So the message says what moved and
-                    // never which commit.
-                    println!(
-                        "Collected the analysis of {} ({} file(s)).",
-                        job.repo, ready.rows
-                    );
-                    if ready.superseded {
-                        println!(
-                            "{}",
-                            superseded_line(&job.repo, ready.superseded_by.as_deref())
-                        );
-                    }
-                    resuming.insert(
-                        PathBuf::from(&job.path),
-                        super::index::Resumption {
-                            answers: Some(ready.answers),
-                            superseded: ready.superseded,
-                        },
-                    );
-                    collected.push(job.job_id.clone());
-                }
-                Err(error) => println!("Could not collect the analysis of {}: {error}", job.repo),
-            },
-        }
+    let answers_dir = index_dir.join("jobs");
+    let collection = collect_jobs(&jobs, super::jobs::ask(&jobs), &mut |job| {
+        super::jobs::download(job, &answers_dir)
+    });
+    for line in &collection.lines {
+        println!("{line}");
+    }
+    resuming.extend(collection.resuming);
+    // Nothing more is coming for these and there was nothing in them to
+    // collect, so the record goes now: it has been reported once, and leaving
+    // it would make every later `carrick status` repeat a job nobody can act
+    // on (carrick#1319).
+    if !collection.stopped.is_empty() {
+        super::jobs::forget(&index_dir, &collection.stopped)?;
     }
     // Nothing was collected: every job is still running, and a build now would
     // write an index missing the repos they cover.
-    if collected.is_empty() {
+    if collection.collected.is_empty() {
         return Ok(());
     }
 
@@ -678,8 +665,8 @@ fn resume(root: Option<&Path>) -> Result<(), String> {
     // Only once the index is written. A resume that died half way through
     // leaves the job where it was, so running it again collects the same
     // answers rather than asking for them all over again.
-    super::jobs::forget(&index_dir, &collected)?;
-    for id in &collected {
+    super::jobs::forget(&index_dir, &collection.collected)?;
+    for id in &collection.collected {
         let _ = std::fs::remove_file(
             index_dir
                 .join("jobs")
@@ -687,6 +674,125 @@ fn resume(root: Option<&Path>) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// What a resume decided about the jobs this workspace recorded.
+#[derive(Default)]
+struct Collection {
+    /// What to say, one job at a time, in the order they were recorded.
+    lines: Vec<String>,
+    /// The repos this build scans with answers in hand.
+    resuming: std::collections::BTreeMap<PathBuf, super::index::Resumption>,
+    /// The jobs whose answers this build is about to replay. Forgotten once
+    /// the index is written, so a resume that dies half way through can be run
+    /// again.
+    collected: Vec<String>,
+    /// The jobs nothing more is coming for that held nothing to collect.
+    /// Forgotten as soon as they are reported: there is no index to wait for.
+    stopped: Vec<String>,
+}
+
+/// Decide what to do about each recorded job, given what the cloud said about
+/// it and a way to fetch its answers.
+///
+/// Separated from `resume` so the decision can be driven with a stub rather
+/// than a network: the case it exists for is a job the cloud calls `failed`,
+/// which is exactly the one no live test can arrange (carrick#1319).
+///
+/// A stopped job is COLLECTED before it is reported. The cloud serves the
+/// answers of a job in any state but queued, running and cancelled, and a
+/// driver that stopped half way through has already written every part it
+/// finished — abandoning them would throw away work the analysis already did,
+/// and the answers are the whole reason the job was handed over.
+fn collect_jobs(
+    jobs: &[super::jobs::Job],
+    statuses: Vec<Result<super::jobs::JobStatus, String>>,
+    download: &mut dyn FnMut(&super::jobs::Job) -> Result<Option<super::jobs::Collected>, String>,
+) -> Collection {
+    let mut collection = Collection::default();
+    for (job, status) in jobs.iter().zip(statuses) {
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                collection
+                    .lines
+                    .push(format!("Could not ask about {}: {error}", job.repo));
+                continue;
+            }
+        };
+        // Somebody's decision, and the cloud refuses to serve its answers, so
+        // there is nothing to fetch and nothing to keep the record for.
+        if status.state == "cancelled" {
+            collection.lines.push(cancelled_line(&job.repo));
+            collection.stopped.push(job.job_id.clone());
+            continue;
+        }
+        if !status.has_failed() && !status.is_ready() {
+            collection.lines.push(waiting_line(job, &status));
+            continue;
+        }
+        if status.failure_reason.as_deref() == Some("driver_stopped") {
+            tracing::debug!("Job {} stopped being worked on", job.job_id);
+        }
+        match download(job) {
+            Ok(Some(ready)) => {
+                collection.lines.push(if status.has_failed() {
+                    // Said as a count, because the rest of the repo is
+                    // analysed by the build this is about to start: a resume
+                    // of a stopped job finishes here rather than in the cloud.
+                    format!(
+                        "Carrick Cloud stopped analysing {} before it finished. Collected the {} \
+                         file(s) it answered; the rest are analysed here.",
+                        job.repo, ready.rows
+                    )
+                } else {
+                    // The cloud decides this, not the laptop: a stored index
+                    // row carries no commit, and nothing in a check-or-upload
+                    // response says when one landed or what wrote it
+                    // (carrick-cloud#1006). So the message says what moved and
+                    // never which commit.
+                    format!(
+                        "Collected the analysis of {} ({} file(s)).",
+                        job.repo, ready.rows
+                    )
+                });
+                if ready.superseded {
+                    collection
+                        .lines
+                        .push(superseded_line(&job.repo, ready.superseded_by.as_deref()));
+                }
+                collection.resuming.insert(
+                    PathBuf::from(&job.path),
+                    super::index::Resumption {
+                        answers: Some(ready.answers),
+                        superseded: ready.superseded,
+                    },
+                );
+                collection.collected.push(job.job_id.clone());
+            }
+            // The cloud answered, and the job holds nothing.
+            Ok(None) => {
+                if status.has_failed() {
+                    collection.lines.push(stopped_line(&job.repo));
+                    collection.stopped.push(job.job_id.clone());
+                } else {
+                    collection.lines.push(format!(
+                        "Could not collect the analysis of {}: Carrick Cloud did not say where \
+                         this job's answers are.",
+                        job.repo
+                    ));
+                }
+            }
+            // This machine could not ask, which says nothing about the job.
+            // The record stays: it is the only handle on answers that may well
+            // be there.
+            Err(error) => collection.lines.push(format!(
+                "Could not collect the analysis of {}: {error}",
+                job.repo
+            )),
+        }
+    }
+    collection
 }
 
 /// What a resume says when the index it is finishing is not the one the cloud
@@ -708,26 +814,40 @@ fn superseded_line(repo: &str, by: Option<&str>) -> String {
     )
 }
 
-/// What both say about a job that is not going to finish.
+/// What `status` and `resume` say about a job that stopped with nothing in it.
 ///
-/// A cancelled job was somebody's decision and needs no explanation; a failed
-/// one is ours, and the move is the same either way — index the repo here.
-fn stopped_line(job: &super::jobs::Job, status: &super::jobs::JobStatus) -> String {
-    if status.state == "cancelled" {
-        return format!(
-            "The analysis of {} was cancelled. Run `carrick index` to index it here.",
-            job.repo
-        );
-    }
-    // `driver_stopped` is a job nothing is working on any more, which reads
-    // the same to the user as one that failed outright and is worth separating
-    // only in what we log.
-    if status.failure_reason.as_deref() == Some("driver_stopped") {
-        tracing::debug!("Job {} stopped being worked on", job.job_id);
-    }
+/// The move is to hand it over again, not to index the repo here: whoever
+/// dispatched did so because this machine could not stay awake for the
+/// analysis, and `carrick index` is the one thing they cannot do
+/// (carrick#1319).
+fn stopped_line(repo: &str) -> String {
     format!(
-        "The analysis of {} did not finish. Run `carrick index` to index it here.",
-        job.repo
+        "Carrick Cloud stopped analysing {repo} and answered nothing. Run `carrick index \
+         --dispatch` to hand it over again."
+    )
+}
+
+/// What `status` says about a job that stopped part way through: how much of
+/// it is sitting there, and the command that collects it.
+fn stopped_with_answers_line(repo: &str, status: &super::jobs::JobStatus) -> String {
+    let of = if status.total_rows > 0 {
+        format!(" of {}", status.total_rows)
+    } else {
+        String::new()
+    };
+    format!(
+        "Carrick Cloud stopped analysing {repo} after {}{of} files. Run `carrick resume` to \
+         collect them and finish the index.",
+        status.answered
+    )
+}
+
+/// A job somebody cancelled. Both moves are open — it was a decision, not a
+/// failure — and the cloud serves nothing for it either way.
+fn cancelled_line(repo: &str) -> String {
+    format!(
+        "The analysis of {repo} was cancelled. Run `carrick index --dispatch` to hand it over \
+         again, or `carrick index` to index it here."
     )
 }
 
@@ -1396,6 +1516,143 @@ mod tests {
             kept_here_line("web", NotDispatched::NothingToAnalyse),
             "Nothing was handed over for web: nothing in it needed the analyzer. `carrick resume` \
              indexes it with the rest."
+        );
+    }
+
+    fn dispatched_job(repo: &str, id: &str) -> crate::local_mode::jobs::Job {
+        crate::local_mode::jobs::Job {
+            repo: repo.to_string(),
+            path: format!("/w/{repo}"),
+            job_id: id.to_string(),
+            commit: "abc1234".to_string(),
+            analyze_rows: 1017,
+            submitted_at: "2026-09-17T21:00:00Z".to_string(),
+        }
+    }
+
+    /// The deployed body of a job whose driver stopped renewing, with the
+    /// answers of the passes that did finish sitting behind it.
+    fn stopped_status() -> crate::local_mode::jobs::JobStatus {
+        serde_json::from_value(serde_json::json!({
+            "state": "failed", "failure_reason": "driver_stopped",
+            "answered": 192, "total_rows": 1017
+        }))
+        .unwrap()
+    }
+
+    fn collected(rows: usize) -> crate::local_mode::jobs::Collected {
+        crate::local_mode::jobs::Collected {
+            answers: PathBuf::from("/w/.carrick/jobs/answers-j1.ndjson.gz"),
+            rows,
+            superseded: false,
+            superseded_by: None,
+        }
+    }
+
+    /// A job the cloud gave up on is still worth asking for.
+    ///
+    /// The incident: a driver killed at the Lambda limit left 192 of 1017
+    /// files answered and stored, and every read of that job — `status` and
+    /// `resume` both — reported the death without ever calling
+    /// `analysis-job-answers`, which serves a job in any state but queued,
+    /// running and cancelled. The rows were reachable the whole time
+    /// (carrick#1319).
+    #[test]
+    fn a_stopped_job_is_collected_before_it_is_reported() {
+        let job = dispatched_job("owner/api", "j1");
+        let mut asked = 0;
+        let collection = collect_jobs(
+            std::slice::from_ref(&job),
+            vec![Ok(stopped_status())],
+            &mut |_| {
+                asked += 1;
+                Ok(Some(collected(192)))
+            },
+        );
+        assert_eq!(asked, 1, "the answers of a stopped job are asked for");
+        assert_eq!(collection.collected, vec!["j1".to_string()]);
+        assert_eq!(
+            collection
+                .resuming
+                .get(Path::new("/w/owner/api"))
+                .and_then(|resumption| resumption.answers.clone()),
+            Some(PathBuf::from("/w/.carrick/jobs/answers-j1.ndjson.gz")),
+            "the build replays what the stopped job did answer"
+        );
+        assert!(
+            collection.stopped.is_empty(),
+            "a collected job is forgotten after the index is written, not before"
+        );
+        assert!(
+            collection.lines[0].contains("Collected the 192 file(s)"),
+            "{:?}",
+            collection.lines
+        );
+    }
+
+    /// And when there is genuinely nothing in it, the record goes.
+    ///
+    /// `jobs::forget` ran only for collected jobs, so a job nobody could act
+    /// on was repeated by every later `carrick status` for the fortnight the
+    /// cloud row lives.
+    #[test]
+    fn a_stopped_job_holding_nothing_is_forgotten() {
+        let job = dispatched_job("owner/api", "j1");
+        let collection = collect_jobs(
+            std::slice::from_ref(&job),
+            vec![Ok(stopped_status())],
+            &mut |_| Ok(None),
+        );
+        assert_eq!(collection.stopped, vec!["j1".to_string()]);
+        assert!(collection.collected.is_empty());
+        assert!(collection.resuming.is_empty());
+    }
+
+    /// A machine that could not ask keeps its record.
+    ///
+    /// The discriminator is whether the CLOUD answered: `Ok(None)` is a job
+    /// that holds nothing, and an error is a laptop on a train. Forgetting on
+    /// either would drop the only local handle on answers that are there.
+    #[test]
+    fn a_stopped_job_this_machine_could_not_reach_keeps_its_record() {
+        let job = dispatched_job("owner/api", "j1");
+        let collection = collect_jobs(
+            std::slice::from_ref(&job),
+            vec![Ok(stopped_status())],
+            &mut |_| Err("Could not reach Carrick Cloud".to_string()),
+        );
+        assert!(collection.stopped.is_empty(), "{:?}", collection.lines);
+        assert!(collection.collected.is_empty());
+    }
+
+    /// What a stopped job's lines tell the reader to do.
+    ///
+    /// Never `carrick index` on its own: whoever dispatched did it because
+    /// this machine could not run the analysis, so an instruction to index
+    /// here is an instruction they cannot follow (carrick#1319).
+    #[test]
+    fn a_stopped_job_is_told_how_to_resume_it_not_to_index_here() {
+        let with_answers = stopped_with_answers_line("owner/api", &stopped_status());
+        assert!(
+            with_answers.contains("192 of 1017 files") && with_answers.contains("`carrick resume`"),
+            "{with_answers}"
+        );
+        assert!(
+            stopped_line("owner/api").contains("`carrick index --dispatch`"),
+            "a job with nothing in it is handed over again"
+        );
+        for line in [with_answers, stopped_line("owner/api")] {
+            assert!(
+                !line.contains("Run `carrick index` to index it here"),
+                "{line}"
+            );
+        }
+        // Cancelling was a decision, so both moves are offered.
+        let cancelled = cancelled_line("owner/api");
+        assert!(
+            cancelled.contains("`carrick index --dispatch`")
+                && cancelled.contains("`carrick index`"),
+            "{cancelled}"
         );
     }
 

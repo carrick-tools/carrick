@@ -253,12 +253,17 @@ impl JobReader {
     /// To a file rather than into memory: the answers are large, the scan
     /// subprocess is the thing that reads them, and a path is what crosses
     /// that boundary.
+    ///
+    /// `Ok(None)` is a job the cloud answered for and that holds nothing: no
+    /// pass of it ever wrote an object. It is a value rather than an error
+    /// because a caller deciding whether to keep the local record has to tell
+    /// it apart from a machine that could not ask (carrick#1319).
     pub async fn answers(
         &self,
         credential: &Credential,
         job: &Job,
         into: &Path,
-    ) -> Result<Collected, String> {
+    ) -> Result<Option<Collected>, String> {
         let value = self
             .post(
                 credential,
@@ -277,7 +282,7 @@ impl JobReader {
             ));
         }
         if response.parts.is_empty() {
-            return Err("Carrick Cloud did not say where this job's answers are".to_string());
+            return Ok(None);
         }
         // One object per PASS, not one per job (carrick-cloud#1006): a pass
         // writes what it has before it hands on, so nothing anywhere holds the
@@ -305,12 +310,12 @@ impl JobReader {
         writer
             .finish()
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(Collected {
+        Ok(Some(Collected {
             answers: path,
             rows: response.parts.iter().map(|part| part.rows).sum(),
             superseded: response.superseded,
             superseded_by: response.current_index.and_then(|index| index.source),
-        })
+        }))
     }
 
     /// GET one part, with the three conditions a link this machine follows
@@ -432,8 +437,9 @@ pub fn ask(jobs: &[Job]) -> Vec<Result<JobStatus, String>> {
     .unwrap_or_else(|_| jobs.iter().map(|_| Err(UNREACHABLE.to_string())).collect())
 }
 
-/// Download one job's answers, and say where they landed.
-pub fn download(job: &Job, into: &Path) -> Result<Collected, String> {
+/// Download one job's answers, and say where they landed. `Ok(None)` is a job
+/// that holds none.
+pub fn download(job: &Job, into: &Path) -> Result<Option<Collected>, String> {
     let credential = Credential::load()?.ok_or(SIGNED_OUT)?;
     let job = job.clone();
     let into = into.to_path_buf();
