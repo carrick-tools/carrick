@@ -960,6 +960,8 @@ mod drift_tests {
             boundary: None,
             routes: 0,
             calls: 0,
+            functions: 0,
+            types: 0,
         }
     }
 

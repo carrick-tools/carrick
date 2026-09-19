@@ -1129,9 +1129,12 @@ fn build_workspace(
 /// The counts a finished build states to whoever is rendering it.
 ///
 /// Read off the same index the map prints, service by service, so the two
-/// cannot disagree. `routes_without_response_type` is the one shortfall
-/// carried: it says how much of this index has a producer side to check a
-/// consumer against, and the rest of the boundary is a diagnostic.
+/// cannot disagree. Routes and calls were the whole of it, and on a service
+/// of 111 routes, 363 functions and 175 types that read as a nearly empty
+/// index (carrick#1321) — so the two largest things the index holds are
+/// carried too. `routes_without_response_type` is the one shortfall: it says
+/// how much of this index has a producer side to check a consumer against,
+/// and the rest of the boundary is a diagnostic.
 fn summary(outcome: &super::index::IndexOutcome) -> crate::progress::Summary {
     let services = outcome
         .index
@@ -1142,6 +1145,8 @@ fn summary(outcome: &super::index::IndexOutcome) -> crate::progress::Summary {
             name: service.name.clone(),
             routes: service.routes,
             calls: service.calls,
+            functions: service.functions,
+            types: service.types,
             routes_without_response_type: service
                 .boundary
                 .as_ref()

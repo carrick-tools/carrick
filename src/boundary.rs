@@ -450,8 +450,22 @@ fn routes_without_a_type(
     )
 }
 
-/// Every operation of `role` with no resolved response type, as its reason
-/// line and its `(file, line)` site when the row states one.
+/// Every operation of `role` the index has no shape to serve for, as its
+/// reason line and its `(file, line)` site when the row states one.
+///
+/// "Has a shape to serve" is the question `get_endpoint_types` answers, and
+/// there are two ways the index answers it: the manifest entry carries a
+/// `resolved_definition`, or the bundled `.d.ts` declares the entry's alias
+/// with a body worth reading.
+///
+/// It used to be the first of those alone, and the two disagree far more often
+/// than they look like they would: a shape reaches the bundle and then a
+/// single `any` at any depth of its expansion — one `Record<string, any>`
+/// jsonb column, reached through a relation — withholds the
+/// `resolved_definition` (the mechanism carrick#540 describes). On one
+/// 111-route service that was 46 routes reported as having no response type
+/// while the index served a full definition for 45 of them (carrick#1321). A
+/// count that contradicts what the same index serves is worse than no count.
 fn untyped_operations(
     data: &CloudRepoData,
     role: ManifestRole,
@@ -461,11 +475,15 @@ fn untyped_operations(
         ManifestRole::Consumer => &data.calls,
     };
     let manifest = data.type_manifest.as_deref().unwrap_or_default();
+    let bundle = data.bundled_types.as_deref().unwrap_or_default();
     let typed: HashSet<(String, String)> = manifest
         .iter()
         .filter(|entry| entry.role == role)
         .filter(|entry| matches!(entry.type_kind, ManifestTypeKind::Response))
-        .filter(|entry| entry.resolved_definition.is_some())
+        .filter(|entry| {
+            entry.resolved_definition.is_some()
+                || crate::type_manifest::dts_alias_serves_a_shape(bundle, &entry.type_alias)
+        })
         .map(|entry| (entry.key.canonical(), entry.file_path.clone()))
         .collect();
     operations.iter().filter_map(move |operation| {
@@ -542,6 +560,113 @@ mod tests {
         assert_eq!(boundary.sdk_unresolved.total, 4);
         assert_eq!(boundary.sdk_unresolved.reasons.len(), 2);
         assert!(boundary.sdk_unresolved.reasons[0].contains("@org/ledger ×3"));
+    }
+
+    /// A route the index can serve a definition for is not a route without a
+    /// response type, whatever the manifest's `resolved_definition` says
+    /// (carrick#1321).
+    ///
+    /// The three rows are the three cases a real service mixes: a shape that
+    /// reached the bundle but whose expansion holds one `any` at depth, so the
+    /// manifest withheld its `resolved_definition`; a shape that is `any[]` and
+    /// serves nothing; and the placeholder the bundler writes for an alias that
+    /// never arrived. Only the last two are a shortfall.
+    #[test]
+    fn a_route_whose_shape_the_bundle_serves_is_not_counted_as_untyped() {
+        use crate::cloud_storage::CloudRepoData;
+        use crate::type_manifest::MISSING_ALIAS_MARKER;
+
+        let endpoint = |path: &str, line: u32| {
+            serde_json::json!({
+                "owner": { "App": "UsersController" },
+                "key": { "protocol": "http", "method": "GET", "path": path },
+                "params": [],
+                "request_body": null,
+                "response_body": null,
+                "handler_name": null,
+                "request_type": null,
+                "response_type": null,
+                "file_path": format!("src/users.controller.ts:{line}"),
+                "provenance": "route",
+                "resolution_source": "decorator_route"
+            })
+        };
+        let entry = |path: &str, line: u32, alias: &str| {
+            serde_json::json!({
+                "protocol": "http",
+                "method": "GET",
+                "path": path,
+                "role": "producer",
+                "type_kind": "response",
+                "type_alias": alias,
+                "file_path": "src/users.controller.ts",
+                "line_number": line,
+                "is_explicit": false,
+                "type_state": "unknown",
+                "evidence": {
+                    "file_path": "src/users.controller.ts",
+                    "span_start": null,
+                    "span_end": null,
+                    "line_number": line,
+                    "infer_kind": "response_body",
+                    "is_explicit": false,
+                    "type_state": "unknown"
+                }
+            })
+        };
+
+        let bundle = format!(
+            "export type Served = {{ id: string; tenant: {{ settings: Record<string, any> }} }};\n\
+             export type TopType = any[];\n\
+             export type NeverArrived = unknown; {MISSING_ALIAS_MARKER}\n"
+        );
+        let blob = serde_json::json!({
+            "repo_name": "acme/app",
+            "endpoints": [endpoint("/a", 10), endpoint("/b", 20), endpoint("/c", 30)],
+            "calls": [],
+            "mounts": [],
+            "apps": {},
+            "imported_handlers": [],
+            "function_definitions": {},
+            "config_json": null,
+            "package_json": null,
+            "packages": null,
+            "last_updated": "2026-01-01T00:00:00Z",
+            "commit_hash": "abc1234",
+            "bundled_types": bundle,
+            "type_manifest": [
+                entry("/a", 10, "Served"),
+                entry("/b", 20, "TopType"),
+                entry("/c", 30, "NeverArrived"),
+            ]
+        });
+        let data: CloudRepoData = serde_json::from_value(blob).expect("the blob reads");
+        assert!(
+            data.type_manifest
+                .as_ref()
+                .expect("a manifest")
+                .iter()
+                .all(|entry| entry.resolved_definition.is_none()),
+            "the point of the test is that none of the three has one"
+        );
+
+        let boundary =
+            ServiceBoundary::collect(&data, &ProcessingStats::default(), &HashMap::new(), "/repo");
+
+        assert_eq!(
+            boundary.routes_without_response_type.total, 2,
+            "only the top type and the placeholder are a shortfall: {:?}",
+            boundary.routes_without_response_type.reasons
+        );
+        let counted = boundary.routes_without_response_type.reasons.join(" ");
+        assert!(
+            !counted.contains("/a"),
+            "the served route is not counted: {counted}"
+        );
+        assert!(
+            counted.contains("/b") && counted.contains("/c"),
+            "{counted}"
+        );
     }
 
     /// The scan counts its losses while it still speaks in absolute paths, so

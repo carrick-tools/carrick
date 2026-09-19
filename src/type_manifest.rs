@@ -254,6 +254,87 @@ pub fn dts_alias_is_trivially_unknown(content: &str, alias: &str) -> bool {
     }
 }
 
+/// The body the bundle states for `alias`, when it states one as a type alias.
+///
+/// `None` for an alias declared as an interface, class, enum or namespace —
+/// those are declarations with no right-hand side, and the caller reads the
+/// absence as "declared, shape unknown from here" rather than as "absent".
+fn dts_alias_body(content: &str, alias: &str) -> Option<String> {
+    let escaped = regex::escape(alias);
+    // Up to the first `;` that ends the statement. `[^=\n]*` skips generics
+    // and modifiers between the name and the `=` without crossing a line.
+    let pattern = format!(r"\btype\s+{escaped}\b[^=\n]*=\s*(?s)(.*?);");
+    let re = regex::Regex::new(&pattern).ok()?;
+    let body = re.captures(content)?.get(1)?.as_str().trim().to_string();
+    Some(body)
+}
+
+/// A body that describes nothing: the top types, and the arrays of them.
+///
+/// Narrower than [`crate::engine::type_compat_v2::contains_disqualifying_top_type`],
+/// deliberately. That one rejects an `any` at ANY depth, which is what decides
+/// whether two shapes can be COMPARED; this one asks whether the bundle holds
+/// a shape worth serving at all. A definition whose one jsonb column is
+/// `Record<string, any>` is rejected by the first and kept by this: an agent
+/// reading it learns every other field (carrick#1321, and the mechanism
+/// carrick#540 describes).
+fn describes_nothing(body: &str) -> bool {
+    let body = body.trim().trim_end_matches(';').trim();
+    let body = body.strip_suffix("[]").unwrap_or(body).trim();
+    let body = body
+        .strip_prefix("Array<")
+        .and_then(|rest| rest.strip_suffix('>'))
+        .unwrap_or(body)
+        .trim();
+    matches!(body, "any" | "unknown" | "")
+}
+
+/// Whether the bundle holds a shape for `alias` that a reader can be served.
+///
+/// Three ways it does not: the bundle says nothing about the alias, it carries
+/// only the [`MISSING_ALIAS_MARKER`] placeholder, or the body it carries is a
+/// top type. This is the question `get_endpoint_types` effectively answers, so
+/// it is the question a count of "routes without a response type" has to ask —
+/// counting rows by `resolved_definition` instead reported 46 of one service's
+/// 111 routes as untyped while the index served a full definition for 45 of
+/// them (carrick#1321).
+pub fn dts_alias_serves_a_shape(content: &str, alias: &str) -> bool {
+    if !dts_defines_alias(content, alias) || dts_alias_is_trivially_unknown(content, alias) {
+        return false;
+    }
+    match dts_alias_body(content, alias) {
+        Some(body) => !describes_nothing(&body),
+        // An interface or a class: a declaration with members, not a body.
+        None => true,
+    }
+}
+
+/// How many distinct types the bundle can be read for.
+///
+/// Declarations, distinct by name, minus the ones that describe nothing: the
+/// [`MISSING_ALIAS_MARKER`] placeholders, which are Carrick's record that no
+/// shape arrived, and the top-type bodies. A count of every statement in the
+/// bundle would say 175 where 152 can be served, and the number is shown to a
+/// developer as what their agents can read (David's ruling, carrick#1321).
+///
+/// The same predicate the route count uses, for the same reason: a line that
+/// names what the index holds and a line that names what it cannot serve must
+/// not disagree about what counts as a type.
+pub fn dts_servable_types(content: &str) -> usize {
+    let Ok(re) =
+        regex::Regex::new(r"\b(?:type|interface|class|enum|namespace)\s+([A-Za-z_$][\w$]*)")
+    else {
+        return 0;
+    };
+    re.captures_iter(content)
+        .filter_map(|found| found.get(1))
+        .map(|name| name.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .filter(|name| dts_alias_serves_a_shape(content, name))
+        .count()
+}
+
 /// Append `export type <alias> = <type_string>;` to a bundled `.d.ts`.
 ///
 /// A bare `unknown` type string is not a shape — it is the writer saying it has
@@ -567,6 +648,81 @@ mod tests {
     }
 
     /// An alias the bundle already declares keeps its declaration.
+    /// What the bundle can be served for, and what it cannot (carrick#1321).
+    ///
+    /// The first case is the whole reason this predicate exists: a definition
+    /// whose one jsonb column is `Record<string, any>` is a shape an agent can
+    /// read every other field of, and the manifest withholds its
+    /// `resolved_definition` for exactly that `any`.
+    #[test]
+    fn a_shape_worth_serving_is_told_from_one_that_describes_nothing() {
+        let bundle = format!(
+            "export type Deep = {{ id: string; settings: Record<string, any> }};\n\
+             export interface Members {{ id: string }}\n\
+             export type Loose = any;\n\
+             export type LooseList = any[];\n\
+             export type Wrapped = Array<unknown>;\n\
+             export type Absent = unknown; {MISSING_ALIAS_MARKER}\n\
+             export type Honest = unknown;\n"
+        );
+
+        for alias in ["Deep", "Members"] {
+            assert!(
+                dts_alias_serves_a_shape(&bundle, alias),
+                "{alias} is a shape a reader can be served"
+            );
+        }
+        // `Honest` is a developer's own `= unknown`, and it is NOT the
+        // placeholder: [`dts_alias_is_trivially_unknown`] says so, and #244
+        // turns on that distinction. It still serves no shape. The two
+        // questions are different — "did a shape reach the bundle" versus
+        // "is there something here to check a consumer against" — and this
+        // predicate asks the second.
+        for alias in [
+            "Loose",
+            "LooseList",
+            "Wrapped",
+            "Absent",
+            "Honest",
+            "NotThere",
+        ] {
+            assert!(
+                !dts_alias_serves_a_shape(&bundle, alias),
+                "{alias} describes nothing"
+            );
+        }
+        assert!(
+            !dts_alias_is_trivially_unknown(&bundle, "Honest"),
+            "a developer's own `= unknown` is still not Carrick's placeholder"
+        );
+    }
+
+    /// The bundle counts what a reader can be served, not what it states:
+    /// a placeholder and a top type are declarations that describe nothing,
+    /// and the line is shown to a developer as what their agents can read
+    /// (David's ruling, carrick#1321).
+    #[test]
+    fn the_bundle_is_counted_by_the_declarations_worth_reading() {
+        let bundle = format!(
+            "export type One = {{ a: string }};\n\
+             export interface Two {{ b: string }}\n\
+             export enum Three {{ A }}\n\
+             export type Four = unknown; {MISSING_ALIAS_MARKER}\n\
+             export type Five = any[];\n"
+        );
+        assert_eq!(
+            dts_servable_types(&bundle),
+            3,
+            "the placeholder and the top type are not types an agent can read"
+        );
+        // A name declared twice is one type, and an empty bundle is none.
+        assert_eq!(
+            dts_servable_types("export type One = { a: string };\ntype One = number;\n"),
+            1
+        );
+        assert_eq!(dts_servable_types(""), 0);
+    }
+
     #[test]
     fn append_missing_aliases_leaves_a_declared_alias_alone() {
         let dts = "export interface Payment { id: string }\n".to_string();

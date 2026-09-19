@@ -58,7 +58,7 @@ err('@carrick-phase {"label":"joining the workspace","state":"started"}');
 err("✓ joined the workspace");
 err('@carrick-phase {"label":"joined the workspace","state":"done"}');
 err(
-  '@carrick-summary {"services":[{"name":"pan-api","routes":111,"calls":10,"routes_without_response_type":46}],"elapsed_secs":169.4}',
+  '@carrick-summary {"services":[{"name":"pan-api","routes":111,"calls":10,"functions":363,"types":175,"routes_without_response_type":46}],"elapsed_secs":169.4}',
 );
 
 out("");
