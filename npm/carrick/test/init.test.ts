@@ -36,6 +36,7 @@ import {
   init,
   SCAFFOLD_SENTENCE,
 } from "../src/init/run.ts";
+import { taskSkillPaths } from "../src/init/task-skills.ts";
 import { hostedReport } from "../src/init/hosted.ts";
 import { DOCS, interactiveOutput, plainOutput } from "../src/init/output.ts";
 import { Writable } from "node:stream";
@@ -719,11 +720,11 @@ function pathsUnder(root: string): string[] {
 }
 
 // The pinned set (carrick#974). The first run leaves the repository as it
-// found it apart from the ignored `.carrick` directory and the hook settings:
-// carrick.json is the agent's to write, after someone has read it, and before
-// the one paid scan (carrick-cloud#799). A change to this set is a deliberate
-// diff in this list.
-test("a first init writes the proposal, its ignore file and the hook settings, and nothing else", posixNativeFixture, () => {
+// found it apart from the ignored `.carrick` directory, the hook settings and
+// the task skills the two harnesses read: carrick.json is the agent's to write,
+// after someone has read it, and before the one paid scan
+// (carrick-cloud#799). A change to this set is a deliberate diff in this list.
+test("a first init writes the proposal, its ignore file, the hook settings and the task skills, and nothing else", posixNativeFixture, () => {
   const fixture = executableInitFixture("payments", "absent", "monorepo");
   try {
     const result = spawnSync(
@@ -735,6 +736,10 @@ test("a first init writes the proposal, its ignore file and the hook settings, a
     // ends 0 is a run that asked it for no scan.
     assert.equal(result.status, 0, result.stderr);
 
+    // The run says it installed them, so the wiring is reached and not only
+    // the writer underneath it.
+    assert.match(result.stdout, /Task skills installed in .+: carrick-impact, /);
+
     const onPath =
       spawnSync(process.platform === "win32" ? "where" : "which", ["carrick"], { stdio: "ignore" })
         .status === 0;
@@ -744,16 +749,18 @@ test("a first init writes the proposal, its ignore file and the hook settings, a
         path.join(".carrick", ".gitignore"),
         PROPOSAL_FILE,
         path.join(".claude", onPath ? "settings.json" : "settings.local.json"),
+        ...taskSkillPaths(),
       ].sort(),
     );
 
     // The proposal is the whole derivation, including the config it would once
     // have written into the tree.
     // And the set is ignored where it has to be: all git can see in the tree
-    // after a first run is the settings directory.
+    // after a first run is the two agent directories, which hold the settings
+    // and the skills and are meant to be committed.
     assert.equal(
       execFileSync("git", ["-C", fixture.repo, "status", "--porcelain"], { encoding: "utf8" }),
-      "?? .claude/\n",
+      "?? .agents/\n?? .claude/\n",
     );
 
     const proposal = JSON.parse(fs.readFileSync(path.join(fixture.repo, PROPOSAL_FILE), "utf8"));

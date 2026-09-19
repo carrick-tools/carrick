@@ -26,6 +26,8 @@ import { downloadHostedIndex, hostedReport, nativeRunner } from "./hosted.ts";
 import { ensureProject, projectStep, SLUG } from "./projects.ts";
 import { connectMcpClients, mcpLine, type McpOutcome } from "./mcp.ts";
 import { hookCommand, mergeCarrickHooks, removeCarrickHooks } from "./settings.ts";
+import { ignoredSkillRoots, taskSkillLines, writeTaskSkills } from "./task-skills.ts";
+import { writeIfChanged } from "./files.ts";
 import { createOutput, DOCS, type InitOutput } from "./output.ts";
 import { renderTemplate } from "../templates.ts";
 
@@ -124,14 +126,6 @@ function help(): string {
     "",
     `The editor extension, the hooks, CI and a carrick.json written by hand: ${DOCS}`,
   ].join("\n");
-}
-
-function writeIfChanged(target: string, body: string): "written" | "unchanged" {
-  const existing = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : null;
-  if (existing === body) return "unchanged";
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, body);
-  return "written";
 }
 
 /** Whether a command answers on this machine, for a line we should not print. */
@@ -270,6 +264,10 @@ export async function init(argv: string[]): Promise<number> {
   // The repos the workspace read found an index for: where CI has already built
   // one, this run reads it rather than ordering a scan (carrick#993 row 2).
   const hostedIndex: string[] = [];
+  // The project the skills are written against, once it is settled. It stays
+  // null where no repo here names a GitHub repository, and the skills then
+  // tell the agent to read the scope from the git remote instead.
+  let projectSlug: string | null = null;
   try {
     // A machine that has never signed in signs in here rather than being told
     // to run another command: `carrick login` is the same browser round trip,
@@ -357,6 +355,7 @@ export async function init(argv: string[]): Promise<number> {
     } else if (!reposAreInProject(initial, names, project)) {
       projectExists = await ensureProject(credential.token, project, prompts);
     }
+    projectSlug = project;
     const identity = await connectRepos(credential.token, names, initial, {
       interactive,
       project: project ?? undefined,
@@ -461,6 +460,25 @@ export async function init(argv: string[]): Promise<number> {
       `Could not configure Carrick hooks: ${(error as Error).message}. Fix ${settingsName} and run carrick init again.`,
     );
   }
+  // The task skills, beside the hooks and independent of them: a settings file
+  // somebody hand-edited into invalid JSON is no reason to withhold the bodies
+  // an agent reads. A file this package did not write, or one somebody has
+  // since changed, is left alone and named.
+  try {
+    const { done, warn } = taskSkillLines(writeTaskSkills(workspace, { slug: projectSlug }));
+    for (const line of done) out.done(line);
+    for (const line of warn) out.warn(line);
+    const ignored = ignoredSkillRoots(workspace);
+    if (ignored.length > 0) {
+      const one = ignored.length === 1;
+      out.warn(
+        `${ignored.join(" and ")} ${one ? "is" : "are"} git-ignored here, so these skills stay on this machine. Track ${one ? "it" : "them"} to give the rest of the team the same answers.`,
+      );
+    }
+  } catch (error) {
+    out.refuse(`Could not write the task skills: ${(error as Error).message}`);
+  }
+
   const mcp = connectMcpClients();
   if (hooksWritten) out.done(configuredLine(mcp));
   for (const line of mcpClientLines(mcp)) out.done(line);

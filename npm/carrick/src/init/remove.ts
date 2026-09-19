@@ -15,12 +15,18 @@
 // `writeProposal` / the `.carrick` removal below, `saveCredential` /
 // `removeCredential` in `../auth/credentials.ts`.
 //
-// What it does NOT do is edit a tracked file. The scaffold pull request put
-// files in the repository and a repository is version controlled: those are
-// listed with the `git rm` line that removes them, and the sections that were
-// merged into files someone else owns are named for a human to delete. A
-// command that rewrote a committed workflow or an AGENTS.md would be
-// destroying work this command cannot read.
+// What it does NOT do is edit a file whose content it cannot reproduce. The
+// scaffold pull request put files in the repository and a repository is
+// version controlled: those are listed with the `git rm` line that removes
+// them, and the sections that were merged into files someone else owns are
+// named for a human to delete. A command that rewrote a committed workflow or
+// an AGENTS.md would be destroying work this command cannot read.
+//
+// The task skills are the one exception, and they earn it by being checkable:
+// each one carries a digest of the body this package wrote, so a file that
+// still matches its stamp is byte for byte what `carrick init` put there and
+// nothing of anyone's is in it. One whose stamp no longer matches, and one
+// carrying no stamp, are left where they are and named.
 //
 // It runs no scan and never asks for the scanner binary: everything it touches
 // is a file this package wrote.
@@ -32,6 +38,7 @@ import { installIdPath, removeInstallId } from "./install-id.ts";
 import { disconnectMcpClients, type McpRemoval } from "./mcp.ts";
 import { repoRoots } from "./repos.ts";
 import { removeCarrickHooks } from "./settings.ts";
+import { removeTaskSkills, SKILL_ROOTS } from "./task-skills.ts";
 import { createOutput, DOCS, type InitOutput } from "./output.ts";
 
 export type RemoveOptions = {
@@ -76,8 +83,10 @@ function help(): string {
     "client's configuration, the .carrick directory, this machine's install id,",
     "and the saved credential.",
     "Other hooks, other MCP servers and the settings files themselves are left",
-    "as they are. Files the scaffold added to the repository are listed with the",
-    "git rm line that removes them; this command never edits a tracked file.",
+    "as they are. The task skills it wrote are removed where they still match",
+    "the stamp it wrote them with, and named where they do not. Files the",
+    "scaffold added to the repository are listed with the git rm line that",
+    "removes them.",
     "",
     "    -w, --workspace DIR  The folder init was run in (default: this one)",
     "        --keep-login     Leave the saved credential; remove everything else",
@@ -239,6 +248,21 @@ export async function remove(argv: string[], out: InitOutput = createOutput()): 
     }
   } catch (error) {
     out.refuse(`${(error as Error).message}. Delete ${installIdPath()} by hand.`);
+  }
+
+  // Only the stamped, unchanged copies. Anything a user has made their own is
+  // named rather than deleted, which is the same rule the install follows.
+  const skills = removeTaskSkills(workspace);
+  if (skills.deleted.length > 0) {
+    out.done(`${skills.deleted.length} task skill file(s) removed from ${SKILL_ROOTS.join(" and ")}`);
+    removed += 1;
+  }
+  for (const row of skills.kept) {
+    out.warn(
+      row.state === "edited"
+        ? `${row.path} has been edited since Carrick wrote it, so it was left in place. Delete it by hand to finish removing it.`
+        : `${row.path} was not written by Carrick, so it was left in place.`,
+    );
   }
 
   const carrick = path.join(workspace, ".carrick");
