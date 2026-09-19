@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.82](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.81...carrick-v0.3.82) (2026-09-19)
+
+
+### Features
+
+* **cli:** count a route by what the index can serve, and name what it holds ([#1323](https://github.com/carrick-tools/carrick/issues/1323)) ([4862694](https://github.com/carrick-tools/carrick/commit/48626943718d9350e84788e7b79778bac344f4aa))
+
+
+### Bug Fixes
+
+* **resume:** collect a stopped job's answers instead of abandoning them ([#1322](https://github.com/carrick-tools/carrick/issues/1322)) ([f0d7600](https://github.com/carrick-tools/carrick/commit/f0d7600c7eba1ede6a5c7d45c1798d13fbf91104)), closes [#1319](https://github.com/carrick-tools/carrick/issues/1319)
+* **resume:** find a job the local record lost, and skip one whose repo moved ([#1325](https://github.com/carrick-tools/carrick/issues/1325)) ([7b34d51](https://github.com/carrick-tools/carrick/commit/7b34d51d252ac62f794b71231fd930502d55cf05)), closes [#1320](https://github.com/carrick-tools/carrick/issues/1320)
+
 ## [0.3.81](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.80...carrick-v0.3.81) (2026-09-17)
 
 
