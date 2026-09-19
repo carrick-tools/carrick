@@ -358,6 +358,7 @@ test("which invocations count as a scan", () => {
   for (const command of [
     "derive",
     "refresh",
+    "resume",
     "status",
     "check",
     "touch",

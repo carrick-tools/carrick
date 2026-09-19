@@ -389,6 +389,7 @@ const COMMANDS = new Set([
   "derive",
   "index",
   "refresh",
+  "resume",
   "status",
   "check",
   "touch",
