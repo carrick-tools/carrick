@@ -1,29 +1,233 @@
 name: Release
 
+# Two entry points:
+#   - push to main, where release-please decides whether a release was created
+#   - workflow_dispatch against an existing tag, to publish a release that was
+#     tagged but never shipped (carrick#1242)
+#
+# A transient GitHub API error inside release-please strands a release: the tag
+# and the GitHub Release exist, but every publish job is gated on
+# `release_created`, and on a re-run release-please sees the release already
+# exists and answers `false`, so they all skip again — for ever. 0.3.74 was only
+# rescued because 0.3.75 carried its content.
+#
+# Both paths resolve through the `target` job, which is the ONLY place a tag,
+# its commit and the decision to publish are decided. Every later job builds
+# from `target`'s resolved commit sha, so a dispatch run cannot build one commit
+# and publish it under another commit's version.
+#
+# Nothing but a real release exercises the jobs below `target`, so the dispatch
+# form takes a `dry_run` input: it resolves the tag, checks the commit carries
+# that version, and stops. That is the way to rehearse this path.
+#
+# The dispatch is ONE step, not two: it needs no run approval. The
+# first-time-contributor policy that holds the release PR's checks at
+# `action_required` — because that PR is authored by `app/github-actions`,
+# which is not a repo contributor — applies to `pull_request` runs only. Every
+# run of this workflow, and every `workflow_dispatch` run in this repo, has
+# started immediately.
+
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish, e.g. carrick-v0.3.74. Must already exist; nothing here creates a tag."
+        required: true
+        type: string
+      dry_run:
+        description: "Resolve and check the tag, then stop. Nothing is built, published, attached or moved."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
   pull-requests: write
 
+# One release at a time: a push to main and a `workflow_dispatch` rescue of an
+# older tag would otherwise publish npm packages and move release assets
+# concurrently. Queued rather than cancelled, because an npm publish killed
+# half way through cannot be re-run (carrick#1140).
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release-please:
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
+      # With the default GITHUB_TOKEN the release PR is authored by
+      # `app/github-actions`, which has no merged commit of its own, so GitHub's
+      # first-time-contributor approval parks every workflow run on the release
+      # branch at `action_required` until a maintainer approves it by hand
+      # (carrick#1270; it bit 0.3.74 through 0.3.78). A token owned by a
+      # contributor makes the PR theirs and the runs start on their own. Falls
+      # back to GITHUB_TOKEN when the secret is absent, so nothing breaks
+      # before it exists.
       - uses: googleapis/release-please-action@v4
         id: release
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+  # The single resolver for both entry points. Everything downstream reads
+  # `needs.target.outputs.*` and nothing downstream reads release-please, so the
+  # two paths cannot drift.
+  #
+  # `always()` because on the dispatch path release-please is skipped, and a
+  # skipped dependency would skip this job too. A release-please that FAILED
+  # must not publish anything, hence the explicit `result == 'success'`.
+  target:
+    needs: release-please
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || needs.release-please.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      # Literal 'true'/'false'. Compared as strings downstream: an empty string
+      # is falsey in a GitHub `if:`, but so is every typo of the field name.
+      publish: ${{ steps.resolve.outputs.publish }}
+      tag_name: ${{ steps.resolve.outputs.tag_name }}
+      version: ${{ steps.resolve.outputs.version }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      # Only the newest release tag may move `v1` or be marked the latest
+      # release. Dispatching an older tag otherwise downgrades every workflow
+      # pinned to `carrick-tools/carrick@v1`.
+      is_latest: ${{ steps.resolve.outputs.is_latest }}
+    steps:
+      - name: Resolve the tag to publish
+        id: resolve
+        env:
+          # Through the environment, never interpolated into the script: the
+          # input is attacker-controlled text as far as the shell is concerned.
+          INPUT_TAG: ${{ inputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          RELEASE_CREATED: ${{ needs.release-please.outputs.release_created }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+            case "$TAG" in
+              *[!A-Za-z0-9.+-]*)
+                echo "::error::'$TAG' holds a character no tag of ours contains."
+                exit 1
+                ;;
+              carrick-v[0-9]*) ;;
+              *)
+                echo "::error::'$TAG' is not a release tag. Expected carrick-v<version>, e.g. carrick-v0.3.74."
+                exit 1
+                ;;
+            esac
+          else
+            if [ "$RELEASE_CREATED" != "true" ]; then
+              echo "release-please created no release; nothing to publish."
+              printf 'resolved=false\npublish=false\n' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            TAG="$RELEASE_TAG"
+          fi
+
+          VERSION="${TAG##*v}"
+
+          # The tag pins the commit, not the other way round. Resolved once,
+          # here, and every build job checks out this sha: a tag that is moved
+          # mid-run cannot change what gets built or published.
+          if ! REF=$(gh api "repos/$REPO/git/ref/tags/$TAG" \
+            --jq '.object.sha + " " + .object.type' 2>"$RUNNER_TEMP/tag-lookup.txt"); then
+            cat "$RUNNER_TEMP/tag-lookup.txt"
+            echo "::error::Could not resolve tag $TAG in $REPO — see the API error above. Nothing here creates a tag; cut the release first."
+            exit 1
+          fi
+          SHA="${REF%% *}"
+          TYPE="${REF##* }"
+          if [ "$TYPE" = "tag" ]; then
+            # An annotated tag points at a tag object, which points at the commit.
+            SHA=$(gh api "repos/$REPO/git/tags/$SHA" --jq '.object.sha')
+          fi
+
+          # Not a gate: a release that does not exist yet is created by the
+          # upload steps. Logged because "tagged but no Release" and "tagged
+          # with a Release that never published" need different reading.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "GitHub Release for $TAG exists."
+          else
+            echo "::notice::No GitHub Release for $TAG yet; the asset uploads will create it."
+          fi
+
+          # `resolved` says the tag is real and worth checking; `publish` says
+          # the rest of the workflow runs. A dry run separates them, so the
+          # dispatch path can be exercised against a real tag without
+          # publishing, attaching or moving anything.
+          PUBLISH=true
+          if [ "$DRY_RUN" = "true" ]; then
+            PUBLISH=false
+            echo "::notice::Dry run: $TAG resolves and will be checked, then the workflow stops."
+          fi
+
+          {
+            echo "resolved=true"
+            echo "publish=$PUBLISH"
+            echo "tag_name=$TAG"
+            echo "version=$VERSION"
+            echo "sha=$SHA"
+          } >> "$GITHUB_OUTPUT"
+          echo "resolved $TAG -> $SHA (version $VERSION)"
+
+          # The API rather than a clone: this job holds no checkout yet, and the
+          # tag list is one authenticated page.
+          LATEST=$(gh api "repos/$REPO/tags?per_page=100" --paginate --jq '.[].name' \
+            | sed -n 's/^carrick-v//p' \
+            | sort -V | tail -1)
+          if [ "$VERSION" = "$LATEST" ]; then
+            echo "is_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::$TAG is not the newest release tag (that is carrick-v$LATEST), so v1 will not be moved and the release will not be marked latest."
+          fi
+
+      # The assertion that a dispatch publishes what its tag says it publishes:
+      # the version release-please wrote into the manifests at this commit must
+      # be the version in the tag name. A mistyped tag, or a tag pointing at the
+      # wrong commit, stops here rather than publishing a mislabelled package.
+      # `crates/carrick-match/Cargo.toml` is deliberately not checked — it is
+      # versioned outside release-please.
+      - uses: actions/checkout@v4
+        if: ${{ steps.resolve.outputs.resolved == 'true' }}
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+
+      - name: The commit carries the tag's version
+        if: ${{ steps.resolve.outputs.resolved == 'true' }}
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          TAG: ${{ steps.resolve.outputs.tag_name }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          NPM_VERSION=$(node -p "require('./npm/carrick/package.json').version")
+          CARGO_VERSION=$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "tag=$VERSION npm/carrick=$NPM_VERSION Cargo.toml=$CARGO_VERSION at $SHA"
+          if [ "$NPM_VERSION" != "$VERSION" ] || [ "$CARGO_VERSION" != "$VERSION" ]; then
+            echo "::error::$TAG points at $SHA, where npm/carrick/package.json is $NPM_VERSION and Cargo.toml is $CARGO_VERSION. Publishing that as $VERSION would ship a mislabelled package."
+            exit 1
+          fi
 
   # One binary per platform npm can install. The names are the npm platform and
   # arch strings, because that is what `carrick`'s resolver asks for
   # (npm/carrick/src/native.ts) — a rust target triple is a detail of this job.
   binaries:
-    needs: release-please
-    if: ${{ needs.release-please.outputs.release_created }}
+    needs: target
+    if: ${{ needs.target.outputs.publish == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -59,14 +263,17 @@ jobs:
     runs-on: ${{ matrix.runner }}
     continue-on-error: ${{ matrix.optional == true }}
     steps:
+      # The tag's commit, resolved once by `target`. On the dispatch path
+      # `github.sha` is main's head, which is not what is being published.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.target.outputs.sha }}
 
       - name: Read the version from the tag
         id: version
         shell: bash
         run: |
-          TAG="${{ needs.release-please.outputs.tag_name }}"
-          echo "version=${TAG##*v}" >> "$GITHUB_OUTPUT"
+          echo "version=${{ needs.target.outputs.version }}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -134,13 +341,17 @@ jobs:
   # platforms out of five, must not take every customer's scan with it.
   # Its own job, so a failed publish cannot stop the asset being attached.
   action-tarball:
-    needs: release-please
-    if: ${{ needs.release-please.outputs.release_created }}
+    needs: target
+    if: ${{ needs.target.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      # The tag's commit, resolved once by `target`. On the dispatch path
+      # `github.sha` is main's head, which is not what is being published.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.target.outputs.sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -184,9 +395,9 @@ jobs:
       - name: Upload release artifact
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.release-please.outputs.tag_name }}
+          tag_name: ${{ needs.target.outputs.tag_name }}
           files: release/carrick-action-linux.tar.gz
-          make_latest: true
+          make_latest: ${{ needs.target.outputs.is_latest }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -195,14 +406,14 @@ jobs:
       # asset, so a release that published nothing to npm is still a release
       # a pinned workflow can run.
       - name: Update v1 moving tag
+        if: ${{ needs.target.outputs.is_latest == 'true' }}
         run: |
-          TAG="${{ needs.release-please.outputs.tag_name }}"
-          VERSION="${TAG##*v}"
+          VERSION="${{ needs.target.outputs.version }}"
           if [[ "$VERSION" == *-* ]]; then
             echo "Pre-release version ($VERSION) — skipping v1 update"
             exit 0
           fi
-          git tag -f v1 ${{ github.sha }}
+          git tag -f v1 ${{ needs.target.outputs.sha }}
           git push -f origin v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -214,15 +425,19 @@ jobs:
   # carrick#874. `id-token: write` stays either way — provenance is
   # generated from it, token or no token.
   publish:
-    needs: [release-please, binaries]
-    if: ${{ needs.release-please.outputs.release_created }}
+    needs: [target, binaries]
+    if: ${{ needs.target.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       # Provenance is generated from this, with or without the token below.
       id-token: write
     steps:
+      # The tag's commit, resolved once by `target`. On the dispatch path
+      # `github.sha` is main's head, which is not what is being published.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.target.outputs.sha }}
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -306,8 +521,7 @@ jobs:
         timeout-minutes: 50
         run: |
           set -euo pipefail
-          TAG="${{ needs.release-please.outputs.tag_name }}"
-          VERSION="${TAG##*v}"
+          VERSION="${{ needs.target.outputs.version }}"
           DEADLINE=$(( $(date +%s) + 2700 ))
           while read -r pkg; do
             [ -n "$pkg" ] || continue
@@ -335,8 +549,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd npm/carrick
-          TAG="${{ needs.release-please.outputs.tag_name }}"
-          VERSION="${TAG##*v}"
+          VERSION="${{ needs.target.outputs.version }}"
           if [ "$(curl -sS -o /dev/null -w '%{http_code}' \
             "https://registry.npmjs.org/carrick/$VERSION")" = "200" ]; then
             echo "carrick@$VERSION is already on the registry, skipping"
@@ -369,8 +582,7 @@ jobs:
         timeout-minutes: 50
         run: |
           set -euo pipefail
-          TAG="${{ needs.release-please.outputs.tag_name }}"
-          VERSION="${TAG##*v}"
+          VERSION="${{ needs.target.outputs.version }}"
           DEADLINE=$(( $(date +%s) + 2700 ))
           delay=5
           until [ "$(curl -sS -o /dev/null -w '%{http_code}' \
@@ -390,11 +602,11 @@ jobs:
   # workflow because release-please creates the release with GITHUB_TOKEN,
   # which never fires `release:`-triggered workflows.
   wasm-artifact:
-    needs: release-please
-    if: ${{ needs.release-please.outputs.release_created }}
+    needs: target
+    if: ${{ needs.target.outputs.publish == 'true' }}
     uses: ./.github/workflows/wasm-artifact.yml
     with:
-      tag: ${{ needs.release-please.outputs.tag_name }}
+      tag: ${{ needs.target.outputs.tag_name }}
     secrets: inherit
 
   # The VS Code extension, packaged at the release version and published to the
@@ -407,19 +619,22 @@ jobs:
   # plugin/vscode/package.json, so the checked-in manifest at the release commit
   # already carries it and `vsce package` names the file from it.
   extension:
-    needs: release-please
-    if: ${{ needs.release-please.outputs.release_created }}
+    needs: target
+    if: ${{ needs.target.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      # The tag's commit, resolved once by `target`. On the dispatch path
+      # `github.sha` is main's head, which is not what is being published.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.target.outputs.sha }}
 
       - name: Read the version from the tag
         id: version
         run: |
-          TAG="${{ needs.release-please.outputs.tag_name }}"
-          echo "version=${TAG##*v}" >> "$GITHUB_OUTPUT"
+          echo "version=${{ needs.target.outputs.version }}" >> "$GITHUB_OUTPUT"
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -460,11 +675,12 @@ jobs:
       - name: Attach the .vsix to the release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.release-please.outputs.tag_name }}
+          tag_name: ${{ needs.target.outputs.tag_name }}
           files: ${{ steps.vsix.outputs.vsix }}
-          # Matches action-tarball: this release is the latest one, and `false`
-          # here would take that flag off whichever job wrote it first.
-          make_latest: true
+          # The same value action-tarball writes: the two jobs upload to one
+          # release, and a disagreement here would take the flag off whichever
+          # of them wrote it first.
+          make_latest: ${{ needs.target.outputs.is_latest }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

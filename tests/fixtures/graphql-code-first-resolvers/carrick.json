@@ -1,0 +1,9 @@
+{
+  "services": [
+    {
+      "serviceName": "parcels-api",
+      "directory": "apps/api",
+      "graphqlSchemas": ["apps/api/dist/schema.graphql"]
+    }
+  ]
+}

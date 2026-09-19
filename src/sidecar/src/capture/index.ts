@@ -59,6 +59,33 @@ export type { CheckProgress } from './check.js';
 
 const SURFACE_ENTRY_BASENAME = '__carrick_surface__';
 
+/** Captures made by this process, so each one's entry file has a name of its
+ * own. Paired with the pid it is unique across processes too. */
+let surfaceEntrySequence = 0;
+
+/**
+ * The name of THIS capture's surface entry, without an extension
+ * (carrick#1046).
+ *
+ * The entry has to live inside the effective `rootDir` — an entry beside a
+ * `rootDir` of `src` fails TS6059 — so it is written into the scanned tree and
+ * unlinked afterwards. One name per repo root made two captures of the same
+ * tree share a single file: whichever finished first unlinked it while the
+ * other's program was still reading it, and every alias whose print anchors in
+ * that destination then demoted to `structural_fallback` with an accessibility
+ * reason that described the harness rather than the code. Concurrent captures
+ * of one tree are ordinary — the test suite does it on every run, and two
+ * services of a monorepo can share a root — so the name, not the locking, is
+ * what has to give.
+ *
+ * A leftover from an interrupted capture is also identifiable as one process's
+ * (carrick#1069), rather than a fixed name the next scan reads as source.
+ */
+export function surfaceEntryFileName(): string {
+  surfaceEntrySequence += 1;
+  return `${SURFACE_ENTRY_BASENAME}.${process.pid}.${surfaceEntrySequence}`;
+}
+
 /** Same normalization intent as bundle_file_stems on the Rust side. */
 export function sanitizeServiceName(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
@@ -175,9 +202,11 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   const entryDir = parsed.options.rootDir
     ? path.resolve(path.dirname(configPath), parsed.options.rootDir)
     : repoRoot;
+  const surfaceEntry = surfaceEntryFileName();
+  const surfaceDeclaration = `${surfaceEntry}.d.ts`;
   const entryPath = deno
-    ? path.join(deno.cacheDir, `${SURFACE_ENTRY_BASENAME}.ts`)
-    : path.join(entryDir, `${SURFACE_ENTRY_BASENAME}.ts`);
+    ? path.join(deno.cacheDir, `${surfaceEntry}.ts`)
+    : path.join(entryDir, `${surfaceEntry}.ts`);
   fs.mkdirSync(path.dirname(entryPath), { recursive: true });
 
   // ---- Phase A: analysis program over placeholder entry + anchor sources ----
@@ -280,7 +309,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
       `declaration emit was partial: kept ${emitted.size} emitted file(s); ` +
         'aliases referencing unemitted modules are demoted to structural_fallback'
     );
-    resolved = demoteDanglingAliases({ resolved, emitted, declarationSources, staging });
+    resolved = demoteDanglingAliases({ resolved, emitted, declarationSources, staging, surfaceDeclaration });
   }
 
   // ---- Relocate the emitted tree into the stub package ----
@@ -292,7 +321,7 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   let surfaceAbsPath = '';
   for (const [fileName, text] of emitted) {
     let rel = path.relative(staging, fileName).split(path.sep).join('/');
-    if (path.basename(rel) === `${SURFACE_ENTRY_BASENAME}.d.ts`) {
+    if (path.basename(rel) === surfaceDeclaration) {
       const source = sourceByEmitted.get(rel);
       sourceByEmitted.delete(rel);
       rel = 'surface.d.ts';
@@ -482,13 +511,15 @@ function demoteDanglingAliases(args: {
   /** entryDir-relative verbatim .d.ts sources that will ship with the tree. */
   declarationSources: Map<string, string>;
   staging: string;
+  /** The emitted name of this capture's surface entry (carrick#1046). */
+  surfaceDeclaration: string;
 }): ResolvedAnchor[] {
   // Extensionless, entryDir-relative POSIX module ids present in the tree.
   const treeModules = new Set<string>();
   let surfaceKey: string | undefined;
   for (const fileName of args.emitted.keys()) {
     const rel = path.relative(args.staging, fileName).split(path.sep).join('/');
-    if (path.basename(rel) === `${SURFACE_ENTRY_BASENAME}.d.ts`) surfaceKey = fileName;
+    if (path.basename(rel) === args.surfaceDeclaration) surfaceKey = fileName;
     if (rel.endsWith('.d.ts')) treeModules.add(rel.slice(0, -'.d.ts'.length));
   }
   for (const rel of args.declarationSources.keys()) {

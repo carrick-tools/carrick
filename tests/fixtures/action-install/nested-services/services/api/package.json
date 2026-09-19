@@ -1,0 +1,8 @@
+{
+  "name": "carrick-fixture-nested-api",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "api-lib": "file:./api-lib"
+  }
+}

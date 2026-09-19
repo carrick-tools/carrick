@@ -62,12 +62,15 @@ jobs:
           --test alias_import_callers_test
           --test analysis_failure_keeps_deterministic_rows_test
           --test dependency_analysis_test
+          --test dispatch_resume_test
           --test env_var_template_call_segment_test
           --test eval_xrepo
           --test extraction_config_test
           --test file_based_routing_test
           --test file_centric_analysis_test
           --test framework_coverage_test
+          --test graphql_code_first_resolvers_test
+          --test graphql_code_first_response_types_test
           --test graphql_document_call_sites_test
           --test graphql_extraction_test
           --test graphql_schema_identity_test
@@ -92,6 +95,7 @@ jobs:
           --test sidecar_integration_test
           --test socket_class_field_test
           --test socket_extraction_test
+          --test socket_generic_test
           --test socket_namespace_test
           --test socket_type_alias_test
           --test span_locator_units_test
@@ -145,6 +149,7 @@ jobs:
           --test pubsub_wrapper_type_capture_test
           --test run_log_isolation_test
           --test undeclared_external_host_test
+          --test unprepared_refusal_test
           --test xrepo_harness_test
 
   # local_mode_test on its own: at 2.4 minutes it is the longest single

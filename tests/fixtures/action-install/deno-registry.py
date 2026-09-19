@@ -49,7 +49,7 @@ with tempfile.TemporaryDirectory(prefix="carrick-deno-lifecycle-") as temporary:
             "nodeModulesDir": "auto", "allowScripts": ["npm:fixture-dependency"], "lock": False,
         }))
         env = dict(os.environ, DENO_DIR=str(root / "cache"), NPM_CONFIG_REGISTRY=f"http://127.0.0.1:{server.server_port}/")
-        prepared = subprocess.run(["bash", sys.argv[1], "install", str(root), "deno"], env=env, capture_output=True, text=True, timeout=60)
+        prepared = subprocess.run(["bash", sys.argv[1], "install-one", str(root), "deno"], env=env, capture_output=True, text=True, timeout=60)
         assert prepared.returncode == 0 and "Installed" in prepared.stdout, prepared.stdout + prepared.stderr
         assert not sentinel.exists(), "Action ran the dependency lifecycle script"
         assert not (root / "node_modules").exists(), "Action did not force the global cache"
@@ -72,8 +72,8 @@ with tempfile.TemporaryDirectory(prefix="carrick-deno-lifecycle-") as temporary:
         }))
         mixed_env = dict(env, DENO_DIR=str(root / "mixed-cache"), npm_config_cache=str(root / "npm-cache"))
         detected = subprocess.run(["bash", sys.argv[1], "detect", str(root)], env=mixed_env, capture_output=True, text=True, timeout=60)
-        assert "manager=npm" in detected.stdout, detected.stdout + detected.stderr
-        mixed = subprocess.run(["bash", sys.argv[1], "install", str(root), "npm"], env=mixed_env, capture_output=True, text=True, timeout=60)
+        assert "managers=npm" in detected.stdout, detected.stdout + detected.stderr
+        mixed = subprocess.run(["bash", sys.argv[1], "install-one", str(root), "npm"], env=mixed_env, capture_output=True, text=True, timeout=60)
         assert mixed.returncode == 0 and "with npm" in mixed.stdout and "with deno" in mixed.stdout, mixed.stdout + mixed.stderr
         assert (root / "node_modules/fixture-dependency/package.json").is_file(), "Node install missing"
         assert any((root / "mixed-cache").rglob("package.json")), "Deno cache missing"

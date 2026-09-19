@@ -1048,6 +1048,11 @@ impl FileOrchestrator {
         // long as the cache lives (#478).
         let mut raw_model_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         let mut stats = ProcessingStats::default();
+        // Every path that reaches a prompt is reduced against this (see
+        // `PendingFile::prompt_path`). The engine canonicalizes `repo_path`
+        // before discovery, so the files and the root are in the same form and
+        // the reduction cannot silently fail to a leading `/Users/...`.
+        let repo_root_str = repo_root.to_string_lossy().to_string();
         let cm: Lrc<SourceMap> = Default::default();
         let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(cm.clone()));
 
@@ -1066,6 +1071,16 @@ impl FileOrchestrator {
         // the LLM calls themselves are then dispatched concurrently.
         struct PendingFile {
             path_str: String,
+            /// The same file as `path_str`, reduced to the form the index
+            /// stores as a row's `file`, and the ONLY form that reaches the
+            /// model's prompt (carrick#1223). The cloud's analysis cache hashes
+            /// the prompt bytes and deliberately keys nothing about where the
+            /// scan ran, so an absolute path in there makes every entry private
+            /// to one checkout: two developers on one commit, or a laptop and
+            /// CI, never share a hit, and a moved or freshly cloned tree
+            /// re-pays the whole repo. `path_str` stays absolute because it
+            /// keys `file_results` and reads files off disk.
+            prompt_path: String,
             content: String,
             candidate_hints: Vec<String>,
             candidate_contexts: Vec<String>,
@@ -1340,6 +1355,17 @@ impl FileOrchestrator {
         // work list of files that actually need an LLM call. Zero-cost skips are recorded here.
         let mut pending: Vec<PendingFile> = Vec::new();
         let mut deferred_zero_candidates: Vec<DeferredZeroCandidate> = Vec::new();
+        // carrick#1157: which files build a GraphQL schema in code, read only
+        // when the service has schema fields a resolver could be linked to and
+        // detection named packages to trace values to. Aliases resolve here:
+        // nothing cached was keyed on this reading before it existed.
+        let mut schema_builder_reader = (graphql_producer_hints.has_schema_fields()
+            && !framework_detection.data_fetchers.is_empty())
+        .then(|| {
+            crate::graphql_schema_builder::PackageValueReader::new(Some(
+                WorkspaceIndex::build_with_aliases(repo_root, None),
+            ))
+        });
         // Route tables that bind a path to an imported handler (#580 part b).
         // Collected here, where the file's content is already in hand, and
         // resolved after the whole pass: the endpoints belong to the CONTROLLER
@@ -1570,6 +1596,34 @@ impl FileOrchestrator {
             let is_graphql_consumer_file = !graphql_consumer_hints.is_empty()
                 && graphql_consumer_hints.file_has_hint(file_path);
 
+            // GraphQL schema built in code (carrick#1157): a module that adds
+            // fields to a schema builder calls through a value that came out of
+            // a detected package, usually imported from the module that
+            // created it, and often exports nothing and raises no candidate.
+            // Rescued, and given the declared schema's fields as well as the
+            // walked ones, so the model can link a field to where it is
+            // resolved. Detection decides which packages count; no library is
+            // named here.
+            let is_graphql_schema_builder_file =
+                schema_builder_reader.as_mut().is_some_and(|reader| {
+                    crate::swc_scanner::parse_standalone_module(file_path, &content).is_some_and(
+                        |(_, module)| {
+                            reader.calls_package_value_at_module_scope(
+                                file_path,
+                                &module,
+                                &framework_detection.data_fetchers,
+                            )
+                        },
+                    )
+                });
+            if is_graphql_schema_builder_file {
+                debug!(
+                    "GraphQL schema-builder file, given the declared schema fields: {} [{} HTTP candidate(s)]",
+                    path_str,
+                    http_candidates.len()
+                );
+            }
+
             // STEP 2: Check Relevance - if there are no candidates for a routed
             // protocol, SKIP the (expensive) LLM call. File-based route and
             // route-descriptor endpoints are still recorded: they're derived
@@ -1618,6 +1672,13 @@ impl FileOrchestrator {
                     // file content to emit `graphql_operations`.
                     debug!(
                         "Routed GraphQL resolver file (no HTTP candidates): {}",
+                        path_str
+                    );
+                } else if is_graphql_schema_builder_file {
+                    // Fall through with empty HTTP candidates: the producer
+                    // section lists the schema's fields (carrick#1157).
+                    debug!(
+                        "Routed GraphQL schema-builder file (no HTTP candidates): {}",
                         path_str
                     );
                 } else if is_graphql_consumer_file {
@@ -1689,6 +1750,8 @@ impl FileOrchestrator {
             let symbols = Self::extract_symbol_table(file_path, &cm, &handler);
 
             pending.push(PendingFile {
+                prompt_path: crate::utils::repo_relative_source_path(&path_str, &repo_root_str)
+                    .to_string(),
                 path_str,
                 content,
                 route_module_claimed,
@@ -1703,7 +1766,11 @@ impl FileOrchestrator {
                 route_endpoints,
                 descriptor_endpoints,
                 decorator_endpoints,
-                graphql_producer_hints: graphql_producer_hints.lines.clone(),
+                graphql_producer_hints: if is_graphql_schema_builder_file {
+                    graphql_producer_hints.schema_builder_lines()
+                } else {
+                    graphql_producer_hints.lines.clone()
+                },
                 graphql_consumer_hints: graphql_consumer_hints.lines.clone(),
                 wrapper_context: Vec::new(),
                 wrapper_request_shape: None,
@@ -1744,7 +1811,7 @@ impl FileOrchestrator {
             let Ok(canonical) = path.canonicalize() else {
                 continue;
             };
-            let mut snippet = format!("--- wrapper module: {} ---\n", pf.path_str);
+            let mut snippet = format!("--- wrapper module: {} ---\n", pf.prompt_path);
             if pf.content.len() > WRAPPER_SNIPPET_MAX {
                 let mut end = WRAPPER_SNIPPET_MAX;
                 while end > 0 && !pf.content.is_char_boundary(end) {
@@ -2085,6 +2152,11 @@ impl FileOrchestrator {
             };
             let symbols = Self::extract_symbol_table(&deferred.file_path, &cm, &handler);
             pending.push(PendingFile {
+                prompt_path: crate::utils::repo_relative_source_path(
+                    &deferred.path_str,
+                    &repo_root_str,
+                )
+                .to_string(),
                 path_str: deferred.path_str,
                 content,
                 route_module_claimed: deferred.route_module_claimed,
@@ -2265,7 +2337,7 @@ impl FileOrchestrator {
         // `raw_model_results`: an empty answer cached there would read as "the
         // model said nothing about this file" and freeze the skip for as long
         // as the cache lives (#478).
-        let (to_dispatch, not_asked): (Vec<PendingFile>, Vec<PendingFile>) =
+        let (mut to_dispatch, mut not_asked): (Vec<PendingFile>, Vec<PendingFile>) =
             if crate::local_mode::no_model() || self.model_deferred {
                 (Vec::new(), to_dispatch)
             } else {
@@ -2277,7 +2349,118 @@ impl FileOrchestrator {
                 not_asked.len()
             );
         }
-        stats.files_model_reused = reused.len();
+
+        // Dispatch and resume both turn on the same bytes, so both build the
+        // prompt here rather than inside the call (carrick#1229).
+        //
+        // Dispatching, the prompt is collected and the file is treated exactly
+        // as local mode treats one: not asked, not a loss, nothing cached. The
+        // run ends without an index and the bundle is what it produced.
+        //
+        // Resuming, the prompt's BODY names the answer: the hash of those bytes
+        // is the id the job answered under, so a match is this file's answer
+        // wherever and whenever it was produced, and everything else — a file
+        // edited since the dispatch, an answer the job could not produce, a
+        // truncated one — simply goes to the model below. That is why the join
+        // is content and not a commit diff: a resume has to work on a dirty
+        // tree and in a shallow clone, where a diff answers nothing.
+        let mut collected: Vec<(PendingFile, FileAnalysisResult)> = Vec::new();
+        let mut collecting = false;
+        if crate::analysis_channel::dispatching() {
+            let schema = crate::agents::schemas::AgentSchemas::file_analysis_schema();
+            let service = crate::current_service::name();
+            for pf in &to_dispatch {
+                let Some(key) = guidance.guidance_key.as_deref() else {
+                    // Without a guidance id the cloud keys the whole message,
+                    // so the block this bundle carries once is re-keyed for
+                    // every file. Refuse the job rather than ship that.
+                    crate::analysis_channel::degrade(service.as_deref().unwrap_or("this service"));
+                    break;
+                };
+                if let Some(prompt) = self.file_analyzer.prompt_for(
+                    &pf.prompt_path,
+                    &pf.content,
+                    guidance,
+                    &pf.candidate_hints,
+                    &pf.candidate_contexts,
+                    &pf.symbol_table.imported_symbols,
+                    &pf.graphql_producer_hints,
+                    &pf.graphql_consumer_hints,
+                    &pf.wrapper_context,
+                ) {
+                    crate::analysis_channel::record(service.as_deref(), key, &prompt, &schema);
+                    collecting = true;
+                }
+            }
+            not_asked.append(&mut to_dispatch);
+        } else if let Some(answers) = crate::analysis_channel::answers() {
+            let mut unanswered: Vec<PendingFile> = Vec::with_capacity(to_dispatch.len());
+            for pf in to_dispatch.drain(..) {
+                let replay = self
+                    .file_analyzer
+                    .prompt_for(
+                        &pf.prompt_path,
+                        &pf.content,
+                        guidance,
+                        &pf.candidate_hints,
+                        &pf.candidate_contexts,
+                        &pf.symbol_table.imported_symbols,
+                        &pf.graphql_producer_hints,
+                        &pf.graphql_consumer_hints,
+                        &pf.wrapper_context,
+                    )
+                    .and_then(|prompt| {
+                        answers.text_for(&crate::analysis_job::body_id(prompt.body()))
+                    })
+                    .map(|text| FileAnalyzerAgent::result_from_answer(&pf.prompt_path, text));
+                match replay {
+                    Some(Ok(result)) => collected.push((pf, result)),
+                    Some(Err(error)) => {
+                        // An answer this scanner cannot read is a miss, not a
+                        // failure: the model can be asked the same question.
+                        warn!(
+                            "A collected answer for {} could not be read ({error}); asking the model for it",
+                            pf.prompt_path
+                        );
+                        unanswered.push(pf);
+                    }
+                    None => unanswered.push(pf),
+                }
+            }
+            debug!(
+                "Collected answers joined onto {} file(s); {} go to the model",
+                collected.len(),
+                unanswered.len()
+            );
+            to_dispatch = unanswered;
+        }
+
+        // A dispatched service's product is the bundle, and every phase from
+        // here on works on model answers it does not have. Ending here rather
+        // than walking them with an empty map saves a service's worth of
+        // parsing, a workspace index rebuilt from disk and a sidecar pass over
+        // a tree nothing will be said about. The caller ends the run at the
+        // same point and submits what was collected.
+        //
+        // A service that built no prompt is not dispatched and does not end
+        // here: it has nothing to hand over, so it finishes the way it would
+        // have without the flag, and its rows reach the index.
+        if collecting {
+            debug!(
+                "Dispatching: {} prompt(s) built for this service, no index will be written",
+                not_asked.len()
+            );
+            return Ok(FileCentricAnalysisResult {
+                file_results: HashMap::new(),
+                raw_model_results: HashMap::new(),
+                mount_graph: MountGraph::new(),
+                stats,
+                bundled_types: None,
+                type_resolution: None,
+            });
+        }
+
+        stats.files_model_reused = reused.len() + collected.len();
         stats.files_model_dispatched = to_dispatch.len();
         stats.files_model_not_asked = not_asked.len();
         if !reused.is_empty() {
@@ -2301,7 +2484,7 @@ impl FileOrchestrator {
                 let result = self
                     .file_analyzer
                     .analyze_file_with_candidates(
-                        &pf.path_str,
+                        &pf.prompt_path,
                         &pf.content,
                         guidance,
                         &pf.candidate_hints,
@@ -2348,6 +2531,14 @@ impl FileOrchestrator {
                     .expect("partitioned on this key being present");
                 (pf, ModelAnswer::Answered(cached))
             })
+            // A collected answer is the model's answer, and enters phase 3 as
+            // one: it is cached, joined and uploaded exactly as a fresh one is,
+            // which is what makes a resume a replay (carrick#1229).
+            .chain(
+                collected
+                    .into_iter()
+                    .map(|(pf, result)| (pf, ModelAnswer::Answered(result))),
+            )
             .chain(dispatched.into_iter().map(|(pf, result)| match result {
                 Ok(model) => (pf, ModelAnswer::Answered(model)),
                 Err(e) => (pf, ModelAnswer::Failed(e)),
@@ -3844,11 +4035,26 @@ impl FileOrchestrator {
     /// Only producers with BOTH `resolver_file` and `resolver_line` set produce a
     /// request; an SDL producer with no matched LLM op stays inferred-from-nothing
     /// (it keeps its SDL anchor, but no expanded response contract).
+    ///
+    /// The line the model names is the FIELD's line. In a schema built in code
+    /// the resolver is a `resolve` function inside the field's config object,
+    /// often many lines below, and a bare line anchor binds to whatever
+    /// function starts within two lines of it: nothing, or the builder
+    /// callback above, or the previous field's resolver (carrick#1256). So the
+    /// request carries the resolver function's own span when
+    /// [`crate::graphql_resolver_anchor`] can read it from the AST, converted
+    /// to the sidecar's UTF-16 numbering at this boundary (carrick#805). A
+    /// field whose resolver the pass sees but cannot span (an identifier)
+    /// gets NO request: the manifest entry stays `Unknown` rather than
+    /// carrying a neighbour's type. A line the pass cannot read at all keeps
+    /// the line-only anchor.
     pub fn collect_graphql_producer_infer_requests(
         &self,
         graphql: &crate::graphql::GraphqlExtraction,
         repo_path: &str,
     ) -> Vec<InferRequestItem> {
+        use crate::graphql_resolver_anchor::{ResolverAnchor, resolver_anchor};
+
         let repo_root = std::path::Path::new(repo_path);
         let repo_root_absolute = if repo_root.is_absolute() {
             repo_root.to_path_buf()
@@ -3862,6 +4068,11 @@ impl FileOrchestrator {
 
         let mut requests: Vec<InferRequestItem> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        // Resolver files are read once each; `None` records a file that could
+        // not be read, whose anchors fall back to the line.
+        let mut file_source: HashMap<String, Option<String>> = HashMap::new();
+        let mut spanned = 0usize;
+        let mut withheld = 0usize;
         for op in &graphql.producers {
             let (Some(resolver_file), Some(resolver_line)) =
                 (op.resolver_file.as_ref(), op.resolver_line)
@@ -3875,13 +4086,42 @@ impl FileOrchestrator {
                 ManifestRole::Producer,
                 ManifestTypeKind::Response,
             );
+            let source = file_source
+                .entry(file_abs.clone())
+                .or_insert_with(|| std::fs::read_to_string(&file_abs).ok());
+            let anchor = match source.as_deref() {
+                Some(content) => {
+                    resolver_anchor(std::path::Path::new(&file_abs), content, resolver_line)
+                }
+                None => ResolverAnchor::Absent,
+            };
+            let (span_start, span_end) = match (anchor, source.as_deref()) {
+                (ResolverAnchor::Function { lo, hi }, Some(content)) => {
+                    spanned += 1;
+                    (
+                        Some(Self::sidecar_position(content, lo)),
+                        Some(Self::sidecar_position(content, hi)),
+                    )
+                }
+                (ResolverAnchor::Unresolvable, _) => {
+                    withheld += 1;
+                    debug!(
+                        op = %op.key.canonical(),
+                        file = %file_abs,
+                        line = resolver_line,
+                        "graphql resolver is not a function literal at its field; sending no type anchor"
+                    );
+                    continue;
+                }
+                _ => (None, None),
+            };
             let dedup_key = format!("{}|{}|{}", file_abs, resolver_line, alias);
             if seen.insert(dedup_key) {
                 requests.push(InferRequestItem {
                     file_path: file_abs,
                     line_number: resolver_line,
-                    span_start: None,
-                    span_end: None,
+                    span_start,
+                    span_end,
                     expression_text: None,
                     expression_line: None,
                     infer_kind: InferKind::FunctionReturn,
@@ -3891,8 +4131,10 @@ impl FileOrchestrator {
             }
         }
         debug!(
-            "[FileOrchestrator] Collected {} graphql producer infer requests",
-            requests.len()
+            "[FileOrchestrator] Collected {} graphql producer infer requests ({} span-anchored at their resolver function, {} withheld: resolver not a function literal)",
+            requests.len(),
+            spanned,
+            withheld,
         );
         requests
     }
@@ -5696,8 +5938,16 @@ impl FileOrchestrator {
         // With neither list populated nothing can be classified, and the
         // request would be pure cost.
         if detection.frameworks.is_empty() && detection.data_fetchers.is_empty() {
+            debug!("Receiver classification skipped: detection named no package");
             return roles;
         }
+        // The lists a role is decided against. A run where every site comes
+        // back unresolved is ambiguous without them — the package the receiver
+        // resolved to may simply not be on either list (carrick#1260).
+        debug!(
+            "Receiver classification lists: server={:?} client={:?}",
+            detection.frameworks, detection.data_fetchers
+        );
 
         // alias -> (file, span). The alias is the join key on the way back.
         let mut sites: HashMap<String, (String, u32)> = HashMap::new();
@@ -5969,13 +6219,41 @@ impl FileOrchestrator {
             // side has always applied in `fold_model_call`. Before carrick#660
             // the stamp above survived the join, and a file route the model
             // also described reached the index as the model's own reading.
+            //
+            // The path the two rows agree ON is not always the model's own.
+            // Where the model copied the mount segment into the path the
+            // registration states (`/tasks/:taskId` for a `router.get(
+            // '/:taskId', …)` mounted at `/tasks`), carrick#1145 keeps the
+            // model's reading and hands the registration literal on for the
+            // mount chain to judge — and the deterministic row at that same
+            // call holds the LITERAL. Matching on the model's path alone left
+            // those two rows unjoined, so one registration reached the index
+            // twice: once as the structural row with no handler and no type
+            // anchor, once as the model's (carrick#1288). The literal is the
+            // common ground, and it is already canonical.
             let canonical = Self::canonicalize_route_path(&endpoint.path);
+            let literal = endpoint.registration_literal.clone();
             let agreeing = result.endpoints[..deterministic_rows]
                 .iter()
                 .position(|existing| {
-                    existing.resolution_source != Some(ResolutionSource::Model)
-                        && existing.method.eq_ignore_ascii_case(&endpoint.method)
-                        && Self::canonicalize_route_path(&existing.path) == canonical
+                    if existing.resolution_source == Some(ResolutionSource::Model)
+                        || !existing.method.eq_ignore_ascii_case(&endpoint.method)
+                    {
+                        return false;
+                    }
+                    let existing_path = Self::canonicalize_route_path(&existing.path);
+                    if existing_path == canonical {
+                        return true;
+                    }
+                    // Only a row registered at the SAME call can be the twin
+                    // the literal was read off: the literal is that call's own
+                    // first argument, and two routers in one file can register
+                    // the same local path (carrick#1145's own reason for
+                    // keeping the owner on the fold key).
+                    literal.as_deref() == Some(existing_path.as_str())
+                        && existing.call_expression_span_start.is_some()
+                        && existing.call_expression_span_start
+                            == endpoint.call_expression_span_start
                 });
             // A model row that agrees with no deterministic row may still be
             // describing one. A decorator route is stated by a DECLARATION, and
@@ -13633,6 +13911,128 @@ export { routes };
             Some(ResolutionSource::ReceiverType)
         );
         assert_eq!(stats.unemitted_literal_candidates, 0);
+    }
+
+    #[test]
+    fn a_model_row_that_prefixed_the_path_still_joins_the_structural_route() {
+        // carrick#1288. The model reads the route the way the mounted service
+        // serves it (`/tasks/:taskId`) while the registration states only
+        // `/:taskId`, and carrick#1145 keeps the model's reading and hands the
+        // literal on for the mount chain. The deterministic row at the same
+        // call holds the literal, so matching on the model's path alone left
+        // the two unjoined and one registration reached the index twice — once
+        // structurally with no handler and no response anchor, once as the
+        // model's.
+        let candidates = bare_literal_map("router", "/:taskId");
+        let candidate_id = candidates.keys().next().unwrap().clone();
+        let mut reported = endpoint_with_candidate("/tasks/:taskId", &candidate_id);
+        reported.handler_name = "anonymous".to_string();
+        reported.owner_node = "router".to_string();
+        reported.response_expression_text = Some("formatTaskResponse(task)".to_string());
+        reported.response_expression_line = Some(14);
+
+        let (result, stats) = emit_and_join_with_receivers(
+            FileAnalysisResult {
+                endpoints: vec![reported],
+                ..Default::default()
+            },
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/api/tasks/tasks.router.ts",
+            false,
+            &HashMap::from([(100, ReceiverRole::Server)]),
+        );
+
+        assert_eq!(
+            result.endpoints.len(),
+            1,
+            "one registration is one row: {:?}",
+            result
+                .endpoints
+                .iter()
+                .map(|e| (e.resolution_source, e.path.clone()))
+                .collect::<Vec<_>>()
+        );
+        let endpoint = &result.endpoints[0];
+        // The structural layer stated this route, so it keeps the claim.
+        assert_eq!(
+            endpoint.resolution_source,
+            Some(ResolutionSource::ReceiverType)
+        );
+        // The model's reading of the path and the literal both survive: which
+        // of them the mount chain serves is carrick#1145's question.
+        assert_eq!(endpoint.path, "/tasks/:taskId");
+        assert_eq!(endpoint.registration_literal.as_deref(), Some("/:taskId"));
+        // The fields the structural row cannot state — without these the
+        // response type has nothing to anchor on.
+        assert_eq!(endpoint.handler_name, "anonymous");
+        assert_eq!(
+            endpoint.response_expression_text.as_deref(),
+            Some("formatTaskResponse(task)")
+        );
+        assert_eq!(stats.model_rows_joined, 1);
+    }
+
+    #[test]
+    fn a_prefixed_model_row_joins_only_the_registration_it_was_read_off() {
+        // The literal is the first argument of ONE call, so it may only match
+        // the deterministic row at that same call. A second router in the file
+        // registering the same local path is a different operation.
+        // Two routers in one file registering the same local path, mounted at
+        // different prefixes. The earlier one is emitted first, so a literal
+        // match that ignored the call would fold the model's row onto it.
+        let mut first = bare_literal_candidate("v1", "/:taskId");
+        first.span_start = 50;
+        first.span_end = 90;
+        first.candidate_id = "v1-site".to_string();
+        let second = bare_literal_candidate("v2", "/:taskId");
+        let candidates = HashMap::from([
+            (first.candidate_id.clone(), first),
+            (second.candidate_id.clone(), second.clone()),
+        ]);
+
+        let mut reported = endpoint_with_candidate("/tasks/:taskId", &second.candidate_id);
+        reported.handler_name = "anonymous".to_string();
+        reported.owner_node = "v2".to_string();
+
+        let (result, _) = emit_and_join_with_receivers(
+            FileAnalysisResult {
+                endpoints: vec![reported],
+                ..Default::default()
+            },
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &[],
+            "src/api/tasks/tasks.router.ts",
+            false,
+            &HashMap::from([(50, ReceiverRole::Server), (100, ReceiverRole::Server)]),
+        );
+
+        let rows: Vec<_> = result
+            .endpoints
+            .iter()
+            .map(|e| (e.owner_node.clone(), e.path.clone(), e.handler_name.clone()))
+            .collect();
+        assert_eq!(result.endpoints.len(), 2, "{rows:?}");
+        assert!(
+            rows.contains(&("v1".to_string(), "/:taskId".to_string(), "get".to_string())),
+            "the registration the model did not answer at must survive: {rows:?}"
+        );
+        assert!(
+            rows.contains(&(
+                "v2".to_string(),
+                "/tasks/:taskId".to_string(),
+                "anonymous".to_string()
+            )),
+            "the model's row must fold onto its own registration: {rows:?}"
+        );
     }
 
     #[test]

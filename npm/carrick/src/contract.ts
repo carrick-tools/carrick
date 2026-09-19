@@ -246,9 +246,11 @@ export type RunningScan = {
   /**
    * `finished` is written by the scan itself and cleared by the next build, so
    * the poll the scaffold describes terminates on the word it waits for
-   * (carrick#1007 item 4).
+   * (carrick#1007 item 4). `dispatched` is neither running nor finished: the
+   * prompts went to Carrick Cloud and the index arrives when `carrick resume`
+   * collects the answers (carrick#1229).
    */
-  status: "running" | "finished" | "failed";
+  status: "running" | "finished" | "failed" | "dispatched";
   phase?: string;
   progress?: {
     service?: string;
@@ -326,6 +328,13 @@ export type StatusResult = {
    * index still spent the money.
    */
   last_scan?: RunSpend;
+  /**
+   * What Carrick Cloud is analysing for this workspace right now, one line per
+   * repo handed over by `carrick index --dispatch` (carrick#1229). Rendered
+   * verbatim: the CLI asked the cloud and this package did not, so it repeats
+   * the sentence rather than reconstructing one.
+   */
+  analysing?: string[];
   services: StatusService[];
 };
 
@@ -423,6 +432,10 @@ export function parseStatusResult(stdout: string): StatusResult | null {
     if (!isRecord(entry)) continue;
     if (typeof entry["scan_id"] !== "string" || typeof entry["status"] !== "string") continue;
     (result.running_scans ??= []).push(entry as unknown as RunningScan);
+  }
+  const analysing = Array.isArray(parsed["analysing"]) ? parsed["analysing"] : [];
+  for (const line of analysing) {
+    if (typeof line === "string" && line) (result.analysing ??= []).push(line);
   }
   const lastScan = parsed["last_scan"];
   if (isRecord(lastScan) && Array.isArray(lastScan["scans"])) {

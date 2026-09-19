@@ -40,21 +40,81 @@ pub struct IndexOutcome {
     pub index: LocalIndex,
     pub scanned: Vec<String>,
     pub elapsed_secs: f64,
-    /// What this run paid Carrick Cloud, one entry per repo `carrick index`
-    /// scanned. Empty after `refresh`, the pass that pays for nothing.
-    pub spend: crate::scan_spend::RunSpend,
     /// What the hosted read downloaded and what it reused unchanged. `None`
     /// when no hosted metadata was read at all.
     pub hosted_download: Option<String>,
+    /// The repos a `--dispatch` build asked to hand over and did not, and why
+    /// (carrick#1251). Empty on every other pass.
+    pub not_dispatched: Vec<(String, crate::progress::NotDispatched)>,
+    /// What the scans left for a later run, in their own sentences. Empty on
+    /// a build that finished everything it started (carrick#1315).
+    pub pending: Vec<String>,
+}
+
+/// What one repo's scan is doing on a resume: where its collected answers are,
+/// and whether the index it builds is worth uploading.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resumption {
+    /// The answer bundle this repo's scan joins by content. `None` for a repo
+    /// that was never handed over: it has no job to collect and is scanned the
+    /// ordinary way, because the index the resume writes covers the workspace
+    /// and a repo left out of it reads as a repo with nothing in it.
+    pub answers: Option<PathBuf>,
+    /// The cloud already serves a newer index for this repo — CI indexed it
+    /// while the job ran. The scan still builds the local read model, because
+    /// that is what `carrick check` answers from, but it does not replace a
+    /// newer stored index with an older one (carrick#1229, R8).
+    pub superseded: bool,
+}
+
+/// Which of the four passes a build is.
+///
+/// They differ in what each repo's scan subprocess is asked to do, and nothing
+/// else; every one of them ends in the same join and the same read model,
+/// except the one that deliberately does not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pass {
+    /// `refresh`: deterministic rows only. Asks no model and pays for nothing.
+    Facts,
+    /// `carrick index`: the inferred scan.
+    Infer,
+    /// `carrick index --dispatch`: build every prompt, hand them to Carrick
+    /// Cloud as a job, and write no index. The answers arrive later.
+    Dispatch,
+    /// `carrick resume`: the inferred scan with a job's answers in hand. Files
+    /// whose content still matches take their answer from the job; anything
+    /// that has changed since is analysed now.
+    Resume(BTreeMap<PathBuf, Resumption>),
+}
+
+impl Pass {
+    /// Whether this pass asks the model anything at all.
+    pub fn infers(&self) -> bool {
+        !matches!(self, Pass::Facts)
+    }
+}
+
+/// What a build produced: an index, or a set of jobs somebody will collect.
+pub enum Built {
+    Indexed(Box<IndexOutcome>),
+    /// Nothing was indexed because the analysis is happening elsewhere. One
+    /// entry per repo handed over.
+    Dispatched {
+        jobs: Vec<crate::analysis_job::Dispatched>,
+        /// The repos in the same build that were not handed over, and why.
+        /// They wrote blobs this build throws away, so they are scanned again
+        /// by the `carrick resume` that collects the jobs (carrick#1251).
+        not_dispatched: Vec<(String, crate::progress::NotDispatched)>,
+    },
 }
 
 /// Index every repo in the workspace, or re-index the one holding `only`.
 ///
-/// `infer` turns each per-repo scan into a laptop scan: model analysis through
-/// Carrick Cloud, an upload, and the same payload written into this build's
-/// cache directory. The join phase never infers — it analyses nothing, it
-/// reads blobs back.
-pub fn run(workspace: &Workspace, only: Option<&str>, infer: bool) -> Result<IndexOutcome, String> {
+/// An inferring pass turns each per-repo scan into a laptop scan: model
+/// analysis through Carrick Cloud, an upload, and the same payload written
+/// into this build's cache directory. The join phase never infers — it
+/// analyses nothing, it reads blobs back.
+pub fn run(workspace: &Workspace, only: Option<&str>, pass: &Pass) -> Result<Built, String> {
     let started = Instant::now();
     // Build into a fresh generation. A failed scan leaves the last complete
     // read model intact; account changes never inherit previous local rows.
@@ -80,12 +140,21 @@ pub fn run(workspace: &Workspace, only: Option<&str>, infer: bool) -> Result<Ind
                 .collect::<Vec<_>>()
                 == workspace.repos
     });
-    let targets = if same_sources {
-        requested
+    let targets = match pass {
+        // A resume scans what the caller listed and nothing else: the repos
+        // whose answers are in hand, and the repos that were never handed
+        // over. A repo whose job is still running is absent from the map and
+        // is not analysed here, which is the whole reason it was handed over.
+        Pass::Resume(resuming) => workspace
+            .repos
+            .iter()
+            .filter(|repo| resuming.contains_key(*repo))
+            .cloned()
+            .collect(),
+        _ if same_sources => requested
             .map(|path| vec![path])
-            .unwrap_or_else(|| workspace.repos.clone())
-    } else {
-        workspace.repos.clone()
+            .unwrap_or_else(|| workspace.repos.clone()),
+        _ => workspace.repos.clone(),
     };
     let generation = workspace
         .index_dir()
@@ -101,7 +170,7 @@ pub fn run(workspace: &Workspace, only: Option<&str>, infer: bool) -> Result<Ind
         &blobs,
         &targets,
         started,
-        infer,
+        pass,
     );
     let _ = std::fs::remove_dir_all(&generation);
     result
@@ -115,8 +184,8 @@ fn run_generation(
     blobs: &Path,
     targets: &[PathBuf],
     started: Instant,
-    infer: bool,
-) -> Result<IndexOutcome, String> {
+    pass: &Pass,
+) -> Result<Built, String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("could not find the carrick binary to run a scan with: {e}"))?;
 
@@ -149,10 +218,23 @@ fn run_generation(
     // the cloud's error, so a refused upload fails the scan — and that is the
     // one fact the pre-scan hosted snapshot cannot know (carrick#1007 item 1).
     let mut uploaded: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    // The receipt, written as each figure lands rather than at the end: the
-    // money is spent at the upload, so a run killed after paying still leaves
-    // the record of it behind (carrick#995).
+    // The receipt, written as each block lands rather than at the end: a run
+    // killed after an upload has still uploaded that repo, and this is the
+    // record of it (carrick#995). Nothing printed reads it; `carrick status
+    // --json` carries it for whoever parses that (carrick#1236).
     let mut spend = crate::scan_spend::RunSpend::default();
+    // The repos whose analysis is happening in the cloud. A build with any of
+    // these writes no index: it has nothing to write one from, and a thinner
+    // index over the top of the last one would read as an answer.
+    let mut handed_over: Vec<(PathBuf, crate::analysis_job::Dispatched)> = Vec::new();
+    // And the repos this build asked to hand over that did not. A warm cache
+    // is the ordinary case for every scan after the first, so this is the
+    // ordinary outcome of `--dispatch` — and it used to be silent, which is
+    // indistinguishable from the flag doing nothing (carrick#1251).
+    let mut not_dispatched: Vec<(String, crate::progress::NotDispatched)> = Vec::new();
+    // And what they left behind, so the build's closing line can say it
+    // (carrick#1315).
+    let mut pending: Vec<String> = Vec::new();
     for (position, repo) in targets.iter().enumerate() {
         let name = repo_label(repo);
         let previous = generation.join("previous.json");
@@ -165,11 +247,30 @@ fn run_generation(
         // scanner in its own directory so user labels cannot overwrite a
         // retained or hosted blob in the join input.
         let scan_dir = generation.join(format!("scan-{position}"));
-        let paid = scan_repo(&exe, repo, &scan_dir, &previous, &name, infer)?;
-        if infer {
+        let report = scan_repo(&exe, repo, &scan_dir, &previous, &name, pass)?;
+        pending.extend(report.pending.iter().cloned());
+        // A repo that handed its prompts over wrote no blob. One that was
+        // asked to and found nothing for the model says nothing here: it
+        // indexed itself, in the seconds it takes to state facts nobody has to
+        // be asked about.
+        if let Some(dispatched) = report.dispatched {
+            handed_over.push((repo.clone(), dispatched));
+            continue;
+        }
+        if let Some(reason) = report.not_dispatched {
+            not_dispatched.push((name.clone(), reason));
+        }
+        // "Uploaded" drives the enrichment this repo's services are shown
+        // with, so a resume that deliberately kept its index to itself must
+        // not claim one.
+        let kept_local = match pass {
+            Pass::Resume(resuming) => resuming.get(repo).is_some_and(|r| r.superseded),
+            _ => false,
+        };
+        if pass.infers() && !kept_local {
             uploaded.insert(repo.clone());
         }
-        if let Some(paid) = paid {
+        if let Some(paid) = report.spend {
             spend.record(&name, paid);
             spend.write(&workspace.last_scan_file());
             // And into the detached build's own state file, so the one
@@ -184,6 +285,31 @@ fn run_generation(
             .map_err(|e| e.to_string())?;
         }
         scanned.push(name);
+    }
+
+    // Handed over, so there is nothing here to join: the answers are being
+    // produced elsewhere and the index arrives when they are collected.
+    if !handed_over.is_empty() {
+        for (repo, dispatched) in &handed_over {
+            super::jobs::record(
+                &workspace.index_dir(),
+                super::jobs::Job {
+                    repo: dispatched.repo.clone(),
+                    path: repo.to_string_lossy().into_owned(),
+                    job_id: dispatched.job_id.clone(),
+                    commit: dispatched.commit.clone(),
+                    analyze_rows: dispatched.analyze_rows,
+                    submitted_at: chrono::Utc::now().to_rfc3339(),
+                },
+            )?;
+        }
+        return Ok(Built::Dispatched {
+            jobs: handed_over
+                .into_iter()
+                .map(|(_, dispatched)| dispatched)
+                .collect(),
+            not_dispatched,
+        });
     }
 
     // Hosted-only repositories enter the existing matcher/type judge, but
@@ -284,13 +410,14 @@ fn run_generation(
     // treat a stale copy of the join as the index.
     let _ = std::fs::remove_file(workspace.join_file());
 
-    Ok(IndexOutcome {
+    Ok(Built::Indexed(Box::new(IndexOutcome {
         index,
         scanned,
         elapsed_secs: started.elapsed().as_secs_f64(),
-        spend,
         hosted_download: hosted.download_line(),
-    })
+        not_dispatched,
+        pending,
+    })))
 }
 
 /// The repo holding a named service, for `refresh --service`. The blobs know
@@ -330,9 +457,9 @@ fn scan_repo(
     blobs: &Path,
     previous: &Path,
     label: &str,
-    infer: bool,
-) -> Result<Option<crate::scan_spend::ScanSpend>, String> {
-    let command = scan_command(exe, repo, blobs, previous, infer);
+    pass: &Pass,
+) -> Result<ScanReport, String> {
+    let command = scan_command(exe, repo, blobs, previous, pass);
     run_scan(
         command,
         &format!("scan of {label}"),
@@ -355,7 +482,7 @@ pub(super) fn scan_command(
     repo: &Path,
     blobs: &Path,
     previous: &Path,
-    infer: bool,
+    pass: &Pass,
 ) -> Command {
     let mut command = Command::new(exe);
     command
@@ -374,7 +501,13 @@ pub(super) fn scan_command(
         .env(crate::progress::PROGRESS_ENV, "1")
         .env_remove("CARRICK_OUTPUT_JSON")
         .env_remove(super::JOIN_OUT_ENV);
-    if infer {
+    // Whatever the pass, the two flags that decide what this scan may do are
+    // set here and nowhere else.
+    command
+        .env_remove(crate::analysis_channel::DISPATCH_ENV)
+        .env_remove(crate::analysis_channel::ANSWERS_ENV)
+        .env_remove(super::SKIP_UPLOAD_ENV);
+    if pass.infers() {
         // A laptop scan asks the model, generates intents, and uploads — the
         // same index a CI scan writes. The two flags a facts-only pass sets
         // are the two that would make it something less.
@@ -387,6 +520,31 @@ pub(super) fn scan_command(
             .env(super::NO_MODEL_ENV, "1")
             .env("CARRICK_SKIP_INTENTS", "1")
             .env_remove(crate::cloud_storage::LAPTOP_SCAN_ENV);
+    }
+    match pass {
+        Pass::Dispatch => {
+            command.env(crate::analysis_channel::DISPATCH_ENV, "1");
+        }
+        Pass::Resume(resuming) => {
+            if let Some(resumption) = resuming.get(repo) {
+                if let Some(answers) = &resumption.answers {
+                    command.env(crate::analysis_channel::ANSWERS_ENV, answers);
+                }
+                if resumption.superseded {
+                    command.env(super::SKIP_UPLOAD_ENV, "1");
+                }
+            }
+        }
+        Pass::Facts | Pass::Infer => {}
+    }
+    // The build has already checked every repo for a tree it cannot type, so
+    // a scan it starts must not check again and reach a different answer: the
+    // build's decision travels with the child (carrick#1254). Set either way,
+    // so an inherited variable cannot allow a scan this build refused.
+    if crate::preflight::allowed() {
+        command.env(crate::preflight::ALLOW_ENV, "1");
+    } else {
+        command.env_remove(crate::preflight::ALLOW_ENV);
     }
     // Always: the ambient CI context would name every repo in the workspace
     // after the one whose shell this ran in, and on a laptop scan its OIDC
@@ -440,6 +598,23 @@ pub(super) fn join_command(exe: &Path, repo: &Path, blobs: &Path, out: &Path) ->
     command
 }
 
+/// What one repo's scan said on the way past: what it paid, and whether it
+/// handed its prompts over instead of answering them here.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct ScanReport {
+    pub spend: Option<crate::scan_spend::ScanSpend>,
+    pub dispatched: Option<crate::analysis_job::Dispatched>,
+    /// Set only on a `--dispatch` pass, and only when the scan did not hand
+    /// over: why it did not (carrick#1251). `None` on every other pass, and on
+    /// a dispatch that worked.
+    pub not_dispatched: Option<crate::progress::NotDispatched>,
+    /// What this scan left for a later run, in the sentence the scan stated.
+    /// Printed as it arrives, and carried out of here so the build's summary
+    /// can end on it: a run that landed six services and deferred a seventh
+    /// has a next step, and it is not the ordinary one (carrick#1315).
+    pub pending: Vec<String>,
+}
+
 /// What one phase of a build calls itself while it runs and once it is done.
 struct Reporting {
     working: String,
@@ -464,7 +639,7 @@ fn run_scan(
     what: &str,
     reporting: Reporting,
     heartbeat: std::time::Duration,
-) -> Result<Option<crate::scan_spend::ScanSpend>, String> {
+) -> Result<ScanReport, String> {
     command.stdout(Stdio::null()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
@@ -474,6 +649,10 @@ fn run_scan(
         .take()
         .ok_or_else(|| format!("the {what} produced no stderr to read"))?;
     let bar = crate::logging::spinner(&reporting.working);
+    // And to a third, when this build is itself a child: the npm wrapper draws
+    // the terminal, and a spinner rewriting a pipe is what reached a first run
+    // as padded fragments on one line (carrick#1315).
+    crate::progress::report_phase(&reporting.working, crate::progress::PhaseState::Started);
     // The same update, to the two places that can be waiting on it: the
     // spinner a person is watching, and the state file `carrick status` reads
     // for a scan nobody is watching at all (carrick#992). The second is a
@@ -489,6 +668,15 @@ fn run_scan(
     // the scan's output, so a figure it does not lift out is a figure nobody
     // ever sees (carrick#995).
     let mut spend = None;
+    // Whether this scan handed its prompts to Carrick Cloud rather than
+    // answering them here (carrick#1229). It crosses on the same channel as
+    // the spend, and for the same reason: this process swallows the scan's
+    // output, and a scan that dispatched writes no blob for the caller to find.
+    let mut dispatched = None;
+    // And why it did not, when it was asked to and did not. The scan that
+    // reports this exits 0 with an index, so nothing downstream needs the
+    // line — the reader does (carrick#1251).
+    let mut not_dispatched = None;
     // What the scan still owes, when it landed some services and left others
     // pending. A scan in that state exits 0, so its output would otherwise be
     // dropped with the rest, and this is the sentence that says to re-run.
@@ -528,6 +716,10 @@ fn run_scan(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if let Some(update) = crate::progress::parse(&line) {
+            // Passed on unchanged when this build has a parent of its own: the
+            // counts a spinner here draws are the counts that renderer draws
+            // (carrick#1315).
+            forward(&line);
             bar.set_message(bar_message(
                 &reporting.working,
                 Some(&update),
@@ -540,6 +732,7 @@ fn run_scan(
         // Why the scan is slow, said by the scan (carrick#1122). It rides
         // beside the counts until the next one replaces it.
         if let Some(text) = crate::progress::parse_notice(&line) {
+            forward(&line);
             bar.set_message(bar_message(
                 &reporting.working,
                 last_update.as_ref(),
@@ -551,6 +744,14 @@ fn run_scan(
         }
         if let Some(reported) = crate::scan_spend::parse(&line) {
             spend = Some(reported);
+            continue;
+        }
+        if let Some(reported) = crate::progress::parse_dispatched(&line) {
+            dispatched = Some(reported);
+            continue;
+        }
+        if let Some(reason) = crate::progress::parse_not_dispatched(&line) {
+            not_dispatched = Some(reason);
             continue;
         }
         if let Some(statement) = crate::progress::parse_pending(&line) {
@@ -588,13 +789,20 @@ fn run_scan(
     if status.success() {
         if pending.is_empty() {
             crate::logging::finish_spinner(&bar, &reporting.done);
+            crate::progress::report_phase(&reporting.done, crate::progress::PhaseState::Done);
         } else {
             crate::logging::finish_spinner_warn(&bar, &reporting.done);
+            crate::progress::report_phase(&reporting.done, crate::progress::PhaseState::Warned);
             for statement in &pending {
                 eprintln!("carrick: {statement}");
             }
         }
-        return Ok(spend);
+        return Ok(ScanReport {
+            spend,
+            dispatched,
+            not_dispatched,
+            pending,
+        });
     }
     bar.finish_and_clear();
     let reason = match failure {
@@ -605,6 +813,19 @@ fn run_scan(
         "the {what} failed: {reason}\n{}",
         failure_excerpt(head, causes, tail, dropped)
     ))
+}
+
+/// Pass a marker line on to this build's own parent, unchanged.
+///
+/// A build is a parent to its scans and, under the npm wrapper, a child
+/// itself. The counts and notices it renders on a spinner are exactly what
+/// that renderer needs, and re-encoding them here would give the two readers
+/// two different lines to keep in step (carrick#1315). Nothing is written when
+/// nobody is reading.
+fn forward(line: &str) {
+    if crate::progress::parent_is_reading() {
+        eprintln!("{line}");
+    }
 }
 
 /// The spinner's message: the phase, its counts, and why it is slow when the
@@ -854,6 +1075,12 @@ pub(super) fn build(
                 boundary: blob.boundary.clone(),
                 routes: blob.endpoints.len(),
                 calls: blob.calls.len(),
+                functions: blob.function_definitions.len(),
+                types: blob
+                    .bundled_types
+                    .as_deref()
+                    .map(crate::type_manifest::dts_servable_types)
+                    .unwrap_or(0),
             })
             .collect();
         repos.push(IndexedRepo {
@@ -1239,13 +1466,13 @@ mod tests {
             .collect()
     }
 
-    fn scan_env(infer: bool) -> BTreeMap<String, Option<String>> {
+    fn scan_env(pass: &Pass) -> BTreeMap<String, Option<String>> {
         env_of(&scan_command(
             Path::new("/bin/carrick"),
             Path::new("/repos/api"),
             Path::new("/build/repos"),
             Path::new("/build/previous.json"),
-            infer,
+            pass,
         ))
     }
 
@@ -1281,7 +1508,42 @@ mod tests {
             HEARTBEAT,
         )
         .unwrap();
-        assert_eq!(lifted, Some(spend));
+        assert_eq!(lifted.spend, Some(spend));
+        assert_eq!(lifted.dispatched, None);
+        assert_eq!(lifted.not_dispatched, None);
+    }
+
+    /// The same lift, for the scan that was asked to dispatch and did not.
+    /// That scan exits 0 with an index, so nothing downstream misses this
+    /// line — which is exactly why it was silent for so long. Without this
+    /// branch the marker falls into the failure tail nobody reads, and
+    /// `--dispatch` goes back to being indistinguishable from a flag that does
+    /// nothing (carrick#1251).
+    #[test]
+    fn the_indexer_lifts_out_a_dispatch_that_did_not_happen() {
+        let _serialised = SCAN_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "echo 'indexing' >&2; echo '@carrick-not-dispatched {}' >&2",
+            serde_json::to_string(&crate::progress::NotDispatched::NothingToAnalyse).unwrap()
+        ));
+        let lifted = run_scan(
+            command,
+            "scan of /repos/api",
+            Reporting {
+                working: "indexing api".to_string(),
+                done: "indexed api".to_string(),
+            },
+            HEARTBEAT,
+        )
+        .unwrap();
+        assert_eq!(
+            lifted.not_dispatched,
+            Some(crate::progress::NotDispatched::NothingToAnalyse)
+        );
+        assert_eq!(lifted.dispatched, None);
     }
 
     /// A free pass reports nothing, and nothing is not a scan that cost zero.
@@ -1302,7 +1564,7 @@ mod tests {
             HEARTBEAT,
         )
         .unwrap();
-        assert!(lifted.is_none());
+        assert_eq!(lifted, ScanReport::default());
     }
 
     /// The default is unchanged and costs nothing: no model, no intents, no
@@ -1310,7 +1572,7 @@ mod tests {
     /// the command it runs.
     #[test]
     fn a_scan_without_inference_asks_for_no_model_and_no_intents() {
-        let env = scan_env(false);
+        let env = scan_env(&Pass::Facts);
         assert_eq!(env.get(super::super::NO_MODEL_ENV), Some(&Some("1".into())));
         assert_eq!(env.get("CARRICK_SKIP_INTENTS"), Some(&Some("1".into())));
         assert_eq!(
@@ -1325,7 +1587,7 @@ mod tests {
     /// removed rather than set to "0", because the readers test for presence.
     #[test]
     fn a_scan_with_inference_drops_the_two_flags_that_make_it_facts_only() {
-        let env = scan_env(true);
+        let env = scan_env(&Pass::Infer);
         assert_eq!(
             env.get(crate::cloud_storage::LAPTOP_SCAN_ENV),
             Some(&Some("1".into()))
@@ -1334,15 +1596,103 @@ mod tests {
         assert_eq!(env.get("CARRICK_SKIP_INTENTS"), Some(&None));
     }
 
+    /// A build the flag allowed hands that decision to every scan it starts,
+    /// and a build that was not allowed clears the variable rather than
+    /// letting an inherited one through (carrick#1254).
+    #[test]
+    #[serial_test::serial(allow_unprepared)]
+    fn a_build_hands_its_unprepared_decision_to_the_scans_it_starts() {
+        assert_eq!(
+            scan_env(&Pass::Infer).get(crate::preflight::ALLOW_ENV),
+            Some(&None),
+            "the default is a scan that checks the tree for itself"
+        );
+        // SAFETY: serialised with every other test that reads this variable.
+        unsafe { std::env::set_var(crate::preflight::ALLOW_ENV, "1") };
+        let allowed = scan_env(&Pass::Infer);
+        unsafe { std::env::remove_var(crate::preflight::ALLOW_ENV) };
+        assert_eq!(
+            allowed.get(crate::preflight::ALLOW_ENV),
+            Some(&Some("1".into()))
+        );
+    }
+
+    /// The three passes that are not the ordinary one, read back from the
+    /// environment they hand the scan. The difference between them is entirely
+    /// here, which is why this file tests it (carrick#1229).
+    #[test]
+    fn each_pass_asks_the_scan_for_exactly_what_it_is() {
+        let dispatch = scan_env(&Pass::Dispatch);
+        assert_eq!(
+            dispatch.get(crate::analysis_channel::DISPATCH_ENV),
+            Some(&Some("1".into()))
+        );
+        assert_eq!(
+            dispatch.get(crate::analysis_channel::ANSWERS_ENV),
+            Some(&None),
+            "a dispatch has no answers to replay"
+        );
+        assert_eq!(
+            dispatch.get(crate::cloud_storage::LAPTOP_SCAN_ENV),
+            Some(&Some("1".into())),
+            "and it still asks the model for detection and guidance"
+        );
+
+        let resume = scan_env(&Pass::Resume(BTreeMap::from([(
+            PathBuf::from("/repos/api"),
+            Resumption {
+                answers: Some(PathBuf::from("/build/answers.ndjson.gz")),
+                superseded: true,
+            },
+        )])));
+        assert_eq!(
+            resume.get(crate::analysis_channel::ANSWERS_ENV),
+            Some(&Some("/build/answers.ndjson.gz".into()))
+        );
+        assert_eq!(
+            resume.get(super::super::SKIP_UPLOAD_ENV),
+            Some(&Some("1".into())),
+            "a resume the cloud has moved past keeps its index to itself"
+        );
+        assert_eq!(
+            resume.get(crate::analysis_channel::DISPATCH_ENV),
+            Some(&None)
+        );
+
+        // A repo in the same resume that was never handed over is scanned the
+        // ordinary way: no answers, and its index is uploaded.
+        let untouched = scan_env(&Pass::Resume(BTreeMap::new()));
+        assert_eq!(
+            untouched.get(crate::analysis_channel::ANSWERS_ENV),
+            Some(&None)
+        );
+        assert_eq!(untouched.get(super::super::SKIP_UPLOAD_ENV), Some(&None));
+
+        for pass in [Pass::Facts, Pass::Infer] {
+            let env = scan_env(&pass);
+            for key in [
+                crate::analysis_channel::DISPATCH_ENV,
+                crate::analysis_channel::ANSWERS_ENV,
+                super::super::SKIP_UPLOAD_ENV,
+            ] {
+                assert_eq!(
+                    env.get(key),
+                    Some(&None),
+                    "{key} is cleared, not merely absent, on {pass:?}"
+                );
+            }
+        }
+    }
+
     /// Both variants strip the ambient CI context. On a laptop scan that is
     /// not tidiness: leaving `ACTIONS_ID_TOKEN_REQUEST_URL` in place would
     /// select the OIDC credential inside a scan that has none to mint.
     #[test]
     fn every_scan_strips_the_ci_context() {
-        for infer in [false, true] {
-            let env = scan_env(infer);
+        for pass in [Pass::Facts, Pass::Infer] {
+            let env = scan_env(&pass);
             for key in ["ACTIONS_ID_TOKEN_REQUEST_URL", "GITHUB_REPOSITORY", "CI"] {
-                assert_eq!(env.get(key), Some(&None), "{key} survived infer={infer}");
+                assert_eq!(env.get(key), Some(&None), "{key} survived {pass:?}");
             }
         }
     }
@@ -1353,8 +1703,8 @@ mod tests {
     /// without it every laptop rescan would be a cold, paid one.
     #[test]
     fn both_variants_carry_the_cache_dir_and_the_previous_generation() {
-        for infer in [false, true] {
-            let env = scan_env(infer);
+        for pass in [Pass::Facts, Pass::Infer] {
+            let env = scan_env(&pass);
             assert_eq!(
                 env.get(crate::cloud_storage::CACHE_DIR_ENV),
                 Some(&Some("/build/repos".into()))
@@ -1377,8 +1727,8 @@ mod tests {
     #[test]
     fn every_subprocess_carries_this_run_and_says_which_phase_it_is() {
         let expected = Some(&Some(crate::logging::run_id().to_string()));
-        for infer in [false, true] {
-            let env = scan_env(infer);
+        for pass in [Pass::Facts, Pass::Infer] {
+            let env = scan_env(&pass);
             assert_eq!(env.get(crate::logging::RUN_ID_ENV), expected);
             assert_eq!(
                 env.get(crate::logging::RUN_PHASE_ENV),

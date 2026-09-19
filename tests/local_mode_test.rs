@@ -141,6 +141,30 @@ fn run_mocked(workspace: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("stdout was not UTF-8")
 }
 
+/// The same as [`run_mocked`], with the narration the command writes to
+/// stderr. A build states what it did on stderr and prints the index map on
+/// stdout, so a test of what it SAID needs both (carrick#1251).
+fn run_mocked_output(workspace: &Path, args: &[&str]) -> (String, String) {
+    let output = Command::new(carrick())
+        .args(args)
+        .current_dir(workspace)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", workspace.join(".test-credentials"))
+        .env("CARRICK_MOCK_ALL", "1")
+        .output()
+        .unwrap_or_else(|e| panic!("carrick {args:?}: {e}"));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "carrick {args:?} exited {:?}:\n{stderr}",
+        output.status.code(),
+    );
+    (
+        String::from_utf8(output.stdout).expect("stdout was not UTF-8"),
+        stderr,
+    )
+}
+
 /// Build the index with no model and nothing to pay.
 ///
 /// `refresh`, not `index`: since carrick#1008 `carrick index` is the inferred
@@ -883,10 +907,13 @@ fn a_scan_states_its_progress_to_the_indexer_and_not_to_the_user() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
+    // Every marker, not just the counts: a phase and a summary are gated on
+    // the same flag, and one emitted without it would reach a user as JSON
+    // (carrick#1315).
     for (name, stream) in [("stdout", &stdout), ("stderr", &stderr)] {
         assert!(
-            !stream.contains("@carrick-progress"),
-            "the indexer reads the updates; one reached {name} raw:\n{stream}"
+            !stream.contains("@carrick-"),
+            "nobody asked for markers; one reached {name} raw:\n{stream}"
         );
     }
     // One line per repo either way, because the animated form is a terminal's
@@ -905,6 +932,79 @@ fn a_scan_states_its_progress_to_the_indexer_and_not_to_the_user() {
         stdout.contains("indexed 2 repo(s)"),
         "the summary is unchanged:\n{stdout}"
     );
+}
+
+/// A build that has a parent of its own states its phases and its counts as
+/// markers, and the parent renders them (carrick#1315).
+///
+/// The npm wrapper is that parent: it pipes this process's stderr, draws a
+/// spinner per phase and ends on the counts. Everything it draws has to be a
+/// marker, because the alternative is what a first run saw — an indicatif
+/// spinner rewriting a pipe, arriving as padded fragments sharing one line.
+#[test]
+#[serial]
+fn a_build_states_its_phases_and_counts_to_a_parent_that_is_reading() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+
+    let output = Command::new(carrick())
+        .args(["refresh", "--workspace", "."])
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env(carrick::progress::PROGRESS_ENV, "1")
+        .output()
+        .expect("carrick refresh");
+    assert!(output.status.success(), "carrick refresh failed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let phases: Vec<carrick::progress::PhaseUpdate> = stderr
+        .lines()
+        .filter_map(carrick::progress::parse_phase)
+        .collect();
+    for repo in ["catalog-web", "inventory-svc"] {
+        for (label, state) in [
+            (
+                format!("indexing {repo}"),
+                carrick::progress::PhaseState::Started,
+            ),
+            (
+                format!("indexed {repo}"),
+                carrick::progress::PhaseState::Done,
+            ),
+        ] {
+            assert!(
+                phases
+                    .iter()
+                    .any(|phase| phase.label == label && phase.state == state),
+                "no phase marker for '{label}':\n{stderr}"
+            );
+        }
+    }
+
+    // The scans' own counts are passed on, not consumed: the spinner a
+    // renderer draws is the one the scan is filling in.
+    assert!(
+        stderr
+            .lines()
+            .any(|line| carrick::progress::parse(line).is_some()),
+        "no scan's progress reached the parent:\n{stderr}"
+    );
+
+    let summary = stderr
+        .lines()
+        .find_map(carrick::progress::parse_summary)
+        .unwrap_or_else(|| panic!("the build stated no summary:\n{stderr}"));
+    assert_eq!(
+        summary.services.len(),
+        2,
+        "one row per indexed service:\n{stderr}"
+    );
+    assert!(
+        summary.services.iter().any(|service| service.routes > 0),
+        "the routes the map prints are the routes the summary carries:\n{stderr}"
+    );
+    assert!(summary.elapsed_secs > 0.0, "{stderr}");
 }
 
 /// Rewrite a file with the bytes it already has, and push its mtime forward so
@@ -1729,5 +1829,155 @@ fn a_successful_index_supersedes_the_record_of_the_scan_before_it() {
     assert!(
         !rendered.contains("12d9106f"),
         "and `status` stops leading with it:\n{rendered}"
+    );
+}
+
+/// `carrick index --dispatch` hands the analysis over and says so, and the
+/// workspace remembers the jobs (carrick#1229).
+///
+/// The scan that dispatches writes no index — that is the point of it — so the
+/// two things that must survive the command are the record of what is being
+/// analysed and a line telling the user how it arrives. The offline storage
+/// takes the job in place of the cloud, so this runs on a machine with no
+/// credential and no network.
+#[test]
+#[serial]
+fn a_dispatched_index_records_its_jobs_and_says_the_analysis_is_elsewhere() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    for repo in ["catalog-web", "inventory-svc"] {
+        std::fs::write(root.join(repo).join("carrick.json"), "{}\n").expect("write a config");
+    }
+
+    let stdout = run_mocked(root, &["index", "--dispatch", "--workspace", "."]);
+    assert!(
+        stdout.contains("Carrick Cloud is analysing"),
+        "the command says who is doing the work:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("carrick resume"),
+        "and how the index arrives:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains('$') && !stdout.to_lowercase().contains("paid"),
+        "what the analysis costs us is never a customer's line (carrick#1236):\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("The index is written"),
+        "no index was written, and the record must not say one was:\n{stdout}"
+    );
+
+    // The scan record says what happened to it. Written by the build rather
+    // than by the scan, and not rewritten as "finished" on the way out.
+    let record = std::fs::read_dir(root.join(".carrick"))
+        .expect(".carrick")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("scan-") && name.ends_with(".json"))
+        })
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .expect("the build recorded its scan");
+    let state: serde_json::Value = serde_json::from_str(&record).expect("scan record is json");
+    assert_eq!(
+        state["status"], "dispatched",
+        "the record says the analysis went elsewhere:\n{record}"
+    );
+    assert!(
+        !state["jobs"].as_array().unwrap_or(&Vec::new()).is_empty(),
+        "and names the job it is waiting on:\n{record}"
+    );
+
+    let recorded = std::fs::read_to_string(root.join(".carrick/jobs.json"))
+        .expect("the jobs outlive the command that dispatched them");
+    let jobs: serde_json::Value = serde_json::from_str(&recorded).expect("jobs.json is json");
+    let jobs = jobs["jobs"]
+        .as_array()
+        .expect("one entry per repo handed over");
+    // One per repo that had anything for the model. A repo whose files raise
+    // no candidate has no job to wait for and was indexed here instead, which
+    // is why this is a floor and not an equality.
+    assert!(!jobs.is_empty(), "something was handed over:\n{recorded}");
+    for job in jobs {
+        // `/private/var` on macOS against the `/var` the test built: compare
+        // the tail, which is what says this is that repo.
+        let path = job["path"].as_str().unwrap_or_default();
+        assert!(
+            std::path::Path::new(path).ends_with(job["repo"].as_str().unwrap_or("nothing")),
+            "each names the tree a resume rebuilds the prompts from:\n{recorded}"
+        );
+        assert!(
+            !job["job_id"].as_str().unwrap_or_default().is_empty(),
+            "each names the job to collect:\n{recorded}"
+        );
+        assert!(
+            job["analyze_rows"].as_u64().unwrap_or_default() > 0,
+            "and how many files it carries:\n{recorded}"
+        );
+    }
+
+    // And `status` leads with it. Without the record this reads "no index
+    // here", which is the wrong answer while the work that builds it is
+    // running somewhere else. The cloud cannot be asked on this machine, so
+    // the line says that rather than pretending.
+    let rendered = run(root, &["status", "--workspace", "."]);
+    assert!(
+        rendered.contains("Carrick Cloud is analysing"),
+        "status names the analysis in flight:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("could not ask"),
+        "and says it could not reach the cloud rather than inventing progress:\n{rendered}"
+    );
+}
+
+/// `carrick index --dispatch` that has nothing to hand over says so, and says
+/// where the index came from instead (carrick#1251).
+///
+/// This is the ordinary outcome of `--dispatch`, not an edge: a warm analysis
+/// cache is the normal state of every scan after the first, and a repo whose
+/// files raise no candidate never had anything for the model. It used to print
+/// nothing whatever, which is indistinguishable from a flag that was ignored,
+/// misspelled or broken — and it cost a session three unnoticed synchronous
+/// runs.
+///
+/// The repo here is the second kind: sources with no candidate in them, so no
+/// prompt is built and the collector is empty.
+#[test]
+#[serial]
+fn a_dispatch_with_nothing_to_hand_over_says_so() {
+    let workspace = workspace("local-mode-workspace", &["inventory-svc"]);
+    let root = workspace.path();
+    let repo = root.join("inventory-svc");
+    std::fs::write(repo.join("carrick.json"), "{}\n").expect("write a config");
+    // Nothing a model would be asked about: no route, no call, no schema.
+    for file in std::fs::read_dir(repo.join("src")).expect("the fixture's sources") {
+        std::fs::remove_file(file.expect("dir entry").path()).expect("remove it");
+    }
+    std::fs::write(
+        repo.join("src/arithmetic.ts"),
+        "export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+    )
+    .expect("write the one file");
+
+    let (stdout, stderr) = run_mocked_output(root, &["index", "--dispatch", "--workspace", "."]);
+    let said = format!("{stdout}\n{stderr}");
+    assert!(
+        said.contains("nothing was handed to Carrick Cloud for inventory-svc"),
+        "the command names the repo it handed nothing over for:\n{said}"
+    );
+    assert!(
+        said.contains("The index was built here."),
+        "and says where the index came from instead:\n{said}"
+    );
+    assert!(
+        root.join(".carrick/index.json").is_file(),
+        "and it really did build one"
+    );
+    assert!(
+        !root.join(".carrick/jobs.json").exists(),
+        "nothing is waiting to be collected:\n{said}"
     );
 }

@@ -1,6 +1,6 @@
 use crate::agent_service::{AgentService, RetryPolicy};
 use crate::agents::file_orchestrator::FileOrchestrator;
-use crate::agents::framework_guidance_agent::FrameworkGuidanceAgent;
+use crate::agents::framework_guidance_agent::{FrameworkGuidanceAgent, ProtocolGuidance};
 use crate::analyzer::{Analyzer, ApiEndpointDetails, builder::AnalyzerBuilder};
 use crate::cloud_storage::{
     CACHE_DIR_ENV, CloudRepoData, CloudStorage, INLINE_PAYLOAD_LIMIT_BYTES, ManifestRole,
@@ -437,6 +437,26 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         warn!("{sentence}");
     }
 
+    // Dispatch, decided here because this is the first moment both halves of
+    // the question are answerable: the indexer asked for it in the
+    // environment, and `start-scan` has just said whether this cloud runs
+    // analysis jobs (carrick#1229). A cloud that does not is not an error —
+    // this run scans the way every run did before, and the user waits.
+    if crate::analysis_channel::dispatch_requested() {
+        if storage.accepts_analysis_job() {
+            crate::analysis_channel::begin_dispatch();
+        } else {
+            info!(
+                "Carrick Cloud is not running analysis jobs yet, so this scan analyses the repo \
+                 here and now."
+            );
+            // And on the marker channel, because the indexer swallows this
+            // process's stderr and `--dispatch` would otherwise look like a
+            // flag that did nothing (carrick#1251).
+            crate::progress::report_not_dispatched(crate::progress::NotDispatched::CloudDeclined);
+        }
+    }
+
     // 2. Download all repos (moved earlier for incremental cache lookup)
     let sp = logging::spinner("Downloading cross-repo data...");
     let (mut all_repo_data, _repo_s3_urls) = storage
@@ -583,6 +603,49 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 return Err(error);
             }
         }
+    }
+
+    // 4a. A dispatched run ends here, and this is its whole product: every
+    // prompt every service built, shipped as one job (carrick#1229).
+    //
+    // Nothing below this point has anything to work on — the model answers it
+    // would join, cache, type-check and upload are what the job is for — and
+    // the cloud is holding a slot for the job rather than for this process, so
+    // the run exits 0 and the machine is free.
+    //
+    // A run asked to dispatch that built no prompt at all is not that run. It
+    // has nothing to hand over, every service went through the ordinary phases
+    // (see `analyze_files`), and it finishes here the way any other scan does:
+    // it writes its index, closes its scan and leaves nobody waiting for
+    // answers that were never asked for. It says so on the way past, which is
+    // the one thing it used not to do (carrick#1251).
+    match crate::analysis_channel::take() {
+        Some(collected) if !collected.rows.is_empty() => {
+            let submitted =
+                dispatch_analysis_job(storage, collected, &run_context, repo_path).await?;
+            crate::progress::report_dispatched(&submitted);
+            logging::finish_spinner(
+                &sp,
+                &format!(
+                    "Carrick Cloud is analysing {} file(s) of {}",
+                    submitted.analyze_rows, submitted.repo
+                ),
+            );
+            return Ok(());
+        }
+        // Asked to dispatch, collected nothing. The cloud that declined the
+        // job never started a collector, so it is not this branch: it said so
+        // where it declined.
+        Some(_) => {
+            info!(
+                "Nothing in this repo needed the analyzer, so there was nothing to hand over: it \
+                 is indexed here."
+            );
+            crate::progress::report_not_dispatched(
+                crate::progress::NotDispatched::NothingToAnalyse,
+            );
+        }
+        None => {}
     }
 
     // 4b. The work the run still owes gets one more try before it ends: a
@@ -1333,6 +1396,13 @@ impl ServiceScan<'_> {
         crate::progress::service_started(label, index + 1, self.total);
         // Every loss from here on is this service's.
         crate::scan_health::enter_service(service.service_name.as_deref());
+        // And so is every prompt-lambda call: they all happen inside this
+        // function, and each one carries this name so the cloud's logs can
+        // say which tree of a monorepo spent the money (carrick#1221). The
+        // guard is bound, not dropped on this line: the scope has to outlive
+        // the analysis below and end with it, so that the cross-repo phase,
+        // the upload and a service that failed mid-loop name nobody.
+        let _service_scope = crate::current_service::enter(service.service_name.as_deref());
         let quota_aborts_before = crate::agent_service::quota_abort_count();
         let service_started = Instant::now();
 
@@ -1419,6 +1489,74 @@ fn previous_generation(
         .iter()
         .find(|r| r.repo_name == repo_name && r.service_name == service.service_name)
         .cloned()
+}
+
+/// Ship a dispatched run's prompts and say what came back (carrick#1229).
+///
+/// One thing can stop it: a service whose framework guidance has no id. The
+/// cloud keys the whole message without one, so the block this bundle carries
+/// once is re-keyed for every file, and the job is not sent.
+async fn dispatch_analysis_job<T: CloudStorage + Sync>(
+    storage: &T,
+    collected: crate::analysis_channel::Collected,
+    run: &crate::cloud_storage::RunContext,
+    repo_path: &str,
+) -> Result<crate::analysis_job::Dispatched, Box<dyn std::error::Error>> {
+    // The name the cloud authorised the scan with, and this tree's own name
+    // when it has no remote: never the working directory, which in a
+    // multi-repo build is the workspace and is the same for every repo in it.
+    let repo = run
+        .repo_full_name
+        .clone()
+        .unwrap_or_else(|| get_repository_name(repo_path));
+    if !collected.degraded.is_empty() {
+        return Err(format!(
+            "Carrick could not read the framework guidance for {}, so this scan cannot be handed \
+             over. Run `carrick index` and it will analyse the repo here.",
+            collected.degraded.join(", ")
+        )
+        .into());
+    }
+    let analyze_rows = collected.rows.len();
+    let bundle = crate::analysis_job::JobBundle {
+        header: crate::analysis_job::JobHeader {
+            schema: crate::analysis_job::JOB_SCHEMA.to_string(),
+            scan_id: crate::credentials::scan_id()
+                .unwrap_or_default()
+                .to_string(),
+            repo: repo.clone(),
+            commit: run.commit.clone(),
+            scanner_version: env!("CARGO_PKG_VERSION").to_string(),
+            cache_version: CACHE_VERSION,
+            services: collected.services,
+            guidance: collected.guidance,
+            schemas: collected.schemas,
+            counts: crate::analysis_job::JobCounts {
+                analyze_file: analyze_rows,
+                // Intents are generated by the machine that resumes: they are a
+                // small fraction of a scan's calls once batched, and their
+                // prompts embed answers that do not exist until the level below
+                // them has been answered (carrick#1245).
+                intent_functions: 0,
+                intent_levels: 0,
+            },
+        },
+        analyze: collected.rows,
+    };
+    let submission = storage
+        .submit_analysis_job(&bundle)
+        .await?
+        .ok_or("Carrick Cloud did not take this analysis job")?;
+    info!(
+        "Carrick Cloud took job {} for {} file(s)",
+        submission.job_id, submission.analyze_rows
+    );
+    Ok(crate::analysis_job::Dispatched {
+        repo,
+        commit: run.commit.clone(),
+        job_id: submission.job_id,
+        analyze_rows: submission.analyze_rows,
+    })
 }
 
 /// The upload payloads for `services`, stripped and stamped with the state
@@ -1852,6 +1990,25 @@ async fn upload_landed_anyway<T: CloudStorage>(
     false
 }
 
+/// Did this run send any of this service's files to the analyzer?
+///
+/// Read off the payload's own boundary, which every branch of the analysis
+/// builds fresh from this scan's processing stats before the payload is
+/// uploaded — so it is this run's count, not a number carried over from the
+/// generation the index holds. A held-back service writes no payload at all,
+/// so nothing here can be reading a served generation's boundary
+/// (carrick#1306).
+///
+/// A payload with no boundary at all answers `false`: absence is not evidence
+/// that analysis happened, and the alternative is forcing a re-index on every
+/// upload.
+fn payload_reached_the_analyzer(payload: &CloudRepoData) -> bool {
+    payload
+        .boundary
+        .as_ref()
+        .is_some_and(|boundary| boundary.files_attempted > 0)
+}
+
 /// Upload each already-prepared service payload to the cloud index, in order,
 /// and report every service whose index this run could not confirm.
 ///
@@ -1875,6 +2032,21 @@ async fn upload_service_payloads<T: CloudStorage>(
     boundary: &upload_boundary::UploadBoundary,
 ) -> Vec<UnconfirmedUpload> {
     crate::scan_stage::enter(crate::scan_stage::Stage::Upload);
+    // Before the first write, because every write action reads it: a run that
+    // sent even one file to the analyzer computed something the stored
+    // generation does not hold, and the cloud's freshness guard — which sees
+    // (commit, scanner version) and nothing else — would otherwise dedupe the
+    // whole upload away at an unchanged commit (carrick#1306). Run-scoped, not
+    // per service: one service's fresh answers reach the others through the
+    // cross-repo join, so a repo where one service was analysed writes a
+    // generation that differs everywhere.
+    let analyzed = payloads.iter().any(payload_reached_the_analyzer);
+    if analyzed {
+        storage.note_analyzed_files();
+    }
+    // The diagnostic below asks whether the cloud discarded analysis this run
+    // had done, so it has to mean the same thing the wire flag means.
+    let forced = forced || analyzed;
     let sp = logging::spinner("Uploading results...");
     let mut outcomes: Vec<UploadOutcome> = Vec::with_capacity(payloads.len());
     let mut confirmed: Vec<&str> = Vec::new();
@@ -2007,12 +2179,12 @@ fn upload_finish_message(outcomes: &[UploadOutcome]) -> &'static str {
     }
 }
 
-/// Said when a `--no-cache` run's answers were computed and then discarded by
-/// the ingest. Names the one cause it can have, because the run itself did
-/// nothing wrong.
-const FORCED_REANALYSIS_DISCARDED: &str = "Full re-analysis was discarded: the cloud kept the stored index for this commit. \
-     It is deployed without force_reindex support (carrick#885); the answers this run \
-     computed were not stored.";
+/// Said when a run that told the cloud to replace the stored generation had
+/// its answers computed and then discarded by the ingest. Names the one cause
+/// it can have, because the run itself did nothing wrong.
+const FORCED_REANALYSIS_DISCARDED: &str = "This scan's fresh analysis was discarded: the cloud kept the stored index for this \
+     commit. It is deployed without force_reindex support (carrick#885); the answers this \
+     run computed were not stored.";
 
 /// Did a forced run pay for a re-analysis the cloud then threw away?
 ///
@@ -2020,8 +2192,9 @@ const FORCED_REANALYSIS_DISCARDED: &str = "Full re-analysis was discarded: the c
 /// exactly one explanation: the deployed cloud predates the reader for that
 /// field, since a cloud that has it never answers current to a forced write.
 /// That is a deploy-order mistake, and it must show as a warning rather than
-/// as the ordinary "already current" line — the whole point of `--no-cache` is
-/// that the run believed the stored answers were stale (carrick#885).
+/// as the ordinary "already current" line — a forced run is one that believed
+/// the stored answers were stale, whether because `--no-cache` said so or
+/// because it sent files to the analyzer (carrick#885, carrick#1306).
 fn forced_reanalysis_was_discarded(outcomes: &[UploadOutcome], forced: bool) -> bool {
     forced && !outcomes.is_empty() && outcomes.iter().all(|o| o.already_current)
 }
@@ -2401,7 +2574,12 @@ async fn analyze_current_repo_incremental(
                     )
                 }
             } else if !pkg_changed {
-                if let (Some(det), Some(guid)) = (&prev.cached_detection, &prev.cached_guidance) {
+                if let (Some(det), Some(guid)) = (
+                    &prev.cached_detection,
+                    prev.cached_guidance
+                        .as_ref()
+                        .filter(|g| guidance_is_keyed(g)),
+                ) {
                     debug!("Reusing cached framework detection and guidance");
                     // A missing cached config (older cache entry, or an earlier
                     // failed generation) is regenerated on its own.
@@ -2414,10 +2592,16 @@ async fn analyze_current_repo_incremental(
                     };
                     ModelSetup::ready(det.clone(), guid.clone(), extraction)
                 } else {
-                    // Something is missing: a first scan's cache entry, or the
-                    // service a previous scan deferred. A detection that
-                    // landed without its guidance is kept, and only the
-                    // guidance is asked again (carrick#1126).
+                    // Something is missing: a first scan's cache entry, the
+                    // service a previous scan deferred, or a blob whose
+                    // guidance predates the guidance id (carrick#1224). A
+                    // detection that landed without usable guidance is kept,
+                    // and only the guidance is asked again (carrick#1126).
+                    if prev.cached_guidance.is_some() {
+                        debug!(
+                            "Cached guidance carries no id (written before the id existed); asking for guidance again so the analysis cache keys it by identity, not by its text"
+                        );
+                    }
                     model_setup(
                         packages,
                         &all_import_facts,
@@ -2445,6 +2629,11 @@ async fn analyze_current_repo_incremental(
             // producer list is complete; empty for non-GraphQL services.
             let graphql_producer_hints = crate::graphql::GraphqlProducerHints::collect(
                 service_graphql_roots(repo_path, service),
+                &crate::graphql::resolve_declared_schemas(
+                    Path::new(repo_path),
+                    &service.graphql_schemas,
+                )
+                .files,
                 &files,
             );
             // #268: the consumer mirror — document consumers with no
@@ -2454,6 +2643,7 @@ async fn analyze_current_repo_incremental(
             let graphql_consumer_hints = crate::graphql::GraphqlConsumerHints::collect(
                 service_graphql_roots(repo_path, service),
                 &files,
+                repo_path,
             );
 
             let normalizer = UrlNormalizer::new(config);
@@ -2514,8 +2704,13 @@ async fn analyze_current_repo_incremental(
             // the GraphQL consumer file set folds transport data calls out of
             // the graph (#307) so every downstream surface (cloud projection,
             // type manifest, type requests) sees the same call set.
-            let (mut protocol_extractions, document_sites) =
-                scan_protocol_extractions(repo_path, service, &files, &merged_results);
+            let (mut protocol_extractions, document_sites) = scan_protocol_extractions(
+                repo_path,
+                service,
+                &files,
+                &merged_results,
+                &setup.detection.socket_clients,
+            );
             settle_graphql_documents(
                 &mut protocol_extractions.graphql,
                 document_sites,
@@ -2774,14 +2969,34 @@ struct SettledDetection {
     extraction_config: Option<crate::services::type_sidecar::ExtractionConfig>,
 }
 
+/// Whether a persisted guidance can be replayed instead of asked for again.
+///
+/// The id is the whole test. `/analyze-file` sends it so the cloud's analysis
+/// cache can key the guidance block by identity rather than by its text, and a
+/// guidance without one puts its TEXT in the key instead — so every file in the
+/// service re-pays whenever the words move, which is the recurring cost the id
+/// was built to remove (carrick-cloud#871).
+///
+/// A blob written before the id existed carries none, and the
+/// `package_json_hash` gate around the replay does not move on an ordinary
+/// scan: without this check such a repo replays keyless guidance on every scan
+/// from here on and never self-heals (carrick#1224). Asking again costs the
+/// five guidance calls once — the cloud serves them from its own guidance
+/// cache — and the answer that comes back carries the id, which the blob then
+/// persists.
+fn guidance_is_keyed(guidance: &ProtocolGuidance) -> bool {
+    !guidance.is_empty() && guidance.values().all(|g| g.guidance_key.is_some())
+}
+
 impl SettledDetection {
     /// The detection `prev` kept when its guidance was deferred
-    /// ([`ModelSetup::guidance_deferred`]): there is a cached detection and no
+    /// ([`ModelSetup::guidance_deferred`]) or cannot be replayed
+    /// ([`guidance_is_keyed`]): there is a cached detection and no usable
     /// cached guidance, from this cache version and these manifests. A
     /// complete previous generation returns `None`; the incremental branch
     /// reuses it whole, and a full analysis asks again as it always has.
     fn kept_by(prev: &CloudRepoData, current_pkg_hash: &str) -> Option<Self> {
-        if prev.cached_guidance.is_some()
+        if prev.cached_guidance.as_ref().is_some_and(guidance_is_keyed)
             || prev.cache_version != Some(CACHE_VERSION)
             || prev.package_json_hash.as_deref() != Some(current_pkg_hash)
         {
@@ -2947,6 +3162,7 @@ fn scan_protocol_extractions(
     service: &Config,
     files: &[PathBuf],
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    socket_clients: &[String],
 ) -> (
     ProtocolExtractions,
     crate::graphql_document_sites::DocumentSiteConsumers,
@@ -2967,7 +3183,9 @@ fn scan_protocol_extractions(
         crate::workspace_resolver::WorkspaceIndex::build_with_aliases(Path::new(repo_path), None);
     let document_sites =
         crate::graphql_document_sites::collect_document_site_consumers(files, Some(&workspace));
-    let sockets = crate::socket_io::scan_files(files);
+    // The detected socket clients gate the pass's unknown-direction half; its
+    // Socket.IO rules are independent of them (carrick#1281).
+    let sockets = crate::socket_io::scan_files(files, socket_clients);
     let event_bus = crate::event_emitter::scan_files(files, &sockets);
     (
         ProtocolExtractions {
@@ -3185,12 +3403,19 @@ fn append_deterministic_protocol_operations(
             consumers = graphql.consumers.len(),
             "Indexing GraphQL operations"
         );
-        cloud_data.endpoints.extend(
-            graphql
-                .producers
-                .iter()
-                .map(|op| to_details(op.key.clone(), &op.file_path, op.line)),
-        );
+        // A producer is served where its resolver is, when one was located
+        // (carrick#1157): the schema file states the field, the resolver is
+        // the code that changes when the operation does. A field with only a
+        // backing type located has no line to point at and stays on its schema
+        // line.
+        cloud_data
+            .endpoints
+            .extend(graphql.producers.iter().map(|op| {
+                match (&op.resolver_file, op.resolver_line) {
+                    (Some(file), Some(line)) => to_details(op.key.clone(), file, line),
+                    _ => to_details(op.key.clone(), &op.file_path, op.line),
+                }
+            }));
         cloud_data
             .calls
             .extend(graphql.consumers.iter().map(|op| ApiEndpointDetails {
@@ -4812,26 +5037,11 @@ fn report_unresolved_imports(
     unresolved: &crate::call_graph::UnresolvedImports,
     unfollowed_extends: &[String],
 ) {
-    if !unresolved.aliases.is_empty() {
-        let imports: usize = unresolved.aliases.values().sum();
-        let mut ranked: Vec<(&String, &usize)> = unresolved.aliases.iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-        let named: Vec<&str> = ranked
-            .iter()
-            .take(MAX_NAMED_UNRESOLVED_SPECIFIERS)
-            .map(|(specifier, _)| specifier.as_str())
-            .collect();
-        info!(
-            "Call graph: {} import(s) through {} aliased specifier(s) resolved to no file, so those calls record no caller edge. No tsconfig, package.json or Deno config declares the alias; one set only in bundler or build code is not read (carrick#1104): {}{}",
-            imports,
-            unresolved.aliases.len(),
-            named.join(", "),
-            if ranked.len() > named.len() {
-                ", ..."
-            } else {
-                ""
-            }
-        );
+    if let Some(line) = undeclared_alias_line(unresolved) {
+        info!("{line}");
+    }
+    for line in missing_mapping_lines(unresolved) {
+        info!("{line}");
     }
     if unresolved.undeclared_packages > 0 {
         debug!(
@@ -4845,6 +5055,80 @@ fn report_unresolved_imports(
             unfollowed_extends.join(", ")
         );
     }
+}
+
+/// The specifiers no config declares, worst first, capped.
+///
+/// Same four things as [`missing_mapping_lines`] and for the same reason: how
+/// many, which ones, what is missing, and what to do. What this costs the
+/// scanner — that the calls record no caller edge — was half the old line and
+/// is ours to know, not theirs to read (David's ruling, 2026-09-17).
+///
+/// The instruction carries the three config kinds that would fix it, which is
+/// also the answer to the question the old line spent a clause on: an alias
+/// set only in bundler or build code is not one of them, and declaring it in
+/// one of these is what makes it readable.
+fn undeclared_alias_line(unresolved: &crate::call_graph::UnresolvedImports) -> Option<String> {
+    if unresolved.aliases.is_empty() {
+        return None;
+    }
+    let imports: usize = unresolved.aliases.values().sum();
+    let mut ranked: Vec<(&String, &usize)> = unresolved.aliases.iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    let named: Vec<&str> = ranked
+        .iter()
+        .take(MAX_NAMED_UNRESOLVED_SPECIFIERS)
+        .map(|(specifier, _)| specifier.as_str())
+        .collect();
+    Some(format!(
+        "Call graph: {imports} import(s) through {} undeclared alias(es) are unresolved: {}{}. Declare them in tsconfig, package.json or a Deno import map.",
+        unresolved.aliases.len(),
+        named.join(", "),
+        if ranked.len() > named.len() {
+            ", ..."
+        } else {
+            ""
+        }
+    ))
+}
+
+/// One line per config mapping whose target is not on disk, worst first
+/// (carrick#1273).
+///
+/// Four things and nothing else: how many imports, which mapping, what is
+/// missing, and what to do. A count with no referent is what the old `debug!`
+/// line was and it told nobody anything — but explaining what an unresolved
+/// import costs US is our internals, not their problem (David's ruling,
+/// 2026-09-17).
+///
+/// The target named is the MAPPING's — `src/db/generated/client/`, not the
+/// file one import happened to want under it. Whether it is there at all is
+/// the difference between a build step nobody ran and one import spelled
+/// wrong, and it is carried by the instruction rather than by a clause of its
+/// own, which is where a reader needs it and costs no words.
+///
+/// Capped like its sibling above: a repo with dozens of broken mappings has
+/// one cause, not dozens, and the ranked head names it.
+fn missing_mapping_lines(unresolved: &crate::call_graph::UnresolvedImports) -> Vec<String> {
+    let mut ranked: Vec<(&String, &crate::call_graph::MissingMapping)> =
+        unresolved.missing_mappings.iter().collect();
+    ranked.sort_by(|a, b| b.1.imports.cmp(&a.1.imports).then(a.0.cmp(b.0)));
+    ranked
+        .iter()
+        .take(MAX_NAMED_UNRESOLVED_SPECIFIERS)
+        .map(|(declared_by, missing)| {
+            format!(
+                "Call graph: {} import(s) through `{declared_by}` are unresolved: its target {} does not exist. {}",
+                missing.imports,
+                missing.target_root,
+                if missing.directory_missing {
+                    "Generate it, or fix the mapping."
+                } else {
+                    "Fix the mapping, or the import."
+                },
+            )
+        })
+        .collect()
 }
 
 fn discover_files_and_symbols(
@@ -5843,6 +6127,8 @@ async fn analyze_current_repo(
     // later for the operation index; the duplicate parse is acceptable.
     let graphql_producer_hints = crate::graphql::GraphqlProducerHints::collect(
         service_graphql_roots(repo_path, service),
+        &crate::graphql::resolve_declared_schemas(Path::new(repo_path), &service.graphql_schemas)
+            .files,
         &files,
     );
     // #268: the consumer mirror — document consumers with no deterministic
@@ -5851,6 +6137,7 @@ async fn analyze_current_repo(
     let graphql_consumer_hints = crate::graphql::GraphqlConsumerHints::collect(
         service_graphql_roots(repo_path, service),
         &files,
+        repo_path,
     );
 
     // 3b. Settle the model stages for this service: detection and guidance
@@ -5906,8 +6193,13 @@ async fn analyze_current_repo(
     // GraphQL consumer file set folds transport data calls out of the mount
     // graph (#307) so every downstream surface (cloud projection, type
     // manifest, type requests) sees the same call set.
-    let (mut protocol_extractions, document_sites) =
-        scan_protocol_extractions(repo_path, service, &files, &analysis_result.file_results);
+    let (mut protocol_extractions, document_sites) = scan_protocol_extractions(
+        repo_path,
+        service,
+        &files,
+        &analysis_result.file_results,
+        &setup.detection.socket_clients,
+    );
     let mut analysis_result = analysis_result;
     settle_graphql_documents(
         &mut protocol_extractions.graphql,
@@ -6165,6 +6457,73 @@ async fn build_cross_repo_analyzer(
 
 #[cfg(test)]
 mod tests {
+    use crate::git_state::tests::committed_repo;
+
+    /// The aliased-specifier line, pinned for the same reason as its sibling
+    /// below: it carried the same internals clause and the same stray ticket
+    /// ref, and was the last verbose line in this reporter.
+    #[test]
+    fn undeclared_aliases_are_named_with_their_count_and_what_to_do() {
+        let mut unresolved = crate::call_graph::UnresolvedImports::default();
+        assert_eq!(super::undeclared_alias_line(&unresolved), None);
+
+        unresolved.aliases.insert("~/queue".to_string(), 9);
+        unresolved.aliases.insert("$lib/db".to_string(), 2);
+        let line = super::undeclared_alias_line(&unresolved).expect("a line");
+        assert_eq!(
+            line,
+            "Call graph: 11 import(s) through 2 undeclared alias(es) are unresolved: ~/queue, \
+             $lib/db. Declare them in tsconfig, package.json or a Deno import map."
+        );
+    }
+
+    /// The sentence is the deliverable of carrick#1273, so it is pinned.
+    ///
+    /// A third bucket that still logged a bare count would be the same defect
+    /// with better bookkeeping: what a user can act on is the mapping they
+    /// wrote, the path it points at, and how many imports went through it.
+    #[test]
+    fn a_mapping_that_points_at_nothing_is_named_with_its_count() {
+        let mut unresolved = crate::call_graph::UnresolvedImports::default();
+        unresolved.missing_mappings.insert(
+            "@generated-client/".to_string(),
+            crate::call_graph::MissingMapping {
+                target_root: "src/db/generated/client/".to_string(),
+                directory_missing: true,
+                imports: 83,
+            },
+        );
+        let lines = super::missing_mapping_lines(&unresolved);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0],
+            "Call graph: 83 import(s) through `@generated-client/` are unresolved: its target \
+             src/db/generated/client/ does not exist. Generate it, or fix the mapping."
+        );
+
+        // A file missing beside its siblings is a mis-spelled import, not a
+        // build step nobody ran, and the line must not claim otherwise.
+        unresolved.missing_mappings.insert(
+            "@/*".to_string(),
+            crate::call_graph::MissingMapping {
+                target_root: "src/absent.ts".to_string(),
+                directory_missing: false,
+                imports: 1,
+            },
+        );
+        let lines = super::missing_mapping_lines(&unresolved);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains("83 import(s)") && lines[1].contains("1 import(s)"),
+            "worst first, so the cause leads:\n{lines:#?}"
+        );
+        assert!(
+            lines[1].ends_with("Fix the mapping, or the import."),
+            "a file missing beside its siblings is not a directory nobody generated, and the \
+             instruction is where that difference reaches a reader:\n{}",
+            lines[1]
+        );
+    }
 
     /// A blob with only the fields every generation has carried, so the test
     /// states what it is about and nothing else.
@@ -6929,6 +7288,10 @@ mod tests {
         /// The serialized body of each upload, as the wire would carry it.
         uploaded_bodies: std::sync::Mutex<Vec<String>>,
         landed_asks: std::sync::Mutex<Vec<String>>,
+        /// Whether the upload loop told this storage the run had analysed
+        /// files, and so that its write actions must supersede the stored
+        /// generation (carrick#1306).
+        analyzed_noted: std::sync::atomic::AtomicBool,
     }
 
     impl ScriptedStorage {
@@ -6942,7 +7305,13 @@ mod tests {
                 uploaded: std::sync::Mutex::new(Vec::new()),
                 uploaded_bodies: std::sync::Mutex::new(Vec::new()),
                 landed_asks: std::sync::Mutex::new(Vec::new()),
+                analyzed_noted: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+
+        fn analyzed_noted(&self) -> bool {
+            self.analyzed_noted
+                .load(std::sync::atomic::Ordering::Relaxed)
         }
 
         fn uploaded(&self) -> Vec<String> {
@@ -6966,6 +7335,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CloudStorage for ScriptedStorage {
+        fn note_analyzed_files(&self) {
+            self.analyzed_noted
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
         async fn upload_repo_data(
             &self,
             data: &CloudRepoData,
@@ -7095,6 +7469,75 @@ mod tests {
             service_data("api-server", Some("orders")),
             service_data("api-server", Some("billing")),
         ]
+    }
+
+    /// A payload whose boundary says this scan sent `files` to the analyzer.
+    fn analyzed_service(service: &str, files: usize) -> CloudRepoData {
+        let mut data = service_data("api-server", Some(service));
+        data.boundary = Some(crate::boundary::ServiceBoundary {
+            files_attempted: files,
+            ..Default::default()
+        });
+        data
+    }
+
+    /// carrick#1306. The incident: a user did what the pre-flight refusal told
+    /// them to, the generated output was gitignored so the tree stayed clean,
+    /// and the rescan ran at the same commit without `--no-cache`. Nothing the
+    /// cloud's freshness guard reads had moved, so it kept the stored
+    /// generation and the scan's fresh answers were never served. The run
+    /// analysed files, and this is where it has to say so — before the first
+    /// write, since every write action reads the flag.
+    #[tokio::test]
+    async fn a_run_that_analyzed_files_tells_the_storage_before_it_uploads() {
+        let storage = ScriptedStorage::new(
+            vec![Ok(UploadOutcome::default()), Ok(UploadOutcome::default())],
+            vec![],
+        );
+
+        let unconfirmed = upload_service_payloads(
+            &storage,
+            &[
+                analyzed_service("orders", 0),
+                analyzed_service("billing", 3),
+            ],
+            false,
+            true,
+            &no_boundary(),
+        )
+        .await;
+
+        assert!(unconfirmed.is_empty());
+        assert!(
+            storage.analyzed_noted(),
+            "one analysed service is enough: its fresh answers reach the others through the \
+             cross-repo join, so the whole run's generation differs"
+        );
+    }
+
+    /// And the other half of the acceptance: a rescan that analysed nothing
+    /// says nothing, so an unchanged repo is still deduped and re-ingests
+    /// nothing.
+    #[tokio::test]
+    async fn a_run_that_analyzed_nothing_leaves_the_dedupe_alone() {
+        let storage = ScriptedStorage::new(
+            vec![Ok(UploadOutcome::default()), Ok(UploadOutcome::default())],
+            vec![],
+        );
+
+        upload_service_payloads(
+            &storage,
+            &[
+                analyzed_service("orders", 0),
+                analyzed_service("billing", 0),
+            ],
+            false,
+            true,
+            &no_boundary(),
+        )
+        .await;
+
+        assert!(!storage.analyzed_noted());
     }
 
     /// carrick#1067. The incident: the write landed and its response did not,
@@ -8397,41 +8840,6 @@ mod tests {
         assert!(normalized.contains_key("src/app.ts"));
     }
 
-    /// A throwaway repository with one commit holding `files`, for the tests
-    /// that ask git about a real tree.
-    fn committed_repo(files: &[(&str, &str)]) -> (tempfile::TempDir, String) {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let git = |args: &[&str]| {
-            // Clear git env vars so the commands are scoped to the temp repo
-            // rather than an ambient GIT_DIR set by a parent process (e.g. a
-            // pre-commit hook running inside a git worktree).
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(temp_dir.path())
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_INDEX_FILE")
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?} failed");
-            String::from_utf8(out.stdout).unwrap().trim().to_string()
-        };
-        git(&["init", "-q"]);
-        for (relative, contents) in files {
-            let path = temp_dir.path().join(relative);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, contents).unwrap();
-        }
-        git(&["add", "-A"]);
-        git(&["commit", "-qm", "init"]);
-        let head = git(&["rev-parse", "HEAD"]);
-        (temp_dir, head)
-    }
-
     /// The reader half of carrick#1079: a file is reusable only while its
     /// bytes on disk are the ones the previous scan's commit holds. Uncommitted
     /// edits, staged or not, and files git does not track are all changed; a
@@ -8692,6 +9100,7 @@ mod tests {
                     frameworks: vec!["express".to_string()],
                     data_fetchers: vec![],
                     messaging_clients: vec![],
+                    socket_clients: vec![],
                     notes: String::new(),
                 }),
                 cached_guidance: None,
@@ -8986,6 +9395,7 @@ mod tests {
                 frameworks: vec!["express".to_string()],
                 data_fetchers: vec!["fetch".to_string()],
                 messaging_clients: vec![],
+                socket_clients: vec![],
                 notes: "test".to_string(),
             }),
             cached_guidance: None,

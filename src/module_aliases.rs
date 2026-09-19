@@ -98,6 +98,84 @@ pub(crate) enum AliasTarget {
     Leaves { dir: PathBuf, leaves: Vec<String> },
 }
 
+/// One mapping key, and the directories its targets live in (carrick#1254).
+///
+/// The alternatives are a disjunction, as they are for the compiler: a
+/// `paths` pattern with two targets is satisfied by either, so a caller
+/// reports the mapping only when none of them exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaimedDirectory {
+    /// The key as written in the config.
+    pub declared_by: String,
+    /// Repo-relative directories, sorted, any one of which existing satisfies
+    /// the claim.
+    pub directories: Vec<PathBuf>,
+}
+
+/// The repo-relative directory a mapping target lives in: the target up to
+/// its last separator, with anything from the `*` onward dropped, resolved
+/// against the base the declaring config resolves targets against. A target
+/// that names a file directly in `base` claims `base`.
+fn target_directory(base: &Path, target: &str) -> PathBuf {
+    let literal = target.split('*').next().unwrap_or_default();
+    match literal.rfind('/') {
+        Some(cut) => normalize(&base.join(&literal[..=cut])),
+        None => normalize(base),
+    }
+}
+
+/// One config answer, and the key that gave it (carrick#1273).
+///
+/// The key is what a reader recognises: it is the line they wrote in their own
+/// config, so a target that is not on disk can be reported against the mapping
+/// that claims it rather than against each of the specifiers that went through
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AliasMatch {
+    /// The mapping that claimed the specifier.
+    ///
+    /// `None` for the `baseUrl` fallback, which declares no key: `baseUrl` is
+    /// a search root rather than a claim that any particular path exists, so a
+    /// specifier that misses under it was never claimed by anything and must
+    /// not be reported as a mapping whose target is missing.
+    pub declared: Option<Declared>,
+    pub target: AliasTarget,
+}
+
+/// What one config line says, as it is written there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Declared {
+    /// The key: an import-map key, a package.json `imports` key, or a
+    /// tsconfig `paths` pattern.
+    pub key: String,
+    /// The path the key names, before the specifier's own segment is appended
+    /// — the declared target with its `*` removed, so `./src/generated/*`
+    /// roots at `src/generated/`.
+    ///
+    /// The MAPPING's target, not one import's resolved file: every specifier
+    /// under the key shares it, which is what makes it the thing to report a
+    /// missing target against.
+    pub target_root: String,
+}
+
+/// [`Declared::target_root`] for one declared target, relative to the base it
+/// resolves against.
+///
+/// A `String` rather than a `PathBuf` because the trailing separator is what
+/// says the mapping names a directory rather than a file, and a `PathBuf`
+/// drops it.
+fn target_root(base: &Path, declared: &str) -> String {
+    let stripped = declared.split('*').next().unwrap_or(declared);
+    let names_a_directory = stripped.ends_with('/');
+    let mut root = normalize(&base.join(stripped))
+        .to_string_lossy()
+        .replace('\\', "/");
+    if names_a_directory && !root.ends_with('/') {
+        root.push('/');
+    }
+    root
+}
+
 impl ModuleAliases {
     /// Read every config the tree holds. `configs` is the repo-relative list
     /// of `package.json`, `deno.json(c)`, `tsconfig.json` and `jsconfig.json`
@@ -168,6 +246,73 @@ impl ModuleAliases {
         self.unfollowed_extends.iter()
     }
 
+    /// Every mapping these configs declare, as the directory its target lives
+    /// in (carrick#1254).
+    ///
+    /// The same claims [`Self::resolve`] answers a specifier with, read the
+    /// other way round: without a specifier to ask about, so a caller can stat
+    /// them before a scan starts rather than discover them one failed import
+    /// at a time. One entry per key, because every import through a mapping
+    /// fails identically and the key is the line the user wrote.
+    ///
+    /// A DIRECTORY rather than the target itself: which file a target names
+    /// depends on extension and index-file rules that are
+    /// [`crate::workspace_resolver::WorkspaceIndex`]'s, and a caller that
+    /// guessed them here would refuse a mapping that resolves perfectly well.
+    /// A directory that is not there cannot hold any spelling of the file.
+    /// `baseUrl` declares no key and is not a claim, so it is not here.
+    pub(crate) fn claimed_directories(&self) -> Vec<ClaimedDirectory> {
+        let mut claims: BTreeMap<String, BTreeSet<PathBuf>> = BTreeMap::new();
+        for map in &self.deno_maps {
+            for (key, target) in &map.entries {
+                // A key that names a registry package claims no path here.
+                if let Some(target) = target {
+                    claims
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(target_directory(&map.base, target));
+                }
+            }
+        }
+        for (dir, imports) in &self.package_imports {
+            let Some(object) = imports.as_ref().and_then(serde_json::Value::as_object) else {
+                continue;
+            };
+            for (key, value) in object {
+                let mut leaves = Vec::new();
+                collect_string_leaves(value, 0, &mut leaves);
+                for leaf in leaves.iter().filter(|leaf| leaf.starts_with("./")) {
+                    claims
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(target_directory(dir, leaf));
+                }
+            }
+        }
+        let ts = self.ts_configs.values().filter_map(Option::as_ref).chain(
+            self.service_ts
+                .iter()
+                .filter_map(|(_, mapping)| mapping.as_ref()),
+        );
+        for mapping in ts {
+            for (pattern, targets) in &mapping.paths {
+                for target in targets {
+                    claims
+                        .entry(pattern.clone())
+                        .or_default()
+                        .insert(target_directory(&mapping.paths_base, target));
+                }
+            }
+        }
+        claims
+            .into_iter()
+            .map(|(declared_by, directories)| ClaimedDirectory {
+                declared_by,
+                directories: directories.into_iter().collect(),
+            })
+            .collect()
+    }
+
     /// What config maps `specifier` to, as written in `from_file`
     /// (repo-relative). Deno import maps first, because in a Deno project they
     /// are the resolver; then package.json `imports` for a `#` specifier; then
@@ -178,15 +323,24 @@ impl ModuleAliases {
     /// entry that names a registry package, or a `#` key whose target does not
     /// exist, ends the lookup. A `paths` pattern whose targets all miss falls
     /// through to `baseUrl`, which is what the compiler does.
-    pub(crate) fn resolve(&self, from_file: &Path, specifier: &str) -> Vec<AliasTarget> {
-        if let Some(matched) = self
+    pub(crate) fn resolve(&self, from_file: &Path, specifier: &str) -> Vec<AliasMatch> {
+        if let Some((key, declared_target, matched)) = self
             .deno_maps
             .iter()
             .filter(|map| from_file.starts_with(&map.scope))
-            .find_map(|map| match_import_map(map, specifier))
+            .find_map(|map| {
+                match_import_map(map, specifier)
+                    .map(|(key, entry, resolved)| (key, (map.base.clone(), entry), resolved))
+            })
         {
             return matched
-                .map(|path| AliasTarget::Paths(vec![path]))
+                .map(|path| AliasMatch {
+                    declared: Some(Declared {
+                        key: key.clone(),
+                        target_root: target_root(&declared_target.0, &declared_target.1),
+                    }),
+                    target: AliasTarget::Paths(vec![path]),
+                })
                 .into_iter()
                 .collect();
         }
@@ -209,12 +363,13 @@ impl ModuleAliases {
         if let Some((pattern, substitution)) =
             match_pattern(mapping.paths.iter().map(|(p, _)| p.as_str()), specifier)
         {
-            let candidates = mapping
+            let declared_targets = mapping
                 .paths
                 .iter()
                 .find(|(p, _)| p == pattern)
                 .map(|(_, targets)| targets.as_slice())
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let candidates = declared_targets
                 .iter()
                 .map(|target| {
                     normalize(
@@ -224,12 +379,22 @@ impl ModuleAliases {
                     )
                 })
                 .collect();
-            targets.push(AliasTarget::Paths(candidates));
+            targets.push(AliasMatch {
+                // The first declared target is the one the pattern is reported
+                // against: a `paths` entry states its targets in preference
+                // order, so it is the one the config says to use.
+                declared: declared_targets.first().map(|declared| Declared {
+                    key: pattern.to_string(),
+                    target_root: target_root(&mapping.paths_base, declared),
+                }),
+                target: AliasTarget::Paths(candidates),
+            });
         }
         if let Some(base_url) = &mapping.base_url {
-            targets.push(AliasTarget::Paths(vec![normalize(
-                &base_url.join(specifier),
-            )]));
+            targets.push(AliasMatch {
+                declared: None,
+                target: AliasTarget::Paths(vec![normalize(&base_url.join(specifier))]),
+            });
         }
         targets
     }
@@ -246,7 +411,7 @@ impl ModuleAliases {
 
     /// Node's `PACKAGE_IMPORTS_RESOLVE`: the importer's nearest package.json
     /// alone decides, whether or not it declares `imports`.
-    fn package_import(&self, from_file: &Path, specifier: &str) -> Option<AliasTarget> {
+    fn package_import(&self, from_file: &Path, specifier: &str) -> Option<AliasMatch> {
         let (dir, imports) = from_file
             .ancestors()
             .skip(1)
@@ -255,15 +420,24 @@ impl ModuleAliases {
         let (key, substitution) = match_pattern(map.keys().map(String::as_str), specifier)?;
         let mut leaves = Vec::new();
         collect_string_leaves(&map[key], 0, &mut leaves);
-        let leaves = leaves
+        let declared_leaves = leaves
             .into_iter()
             // A bare target names a package, not a file in this directory.
             .filter(|leaf| leaf.starts_with("./"))
+            .collect::<Vec<_>>();
+        let leaves = declared_leaves
+            .iter()
             .map(|leaf| leaf.replace('*', &substitution))
             .collect::<Vec<_>>();
-        (!leaves.is_empty()).then(|| AliasTarget::Leaves {
-            dir: dir.to_path_buf(),
-            leaves,
+        (!leaves.is_empty()).then(|| AliasMatch {
+            declared: declared_leaves.first().map(|declared| Declared {
+                key: key.to_string(),
+                target_root: target_root(dir, declared),
+            }),
+            target: AliasTarget::Leaves {
+                dir: dir.to_path_buf(),
+                leaves,
+            },
         })
     }
 
@@ -462,21 +636,34 @@ fn import_map_entries(
 /// outside this repo, `Some(Some(path))` when it maps to a local path. An
 /// exact key beats a prefix key, the longest prefix key wins, and only a key
 /// ending in `/` is a prefix.
-fn match_import_map(map: &DenoImportMap, specifier: &str) -> Option<Option<PathBuf>> {
-    if let Some(target) = map.entries.get(specifier) {
-        return Some(target.as_ref().map(|t| normalize(&map.base.join(t))));
+/// The import-map key that claims `specifier`, and the path it names. The key
+/// is returned even when the path is `None` — an entry naming a registry
+/// package still ends the lookup, and a caller reporting a target that is not
+/// on disk needs the key to report it against (carrick#1273).
+fn match_import_map<'a>(
+    map: &'a DenoImportMap,
+    specifier: &str,
+) -> Option<(&'a String, String, Option<PathBuf>)> {
+    if let Some((key, target)) = map.entries.get_key_value(specifier) {
+        return Some((
+            key,
+            target.clone().unwrap_or_default(),
+            target.as_ref().map(|t| normalize(&map.base.join(t))),
+        ));
     }
     let (key, target) = map
         .entries
         .iter()
         .filter(|(key, _)| key.ends_with('/') && specifier.starts_with(key.as_str()))
         .max_by_key(|(key, _)| key.len())?;
-    Some(
+    Some((
+        key,
+        target.clone().unwrap_or_default(),
         target
             .as_ref()
             .filter(|t| t.ends_with('/'))
             .map(|t| normalize(&map.base.join(t).join(&specifier[key.len()..]))),
-    )
+    ))
 }
 
 /// The key a specifier matches, and what its `*` captured. An exact key

@@ -198,14 +198,22 @@ fn a_bundler_only_alias_records_no_edge_and_is_reported() {
         Some(&BTreeSet::new()),
         "`~/` is declared only in vite.config.ts"
     );
+    // Found by what the line is about, not by a ticket ref: the ref was
+    // dropped when the line was cut to what a reader acts on (carrick#1273).
     let report = scan
         .stderr
         .lines()
-        .find(|line| line.contains("carrick#1104"))
+        .find(|line| line.contains("undeclared alias(es)"))
         .unwrap_or_else(|| panic!("no unresolved-alias report on stderr:\n{}", scan.stderr));
     assert!(
-        report.contains("1 import(s) through 1 aliased specifier(s)")
-            && report.ends_with("~/pickup/queue.ts"),
+        report.contains(
+            "1 import(s) through 1 undeclared alias(es) are unresolved: \
+                         ~/pickup/queue.ts"
+        ),
         "report must count and name the specifier: {report}"
+    );
+    assert!(
+        report.ends_with("Declare them in tsconfig, package.json or a Deno import map."),
+        "and say what to do about it: {report}"
     );
 }

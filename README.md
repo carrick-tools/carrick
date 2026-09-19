@@ -79,11 +79,11 @@ Pull requests opened from forks are skipped gracefully: GitHub withholds OIDC cr
 
 Package types need their dependencies on disk. Node projects use installed `node_modules`, and Deno projects use the Deno dependency cache. The Action prepares those dependencies before analysis:
 
-- For Node projects, installation runs when a lockfile sits at the path being analyzed. The lockfile picks the manager: `package-lock.json` runs `npm ci`, `pnpm-lock.yaml` runs `pnpm install --frozen-lockfile`, `yarn.lock` runs `yarn install`, `bun.lock`/`bun.lockb` runs `bun install`.
+- For Node projects, installation runs for every service the scan will visit, at that service's own nearest lockfile. A monorepo whose packages carry their own lockfiles is installed package by package; a workspace that hoists to one lockfile at its root is installed once. The lockfile picks the manager: `package-lock.json` runs `npm ci`, `pnpm-lock.yaml` runs `pnpm install --frozen-lockfile`, `yarn.lock` runs `yarn install`, `bun.lock`/`bun.lockb` runs `bun install`.
 - Lifecycle scripts are disabled in every case, so nothing in your repo executes during a scan.
-- Each install command has a five-minute timeout. A failed or timed-out install prints a warning, and analysis continues with the available dependencies; missing type prerequisites are reported by the scanner.
-- Existing `node_modules` skips the Node install. A Deno manifest at the scan root still triggers Deno cache preparation. In a monorepo preparation happens at the path being scanned.
-- The package manager's download cache is restored between runs, keyed on the lockfile's hash.
+- Each install command has a five-minute timeout. A failed or timed-out install prints a warning, and the scan that follows refuses any service whose dependencies are still missing (see below).
+- Existing `node_modules` skips that service's Node install. A Deno manifest still triggers Deno cache preparation, which the separate Deno cache does not get from a Node install.
+- The package managers' download caches are restored between runs, keyed on the hash of every lockfile the run installs from.
 
 For Deno roots the Action runs `deno install --frozen --node-modules-dir=none`.
 This prepares the Deno dependency cache and prevents npm lifecycle scripts from
@@ -93,12 +93,38 @@ local indexing, install Deno 2.9.4 or newer and run the same preparation command
 from the Deno workspace root. Projects that import generated declarations must
 generate those declarations through their normal build before indexing.
 
+### An unprepared checkout is refused
+
+Carrick refuses to scan a checkout it cannot type, rather than charging for an
+index whose types are `any` and saying nothing about why. The check runs before
+the scan starts, per service, on what is reachable from that service's own
+directory — a monorepo root that is installed says nothing about a nested
+workspace that is not. Two things are refused:
+
+- **Dependencies a lockfile states and the tree has not installed.** The
+  refusal names the service and the exact command, because the lockfile names
+  the package manager. A tree with no lockfile above the service states no
+  install and is scanned as it is. Deno services are asked only when their
+  config sets `nodeModulesDir`, since Deno otherwise caches outside the tree.
+- **A config mapping whose target directory is not on the checkout, that the
+  service imports through.** A TypeScript `paths` entry, a `package.json`
+  `imports` key or a Deno import-map entry pointing at, say, a generated client
+  whose generator has not run. The refusal names the mapping and the missing
+  directory and stops there: nothing in the config says what fills a generated
+  directory. A mapping left behind by a deleted package, that nothing imports,
+  is logged and scanned past — no type can be `any` through a mapping no import
+  uses.
+
+Both are proxies, so there is always a way past: `--allow-unprepared` on the
+command, `CARRICK_ALLOW_UNPREPARED=1` in the environment, or
+`allow-unprepared: true` on the Action (which `install-dependencies: false`
+already implies). A pipeline that scans a bare checkout deliberately keeps
+working; it just says so.
+
 Deno services normally omit `tsconfig` and use their nearest Deno manifest.
 An explicit ordinary TypeScript config selects the TypeScript path. An explicit
 Deno config must name that nearest manifest; `deno.json` takes precedence over
-`deno.jsonc` when both exist. Import maps must be local files. Nested Deno roots
-without a Deno manifest at the Action's scan root need dependency preparation
-in their own workspace before the Carrick step.
+`deno.jsonc` when both exist. Import maps must be local files.
 
 Turn it off with:
 
@@ -287,6 +313,8 @@ Carrick reads a GraphQL server's operations from SDL: `.graphql`/`.gql` files un
 Each entry is a path relative to `carrick.json`, or a glob such as `packages/schema/generated/*.graphql`. The file can sit anywhere in the repository, including a build folder like `dist/` or another app's directory, as long as it is committed. Every `Query`, `Mutation` and `Subscription` field it defines is indexed as an operation that this service serves. A flat single-service `carrick.json` accepts the field at the top level.
 
 An entry that matches no file, or a file that defines no root field, is reported as a warning in the scan output. When a service depends on a GraphQL library and serves HTTP routes but indexes no GraphQL schema fields, the scan output suggests this setting.
+
+Once the schema's fields are known, Carrick also reads the modules that build the schema: files that call through a builder value created from a library the scan detects, including field modules that export nothing and only import the builder. Each such file is analysed with the schema's field list, and a field whose resolver is found there is indexed at the resolver's line rather than at the printed schema. A field with no located resolver stays at its schema line.
 
 #### GraphQL documents for another team's API
 

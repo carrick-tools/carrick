@@ -38,6 +38,11 @@ jobs:
         # Full git history lets Carrick diff against the last scan and run incrementally.
         with:
           fetch-depth: 0
+      # No install step: the type sidecar is a service of this repo with its
+      # own lockfile, and the Action's own installer prepares it (carrick#1312).
+      # A workflow that installed it here would hide the regression that made
+      # the Action prepare the scan root alone, so this run is the proof that
+      # the default inputs are enough.
       - uses: carrick-tools/carrick@v1
         with:
           # Empty on every trigger but workflow_dispatch, which is the point:

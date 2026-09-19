@@ -166,9 +166,199 @@ pub fn parse_pending(line: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The prefix a dispatched scan names its job on.
+const DISPATCHED_MARKER: &str = "@carrick-dispatched ";
+
+/// State, for the parent, that this repo's prompts went to Carrick Cloud as a
+/// job rather than being answered here (carrick#1229).
+///
+/// The scan writes no index when it dispatches, so without this line the
+/// indexer would look for a blob that was never going to exist.
+pub fn report_dispatched(dispatched: &crate::analysis_job::Dispatched) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(payload) = serde_json::to_string(dispatched) {
+        eprintln!("{DISPATCHED_MARKER}{payload}");
+    }
+}
+
+/// Read a dispatch out of a line of a scan's stderr.
+pub fn parse_dispatched(line: &str) -> Option<crate::analysis_job::Dispatched> {
+    let payload = line.trim_start().strip_prefix(DISPATCHED_MARKER)?;
+    serde_json::from_str(payload).ok()
+}
+
+/// The prefix a scan states a dispatch that was asked for and did not happen
+/// on.
+const NOT_DISPATCHED_MARKER: &str = "@carrick-not-dispatched ";
+
+/// Why a scan that was asked to dispatch analysed the repo here instead
+/// (carrick#1251).
+///
+/// Both are ordinary states rather than failures, and the run that hits one
+/// exits 0 with an index — which is exactly why it has to say so. `--dispatch`
+/// that hands nothing over is otherwise indistinguishable from a flag that was
+/// ignored, misspelled or broken.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotDispatched {
+    /// This Carrick Cloud does not run analysis jobs.
+    CloudDeclined,
+    /// No prompt was built, so there was nothing to hand over.
+    NothingToAnalyse,
+}
+
+impl NotDispatched {
+    /// The half-sentence a reader is told, after the repo has been named.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::CloudDeclined => "Carrick Cloud is not running analysis jobs yet",
+            Self::NothingToAnalyse => "nothing in it needed the analyzer",
+        }
+    }
+}
+
+/// State, for the parent, that this repo was NOT handed over after all.
+///
+/// The scan writes an index in this case, so unlike [`report_dispatched`]
+/// nothing downstream breaks without it — which is the whole reason the
+/// silence lasted (carrick#1251).
+pub fn report_not_dispatched(reason: NotDispatched) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(payload) = serde_json::to_string(&reason) {
+        eprintln!("{NOT_DISPATCHED_MARKER}{payload}");
+    }
+}
+
+/// Read a declined dispatch out of a line of a scan's stderr.
+pub fn parse_not_dispatched(line: &str) -> Option<NotDispatched> {
+    let payload = line.trim_start().strip_prefix(NOT_DISPATCHED_MARKER)?;
+    serde_json::from_str(payload).ok()
+}
+
 /// Read one update out of a line of a scan's stderr, if that is what it is.
 pub fn parse(line: &str) -> Option<Update> {
     let payload = line.trim_start().strip_prefix(MARKER)?;
+    serde_json::from_str(payload).ok()
+}
+
+/// The prefix a build names the phase it is entering or leaving on.
+const PHASE_MARKER: &str = "@carrick-phase ";
+
+/// Where a phase of a build is: starting, finished, or finished with
+/// something to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhaseState {
+    Started,
+    Done,
+    /// Done, and the build has a sentence about it — a scan that left services
+    /// pending states one.
+    Warned,
+}
+
+/// One phase of a build, as it crosses to the process that started it.
+///
+/// The indexer draws a spinner per phase and a terminal renders it, which is
+/// true of exactly one terminal: the one whose stderr the indexer holds. Under
+/// the npm wrapper that is a pipe, and indicatif's rewrites arrived as padded
+/// fragments sharing a line (carrick#1315). The phase is stated here so
+/// whoever owns the terminal draws it, and the label is the same one the
+/// spinner carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhaseUpdate {
+    /// What the phase is called: `indexing api`, `indexed api`, `joining the
+    /// workspace`. The verb is the state's, so a renderer prints the label as
+    /// it stands.
+    pub label: String,
+    pub state: PhaseState,
+}
+
+/// State, for the parent, that a phase of this build has started or finished.
+pub fn report_phase(label: &str, state: PhaseState) {
+    if !enabled() {
+        return;
+    }
+    let update = PhaseUpdate {
+        label: label.to_string(),
+        state,
+    };
+    if let Ok(line) = serde_json::to_string(&update) {
+        eprintln!("{PHASE_MARKER}{line}");
+    }
+}
+
+/// Read a phase out of a line of a build's stderr, if that is what it is.
+#[allow(dead_code)] // Read by tests through the library. The renderer that
+// consumes the line is the npm wrapper's, and the round-trip test below is
+// what holds this half to the shape that one parses.
+pub fn parse_phase(line: &str) -> Option<PhaseUpdate> {
+    let payload = line.trim_start().strip_prefix(PHASE_MARKER)?;
+    serde_json::from_str(payload).ok()
+}
+
+/// The prefix a finished build states its counts on.
+const SUMMARY_MARKER: &str = "@carrick-summary ";
+
+/// One service's line in a finished build's summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceSummary {
+    pub name: String,
+    pub routes: usize,
+    pub calls: usize,
+    /// Functions this service indexed, whether or not they are exported. The
+    /// largest thing the index holds and the one a summary of routes and calls
+    /// alone hid entirely: 363 of them on a service whose first-run line read
+    /// `111 routes · 1 call` (carrick#1321).
+    pub functions: usize,
+    /// Distinct types the bundled `.d.ts` can be read for — the request and
+    /// response definitions `get_endpoint_types` serves. Placeholders and
+    /// top-type bodies are declarations that describe nothing, and are not
+    /// counted: the number is shown to a developer as what their agents can
+    /// read (David's ruling, carrick#1321).
+    pub types: usize,
+    /// Indexed routes with nothing on the producer side of a compatibility
+    /// check. The one shortfall worth a first-run line: it is the number that
+    /// says how much of this index can be checked against a consumer.
+    pub routes_without_response_type: usize,
+}
+
+/// What a finished build amounts to, for the process that started it.
+///
+/// The map a build prints is a diagnostic: a table, a boundary paragraph per
+/// service, and per-package candidate counts. What a person who just ran
+/// `carrick index` needs is how many routes and calls were indexed, how much
+/// of it is untyped, and the one next step (carrick#1315, carrick#1284). The
+/// diagnostics stay on stdout for `--verbose` and for the log; this is what a
+/// renderer shows instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Summary {
+    pub services: Vec<ServiceSummary>,
+    pub elapsed_secs: f64,
+    /// The sentences this build owes the reader beyond its counts: where a
+    /// dispatched repo is being analysed, what a pending scan still owes.
+    /// Empty on the ordinary run, whose next step is the renderer's own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub next: Vec<String>,
+}
+
+/// State, for the parent, what this build indexed.
+pub fn report_summary(summary: &Summary) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(line) = serde_json::to_string(summary) {
+        eprintln!("{SUMMARY_MARKER}{line}");
+    }
+}
+
+/// Read a summary out of a line of a build's stderr, if that is what it is.
+#[allow(dead_code)] // As [`parse_phase`]: the renderer is the npm wrapper's.
+pub fn parse_summary(line: &str) -> Option<Summary> {
+    let payload = line.trim_start().strip_prefix(SUMMARY_MARKER)?;
     serde_json::from_str(payload).ok()
 }
 
@@ -328,6 +518,30 @@ mod tests {
         assert!(parse_failure(&line).is_none());
     }
 
+    /// A dispatch that did not happen crosses the process boundary the same
+    /// way a dispatch that did — and is not mistaken for one, which is the
+    /// whole risk of a marker whose prefix contains another's word
+    /// (carrick#1251).
+    #[test]
+    fn a_declined_dispatch_survives_the_round_trip_and_is_not_a_dispatch() {
+        for reason in [
+            NotDispatched::CloudDeclined,
+            NotDispatched::NothingToAnalyse,
+        ] {
+            let line = format!(
+                "{NOT_DISPATCHED_MARKER}{}",
+                serde_json::to_string(&reason).unwrap()
+            );
+            assert_eq!(parse_not_dispatched(&line), Some(reason));
+            assert!(parse_dispatched(&line).is_none());
+            assert!(parse(&line).is_none());
+            assert!(parse_notice(&line).is_none());
+            assert!(!reason.reason().is_empty());
+        }
+        assert!(parse_not_dispatched("@carrick-dispatched {}").is_none());
+        assert!(parse_not_dispatched("@carrick-not-dispatched not json").is_none());
+    }
+
     /// The reason is the error's leading sentence, and it survives the
     /// process boundary; a progress line is not read as a failure.
     #[test]
@@ -350,6 +564,55 @@ mod tests {
             failure("upload", "").reason,
             "the scan stopped without an error message"
         );
+    }
+
+    /// A phase and a summary cross the boundary intact, and neither is read
+    /// as any other marker — the risk of a family of prefixes sharing a word
+    /// (carrick#1315).
+    #[test]
+    fn a_phase_and_a_summary_survive_the_round_trip() {
+        for state in [PhaseState::Started, PhaseState::Done, PhaseState::Warned] {
+            let phase = PhaseUpdate {
+                label: "indexing api".to_string(),
+                state,
+            };
+            let line = format!("{PHASE_MARKER}{}", serde_json::to_string(&phase).unwrap());
+            assert_eq!(parse_phase(&line), Some(phase));
+            assert!(parse(&line).is_none());
+            assert!(parse_summary(&line).is_none());
+        }
+
+        let summary = Summary {
+            services: vec![
+                ServiceSummary {
+                    name: "api".to_string(),
+                    routes: 111,
+                    calls: 10,
+                    functions: 363,
+                    types: 175,
+                    routes_without_response_type: 46,
+                },
+                ServiceSummary {
+                    name: "web".to_string(),
+                    routes: 4,
+                    calls: 2,
+                    functions: 12,
+                    types: 8,
+                    routes_without_response_type: 1,
+                },
+            ],
+            elapsed_secs: 169.4,
+            next: vec!["Carrick Cloud is analysing acme/api (95 file(s)).".to_string()],
+        };
+        let line = format!(
+            "{SUMMARY_MARKER}{}",
+            serde_json::to_string(&summary).unwrap()
+        );
+        assert_eq!(parse_summary(&line), Some(summary.clone()));
+        assert!(parse_phase(&line).is_none());
+        assert!(parse_notice(&line).is_none());
+        assert_eq!(summary.services.len(), 2);
+        assert!(parse_summary("@carrick-summary not json").is_none());
     }
 
     #[test]

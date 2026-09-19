@@ -1,0 +1,18 @@
+type Mutation {
+  dispatchParcel(id: ID!): Parcel!
+  recallParcel(id: ID!): Boolean!
+  retireParcel(id: ID!): Boolean!
+}
+
+type Parcel {
+  id: ID!
+  weightGrams: Int!
+}
+
+type Query {
+  health: String!
+  heaviestWeight: Int
+  parcel(id: ID!): Parcel
+  parcels: [Parcel!]!
+  recentParcels: [Parcel!]!
+}

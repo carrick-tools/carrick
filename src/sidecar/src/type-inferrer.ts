@@ -37,6 +37,8 @@ import {
   type Symbol as TsSymbol,
   ts,
 } from 'ts-morph';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import type {
   InferRequestItem,
   InferResult,
@@ -112,7 +114,7 @@ const BUILTIN_ANCHOR_SYMBOLS = new Set<string>([
 /**
  * Strongly-discriminating member names of HTTP transport machinery — the
  * fetch/DOM `Response` & `Request`, a Node `http.ServerResponse`, a framework
- * reply object. A type declared in a lib or `node_modules` origin that carries
+ * reply object. A type declared in a lib or installed-dependency origin that carries
  * a subset of these is framework machinery, never a user contract: the
  * PRODUCER-side structural mirror of the consumer `machineryIndicators`
  * (ExtractionConfig), used to reject a wrapper envelope whose response field is
@@ -193,29 +195,78 @@ const RESPONSE_INIT_MEMBER_NAMES = new Set<string>([
 ]);
 
 /**
- * True when a declaration file path is runtime/library origin rather than user
- * source: a TypeScript lib (`lib.dom.d.ts`), an installed package, or the
- * runtime declarations Carrick itself materialises for a non-Node runtime
- * (`.carrick/deno/<hash>/runtime.d.ts`, and the remote modules cached beside
- * it).
+ * True when a declaration's source file is runtime/library origin rather than
+ * user source. Four answers, in order:
  *
- * The third case is carrick#1017: on a Deno service the platform `Response`
- * is declared in Carrick's own generated runtime file, which is neither a
- * `lib.*.d.ts` nor under `node_modules`, so the machinery origin gate stayed
- * shut and every route published the fetch `Response` wrapper as its response
- * contract. The path is Carrick's own artefact, not a framework name.
+ *  1. The runtime declarations Carrick materialises for a non-Node runtime
+ *     under `.carrick/deno/` (carrick#1017), and the remote (JSR, `https:`)
+ *     modules it copies beside them. Carrick's own artefact layout, not a
+ *     guess about anyone else's.
+ *  2. A TypeScript default library (`lib.dom.d.ts`, ...), as the program
+ *     classifies it; on a bare checkout the DOM `Response` resolves from here.
+ *  3. An install under a `node_modules` segment, however it entered the
+ *     program (an import, or a root the loader registered).
+ *  4. A file the PROGRAM'S RESOLVER marked as an external library import.
+ *     This is the graph-backed answer for a project whose resolution does not
+ *     go through `node_modules` (carrick#1264): Deno serves an npm dependency's
+ *     types from its own cache, a path with no `node_modules` segment, and
+ *     `DenoProject.resolve` hands the compiler `isExternalLibraryImport` from
+ *     the graph, which the compiler records on the file. Nothing crosses the
+ *     capture seam; both programs are built with that host. One exclusion: a
+ *     workspace package reached through a `node_modules` symlink is also
+ *     marked external by the compiler but is the user's own source, so a file
+ *     inside the checkout (the nearest `.git` above the service root) that
+ *     carries no `node_modules` segment stays user source.
  *
- * Kept in lockstep with `capture/machinery.ts`'s copy (the capture seam forbids
- * sharing a module across it); `machinery-indicator-mirror.test.ts` guards the
- * pair.
+ * Lockstep mirror of `isExternalOrigin` in `capture/machinery.ts` (the capture
+ * seam forbids sharing a module); `machinery-indicator-mirror.test.ts` guards
+ * the pair on a real program.
  */
-export function isExternalOrigin(filePath: string): boolean {
-  const normalized = filePath.replace(/\\/g, '/');
-  return (
-    normalized.includes('/node_modules/') ||
-    /\/lib\.[^/]*\.d\.ts$/.test(normalized) ||
-    normalized.includes('/.carrick/deno/')
-  );
+export function isExternalOrigin(
+  program: ts.Program,
+  sourceFile: ts.SourceFile,
+  repoRoot: string
+): boolean {
+  const file = sourceFile.fileName.replace(/\\/g, '/');
+  if (file.includes('/.carrick/deno/')) {
+    return true;
+  }
+  if (program.isSourceFileDefaultLibrary(sourceFile)) {
+    return true;
+  }
+  if (file.includes('/node_modules/')) {
+    return true;
+  }
+  return program.isSourceFileFromExternalLibrary(sourceFile) && !isInsideCheckout(file, repoRoot);
+}
+
+const checkoutRoots = new Map<string, string>();
+
+/** The checkout the service root sits in: the nearest ancestor holding a
+ * `.git` entry (a directory, or the file a worktree carries), else the service
+ * root itself. */
+function checkoutRootOf(repoRoot: string): string {
+  const key = path.resolve(repoRoot);
+  const cached = checkoutRoots.get(key);
+  if (cached) return cached;
+  let dir = key;
+  let root = key;
+  for (;;) {
+    if (fs.existsSync(path.join(dir, '.git'))) {
+      root = dir;
+      break;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  checkoutRoots.set(key, root);
+  return root;
+}
+
+function isInsideCheckout(file: string, repoRoot: string): boolean {
+  const root = checkoutRootOf(repoRoot).replace(/\\/g, '/');
+  return file === root || file.startsWith(root.endsWith('/') ? root : root + '/');
 }
 
 /**
@@ -348,6 +399,19 @@ type FunctionLike =
 export interface TypeInferrerOptions {
   /** The ts-morph Project instance */
   project: Project;
+  /**
+   * The registry package a resolved file belongs to, when the module graph
+   * that built the project names one (carrick#1260). Supplied for a project
+   * whose resolution went through a graph rather than through `node_modules`;
+   * absent otherwise, and the path itself is then the only thing to read.
+   */
+  packageOf?: (filePath: string) => string | undefined;
+  /**
+   * The service root the project was built for. The machinery origin gate
+   * reads it to tell a workspace package the compiler reached through a
+   * `node_modules` symlink from an installed dependency (carrick#1264).
+   */
+  repoRoot: string;
 }
 
 /**
@@ -413,9 +477,13 @@ type RuleAttempt =
  */
 export class TypeInferrer {
   private readonly project: Project;
+  private readonly packageOf: ((filePath: string) => string | undefined) | undefined;
+  private readonly repoRoot: string;
 
   constructor(options: TypeInferrerOptions) {
     this.project = options.project;
+    this.packageOf = options.packageOf;
+    this.repoRoot = options.repoRoot;
   }
 
   /**
@@ -2474,7 +2542,7 @@ export class TypeInferrer {
    *     Promise-unwrapped before the machinery check);
    *   - an array element type: `Response[]` is not descended to its element;
    *   - `interface X extends Response` declared in USER source — the origin gate
-   *     is lib/`node_modules` only, so a user-declared subtype reads as a real
+   *     is lib/installed-dependency only, so a user-declared subtype reads as a real
    *     contract, not machinery;
    *   - a function / call-signature return type: the response paths that call
    *     this resolve a handler's RETURN (an envelope/object), never a function
@@ -2522,7 +2590,7 @@ export class TypeInferrer {
    * True when `type` itself is an HTTP-machinery type: it structurally carries
    * at least `MACHINERY_INDICATOR_THRESHOLD` of the strongly-discriminating
    * `MACHINERY_MEMBER_INDICATORS`, AND its symbol is declared in a lib
-   * (`lib.dom.d.ts`, ...) or `node_modules` origin. Both gates are required —
+   * (`lib.dom.d.ts`, ...) or installed-dependency origin. Both gates are required —
    * the indicator subset alone essentially never matches a JSON payload, and
    * the origin gate makes certain a user's own local type sharing those member
    * names is never mistaken for framework machinery (the advisor's guard).
@@ -2559,19 +2627,21 @@ export class TypeInferrer {
   }
 
   /**
-   * True when the symbol is declared in a TypeScript lib file (`lib.*.d.ts`),
-   * under `node_modules`, or in the runtime declarations Carrick materialises
-   * for a non-Node runtime under `.carrick/deno/` — i.e. framework/runtime
-   * machinery, not user source. Works on a bare checkout: the DOM
-   * `Response`/`Request` resolve from the bundled `lib.dom.d.ts` even with no
-   * installed dependencies.
+   * True when the symbol is declared in a runtime/library origin
+   * (`isExternalOrigin`): a TypeScript lib, an installed dependency however
+   * the program resolved it, or the runtime declarations Carrick materialises
+   * under `.carrick/deno/` — framework/runtime machinery, not user source.
+   * Works on a bare checkout: the DOM `Response`/`Request` resolve from the
+   * bundled `lib.dom.d.ts` even with no installed dependencies. The program is
+   * read per call: the project adds source files lazily and rebuilds it.
    */
   private symbolIsLibOrExternalOrigin(symbol: TsSymbol | undefined): boolean {
     if (!symbol) {
       return false;
     }
+    const program = this.project.getProgram().compilerObject;
     for (const decl of symbol.getDeclarations()) {
-      if (isExternalOrigin(decl.getSourceFile().getFilePath())) {
+      if (isExternalOrigin(program, decl.getSourceFile().compilerNode, this.repoRoot)) {
         return true;
       }
     }
@@ -3713,14 +3783,25 @@ export class TypeInferrer {
   }
 
   /**
-   * The npm package name that declares a type, read off its declaration's file
-   * path. `undefined` when the type has no declaration to read (a top type, a
-   * primitive, an anonymous object literal) or when its declaration is not
-   * under a `node_modules` tree — a type the workspace itself declares.
+   * The npm package name that declares a type. `undefined` when the type has
+   * no declaration to read (a top type, a primitive, an anonymous object
+   * literal) or when nothing owns its declaration but the workspace itself.
    *
-   * The LAST `node_modules` segment wins, which is what a nested or
-   * content-addressed store (`node_modules/.store/pkg@1.0.0/node_modules/pkg`)
-   * requires. Scoped names keep both segments.
+   * The module graph is asked first, where there is one, because it is the
+   * only thing that can answer for a project whose resolution does not go
+   * through `node_modules`. Deno resolves an npm dependency's types straight
+   * out of its own cache
+   * (`$DENO_DIR/npm/<registry-host>/<name>/<version>/…`), a path with no
+   * `node_modules` segment anywhere in it, so the scan below found no package
+   * for ANY dependency-declared type on such a repo and every receiver the
+   * compiler had typed correctly went unclassified (carrick#1260). It runs
+   * first rather than second because a mixed checkout has both, and the graph
+   * is what actually resolved the module.
+   *
+   * The path scan is the Node answer: the LAST `node_modules` segment wins,
+   * which is what a nested or content-addressed store
+   * (`node_modules/.store/pkg@1.0.0/node_modules/pkg`) requires. Scoped names
+   * keep both segments.
    */
   private declaringPackageOf(type: Type): string | undefined {
     const symbol = type.getSymbol() ?? type.getAliasSymbol();
@@ -3729,6 +3810,10 @@ export class TypeInferrer {
       return undefined;
     }
     const filePath = declaration.getSourceFile().getFilePath().replace(/\\/g, '/');
+    const named = this.packageOf?.(filePath);
+    if (named) {
+      return named;
+    }
     const marker = '/node_modules/';
     const index = filePath.lastIndexOf(marker);
     if (index < 0) {

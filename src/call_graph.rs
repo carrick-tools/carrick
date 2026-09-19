@@ -400,14 +400,59 @@ pub struct UnresolvedImports {
     /// a bundler or build-tool alias set in code, or config the resolver does
     /// not follow. Each is a caller `get_callers` cannot see.
     pub aliases: std::collections::BTreeMap<String, usize>,
-    /// Package-shaped specifiers no manifest declares: runtime builtins
-    /// written without `node:`, undeclared dependencies, and a `baseUrl`-style
-    /// alias set only in bundler code. Counted, not listed: the common members
-    /// are builtins, which are not a loss.
+    /// Package-shaped specifiers no manifest declares AND no config maps:
+    /// runtime builtins written without `node:`, undeclared dependencies, and
+    /// a `baseUrl`-style alias set only in bundler code. Counted, not listed:
+    /// the common members are builtins, which are not a loss.
+    ///
+    /// A specifier the repo's own config maps to a missing path is NOT here —
+    /// it is in [`UnresolvedImports::missing_mappings`], because it is a
+    /// different fact and the only one of the two a user can act on
+    /// (carrick#1273).
     pub undeclared_packages: usize,
+    /// Mappings the repo's config declares whose target is not on disk, keyed
+    /// by the config key as written, with the number of imports that went
+    /// through each.
+    ///
+    /// Deterministic and repeatable, so a logged limit rather than a
+    /// `scan_health` loss, for the same reason [`UnresolvedImports::aliases`]
+    /// is: a repo that has not run a code generator would otherwise be
+    /// permanently red.
+    pub missing_mappings: std::collections::BTreeMap<String, MissingMapping>,
+}
+
+/// One config mapping that points at nothing, and what went through it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingMapping {
+    /// The path the mapping names, repo-relative, with its `*` removed —
+    /// `src/db/generated/client/`. The MAPPING's target, so it is the same
+    /// for every import through the key and needs no example.
+    pub target_root: String,
+    /// The target is absent entirely — every import through this mapping
+    /// fails, and a build step that was never run looks like this.
+    pub directory_missing: bool,
+    /// How many imports resolved to nothing through it.
+    pub imports: usize,
 }
 
 impl UnresolvedImports {
+    /// Count one import through a mapping whose target is not on disk. The
+    /// specifier is not kept: every specifier under the mapping fails the same
+    /// way, and the mapping is the line the user wrote.
+    fn record_missing_mapping(&mut self, missing: crate::workspace_resolver::MissingAliasTarget) {
+        // Both facts belong to the mapping rather than to the specifier, so
+        // they are the same whichever import gets here first and the row is
+        // only ever counted up.
+        self.missing_mappings
+            .entry(missing.declared_by)
+            .or_insert_with(|| MissingMapping {
+                target_root: missing.target_root,
+                directory_missing: missing.directory_missing,
+                imports: 0,
+            })
+            .imports += 1;
+    }
+
     fn record(&mut self, specifier: &str) {
         match specifier_kind(specifier) {
             SpecifierKind::Scheme => {}
@@ -956,6 +1001,12 @@ impl<'a> CallResolver<'a> {
         match self.workspace.resolve(importer, specifier) {
             Resolution::Internal(relative) => self.workspace.source_path(&relative),
             Resolution::External { .. } => None,
+            // The repo said where this module lives and it is not there. A
+            // relative specifier can never reach here: nothing maps one.
+            Resolution::AliasTargetMissing(missing) => {
+                self.unresolved.record_missing_mapping(missing);
+                None
+            }
             Resolution::Unresolved => {
                 if !(specifier.starts_with("./") || specifier.starts_with("../")) {
                     self.unresolved.record(specifier);
@@ -1170,6 +1221,52 @@ mod tests {
             std::collections::BTreeMap::from([("~/queue".to_string(), 1)])
         );
         assert_eq!(unresolved.undeclared_packages, 1, "`fs` without `node:`");
+    }
+
+    /// An import through a config mapping whose target was never generated is
+    /// counted against the MAPPING, not against each specifier that went
+    /// through it, and not as an undeclared package (carrick#1273).
+    ///
+    /// The specifier here is a legal npm package name, which is why the old
+    /// classification put it in `undeclared_packages` beside `fs`: a bare
+    /// integer at `debug!`, holding the one fact that explained why every type
+    /// through it was `any`.
+    #[test]
+    fn imports_through_an_ungenerated_mapping_are_counted_against_the_mapping() {
+        let (_dir, _defs, unresolved) = scan_reporting(
+            &[
+                (
+                    "deno.json",
+                    "{ \"imports\": { \"@generated-client/\": \"./src/db/generated/client/\" } }\n",
+                ),
+                (
+                    "src/users.ts",
+                    "import { findUser } from \"@generated-client/models.ts\";\n                     export function user(id: string) {\n  return findUser(id);\n}\n",
+                ),
+                (
+                    "src/orders.ts",
+                    "import { findOrder } from \"@generated-client/orders.ts\";\n                     export function order(id: string) {\n  return findOrder(id);\n}\n",
+                ),
+            ],
+            "",
+        );
+        assert_eq!(
+            unresolved.missing_mappings,
+            std::collections::BTreeMap::from([(
+                "@generated-client/".to_string(),
+                crate::call_graph::MissingMapping {
+                    target_root: "src/db/generated/client/".to_string(),
+                    directory_missing: true,
+                    imports: 2,
+                }
+            )]),
+            "one row per mapping, carrying the count of everything that went through it"
+        );
+        assert_eq!(
+            unresolved.undeclared_packages, 0,
+            "and it is no longer indistinguishable from a builtin"
+        );
+        assert!(unresolved.aliases.is_empty());
     }
 
     #[test]

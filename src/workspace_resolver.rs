@@ -60,9 +60,56 @@ pub enum Resolution {
     },
     /// A file inside this repo, repo-relative.
     Internal(PathBuf),
+    /// The repo's own config maps this specifier to a path, and nothing is
+    /// there (carrick#1273).
+    ///
+    /// A different fact from [`Resolution::Unresolved`], and the reason it has
+    /// its own variant: the repo STATED where this module lives, so the miss
+    /// is a tree that was not fully prepared — a generated directory whose
+    /// generator never ran, most often — rather than a specifier nothing
+    /// accounts for. Every import through the mapping fails the same way, so
+    /// the count belongs to the mapping.
+    AliasTargetMissing(MissingAliasTarget),
     /// Node builtins, absolute paths, assets, and anything the repo's own
     /// manifests and file tree do not account for.
     Unresolved,
+}
+
+/// A config mapping that claims a specifier and points at nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingAliasTarget {
+    /// The key as written in the config: an import-map key, a package.json
+    /// `imports` key, or a tsconfig `paths` pattern. What the reader
+    /// recognises, and what the count is reported against.
+    pub declared_by: String,
+    /// The repo-relative path the MAPPING names, with its `*` removed and its
+    /// trailing separator kept — `src/db/generated/client/`, not the file one
+    /// import happened to want under it. Every specifier under the key shares
+    /// it, which is what makes it the target to report.
+    pub target_root: String,
+    /// The target is not there at all, so nothing under the mapping can
+    /// resolve. A build step that never ran looks like this; a single
+    /// mis-spelled import does not.
+    pub directory_missing: bool,
+}
+
+/// The answer for a specifier no package accounted for: the mapping that
+/// claimed it, when one did.
+fn unclaimed_or_missing(claimed: Option<MissingAliasTarget>) -> Resolution {
+    match claimed {
+        Some(missing) => Resolution::AliasTargetMissing(missing),
+        None => Resolution::Unresolved,
+    }
+}
+
+/// What the alias tables said about one specifier.
+enum AliasOutcome {
+    /// A mapping named a file that is on disk.
+    Resolved(PathBuf),
+    /// A mapping claimed the specifier and named nothing that is on disk.
+    Missing(MissingAliasTarget),
+    /// No mapping claimed it, so package resolution decides.
+    Unclaimed,
 }
 
 /// One workspace member: where it lives and what its manifest says its entry
@@ -293,9 +340,15 @@ impl WorkspaceIndex {
             };
         }
 
-        if let Some(file) = self.resolve_alias(from_file, specifier) {
-            return Resolution::Internal(file);
-        }
+        // A mapping that claimed the specifier and pointed at nothing does not
+        // end the lookup: a `paths` pattern can shadow a package that is also
+        // installed, and the compiler falls through to it. So the miss is
+        // carried down and stated only where the lookup gives up for good.
+        let claimed = match self.resolve_alias(from_file, specifier) {
+            AliasOutcome::Resolved(file) => return Resolution::Internal(file),
+            AliasOutcome::Missing(missing) => Some(missing),
+            AliasOutcome::Unclaimed => None,
+        };
 
         if let Some(name) = longest_match(specifier, self.internal_packages.keys()) {
             let package = &self.internal_packages[&name];
@@ -314,7 +367,7 @@ impl WorkspaceIndex {
             });
             return match resolved {
                 Some(file) => Resolution::Internal(file),
-                None => Resolution::Unresolved,
+                None => unclaimed_or_missing(claimed),
             };
         }
 
@@ -324,24 +377,67 @@ impl WorkspaceIndex {
                 let subpath = (!subpath.is_empty()).then(|| subpath.to_string());
                 Resolution::External { package, subpath }
             }
-            None => Resolution::Unresolved,
+            None => unclaimed_or_missing(claimed),
         }
     }
 
     /// The file the repo's config aliases `specifier` to, when the index reads
-    /// aliases and one names an existing source file.
-    fn resolve_alias(&self, from_file: &Path, specifier: &str) -> Option<PathBuf> {
-        let aliases = self.aliases.as_ref()?;
+    /// aliases and one names an existing source file — or, when a mapping
+    /// claimed the specifier and nothing it names is on disk, which mapping
+    /// that was (carrick#1273).
+    ///
+    /// The second answer is the one a user can act on: the mapping is a line
+    /// in their own config, and the target is a path they can look for. It is
+    /// taken from the first key that claimed the specifier, because that is
+    /// the one the compiler would have used.
+    fn resolve_alias(&self, from_file: &Path, specifier: &str) -> AliasOutcome {
+        let Some(aliases) = self.aliases.as_ref() else {
+            return AliasOutcome::Unclaimed;
+        };
         let from_file = self.repo_relative(from_file);
-        aliases
-            .resolve(&from_file, specifier)
-            .into_iter()
-            .find_map(|target| match target {
+        let mut claimed: Option<MissingAliasTarget> = None;
+        for matched in aliases.resolve(&from_file, specifier) {
+            let resolved = match &matched.target {
                 AliasTarget::Paths(candidates) => candidates
                     .iter()
                     .find_map(|candidate| self.resolve_file(candidate)),
-                AliasTarget::Leaves { dir, leaves } => self.pick_source_leaf(&dir, leaves),
-            })
+                AliasTarget::Leaves { dir, leaves } => self.pick_source_leaf(dir, leaves.clone()),
+            };
+            if let Some(file) = resolved {
+                return AliasOutcome::Resolved(file);
+            }
+            if let (None, Some(declared)) = (&claimed, matched.declared) {
+                claimed = Some(self.missing_target(declared));
+            }
+        }
+        match claimed {
+            Some(missing) => AliasOutcome::Missing(missing),
+            None => AliasOutcome::Unclaimed,
+        }
+    }
+
+    /// What a claimed mapping pointed at, for the report.
+    ///
+    /// Whether the target is there at all is the difference between a build
+    /// step nobody ran and a single import spelled wrong, and it is answered
+    /// by a `stat` rather than by anything that has to know what fills the
+    /// directory. A root that names a directory is asked about directly; one
+    /// that names a file is asked about through its parent, because a file
+    /// beside existing siblings is a mis-spelled import.
+    fn missing_target(&self, declared: crate::module_aliases::Declared) -> MissingAliasTarget {
+        let path = self
+            .repo_root
+            .join(declared.target_root.trim_end_matches('/'));
+        let directory_missing = if declared.target_root.ends_with('/') {
+            !path.is_dir()
+        } else {
+            path.parent().is_some_and(|dir| !dir.is_dir())
+        };
+        MissingAliasTarget {
+            declared_by: declared.key,
+            target_root: declared.target_root,
+            directory_missing,
+        }
     }
 
     /// The source file a manifest's `exports` field names for one specifier
@@ -880,6 +976,123 @@ mod tests {
 
     fn internal(path: &str) -> Resolution {
         Resolution::Internal(PathBuf::from(path))
+    }
+
+    /// A `paths` pattern pointing at a directory nobody generated is a
+    /// different fact from a specifier nothing accounts for: the repo STATED
+    /// where the module lives (carrick#1273).
+    #[test]
+    fn a_paths_pattern_whose_directory_was_never_generated_names_itself() {
+        let repo = tree(&[
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions":{"paths":{"@gen/*":["./src/generated/*"]}}}"#,
+            ),
+            ("package.json", r#"{"name":"app"}"#),
+            ("src/app.ts", "export const app = 1;"),
+        ]);
+        assert_eq!(
+            aliased(&repo, "src/app.ts", "@gen/client"),
+            Resolution::AliasTargetMissing(MissingAliasTarget {
+                declared_by: "@gen/*".to_string(),
+                target_root: "src/generated/".to_string(),
+                directory_missing: true,
+            }),
+            "the mapping is named as written, not the specifier that went through it"
+        );
+    }
+
+    /// The shape that actually bit us: a Deno import map whose trailing-slash
+    /// key maps a package-shaped specifier onto a generated directory. A
+    /// different branch of the matcher from the `*` pattern above, and the
+    /// specifier is a legal npm package name, so nothing else would have
+    /// reported it.
+    #[test]
+    fn a_deno_import_map_onto_an_ungenerated_directory_names_itself() {
+        let repo = tree(&[
+            (
+                "deno.json",
+                r#"{"imports":{"@generated-client/":"./src/db/generated/client/"}}"#,
+            ),
+            ("src/app.ts", "export const app = 1;"),
+        ]);
+        assert_eq!(
+            aliased(&repo, "src/app.ts", "@generated-client/models.ts"),
+            Resolution::AliasTargetMissing(MissingAliasTarget {
+                declared_by: "@generated-client/".to_string(),
+                target_root: "src/db/generated/client/".to_string(),
+                directory_missing: true,
+            })
+        );
+    }
+
+    /// The mapping's target is reported, not the file one import wanted — so
+    /// a mapping whose target is present reports the target that IS there,
+    /// with `directory_missing` false. That is a mis-spelled import, not a
+    /// build step nobody ran, and the instruction differs accordingly.
+    #[test]
+    fn a_target_that_exists_is_reported_as_present_when_one_import_misses() {
+        let repo = tree(&[
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#,
+            ),
+            ("src/present.ts", "export const present = 1;"),
+        ]);
+        assert_eq!(
+            aliased(&repo, "src/app.ts", "@/absent"),
+            Resolution::AliasTargetMissing(MissingAliasTarget {
+                declared_by: "@/*".to_string(),
+                target_root: "src/".to_string(),
+                directory_missing: false,
+            })
+        );
+    }
+
+    /// A mapping that misses does not end the lookup. A `paths` pattern can
+    /// shadow a package that is also installed, and the compiler falls through
+    /// to it — so the claim is carried down and stated only where the lookup
+    /// gives up for good. Put the new variant one step too early and this
+    /// turns a working external edge into a reported defect.
+    #[test]
+    fn a_missing_mapping_still_falls_through_to_a_declared_package() {
+        let repo = tree(&[
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions":{"paths":{"@acme/*":["./src/acme/*"]}}}"#,
+            ),
+            (
+                "package.json",
+                r#"{"name":"app","dependencies":{"@acme/sdk":"^1.0.0"}}"#,
+            ),
+            ("src/app.ts", "export const app = 1;"),
+        ]);
+        assert_eq!(
+            aliased(&repo, "src/app.ts", "@acme/sdk"),
+            Resolution::External {
+                package: "@acme/sdk".to_string(),
+                subpath: None,
+            }
+        );
+    }
+
+    /// `baseUrl` declares no key. It is a search root, not a claim that any
+    /// path exists, so a specifier that misses under it was never claimed and
+    /// stays unresolved.
+    #[test]
+    fn a_miss_under_base_url_alone_is_not_a_missing_mapping() {
+        let repo = tree(&[
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions":{"baseUrl":"./src"}}"#,
+            ),
+            ("package.json", r#"{"name":"app"}"#),
+            ("src/app.ts", "export const app = 1;"),
+        ]);
+        assert_eq!(
+            aliased(&repo, "src/app.ts", "nowhere"),
+            Resolution::Unresolved
+        );
     }
 
     /// The analyzer-input index never reads aliases (carrick#474): the same

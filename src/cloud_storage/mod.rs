@@ -412,6 +412,22 @@ pub struct RunStart {
     pub indexed_services: Option<Vec<String>>,
 }
 
+/// What the cloud said when it took a dispatched analysis job (carrick#1229).
+#[derive(Debug, Clone)]
+pub struct JobSubmission {
+    /// The name the job answers to afterwards, for `carrick status` and
+    /// `carrick resume`.
+    pub job_id: String,
+    /// How many prompts the job carries, so the command that dispatched it can
+    /// say what is being worked on.
+    ///
+    /// No estimate of how long it will take: the cloud states none, and a
+    /// figure this side invented would be a promise nobody made. What a
+    /// dispatched run can honestly say is that the machine does not have to
+    /// stay on, and that `carrick status` answers how far it has got.
+    pub analyze_rows: usize,
+}
+
 impl RunStart {
     /// Whether this run is a laptop scan.
     ///
@@ -999,6 +1015,29 @@ pub trait CloudStorage {
         self.health_check().await.map(|()| RunStart::default())
     }
 
+    /// Whether this cloud takes a whole scan's prompts as one job.
+    ///
+    /// Asked after the run is open, because it is `start-scan` that answers
+    /// it. Not async, so the default puts no `Sync` bound on generic callers
+    /// (carrick#956).
+    fn accepts_analysis_job(&self) -> bool {
+        false
+    }
+
+    /// Hand the cloud every prompt this run built, instead of asking them one
+    /// at a time and waiting (carrick#1229).
+    ///
+    /// `None` means this backend, or this cloud, does not take analysis jobs —
+    /// in which case the run scans synchronously, which is what it did before
+    /// this existed. So a scanner that can dispatch in front of a cloud that
+    /// cannot is not a broken install, it is an ordinary scan.
+    async fn submit_analysis_job(
+        &self,
+        _bundle: &crate::analysis_job::JobBundle,
+    ) -> Result<Option<JobSubmission>, StorageError> {
+        Ok(None)
+    }
+
     /// Keep `data`, the generation the index already serves for a service this
     /// run held back, wherever this backend builds a read model from the
     /// run's own writes.
@@ -1009,6 +1048,26 @@ pub trait CloudStorage {
     /// already holds it, so the default does nothing. Not async, so the
     /// default body puts no `Sync` bound on generic callers (carrick#956).
     fn keep_served_generation(&self, _data: &CloudRepoData) {}
+
+    /// Tell this backend that the run sent at least one file to the analyzer,
+    /// so its write actions must replace the stored generation rather than be
+    /// short-circuited on the commit hash (carrick#1306).
+    ///
+    /// The cloud dedupes a write on (commit, scanner version), and neither
+    /// moves when a user prepares the checkout the way the pre-flight refusal
+    /// told them to: the generated output is gitignored, so the tree is clean
+    /// by git's measure and `--no-cache` was not passed. The scan then
+    /// re-analyses, reports better numbers locally, and the index every agent
+    /// reads is unchanged. A run that analysed a file knows its answers are
+    /// not the stored generation's, and this is it saying so.
+    ///
+    /// A property of the RUN: called once, before any write action, and every
+    /// write action of the run carries the flag afterwards. Not async, so the
+    /// default body puts no `Sync` bound on generic callers (carrick#956).
+    /// The default does nothing, because only a backend that talks to the
+    /// freshness guard has anything to say to it — but a backend that WRAPS
+    /// one must forward this or the wrapped cloud never hears it.
+    fn note_analyzed_files(&self) {}
 
     /// Ask the run's final write (the one [`Self::upload_repo_data`] gets with
     /// `final_in_run`) to name the services this run leaves pending, and say
@@ -1303,6 +1362,7 @@ mod tests {
                 frameworks: vec![],
                 data_fetchers: vec![],
                 messaging_clients: vec![],
+                socket_clients: vec![],
                 notes: String::new(),
             },
             framework_guidance: ProtocolGuidance::new(),

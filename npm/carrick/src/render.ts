@@ -417,7 +417,14 @@ export function runningScanLine(scan: RunningScan): string {
     return `- scan ${scan.scan_id} failed${reason ? `: ${reason}` : ""}`;
   }
   if (scan.status === "finished") {
-    return `- scan ${scan.scan_id} finished${scan.infer ? ", paid" : ""}. The index is written.`;
+    return `- scan ${scan.scan_id} finished. The index is written.`;
+  }
+  // Neither running nor finished: the prompts went to Carrick Cloud and the
+  // index arrives when something collects them (carrick#1229). Without this
+  // case the line below claims a scan is still going and points at a log that
+  // ended.
+  if (scan.status === "dispatched") {
+    return `- scan ${scan.scan_id} handed this workspace to Carrick Cloud to analyse. \`carrick resume\` builds the index when it is done.`;
   }
   const slow = scan.notice ? ` (${scan.notice})` : "";
   return `- scan ${scan.scan_id} is running${where}${counts}${slow}. Its output is in .carrick/scan-${scan.scan_id}.log`;
@@ -447,10 +454,11 @@ export function repoLine(repo: StatusRepo): string | null {
  * contract holds.
  */
 export function renderSessionStart(status: StatusResult): string {
-  const scans = (status.running_scans ?? []).map(runningScanLine);
+  const scans = [...(status.running_scans ?? []).map(runningScanLine), ...(status.analysing ?? [])];
   if (status.error === "not_indexed") {
     // A first index being built right now is the answer, not "there is none":
-    // told the latter, an agent starts a second scan (carrick#992).
+    // told the latter, an agent starts a second scan (carrick#992). The same
+    // holds for one being built in the cloud (carrick#1229).
     if (scans.length) {
       return [
         "Carrick has no index for this workspace yet, and a scan is building one.",

@@ -202,6 +202,17 @@ pub struct ServiceEnrichment {
     /// those rows (carrick#1023 item 14).
     #[serde(default)]
     pub classified_here: bool,
+    /// This run's upload was not stored: the cloud already held a row for this
+    /// commit from this scanner release, so it kept it (carrick#1255).
+    ///
+    /// The one state in which a scan changes nothing an agent reads and the
+    /// run has no reason to look wrong: installing dependencies, resolving a
+    /// type or fixing a setting moves no source file, so the commit does not
+    /// move, so the write is refused and the stored row — with everything the
+    /// fix was meant to clear still in it — is what is served. Said out loud
+    /// here rather than left to a reader comparing two timestamps.
+    #[serde(default)]
+    pub write_refused_as_current: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -893,6 +904,14 @@ impl HostedInput {
             // (§2.4), so this is a state, not a failure to explain away as a
             // broken read. Saying which one it is stops a user chasing a
             // corrupt index that is behaving exactly as designed.
+            //
+            // The provenance carries it too, because the sentence the reader
+            // gets is chosen on that field: a generation the BLOB knows is
+            // dirty must not read as clean just because the stored row was
+            // written before `dirty` existed (carrick#1255).
+            if let Some(hosted) = result.hosted.as_mut() {
+                hosted.dirty = Some(true);
+            }
             result.failure =
                 Some("Hosted index was written from a tree with uncommitted changes".into());
             HostedState::ReadFailed
@@ -953,7 +972,13 @@ impl HostedInput {
             .as_ref()
             .is_some_and(|hosted| write_was_refused(hosted, blob))
         {
-            return previous;
+            // And the run says so. This is the case carrick#1255 is about: the
+            // scan ran, the local output shows whatever it improved, and the
+            // index an agent reads did not move at all.
+            return ServiceEnrichment {
+                write_refused_as_current: true,
+                ..previous
+            };
         }
         let mut result = ServiceEnrichment {
             remote: self.remotes.get(path).cloned(),
@@ -981,6 +1006,9 @@ impl HostedInput {
             // This process ran the model over this service and wrote the blob,
             // whatever becomes of the hosted row below (carrick#1023 item 14).
             classified_here: true,
+            // The refusal is answered above; reaching here means the write
+            // landed.
+            write_refused_as_current: false,
         };
         if blob.dirty == Some(true) {
             result.failure =
@@ -1113,6 +1141,7 @@ pub(super) fn can_read_index(index: &super::read_model::LocalIndex) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git_state::tests::committed_repo;
     use serde_json::json;
     use std::io::{Read, Write};
 
@@ -1870,6 +1899,88 @@ mod tests {
         );
     }
 
+    /// The stored row predates the `dirty` field, and the blob it points at
+    /// knows better. The provenance has to carry that, because the sentence a
+    /// reader gets is chosen on it (carrick#1255).
+    #[test]
+    fn a_dirty_blob_under_a_pre_field_row_still_reads_as_dirty() {
+        // A real repository at a real commit: the read path answers
+        // `CommitMissing` for a clone that does not hold the hosted commit, and
+        // that branch is reached before this one.
+        let (dir, head) = committed_repo(&[("app.ts", "export const value = 1;")]);
+        let repo = dir.path();
+
+        let mut metadata = resolution();
+        metadata["repos"][0]["services"] = json!([{
+            "service": "api", "hash": head, "updated_at": null,
+            "scanner_version": env!("CARGO_PKG_VERSION"), "source": null,
+            "uploaded_by": null, "dirty": null
+        }]);
+        let mut stored = blob_from(Some(env!("CARGO_PKG_VERSION")));
+        stored.commit_hash = head;
+        stored.dirty = Some(true);
+        let input = HostedInput {
+            snapshot: Some(Snapshot {
+                identity: "test".into(),
+                checked_at: "now".into(),
+                resolution: Resolution::parse(metadata).unwrap(),
+                projects: BTreeMap::from([("p".into(), vec![stored])]),
+            }),
+            failure: None,
+            remotes: BTreeMap::from([(repo.to_path_buf(), "example/api".into())]),
+            unnamed: BTreeMap::new(),
+            downloads: None,
+        };
+        let answer = input.service(repo, &blob());
+        assert_eq!(answer.hosted.as_ref().and_then(|h| h.dirty), Some(true));
+        let note = super::super::query::enrichment_note(&answer, None);
+        assert!(
+            note.contains("Written from a tree with uncommitted changes"),
+            "{note}"
+        );
+        assert!(!note.contains("retained"), "{note}");
+    }
+
+    /// A scan whose write the cloud refuses as already current changed nothing
+    /// an agent reads, and the run says so (carrick#1255). The local output is
+    /// no signal at all here: it shows whatever this scan improved, at a commit
+    /// whose stored row is what is actually being served.
+    #[test]
+    fn a_write_refused_as_already_current_is_stated() {
+        let mut metadata = resolution();
+        metadata["repos"][0]["services"] = json!([{
+            "service": "api", "hash": "abcdef", "updated_at": null,
+            "scanner_version": env!("CARGO_PKG_VERSION"), "source": "ci",
+            "uploaded_by": "ci-bot", "dirty": false
+        }]);
+        let input = HostedInput {
+            snapshot: Some(Snapshot {
+                identity: "test".into(),
+                checked_at: "now".into(),
+                resolution: Resolution::parse(metadata).unwrap(),
+                projects: BTreeMap::from([(
+                    "p".into(),
+                    vec![blob_from(Some(env!("CARGO_PKG_VERSION")))],
+                )]),
+            }),
+            failure: None,
+            remotes: BTreeMap::from([(PathBuf::from("/w/api"), "example/api".into())]),
+            unnamed: BTreeMap::new(),
+            downloads: None,
+        };
+        let answer = input.uploaded(Path::new("/w/api"), &blob());
+        assert!(answer.write_refused_as_current, "{answer:?}");
+        let note = super::super::query::enrichment_note(&answer, None);
+        assert!(
+            note.contains("Nothing this scan computed was stored"),
+            "{note}"
+        );
+        assert!(
+            note.contains("installing dependencies or changing a setting does not move the commit"),
+            "{note}"
+        );
+    }
+
     /// The cloud's "I do not hold this repo" and the machine's "I never had a
     /// name to ask about" are separate answers and separate sentences
     /// (carrick#1056). Both reach the same place — no hosted rows — and only
@@ -1956,6 +2067,23 @@ mod tests {
                 .as_deref()
                 .is_some_and(|failure| failure.contains("uncommitted changes")),
             "{after:?}"
+        );
+        // And never as a refused upload: a dirty run forces the reindex, so
+        // this write landed and the index an agent reads is this one. Reading
+        // that sentence as a refusal is how carrick#1255 was first diagnosed.
+        let note = super::super::query::enrichment_note(&after, None);
+        assert!(!note.contains("retained"), "{note}");
+        assert!(
+            !note.contains("Nothing this scan computed was stored"),
+            "{note}"
+        );
+        assert!(
+            note.contains("Written from a tree with uncommitted changes"),
+            "{note}"
+        );
+        assert!(
+            note.contains("Commit them and run `carrick index` again"),
+            "{note}"
         );
     }
 }

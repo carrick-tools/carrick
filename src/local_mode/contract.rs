@@ -110,11 +110,18 @@ pub struct ErrorOutput {
     /// (carrick#992).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub running_scans: Vec<super::scan_state::ScanState>,
-    /// What the last paid scan of this workspace cost. Carried on the error
-    /// body too: a first run killed before it wrote an index still spent the
-    /// money, and this is the only surface that can say so (carrick#995).
+    /// What the last scan of this workspace reported, for a reader parsing
+    /// `--json`. Carried on the error body too, because a run killed before
+    /// it wrote an index still uploaded the repos it got through
+    /// (carrick#995). Nothing rendered here says anything about it: our
+    /// inference cost is ours (carrick#1236).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_scan: Option<crate::scan_spend::RunSpend>,
+    /// The same as [`StatusOutput::analysing`], carried on the error body too:
+    /// "there is no index" and "the analysis that builds it is running in the
+    /// cloud" are different answers (carrick#1229).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub analysing: Vec<String>,
 }
 
 impl ErrorOutput {
@@ -127,6 +134,7 @@ impl ErrorOutput {
             error: failure.error.wire().to_string(),
             message: failure.message().to_string(),
             running_scans: Vec::new(),
+            analysing: Vec::new(),
             last_scan: None,
         }
     }
@@ -510,11 +518,16 @@ pub struct StatusOutput {
     /// visible through while it runs (carrick#992).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub running_scans: Vec<super::scan_state::ScanState>,
-    /// What the last paid scan of this workspace cost, one entry per repo it
-    /// scanned (carrick#995). Absent until one has run: the free pass pays for
-    /// nothing, and a scan that has not been priced yet states no figure.
+    /// What the last scan of this workspace reported, one entry per repo it
+    /// scanned (carrick#995). Absent until one has run, and read by whoever
+    /// parses `--json`; the human render states none of it (carrick#1236).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_scan: Option<crate::scan_spend::RunSpend>,
+    /// Analysis Carrick Cloud is doing for this workspace right now, one entry
+    /// per repo handed over (carrick#1229). Empty in the ordinary case, and
+    /// the only part of any read command that touches the network.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub analysing: Vec<String>,
     pub services: Vec<StatusService>,
 }
 
@@ -533,17 +546,14 @@ impl StatusOutput {
         if !self.running_scans.is_empty() {
             out.push('\n');
         }
-        // The paid scan prints this when it finishes, and a detached one
-        // prints it into a log nobody is tailing. So it is repeated here,
-        // dated, for the reader who is asking afterwards (carrick#995).
-        if let Some(spend) = &self.last_scan {
-            for line in spend.lines(Some(&spend.updated_at)) {
-                out.push_str(&line);
-                out.push('\n');
-            }
-            if !spend.is_empty() {
-                out.push('\n');
-            }
+        // Above the index for the same reason: an analysis in flight is about
+        // now, and the index below it is about the last build that finished.
+        for line in &self.analysing {
+            out.push_str(line);
+            out.push('\n');
+        }
+        if !self.analysing.is_empty() {
+            out.push('\n');
         }
         out.push_str(&format!(
             "{} — {} service(s), indexed at {} by carrick {}\n\n",
@@ -746,6 +756,50 @@ mod hosted_wire_tests {
         );
     }
 
+    /// The three provenance fields ride INSIDE `hosted`, in these exact
+    /// spellings, and only when the row carries them.
+    ///
+    /// `dirty` is the one a reader acts on — it is what says the generation was
+    /// built from bytes no commit describes — and carrick#1255 made the scanner
+    /// stamp it from the blob as well as the stored row, so a generation
+    /// written before the field existed now reads as dirty. This pins both
+    /// halves: `true` is carried and spelled `dirty`, and a hosted object
+    /// without the key parses and re-serialises without it rather than as a
+    /// `null` a consumer has to interpret.
+    #[test]
+    fn the_hosted_provenance_fields_are_sparse_and_exactly_spelled() {
+        let mut value = serde_json::to_value(super::tests::output()).unwrap();
+        value["hosted"] = serde_json::json!({
+            "commit":"abc123","indexed_at":"2026-09-10T10:00:00Z",
+            "scanner_version":"0.3.58","project":"fixture",
+            "source":"laptop","uploaded_by":"ihor","dirty":true
+        });
+        value["hosted_state"] = serde_json::json!("read_failed");
+        let parsed: CheckOutput = serde_json::from_value(value.clone()).unwrap();
+        let hosted = parsed.hosted.clone().expect("a hosted row");
+        assert_eq!(hosted.dirty, Some(true));
+        assert_eq!(hosted.source.as_deref(), Some("laptop"));
+        assert_eq!(hosted.uploaded_by.as_deref(), Some("ihor"));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+
+        for field in ["source", "uploaded_by", "dirty"] {
+            value["hosted"].as_object_mut().unwrap().remove(field);
+        }
+        let older: CheckOutput = serde_json::from_value(value.clone()).unwrap();
+        let hosted = older.hosted.clone().expect("a hosted row");
+        assert_eq!(hosted.dirty, None);
+        assert_eq!(hosted.source, None);
+        assert_eq!(hosted.uploaded_by, None);
+        let written = serde_json::to_value(older).unwrap();
+        for field in ["source", "uploaded_by", "dirty"] {
+            assert!(
+                !written["hosted"].as_object().unwrap().contains_key(field),
+                "{field} was written onto a row that never carried it"
+            );
+        }
+        assert_eq!(written, value);
+    }
+
     /// The three carrick#1033 fields ride on the ITEM, in these exact
     /// spellings, and a payload written before they existed still parses with
     /// all three absent rather than empty.
@@ -879,6 +933,7 @@ mod hosted_wire_tests {
     /// a time against.
     fn status_output() -> StatusOutput {
         StatusOutput {
+            analysing: Vec::new(),
             repos_detected_by: None,
             repos_added: Vec::new(),
             repos_excluded: Vec::new(),
@@ -944,11 +999,11 @@ mod hosted_wire_tests {
         assert!(text.contains("changed  tools/release.ts"), "{text}");
     }
 
-    /// `carrick status` repeats the last paid scan's line, because the scan
-    /// that paid printed it into a log nobody is tailing (carrick#995). It
-    /// leads the index, which describes a moment that has already passed.
+    /// A spend on the output changes nothing a person reads. What a run costs
+    /// us is our figure, never a line in a customer's terminal (carrick#1236);
+    /// the receipt is on `--json` for whoever parses it.
     #[test]
-    fn the_status_render_repeats_what_the_last_paid_scan_cost() {
+    fn the_status_render_says_nothing_about_what_a_scan_cost() {
         let mut spend = crate::scan_spend::RunSpend::default();
         spend.record(
             "api",
@@ -966,25 +1021,14 @@ mod hosted_wire_tests {
             },
         );
         let mut output = status_output();
+        let bare = output.render();
         output.last_scan = Some(spend);
 
         let text = output.render();
-        let line = text.lines().next().expect("the money line leads");
-        assert!(line.starts_with("The last paid scan, "), "{text}");
-        assert!(
-            line.ends_with(
-                "US$4.32. First-index ceiling left: US$10.68. Laptop allowance this month: \
-                 US$10.00 of US$10.00."
-            ),
-            "{text}"
-        );
-    }
-
-    /// A workspace with no paid scan behind it says nothing about money: there
-    /// is no placeholder for a figure that does not exist.
-    #[test]
-    fn the_status_render_says_nothing_about_money_when_nothing_was_paid() {
-        assert!(!status_output().render().contains("US$"));
+        assert_eq!(text, bare, "a spend must not add a line");
+        for banned in ["US$", "4.32", "allowance", "ceiling", "paid"] {
+            assert!(!text.contains(banned), "{banned} in {text}");
+        }
     }
 
     /// The receipt rides the error body too. A first paid run killed before it

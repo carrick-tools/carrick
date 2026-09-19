@@ -43,6 +43,13 @@ pub fn laptop_scan_requested() -> bool {
 pub struct TeeStorage {
     cloud: AwsStorage,
     local: LocalDirStorage,
+    /// Whether this scan keeps its index to itself (carrick#1229).
+    ///
+    /// Read once, at construction: the indexer sets the variable before it
+    /// spawns the scan, so it cannot change under a run, and a field is one
+    /// fact the tests can hand in rather than a process-wide one they have to
+    /// take turns mutating.
+    skip_upload: bool,
 }
 
 impl TeeStorage {
@@ -50,6 +57,7 @@ impl TeeStorage {
         Ok(Self {
             cloud: AwsStorage::new(force_reindex)?,
             local: LocalDirStorage::from_env()?,
+            skip_upload: std::env::var(crate::local_mode::SKIP_UPLOAD_ENV).as_deref() == Ok("1"),
         })
     }
 }
@@ -69,6 +77,32 @@ impl CloudStorage for TeeStorage {
         final_in_run: bool,
     ) -> Result<UploadOutcome, StorageError> {
         self.local.upload_repo_data(data, final_in_run).await?;
+        // A resume finishing at an older commit than the one the cloud already
+        // serves writes the local half and stops there (carrick#1229). Local
+        // first and cloud never, rather than "do not upload": the read model
+        // this build writes is the point of finishing at all, and a run that
+        // wrote nothing locally would leave the repo out of the index
+        // entirely.
+        if self.skip_upload {
+            tracing::info!(
+                "Not replacing the stored index for {}: it moved on while this analysis ran",
+                data.repo_name
+            );
+            // The run still opened a scan, so it still has to end one
+            // (carrick#1262). `scan_final` rides on the write above, which is
+            // the write this branch is not sending, so the last service of the
+            // run says so directly: the in-flight slot goes back rather than
+            // refusing the user's next run for the quiet window, and the
+            // cloud records that the run ended rather than sweeping it up as
+            // silent. Best-effort, after the local write, and unable to fail
+            // the run — see `docs/reference/dispatch-resume.md`.
+            if final_in_run {
+                self.cloud
+                    .report_scan_closed(crate::local_mode::SUPERSEDED_REASON)
+                    .await;
+            }
+            return Ok(UploadOutcome::default());
+        }
         self.cloud.upload_repo_data(data, final_in_run).await
     }
 
@@ -94,7 +128,21 @@ impl CloudStorage for TeeStorage {
         data: &CloudRepoData,
         written_after: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, StorageError> {
+        // Nothing was sent, so nothing can have failed to land.
+        if self.skip_upload {
+            return Ok(true);
+        }
         self.cloud.index_landed(data, written_after).await
+    }
+
+    /// The CLOUD side: the freshness guard this is aimed at is the cloud's,
+    /// and the local copy is overwritten on every write regardless
+    /// (carrick#1306). Forwarded rather than left to the trait's no-op
+    /// default, because this is the storage the laptop scan uses — the path
+    /// the defect was seen on — and a swallowed call here is the defect
+    /// intact.
+    fn note_analyzed_files(&self) {
+        self.cloud.note_analyzed_files();
     }
 
     /// The cloud side: the first index being kept open is the cloud's, and
@@ -162,12 +210,51 @@ impl CloudStorage for TeeStorage {
     ) -> Result<(), StorageError> {
         self.cloud.post_pr_result(payload).await
     }
+
+    fn accepts_analysis_job(&self) -> bool {
+        self.cloud.accepts_analysis_job()
+    }
+
+    /// The cloud's, not the cache's: an analysis job is work the cloud does,
+    /// and a run that dispatches writes no index for this tee to copy.
+    async fn submit_analysis_job(
+        &self,
+        bundle: &crate::analysis_job::JobBundle,
+    ) -> Result<Option<crate::cloud_storage::JobSubmission>, StorageError> {
+        self.cloud.submit_analysis_job(bundle).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::credentials::CloudAuth;
+
+    fn start_scan_ok() -> (u16, String) {
+        (
+            200,
+            serde_json::json!({
+                "schema": "carrick.start-scan/0",
+                "scan_id": "scan_01J",
+                "project_id": "proj_1",
+                "project_slug": "acme",
+                "indexed_services": [],
+                "multi_service": true
+            })
+            .to_string(),
+        )
+    }
+
+    async fn begin(storage: &TeeStorage) {
+        storage
+            .begin_run(&RunContext {
+                repo_full_name: Some("acme/api".to_string()),
+                commit: "4f2a1c9".to_string(),
+                dirty: false,
+            })
+            .await
+            .unwrap();
+    }
 
     fn blob() -> CloudRepoData {
         serde_json::from_value(serde_json::json!({
@@ -184,6 +271,23 @@ mod tests {
         responses: Vec<(u16, String)>,
         cache: &std::path::Path,
     ) -> (TeeStorage, std::thread::JoinHandle<Vec<String>>) {
+        tee_with(responses, cache, false)
+    }
+
+    /// A tee whose run is one the cloud has already moved past, so it writes
+    /// the local half and sends no index (carrick#1229).
+    fn skipping_tee(
+        responses: Vec<(u16, String)>,
+        cache: &std::path::Path,
+    ) -> (TeeStorage, std::thread::JoinHandle<Vec<String>>) {
+        tee_with(responses, cache, true)
+    }
+
+    fn tee_with(
+        responses: Vec<(u16, String)>,
+        cache: &std::path::Path,
+        skip_upload: bool,
+    ) -> (TeeStorage, std::thread::JoinHandle<Vec<String>>) {
         let (base, server) = crate::agent_service::tests::stub_server(responses);
         let cloud = AwsStorage::for_test(
             &format!("{base}/types/check-or-upload"),
@@ -191,7 +295,14 @@ mod tests {
             false,
         );
         let local = LocalDirStorage::new(cache.to_path_buf(), true).unwrap();
-        (TeeStorage { cloud, local }, server)
+        (
+            TeeStorage {
+                cloud,
+                local,
+                skip_upload,
+            },
+            server,
+        )
     }
 
     fn check_ok() -> (u16, String) {
@@ -273,6 +384,28 @@ mod tests {
         assert_eq!(write["pending_services"], serde_json::json!(["billing"]));
     }
 
+    /// carrick#1306: a laptop run is a tee, so the statement "this run
+    /// analysed files" must reach the cloud through it. A tee that kept the
+    /// trait's no-op default would swallow it on the one path the defect was
+    /// seen on, and every test against `AwsStorage` alone would still pass.
+    #[tokio::test]
+    async fn the_analyzed_statement_reaches_the_cloud_through_the_tee() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, server) = tee(
+            vec![
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            dir.path(),
+        );
+
+        storage.note_analyzed_files();
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        let write = body_of(&server.join().unwrap()[1]);
+        assert_eq!(write["force_reindex"], true, "{write}");
+    }
+
     /// The analysis has already been paid for by the time either write
     /// happens, so a cloud refusal still fails the run — the user is told, and
     /// the cloud's index is not written — but the developer keeps the index
@@ -306,6 +439,97 @@ mod tests {
             "a refusal must not take the paid-for local index with it"
         );
         server.join().unwrap();
+    }
+
+    /// carrick#1262: a resume the cloud has already moved past writes its
+    /// index locally, sends no write action at all — and ends the scan it
+    /// opened, so the in-flight slot is handed back rather than refusing the
+    /// user's next run for the quiet window.
+    #[tokio::test]
+    async fn a_superseded_resume_closes_the_scan_its_last_service_would_have() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, server) = skipping_tee(
+            vec![
+                start_scan_ok(),
+                (200, serde_json::json!({ "ok": true }).to_string()),
+            ],
+            dir.path(),
+        );
+        begin(&storage).await;
+
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2, "the index was sent after all");
+        let close = body_of(&requests[1]);
+        assert_eq!(close["action"], "close-scan");
+        assert_eq!(close["scan_id"], "scan_01J");
+        assert_eq!(close["reason"], "superseded");
+        assert!(
+            dir.path().join("api.json").exists(),
+            "the local index this run exists to build was not written"
+        );
+    }
+
+    /// One close per run, on the write that would have carried `scan_final`:
+    /// a multi-service repo skips N uploads, and closing on the first would
+    /// hand the slot back while the rest of the run is still going.
+    #[tokio::test]
+    async fn a_service_that_is_not_the_run_s_last_closes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, server) = skipping_tee(vec![start_scan_ok()], dir.path());
+        begin(&storage).await;
+
+        storage.upload_repo_data(&blob(), false).await.unwrap();
+
+        assert_eq!(
+            server.join().unwrap().len(),
+            1,
+            "a mid-run service closed the scan"
+        );
+        assert!(dir.path().join("api.json").exists());
+    }
+
+    /// Nothing to close, nothing sent: a run whose `start-scan` never answered
+    /// has no slot held anywhere, and a `close-scan` with no id is one the
+    /// cloud answers 404.
+    #[tokio::test]
+    async fn a_skipped_upload_with_no_scan_open_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, server) = skipping_tee(vec![], dir.path());
+
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        assert!(server.join().unwrap().is_empty());
+        assert!(dir.path().join("api.json").exists());
+    }
+
+    /// The cloud deployed today refuses the action outright, and the run is
+    /// unchanged by it: the index the developer asked for is on disk and the
+    /// scan finishes successfully. Every other refusal — an id this cloud does
+    /// not know, another workspace's scan, a 5xx, a dead network — ends the
+    /// same way.
+    #[tokio::test]
+    async fn a_refused_close_leaves_the_run_successful() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, server) = skipping_tee(
+            vec![
+                start_scan_ok(),
+                (
+                    403,
+                    serde_json::json!({ "error": "wrong key kind", "code": "wrong_key_kind" })
+                        .to_string(),
+                ),
+            ],
+            dir.path(),
+        );
+        begin(&storage).await;
+
+        let outcome = storage.upload_repo_data(&blob(), true).await;
+
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(server.join().unwrap().len(), 2, "the close was retried");
+        assert!(dir.path().join("api.json").exists());
     }
 
     /// The cross-repo read is the local one, so phase 1 stays isolated exactly

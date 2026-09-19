@@ -293,6 +293,7 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadFailure> {
         // beside the index, not a read of it (carrick#992, carrick#995).
         running_scans: Vec::new(),
         last_scan: None,
+        analysing: Vec::new(),
         services,
     })
 }
@@ -713,15 +714,41 @@ pub fn enrichment_note(
              main to refresh it.",
         );
     }
-    if let Some(failure) = &enrichment.failure {
-        if let Some(hosted) = &enrichment.hosted {
+    // The three ways a read can end short of a replayable hosted index, and
+    // each says what it costs the reader and what moves it (carrick#1255).
+    //
+    // A dirty generation is NOT a retained copy: a dirty run sends
+    // `force_reindex` (seam C10), so its write lands and the index an agent
+    // reads IS this one — stamped at a commit that does not describe the bytes
+    // it was built from. What it gives up is the replay, because a dirty
+    // generation carries no reusable model answers (§2.4). Calling that
+    // "retained; could not refresh" described a refused upload that never
+    // happened, and that is how the discrepancy in carrick#1255 was first
+    // diagnosed.
+    if let Some(hosted) = &enrichment.hosted {
+        if enrichment.write_refused_as_current {
+            note.push_str(&format!(
+                " Nothing this scan computed was stored: the cloud already holds an index for this \
+                 commit from this scanner release, so an agent still reads the one from {}. Only \
+                 a new commit replaces it — installing dependencies or changing a setting does \
+                 not move the commit.",
+                hosted.indexed_at
+            ));
+        } else if hosted.dirty == Some(true) && enrichment.failure.is_some() {
+            note.push_str(
+                " Written from a tree with uncommitted changes: it is stored at a commit that \
+                 does not describe it, and this machine cannot replay its answers, so the next \
+                 scan analyses the changed files again. Commit them and run `carrick index` \
+                 again, or let a CI scan of main replace it.",
+            );
+        } else if let Some(failure) = &enrichment.failure {
             note.push_str(&format!(
                 " Hosted copy from {} retained; could not refresh: {failure}.",
                 hosted.indexed_at
             ));
-        } else {
-            note.push_str(&format!(" Could not refresh the hosted index: {failure}."));
         }
+    } else if let Some(failure) = &enrichment.failure {
+        note.push_str(&format!(" Could not refresh the hosted index: {failure}."));
     }
     if let Some(allowance) = &enrichment.allowance_sentence {
         note.push(' ');
@@ -779,24 +806,16 @@ mod tests {
 #[cfg(test)]
 mod hosted_change_tests {
     use super::*;
+    use crate::git_state::tests::committed_repo;
 
     #[test]
     fn hosted_diff_includes_staged_untracked_deleted_and_unusual_paths() {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, commit) = committed_repo(&[
+            ("staged.ts", "export const value = 1;"),
+            ("deleted.ts", "export const value = 1;"),
+            ("odd\nname.ts", "export const value = 1;"),
+        ]);
         let repo = dir.path();
-        for args in [
-            vec!["init", "-q"],
-            vec!["config", "user.email", "fixture@carrick.test"],
-            vec!["config", "user.name", "fixture"],
-        ] {
-            assert!(git(repo, &args).is_some());
-        }
-        for file in ["staged.ts", "deleted.ts", "odd\nname.ts"] {
-            std::fs::write(repo.join(file), "export const value = 1;").unwrap();
-        }
-        git(repo, &["add", "."]).unwrap();
-        git(repo, &["commit", "-qm", "base"]).unwrap();
-        let commit = git(repo, &["rev-parse", "HEAD"]).unwrap();
         std::fs::write(repo.join("staged.ts"), "export const value = 2;").unwrap();
         git(repo, &["add", "staged.ts"]).unwrap();
         std::fs::remove_file(repo.join("deleted.ts")).unwrap();
@@ -839,6 +858,7 @@ mod hosted_change_tests {
                 allowance_sentence: None,
                 hosted_cache_version: Some(crate::engine::CACHE_VERSION),
                 classified_here: false,
+                write_refused_as_current: false,
             },
             None,
         )
@@ -862,6 +882,7 @@ mod hosted_change_tests {
                 allowance_sentence: None,
                 hosted_cache_version: Some(crate::engine::CACHE_VERSION),
                 classified_here: true,
+                write_refused_as_current: false,
             },
             None,
         );
@@ -874,8 +895,14 @@ mod hosted_change_tests {
             "{note}"
         );
         // And the hosted row's own problem is still stated: it is why the next
-        // read of this checkout cannot replay these answers.
+        // read of this checkout cannot replay these answers. Never as a
+        // retained copy, though — this run's write landed (carrick#1255).
         assert!(note.contains("uncommitted changes"), "{note}");
+        assert!(!note.contains("retained"), "{note}");
+        assert!(
+            note.contains("Commit them and run `carrick index` again"),
+            "{note}"
+        );
     }
 
     /// A laptop row says whose laptop and whether the tree was clean, inside
@@ -919,6 +946,7 @@ mod hosted_change_tests {
 #[cfg(test)]
 mod drift_tests {
     use super::*;
+    use crate::git_state::tests::committed_repo;
     use crate::local_mode::read_model::{IndexedRepo, IndexedService, LocalIndex};
 
     fn service(directory: Option<&str>, commit: &str) -> IndexedService {
@@ -932,6 +960,8 @@ mod drift_tests {
             boundary: None,
             routes: 0,
             calls: 0,
+            functions: 0,
+            types: 0,
         }
     }
 
@@ -941,23 +971,8 @@ mod drift_tests {
     /// line against an index a minute old (carrick#1007 item 5).
     #[test]
     fn onboarding_artefacts_are_not_drift_for_a_single_service_repo_either() {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, commit) = committed_repo(&[("src/main.ts", "export const a = 1;")]);
         let repo = dir.path();
-        for args in [
-            vec!["init", "-q"],
-            vec!["config", "user.email", "fixture@carrick.test"],
-            vec!["config", "user.name", "fixture"],
-        ] {
-            assert!(git(repo, &args).is_some());
-        }
-        std::fs::create_dir_all(repo.join("src")).unwrap();
-        std::fs::write(repo.join("src/main.ts"), "export const a = 1;").unwrap();
-        git(repo, &["add", "."]).unwrap();
-        git(repo, &["commit", "-qm", "base"]).unwrap();
-        let commit = git(repo, &["rev-parse", "HEAD"])
-            .unwrap()
-            .trim()
-            .to_string();
 
         std::fs::create_dir_all(repo.join(".github/workflows")).unwrap();
         std::fs::create_dir_all(repo.join(".claude")).unwrap();
@@ -1008,23 +1023,8 @@ mod drift_tests {
     /// indexed row, so none of them can make one stale (carrick#1007 item 5).
     #[test]
     fn onboarding_artefacts_are_not_reported_as_drift() {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, commit) = committed_repo(&[("apps/gateway/main.ts", "export const a = 1;")]);
         let repo = dir.path();
-        for args in [
-            vec!["init", "-q"],
-            vec!["config", "user.email", "fixture@carrick.test"],
-            vec!["config", "user.name", "fixture"],
-        ] {
-            assert!(git(repo, &args).is_some());
-        }
-        std::fs::create_dir_all(repo.join("apps/gateway")).unwrap();
-        std::fs::write(repo.join("apps/gateway/main.ts"), "export const a = 1;").unwrap();
-        git(repo, &["add", "."]).unwrap();
-        git(repo, &["commit", "-qm", "base"]).unwrap();
-        let commit = git(repo, &["rev-parse", "HEAD"])
-            .unwrap()
-            .trim()
-            .to_string();
 
         // What onboarding leaves behind, plus one real source edit outside
         // every service.

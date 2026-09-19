@@ -1,0 +1,47 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "graphql_operations": [
+    {
+      "kind": "query",
+      "field": "parcels",
+      "resolver_function": "parcels",
+      "resolver_line": 6,
+      "primary_type_symbol": "Parcel",
+      "type_import_source": "../kit.ts",
+      "backing_type_symbol": null,
+      "backing_type_source": null
+    },
+    {
+      "kind": "query",
+      "field": "parcel",
+      "resolver_function": "parcel",
+      "resolver_line": 10,
+      "primary_type_symbol": "Parcel",
+      "type_import_source": "../kit.ts",
+      "backing_type_symbol": null,
+      "backing_type_source": null
+    },
+    {
+      "kind": "query",
+      "field": "heaviestWeight",
+      "resolver_function": "heaviestWeight",
+      "resolver_line": 16,
+      "primary_type_symbol": null,
+      "type_import_source": null,
+      "backing_type_symbol": null,
+      "backing_type_source": null
+    },
+    {
+      "kind": "query",
+      "field": "recentParcels",
+      "resolver_function": "recentParcels",
+      "resolver_line": 21,
+      "primary_type_symbol": "Parcel",
+      "type_import_source": "../kit.ts",
+      "backing_type_symbol": null,
+      "backing_type_source": null
+    }
+  ]
+}

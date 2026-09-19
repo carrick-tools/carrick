@@ -157,6 +157,16 @@ pub struct IndexedService {
     pub boundary: Option<ServiceBoundary>,
     pub routes: usize,
     pub calls: usize,
+    /// Functions indexed in this service, exported or not. `0` on an index
+    /// written before the field existed, which is indistinguishable from a
+    /// service with no functions and is the right reading of a record that
+    /// never counted them (carrick#1321).
+    #[serde(default)]
+    pub functions: usize,
+    /// Distinct types the service's bundled `.d.ts` declares. Same default,
+    /// same reason.
+    #[serde(default)]
+    pub types: usize,
 }
 
 impl IndexedService {
@@ -388,6 +398,28 @@ mod tests {
                 .locate_file(Path::new("/elsewhere/src/x.ts"))
                 .is_none()
         );
+    }
+
+    /// A service record written before this scanner counted functions and
+    /// types still reads, as zero of each (carrick#1321).
+    ///
+    /// The index on disk outlives the binary that wrote it: `carrick check`
+    /// reads it on every edit, and a field added without a default would make
+    /// the whole index unreadable until the next scan.
+    #[test]
+    fn an_older_service_record_reads_without_the_new_counts() {
+        let older = serde_json::json!({
+            "name": "api",
+            "commit": "abc1234",
+            "indexed_at": "2026-09-06T00:00:00Z",
+            "boundary": null,
+            "routes": 111,
+            "calls": 1
+        });
+        let service: IndexedService = serde_json::from_value(older).expect("an older record reads");
+        assert_eq!(service.routes, 111);
+        assert_eq!(service.functions, 0);
+        assert_eq!(service.types, 0);
     }
 
     #[test]

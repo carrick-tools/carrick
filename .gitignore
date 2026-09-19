@@ -71,3 +71,6 @@ examples/*/output/
 # Local git worktrees created under .claude/ — never committed
 .claude/worktrees/
 .claude/settings.local.json
+
+# Carrick writes a machine-path-keyed Deno runtime cache under a scanned fixture (carrick#1266)
+tests/fixtures/**/.carrick/

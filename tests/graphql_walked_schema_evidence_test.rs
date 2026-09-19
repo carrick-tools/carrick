@@ -148,8 +148,9 @@ fn a_vendor_schema_in_a_client_directory_is_not_that_clients_producers() {
     );
     assert_eq!(
         scan.graphql_rows("directory-api", "endpoints"),
-        rows(&[("query|people", "apps/directory/src/schema.graphql")]),
-        "a resolver joined to a field is evidence without any route"
+        rows(&[("query|people", "apps/directory/src/people.resolver.ts")]),
+        "a resolver joined to a field is evidence without any route, and the \
+         field is served where the resolver is, not at the schema it declares"
     );
     assert!(
         scan.graphql_rows("wallet-web", "endpoints").is_empty(),

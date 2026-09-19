@@ -22,6 +22,7 @@ pub mod cli;
 mod contract;
 pub(crate) mod hosted;
 pub(crate) mod index;
+pub(crate) mod jobs;
 mod join;
 pub(crate) mod query;
 mod read_model;
@@ -37,6 +38,22 @@ pub use join::LocalJoin;
 /// not dispatched is not a file that failed, so `scan_health` records nothing
 /// and the run does not report a partial index.
 pub const NO_MODEL_ENV: &str = "CARRICK_NO_MODEL";
+
+/// Set to `1` to stop a scan uploading the index it builds.
+///
+/// One caller: a resume that found the cloud holding a NEWER index than the
+/// commit it is finishing at. The local read model is worth building — it is
+/// what `carrick check` answers from — but replacing a newer stored index with
+/// an older one is not (carrick#1229).
+pub const SKIP_UPLOAD_ENV: &str = "CARRICK_SKIP_UPLOAD";
+
+/// Why a run that skipped its upload ended: the `reason` on `close-scan`.
+///
+/// The same fact as [`SKIP_UPLOAD_ENV`], which has one setter, so the token
+/// lives beside it rather than at the call site that sends it. A
+/// `[a-z_]{1,64}` token; the cloud records anything else as `unspecified`
+/// (carrick#1262).
+pub const SUPERSEDED_REASON: &str = "superseded";
 
 /// Set to a path to make a cross-repo run write [`LocalJoin`] there and exit
 /// instead of printing the report. The local indexer's join phase.
@@ -63,7 +80,12 @@ pub fn no_model() -> bool {
 /// Whether this process composes signatures without asking the sidecar to
 /// infer the slots the source left unannotated. See [`SKIP_SIGNATURES_ENV`].
 pub fn skip_signature_inference() -> bool {
+    // A dispatched run composes no signatures for the same reason it generates
+    // no intents: it writes no index for them to live in, and inferring the
+    // slots the source left unannotated is a sidecar pass over every function
+    // in the service (carrick#1229).
     std::env::var(SKIP_SIGNATURES_ENV).as_deref() == Ok("1")
+        || crate::analysis_channel::has_prompts()
 }
 
 /// The guidance map a no-model run analyses with: one entry per LLM-routed

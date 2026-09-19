@@ -1,6 +1,7 @@
 use crate::agent_service::is_oidc_rejection;
 use crate::cloud_storage::{
-    CloudRepoData, CloudStorage, RunContext, RunStart, StorageError, UnanalysedFile, UploadOutcome,
+    CloudRepoData, CloudStorage, JobSubmission, RunContext, RunStart, StorageError, UnanalysedFile,
+    UploadOutcome,
 };
 use crate::credentials::CloudAuth;
 use crate::oidc::OidcProvider;
@@ -175,6 +176,16 @@ fn refusal_message(status: reqwest::StatusCode, body: &str) -> String {
     message
 }
 
+/// The machine code a refusal names, for a log line rather than a message.
+///
+/// The end-of-run markers read this because their status alone is ambiguous:
+/// a 403 is either an action this deploy has never heard of (no envelope, so
+/// no code) or a scan another workspace opened (`scan_not_authorized`), and
+/// the two want opposite things done about them.
+fn refusal_code(body: Option<&str>) -> Option<String> {
+    RefusalBody::of(body?).code
+}
+
 /// Say what the cloud accepted when it took an index that is missing files.
 ///
 /// Only reachable on a first index of this service: once there are rows to
@@ -276,6 +287,12 @@ pub struct AwsStorage {
     /// for this commit. Set once from the CLI flag and sent on every write
     /// action; see `force_reindex` on [`LambdaRequest`].
     force_reindex: bool,
+    /// This run sent at least one file to the analyzer, so its answers are not
+    /// the ones the stored generation was built from. Set once by the engine
+    /// before the first write action and folded into `force_reindex`, so a
+    /// scan of a prepared checkout is not deduped at an unchanged commit
+    /// (carrick#1306). See [`CloudStorage::note_analyzed_files`].
+    analyzed: std::sync::atomic::AtomicBool,
     /// The repository this run was authorised to write, as the cloud names it:
     /// the basename of the `owner/repo` `start-scan` opened the scan with.
     /// Present only on the laptop path, where it is the name every action of
@@ -293,6 +310,11 @@ pub struct AwsStorage {
     /// that predates the flag, where the engine closes a partial run with
     /// `scan-failed` instead.
     accepts_pending_services: std::sync::atomic::AtomicBool,
+    /// `start-scan` answered `accepts_analysis_job`: this cloud takes a whole
+    /// scan's prompts as one job and answers them on its own time
+    /// (carrick#1229). False on every cloud deployed before it, which is what
+    /// keeps a scanner that can dispatch working against one that cannot.
+    accepts_analysis_job: std::sync::atomic::AtomicBool,
     /// The services this run leaves pending, set by the engine before the
     /// uploads through [`CloudStorage::name_pending_on_final_write`] and sent
     /// only on the write marked final.
@@ -430,6 +452,10 @@ struct StartScanResponse {
     /// what the default reads as.
     #[serde(default)]
     accepts_pending_services: bool,
+    /// Additive on the `/0` tag, like the field above: absent means a cloud
+    /// that does not run analysis jobs, and the scan stays synchronous.
+    #[serde(default)]
+    accepts_analysis_job: bool,
 }
 
 /// The tag `start-scan` must answer under. Anything else is a cloud that has
@@ -735,8 +761,10 @@ impl AwsStorage {
             auth,
             scan_id: std::sync::OnceLock::new(),
             dirty: std::sync::atomic::AtomicBool::new(false),
+            analyzed: std::sync::atomic::AtomicBool::new(false),
             multi_service: std::sync::atomic::AtomicBool::new(false),
             accepts_pending_services: std::sync::atomic::AtomicBool::new(false),
+            accepts_analysis_job: std::sync::atomic::AtomicBool::new(false),
             pending_services: std::sync::Mutex::new(Vec::new()),
             force_reindex,
             authorized_repo: std::sync::OnceLock::new(),
@@ -757,13 +785,23 @@ impl AwsStorage {
         )
     }
 
-    /// Whether the index this run writes describes a tree that did not match
-    /// its commit. Folded into `force_reindex` because the cloud's freshness
-    /// guard reasons about the commit hash, and a dirty run's hash is a claim
-    /// the tree does not support: without this a second scan at the same HEAD
-    /// is told the index is current and the dirty rows survive (C10).
+    /// Whether this run's write actions must replace the stored generation
+    /// instead of being short-circuited on the commit hash.
+    ///
+    /// Three ways a run can know the stored generation is not what it just
+    /// computed, and none of them is visible to the cloud's freshness guard,
+    /// which reasons about (commit, scanner version) alone:
+    ///
+    /// - `--no-cache`: the run re-analyzed every file on purpose.
+    /// - A dirty tree: the run's hash is a claim the tree does not support, so
+    ///   without this a second scan at the same HEAD is told the index is
+    ///   current and the dirty rows survive (C10).
+    /// - A file went to the analyzer: the commit has not moved, but this run's
+    ///   answers are not the stored generation's (carrick#1306).
     fn forces_reindex(&self) -> bool {
-        self.force_reindex || self.dirty.load(std::sync::atomic::Ordering::Relaxed)
+        self.force_reindex
+            || self.dirty.load(std::sync::atomic::Ordering::Relaxed)
+            || self.analyzed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The slot this run holds, for the write actions. `None` on the CI path,
@@ -1108,14 +1146,16 @@ impl AwsStorage {
     /// PUTs content to a pre-signed S3 URL. The PUT is idempotent, so
     /// transient failures (network errors, 5xx) are retried with backoff.
     async fn upload_to_s3(&self, upload_url: &str, content: &str) -> Result<(), StorageError> {
-        self.upload_to_s3_with_content_type(upload_url, content, "text/plain")
+        self.upload_to_s3_with_content_type(upload_url, content.as_bytes(), "text/plain")
             .await
     }
 
+    /// Bytes rather than text: the analysis-job bundle is gzipped, and a
+    /// lossless round trip through `String` is not available to it.
     async fn upload_to_s3_with_content_type(
         &self,
         upload_url: &str,
-        content: &str,
+        content: &[u8],
         content_type: &str,
     ) -> Result<(), StorageError> {
         let mut retries = 0u32;
@@ -1124,7 +1164,7 @@ impl AwsStorage {
                 .http_client
                 .put(upload_url)
                 .header("Content-Type", content_type)
-                .body(content.to_string())
+                .body(content.to_vec())
                 .send()
                 .await
             {
@@ -1239,6 +1279,10 @@ impl AwsStorage {
             response.accepts_pending_services,
             std::sync::atomic::Ordering::Relaxed,
         );
+        self.accepts_analysis_job.store(
+            response.accepts_analysis_job,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.dirty
             .store(run.dirty, std::sync::atomic::Ordering::Relaxed);
         // `set` rather than an assignment: one run opens one scan, and a
@@ -1292,17 +1336,77 @@ impl AwsStorage {
             reason,
         };
 
-        self.post_failure_once(token, request.action, &request)
+        self.post_run_marker_once(token, request.action, &request)
             .await;
     }
 
-    /// Send one failure event, once, and say what happened at debug only.
+    /// `close-scan`: the run ended, and it replaced no index (carrick#1262).
     ///
-    /// Shared by `scan-failed` and `preflight-failed`: both describe a run
-    /// that is already failing, so neither may retry, wait long, or print a
-    /// second failure — a 4xx from a cloud that predates the action, a 5xx and
-    /// a dead network all end here as one debug line.
-    async fn post_failure_once<B: Serialize + ?Sized>(&self, token: &str, action: &str, body: &B) {
+    /// The counterpart to `scan_final` for a run that writes nothing to the
+    /// cloud. A resume the cloud answered `superseded: true` finishes its
+    /// index locally and sends no write action at all, so the write that
+    /// carries `scan_final` never happens and the scan `start-scan` opened
+    /// stays open: the repo's in-flight slot keeps refusing the user's next
+    /// run for the quiet window, and the cloud's silent-scan sweep alerts
+    /// about a run that did exactly what it was asked to.
+    ///
+    /// Wire contract: the check-or-upload envelope,
+    /// `{ action: "close-scan", scan_id, reason }`, Bearer auth, 200
+    /// `{ ok: true }`. `reason` is a `[a-z_]{1,64}` token that the cloud
+    /// records as `unspecified` rather than refusing, because a 400 here
+    /// would confirm the very scan row the call names.
+    ///
+    /// Exactly the fail marker's delivery, and for the same reason: one
+    /// attempt, the same short timeout, every refusal at debug and none of
+    /// them able to change the run's exit code. The cloud deployed today
+    /// answers 403 from its action gate, which reads here as the nothing that
+    /// was sent before this existed — the slot falls to its TTL.
+    ///
+    /// Laptop credential and an open scan only: a CI run opens no scan, so
+    /// there is no slot to hand back and no `scan_id` to name it with.
+    pub async fn report_scan_closed(&self, reason: &str) {
+        let CloudAuth::Bearer(token) = &self.auth else {
+            return;
+        };
+        let Some(scan_id) = self.scan_id() else {
+            return;
+        };
+
+        #[derive(Serialize)]
+        struct CloseScanRequest<'a> {
+            action: &'a str,
+            scan_id: &'a str,
+            reason: &'a str,
+        }
+
+        let request = CloseScanRequest {
+            action: "close-scan",
+            scan_id: &scan_id,
+            reason,
+        };
+
+        self.post_run_marker_once(token, request.action, &request)
+            .await;
+    }
+
+    /// Send one end-of-run marker, once, and say what happened at debug only.
+    ///
+    /// Shared by `scan-failed`, `preflight-failed` and `close-scan`: all three
+    /// describe a run that is already over, so none of them may retry, wait
+    /// long, or raise a second error — a 4xx from a cloud that predates the
+    /// action, a 5xx and a dead network all end here as one debug line.
+    ///
+    /// That line carries the refusal's `code` when the body has one, because
+    /// the status alone cannot tell an action this deploy does not know (403,
+    /// no code) from a scan belonging to another workspace (403
+    /// `scan_not_authorized`) — and after a deploy those two want opposite
+    /// things done about them.
+    async fn post_run_marker_once<B: Serialize + ?Sized>(
+        &self,
+        token: &str,
+        action: &str,
+        body: &B,
+    ) {
         let sent = self
             .http_client
             .post(&self.lambda_url)
@@ -1316,17 +1420,20 @@ impl AwsStorage {
 
         match sent {
             Ok(response) if response.status().is_success() => {
-                debug!(action = %action, "Reported this run's failure to Carrick Cloud");
+                debug!(action = %action, "Told Carrick Cloud how this run ended");
             }
             Ok(response) => {
+                let status = response.status();
+                let code = refusal_code(response.text().await.ok().as_deref());
                 debug!(
                     action = %action,
-                    status = %response.status(),
-                    "Carrick Cloud did not record this run's failure"
+                    status = %status,
+                    code = %code.as_deref().unwrap_or("none"),
+                    "Carrick Cloud did not record how this run ended"
                 );
             }
             Err(e) => {
-                debug!(action = %action, "Could not report this run's failure: {e}");
+                debug!(action = %action, "Could not tell Carrick Cloud how this run ended: {e}");
             }
         }
     }
@@ -1356,13 +1463,236 @@ impl AwsStorage {
             serialized.len(),
             repo
         );
-        self.upload_to_s3_with_content_type(url, serialized, "application/json")
+        self.upload_to_s3_with_content_type(url, serialized.as_bytes(), "application/json")
             .await
+    }
+
+    /// Hand over a dispatched scan's prompts: mint the URL, PUT the object,
+    /// say it is there (carrick#1229).
+    ///
+    /// Three steps rather than one because the object is too large to inline
+    /// and a presigned PUT carries no integrity condition — the same shape
+    /// payload staging already uses (carrick#486). The cloud MINTS the job id
+    /// on the first call, heads the object it derived the key for on the
+    /// second, and compares what it finds against the digest and the length
+    /// this names. Both describe the COMPRESSED object, which is what S3 holds
+    /// and what `HeadObject` measures.
+    ///
+    /// Field names are the deployed ones (`carrick-cloud`
+    /// `lambdas/check-or-upload/analysis_job_actions.js`), not the design
+    /// document's: `wants_upload_url`, `payload_sha256`, `payload_size`.
+    async fn submit_job(
+        &self,
+        bundle: &crate::analysis_job::JobBundle,
+    ) -> Result<JobSubmission, StorageError> {
+        let bytes = bundle.encode().map_err(StorageError::SerializationError)?;
+        let (payload_sha256, payload_size) = crate::analysis_job::digest(&bytes);
+        // Both calls below carry it, and the cloud validates it first on each.
+        // Answering here rather than letting the cloud 400 keeps the reason in
+        // the user's own terms: a dispatch is part of a scan, and without one
+        // there is nothing for the job to belong to.
+        let scan_id = self.scan_id().ok_or_else(|| {
+            StorageError::ConnectionError(
+                "This dispatch is not part of an open scan, so Carrick Cloud has nothing to \
+                 attach the job to. Run the scan again so it can open with start-scan."
+                    .to_string(),
+            )
+        })?;
+
+        let opened: AnalysisJobResponse = self
+            .call_lambda_generic(
+                "submit-analysis-job",
+                &SubmitAnalysisJobRequest {
+                    action: "submit-analysis-job",
+                    scan_id: &scan_id,
+                    repo: &bundle.header.repo,
+                    commit: &bundle.header.commit,
+                    scanner_version: &bundle.header.scanner_version,
+                    cache_version: Some(bundle.header.cache_version),
+                    counts: &bundle.header.counts,
+                    wants_upload_url: Some(true),
+                    job_id: None,
+                    payload_sha256: None,
+                    payload_size: None,
+                },
+            )
+            .await
+            .map_err(already_running)?;
+        if opened.schema != ANALYSIS_JOB_SCHEMA {
+            return Err(StorageError::ConnectionError(format!(
+                "Carrick Cloud answered submit-analysis-job with schema '{}'; this scanner \
+                 reads {ANALYSIS_JOB_SCHEMA}.",
+                opened.schema
+            )));
+        }
+        let (job_id, url) = match (opened.job_id.as_deref(), opened.upload_url.as_deref()) {
+            (Some(job_id), Some(url)) if !job_id.is_empty() && !url.is_empty() => (job_id, url),
+            _ => {
+                return Err(StorageError::ConnectionError(
+                    "Carrick Cloud took the job but named no place to put it.".to_string(),
+                ));
+            }
+        };
+        // Read the cap rather than discover it by rejection: the cloud heads
+        // the object and refuses one over its ceiling AFTER the whole thing
+        // has been uploaded, which on this object is the expensive way to
+        // learn a number it already told us (carrick#1244 is the fix, which is
+        // to stop holding the rows in memory in the first place).
+        if let Some(max) = opened.max_bytes
+            && payload_size > max
+        {
+            return Err(StorageError::ConnectionError(format!(
+                "This scan built {payload_size} bytes of prompts and Carrick Cloud accepts \
+                 {max}. Run `carrick index` to analyse {} here instead.",
+                bundle.header.repo
+            )));
+        }
+        debug!(
+            "Staging a {payload_size} byte analysis job for {}",
+            bundle.header.repo
+        );
+        self.upload_to_s3_with_content_type(url, &bytes, "application/gzip")
+            .await?;
+
+        let confirmed: AnalysisJobResponse = self
+            .call_lambda_generic(
+                "submit-analysis-job",
+                &SubmitAnalysisJobRequest {
+                    action: "submit-analysis-job",
+                    scan_id: &scan_id,
+                    repo: &bundle.header.repo,
+                    commit: &bundle.header.commit,
+                    scanner_version: &bundle.header.scanner_version,
+                    cache_version: Some(bundle.header.cache_version),
+                    counts: &bundle.header.counts,
+                    wants_upload_url: None,
+                    job_id: Some(job_id),
+                    payload_sha256: Some(&payload_sha256),
+                    payload_size: Some(payload_size),
+                },
+            )
+            .await
+            .map_err(already_running)?;
+        // A 200 that says the driver could not be started. The bundle is
+        // stored and the job row exists, but nothing is coming for it, so this
+        // is a failure however it is spelled.
+        if confirmed.state.as_deref() == Some("failed") {
+            return Err(StorageError::ConnectionError(
+                confirmed
+                    .error
+                    .unwrap_or_else(|| "Carrick Cloud could not start this analysis.".to_string()),
+            ));
+        }
+        Ok(JobSubmission {
+            job_id: confirmed.job_id.unwrap_or_else(|| job_id.to_string()),
+            analyze_rows: bundle.analyze.len(),
+        })
     }
 }
 
+/// Re-state the one refusal that is not a fault: this repo already has an
+/// analysis running (carrick#1229).
+///
+/// Matched on the CODE the cloud sends, which `refusal_message` puts in the
+/// sentence beside its own words. The user's move is to look at the job that
+/// exists, not to send a second one, and "the scan failed" reads as an
+/// instruction to try again.
+fn already_running(error: StorageError) -> StorageError {
+    let StorageError::ConnectionError(message) = &error else {
+        return error;
+    };
+    if !message.contains("analysis_job_in_flight") {
+        return error;
+    }
+    StorageError::ConnectionError(format!(
+        "{message}. Nothing new was sent; `carrick status` says how far the one that is \
+         running has got."
+    ))
+}
+
+/// `submit-analysis-job`, sent twice: once to open the job and take the URL
+/// the cloud mints with it, once to say the object is there and what it should
+/// hash and measure.
+#[derive(Serialize)]
+struct SubmitAnalysisJobRequest<'a> {
+    action: &'a str,
+    /// The scan this job belongs to. The cloud reads the row it names and
+    /// refuses a submission that is not part of a scan this workspace opened
+    /// with `start-scan`, so this is the live scan id, never a fresh one.
+    /// Required: `analysis_job_actions.js` rejects a body without it before
+    /// it looks at anything else (carrick#1257).
+    scan_id: &'a str,
+    repo: &'a str,
+    commit: &'a str,
+    scanner_version: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_version: Option<u32>,
+    counts: &'a crate::analysis_job::JobCounts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wants_upload_url: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_sha256: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_size: Option<usize>,
+}
+
+/// The 200 body of either call. Additive-tolerant, like every other response
+/// on this endpoint: a field this scanner does not read is ignored.
+#[derive(Deserialize)]
+struct AnalysisJobResponse {
+    #[serde(default)]
+    schema: String,
+    #[serde(default)]
+    job_id: Option<String>,
+    /// Minted with the job id on the first call, and the exact URL the object
+    /// must land at: the cloud heads the key it derived, not one it is told.
+    #[serde(default)]
+    upload_url: Option<String>,
+    /// What this endpoint accepts, stated rather than discovered.
+    #[serde(default)]
+    max_bytes: Option<usize>,
+    /// `queued` on the second call, or `failed` when the driver could not be
+    /// started.
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// The tag `submit-analysis-job` answers under, which is the bundle's own tag:
+/// the action takes a `carrick.analysis-job/0` and says so back.
+const ANALYSIS_JOB_SCHEMA: &str = "carrick.analysis-job/0";
+
 #[async_trait]
 impl CloudStorage for AwsStorage {
+    /// Folded into every later write action's `force_reindex` — see
+    /// [`AwsStorage::forces_reindex`]. Idempotent: the engine says it once per
+    /// run, and saying it twice is the same statement.
+    fn note_analyzed_files(&self) {
+        self.analyzed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn accepts_analysis_job(&self) -> bool {
+        self.accepts_analysis_job
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn submit_analysis_job(
+        &self,
+        bundle: &crate::analysis_job::JobBundle,
+    ) -> Result<Option<JobSubmission>, StorageError> {
+        // Asked for by the run, offered by the cloud, and only then done. A
+        // cloud that has not deployed analysis jobs says nothing about them,
+        // and this run scans the way it always has.
+        if !CloudStorage::accepts_analysis_job(self) {
+            return Ok(None);
+        }
+        self.submit_job(bundle).await.map(Some)
+    }
+
     async fn upload_repo_data(
         &self,
         data: &CloudRepoData,
@@ -1729,7 +2059,7 @@ impl CloudStorage for AwsStorage {
             reason,
             scanner_version: env!("CARGO_PKG_VERSION"),
         };
-        self.post_failure_once(token, request.action, &request)
+        self.post_run_marker_once(token, request.action, &request)
             .await;
     }
 
@@ -1921,6 +2251,135 @@ impl CloudStorage for AwsStorage {
 mod tests {
     use super::*;
     use reqwest::StatusCode;
+
+    /// The field names the deployed `submit-analysis-job` reads, pinned here
+    /// because getting one wrong is a 400 nothing local can reproduce
+    /// (carrick#1229; `carrick-cloud/lambdas/check-or-upload/analysis_job_actions.js`).
+    ///
+    /// The cloud gates the first call on `wants_upload_url === true && !job_id`
+    /// and the second on `job_id` + `payload_sha256` + `payload_size`, each
+    /// with its own 400. It mints the job id itself, so the first call names
+    /// none.
+    #[test]
+    fn the_submit_request_uses_the_names_the_cloud_reads() {
+        let counts = crate::analysis_job::JobCounts {
+            analyze_file: 3,
+            ..Default::default()
+        };
+        let asking = SubmitAnalysisJobRequest {
+            action: "submit-analysis-job",
+            scan_id: "scan_1",
+            repo: "owner/api",
+            commit: "abc",
+            scanner_version: "0.0.0",
+            cache_version: Some(21),
+            counts: &counts,
+            wants_upload_url: Some(true),
+            job_id: None,
+            payload_sha256: None,
+            payload_size: None,
+        };
+        let body: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&asking).unwrap()).unwrap();
+        // Every field the cloud refuses the body for not having, on EITHER
+        // call. Asserting the names we send are spelled right is not the same
+        // check: carrick#1257 shipped a request that spelled all of them
+        // correctly and simply never sent `scan_id`, which this list would
+        // have caught and the assertions below would not.
+        for required in ["action", "scan_id", "repo", "commit", "scanner_version"] {
+            assert!(
+                body.get(required).is_some(),
+                "submit-analysis-job refuses a body with no `{required}`; \
+                 see carrick-cloud lambdas/check-or-upload/analysis_job_actions.js"
+            );
+        }
+        assert_eq!(body["scan_id"], "scan_1");
+        assert_eq!(body["wants_upload_url"], true);
+        assert!(body.get("job_id").is_none(), "the cloud mints it");
+        assert!(body.get("payload_sha256").is_none());
+        assert_eq!(body["counts"]["analyze_file"], 3);
+        assert_eq!(body["cache_version"], 21);
+
+        let confirming = SubmitAnalysisJobRequest {
+            job_id: Some("job_1"),
+            payload_sha256: Some(&"a".repeat(64)),
+            payload_size: Some(2048),
+            wants_upload_url: None,
+            ..asking
+        };
+        let body: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&confirming).unwrap()).unwrap();
+        assert_eq!(body["job_id"], "job_1");
+        assert_eq!(body["payload_sha256"], "a".repeat(64));
+        assert_eq!(body["payload_size"], 2048);
+        assert!(
+            body.get("wants_upload_url").is_none(),
+            "asking again would mint a second job"
+        );
+        // The second call is validated by the same guard as the first, so it
+        // carries the scan too.
+        assert_eq!(body["scan_id"], "scan_1");
+    }
+
+    /// And the names it answers with. `upload_url` is the exact place the
+    /// object must land: the cloud heads the key it derived, not one it is
+    /// told about.
+    #[test]
+    fn the_submit_response_is_read_by_the_names_the_cloud_sends() {
+        let opened: AnalysisJobResponse = serde_json::from_value(serde_json::json!({
+            "schema": "carrick.analysis-job/0",
+            "job_id": "job_1",
+            "upload_url": "https://example.invalid/put",
+            "max_bytes": 104_857_600u64,
+        }))
+        .unwrap();
+        assert_eq!(opened.schema, ANALYSIS_JOB_SCHEMA);
+        assert_eq!(opened.job_id.as_deref(), Some("job_1"));
+        assert_eq!(
+            opened.upload_url.as_deref(),
+            Some("https://example.invalid/put")
+        );
+        assert_eq!(opened.max_bytes, Some(100 * 1024 * 1024));
+
+        // A 200 that says the driver never started. The bundle is stored and
+        // the row exists, and nothing is coming for it.
+        let dead: AnalysisJobResponse = serde_json::from_value(serde_json::json!({
+            "schema": "carrick.analysis-job/0",
+            "job_id": "job_1",
+            "state": "failed",
+            "failure_reason": "dispatch_failed",
+            "error": "The analysis could not be started. Run the scan again.",
+        }))
+        .unwrap();
+        assert_eq!(dead.state.as_deref(), Some("failed"));
+        assert!(dead.error.is_some());
+    }
+
+    /// A repo that already has an analysis running is not a fault, and the
+    /// move is to look at the job that exists rather than send another.
+    #[test]
+    fn the_in_flight_refusal_is_restated_rather_than_read_as_a_failure() {
+        let refused = refusal_message(
+            StatusCode::CONFLICT,
+            &serde_json::json!({
+                "error": "owner/api already has an analysis running. Run carrick status to see how far along it is.",
+                "code": "analysis_job_in_flight",
+                "job_id": "job_1",
+            })
+            .to_string(),
+        );
+        let StorageError::ConnectionError(said) =
+            already_running(StorageError::ConnectionError(refused))
+        else {
+            panic!("the error keeps its kind");
+        };
+        assert!(said.contains("already has an analysis running"), "{said}");
+        assert!(said.contains("Nothing new was sent"), "{said}");
+
+        // Anything else is passed through untouched.
+        let other = already_running(StorageError::ConnectionError("no".to_string()));
+        assert!(matches!(other, StorageError::ConnectionError(said) if said == "no"));
+    }
 
     #[test]
     fn transient_statuses_are_retryable() {
@@ -2791,6 +3250,68 @@ mod tests {
         unopened.report_scan_failed("discovery", "no remote").await;
     }
 
+    /// The close marker's wire shape (carrick#1262): the check-or-upload
+    /// envelope with `close-scan`, the slot and the reason — no stage, since
+    /// this is a run that ended rather than one that died — under the laptop
+    /// credential and the run headers.
+    #[tokio::test]
+    async fn a_run_that_replaced_no_index_closes_its_own_scan() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![(200, serde_json::json!({ "ok": true }).to_string())],
+            "scan_01J",
+        );
+
+        storage.report_scan_closed("superseded").await;
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        let body = body_of(&requests[0]);
+        assert_eq!(body["action"], "close-scan");
+        assert_eq!(body["scan_id"], "scan_01J");
+        assert_eq!(body["reason"], "superseded");
+        assert!(body.get("stage").is_none(), "{body}");
+        assert!(
+            has_header(&requests[0], "authorization", "Bearer carrick_sk_live_test"),
+            "{}",
+            requests[0]
+        );
+    }
+
+    /// The cloud deployed today has no `close-scan` and answers 403 from its
+    /// action gate. That is the nothing this run sent before the marker
+    /// existed: one attempt, no retry, no error of its own, and the scan the
+    /// cloud is still holding falls to its TTL exactly as it does now.
+    #[tokio::test]
+    async fn a_refused_close_marker_is_swallowed_and_never_retried() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![(
+                403,
+                serde_json::json!({ "error": "wrong key kind", "code": "wrong_key_kind" })
+                    .to_string(),
+            )],
+            "scan_01J",
+        );
+
+        storage.report_scan_closed("superseded").await;
+
+        assert_eq!(server.join().unwrap().len(), 1, "the marker was retried");
+    }
+
+    /// Nothing to close: a CI run opens no scan, and neither does a laptop run
+    /// whose `start-scan` never answered. Asserted as silence on the wire,
+    /// because a `close-scan` with no `scan_id` is one the cloud answers 404.
+    #[tokio::test]
+    async fn a_run_with_no_scan_sends_no_close_marker() {
+        // Nothing is listening on that port: reaching the network at all would
+        // hang or error, and both of these return instead.
+        let ci = AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Oidc, false);
+        ci.report_scan_closed("superseded").await;
+
+        let unopened =
+            AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Bearer("t".into()), false);
+        unopened.report_scan_closed("superseded").await;
+    }
+
     /// The pre-scan failure event's wire shape (carrick#1096): the
     /// check-or-upload envelope with `preflight-failed`, this run's id, the
     /// repo as `null` when the origin named none, the stage, the reason and
@@ -3112,6 +3633,38 @@ mod tests {
         storage
             .dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        storage.upload_repo_data(&blob(), true).await.unwrap();
+
+        let requests = server.join().unwrap();
+        assert!(
+            body_of(&requests[0]).get("force_reindex").is_none(),
+            "the existence check supersedes nothing: {}",
+            body_of(&requests[0])
+        );
+        assert_eq!(body_of(&requests[1])["force_reindex"], true);
+    }
+
+    /// carrick#1306's scanner half, on the wire. A user told by the pre-flight
+    /// to prepare the checkout does so, the generated output is gitignored, and
+    /// the rescan runs at the same commit with a clean tree and no
+    /// `--no-cache` — so nothing the cloud's freshness guard can see has moved
+    /// and it keeps the stored generation. The run DID send files to the
+    /// analyzer, which is the fact that says its answers are not the stored
+    /// ones, and that is what rides here.
+    #[tokio::test]
+    async fn a_run_that_analyzed_files_forces_the_reindex_on_its_write_action() {
+        let (storage, server) = bearer_storage_in_scan(
+            vec![
+                check_ok(),
+                (200, serde_json::json!({ "success": true }).to_string()),
+            ],
+            "scan_01J",
+        );
+        // Neither of the two signals that used to be the only ones.
+        assert!(!storage.force_reindex);
+        assert!(!storage.dirty.load(std::sync::atomic::Ordering::Relaxed));
+        storage.note_analyzed_files();
 
         storage.upload_repo_data(&blob(), true).await.unwrap();
 
