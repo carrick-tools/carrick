@@ -49,34 +49,53 @@ those two texts can describe the same bytes, and that is not drift.
 - **MATCH**: the stored verdict is `compatible`.
 - **DRIFT**: the stored verdict is `incompatible`. Name the field and the
   direction, request or response, from `mismatch_reason` and the two type texts.
+- **UNRESOLVED**: the stored verdict is `unresolved`. Report `unresolved_reason`
+  as it is written. Then read the two type texts this answer already returned in
+  `types`, the producer's side against the call site's expected type, and where
+  they differ name the field and say whether it is missing on one side, optional
+  on one side and required on the other, or of a different type. Report that as
+  "type texts differ", never as a verdict.
+- **NOT JUDGED**: `verdicts` is empty. Relay `verdict_note`, then read the same
+  two type texts the same way and report any difference as "type texts differ".
 - **CONSUMER UNTYPED**: a call site's `expected_request` or `expected_response`
   is null on a side that carries one.
 - **PRODUCER UNTYPED**: `producer.request` is null on a method that carries a
   body, or `producer.response` is null.
 
 A GET declares no request type by design, and `untyped_sides` already counts it
-that way.
+that way. The wire note covers both readings above, so a `Date` on one side
+against a `string` on the other is not a difference.
 
 ## 4. Report
 
 | operation | class | producer type | consumer type | call site | verdict |
 |---|---|---|---|---|---|
 | GET /api/orders/:id | DRIFT | Order | OrderSummary | web/src/orders.ts:31 | incompatible |
+| POST /api/orders | UNRESOLVED | NewOrder | OrderDraft | web/src/orders.ts:52 | unresolved; type texts differ on `note` |
+
+Class words, and only these: MATCH, DRIFT, UNRESOLVED, NOT JUDGED, CONSUMER
+UNTYPED, PRODUCER UNTYPED. A reading of the two type texts goes in the verdict
+column beside the stored state, in the words "type texts differ", so nothing in
+the table reads as a verdict the index did not give you.
 
 State alongside it: `operations_total` against `operations_shown`,
 `matched_calls` and `unmatched_calls`, `dropped_rows`, and the `non_http_note`
 where the pair also carries GraphQL, socket or pub/sub operations, whose type
 text this surface does not hold.
 
-Where a verdict names a problem and no field, read the two type texts in the
-`types` array and say which field differs. Report no verdict the index did not
-give you.
-
 ## 5. Act
 
-Change no type unless you were asked to. Offer one issue per DRIFT, and file the
-ones accepted:
+Change no type unless you were asked to. Offer one issue per DRIFT, and one per
+UNRESOLVED or NOT JUDGED row whose type texts differ. File the ones accepted:
 
 ```
 gh issue create --title "<consumer> and <producer> disagree on <field> of <operation>" --body "<producer type, consumer type, call sites, stored verdict and scanner version>"
+```
+
+An UNRESOLVED or NOT JUDGED row holds no verdict on the difference you read, so
+its title says the two sides may disagree and its body carries the reason the
+tool gave in place of a stored verdict:
+
+```
+gh issue create --title "<consumer> and <producer> may disagree on <field> of <operation>" --body "<producer type, consumer type, call sites, and the unresolved_reason or verdict_note as written>"
 ```

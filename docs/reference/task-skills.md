@@ -24,8 +24,13 @@ and is untouched by everything below.
 | `carrick-census` | "Every place that does X" questions | `search_by_intent` twice, once worded by purpose and once by mechanism, paged to the end |
 
 Each one reports a table first, with a file and line on every row and a fixed
-set of class words (DUPLICATE, VARIANT, FALSE POSITIVE; MATCH, DRIFT, CONSUMER
-UNTYPED, PRODUCER UNTYPED; COMPATIBLE, INCOMPATIBLE, UNRESOLVED, NOT COMPARED).
+set of class words (DUPLICATE, VARIANT, FALSE POSITIVE; MATCH, DRIFT,
+UNRESOLVED, NOT JUDGED, CONSUMER UNTYPED, PRODUCER UNTYPED; COMPATIBLE,
+INCOMPATIBLE, UNRESOLVED, NOT COMPARED). Every verdict state a tool can return
+carries a class, because a state with no class is a finding the skill drops. A
+`carrick-drift` operation whose stored verdict is `unresolved`, or which carries
+no verdict at all, is classed, and its two type texts are read against each
+other and reported as "type texts differ" rather than as a verdict.
 Each relays the counts its tool stated about what it did not look at. None of
 them edits code unless asked, and each ends by offering one issue per finding.
 

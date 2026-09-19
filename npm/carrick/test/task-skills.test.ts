@@ -72,6 +72,34 @@ test("a known project slug is written into the calls, and an unknown one names t
   }
 });
 
+test("the drift body classes every verdict situation get_contract_pair can return", () => {
+  // A stored state with no class is a finding the skill drops. The first real
+  // drift this body was written against was stored `unresolved` while the two
+  // type texts differed on one field's optionality, and a body holding MATCH
+  // and DRIFT alone had nowhere to put it.
+  const body = renderTaskSkill("carrick-drift", { slug: "acme-index" });
+  const classes = body.slice(body.indexOf("\n## 3."), body.indexOf("\n## 4."));
+  assert.ok(classes.length > 0, "the drift body has no section 3");
+
+  for (const head of [
+    /\*\*MATCH\*\*: the stored verdict is `compatible`/,
+    /\*\*DRIFT\*\*: the stored verdict is `incompatible`/,
+    /\*\*UNRESOLVED\*\*: the stored verdict is `unresolved`/,
+    /\*\*NOT JUDGED\*\*: `verdicts` is empty/,
+  ]) {
+    assert.match(classes, head, `no class in section 3 matches ${head}`);
+  }
+  // Read by the agent, so it is labelled as a reading and never as a verdict.
+  assert.match(classes, /"type texts differ"/);
+
+  const flat = body.replace(/\s+/g, " ");
+  assert.match(
+    flat,
+    /Class words, and only these: MATCH, DRIFT, UNRESOLVED, NOT JUDGED, CONSUMER UNTYPED, PRODUCER UNTYPED\./,
+  );
+  assert.match(flat, /gh issue create --title "<consumer> and <producer> may disagree on/);
+});
+
 test("a second run writes nothing and reports nothing to fix", () => {
   const dir = workspace();
   writeTaskSkills(dir, { slug: "acme-index" });
