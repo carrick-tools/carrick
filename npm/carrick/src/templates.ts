@@ -37,7 +37,15 @@ export const DEFAULTS: Record<string, string> = {
   DEFAULT_BRANCH: "main",
 };
 
-function templatesDir(): string {
+/**
+ * The directory the shipped template files sit in.
+ *
+ * Resolved from this module rather than from the process, because the same
+ * resolution has to hold in the checkout (`src/../templates`) and in the
+ * published emit (`dist/../templates`). `init/task-skills.ts` reads the skill
+ * bodies from a subdirectory of it.
+ */
+export function templatesDir(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "templates");
 }
 

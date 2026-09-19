@@ -100,13 +100,22 @@ pub fn inspect(repo_path: &str) -> GitState {
 /// index describes exactly what the commit holds.
 ///
 /// Mirrors `npm/carrick/src/init/remove.ts` (`SCAFFOLD_FILES`,
-/// `SETTINGS_FILES` and the files `SECTION_CARRIERS` merges into), which
-/// mirrors the scaffold tool in carrick-cloud
+/// `SETTINGS_FILES` and the files `SECTION_CARRIERS` merges into) and
+/// `npm/carrick/src/init/task-skills.ts` (`SKILL_ROOTS` x `TASK_SKILLS`),
+/// which mirror the scaffold tool in carrick-cloud
 /// (`lambdas/mcp-server/src/tools/scaffold.ts`). A file added there is added
 /// here too, or a first run is dirty again.
 const SCAFFOLD_FILES: &[&str] = &[
     ".github/workflows/carrick.yml",
     ".claude/skills/carrick/SKILL.md",
+    ".claude/skills/carrick-impact/SKILL.md",
+    ".claude/skills/carrick-reuse/SKILL.md",
+    ".claude/skills/carrick-drift/SKILL.md",
+    ".claude/skills/carrick-census/SKILL.md",
+    ".agents/skills/carrick-impact/SKILL.md",
+    ".agents/skills/carrick-reuse/SKILL.md",
+    ".agents/skills/carrick-drift/SKILL.md",
+    ".agents/skills/carrick-census/SKILL.md",
     ".claude/session-start.sh",
     ".claude/turn-reminder.sh",
     ".claude/search-gate.sh",
@@ -601,6 +610,14 @@ pub(crate) mod tests {
             "carrick.json",
             ".github/workflows/carrick.yml",
             ".claude/skills/carrick/SKILL.md",
+            ".claude/skills/carrick-impact/SKILL.md",
+            ".claude/skills/carrick-reuse/SKILL.md",
+            ".claude/skills/carrick-drift/SKILL.md",
+            ".claude/skills/carrick-census/SKILL.md",
+            ".agents/skills/carrick-impact/SKILL.md",
+            ".agents/skills/carrick-reuse/SKILL.md",
+            ".agents/skills/carrick-drift/SKILL.md",
+            ".agents/skills/carrick-census/SKILL.md",
             ".claude/session-start.sh",
             ".claude/turn-reminder.sh",
             ".claude/search-gate.sh",
