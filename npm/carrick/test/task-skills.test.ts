@@ -113,6 +113,19 @@ test("a body somebody has edited is left alone and named", () => {
   );
 });
 
+test("a checkout that rewrote the line endings still reads as ours", () => {
+  // `core.autocrlf` is on by default on Windows, so this is the ordinary state
+  // of these files there rather than an exotic one.
+  const dir = workspace();
+  writeTaskSkills(dir, { slug: "acme-index" });
+  const target = path.join(dir, skillFile(SKILL_ROOTS[0]!, "carrick-drift"));
+  const crlf = fs.readFileSync(target, "utf8").replace(/\n/g, "\r\n");
+  fs.writeFileSync(target, crlf);
+
+  assert.equal(skillState(crlf), "ours");
+  assert.equal(removeTaskSkills(dir).deleted.length, 8);
+});
+
 test("a skill of the same name that Carrick never wrote is left alone and named", () => {
   const dir = workspace();
   const target = path.join(dir, skillFile(SKILL_ROOTS[0]!, "carrick-drift"));

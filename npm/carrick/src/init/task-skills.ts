@@ -83,7 +83,11 @@ export type SkillState = "absent" | "ours" | "edited" | "theirs";
 
 export function skillState(existing: string | null): SkillState {
   if (existing === null) return "absent";
-  const lines = existing.split("\n");
+  // Line endings are normalised before anything is compared. A checkout with
+  // `core.autocrlf` set rewrites every one of these files to CRLF on the way
+  // to disk, and a digest taken over those bytes would read all eight as
+  // somebody else's work and warn about them on every run.
+  const lines = existing.replace(/\r\n/g, "\n").split("\n");
   // The marker is looked for anywhere rather than on the last line, because
   // appending a step under it is as ordinary an edit as changing one above it,
   // and a file that still carries our marker is still one of ours.

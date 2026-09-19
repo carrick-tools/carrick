@@ -1,15 +1,16 @@
 // Undoing `carrick init`, on this machine.
 //
 // An install that can state its own undo is the courtesy that makes people
-// willing to try it (carrick#1034), and init now writes in seven places: the
-// hook entries in a workspace's `.claude` settings, an MCP server entry in
-// each agent client's own configuration, the `.carrick` directory, the
-// install id in `~/.carrick`, and the credential in the user's configuration
-// directory.
+// willing to try it (carrick#1034), and init now writes in eight places: the
+// hook entries in a workspace's `.claude` settings, the task skills under
+// `.claude/skills` and `.agents/skills`, an MCP server entry in each agent
+// client's own configuration, the `.carrick` directory, the install id in
+// `~/.carrick`, and the credential in the user's configuration directory.
 //
 // Every step here is the inverse of a writer in this folder, and each pair
 // lives in one file so the two cannot drift: `mergeCarrickHooks` /
-// `removeCarrickHooks` in `settings.ts`, `mergeServerEntry` /
+// `removeCarrickHooks` in `settings.ts`, `writeTaskSkills` /
+// `removeTaskSkills` in `task-skills.ts`, `mergeServerEntry` /
 // `removeServerEntry` and `connectMcpClients` / `disconnectMcpClients` in
 // `mcp.ts`, `ensureInstallId` / `removeInstallId` in `install-id.ts`,
 // `writeProposal` / the `.carrick` removal below, `saveCredential` /

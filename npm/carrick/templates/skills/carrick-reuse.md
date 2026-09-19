@@ -66,7 +66,7 @@ finds a copy somebody renamed.
 
 | class | function | file:line | pair | why |
 |---|---|---|---|---|
-| DUPLICATE | sha256Hex | src/hash.ts:12 | src/util/digest.ts:4 | same one-line digest |
+| DUPLICATE | slugify | src/text.ts:12 | src/util/url.ts:4 | same replacement rules |
 
 Then relay the counts the response stated, in its numbers:
 
