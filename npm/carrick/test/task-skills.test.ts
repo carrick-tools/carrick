@@ -119,8 +119,14 @@ test("the reuse body classes every row find_similar returned, by tests that deci
   // Ordered, so the first test that holds decides the row.
   assert.match(classes.replace(/\s+/g, " "), /take the first of these that holds/);
   // `find_similar` carries no field for a documented mirror, so the evidence is
-  // the comment in the span the tool points at.
-  assert.match(classes, /"documented mirror"/);
+  // a comment in the file the tool points at. The head of the file counts: a
+  // run against our own index read two mirrored copies as one behaviour,
+  // because the comment naming the mirror sits above the module rather than
+  // above the function the span starts at.
+  assert.match(
+    classes.replace(/\s+/g, " "),
+    /Where a comment on the member or at the head of its file names the file it mirrors, the clause is "documented mirror"\./,
+  );
 
   const report = body.slice(body.indexOf("\n## Report"), body.indexOf("\n## Act"));
   const flat = report.replace(/\s+/g, " ");

@@ -63,8 +63,9 @@ that holds:
   together.
 - **VARIANT**: one contract, and a behavioural difference you can name in a
   clause. A different normalisation, a different error path, a different
-  default. Write the clause in the row. Where a member's own comment names the
-  file it mirrors, the clause is "documented mirror".
+  default. Write the clause in the row. Where a comment on the member or at the
+  head of its file names the file it mirrors, the clause is "documented
+  mirror".
 - **DUPLICATE**: one contract, and nothing left to name. Two bodies that run
   the same once the identifiers are renamed land here.
 

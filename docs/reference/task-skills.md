@@ -50,9 +50,12 @@ The tests are mechanical and ordered, so the first that holds decides and two
 words cannot describe the same row equally well. `carrick-reuse` reads both
 spans and takes a different contract as FALSE POSITIVE, one contract with a
 behavioural difference it can name in a clause as VARIANT, and one contract with
-nothing left to name as DUPLICATE. A copy whose own comment names the file it
-mirrors is a VARIANT whose clause is "documented mirror"; `find_similar` carries
-no field for that, and the evidence is in the span it points at.
+nothing left to name as DUPLICATE. A copy whose own comment, or the header of
+its file, names the file it mirrors is a VARIANT whose clause is "documented
+mirror"; `find_similar` carries no field for that, and the evidence is in the
+file it points at. A run against our own index read two mirrored copies as one
+behaviour while the comment naming the mirror sat above the module, which is why
+the body reads the file head and not the function's own lines alone.
 `carrick-drift`, where a stored verdict and an untyped side both fit, takes the
 first of DRIFT, PRODUCER UNTYPED, CONSUMER UNTYPED, UNRESOLVED, NOT JUDGED,
 MATCH.
