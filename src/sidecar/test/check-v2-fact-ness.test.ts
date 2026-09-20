@@ -26,7 +26,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { buildProbe } from '../src/capture/check-probe.js';
-import { probeDeepFindings } from '../src/capture/check-deep.js';
+import { openProbeProgram, probeDeepFindings } from '../src/capture/check-deep.js';
 import type { CheckPairSpec } from '../src/capture/api.js';
 
 const TSCONFIG = JSON.stringify({
@@ -96,7 +96,7 @@ export type nested_Consumer = { rows: Array<{ id: string; payload: { at: string 
 
   function findingsFor(key: (typeof PAIRS)[number]) {
     const plan = buildProbe(spec(key), (s) => `@carrick/${s}`);
-    const all = probeDeepFindings(dir, [plan]);
+    const all = probeDeepFindings(openProbeProgram(dir, [plan]), [plan]);
     return all.get(plan.pairId);
   }
 
@@ -128,9 +128,9 @@ export type nested_Consumer = { rows: Array<{ id: string; payload: { at: string 
   });
 
   it('returns no entry rather than an empty one when it cannot run', () => {
-    const empty = probeDeepFindings(path.join(dir, 'nowhere'), [
-      buildProbe(spec('clean'), (s) => `@carrick/${s}`),
-    ]);
+    const plan = buildProbe(spec('clean'), (s) => `@carrick/${s}`);
+    const nowhere = path.join(dir, 'nowhere');
+    const empty = probeDeepFindings(openProbeProgram(nowhere, [plan]), [plan]);
     assert.strictEqual(
       empty.size,
       0,

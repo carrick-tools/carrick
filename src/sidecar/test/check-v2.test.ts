@@ -72,6 +72,18 @@ const PAIRS: CheckPairSpec[] = [
   mk('anyrequest', 'Form_Expected', 'Any_Exp', { type_kind: 'request' }),
   // The known true positive: a free `string` sent where a union is required.
   mk('unionrequest', 'Union_Expected', 'Union_Sent', { type_kind: 'request' }),
+  // carrick-tools/carrick-cloud#1118: the mismatch text must name the fields.
+  mk('fielddrift', 'Drift_Producer', 'Drift_Consumer'),
+  mk('optionalgap', 'Gap_Producer', 'Gap_Consumer'),
+  mk('renamedfield', 'Rename_Producer', 'Rename_Consumer', { type_kind: 'request' }),
+  // carrick-tools/carrick-cloud#1119: the JSON wire rule, both directions.
+  mk('wiredate', 'Wire_Producer', 'Wire_Consumer'),
+  mk('wiredatereverse', 'Wire_Reverse_Producer', 'Wire_Reverse_Consumer'),
+  mk('wiredaterequest', 'Wire_Req_Producer', 'Wire_Req_Consumer', {
+    type_kind: 'request',
+  }),
+  mk('wirebigint', 'Wire_Bigint_Producer', 'Wire_Bigint_Consumer'),
+  mk('wirepartial', 'Wire_Partial_Producer', 'Wire_Partial_Consumer'),
 ];
 
 function byKey(verdicts: CheckVerdict[]): Map<string, CheckVerdict> {
@@ -95,6 +107,14 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type V_Sent = { a: string; };',
         'export type Form_Expected = { title: string; content: string; };',
         'export type Union_Expected = { type: "boolean" | "file_upload" | "text_input"; };',
+        'export type Drift_Producer = { id: string; total: number; owner: { name: string; }; };',
+        'export type Gap_Producer = { id: string; email: string; };',
+        'export type Rename_Producer = { username: string; role: string; };',
+        'export type Wire_Producer = { id: string; createdAt: Date; };',
+        'export type Wire_Reverse_Producer = { id: string; createdAt: string; };',
+        'export type Wire_Req_Producer = { at: string; };',
+        'export type Wire_Bigint_Producer = { id: string; size: bigint; };',
+        'export type Wire_Partial_Producer = { createdAt: Date; size: number; };',
       ].join('\n') + '\n'
     );
     writeStub(
@@ -111,6 +131,14 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type Form_Sent = FormData;',
         'export type Union_Sent = { type: string; };',
         'export type Any_Exp = any;',
+        'export type Drift_Consumer = { id: number; total: number; owner: { name: number; }; };',
+        'export type Gap_Consumer = { id: string; email?: string; nickname: string; };',
+        'export type Rename_Consumer = { userName: string; role: string; };',
+        'export type Wire_Consumer = { id: string; createdAt: string; };',
+        'export type Wire_Reverse_Consumer = { id: string; createdAt: Date; };',
+        'export type Wire_Req_Consumer = { at: Date; };',
+        'export type Wire_Bigint_Consumer = { id: string; size: string; };',
+        'export type Wire_Partial_Consumer = { createdAt: string; size: string; };',
       ].join('\n') + '\n'
     );
     stubs = [
@@ -211,6 +239,112 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
     const v = verdicts.get('unionrequest')!;
     assert.strictEqual(v.bucket, 'incompatible');
     assert.match(v.diagnostic!, /type/);
+  });
+
+  // carrick-tools/carrick-cloud#1118. The stored text is the whole report a
+  // reader (or a skill relaying it) ever sees, so "does not typecheck" has to
+  // become "these fields differ, and this is how".
+  describe('the mismatch text names the drifting fields', () => {
+    it('a response mismatch names each differing field and both types', () => {
+      const v = verdicts.get('fielddrift')!;
+      assert.strictEqual(v.bucket, 'incompatible');
+      assert.match(v.diagnostic!, /Fields that differ:/);
+      assert.match(v.diagnostic!, /'id' is string on the producer and number on the consumer/);
+      assert.match(
+        v.diagnostic!,
+        /'owner\.name' is string on the producer and number on the consumer/,
+        `a nested field must be named at its path: ${v.diagnostic}`
+      );
+    });
+
+    it('names an optionality gap no assignment error can report', () => {
+      const v = verdicts.get('optionalgap')!;
+      assert.strictEqual(v.bucket, 'incompatible');
+      // The mismatch tsc found.
+      assert.match(
+        v.diagnostic!,
+        /'nickname' is required by the consumer and the producer does not send it/
+      );
+      // The gap it structurally cannot find: the producer always sends
+      // `email`, so the consumer's optional branch never runs, and assigning
+      // a required member to an optional one is legal.
+      assert.match(
+        v.diagnostic!,
+        /'email' is always sent by the producer and optional on the consumer/,
+        `the optionality gap must be named: ${v.diagnostic}`
+      );
+    });
+
+    it('a request mismatch names both halves of a renamed field', () => {
+      const v = verdicts.get('renamedfield')!;
+      assert.strictEqual(v.bucket, 'incompatible');
+      // Direction is inverted for request bodies: the consumer sends.
+      assert.match(
+        v.diagnostic!,
+        /'username' is required by the producer and the consumer does not send it/
+      );
+      assert.match(
+        v.diagnostic!,
+        /'userName' is sent by the consumer and the producer declares no such field/,
+        `the near-neighbour the client does send must be named: ${v.diagnostic}`
+      );
+    });
+  });
+
+  // carrick-tools/carrick-cloud#1119.
+  describe('the JSON wire rule', () => {
+    it('a producer Date read as a string is not a drift', () => {
+      const v = verdicts.get('wiredate')!;
+      assert.strictEqual(
+        v.bucket,
+        'compatible',
+        `a Date travels as the string JSON writes: ${v.diagnostic}`
+      );
+      assert.strictEqual(v.diagnostic, undefined);
+    });
+
+    it('a consumer Date read from a producer string is still a mismatch', () => {
+      const v = verdicts.get('wiredatereverse')!;
+      assert.strictEqual(
+        v.bucket,
+        'incompatible',
+        'no Date ever arrives over JSON, so a consumer declaring one is wrong'
+      );
+      assert.match(v.diagnostic!, /'createdAt' is string on the producer and Date on the consumer/);
+      assert.ok(
+        !/JSON puts on the wire/.test(v.diagnostic!),
+        `nothing was serialised away here, so no wire note: ${v.diagnostic}`
+      );
+    });
+
+    it('applies to a request body too, in the direction the body travels', () => {
+      const v = verdicts.get('wiredaterequest')!;
+      assert.strictEqual(
+        v.bucket,
+        'compatible',
+        `a consumer sending a Date delivers a string: ${v.diagnostic}`
+      );
+    });
+
+    it('says so when the comparison it reports is against the serialised form', () => {
+      const v = verdicts.get('wirepartial')!;
+      assert.strictEqual(v.bucket, 'incompatible');
+      assert.match(
+        v.diagnostic!,
+        /compared in the form JSON puts on the wire/,
+        `a reader must be told the Date was read as a string: ${v.diagnostic}`
+      );
+      // The surviving mismatch is named; the serialised field is not, because
+      // on the wire it agrees.
+      assert.match(v.diagnostic!, /'size' is number on the producer and string on the consumer/);
+      assert.ok(!/'createdAt'/.test(v.diagnostic!), v.diagnostic);
+    });
+
+    it('leaves a bigint a mismatch: JSON.stringify throws on one', () => {
+      const v = verdicts.get('wirebigint')!;
+      assert.strictEqual(v.bucket, 'incompatible');
+      assert.match(v.diagnostic!, /'size' is bigint on the producer and string on the consumer/);
+    });
   });
 
   it('diagnostics carry no absolute paths or scan internals', () => {

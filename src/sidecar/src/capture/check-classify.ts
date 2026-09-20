@@ -23,9 +23,10 @@
  */
 
 import type { CheckVerdict } from './api.js';
-import type { GateName, ProbePlan, Side } from './check-probe.js';
-import { scrubDiagnostic, type ScrubContext } from './check-scrub.js';
+import { decisiveAssignmentLine, type GateName, type ProbePlan, type Side } from './check-probe.js';
+import { scrubDiagnostic, scrubPaths, type ScrubContext } from './check-scrub.js';
 import type { PairDeepFindings } from './check-deep.js';
+import { describeFieldReport, type PairFieldReport } from './check-fields.js';
 
 export interface RawDiagnostic {
   /** Workspace-relative, forward-slash file path (empty for global errors). */
@@ -103,6 +104,14 @@ export interface ClassifyInput {
    * verdict is then not a fact either.
    */
   deepFindings?: PairDeepFindings;
+  /**
+   * The differing fields of the two types the judge compared
+   * (carrick-tools/carrick-cloud#1118), walked in the same program. Read only
+   * on a mismatch, and only to NAME what the judge already decided: it never
+   * moves a bucket and never sets `resolved`. Absent when the walk could not
+   * run, in which case the tsc text stands alone.
+   */
+  fieldReport?: PairFieldReport;
 }
 
 /** Classify one pair into exactly one bucket, honouring the precedence order. */
@@ -204,44 +213,109 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
     };
   }
 
-  // 5. Assignment-class error on the value assignment line -> incompatible.
+  // 5. Assignment-class error on the DECISIVE assignment line -> incompatible.
+  //
+  // On an `http` pair that line is the JSON wire assignment, not the declared
+  // one (carrick-tools/carrick-cloud#1119). The two cannot disagree in the
+  // direction that matters: the wire comparand short-circuits to the declared
+  // type whenever that already assigns, so an error there means the shapes
+  // disagree as declared AND as serialised. A pair whose declared forms
+  // disagree only over what serialisation changes (a producer `Date` read as
+  // the `string` it becomes) has no error on this line and is not a drift.
+  const decisiveLine = decisiveAssignmentLine(plan);
   const assignDiag = probeDiags.find(
-    (d) => d.line === plan.assignmentLine && ASSIGNMENT_CODES.has(d.code)
+    (d) => d.line === decisiveLine && ASSIGNMENT_CODES.has(d.code)
   );
   if (assignDiag) {
+    const text = scrubDiagnostic(
+      assignDiag.message,
+      scrubCtx,
+      plan.sentEndpoint.alias,
+      plan.expectedEndpoint.alias
+    );
     return {
       ...base,
       bucket: 'incompatible',
-      diagnostic: scrubDiagnostic(
-        assignDiag.message,
-        scrubCtx,
-        plan.sentEndpoint.alias,
-        plan.expectedEndpoint.alias
-      ),
+      diagnostic: text + namedFields(input, scrubCtx),
       ...factness(input),
     };
   }
 
-  // Any other diagnostic on the assignment line that is not a known assignment
-  // code still means the pair could not be cleanly verified.
-  const otherAssign = probeDiags.find((d) => d.line === plan.assignmentLine);
+  // Any other diagnostic on the DECLARED assignment line that is not a known
+  // assignment code still means the pair could not be cleanly verified.
+  // A mismatch there with none on the wire line is not one of these: it is the
+  // pair the wire rule just cleared, and it falls through to `compatible`.
+  const scrub = (text: string) =>
+    scrubDiagnostic(text, scrubCtx, plan.sentEndpoint.alias, plan.expectedEndpoint.alias);
+  const otherAssign = probeDiags.find(
+    (d) => d.line === plan.assignmentLine && !ASSIGNMENT_CODES.has(d.code)
+  );
   if (otherAssign) {
     return {
       ...base,
       bucket: 'unverifiable',
       gate: 'assignment:other',
-      diagnostic: scrubDiagnostic(
-        otherAssign.message,
-        scrubCtx,
-        plan.sentEndpoint.alias,
-        plan.expectedEndpoint.alias
-      ),
+      diagnostic: scrub(otherAssign.message),
+      ...notAFact('the probe raised a diagnostic that is not an assignment mismatch'),
+    };
+  }
+
+  // The same on the WIRE line: the serialised form was never judged (a type too
+  // deep to instantiate the transform over, say). What the DECLARED forms say
+  // is then the only judgment there is, and a mismatch in them is still a
+  // mismatch — reporting it as unverifiable would hide a real one. The
+  // unjudged wire form is named, because it is the reason the usual
+  // serialisation allowance did not apply.
+  const wireOther =
+    plan.wireAssignmentLine === undefined
+      ? undefined
+      : probeDiags.find(
+          (d) => d.line === plan.wireAssignmentLine && !ASSIGNMENT_CODES.has(d.code)
+        );
+  if (wireOther) {
+    const declaredMismatch = probeDiags.find(
+      (d) => d.line === plan.assignmentLine && ASSIGNMENT_CODES.has(d.code)
+    );
+    if (declaredMismatch) {
+      return {
+        ...base,
+        bucket: 'incompatible',
+        diagnostic:
+          scrub(declaredMismatch.message) +
+          ' The serialised form of the sent type could not be computed, so this' +
+          ' compares the types as declared.' +
+          namedFields(input, scrubCtx),
+        ...factness(input),
+      };
+    }
+    return {
+      ...base,
+      bucket: 'unverifiable',
+      gate: 'assignment:other',
+      diagnostic: scrub(wireOther.message),
       ...notAFact('the probe raised a diagnostic that is not an assignment mismatch'),
     };
   }
 
   // 6. No diagnostics -> compatible.
   return { ...base, bucket: 'compatible', ...factness(input) };
+}
+
+/**
+ * The field-level sentence appended to a mismatch diagnostic
+ * (carrick-tools/carrick-cloud#1118), or `''` when the walk found nothing to
+ * name. Scrubbed on the same terms as the tsc text: a printed member type can
+ * carry a stub-absolute `import("...")` path.
+ */
+function namedFields(input: ClassifyInput, scrubCtx: ScrubContext): string {
+  const report = input.fieldReport;
+  if (!report) return '';
+  const text = describeFieldReport(
+    report,
+    input.plan.direction.sent,
+    input.plan.direction.expected
+  );
+  return text === '' ? '' : scrubPaths(text, scrubCtx);
 }
 
 /**

@@ -373,6 +373,15 @@ per-stub `node_modules`), with these corrections:
    // Value-level assignability in the data-flow direction.
    declare const sent: Sent;
    const expected: Expected = sent;
+
+   // http only: the same value again, in the form JSON puts on the wire.
+   // `JsonWire` follows `toJSON()` (a Date arrives as the string it
+   // serialises to) and is depth-bounded; the comparand short-circuits to
+   // `Sent` whenever that already assigns, or whenever serialising changes
+   // nothing observable, so the compiler's headline keeps naming the real
+   // surface alias.
+   declare const sentWire: WireSent;
+   const expectedWire: Expected = sentWire;
    ```
 
    Value-level assignment, not `[X] extends [Y]` conditional types: the
@@ -395,8 +404,14 @@ per-stub `node_modules`), with these corrections:
    alone**, with four buckets:
    - `TS2344` on a probe's gate lines → **unverifiable** (which side, which
      gate — `any`/`unknown`/`never` — is recoverable from the gate name);
-   - `TS2322`/`TS2559`/`TS2739`/`TS2741`-class on the assignment → 
-     **incompatible**; diagnostic text is the report;
+   - `TS2322`/`TS2559`/`TS2739`/`TS2741`-class on the DECISIVE assignment →
+     **incompatible**; diagnostic text is the report, followed by the fields
+     that differ (walked in the same program with the compiler's own
+     assignability relation, so the list can never contradict the verdict).
+     The decisive assignment is the wire line on an `http` pair and the
+     declared line everywhere else: a pair whose declared types disagree only
+     over what serialisation changes is not a drift, and a pair whose wire
+     forms disagree is one in both forms;
    - errors on the probe's **import lines** (missing/renamed surface export) →
      **unverifiable** (third bucket the naive line-split misses);
    - **any diagnostic landing in a stub's own files poisons every probe

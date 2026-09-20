@@ -298,6 +298,10 @@ Terminal frame (`result` is a `CheckResult`, abbreviated):
 }
 ```
 
+A verdict's `diagnostic` (present on a mismatch) is the compiler's own text, followed by the fields that differ: which side does not send a field the other requires, which field is sent under a name the other does not declare, which are optional on one side and always present on the other, and where two member types disagree. The list is capped and says how many it did not name. It is walked over the same two types the judge compared, with the compiler's own assignability relation, so it never names a field the verdict does not rest on and never changes a verdict.
+
+An `http` pair is judged on the form JSON puts on the wire. A value with a `toJSON()` method travels as what it serialises to, so a producer returning `Date` where the consumer reads `string` is not a drift, and a consumer that sends a `Date` in a request body satisfies a producer declaring `string`. The transform applies to the SENDING side in each direction, which is where serialisation happens: a consumer declaring `Date` for a response is still a mismatch, because no `Date` ever arrives. `bigint` is left alone — `JSON.stringify` throws on one, so it is a real problem, not a wire difference.
+
 #### `infer` - Resolve the type at a locator
 
 Each item locates one expression. The fields are `file_path`, `line_number` and `infer_kind`; a locator is completed by a span (`span_start` + `span_end`), by `expression_text` (+ optional `expression_line`), or by the line alone for the kinds that anchor on a function (`function_return`, `signature_return`, `function_param`, `response_body`, `request_body`). Anything else is rejected per item, and that item alone pads to `unknown` — a bad item never sinks the batch.
