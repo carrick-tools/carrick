@@ -322,6 +322,10 @@ impl Reader {
             }
             bytes.extend_from_slice(&chunk);
         }
+        // How much came down, for the line a person is watching. Decoded
+        // bytes, which is what the reader holds: the wire is gzipped and the
+        // ratio is not this layer's to state (carrick#1365).
+        crate::progress::hosted_bytes(bytes.len());
         serde_json::from_slice(&bytes).map_err(|_| "Invalid hosted JSON response".into())
     }
 

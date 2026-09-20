@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  BOUNDARY_POINTER,
+  LISTED_SERVICES,
   boundaryFor,
   boundaryLines,
   itemLine,
@@ -264,6 +266,37 @@ test("the session line is one line per service, with what it holds and how far i
     /^- user-service at 6a1b2c3: 157 route\(s\), 12 call\(s\), changed since index: 7 \(/,
   );
   assert.match(lines[3] ?? "", /^- order-service at 9988776: 40 route\(s\), 61 call\(s\), changed since index: 120 \(/);
+});
+
+// A workspace of fifteen services printed about ninety lines into every
+// session: each service, then each service's boundary report. Above three
+// services the session gets the total, the services with something to do about
+// them, and the command that prints the rest (carrick#1365).
+test("a large workspace gets the services worth acting on, and a pointer to the rest", () => {
+  const base = statusFixture("status-workspace.json");
+  const template = base.services[0]!;
+  const services = Array.from({ length: 15 }, (_, index) => ({
+    ...template,
+    service: `svc-${index}`,
+    routes: 2,
+    calls: 1,
+    changed_since_index: index < 10 ? 1 : 0,
+    stale_files: index < 10 ? ["src/a.ts"] : [],
+    stale_files_total: index < 10 ? 1 : 0,
+    hosted_state: "enriched" as const,
+    boundary: undefined,
+    boundary_lines: ["boundary line nobody acts on at session start"],
+  }));
+  const lines = renderSessionStart({ ...base, services, repos: [] }).split("\n");
+  assert.match(lines[0] ?? "", /^Carrick indexed 15 service\(s\).*: 30 route\(s\), 15 call\(s\)\.$/);
+  // Eight of the ten that moved, the other two counted, the five quiet ones
+  // nowhere, and no boundary report at all.
+  assert.equal(lines.filter((line) => line.startsWith("- svc-")).length, LISTED_SERVICES);
+  assert.ok(lines.includes("- +2 more service(s) with something to act on"));
+  assert.ok(!lines.some((line) => line.includes("svc-12")));
+  assert.ok(!lines.some((line) => line.includes("boundary line nobody acts on")));
+  assert.equal(lines.at(-1), BOUNDARY_POINTER);
+  assert.equal(lines.length, 1 + LISTED_SERVICES + 1 + 1);
 });
 
 test("at most five stale files are named, and the rest are counted", () => {

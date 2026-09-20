@@ -159,7 +159,7 @@ pub fn answer(
         index_commit: commit,
         indexed_at,
         scanner_version: index.scanner_version.clone(),
-        changed_since_index: changed.len(),
+        changed_since_index: scanned_changes(&repo_root, changed.iter()),
         stale,
         deleted,
         items: items
@@ -277,7 +277,7 @@ pub fn status(workspace_root: &Path) -> Result<StatusOutput, ReadFailure> {
         repos.push(StatusRepo {
             repo: repo.path.clone(),
             name: repo.name.clone(),
-            changed_since_index: changed.len(),
+            changed_since_index: scanned_changes(&repo_root, changed.iter()),
             outside_every_service: outside_total,
             stale_files: outside,
             stale_files_truncated: outside_truncated,
@@ -519,6 +519,27 @@ fn read_index(workspace_root: &Path) -> Result<LocalIndex, ReadFailure> {
 /// two used to collapse into one empty set, so a caller could not tell a clean
 /// tree from an unanswerable one and had to OR in a signal that is wrong
 /// whenever git can speak (carrick#857).
+/// How many of a repo's changes are changes to rows the index holds.
+///
+/// The set `changed_since` returns is every file git can name: tracked files
+/// that differ from the indexed commit, and every untracked file that is not
+/// ignored. The second half is the one that has to be filtered before it is
+/// counted. One checkout answered "13384 file(s) have changed since this index
+/// was built" — measured 2026-09-20: 13378 of them were untracked result files
+/// under one directory and not one was TypeScript (carrick#1365). The count is
+/// printed beside a sentence about rows being answered from the tree rather
+/// than the index, and a file no scan reads holds no row either way.
+///
+/// The same filter the per-service and outside-every-service counts beside it
+/// already apply, so the three can no longer disagree about what a change is.
+/// An untracked source file stays counted: it is in the tree, it is not in the
+/// index, and that is exactly what the sentence says.
+fn scanned_changes<'a>(repo_root: &Path, changed: impl Iterator<Item = &'a String>) -> usize {
+    changed
+        .filter(|file| crate::file_finder::is_scanned_source(&repo_root.join(file), repo_root))
+        .count()
+}
+
 pub(crate) fn changed_since(repo: &Path, commit: &str) -> Option<HashSet<String>> {
     if commit.is_empty() || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -1075,8 +1096,11 @@ mod drift_tests {
 
         let answer = status(repo).expect("the index is readable");
         let stated = &answer.repos[0];
-        // Four files moved and one of them is a file a scan reads.
-        assert_eq!(stated.changed_since_index, 4, "{:?}", stated.stale_files);
+        // Four files moved and one of them is a file a scan reads, which is
+        // the only one this count is about. It used to be all four, and on a
+        // checkout carrying untracked data files that read as "13384 file(s)
+        // have changed since this index was built" (carrick#1365).
+        assert_eq!(stated.changed_since_index, 1, "{:?}", stated.stale_files);
         assert_eq!(stated.outside_every_service, 1, "{:?}", stated.stale_files);
         assert_eq!(stated.stale_files, vec!["tools/release.ts".to_string()]);
         let text = answer.render();

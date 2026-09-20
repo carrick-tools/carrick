@@ -235,8 +235,21 @@ fn run_generation(
     // And what they left behind, so the build's closing line can say it
     // (carrick#1315).
     let mut pending: Vec<String> = Vec::new();
+    // How many services this build is about, and how many are behind it, so
+    // the one line a reader is watching counts the workspace rather than
+    // restarting at each repo (carrick#1365). Best effort: the same resolution
+    // `carrick derive` runs, and a repo it cannot resolve leaves every child
+    // counting its own services, as they did.
+    let service_counts = workspace_service_counts(targets);
+    let mut services_done = 0usize;
     for (position, repo) in targets.iter().enumerate() {
         let name = repo_label(repo);
+        let workspace_position = service_counts
+            .as_ref()
+            .map(|counts| (services_done, counts.iter().sum::<usize>()));
+        if let Some(counts) = &service_counts {
+            services_done += counts.get(position).copied().unwrap_or(0);
+        }
         let previous = generation.join("previous.json");
         std::fs::write(
             &previous,
@@ -247,7 +260,15 @@ fn run_generation(
         // scanner in its own directory so user labels cannot overwrite a
         // retained or hosted blob in the join input.
         let scan_dir = generation.join(format!("scan-{position}"));
-        let report = scan_repo(&exe, repo, &scan_dir, &previous, &name, pass)?;
+        let report = scan_repo(
+            &exe,
+            repo,
+            &scan_dir,
+            &previous,
+            &name,
+            pass,
+            workspace_position,
+        )?;
         pending.extend(report.pending.iter().cloned());
         // A repo that handed its prompts over wrote no blob. One that was
         // asked to and found nothing for the model says nothing here: it
@@ -450,6 +471,23 @@ fn repo_for_service(workspace: &Workspace, blobs: &Path, service: &str) -> Resul
         })
 }
 
+/// How many services each repo of this build declares, or None.
+///
+/// The same resolution the proposal is derived from, which reads manifests and
+/// globs and parses nothing: a `carrick.json`, an npm or pnpm workspace, or a
+/// single service. All or nothing — a total that is missing a repo is a total
+/// the count would overshoot, and no count is better than a wrong one.
+fn workspace_service_counts(repos: &[PathBuf]) -> Option<Vec<usize>> {
+    repos
+        .iter()
+        .map(|repo| {
+            crate::service_derivation::resolve(repo)
+                .ok()
+                .map(|derived| derived.services.len().max(1))
+        })
+        .collect()
+}
+
 /// Phase 1 for one repo, and what its scan cost when it was a paid one.
 fn scan_repo(
     exe: &Path,
@@ -458,8 +496,14 @@ fn scan_repo(
     previous: &Path,
     label: &str,
     pass: &Pass,
+    workspace_position: Option<(usize, usize)>,
 ) -> Result<ScanReport, String> {
-    let command = scan_command(exe, repo, blobs, previous, pass);
+    let mut command = scan_command(exe, repo, blobs, previous, pass);
+    if let Some((offset, total)) = workspace_position {
+        command
+            .env(crate::progress::OFFSET_ENV, offset.to_string())
+            .env(crate::progress::TOTAL_ENV, total.to_string());
+    }
     run_scan(
         command,
         &format!("scan of {label}"),

@@ -173,6 +173,45 @@ test("a sibling repo with no carrick.json is reported as a fact, not as a findin
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+// The folder that HOLDS the repos is not one of them. `repoRoots` always
+// includes the root, because in a single-repo workspace the root is the repo;
+// in a folder of repos it has no `.git` and no config of its own, and it was
+// reported under its basename as a repo with nothing indexed — which in a
+// folder named after one of its repos reads as a statement about that repo
+// (carrick#1365).
+test("the folder holding the repos is not reported as a repo", () => {
+  const root = workspace({
+    "api/.git": "gitdir: elsewhere\n",
+    "api/carrick.json": JSON.stringify({ serviceName: "api" }),
+    "web/.git": "gitdir: elsewhere\n",
+    "web/carrick.json": JSON.stringify({ serviceName: "web" }),
+  });
+  const labels = configuredRepos(root).map((repo) => repo.label);
+  assert.deepEqual(labels, ["api", "web"]);
+  assert.equal(findingCount(checkDeclaredPaths(configuredRepos(root))), 0);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+// A repo the workspace file excludes is a repo nothing else looks at: the
+// derivation drops it, the scans never walk it, and the read path refuses to
+// answer from it. Doctor was the one surface still auditing it (carrick#1365).
+test("a repo the workspace file excludes is not audited", () => {
+  const root = workspace({
+    "api/.git": "gitdir: elsewhere\n",
+    "api/carrick.json": JSON.stringify({ serviceName: "api" }),
+    "notes/.git": "gitdir: elsewhere\n",
+    "notes/README.md": "not a Carrick repo\n",
+    "carrick-workspace.json": JSON.stringify({ exclude: ["notes"] }),
+  });
+  const lines = checkDeclaredPaths(configuredRepos(root));
+  assert.deepEqual(
+    configuredRepos(root).map((repo) => repo.label),
+    ["api"],
+  );
+  assert.ok(!texts(lines).some((line) => line.includes("notes")), texts(lines).join("\n"));
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test("the services a config declares, flat and as an array", () => {
   assert.deepEqual(declaredServices({ serviceName: "api", directory: "src", include: ["shared"] }), [
     { name: "api", include: ["shared"], graphqlSchemas: [], directory: "src" },
@@ -457,24 +496,19 @@ test("an MCP client that is connected, one that is not, and one pointing elsewhe
   assert.match(mixed[1]!.text, /points at http:\/\/localhost:9000/);
 });
 
-// Connected, and answering as nobody in particular: an entry written before
-// the install id existed is drift (carrick-cloud#890). The repair travels in
-// the detail, because it differs per client — a file client is merged in place
-// by `carrick init`, and Claude Code's entry is the owner's to write again.
-test("an MCP entry with no install id is a finding, with the repair on the line", () => {
-  const pair =
-    "MCP entry has no install id. To add it: claude mcp remove --scope user carrick && " +
-    'claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp ' +
-    '--header "X-Carrick-Install-Id: 11111111-2222-4333-8444-555555555555"';
+// An entry that answers is not a finding, whatever headers it does or does
+// not carry. The install id is a field on the server's log line, and the
+// repair this used to print — remove the server and add it again — costs the
+// reader the sign-in it is keyed under (`mcp.ts`, carrick#1365). A healthy
+// install must exit zero, and this was the one thing standing between the
+// owner's install and that.
+test("a connected entry is not a finding, whatever it carries", () => {
   const lines = checkMcp([
-    { client: "Cursor", state: "unstamped", detail: "MCP entry has no install id; run carrick init" },
-    { client: "Claude Code", state: "unstamped", detail: pair },
+    { client: "Claude Code", state: "connected", detail: "https://api.carrick.tools/mcp" },
+    { client: "Cursor", state: "connected", detail: "https://api.carrick.tools/mcp" },
   ]);
-  assert.equal(findingCount(lines), 2);
-  assert.deepEqual(texts(lines), [
-    "warn: Cursor: MCP entry has no install id; run carrick init.",
-    `warn: Claude Code: ${pair}.`,
-  ]);
+  assert.equal(findingCount(lines), 0);
+  assert.deepEqual(texts(lines), ["done: MCP server connected for Claude Code, Cursor."]);
 });
 
 const noGit: GitReader = { defaultRemoteBranch: () => null, commitsBetween: () => null };

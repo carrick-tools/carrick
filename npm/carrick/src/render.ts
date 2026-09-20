@@ -480,20 +480,72 @@ export function renderSessionStart(status: StatusResult): string {
   const version = status.scanner_version ? `, scanner ${status.scanner_version}` : "";
   const where = status.workspace ? ` in ${status.workspace}` : "";
   const when = status.indexed_at ? ` at ${status.indexed_at}` : "";
+
+  // Every service, with its boundary, is what this printed: on a workspace of
+  // fifteen that was about ninety lines in every session's context, most of
+  // them counts of things nobody acts on when a session opens — SDK calls that
+  // produced no edge, examples of types that did not resolve, rows the model
+  // alone states (carrick#1365). A small workspace keeps all of it, because
+  // there it IS the orientation; a large one gets the services with something
+  // to do about them, and one line naming the command that prints the rest.
+  // The totals go on the first line only where the services below it are the
+  // exceptions; where every service is listed, each line carries its own.
+  const detailed = status.services.length <= DETAILED_SERVICES;
   const lines: string[] = [
-    `Carrick indexed ${status.services.length} service(s)${where}${when}${version}.`,
+    `Carrick indexed ${status.services.length} service(s)${where}${when}${version}${detailed ? "" : totals(status)}.`,
     ...scans,
   ];
-
-  for (const service of status.services) {
-    lines.push(serviceLine(service));
+  if (detailed) {
+    for (const service of status.services) lines.push(serviceLine(service));
+  } else {
+    const actionable = status.services.filter(hasSomethingToDo);
+    for (const service of actionable.slice(0, LISTED_SERVICES)) lines.push(serviceLine(service));
+    if (actionable.length > LISTED_SERVICES) {
+      lines.push(`- +${actionable.length - LISTED_SERVICES} more service(s) with something to act on`);
+    }
   }
   for (const repo of status.repos ?? []) {
     const line = repoLine(repo);
     if (line) lines.push(line);
   }
-  for (const service of status.services) {
-    for (const line of serviceBoundary(service)) lines.push(line);
+  if (detailed) {
+    for (const service of status.services) {
+      for (const line of serviceBoundary(service)) lines.push(line);
+    }
+  } else {
+    lines.push(BOUNDARY_POINTER);
   }
   return lines.join("\n");
+}
+
+/** Up to this many services, a session start states every one of them. */
+export const DETAILED_SERVICES = 3;
+
+/** Above that, at most this many of the ones with something to do. */
+export const LISTED_SERVICES = 8;
+
+/** Where the per-service boundary report lives, for the session that wants it. */
+export const BOUNDARY_POINTER =
+  "Per-service detail, including what each scan could not classify: `carrick status`.";
+
+/**
+ * Whether a service is worth a line at the start of a session.
+ *
+ * Three things a reader can act on now: the tree has moved past the index for
+ * this service's files, the service is holding candidates that only
+ * `carrick index` resolves, or the hosted rows are not the ones being answered from. A
+ * service that is none of those is in the total on the first line and nowhere
+ * else.
+ */
+export function hasSomethingToDo(service: StatusService): boolean {
+  if (service.changed_since_index > 0) return true;
+  if ((service.boundary?.candidates_awaiting_model ?? 0) > 0) return true;
+  return service.hosted_state !== undefined && service.hosted_state !== "enriched";
+}
+
+/** What the whole index holds, so the services below it can be the exceptions. */
+function totals(status: StatusResult): string {
+  const sum = (pick: (service: StatusService) => number): number =>
+    status.services.reduce((total, service) => total + pick(service), 0);
+  return `: ${sum((service) => service.routes)} route(s), ${sum((service) => service.calls)} call(s)`;
 }

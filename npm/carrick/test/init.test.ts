@@ -31,7 +31,6 @@ import {
   configuredLine,
   connectedLine,
   mcpClientLines,
-  mcpUnstampedLines,
   packagesLine,
   parseArgs,
   init,
@@ -39,14 +38,19 @@ import {
   namedButExcluded,
   CANCELLED,
   NOTHING_WRITTEN,
-  SCAFFOLD_SENTENCE,
+  scaffoldSentence,
+  reposToScaffold,
+  preselectedRepos,
+  chooseEditors,
+  editorClause,
   type InitOptions,
 } from "../src/init/run.ts";
 import { taskSkillPaths } from "../src/init/task-skills.ts";
 import { writeIfChanged } from "../src/init/files.ts";
 import { WORKSPACE_FILE } from "../src/init/workspace-file.ts";
 import { CODEX_HOOKS_FILE } from "../src/init/codex.ts";
-import { hostedReport } from "../src/init/hosted.ts";
+import { TEMPLATE_PATHS } from "../src/templates.ts";
+import { DOWNLOAD_LABEL, downloadProgress, hostedReport } from "../src/init/hosted.ts";
 import {
   chosenNumbers,
   DOCS,
@@ -293,6 +297,11 @@ globalThis.fetch = async (input, init) => {
 // The seam document carrick-cloud#799 pins: the scaffold tool's agent reads
 // it, so what lands on disk has to be the scanner's own bytes, not a
 // re-serialisation of what this client could parse.
+/** The closing instruction for one repo, as the fixtures name it. */
+function scaffoldFor(name: string): string {
+  return scaffoldSentence([{ path: `/repos/${name}`, name, remote: null, problem: null }]);
+}
+
 test("the proposal is written as the scanner printed it, into an ignored directory", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-init-"));
   try {
@@ -531,7 +540,17 @@ test("init reads its arguments", () => {
     allowMove: false,
     project: "payments",
     repos: [],
+    editors: [],
   });
+  // The editors an entry may be written for, named the way init prints them.
+  // Nothing here is a default: a run with no terminal writes no editor file
+  // unless this flag names one (carrick#1365).
+  assert.deepEqual((parseArgs(["--mcp", "Cursor"]) as InitOptions).editors, ["Cursor"]);
+  assert.deepEqual((parseArgs(["--mcp", "Cursor,Windsurf"]) as InitOptions).editors, [
+    "Cursor",
+    "Windsurf",
+  ]);
+  assert.equal(parseArgs(["--mcp"]), "--mcp needs an editor name");
   // Repeatable, and comma-separable: a folder of repos is named one way or the
   // other, and both are the same list (carrick#1338).
   assert.deepEqual((parseArgs(["--repo", "acme/api"]) as InitOptions).repos, ["acme/api"]);
@@ -917,7 +936,7 @@ test("the executable CLI accepts the named assignment on repeated init", posixNa
       assert.doesNotMatch(result.stdout, /Projects in this workspace/);
       // Setup ends where the dashboard's checklist ends: one sentence naming
       // the scaffold tool, which carries the instructions (cloud#832).
-      assert.ok(result.stdout.includes(SCAFFOLD_SENTENCE), result.stdout);
+      assert.ok(result.stdout.includes(scaffoldFor("acme/api")), result.stdout);
       // No agent client under this fixture's home, so the MCP step states the
       // line rather than claiming a connection. The line carries this
       // machine's install id, which the run has just minted
@@ -1014,7 +1033,7 @@ test("the executable CLI reads the hosted index onto an indexed repo and names t
     // the scaffold tool's to state, from the repo it is asked about
     // (cloud#832), so the terminal carries no second copy of it.
     assert.ok(result.stdout.trimEnd().endsWith(`Docs: ${DOCS}`), result.stdout);
-    assert.ok(result.stdout.includes(SCAFFOLD_SENTENCE), result.stdout);
+    assert.ok(result.stdout.includes(scaffoldFor("acme/api")), result.stdout);
     assert.doesNotMatch(result.stdout, /is connected and has no hosted index yet/);
   } finally {
     fixture.cleanup();
@@ -1158,7 +1177,7 @@ test("a first init writes the proposal, its ignore file, the hook settings and t
         "◇ No index yet: your agent runs the one scan",
         "",
         "Next: paste this to your agent",
-        `  ${SCAFFOLD_SENTENCE}`,
+        `  ${scaffoldFor("acme/api")}`,
         "",
       ].join("\n") + `\nDocs: ${DOCS}`,
       result.stdout,
@@ -1505,37 +1524,59 @@ test("the rest of the project is named, capped, and never guessed at", () => {
 // read as the prompt's own quiet answer — clack returns a cancel symbol, and
 // both renderings turned it into "" or false — so the run carried on into the
 // steps that question governed. A cancel ends the run.
-// The picker itself, in the rendering a terminal gets: every repo chosen to
-// begin with, one keystroke to drop the one that should not be indexed
-// (carrick#1338).
-test("the picker starts with every repo chosen and drops the one deselected", async () => {
+// The picker itself, in the rendering a terminal gets. It opens on the set it
+// was given rather than on everything, every row says in text whether it is in
+// or out, and the header counts them: clack's own multiselect draws the row
+// under the cursor and an unselected row with the SAME glyph, which is what
+// made "space to select" unreadable (carrick#1365).
+test("the picker opens on its initial set, and marks every row in or out", async () => {
   const keys = new PassThrough();
   const rendered = new PassThrough();
   let seen = "";
   rendered.on("data", (chunk: Buffer) => void (seen += String(chunk)));
-  const chosen = interactiveOutput(rendered, keys).choose("Which repos does this install cover?", [
-    { value: "/repos/api", label: "acme/api", hint: "1 package" },
-    { value: "/repos/data", label: "acme/data", hint: "3 packages" },
-  ]);
-  setTimeout(() => keys.write(" "), 30);
-  setTimeout(() => keys.write("\r"), 60);
-  assert.deepEqual(await chosen, ["/repos/data"]);
-  assert.match(seen, /acme\/api \(1 package\)/);
-  assert.match(seen, /acme\/data \(3 packages\)/);
+  const chosen = interactiveOutput(rendered, keys).choose(
+    "Which repos does this install cover?",
+    "a repo",
+    [
+      { value: "/repos/api", label: "acme/api", hint: "1 package" },
+      { value: "/repos/data", label: "acme/data", hint: "3 packages, in Demo Repos" },
+    ],
+    { initial: ["/repos/api"], required: true },
+  );
+  // Down to the second row, space to add it, enter to confirm.
+  setTimeout(() => keys.write("\u001b[B"), 30);
+  setTimeout(() => keys.write(" "), 60);
+  setTimeout(() => keys.write("\r"), 90);
+  assert.deepEqual(await chosen, ["/repos/api", "/repos/data"]);
+  assert.match(seen, /\[x\] acme\/api/);
+  assert.match(seen, /\[ \] acme\/data/);
+  assert.match(seen, /3 packages, in Demo Repos/);
+  assert.match(seen, /Space toggles a repo, Enter confirms\. 1 of 2 selected\./);
+  assert.match(seen, /2 of 2 selected/);
 });
 
 // The plain rendering has no cursor to move, so the picker is a numbered list
 // and an answer naming numbers. Enter covers everything, which is the answer
 // a folder of repos that all belong wants (carrick#1338).
-test("the numbered picker takes numbers, all, or nothing at all", () => {
-  assert.deepEqual(chosenNumbers("", 3), [0, 1, 2]);
-  assert.deepEqual(chosenNumbers("  ", 3), [0, 1, 2]);
-  assert.deepEqual(chosenNumbers("ALL", 3), [0, 1, 2]);
-  assert.deepEqual(chosenNumbers("1,3", 3), [0, 2]);
-  assert.deepEqual(chosenNumbers("3 1 3", 3), [2, 0]);
+test("the numbered picker takes numbers, all, none, or the marked set", () => {
+  const some = { initial: [0], required: true };
+  // Enter accepts what the rows are marked with, which is what the reader can
+  // see — it used to mean "all of them", which is now a different answer.
+  assert.deepEqual(chosenNumbers("", 3, some), [0]);
+  assert.deepEqual(chosenNumbers("  ", 3, some), [0]);
+  assert.deepEqual(chosenNumbers("ALL", 3, some), [0, 1, 2]);
+  assert.deepEqual(chosenNumbers("1,3", 3, some), [0, 2]);
+  assert.deepEqual(chosenNumbers("3 1 3", 3, some), [2, 0]);
   for (const answer of ["0", "4", "x", "1,x", "-1", "1.5"]) {
-    assert.equal(chosenNumbers(answer, 3), null, answer);
+    assert.equal(chosenNumbers(answer, 3, some), null, answer);
   }
+  // Nothing marked and an answer required: Enter is not an answer, and the
+  // question is asked again.
+  assert.equal(chosenNumbers("", 3, { initial: [], required: true }), null);
+  assert.equal(chosenNumbers("none", 3, some), null);
+  // Where an empty answer is one — the editors — both ways of saying it work.
+  assert.deepEqual(chosenNumbers("", 3, { initial: [], required: false }), []);
+  assert.deepEqual(chosenNumbers("NONE", 3, { initial: [1], required: false }), []);
 });
 
 test("a cancelled question is not an answer, in either rendering", async () => {
@@ -1563,9 +1604,12 @@ test("a cancelled question is not an answer, in either rendering", async () => {
     () => interactive.confirm("Keep them there?"),
     () => interactive.ask("Which project should these repos be in?"),
     () =>
-      interactive.choose("Which repos does this install cover?", [
-        { value: "/repos/api", label: "acme/api" },
-      ]),
+      interactive.choose(
+        "Which repos does this install cover?",
+        "a repo",
+        [{ value: "/repos/api", label: "acme/api" }],
+        { initial: ["/repos/api"], required: true },
+      ),
   ]) {
     const pending = prompt();
     setImmediate(() => keys.write("\u0003"));
@@ -1595,7 +1639,8 @@ function recordingOutput(
     },
     confirm: async () => true,
     ask: async () => "",
-    choose: async (_question, options) => options.map((option) => option.value),
+    choose: async (_question, _noun, options, config) =>
+      options.filter((option) => config.initial.includes(option.value)).map((option) => option.value),
     accent: (text) => text,
     quiet: false,
     ...overrides,
@@ -1733,7 +1778,7 @@ test("the plain rendering is one line per thing, with no colour and no box", () 
   out.warn("Hosted index is older than this CLI");
   out.refuse("Hosted index could not be read into .carrick/: no reason");
   out.say("Connect repositories in your browser: https://app.carrick.tools/repos");
-  out.note("Next: paste this to your agent", [SCAFFOLD_SENTENCE]);
+  out.note("Next: paste this to your agent", [scaffoldFor("acme/api")]);
   assert.deepEqual(written.join("").split("\n"), [
     "◇ Repo acme/api connected",
     "▲ Hosted index is older than this CLI",
@@ -1741,7 +1786,7 @@ test("the plain rendering is one line per thing, with no colour and no box", () 
     "Connect repositories in your browser: https://app.carrick.tools/repos",
     "",
     "Next: paste this to your agent",
-    `  ${SCAFFOLD_SENTENCE}`,
+    `  ${scaffoldFor("acme/api")}`,
     "",
     "",
   ]);
@@ -1808,6 +1853,11 @@ test("every hosted outcome is one line, and only an actionable one is a warning"
     text: "Hosted index for 2 services downloaded into .carrick/",
   });
   assert.deepEqual(hostedReport({ kind: "downloaded", services: 1 }).text, "Hosted index for 1 service downloaded into .carrick/");
+  // With the time the step took, which is what a wait of minutes ends on.
+  assert.equal(
+    hostedReport({ kind: "downloaded", services: 15 }, 184).text,
+    "Hosted index for 15 services downloaded into .carrick/ in 3m4s",
+  );
   const older = hostedReport({ kind: "version_mismatch", services: 2 });
   assert.equal(older.kind, "warn");
   assert.match(older.text, /run `carrick index --detach` once from main/);
@@ -1887,31 +1937,149 @@ test("the setup line names the clients this run changed, and no others", () => {
   assert.deepEqual(mcpClientLines(machine), ["MCP added for Cursor: /home/.cursor/mcp.json"]);
 });
 
-// A client connected before the install id existed. `carrick init` does not
-// take somebody's Claude Code entry out and write it again — that would lose
-// whatever else is on it and send the next session back through the server's
-// OAuth — so it states the pair that does it and changes nothing
-// (carrick-cloud#890).
-test("an entry with no install id is one warning, and the commands that fix it", () => {
-  const add =
-    'claude mcp add --scope user --transport http carrick https://api.carrick.tools/mcp ' +
-    '--header "X-Carrick-Install-Id: 11111111-2222-4333-8444-555555555555"';
+// An entry with no install id is not news. The id is a field on the server's
+// own log line; adding one to a working entry costs the sign-in, because
+// Claude Code keys its stored OAuth record on the headers (carrick#1365). The
+// run says nothing about it, which is what leaves the warning count at what
+// the reader can act on.
+test("an entry with no install id produces no line at all", () => {
   const mcp = [
-    {
-      client: "Claude Code",
-      state: "unstamped",
-      detail: `MCP entry has no install id. To add it: claude mcp remove --scope user carrick && ${add}`,
-    } as const,
+    { client: "Claude Code", state: "present", detail: 'already connected as "carrick"' } as const,
     { client: "Cursor", state: "written", detail: "/home/.cursor/mcp.json" } as const,
   ];
-  assert.deepEqual(mcpUnstampedLines(mcp), [
-    "Claude Code: MCP entry has no install id. To add it: " +
-      `claude mcp remove --scope user carrick && ${add}`,
-  ]);
-  // Nothing was configured for Claude Code, so the setup line does not say it
-  // was, and the client is not counted among the files this run wrote.
   assert.equal(configuredLine(mcp), "Claude Code hooks configured");
   assert.deepEqual(mcpClientLines(mcp), ["MCP added for Cursor: /home/.cursor/mcp.json"]);
+});
+
+// What the step says while the download runs. Minutes of silence on a line
+// reading "Reading the hosted index into .carrick/" is what the owner met on a
+// folder of five repos; the scanner already states where it is, and the only
+// thing missing was a reader for it (carrick#1365).
+test("the download says how far through the workspace it is, and how long", () => {
+  const said: string[] = [];
+  let clock = 1000;
+  const report = downloadProgress((text) => void said.push(text), () => clock);
+  // Not a marker: nothing is drawn for the scanner's ordinary log lines.
+  report("2026-09-20T18:00:00Z  INFO carrick: indexing 5 repos");
+  assert.deepEqual(said, []);
+
+  clock = 3500;
+  report(
+    '@carrick-progress {"service":"api","service_index":7,"service_total":15,"phase":"files","done":40,"total":120}',
+  );
+  assert.deepEqual(said, [`${DOWNLOAD_LABEL}: 7 of 15 services, 2.5s`]);
+
+  // The hosted half says its size once, as a notice, because it is two
+  // requests for the whole workspace rather than a count that ticks.
+  clock = 6000;
+  report('@carrick-notice {"text":"hosted bytes 3.2 MB"}');
+  clock = 8000;
+  report(
+    '@carrick-progress {"service":"web","service_index":8,"service_total":15,"phase":"files","done":5,"total":90}',
+  );
+  assert.deepEqual(said.at(-1), `${DOWNLOAD_LABEL}: 8 of 15 services, 3.2 MB, 7.0s`);
+
+  // And never a time remaining: there is no measured rate to derive one from.
+  for (const line of said) assert.doesNotMatch(line, /left|remaining|eta/i);
+});
+
+// What the picker opens on. A default is a claim about somebody's folder, so
+// only a repo the server already says belongs here carries one: connected, and
+// in the project most of this folder's connected repos are in (carrick#1365).
+test("the picker preselects the connected repos of the majority project, and says why the rest are out", () => {
+  const repo = (name: string | null, dir: string) => ({ path: `/w/${dir}`, name, remote: null, problem: null });
+  const candidates = [repo("acme/api", "api"), repo("acme/web", "web"), repo("acme/demo", "demo"), repo("acme/new", "new"), repo(null, "local")];
+  const connected = (full_name: string, project_slug: string) =>
+    ({ full_name, connected: true as const, project_id: project_slug, project_slug, services: [] });
+  const identity = {
+    schema: "carrick.resolve-repos/0" as const,
+    workspace: { slug: "acme", billing_tier: "free" as const, installed: true },
+    allowance_sentence: null,
+    repos: [
+      connected("acme/api", "payments"),
+      connected("ACME/web", "payments"),
+      connected("acme/demo", "demo-repos"),
+      { full_name: "acme/new", connected: false as const },
+    ],
+    project_repos: [],
+  };
+  const chosen = preselectedRepos(candidates, identity, (slug) => (slug === "demo-repos" ? "Demo Repos" : slug));
+  assert.deepEqual(chosen.keep, ["/w/api", "/w/web"]);
+  assert.deepEqual([...chosen.reasons], [
+    ["/w/new", "not connected"],
+    ["/w/local", "no GitHub identity"],
+    ["/w/demo", "in Demo Repos"],
+  ]);
+
+  // A tie is not a majority, and no read is not "not connected": both open on
+  // nothing, and the second gives no reason it has no source for.
+  const tie = { ...identity, repos: [connected("acme/api", "payments"), connected("acme/demo", "demo-repos")] };
+  assert.deepEqual(preselectedRepos(candidates, tie).keep, []);
+  const unread = preselectedRepos(candidates, null);
+  assert.deepEqual(unread.keep, []);
+  assert.deepEqual([...unread.reasons], [["/w/local", "no GitHub identity"]]);
+});
+
+// The closing instruction is about the repos that still need it. A repo with
+// its config and its workflow is already set up, and telling an agent to
+// scaffold it again is what the run did on a folder where every repo was
+// (carrick#1365).
+test("only a repo missing its config or its workflow is sent to the scaffold tool", () => {
+  const repo = (name: string) => ({ path: `/w/${name}`, name: `acme/${name}`, remote: null, problem: null });
+  const repos = ["api", "web", "jobs", "docs", "site"].map(repo);
+  const present = new Set([
+    "/w/api/carrick.json",
+    `/w/api/${TEMPLATE_PATHS.workflow}`,
+    "/w/web/carrick.json",
+  ]);
+  const owed = reposToScaffold(repos, (target) => present.has(target));
+  assert.deepEqual(owed.map((entry) => entry.name), ["acme/web", "acme/jobs", "acme/docs", "acme/site"]);
+  assert.deepEqual(reposToScaffold([repos[0]!], (target) => present.has(target)), []);
+
+  assert.equal(
+    scaffoldSentence([repos[1]!]),
+    "Run the carrick scaffold tool for acme/web, passing its owner/repo as `repo`, and follow what it returns.",
+  );
+  assert.equal(
+    scaffoldSentence(owed),
+    "Run the carrick scaffold tool for acme/web, acme/jobs, acme/docs and 1 more, once each, passing that repo's owner/repo as `repo`, and follow what it returns.",
+  );
+});
+
+// A file under the home directory is outside the workspace the proposal is
+// about, so it has its own answer: the terminal's, or `--mcp`. `--yes` and a
+// run with no terminal are not one (carrick#1365).
+test("an editor file is written only for an editor somebody named", async () => {
+  const offered = [
+    { name: "Cursor", file: "/home/dev/.cursor/mcp.json", installed: true },
+    { name: "Windsurf", file: "/home/dev/.codeium/windsurf/mcp_config.json", installed: false },
+  ];
+  const asked: { initial: string[]; required: boolean }[] = [];
+  const out = recordingOutput({
+    choose: async (_question, _noun, options, config) => {
+      asked.push({ initial: [...config.initial], required: config.required });
+      return options.map((option) => option.value);
+    },
+  });
+  const none = { editors: [], assumeYes: false, interactive: false };
+  assert.deepEqual(await chooseEditors(offered, none, out), []);
+  assert.deepEqual(await chooseEditors(offered, { ...none, interactive: true, assumeYes: true }, out), []);
+  assert.deepEqual(asked, []);
+
+  // The flag names them, in the casing init prints, once each.
+  assert.deepEqual(await chooseEditors(offered, { ...none, editors: ["cursor", "Cursor"] }, out), ["Cursor"]);
+  await assert.rejects(
+    chooseEditors(offered, { ...none, editors: ["Zed"] }, out),
+    /--mcp Zed names no editor configured on this machine\. The ones here are: Cursor, Windsurf\./,
+  );
+
+  // The terminal asks, ticking only what is detected, and takes none for an answer.
+  assert.deepEqual(await chooseEditors(offered, { ...none, interactive: true }, out), ["Cursor", "Windsurf"]);
+  assert.deepEqual(asked, [{ initial: ["Cursor"], required: false }]);
+  assert.deepEqual(await chooseEditors([], { ...none, interactive: true }, out), []);
+
+  assert.equal(editorClause(offered, ["Cursor"]), ", and add Carrick to /home/dev/.cursor/mcp.json");
+  assert.equal(editorClause(offered, []), "");
 });
 
 test("the connected repos are one line however many there are", () => {
