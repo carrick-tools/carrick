@@ -660,7 +660,7 @@ mod tests {
     /// beside it on purpose, and `carrick resume` cannot find a job without
     /// it. A field renamed here reads as a `jobs.json` that was never written:
     /// [`read`] swallows every error and answers "no jobs", `carrick status`
-    /// says nothing is in flight, and the paid answers are simply unreachable.
+    /// says nothing is in flight, and the answers it names are unreachable.
     ///
     /// Checked in verbatim as this release wrote it, so the next release has
     /// to read it or turn this red. Every field is asserted rather than

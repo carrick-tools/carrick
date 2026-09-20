@@ -3057,8 +3057,8 @@ const data = await fetch('/api/users').then(resp => resp.json());
     /// `analysis_job::body_id`, exactly what the cloud's analysis cache hashes,
     /// and exactly the `id` a job's answers come back under. A byte moved
     /// anywhere in one of these sections renames every prompt that carries it,
-    /// so a job in flight misses on those rows and is paid for twice
-    /// (carrick#1248).
+    /// so a job in flight misses on those rows and the model is asked the whole
+    /// question over again (carrick#1248).
     ///
     /// A deliberate change updates this constant in the same PR, and the PR
     /// body says in-flight jobs will miss.
