@@ -23,7 +23,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { runCheck } from '../src/capture/index.js';
-import { buildProbe } from '../src/capture/check-probe.js';
+import { buildProbe, decisiveAssignmentLine } from '../src/capture/check-probe.js';
 import type { CheckPairSpec, CheckStubInput } from '../src/capture/api.js';
 
 let root: string;
@@ -133,7 +133,7 @@ describe('check_v2: abnormal tsc termination is never read as compatible', () =>
     const probeFile = `packages/carrick-probes/probes/${plan.fileName}`;
     const tscPath = fakeTsc(
       'tsc-type-error',
-      `echo "${probeFile}(${plan.assignmentLine},7): error TS2322: Type 'A' is not assignable to type 'B'."; exit 1`
+      `echo "${probeFile}(${decisiveAssignmentLine(plan)},7): error TS2322: Type 'A' is not assignable to type 'B'."; exit 1`
     );
     const result = await runCheck({ stubs, pairs: PAIRS, tscPath });
     assert.strictEqual(result.success, true);

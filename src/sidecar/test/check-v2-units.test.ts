@@ -14,6 +14,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   buildProbe,
+  decisiveAssignmentLine,
   directionFor,
   fnv1a,
   pairId,
@@ -117,6 +118,29 @@ describe('graphql probe shape (resolver-return envelope unwrap)', () => {
   });
 });
 
+// carrick-tools/carrick-cloud#1119: an http payload is serialised before it
+// travels, so the probe asks tsc a second question about the form that arrives.
+describe('the JSON wire assignment', () => {
+  it('an http probe sends the same value again in its serialised form', () => {
+    const plan = buildProbe(spec({ protocol: 'http' }), PKG);
+    assert.ok(plan.wireAssignmentLine, 'an http pair must carry a wire assignment');
+    const lines = plan.source.split('\n');
+    assert.strictEqual(
+      lines[plan.wireAssignmentLine! - 1],
+      'const expectedWire: Expected = sentWire;'
+    );
+    assert.strictEqual(decisiveAssignmentLine(plan), plan.wireAssignmentLine);
+  });
+
+  it('a protocol that does not serialise has no wire assignment to judge', () => {
+    for (const protocol of ['socket', 'pubsub', 'graphql'] as const) {
+      const plan = buildProbe(spec({ protocol }), PKG);
+      assert.strictEqual(plan.wireAssignmentLine, undefined, protocol);
+      assert.strictEqual(decisiveAssignmentLine(plan), plan.assignmentLine, protocol);
+    }
+  });
+});
+
 describe('four-bucket classifier precedence', () => {
   const plan = buildProbe(spec(), PKG);
   const scrubCtx = { workspaceRoot: '/tmp/ws', packageLabelOf: () => undefined };
@@ -158,7 +182,9 @@ describe('four-bucket classifier precedence', () => {
     it('an incompatible verdict is equally a fact when both sides are known', () => {
       const v = classifyPair({
         plan,
-        probeDiags: [diag(plan.assignmentLine, 2741, "Property 'b' is missing in type 'X'.")],
+        probeDiags: [
+          diag(decisiveAssignmentLine(plan), 2741, "Property 'b' is missing in type 'X'."),
+        ],
         poisonReason: noPoison,
         scrubCtx,
         deepFindings: clean,
@@ -210,7 +236,7 @@ describe('four-bucket classifier precedence', () => {
     const v = classifyPair({
       plan,
       probeDiags: [
-        diag(plan.assignmentLine, 2741, "Property 'b' is missing in type 'X'."),
+        diag(decisiveAssignmentLine(plan), 2741, "Property 'b' is missing in type 'X'."),
       ],
       poisonReason: noPoison,
       scrubCtx,
@@ -218,6 +244,56 @@ describe('four-bucket classifier precedence', () => {
     assert.strictEqual(v.bucket, 'incompatible');
     assert.match(v.diagnostic!, /Property 'b' is missing/);
     assert.deepStrictEqual(v.codes, [2741]);
+  });
+
+  // carrick-tools/carrick-cloud#1119. The declared forms disagree only over
+  // what serialisation changes (a `Date` read as the string it becomes), so the
+  // wire line is clean and there is no drift to report.
+  it('a mismatch on the declared line that the wire line clears is compatible', () => {
+    const v = classifyPair({
+      plan,
+      probeDiags: [diag(plan.assignmentLine, 2322, "Type 'Date' is not assignable to type 'string'.")],
+      poisonReason: noPoison,
+      scrubCtx,
+      deepFindings: { sent: [], expected: [] },
+    });
+    assert.strictEqual(v.bucket, 'compatible');
+    assert.strictEqual(v.diagnostic, undefined);
+  });
+
+  // A diagnostic that is not a mismatch (an instantiation-depth error, say)
+  // leaves the wire form unjudged on either line, so a clean read is not
+  // evidence of agreement.
+  it('a non-assignment diagnostic on either assignment line is unverifiable', () => {
+    for (const line of [plan.assignmentLine, decisiveAssignmentLine(plan)]) {
+      const v = classifyPair({
+        plan,
+        probeDiags: [diag(line, 2589, 'Type instantiation is excessively deep.')],
+        poisonReason: noPoison,
+        scrubCtx,
+      });
+      assert.strictEqual(v.bucket, 'unverifiable', `line ${line}`);
+      assert.strictEqual(v.gate, 'assignment:other');
+    }
+  });
+
+  // Hiding a proven mismatch behind an unverifiable is the failure this
+  // branch exists to avoid: the serialised form could not be computed, but
+  // the declared forms were judged and they disagree.
+  it('a wire line that could not be judged falls back to the declared verdict', () => {
+    const v = classifyPair({
+      plan,
+      probeDiags: [
+        diag(plan.assignmentLine, 2322, "Type 'A' is not assignable to type 'B'."),
+        diag(decisiveAssignmentLine(plan), 2589, 'Type instantiation is excessively deep.'),
+      ],
+      poisonReason: noPoison,
+      scrubCtx,
+      deepFindings: { sent: [], expected: [] },
+    });
+    assert.strictEqual(v.bucket, 'incompatible');
+    assert.match(v.diagnostic!, /not assignable/);
+    assert.match(v.diagnostic!, /serialised form of the sent type could not be computed/);
   });
 
   it('IsAny gate (TS2344) -> gate_caught_baked_any on the right side', () => {
@@ -314,7 +390,7 @@ describe('four-bucket classifier precedence', () => {
   it('stub poison for THIS alias outranks everything -> unverifiable', () => {
     const v = classifyPair({
       plan,
-      probeDiags: [diag(plan.assignmentLine, 2741)],
+      probeDiags: [diag(decisiveAssignmentLine(plan), 2741)],
       // #438 part 2: poison is scoped to a (service, alias); the producer
       // alias here is poisoned, so it wins over the assignment error.
       poisonReason: (svc, alias) =>

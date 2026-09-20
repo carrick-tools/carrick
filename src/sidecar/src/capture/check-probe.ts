@@ -7,6 +7,12 @@
  * conditional-type relation diverges around `any`, and because the compiler's
  * elaborated assignment error is the user-facing mismatch report.
  *
+ * An `http` pair carries a SECOND assignment of the same value in the form JSON
+ * puts on the wire, and that one decides the bucket (see `wireAssignmentLine`):
+ * a payload is serialised before it travels, so the declared types are not what
+ * meet each other. Both questions go to the same judge; nothing here decides a
+ * verdict.
+ *
  * GraphQL pairs additionally unwrap the producer's resolver-return ENVELOPE
  * before the assignment (see the `graphql` branch in `buildProbe`): a GraphQL
  * producer's captured type is the resolver function's return type with
@@ -112,8 +118,25 @@ export interface ProbePlan {
   importLines: number[];
   /** 1-based line -> gate name. TS2344 here => baked-any / unverifiable. */
   gateLines: Map<number, GateName>;
-  /** 1-based line of the value-level assignment. Errors here => incompatible. */
+  /** 1-based line of the value-level assignment of the DECLARED sent type. */
   assignmentLine: number;
+  /**
+   * 1-based line of the second assignment, which sends the same value in the
+   * form JSON puts on the wire (carrick-tools/carrick-cloud#1119). Present for
+   * `http` pairs, whose payload is serialised; absent for every other
+   * protocol, where the declared form is what travels.
+   *
+   * This is the DECISIVE line when present: the comparand short-circuits to
+   * the declared type whenever that already assigns, so an error here means
+   * the shapes disagree in both forms, and no error here means they agree in
+   * the form that actually travels.
+   */
+  wireAssignmentLine?: number;
+}
+
+/** The assignment line whose diagnostic decides the bucket. */
+export function decisiveAssignmentLine(plan: ProbePlan): number {
+  return plan.wireAssignmentLine ?? plan.assignmentLine;
 }
 
 /**
@@ -242,6 +265,39 @@ export function buildProbe(
     assignmentLine = push(`const expected: Expected = sent;`);
   }
 
+  // The JSON wire line (carrick-tools/carrick-cloud#1119). An `http` payload is
+  // serialised before it travels, and `JSON.stringify` writes a value's
+  // `toJSON()` RESULT: a producer's `Date` arrives at the consumer as the
+  // string it serialises to, so comparing the DECLARED `Date` against a
+  // correctly-declared `string` reports a drift that cannot happen. The
+  // transform is applied to the SENT side in BOTH directions, which is where
+  // serialisation happens: a consumer that sends a `Date` in a request body
+  // likewise delivers a string, so a producer declaring `Date` there is a real
+  // mismatch and stays one.
+  //
+  // `WireSent` short-circuits to the declared type when that already assigns,
+  // so a pair that agrees as declared never instantiates the mapped type (no
+  // cost, and no way for the transform to turn an agreeing pair into a
+  // disagreeing one). tsc stays the judge of both forms.
+  let wireAssignmentLine: number | undefined;
+  if (spec.protocol === 'http') {
+    push(`type JsonWireDepth = [never, 0, 1, 2, 3, 4, 5, 6];`);
+    push(
+      `type JsonWire<T, D extends number = 6> = [D] extends [never] ? T : T extends { toJSON: (...args: any[]) => infer R } ? JsonWire<R, JsonWireDepth[D]> : T extends (...args: any[]) => any ? T : T extends object ? { [K in keyof T]: JsonWire<T[K], JsonWireDepth[D]> } : T;`
+    );
+    // Keep the DECLARED type whenever serialising changes nothing observable,
+    // so the compiler's headline still names the real surface alias (the probe
+    // prints `Sent`, which the scrub rewrites) instead of expanding a mapped
+    // type structurally. Only a pair whose payload really is transformed loses
+    // that name — and there the declared name no longer describes what travels.
+    push(`type JsonWireSame<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;`);
+    push(
+      `type WireSent = [Sent] extends [Expected] ? Sent : (JsonWireSame<JsonWire<Sent>, Sent> extends true ? Sent : JsonWire<Sent>);`
+    );
+    push(`declare const sentWire: WireSent;`);
+    wireAssignmentLine = push(`const expectedWire: Expected = sentWire;`);
+  }
+
   return {
     pairId: id,
     spec,
@@ -253,5 +309,6 @@ export function buildProbe(
     importLines,
     gateLines,
     assignmentLine,
+    wireAssignmentLine,
   };
 }

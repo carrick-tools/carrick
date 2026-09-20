@@ -29,38 +29,53 @@ export interface PairDeepFindings {
   expected: TypeProvenance[];
 }
 
-/**
- * Walk both sides of every probe in the assembled workspace.
- *
- * Returns an empty map when the program cannot be built — absence of findings
- * must never be read as "clean", so the caller treats a missing entry as
- * unresolved rather than resolved.
- */
-export function probeDeepFindings(
+/** The one compiler program over the assembled probes, shared by every
+ * post-judge walk (fact-ness, and the field-level report the mismatch text
+ * names). Built once: two `createProgram` calls over the same file set would
+ * double the check phase's most expensive step and could not disagree usefully
+ * anyway. `undefined` when it cannot be built at all. */
+export interface ProbeProgram {
+  program: ts.Program;
+  checker: ts.TypeChecker;
+  probesDir: string;
+}
+
+export function openProbeProgram(
   probesDir: string,
   plans: ProbePlan[]
-): Map<string, PairDeepFindings> {
-  const results = new Map<string, PairDeepFindings>();
-  if (plans.length === 0) return results;
-
+): ProbeProgram | undefined {
+  if (plans.length === 0) return undefined;
   const configPath = path.join(probesDir, 'tsconfig.json');
-  if (!fs.existsSync(configPath)) return results;
-
-  let program: ts.Program;
+  if (!fs.existsSync(configPath)) return undefined;
   try {
     const raw = ts.readConfigFile(configPath, (f) => fs.readFileSync(f, 'utf8'));
-    if (raw.error) return results;
+    if (raw.error) return undefined;
     const parsed = ts.parseJsonConfigFileContent(raw.config, ts.sys, probesDir);
     const fileNames = plans
       .map((plan) => path.join(probesDir, 'probes', plan.fileName))
       .filter((f) => fs.existsSync(f));
-    if (fileNames.length === 0) return results;
-    program = ts.createProgram(fileNames, { ...parsed.options, noEmit: true });
+    if (fileNames.length === 0) return undefined;
+    const program = ts.createProgram(fileNames, { ...parsed.options, noEmit: true });
+    return { program, checker: program.getTypeChecker(), probesDir };
   } catch {
-    return results;
+    return undefined;
   }
+}
 
-  const checker = program.getTypeChecker();
+/**
+ * Walk both sides of every probe in the assembled workspace.
+ *
+ * Returns an empty map when the program could not be built — absence of
+ * findings must never be read as "clean", so the caller treats a missing entry
+ * as unresolved rather than resolved.
+ */
+export function probeDeepFindings(
+  opened: ProbeProgram | undefined,
+  plans: ProbePlan[]
+): Map<string, PairDeepFindings> {
+  const results = new Map<string, PairDeepFindings>();
+  if (!opened) return results;
+  const { program, checker, probesDir } = opened;
   for (const plan of plans) {
     const file = program.getSourceFile(path.join(probesDir, 'probes', plan.fileName));
     if (!file) continue;

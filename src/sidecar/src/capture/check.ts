@@ -42,7 +42,8 @@ import {
   type AssembledWorkspace,
 } from './check-workspace.js';
 import { buildPoisonIndexes, type StubPoisonIndex } from './check-poison.js';
-import { probeDeepFindings } from './check-deep.js';
+import { openProbeProgram, probeDeepFindings } from './check-deep.js';
+import { pairFieldReports } from './check-fields.js';
 
 export type CheckProgress = (phase: CheckProgressPhase, message: string) => void;
 
@@ -360,7 +361,12 @@ export async function runCheck(
   // carries a member-level any/unknown HERE — after install, where the capture
   // could not look (carrick#450). It sets `resolved` and nothing else; no
   // bucket depends on it.
-  const deepByPair = probeDeepFindings(ws.probesDir, probing);
+  const probeProgram = openProbeProgram(ws.probesDir, probing);
+  const deepByPair = probeDeepFindings(probeProgram, probing);
+  // The same program answers which FIELDS differ on a pair the judge called
+  // incompatible (carrick-tools/carrick-cloud#1118). It names what the verdict
+  // is about; it never decides one.
+  const fieldsByPair = pairFieldReports(probeProgram, probing);
 
   const verdicts = sortVerdicts([
     ...probing.map((plan) =>
@@ -370,6 +376,7 @@ export async function runCheck(
         poisonReason,
         scrubCtx,
         deepFindings: deepByPair.get(plan.pairId),
+        fieldReport: fieldsByPair.get(plan.pairId),
       })
     ),
     ...preGated,
