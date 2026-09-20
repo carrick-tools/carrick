@@ -21,10 +21,20 @@
 import { spawn } from "node:child_process";
 import { parseStatusResult } from "../contract.ts";
 import { nativeEnv, resolveNativeBinary } from "../native.ts";
-import type { StepReport } from "./output.ts";
+import { elapsed, parseMarker } from "../scan.ts";
+import type { StepProgress, StepReport } from "./output.ts";
 
-/** One run of the scanner binary, injected so tests spawn nothing. */
-export type NativeRun = (args: string[]) => Promise<{
+/**
+ * One run of the scanner binary, injected so tests spawn nothing.
+ *
+ * `watch` asks for the run's progress markers: the download is the one call
+ * here that takes minutes, and `status --json` is a read whose output is the
+ * answer rather than a thing to draw.
+ */
+export type NativeRun = (
+  args: string[],
+  watch?: boolean,
+) => Promise<{
   status: number | null;
   stdout: string;
   stderr: string;
@@ -50,7 +60,11 @@ export type HostedDownload =
  * in a sentence of its own. Its stdout is the index map, which this command
  * summarises in its own words, so that is captured and dropped.
  */
-function spawnNative(args: string[], quiet: boolean): Promise<{ status: number | null; stdout: string; stderr: string }> {
+function spawnNative(
+  args: string[],
+  quiet: boolean,
+  progress: StepProgress | null,
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
   const native = resolveNativeBinary();
   if (!native.binary) {
     return Promise.resolve({
@@ -59,13 +73,18 @@ function spawnNative(args: string[], quiet: boolean): Promise<{ status: number |
       stderr: native.problem ?? "The Carrick scanner is not installed.",
     });
   }
+  const watching = progress !== null;
   return new Promise((resolve) => {
     const child = spawn(native.binary as string, args, {
-      env: nativeEnv(),
+      // The markers are written only when a parent asks for them, so a run
+      // nobody is watching is unchanged (`src/progress.rs`).
+      env: watching ? { ...nativeEnv(), CARRICK_PROGRESS: "1" } : nativeEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
+    let rest = "";
+    const report = progress === null ? null : downloadProgress(progress);
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       stdout += chunk;
@@ -75,16 +94,73 @@ function spawnNative(args: string[], quiet: boolean): Promise<{ status: number |
       // Bounded: a scan of a large workspace prints thousands of lines, and
       // all this holds them for is the sentence at the end.
       stderr = `${stderr}${chunk}`.slice(-8192);
+      if (report !== null) {
+        const lines = (rest + chunk).split("\n");
+        rest = lines.pop() ?? "";
+        for (const line of lines) report(line);
+      }
       // Quiet under a spinner: a spinner owns its line and rewrites it, and a
       // scanner line landing in the middle of that is a corrupted terminal.
       // Where there is no spinner — a pipe, CI, an agent shell — the progress
-      // is the only sign a minutes-long read is alive (carrick#1021).
-      if (!quiet && !args.includes("--json")) process.stderr.write(chunk);
+      // is the only sign a minutes-long read is alive (carrick#1021). The
+      // marker lines are the spinner's own input and are never written through.
+      if (!quiet && !args.includes("--json")) process.stderr.write(withoutMarkers(chunk));
     });
     child.on("error", (error) => resolve({ status: 1, stdout: "", stderr: error.message }));
     child.on("close", (code) => resolve({ status: code, stdout, stderr }));
   });
 }
+
+/** A chunk with the machine-readable lines taken out of it. */
+function withoutMarkers(chunk: string): string {
+  if (!chunk.includes("@carrick-")) return chunk;
+  return chunk
+    .split("\n")
+    .filter((line) => parseMarker(line) === null)
+    .join("\n");
+}
+
+/**
+ * What the download says while it runs: how far through, and how long so far.
+ *
+ * Read off the scanner's own markers rather than timed here, because only the
+ * scanner knows what it is on (`src/progress.rs`). Two counts arrive: the
+ * services of this workspace it has finished, which is the one a reader asked
+ * for, and the files inside the one it is on, which is the one that moves.
+ *
+ * No estimate of what is left. An estimate needs work remaining and a measured
+ * rate for it, and neither is available here: the hosted half is two requests
+ * for the whole workspace, so there are no bytes remaining to divide, and the
+ * local half is a re-scan whose services differ in size by two orders of
+ * magnitude (carrick#1365). A number that cannot be derived is not shown.
+ */
+export function downloadProgress(say: StepProgress, now: () => number = Date.now): (line: string) => void {
+  const startedAt = now();
+  let services = "";
+  let bytes = "";
+  return (line: string): void => {
+    const marker = parseMarker(line);
+    if (marker === null) return;
+    if (marker.kind === "progress") {
+      const update = marker.update;
+      services = `${update.service_index} of ${update.service_total} services`;
+      say([DOWNLOAD_LABEL, `${services}${bytes}, ${elapsed((now() - startedAt) / 1000)}`].join(": "));
+      return;
+    }
+    // The hosted half says how much it read; the scanner states it as a notice
+    // because it is one fact, once, not a count that ticks.
+    if (marker.kind === "notice" && marker.text.startsWith(HOSTED_BYTES)) {
+      bytes = `, ${marker.text.slice(HOSTED_BYTES.length)}`;
+      say([DOWNLOAD_LABEL, `${services || "reading"}${bytes}, ${elapsed((now() - startedAt) / 1000)}`].join(": "));
+    }
+  };
+}
+
+/** The label the step carries, and the stem of every line it writes. */
+export const DOWNLOAD_LABEL = "Downloading your index";
+
+/** The notice prefix the scanner states the hosted read's size under. */
+export const HOSTED_BYTES = "hosted bytes ";
 
 /** The first line of a failure, for a sentence that has to fit on one. */
 function firstLine(text: string, fallback: string): string {
@@ -103,8 +179,8 @@ function firstLine(text: string, fallback: string): string {
  * one — a pipe, CI, an agent's shell — the progress is the only sign a
  * minutes-long read is alive (carrick#1021, carrick#1026).
  */
-export function nativeRunner(quiet: boolean): NativeRun {
-  return (args) => spawnNative(args, quiet);
+export function nativeRunner(quiet: boolean, progress: StepProgress | null = null): NativeRun {
+  return (args, watch = false) => spawnNative(args, quiet, watch ? progress : null);
 }
 
 /**
@@ -118,7 +194,7 @@ export async function downloadHostedIndex(
   workspace: string,
   run: NativeRun = nativeRunner(false),
 ): Promise<HostedDownload> {
-  const refreshed = await run(["refresh", "--workspace", workspace]);
+  const refreshed = await run(["refresh", "--workspace", workspace], true);
   if (refreshed.status !== 0) {
     return { kind: "failed", problem: firstLine(refreshed.stderr, "the scanner gave no reason") };
   }

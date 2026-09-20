@@ -49,6 +49,7 @@
     "build": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
+    "@clack/core": "1.5.1",
     "@clack/prompts": "1.8.1",
     "picocolors": "1.1.1",
     "pnpm": "10.34.5",

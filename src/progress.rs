@@ -98,11 +98,36 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Where this scan's services sit in the workspace its parent is building.
+///
+/// A workspace build runs one scan per repo, and each of those counts its own
+/// services from one. So a fifteen-service folder counted "1 of 3", then "1 of
+/// 5", then "1 of 2" — three little runs, where the reader is waiting on one
+/// long one (carrick#1365). The parent knows both numbers before it starts, so
+/// it states them here and every child reports in the workspace's terms.
+pub const OFFSET_ENV: &str = "CARRICK_PROGRESS_OFFSET";
+pub const TOTAL_ENV: &str = "CARRICK_PROGRESS_TOTAL";
+
+fn workspace_position(index: usize, total: usize) -> (usize, usize) {
+    let read = |name: &str| std::env::var(name).ok()?.parse::<usize>().ok();
+    match (read(OFFSET_ENV), read(TOTAL_ENV)) {
+        // A total smaller than what this scan already counted is a total this
+        // build cannot stand behind: the parent read the configs and the scan
+        // found more services than they declared. The scan's own numbers are
+        // the ones that happened.
+        (Some(offset), Some(workspace)) if offset + total <= workspace => {
+            (offset + index, workspace)
+        }
+        _ => (index, total),
+    }
+}
+
 /// Name the service the following updates are about, and reset the throttle.
 pub fn service_started(label: &str, index: usize, total: usize) {
     if !enabled() {
         return;
     }
+    let (index, total) = workspace_position(index, total);
     if let Ok(mut service) = SERVICE.lock() {
         *service = Some((label.to_string(), index, total));
     }
@@ -364,6 +389,25 @@ pub fn parse_summary(line: &str) -> Option<Summary> {
 
 /// The prefix of the line a scan states a notice on.
 const NOTICE_MARKER: &str = "@carrick-notice ";
+
+/// The prefix the hosted read's size is stated under, and the reason it is a
+/// notice rather than a count of its own.
+///
+/// The hosted half of a build is two requests for the whole workspace — one
+/// `resolve-repos`, one `get-cross-repo-data` per project — so there is
+/// nothing per service to tick, and how much arrived is one fact, stated once
+/// (carrick#1365). The npm renderer matches this prefix.
+const HOSTED_BYTES: &str = "hosted bytes ";
+
+/// Say how much of the hosted index came down, in the units a person reads.
+pub fn hosted_bytes(bytes: usize) {
+    let read = if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else {
+        format!("{} kB", bytes.div_ceil(1024))
+    };
+    announce(&format!("{HOSTED_BYTES}{read}"));
+}
 
 #[derive(Serialize, Deserialize)]
 struct Notice {
