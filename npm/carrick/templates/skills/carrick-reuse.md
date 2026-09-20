@@ -7,8 +7,8 @@ description: Use at the end of a task that added or changed functions, and whene
 
 {{SCOPE_NOTE}}
 
-`find_similar` does the comparison. Your work is to read both spans and class
-each pair.
+`find_similar` does the comparison. Your work is to read the spans it names
+and class every row it returned.
 
 ## Targeted: the functions this task added or changed
 
@@ -26,10 +26,13 @@ An entry is either a `name` with a `file` for a function the index holds, or a
 the other in an entry, never both. A `name` that matches more than one
 definition comes back with its candidates on that entry's `error`.
 
-The two kinds are scored on different scales and the response states both
-floors: 0.85 between two indexed functions, 0.45 for a description. A stored
-vector carries the function's name in front of its intent and a bare sentence
-does not, so a description scoring 0.5 is a hit worth reading.
+The two kinds are scored on different scales, and each result states the floor
+it was ranked against. `vector_basis` says what the cosines are over. On
+`intent` the vector is the intent sentence alone, and a copy somebody renamed
+scores as close as one that kept its name. On `name_anchored` the function's
+name sits in front of the sentence, a renamed copy scores lower, and
+`intent_text` is the signal that still finds it. Read every score against the
+floor and the basis in the answer you got.
 
 ## Audit: the whole project
 
@@ -38,9 +41,8 @@ find_similar({{SCOPE}})
 ```
 
 `clusters` groups functions that describe the same behaviour, ordered by size.
-Page with `offset: <next_offset>` while `has_more` is true. A group is
-transitive, so `lowest_similarity` can sit under the floor and a large group can
-hold more than one idea.
+Call again with `offset: <next_offset>` for as long as the response carries
+`has_more`, and class what every page returned.
 
 Where the project is larger than one pass, the response carries `error` in place
 of clusters and names the two routes under the ceiling: a `service`, or a higher
@@ -48,15 +50,27 @@ of clusters and names the two routes under the ceiling: a `service`, or a higher
 `truncated` is present the audit is partial, and its `scanned_functions` of `of`
 says by how much.
 
-## Class each pair
+## Class every row
 
-Read both spans in source, then class:
+Every row the answer returned is classed here. In an audit the first member of a
+cluster is what the rest of that cluster is classed against; in a targeted call
+it is the function you asked about. Read that span at the file and line the
+response gave, read each other row the same way, and take the first of these
+that holds:
 
-- **DUPLICATE**: the same behaviour, and one call site could use the other.
-- **VARIANT**: near neighbours that cannot share an implementation. Say in one
-  line why they cannot.
-- **FALSE POSITIVE**: the index describes them alike and the code does different
-  work.
+- **FALSE POSITIVE**: the two contracts differ. Different inputs, a different
+  result, or a different effect, and the intent sentences alone brought them
+  together.
+- **VARIANT**: one contract, and a behavioural difference you can name in a
+  clause. A different normalisation, a different error path, a different
+  default. Write the clause in the row. Where a member's own comment names the
+  file it mirrors, the clause is "documented mirror".
+- **DUPLICATE**: one contract, and nothing left to name. Two bodies that run
+  the same once the identifiers are renamed land here.
+
+A cluster is transitive, so `lowest_similarity` can sit under the floor and a
+large group can hold more than one idea. A member that shares no contract with
+the first is FALSE POSITIVE on its own row, and stays in the table.
 
 `matched_on` says which signal joined a row. `similarity` is the intent vectors;
 `intent_text` is two identical intent sentences, which is the signal that still
@@ -64,17 +78,19 @@ finds a copy somebody renamed.
 
 ## Report
 
-| class | function | file:line | pair | why |
+One row per match, and per cluster member beyond the first. The class column
+carries one of the three words and is never empty.
+
+| class | member | file:line | against | why |
 |---|---|---|---|---|
-| DUPLICATE | slugify | src/text.ts:12 | src/util/url.ts:4 | same replacement rules |
+| DUPLICATE | slugify | src/util/url.ts:4 | src/text.ts:12 | same replacement rules |
+| VARIANT | slugTag | src/tags.ts:20 | src/text.ts:12 | documented mirror |
 
-Then relay the counts the response stated, in its numbers:
+State `total_clusters` from the response against the number of clusters carrying
+rows above. Where the two differ, name the clusters left out.
 
-- `compared_functions`, and `total_clusters` on an audit;
-- `not_compared`: `without_intent`, `intent_not_embedded`, `awaiting_embedding`,
-  `model_mismatch`;
-- `excluded`: `below_min_lines`, `tests`, `generated`, `callbacks`,
-  `other_service`.
+Then relay the counts the response stated, in its numbers: `compared_functions`,
+and every key the answer carries under `not_compared` and under `excluded`.
 
 Rows outside the comparison were not looked at, so an empty answer covers what
 was compared and nothing further.

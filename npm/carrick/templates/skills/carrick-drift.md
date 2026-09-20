@@ -74,7 +74,13 @@ against a `string` on the other is not a difference.
 | POST /api/orders | UNRESOLVED | NewOrder | OrderDraft | web/src/orders.ts:52 | unresolved; type texts differ on `note` |
 
 Class words, and only these: MATCH, DRIFT, UNRESOLVED, NOT JUDGED, CONSUMER
-UNTYPED, PRODUCER UNTYPED. A reading of the two type texts goes in the verdict
+UNTYPED, PRODUCER UNTYPED. Every operation the answer returned carries one of
+them, the class column is never empty, and the report states operations returned
+against operations classed. Where more than one word fits an operation, the row
+takes the first that applies of DRIFT, PRODUCER UNTYPED, CONSUMER UNTYPED,
+UNRESOLVED, NOT JUDGED, MATCH, because a stored incompatible verdict is the
+finding and a side carrying no type is why nothing past it could be judged.
+A reading of the two type texts goes in the verdict
 column beside the stored state, in the words "type texts differ", so nothing in
 the table reads as a verdict the index did not give you.
 

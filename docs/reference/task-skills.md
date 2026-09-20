@@ -21,7 +21,7 @@ and is untouched by everything below.
 | `carrick-impact` | Before changing or removing a route, a handler, a response shape, an event, or a function other code calls. Also on "who calls this" and "what breaks if I change it" | `get_operation`, `get_callers`, `check_compatibility`, and `carrick check <file> --recheck --json` for a file already edited in the working tree |
 | `carrick-reuse` | At the end of a task that added or changed functions, and on "does this already exist" or "where have we built this twice" | `find_similar`, targeted with up to 20 entries, or in audit mode with none |
 | `carrick-drift` | Before changing a request or response type, and when a compatibility verdict names a problem with no location | `get_service_graph` for the pairs, then `get_contract_pair` per pair |
-| `carrick-census` | "Every place that does X" questions | `search_by_intent` twice, once worded by purpose and once by mechanism, paged to the end |
+| `carrick-census` | "Every place that does X" questions | `search_by_intent` asked in two wordings, purpose and mechanism, paged to the end |
 
 Each one reports a table first, with a file and line on every row and a fixed
 set of class words (DUPLICATE, VARIANT, FALSE POSITIVE; MATCH, DRIFT,
@@ -33,6 +33,33 @@ no verdict at all, is classed, and its two type texts are read against each
 other and reported as "type texts differ" rather than as a verdict.
 Each relays the counts its tool stated about what it did not look at. None of
 them edits code unless asked, and each ends by offering one issue per finding.
+
+## Classing, and what makes it unskippable
+
+A class word the body defines and nothing applies is a class word the write-up
+leaves off the hard rows, which is what carrick#1349 measured. Three properties
+hold the class column to the tool's answer, and the skill tests pin them.
+
+Every row the tool returned carries a class, and the column is never empty. In
+`carrick-reuse` the rows are the matches of a targeted call and every cluster
+member beyond the first, classed against the function asked about or against the
+cluster's first member. In `carrick-impact` they are the consumer call sites, and
+in `carrick-drift` the operations.
+
+The tests are mechanical and ordered, so the first that holds decides and two
+words cannot describe the same row equally well. `carrick-reuse` reads both
+spans and takes a different contract as FALSE POSITIVE, one contract with a
+behavioural difference it can name in a clause as VARIANT, and one contract with
+nothing left to name as DUPLICATE. A copy whose own comment names the file it
+mirrors is a VARIANT whose clause is "documented mirror"; `find_similar` carries
+no field for that, and the evidence is in the span it points at.
+`carrick-drift`, where a stored verdict and an untyped side both fit, takes the
+first of DRIFT, PRODUCER UNTYPED, CONSUMER UNTYPED, UNRESOLVED, NOT JUDGED,
+MATCH.
+
+A partial write-up is visible in the report. Each body pages its tool to the end
+and states rows returned against rows classed, so a table that stops short says
+so in its own numbers.
 
 ## Where they are written
 
@@ -178,3 +205,13 @@ The bodies name MCP tools, and a skill that names a tool the deployed server
 does not serve is a skill that fails on its first step. `find_similar` and
 `get_contract_pair` reach users with the cloud deploy that serves them, so the
 release carrying these skills follows that deploy.
+
+A field is a softer case than a tool, because the package can reach a user on
+either side of the deploy that serves it, so a body reads what its answer
+carries rather than asserting a shape. `carrick-reuse` takes `vector_basis` from
+the answer instead of assuming which of the two stored vectors the cosines run
+over, and relays whatever keys `not_compared` and `excluded` hold rather than a
+list written here. `carrick-census` asks both wordings on one call with
+`also_phrased_as` and falls back to a call per wording where the answer carries
+no `phrasings`, and it reports `hidden_by_threshold` where the answer carries
+it.

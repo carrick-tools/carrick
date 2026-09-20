@@ -83,7 +83,9 @@ One table, then the detail.
 | admin-ui | src/api/orders.ts:44 | INCOMPATIBLE | fact |
 
 Verdict words, and only these: COMPATIBLE, INCOMPATIBLE, UNRESOLVED,
-NOT COMPARED. In the same message, state:
+NOT COMPARED. Every consumer call site the answers returned carries one of them
+and the verdict column is never empty, and the report states call sites returned
+against call sites given a verdict. In the same message, state:
 
 - the producers, with file and line;
 - unmatched calls and near misses, listed apart from consumers;
