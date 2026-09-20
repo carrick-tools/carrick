@@ -370,7 +370,11 @@ test("a settings file holding last version's entries is a finding, not a pass", 
   const noSessionStart = workspace({ ".claude/settings.json": settings("Write|Edit|MultiEdit") });
   const lines = checkHooks(noSessionStart, onPath);
   assert.equal(findingCount(lines), 1, texts(lines).join("\n"));
+  // Both of the entries that settings file lacks are named, so a check that
+  // learns a new entry (the Stop nudge, carrick#1330) reports it without a
+  // line of its own here.
   assert.match(lines[0]!.text, /not the ones this version installs: SessionStart/);
+  assert.match(lines[0]!.text, /Stop `carrick hook stop`/);
 
   // A matcher that no longer covers every editing tool is the same failure:
   // the entry is ours, it runs, and it never fires on a MultiEdit.

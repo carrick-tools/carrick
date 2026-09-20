@@ -301,6 +301,29 @@ pub struct Recheck {
     /// Why the re-check did not run, on a `none`. One sentence, for a log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Functions this file declares in the working tree that the index does
+    /// not hold under that name (carrick#1330).
+    ///
+    /// The re-check already re-extracts the file, so this costs one set
+    /// difference on top of work that has been done. Empty on a `none` — a
+    /// re-check that did not run extracted nothing to compare — and empty,
+    /// which is the usual answer, when the edit added no function.
+    ///
+    /// It is a NAME comparison against one commit, and both halves of that
+    /// matter to a reader: the index holds no body hash, so a renamed or
+    /// rewritten function is a new name here, and the commit it is compared
+    /// against is `index_commit` on the answer around this block.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_functions: Vec<NewFunction>,
+}
+
+/// One function the working tree declares and the index does not.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NewFunction {
+    /// As the source spells it: `name`, or `Class.member`.
+    pub name: String,
+    /// Where it starts, so a reader can open it without searching.
+    pub line: u32,
 }
 
 impl Recheck {
@@ -325,6 +348,27 @@ impl Recheck {
                 self.elapsed_ms
             ),
         }
+    }
+
+    /// The line naming the functions the index does not hold, or none.
+    ///
+    /// Separate from [`Self::line`] so a reader that prints one does not have
+    /// to print the other: this says nothing about a verdict, and the two
+    /// answer different questions about the same re-check.
+    pub fn new_functions_line(&self, index_commit: &str) -> Option<String> {
+        if self.new_functions.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = self
+            .new_functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        Some(format!(
+            "new since the index at {}: {}. Not in the index, so nothing has been compared against them.",
+            short_commit(index_commit),
+            names.join(", ")
+        ))
     }
 }
 
@@ -408,6 +452,10 @@ impl CheckOutput {
         if let Some(recheck) = &self.recheck {
             out.push_str(&recheck.line());
             out.push('\n');
+            if let Some(line) = recheck.new_functions_line(&self.index_commit) {
+                out.push_str(&line);
+                out.push('\n');
+            }
         }
         for line in &self.boundary_lines {
             out.push_str(line);
@@ -693,6 +741,7 @@ mod tests {
             elapsed_ms: 2543,
             stale_since: None,
             reason: None,
+            new_functions: Vec::new(),
         });
         let text = fresh.render();
         assert!(
@@ -711,6 +760,7 @@ mod tests {
             elapsed_ms: 10_004,
             stale_since: Some("2026-09-13T22:26:26Z".to_string()),
             reason: Some("the re-scan ran past the budget".to_string()),
+            new_functions: Vec::new(),
         });
         let text = degraded.render();
         assert!(text.contains("computed at 2026-09-13T22:26:26Z"), "{text}");

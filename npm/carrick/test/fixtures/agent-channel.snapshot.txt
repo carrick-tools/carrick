@@ -43,6 +43,9 @@ user-service at 6a1b2c3: 128 file(s) sent to the analyzer
   1 model endpoint(s) dropped in modules a routing convention claims
   types captured on a bare checkout: anything through a dependency is `any`
 
+### check-new-functions.json :: renderPostToolUse
+(silent)
+
 ### check-not-indexed.json :: renderPostToolUse
 (silent)
 

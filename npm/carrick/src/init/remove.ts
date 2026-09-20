@@ -36,6 +36,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { removeCredential, credentialPath } from "../auth/credentials.ts";
 import { installIdPath, removeInstallId } from "./install-id.ts";
+import { removeSessions, sessionsDir } from "../hook/reuse.ts";
 import { disconnectMcpClients, type McpRemoval } from "./mcp.ts";
 import { repoRoots } from "./repos.ts";
 import { removeCarrickHooks } from "./settings.ts";
@@ -237,6 +238,16 @@ export async function remove(argv: string[], out: InitOutput = createOutput()): 
     removed += 1;
   }
   for (const line of warn) out.warn(line);
+
+  // Before the install id, so the directory both live in can go with it: what
+  // the Stop hook speaks from is a scratch record of conversations that have
+  // ended, and it is no more use than the hook entry that fed it
+  // (carrick#1330).
+  const sessions = removeSessions();
+  if (sessions > 0) {
+    out.done(`${sessions} session record(s) removed from ${sessionsDir()}`);
+    removed += 1;
+  }
 
   // The install id goes with the entries that carried it: what the header
   // named is this machine's setup, and the setup is what just came off it. A

@@ -24,6 +24,7 @@ import {
 } from "../src/init/remove.ts";
 import { MCP_URL } from "../src/init/mcp.ts";
 import { INSTALL_ID_HEADER, installIdPath } from "../src/init/install-id.ts";
+import { sessionFile, sessionsDir } from "../src/hook/reuse.ts";
 
 const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 /** What this machine calls itself to the index, until this command deletes it. */
@@ -214,6 +215,16 @@ process.exit(0);
   fs.mkdirSync(path.dirname(installIdPath(home)), { recursive: true, mode: 0o700 });
   fs.writeFileSync(installIdPath(home), `${INSTALL_ID}\n`, { mode: 0o600 });
 
+  // A session record the Stop hook would have spoken from (carrick#1330). It
+  // shares `~/.carrick` with the install id, so leaving it behind also leaves
+  // that directory behind.
+  fs.mkdirSync(sessionsDir(home), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(
+    sessionFile("a-session", home)!,
+    `${JSON.stringify({ found: [{ name: "slugify", file: "src/util.ts", indexCommit: "abc" }], nudged: [], updated: "" })}\n`,
+    { mode: 0o600 },
+  );
+
   const credentials = path.join(root, "config", "carrick");
   fs.mkdirSync(credentials, { recursive: true, mode: 0o700 });
   fs.writeFileSync(
@@ -307,6 +318,7 @@ test("remove takes back what init wrote, lists what it will not touch, and says 
   assert.equal(settings.hooks.SessionStart.length, 1);
   assert.match(settings.hooks.SessionStart[0].hooks[0].command, /session-start\.sh/);
   assert.equal(settings.hooks.PostToolUse, undefined);
+  assert.equal(settings.hooks.Stop, undefined);
 
   // The client's own file keeps the server that is not ours, and the header
   // went with the entry it was on.
@@ -316,6 +328,10 @@ test("remove takes back what init wrote, lists what it will not touch, and says 
   // The id itself is gone, and the directory it was alone in with it: the
   // next `carrick init` is a new install (carrick-cloud#890).
   assert.equal(fs.existsSync(installIdPath(state.home)), false);
+  // The session records go with it: they are a scratch note about
+  // conversations that have ended (carrick#1330).
+  assert.match(first.stdout, /1 session record\(s\) removed/);
+  assert.equal(fs.existsSync(sessionsDir(state.home)), false);
   assert.equal(fs.existsSync(path.join(state.home, ".carrick")), false);
   assert.deepEqual(fs.readFileSync(state.log, "utf8").trim().split("\n"), [
     "mcp get carrick",
