@@ -36,7 +36,7 @@
 // and the spinner stops as whatever the work turned out to be (carrick#1032).
 
 import readline from "node:readline/promises";
-import type { Writable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 import * as clack from "@clack/prompts";
 import pc from "picocolors";
 
@@ -45,6 +45,27 @@ export const WARN = "▲";
 export const REFUSE = "■";
 
 export const DOCS = "https://docs.carrick.tools/quickstart";
+
+/**
+ * A question the user ended rather than answered: Ctrl-C, Escape, or an input
+ * that closed under them.
+ *
+ * It is an error and not a value because every caller would otherwise have to
+ * remember that one of its answers means "stop", and one that forgot carried
+ * on with the wrong one: a cancelled project question was read as "leave it to
+ * the browser" and the run continued into the steps that question governed
+ * (carrick#1338). Thrown, it ends the run wherever it is asked, and `init`
+ * asks everything before it writes anything.
+ */
+export class PromptCancelled extends Error {
+  constructor() {
+    super("cancelled");
+    this.name = "PromptCancelled";
+  }
+}
+
+/** One row of a `choose`: what it is called, and what it is worth knowing. */
+export type Choice = { value: string; label: string; hint?: string };
 
 /**
  * What a step's work turned out to be: the line, and the marker it carries.
@@ -103,14 +124,73 @@ export type InitOutput = {
   confirm(question: string): Promise<boolean>;
   /** A typed answer, for the questions whose answer is not yes or no. */
   ask(question: string): Promise<string>;
+  /**
+   * Which of these, with every one of them chosen to begin with.
+   *
+   * At least one must stay chosen: "none of them" is a run with nothing to do,
+   * and the way to say it is to end the question (carrick#1338).
+   */
+  choose(question: string, options: Choice[]): Promise<string[]>;
   /** Dim a fragment, where this rendering has colour to dim it with. */
   accent(text: string): string;
   /** Whether the work under `step` may write to the terminal itself. */
   readonly quiet: boolean;
 };
 
+/**
+ * One question on a terminal with no prompt library: the answer, or a cancel.
+ *
+ * A closed input is a cancel and has to be caught here, because `question`
+ * never settles when the stream ends under it — the interface closes, the loop
+ * drains, and a run that asked nothing further would exit 0 as though the
+ * question had been answered (measured 2026-09-20, carrick#1338). `SIGINT`
+ * reaches this only while a readline interface is open on a TTY; without the
+ * listener Node's own default kills the process, which ends the run too.
+ */
+async function askOnce(input: Readable, output: Writable, text: string): Promise<string> {
+  const rl = readline.createInterface({ input, output });
+  const cancelled = new Promise<never>((_, reject) => {
+    rl.once("SIGINT", () => {
+      rl.close();
+      reject(new PromptCancelled());
+    });
+    rl.once("close", () => reject(new PromptCancelled()));
+  });
+  // Every answer closes the interface too, so this rejects after the race is
+  // already settled. Without a handler of its own that is an unhandled
+  // rejection, which Node ends the process on.
+  cancelled.catch(() => {});
+  try {
+    return await Promise.race([rl.question(text), cancelled]);
+  } finally {
+    rl.close();
+  }
+}
+
+/** The numbers an answer names, or null when it names none of them. */
+export function chosenNumbers(answer: string, count: number): number[] | null {
+  const trimmed = answer.trim();
+  if (trimmed === "" || /^all$/i.test(trimmed)) return Array.from({ length: count }, (_, index) => index);
+  const picked: number[] = [];
+  for (const part of trimmed.split(/[\s,]+/)) {
+    if (!/^\d+$/.test(part)) return null;
+    const index = Number(part) - 1;
+    if (index < 0 || index >= count) return null;
+    if (!picked.includes(index)) picked.push(index);
+  }
+  return picked.length > 0 ? picked : null;
+}
+
 /** Plain text: the same lines, no spinner, no colour, no gutter. */
-export function plainOutput(write: (text: string) => void = (text) => process.stdout.write(text)): InitOutput {
+export function plainOutput(
+  write: (text: string) => void = (text) => process.stdout.write(text),
+  // The streams the questions are asked on. Named rather than taken from the
+  // process so a test can state a cancel: an input it ends is the one thing
+  // that proves a closed terminal stops the run rather than answering it.
+  io: { input?: Readable; output?: Writable } = {},
+): InitOutput {
+  const input = io.input ?? process.stdin;
+  const echo = io.output ?? process.stdout;
   const line = (marker: string, text: string): void => {
     for (const entry of text.split("\n")) write(`${marker} ${entry}\n`);
   };
@@ -146,21 +226,29 @@ export function plainOutput(write: (text: string) => void = (text) => process.st
     // without `--yes`; a stdin that is a TTY under a piped stdout still gets a
     // real question rather than a silent yes.
     confirm: async (question) => {
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      try {
-        const answer = await rl.question(`${question} [Y/n] `);
-        return answer.trim() === "" || /^y(es)?$/i.test(answer.trim());
-      } finally {
-        rl.close();
-      }
+      const answer = (await askOnce(input, echo, `${question} [Y/n] `)).trim();
+      return answer === "" || /^y(es)?$/i.test(answer);
     },
-    ask: async (question) => {
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      try {
-        return (await rl.question(`${question}\n> `)).trim();
-      } finally {
-        rl.close();
+    ask: async (question) => (await askOnce(input, echo, `${question}\n> `)).trim(),
+    // The list, then the numbers to keep. Every row is printed with its own
+    // number because this rendering has no cursor to move: the question a
+    // reader answers has to carry the whole choice.
+    choose: async (question, options) => {
+      write(`${question}\n`);
+      options.forEach((option, index) => {
+        write(`  ${index + 1}. ${option.label}${option.hint === undefined ? "" : `  (${option.hint})`}\n`);
+      });
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const answer = await askOnce(
+          input,
+          echo,
+          `Numbers to include, separated by commas, or Enter for all\n> `,
+        );
+        const picked = chosenNumbers(answer, options.length);
+        if (picked) return picked.map((index) => options[index]!.value);
+        write(`${REFUSE} Not a number between 1 and ${options.length}: "${answer.trim()}"\n`);
       }
+      throw new PromptCancelled();
     },
     quiet: false,
   };
@@ -176,7 +264,7 @@ export function plainOutput(write: (text: string) => void = (text) => process.st
  * with different lines. A test that hands this a stream is the only thing that
  * sees the interactive markers at all (carrick#1032).
  */
-export function interactiveOutput(output: Writable = process.stdout): InitOutput {
+export function interactiveOutput(output: Writable = process.stdout, keys: Readable = process.stdin): InitOutput {
   return {
     done: (text) => clack.log.step(text, { output }),
     warn: (text) => clack.log.warn(text, { output }),
@@ -207,15 +295,31 @@ export function interactiveOutput(output: Writable = process.stdout): InitOutput
       else spinner.cancel(outcome.text);
       return value;
     },
-    // A cancelled prompt is a no: `init` returns 0 and writes nothing, which
-    // is what answering "n" has always done.
+    // A cancelled prompt ends the run. It used to be read as the prompt's own
+    // quiet answer — "no" for a confirm, an empty string for a question — so
+    // Ctrl-C at the project question carried on into the steps that question
+    // governed (carrick#1338).
     confirm: async (question) => {
-      const answer = await clack.confirm({ message: question, initialValue: true, output });
-      return clack.isCancel(answer) ? false : answer;
+      const answer = await clack.confirm({ message: question, initialValue: true, output, input: keys });
+      if (clack.isCancel(answer)) throw new PromptCancelled();
+      return answer;
     },
     ask: async (question) => {
-      const answer = await clack.text({ message: question, output });
-      return clack.isCancel(answer) ? "" : answer.trim();
+      const answer = await clack.text({ message: question, output, input: keys });
+      if (clack.isCancel(answer)) throw new PromptCancelled();
+      return answer.trim();
+    },
+    choose: async (question, options) => {
+      const answer = await clack.multiselect({
+        message: question,
+        options: options.map((option) => ({ value: option.value, label: option.label, hint: option.hint })),
+        initialValues: options.map((option) => option.value),
+        required: true,
+        output,
+        input: keys,
+      });
+      if (clack.isCancel(answer)) throw new PromptCancelled();
+      return answer;
     },
     accent: (text) => pc.dim(text),
     quiet: true,

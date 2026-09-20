@@ -84,9 +84,16 @@ test("the workspace's projects come back when the action exists", async () => {
     }),
   );
   assert.equal(projects?.length, 2);
+  // Display name and slug, in every line that names a project: the dashboard
+  // shows the name, every CLI line showed the slug, and nothing connected the
+  // two (carrick#1338).
   assert.deepEqual(projectLines(projects!), [
-    "  default  Default  3 repos",
-    "  old  Old  0 repos  (archived)",
+    "  Default (default)  3 repos",
+    "  Old (old)  0 repos  (archived)",
+  ]);
+  // A project whose display name IS its slug is printed once, not twice.
+  assert.deepEqual(projectLines([{ slug: "payments", name: "payments", archived: false, repo_count: 1 }]), [
+    "  payments  1 repo",
   ]);
 });
 

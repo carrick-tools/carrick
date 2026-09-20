@@ -48,6 +48,7 @@ test("a repo connected to another project remains pending until it reaches the r
   const result = await connectRepos("token", ["acme/api"], assignedToDefault, {
     interactive: true,
     project: "payments",
+    movable: new Set(["acme/api"]),
     say: (line) => lines.push(line),
     wait: async () => {},
     open: async (url) => {
@@ -70,13 +71,13 @@ test("a repo connected to another project remains pending until it reaches the r
 
   assert.equal(polls, 2);
   assert.deepEqual(result, assignedToPayments);
-  assert.match(lines.join("\n"), /acme\/api is currently in project "default-project"/);
+  assert.match(lines.join("\n"), /acme\/api is currently in project default-project/);
   assert.match(lines.join("\n"), /Create project "payments" if needed: https:\/\/app\.carrick\.tools\/w\/acme\/projects/);
   assert.match(lines.join("\n"), /Assign the requested repos: https:\/\/app\.carrick\.tools\/w\/acme\/repos/);
   // The settled assignment is the claim, read back from the poll. The line
   // that repeated it as a verdict is gone: init states the project once, on the
   // line that names the login (carrick#1026).
-  assert.match(lines.join("\n"), /acme\/api is currently in project "payments"/);
+  assert.match(lines.join("\n"), /acme\/api is currently in project payments/);
 });
 
 test("a wrong project cannot be replayed as though it were selected", async () => {
@@ -163,6 +164,7 @@ test("a project verification deadline ends clearly unverified", async () => {
   const result = await connectRepos("token", ["acme/api"], assignedToDefault, {
     interactive: true,
     project: "payments",
+    movable: new Set(["acme/api"]),
     signal: AbortSignal.timeout(5),
     say: (line) => lines.push(line),
     open: async () => true,
@@ -186,6 +188,7 @@ test("the requested repos are placed from here, and the claim still comes from t
     interactive: false,
     project: "payments",
     projectExists: true,
+    movable: new Set(["acme/api"]),
     say: (line) => lines.push(line),
     open: async () => { throw new Error("must not open"); },
     assign: async (repos) => { asked.push(repos); return moved(repos, "payments"); },
@@ -194,14 +197,35 @@ test("the requested repos are placed from here, and the claim still comes from t
 
   assert.deepEqual(asked, [["acme/api"]]);
   assert.deepEqual(result, assignedToPayments);
-  assert.match(lines.join("\n"), /Moved acme\/api into project "payments"\./);
+  assert.match(lines.join("\n"), /Moved acme\/api into project payments\./);
   // The settled assignment is the claim, read back from the poll. The line
   // that repeated it as a verdict is gone: init states the project once, on the
   // line that names the login (carrick#1026).
-  assert.match(lines.join("\n"), /acme\/api is currently in project "payments"/);
+  assert.match(lines.join("\n"), /acme\/api is currently in project payments/);
   // The browser step this replaces is not printed at all.
   assert.doesNotMatch(lines.join("\n"), /Assign the requested repos/);
   assert.doesNotMatch(lines.join("\n"), /not verified/);
+});
+
+// carrick#1338. A repo whose move nobody accepted is left where it is, and
+// the browser step is printed instead. The consent is collected with the
+// proposal, before this is ever called.
+test("a repo nobody consented to move is not moved, and its project is not claimed", async () => {
+  const lines: string[] = [];
+  const result = await connectRepos("token", ["acme/api"], assignedToDefault, {
+    interactive: false,
+    project: "payments",
+    projectExists: true,
+    say: (line) => lines.push(line),
+    open: async () => { throw new Error("must not open"); },
+    assign: async () => { throw new Error("must not ask the server to move a repo nobody accepted"); },
+    poll: async () => { throw new Error("must not poll: nothing moved"); },
+  });
+
+  assert.deepEqual(result, assignedToDefault);
+  // Left where it is, and said so: the project this run was asked for is not
+  // claimed for a repo it did not place.
+  assert.match(lines.at(-1) ?? "", /Project payments is not verified/);
 });
 
 test("a repo the server could not place is named, and the project is not claimed", async () => {
@@ -210,6 +234,7 @@ test("a repo the server could not place is named, and the project is not claimed
     interactive: false,
     project: "payments",
     projectExists: true,
+    movable: new Set(["acme/api"]),
     say: (line) => lines.push(line),
     open: async () => { throw new Error("must not open"); },
     assign: async () => ({
@@ -233,6 +258,7 @@ test("an API without the action falls back to the browser instruction, once", as
     interactive: true,
     project: "payments",
     projectExists: true,
+    movable: new Set(["acme/api"]),
     signal: controller.signal,
     say: (line) => lines.push(line),
     open: async (url) => {
@@ -258,6 +284,7 @@ test("a refusal is printed in the server's own words before the browser line", a
     interactive: false,
     project: "payments",
     projectExists: true,
+    movable: new Set(["acme/api"]),
     say: (line) => lines.push(line),
     open: async () => { throw new Error("must not open"); },
     assign: async () => ({ kind: "refused", message: 'project "payments" is archived. Unarchive it before moving repos into it.' }),
@@ -265,7 +292,7 @@ test("a refusal is printed in the server's own words before the browser line", a
   });
 
   const said = lines.join("\n");
-  assert.match(said, /Carrick did not assign the requested repos to "payments": project "payments" is archived\./);
+  assert.match(said, /Carrick did not assign the requested repos to payments: project "payments" is archived\./);
   assert.ok(said.indexOf("Carrick did not assign") < said.indexOf("Assign the requested repos"), said);
 });
 
@@ -280,6 +307,7 @@ test("assignment happens when the poll sees the repo, not before", async () => {
     interactive: true,
     project: "payments",
     projectExists: true,
+    movable: new Set(["acme/api"]),
     say: (line) => lines.push(line),
     open: async (url) => {
       // Nothing is connected, so the browser is pointed at the grant.
@@ -296,7 +324,7 @@ test("assignment happens when the poll sees the repo, not before", async () => {
   // The settled assignment is the claim, read back from the poll. The line
   // that repeated it as a verdict is gone: init states the project once, on the
   // line that names the login (carrick#1026).
-  assert.match(lines.join("\n"), /acme\/api is currently in project "payments"/);
+  assert.match(lines.join("\n"), /acme\/api is currently in project payments/);
   assert.doesNotMatch(lines.join("\n"), /Assign the requested repos/);
 });
 

@@ -25,30 +25,51 @@ the hooks deliver, the CI check and a `carrick.json` written by hand, is in the
 agent's shell, a pipe — the same lines are written as plain text, with no colour
 and no spinner.
 
-Existing users can initialise the local workspace against a named Carrick
-project:
+`init` runs in this order, and nothing is written — on this machine or in
+Carrick — until you accept what it proposes:
+
+1. **The repos this install covers.** In a folder of sibling repos it asks
+   which ones, with every repo chosen to begin with. A folder routinely holds a
+   repo that should not be indexed, and a repo you leave out gets no proposal
+   entry, no project assignment and no connection. Without a terminal, name
+   them: `--repo owner/repo`, repeated or comma-separated. A folder of repos
+   with neither a terminal nor `--repo` stops there, having written nothing;
+   add `--yes` to cover all of them. A single repository is not a choice and is
+   never asked about.
+2. **The project.** Which project the selected repos belong in.
+3. **The proposal**, which names the packages found, the repos covered, any
+   project to create, and any repo that would move out of the project it is in
+   now. Answering no, or ending any question with Ctrl-C, ends the run with
+   nothing written.
+
+Existing users can name the project on the command line:
 
 ```
-carrick init --project payments
+carrick init --project payments --allow-move
 ```
 
-The command shows the current project assignment for every proposed GitHub
-repo. When the project is not in the workspace yet, it lists the workspace's
-projects and offers to create the named one from the terminal; where the API
-has no such action it prints the project link instead. Connected repos are then
-put in the project from the terminal too, so the GitHub App grant is the only
-browser step; where the API has no assignment action, the command prints the
-repo-assignment link and, in an interactive terminal, opens the page. Either
-way the claim comes from a read. The CLI reads `resolve-repos` until every
-proposed repo reports `project_slug: "payments"`, and a repo connected to
+`--project` puts the selected repos in that project, creating it from the
+terminal where the API allows that and printing the project link where it does
+not. A repo that is already in another project is **moved** out of it, which
+changes what every agent querying either project can see, so the move is named
+in the proposal with the project it comes out of and asked about separately.
+`--yes` does not grant it: `--allow-move` does, and without either the run
+stops before anything is moved.
+
+Connected repos are placed from the terminal, so the GitHub App grant is the
+only browser step; where the API has no assignment action, the command prints
+the repo-assignment link and, in an interactive terminal, opens the page.
+Either way the claim comes from a read. The CLI reads `resolve-repos` until
+every covered repo reports `project_slug: "payments"`, and a repo connected to
 another project remains pending. A target it cannot meet does not stop the run.
 The hooks, the MCP connection and the proposal are written, and the command
 says which browser steps are left.
 
 Without `--project` the project step still runs: the command takes the project
 the repos are already in, and otherwise lists the workspace's projects for you
-to name one, which it creates from the terminal where the API allows that. An
-empty answer leaves the step to the browser.
+to name one. An empty answer leaves the step to the browser. Every project is
+printed as the dashboard shows it, display name and slug both — `Payments
+(payments)`.
 
 Each repository is identified by its `origin` remote. A remote written through
 a per-account SSH host alias (`git@github.com-work:owner/repo.git`) is resolved
@@ -56,7 +77,8 @@ with `ssh -G`, so an alias whose `HostName` is `github.com` is an ordinary
 GitHub repository here. When a repository still names none, `init` says which
 one it was and what it read, and leaves that repository out of the project and
 connection steps rather than dropping it quietly. `carrick init --repo
-owner/repo` names the repository in that case.
+owner/repo` names the repository in that case: a `--repo` value that matches no
+repo in the folder attaches to the one repo there that has no identity.
 
 Credentials live in `$XDG_CONFIG_HOME/carrick/credentials.json`, falling back
 to `~/.config/carrick/` on macOS and Linux or `%APPDATA%\carrick\` on Windows.
@@ -114,7 +136,7 @@ types in a Node process.
 |---|---|
 | `carrick login` | Authorise a Carrick workspace in the browser, or verify `CARRICK_TOKEN` |
 | `carrick logout` | Remove the saved local credential |
-| `carrick init [--project SLUG] [--repo OWNER/REPO]` | The repo list, the project, the service proposal in `.carrick/`, the agent hooks, the MCP connection, and the prompt that writes `carrick.json` |
+| `carrick init [--repo OWNER/REPO]... [--project SLUG] [--allow-move]` | The repos this install covers, the project, the service proposal in `.carrick/`, the agent hooks, the MCP connection, and the prompt that writes `carrick.json` |
 | `carrick doctor` | Re-check that setup: the declared paths, the CI workflow against the current template, the hooks, the MCP connection and how far the index is behind |
 | `carrick remove [--keep-login]` | Undo all of that on this machine, and list the files the scaffold added to the repository |
 | `carrick index` | Derive the workspace, apply optional repo overrides and write `.carrick/`, with Carrick classifying what the deterministic passes could not |
