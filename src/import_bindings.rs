@@ -116,6 +116,13 @@ pub struct BindingResolver {
     /// The module resolver every hop goes through, when the resolver was built
     /// with one. `None` follows relative specifiers only.
     workspace: Option<WorkspaceIndex>,
+    /// Whether an export table also carries what CommonJS assignments publish
+    /// (carrick#1348). Off by default: the mount, wrapper, SDK-surface and
+    /// GraphQL passes build ANALYZER inputs, and a module they newly resolve
+    /// changes what the model is asked. Only the call graph, whose output is
+    /// deterministic rows, reads them — the same split `new` and
+    /// `with_workspace` already make for hops (carrick#1353).
+    commonjs: bool,
 }
 
 impl Default for BindingResolver {
@@ -136,6 +143,7 @@ impl BindingResolver {
             handler,
             exports: HashMap::new(),
             workspace: None,
+            commonjs: false,
         }
     }
 
@@ -147,6 +155,18 @@ impl BindingResolver {
             workspace: Some(workspace),
             ..Self::new()
         }
+    }
+
+    /// The same resolver, reading what CommonJS assignments publish as well as
+    /// what ESM declarations do (carrick#1348): `module.exports = { x }`,
+    /// `exports.x =`, and `module.exports = require("./other")`, which
+    /// republishes a whole table the way `export * from` does.
+    ///
+    /// A name a module publishes BOTH ways keeps its ESM meaning; everything
+    /// else about the walk — hops, caps, the type tables — is unchanged.
+    pub fn reading_commonjs(mut self) -> Self {
+        self.commonjs = true;
+        self
     }
 
     /// The module one hop names.
@@ -434,11 +454,28 @@ impl BindingResolver {
     fn exports_of(&mut self, file: &Path) -> Option<&ModuleExports> {
         if !self.exports.contains_key(file) {
             let module = parse_file(file, &self.source_map, &self.handler)?;
-            self.exports
-                .insert(file.to_path_buf(), collect_exports(&module));
+            let mut exports = collect_exports(&module);
+            if self.commonjs {
+                merge_commonjs_exports(&mut exports, &module);
+            }
+            self.exports.insert(file.to_path_buf(), exports);
         }
         self.exports.get(file)
     }
+}
+
+/// Fold what CommonJS assignments publish into a module's export table
+/// (carrick#1348).
+///
+/// A name the module publishes as an ESM export as well keeps the ESM entry:
+/// a file that writes both is transpiler output or a shim, and the
+/// declarations are what its own source says.
+fn merge_commonjs_exports(exports: &mut ModuleExports, module: &swc_ecma_ast::Module) {
+    let commonjs = crate::commonjs::export_assignments(module);
+    for (name, local) in commonjs.local {
+        exports.local.entry(name).or_insert(local);
+    }
+    exports.stars.extend(commonjs.stars);
 }
 
 /// Read a module's export table from its AST.

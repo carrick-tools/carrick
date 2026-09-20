@@ -84,8 +84,30 @@ use swc_common::{
     errors::{ColorConfig, Handler},
     sync::Lrc,
 };
+use swc_ecma_ast::Module;
 use swc_ecma_visit::VisitWith;
 use tracing::debug;
+
+/// The import table CALL RESOLUTION reads for one file: the ESM declarations
+/// `esm` already holds, plus the module-scope `require` bindings that state
+/// the same thing (carrick#1348). Also returns how many `require` calls in
+/// the file name a computed specifier, for the caller to count.
+///
+/// The ESM facts are passed in rather than widened in place, and they are
+/// merged LAST so a name declared both ways keeps its ESM meaning. The
+/// analyzer's import-table section and the framework-detect sample are built
+/// from exactly those facts and from nothing this adds: a require binding
+/// reaching them would move the prompt bytes of every CommonJS file, and
+/// every cached answer for one would stop replaying, for no gain.
+pub fn call_resolution_imports(
+    module: &Module,
+    esm: HashMap<String, ImportedSymbol>,
+) -> (HashMap<String, ImportedSymbol>, usize) {
+    let required = crate::commonjs::require_bindings(module);
+    let mut imports = required.bindings;
+    imports.extend(esm);
+    (imports, required.computed_specifiers)
+}
 
 /// Everything one source file contributes to call resolution.
 ///
@@ -102,8 +124,15 @@ pub struct FileCallIndex {
     pub definitions: HashMap<String, u32>,
     /// Definition key → the call sites inside its body.
     pub callees: HashMap<String, Vec<CalleeRef>>,
-    /// Local binding → the import that introduced it.
+    /// Local binding → the import that introduced it. ESM declarations and
+    /// the `require` forms that say the same thing (carrick#1348), which is
+    /// the one table call resolution reads; the ESM facts the analyzer prompt
+    /// and framework detection are built from stay separate.
     pub imports: HashMap<String, ImportedSymbol>,
+    /// `require(expr)` calls in this file whose specifier is not a literal:
+    /// they name no module, so the edges they would carry are a counted limit
+    /// rather than a silence ([`UnresolvedImports::computed_requires`]).
+    pub computed_requires: usize,
     /// Class name → the classes that class declares its own FIELDS to be, for
     /// a `this.field.foo()` receiver (carrick#782). Keyed by class, not by
     /// definition: a field belongs to the class and every method sees it.
@@ -332,6 +361,7 @@ pub fn resolve_call_edges(
 
     for canonical in files {
         let index = &per_file[canonical];
+        resolver.unresolved.computed_requires += index.computed_requires;
         let mut callers: Vec<&String> = index.callees.keys().collect();
         callers.sort();
 
@@ -419,6 +449,11 @@ pub struct UnresolvedImports {
     /// is: a repo that has not run a code generator would otherwise be
     /// permanently red.
     pub missing_mappings: std::collections::BTreeMap<String, MissingMapping>,
+    /// `require(expr)` calls whose specifier is computed (carrick#1348).
+    /// Nothing in the source says which module they load, so they bind no
+    /// name and their calls record no edge. Counted, like every other limit
+    /// here, rather than guessed at.
+    pub computed_requires: usize,
 }
 
 /// One config mapping that points at nothing, and what went through it.
@@ -575,7 +610,10 @@ impl<'a> CallResolver<'a> {
             // Every re-export hop resolves through the same index as the
             // import that entered it, so a barrel reached through `@/` that
             // itself re-exports through `@/` is followed (carrick#1104).
-            bindings: BindingResolver::with_workspace(workspace.clone()),
+            // Reading CommonJS export assignments too, because the binding
+            // side reads `require` (carrick#1348): resolving one without the
+            // other answers nothing for a module that uses both.
+            bindings: BindingResolver::with_workspace(workspace.clone()).reading_commonjs(),
             resolved_imports: HashMap::new(),
             external: HashMap::new(),
             source_map,
@@ -639,7 +677,7 @@ impl<'a> CallResolver<'a> {
                         .iter()
                         .map(|(key, def)| (key.clone(), def.line_number))
                         .collect(),
-                    imports: imports.imported_symbols,
+                    imports: call_resolution_imports(&module, imports.imported_symbols).0,
                     instances: module_scope_types(&module),
                 }
             });
@@ -1110,6 +1148,11 @@ mod tests {
             module.visit_with(&mut functions);
             functions.finalize_exports();
 
+            // The same merge discovery performs, so a require binding is in
+            // the table here exactly when production has it there.
+            let (call_imports, computed_requires) =
+                call_resolution_imports(&module, imports.imported_symbols);
+
             let index = FileCallIndex {
                 path: path.clone(),
                 definitions: functions
@@ -1118,7 +1161,8 @@ mod tests {
                     .map(|(key, def)| (key.clone(), def.line_number))
                     .collect(),
                 callees: functions.callee_refs,
-                imports: imports.imported_symbols,
+                imports: call_imports,
+                computed_requires,
                 field_types: functions.field_types,
                 instances: module_scope_types(&module),
             };
@@ -1320,6 +1364,151 @@ mod tests {
             .iter()
             .map(|c| c.name.clone())
             .collect()
+    }
+
+    /// The fixture carrick#1348 was filed with: two CommonJS files, a
+    /// destructured `require` and a `module.exports = { … }` on the other
+    /// side. Before the fix `handleOrder` recorded no edge at all, while the
+    /// same pair written as ESM recorded one.
+    #[test]
+    fn a_destructured_require_records_the_same_edge_an_import_does() {
+        let commonjs = scan(&[
+            (
+                "svc/helpers.js",
+                "function computeTotal(items) {\n  return items.reduce((sum, item) => sum + item.price, 0);\n}\nmodule.exports = { computeTotal };\n",
+            ),
+            (
+                "svc/index.js",
+                "const { computeTotal } = require(\"./helpers\");\n\
+                 function handleOrder(order) {\n  return computeTotal(order.items);\n}\nmodule.exports = { handleOrder };\n",
+            ),
+        ]);
+        let (root, defs) = (commonjs.0.path().canonicalize().unwrap(), commonjs.1);
+        let calls = &defs["handleOrder"].calls;
+        assert_eq!(calls.len(), 1, "exactly one edge, got {calls:?}");
+        assert_eq!(calls[0].name, "computeTotal");
+        assert_eq!(
+            PathBuf::from(&calls[0].file_path),
+            root.join("svc/helpers.js")
+        );
+
+        // The control arm: the identical pair as ESM, which recorded its edge
+        // before the fix and must still record exactly the same one.
+        let esm = scan(&[
+            (
+                "svc/helpers.js",
+                "export function computeTotal(items) {\n  return items.reduce((sum, item) => sum + item.price, 0);\n}\n",
+            ),
+            (
+                "svc/index.js",
+                "import { computeTotal } from \"./helpers.js\";\n\
+                 export function handleOrder(order) {\n  return computeTotal(order.items);\n}\n",
+            ),
+        ]);
+        assert_eq!(callee_names(&esm.1, "handleOrder"), vec!["computeTotal"]);
+    }
+
+    /// `const helpers = require("./helpers")` binds the whole module, so
+    /// `helpers.computeTotal()` is that module's own `computeTotal` — the same
+    /// answer `import * as helpers` gives.
+    #[test]
+    fn a_whole_module_require_resolves_its_members() {
+        let (_dir, defs) = scan(&[
+            (
+                "svc/helpers.js",
+                "function computeTotal(items) {\n  return items.length;\n}\nmodule.exports = { computeTotal };\n",
+            ),
+            (
+                "svc/index.js",
+                "const helpers = require(\"./helpers\");\n\
+                 function handleOrder(order) {\n  return helpers.computeTotal(order.items);\n}\nmodule.exports = { handleOrder };\n",
+            ),
+        ]);
+        assert_eq!(callee_names(&defs, "handleOrder"), vec!["computeTotal"]);
+    }
+
+    /// A renamed destructure names the EXPORT on one side and a local on the
+    /// other, so only the export table can join them.
+    #[test]
+    fn a_renamed_require_resolves_through_the_export_table() {
+        let (_dir, defs) = scan(&[
+            (
+                "svc/helpers.js",
+                "function computeTotalImpl(items) {\n  return items.length;\n}\nmodule.exports = { computeTotal: computeTotalImpl };\n",
+            ),
+            (
+                "svc/index.js",
+                "const { computeTotal: total } = require(\"./helpers\");\n\
+                 function handleOrder(order) {\n  return total(order.items);\n}\nmodule.exports = { handleOrder };\n",
+            ),
+        ]);
+        assert_eq!(callee_names(&defs, "handleOrder"), vec!["computeTotalImpl"]);
+    }
+
+    /// `exports.x = …` publishes one name at a time, and a `.ts` file states a
+    /// require exactly as a `.js` one does.
+    #[test]
+    fn a_member_export_assignment_resolves_from_a_typescript_file() {
+        let (_dir, defs) = scan(&[
+            (
+                "svc/helpers.js",
+                "function computeTotal(items) {\n  return items.length;\n}\nexports.computeTotal = computeTotal;\n",
+            ),
+            (
+                "svc/index.ts",
+                "const { computeTotal } = require(\"./helpers\");\n\
+                 export function handleOrder(order: { items: number[] }) {\n  return computeTotal(order.items);\n}\n",
+            ),
+        ]);
+        assert_eq!(callee_names(&defs, "handleOrder"), vec!["computeTotal"]);
+    }
+
+    /// `module.exports = require("./other")` republishes another module's
+    /// whole table, which is what a CommonJS barrel is.
+    #[test]
+    fn a_commonjs_barrel_is_followed_to_the_declaring_module() {
+        let (dir, defs) = scan(&[
+            (
+                "svc/helpers.js",
+                "function computeTotal(items) {\n  return items.length;\n}\nmodule.exports = { computeTotal };\n",
+            ),
+            ("svc/index.js", "module.exports = require(\"./helpers\");\n"),
+            (
+                "svc/orders.js",
+                "const { computeTotal } = require(\"./index\");\n\
+                 function handleOrder(order) {\n  return computeTotal(order.items);\n}\nmodule.exports = { handleOrder };\n",
+            ),
+        ]);
+        let root = dir.path().canonicalize().unwrap();
+        let calls = &defs["handleOrder"].calls;
+        assert_eq!(calls.len(), 1, "exactly one edge, got {calls:?}");
+        assert_eq!(
+            PathBuf::from(&calls[0].file_path),
+            root.join("svc/helpers.js"),
+            "the edge must point past the barrel"
+        );
+    }
+
+    /// A computed specifier names no module, so the call records no edge and
+    /// the require is counted as a limit rather than guessed at.
+    #[test]
+    fn a_computed_require_records_no_edge_and_is_counted() {
+        let (_dir, defs, unresolved) = scan_reporting(
+            &[
+                (
+                    "svc/helpers.js",
+                    "function computeTotal(items) {\n  return items.length;\n}\nmodule.exports = { computeTotal };\n",
+                ),
+                (
+                    "svc/index.js",
+                    "const name = \"./helpers\";\nconst { computeTotal } = require(name);\n\
+                     function handleOrder(order) {\n  return computeTotal(order.items);\n}\nmodule.exports = { handleOrder };\n",
+                ),
+            ],
+            "",
+        );
+        assert_eq!(callee_names(&defs, "handleOrder"), Vec::<String>::new());
+        assert_eq!(unresolved.computed_requires, 1);
     }
 
     /// Two files define `helper`; a third imports ONE of them and calls it.

@@ -5043,6 +5043,12 @@ fn report_unresolved_imports(
     for line in missing_mapping_lines(unresolved) {
         info!("{line}");
     }
+    if unresolved.computed_requires > 0 {
+        info!(
+            "Call graph: {} require() call(s) take a computed specifier, so the module they load is unknown. Write the path as a string literal.",
+            unresolved.computed_requires
+        );
+    }
     if unresolved.undeclared_packages > 0 {
         debug!(
             "Call graph: {} import(s) name a package no manifest declares (runtime builtins included), so those calls record no edge",
@@ -5201,6 +5207,13 @@ fn discover_files_and_symbols(
             let file_imports = import_extractor.imported_symbols;
             all_import_facts.extend(file_imports.values().cloned());
 
+            // Call resolution reads the `require` bindings too (carrick#1348).
+            // Merged AFTER the sample above is taken: the framework-detect
+            // body and the analyzer's import table are the ESM facts and
+            // nothing else.
+            let (call_imports, computed_requires) =
+                crate::call_graph::call_resolution_imports(&module, file_imports);
+
             // Extract function definitions with type annotations and source text
             let mut func_extractor =
                 FunctionDefinitionExtractor::new(file_path.clone(), cm.clone());
@@ -5220,7 +5233,8 @@ fn discover_files_and_symbols(
                         .map(|(key, def)| (key.clone(), def.line_number))
                         .collect(),
                     callees: func_extractor.callee_refs,
-                    imports: file_imports,
+                    imports: call_imports,
+                    computed_requires,
                     field_types: func_extractor.field_types,
                     instances: crate::receiver_type::module_scope_types(&module),
                 },

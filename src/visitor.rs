@@ -402,6 +402,26 @@ impl Visit for LexicalReceivers {
         }
     }
 
+    /// `import helpers = require("./helpers")` states the same thing an
+    /// import declaration does, in TypeScript's spelling (carrick#1348).
+    fn visit_ts_import_equals_decl(&mut self, decl: &TsImportEqualsDecl) {
+        let TsModuleRef::TsExternalModuleRef(external) = &decl.module_ref else {
+            return;
+        };
+        self.record(
+            decl.id.to_id(),
+            LexicalBinding {
+                receiver: ReceiverBinding {
+                    imported_name: Some(decl.id.sym.to_string()),
+                    declared: false,
+                    local_member: None,
+                    origin: Some(external.expr.value.to_string()),
+                },
+                ..Default::default()
+            },
+        );
+    }
+
     fn visit_class_decl(&mut self, class: &ClassDecl) {
         self.record(
             class.ident.to_id(),
@@ -427,6 +447,38 @@ impl Visit for LexicalReceivers {
     }
 
     fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
+        // `const m = require("./m")`, `const { x } = require("./m")`: a
+        // binding introduced from another module, which is what an import
+        // declaration above states (carrick#1348). Recorded from the same
+        // reader the import table uses, and the PATTERN is then not walked:
+        // a second record of the same binding carrying no import fact would
+        // cancel this one in `record`.
+        if let Some(specifier) = declarator
+            .init
+            .as_deref()
+            .and_then(crate::commonjs::require_specifier)
+        {
+            let bound = crate::commonjs::require_bound_names(&declarator.name);
+            if !bound.is_empty() {
+                for binding in bound {
+                    self.record(
+                        binding.local.id.to_id(),
+                        LexicalBinding {
+                            receiver: ReceiverBinding {
+                                imported_name: Some(binding.local.id.sym.to_string()),
+                                declared: false,
+                                local_member: None,
+                                origin: Some(specifier.clone()),
+                            },
+                            ..Default::default()
+                        },
+                    );
+                }
+                declarator.init.visit_with(self);
+                return;
+            }
+        }
+
         if let Pat::Ident(ident) = &declarator.name {
             self.record(
                 ident.id.to_id(),
