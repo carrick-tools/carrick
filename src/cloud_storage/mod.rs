@@ -2607,6 +2607,48 @@ mod tests {
         );
     }
 
+    /// Two EDGES landing on one canonical pair union their notes too
+    /// (carrick#1341), which is a different code path from two outcomes on one
+    /// edge: this one runs through [`merge_direction`], where worst-wins
+    /// REPLACES the whole stored struct. The losing edge's observation has to
+    /// survive that replacement, because its comparison happened as much as
+    /// the winner's did.
+    #[test]
+    fn merging_two_edges_unions_their_notes() {
+        let winner_note = "'b' is always sent by the producer and optional on the consumer.";
+        let loser_note = "'a' is always sent by the producer and optional on the consumer.";
+        let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
+        let agrees = edge_at("producer", "http|GET|/x", "consumer", "http|GET|/x", "a.ts");
+        let breaks = edge_at("producer", "http|GET|/x", "consumer", "http|GET|/x", "b.ts");
+        let dirs = directions(&[
+            // The COMPATIBLE edge, which worst-wins discards, is the one whose
+            // note must not be discarded with it.
+            crate::analyzer::PairCheckOutcome {
+                notes: vec![loser_note.to_string()],
+                ..compatible_outcome(&agrees, ManifestTypeKind::Request)
+            },
+            crate::analyzer::PairCheckOutcome {
+                notes: vec![winner_note.to_string()],
+                ..incompatible_outcome(&breaks, ManifestTypeKind::Request, "mismatch")
+            },
+        ]);
+        attach_compat_verdicts(&mut payloads, &[agrees, breaks], &dirs);
+
+        let verdicts = payloads[0].compat_verdicts.clone().unwrap();
+        assert_eq!(verdicts.len(), 1);
+        let request = verdicts[0].request.as_ref().unwrap();
+        assert_eq!(
+            request.verdict,
+            crate::operation::TypeVerdict::Incompatible,
+            "worst-wins still decides the verdict across edges"
+        );
+        assert_eq!(
+            request.notes,
+            vec![loser_note.to_string(), winner_note.to_string()],
+            "the discarded edge's observation survives the replacement, sorted"
+        );
+    }
+
     /// carrick#811: a direction the check reached and could not verify is
     /// PERSISTED, as the third state — not dropped into the same silence as a
     /// pair nobody checked.
