@@ -61,6 +61,7 @@ jobs:
           --test action_install_test
           --test alias_import_callers_test
           --test analysis_failure_keeps_deterministic_rows_test
+          --test bundle_row_id_golden_test
           --test dependency_analysis_test
           --test dispatch_resume_test
           --test env_var_template_call_segment_test

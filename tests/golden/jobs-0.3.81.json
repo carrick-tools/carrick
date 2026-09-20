@@ -1,0 +1,13 @@
+{
+  "schema": "carrick.jobs/0",
+  "jobs": [
+    {
+      "repo": "owner/api",
+      "path": "/Users/someone/repos/api",
+      "job_id": "job-0f3c1a9e",
+      "commit": "9a3f2c1d4b5e6f7a8b9c0d1e2f3a4b5c6d7e8f90",
+      "analyze_rows": 1017,
+      "submitted_at": "2026-09-18T09:14:22+00:00"
+    }
+  ]
+}

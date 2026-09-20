@@ -2989,4 +2989,130 @@ const data = await fetch('/api/users').then(resp => resp.json());
     fn the_fingerprint_target_is_the_documented_one() {
         assert_eq!(PROMPT_FINGERPRINT_TARGET, "carrick::prompt_fingerprint");
     }
+
+    // -----------------------------------------------------------------------
+    // The body a dispatched row is named by, with every optional section in it
+    // (carrick#1332)
+    // -----------------------------------------------------------------------
+
+    /// A file that raises every optional section at once.
+    ///
+    /// `tests/bundle_row_id_golden_test.rs` pins the ids a real fixture
+    /// dispatches, but a plain HTTP fixture renders five of this builder's
+    /// sections as the EMPTY string — the GraphQL producer and consumer hints,
+    /// the imported-wrapper sources, the postMessage block, and the non-empty
+    /// branch of the candidate list and contexts. Every byte inside those
+    /// branches could be rewritten and that golden would still pass. This is
+    /// the body that covers them.
+    fn every_section_prompt() -> AnalysisPrompt {
+        let candidate_hints = vec![
+            "- Candidate span:0-24: Line 1 (span 0-24) app.get [fn: mount] [path: /users] - \
+             `app.get('/users', handler)`"
+                .to_string(),
+            // Gates the postMessage section, which keys off the hint text.
+            "- Candidate span:25-60: Line 3 (span 25-60) parent.postMessage [fn: notify] \
+             [path: <path unavailable>] - `parent.postMessage({ action: 'ready' }, '*')`"
+                .to_string(),
+        ];
+        let candidate_contexts =
+            vec![r#"{"candidate_id":"span:0-24","method":"GET","path":"/users"}"#.to_string()];
+        let imported_symbols = HashMap::from([
+            (
+                "apiRequest".to_string(),
+                ImportedSymbol {
+                    local_name: "apiRequest".to_string(),
+                    imported_name: "apiRequest".to_string(),
+                    source: "../lib/http".to_string(),
+                    kind: SymbolKind::Named,
+                },
+            ),
+            (
+                "Order".to_string(),
+                ImportedSymbol {
+                    local_name: "Order".to_string(),
+                    imported_name: "OrderRecord".to_string(),
+                    source: "./types".to_string(),
+                    kind: SymbolKind::Named,
+                },
+            ),
+        ]);
+
+        FileAnalyzerAgent::new(AgentService::new()).build_user_message_with_candidates(
+            "src/routes/orders.ts",
+            "export const get = () => {};\nparent.postMessage({ action: 'ready' }, '*');\n",
+            &sentinel_guidance(),
+            &candidate_hints,
+            &candidate_contexts,
+            &imported_symbols,
+            &["query order: Order".to_string()],
+            &["query orderSummary: OrderSummary".to_string()],
+            &["export async function apiRequest(method: string, path: string) {}".to_string()],
+        )
+    }
+
+    /// The body of a prompt carrying every optional section, named the way a
+    /// dispatched row names it.
+    ///
+    /// The digest is `sha256` of the bytes after the guidance prefix — exactly
+    /// `analysis_job::body_id`, exactly what the cloud's analysis cache hashes,
+    /// and exactly the `id` a job's answers come back under. A byte moved
+    /// anywhere in one of these sections renames every prompt that carries it,
+    /// so a job in flight misses on those rows and is paid for twice
+    /// (carrick#1248).
+    ///
+    /// A deliberate change updates this constant in the same PR, and the PR
+    /// body says in-flight jobs will miss.
+    #[test]
+    fn the_body_with_every_optional_section_is_named_by_these_bytes() {
+        let prompt = every_section_prompt();
+        let id = crate::analysis_job::body_id(prompt.body());
+        assert_eq!(
+            id,
+            "3dcb4efafcbd9c6e3cc0cb8e7e9b48080e2d57fb8eaa97e4dddf78b4373a70c9",
+            "an optional prompt section moved; every dispatched row carrying it is renamed \
+             and every answer already bought for it is orphaned.\n\nIf that is deliberate, \
+             this is the digest to check in:\n{id}\nBody was:\n{}",
+            prompt.body()
+        );
+    }
+
+    /// The golden above is only worth the sections it actually renders.
+    ///
+    /// Without this, dropping a section from `every_section_prompt` (or gating
+    /// one behind an input the fixture stopped supplying) would leave the
+    /// digest test green over a body that covers nothing — the failure mode
+    /// where a test passes with the code it defends deleted.
+    #[test]
+    fn the_golden_body_really_carries_every_optional_section() {
+        let body = every_section_prompt().text;
+        for section in [
+            "### GRAPHQL SCHEMA PRODUCERS",
+            "### GRAPHQL DOCUMENT CONSUMERS WITH NO EXPLICIT RESULT TYPE",
+            "### IMPORTED HTTP WRAPPER DEFINITIONS",
+            "### WEB POSTMESSAGE CHANNEL",
+            "### CANDIDATE TARGETS",
+            "### CANDIDATE CONTEXT",
+            "### IMPORT TABLE",
+            "### FILE CONTENT",
+        ] {
+            assert!(
+                body.contains(section),
+                "the pinned body renders no `{section}`, so the digest defends nothing there"
+            );
+        }
+        // And the branches, not just the headers: an empty candidate list and
+        // an empty import table have their own wording, and a body carrying
+        // those pins the wrong thing.
+        for empty_branch in [
+            "No specific candidates provided",
+            "No structured candidate contexts provided",
+            "No imports detected by AST",
+        ] {
+            assert!(
+                !body.contains(empty_branch),
+                "the pinned body took the EMPTY branch (`{empty_branch}`), so the digest \
+                 defends the placeholder rather than the rendered section"
+            );
+        }
+    }
 }

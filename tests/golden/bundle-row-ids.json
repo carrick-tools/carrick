@@ -1,0 +1,22 @@
+{
+  "note": "The names a dispatched job's answers come back under (carrick#1332). Each `id` is sha256 of that file's analyze-file prompt body -- the bytes after the framework-guidance prefix. Moving one of them orphans every answer an in-flight job has already been paid for. Regenerate ONLY as part of a deliberate prompt or schema change, paste the list the failing test prints, and say in the PR body that in-flight jobs will miss. Owned by tests/bundle_row_id_golden_test.rs.",
+  "fixture": "tests/fixtures/llm-mocked-api",
+  "guidance_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "rows": [
+    {
+      "path": "src/index.ts",
+      "id": "33ad427c3ca38e5842b09da95d73f4b88a52fa52acd01fea9d1fc53222e5b4f0",
+      "schema_sha": "aa222cf9a5d7992e055aff4792e60fedb34e13751dfb7b0838c9f0a383561269"
+    },
+    {
+      "path": "src/routes/users.ts",
+      "id": "44dd80a045dc8032d9750e1273f3b287694b1444cf41751e7a150d5515cf1657",
+      "schema_sha": "aa222cf9a5d7992e055aff4792e60fedb34e13751dfb7b0838c9f0a383561269"
+    },
+    {
+      "path": "src/client.ts",
+      "id": "679ea5bcc522bff40c03d15cc3f3a54425d609911bd28a4ccf8a3ec93639d1e4",
+      "schema_sha": "aa222cf9a5d7992e055aff4792e60fedb34e13751dfb7b0838c9f0a383561269"
+    }
+  ]
+}

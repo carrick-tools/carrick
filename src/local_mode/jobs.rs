@@ -652,6 +652,51 @@ mod tests {
         assert_eq!(job["analyze_rows"], 10);
     }
 
+    /// A `jobs.json` written by the PREVIOUS release still reads
+    /// (carrick#1332).
+    ///
+    /// This is the file a customer's laptop is holding right now. It is the
+    /// only thing that survives a dispatched scan, it outlives the scan record
+    /// beside it on purpose, and `carrick resume` cannot find a job without
+    /// it. A field renamed here reads as a `jobs.json` that was never written:
+    /// [`read`] swallows every error and answers "no jobs", `carrick status`
+    /// says nothing is in flight, and the paid answers are simply unreachable.
+    ///
+    /// Checked in verbatim as this release wrote it, so the next release has
+    /// to read it or turn this red. Every field is asserted rather than
+    /// "it parsed", because [`read`] returning an empty `Vec` is exactly what
+    /// a silently broken parse looks like.
+    #[test]
+    fn a_jobs_file_the_previous_release_wrote_still_reads() {
+        const PREVIOUS: &str = include_str!("../../tests/golden/jobs-0.3.81.json");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(jobs_file(dir.path()), PREVIOUS).unwrap();
+        let jobs = read(dir.path());
+
+        assert_eq!(
+            jobs.len(),
+            1,
+            "the record a dispatched scan left is unreadable to this version, so its answers \
+             cannot be collected at all"
+        );
+        assert_eq!(
+            jobs[0],
+            Job {
+                repo: "owner/api".to_string(),
+                path: "/Users/someone/repos/api".to_string(),
+                job_id: "job-0f3c1a9e".to_string(),
+                commit: "9a3f2c1d4b5e6f7a8b9c0d1e2f3a4b5c6d7e8f90".to_string(),
+                analyze_rows: 1017,
+                submitted_at: "2026-09-18T09:14:22+00:00".to_string(),
+            }
+        );
+        // And the tag it was written under is the one this version writes, so
+        // the file a resume rewrites is the same file the next one reads.
+        let written: serde_json::Value = serde_json::from_str(PREVIOUS).unwrap();
+        assert_eq!(written["schema"], JOBS_SCHEMA);
+    }
+
     #[test]
     fn an_unreadable_record_is_a_record_of_nothing() {
         let dir = tempfile::tempdir().unwrap();
