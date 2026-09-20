@@ -87,8 +87,8 @@ Three parts, in the order they fire:
 | Part | Governed code | What it does |
 |---|---|---|
 | `carrick check <file> --recheck` | `src/local_mode/recheck.rs` | already re-extracts the edited file; now also answers with `recheck.new_functions`, the functions it declares that the index does not hold (`docs/local-mode-output.md`) |
-| `carrick hook post-edit` | `npm/carrick/src/hook/post-edit.ts`, `npm/carrick/src/hook/reuse.ts` | records those names for the session under `~/.carrick/sessions/<session_id>.json`, outside every repository, and prints not one byte about them |
-| `carrick hook stop` | `npm/carrick/src/hook/stop.ts` | at the end of the task, names the accumulated set once and points at this skill |
+| `carrick hook post-edit` | `npm/carrick/src/hook/post-edit.ts`, `npm/carrick/src/hook/apply-patch.ts`, `npm/carrick/src/hook/reuse.ts` | records those names for the session under `~/.carrick/sessions/<session_id>.json`, outside every repository, and prints not one byte about them |
+| `carrick hook stop` (Claude Code) or `carrick hook user-prompt` (Codex) | `npm/carrick/src/hook/stop.ts`, `npm/carrick/src/hook/user-prompt.ts`, `drain` in `npm/carrick/src/hook/reuse.ts` | names the accumulated set once and points at this skill |
 
 Why the nudge is not on the edit: most edits add no function, and every nudge
 costs a model turn. Why it is not left to the agent: see the measurement above.
@@ -115,26 +115,62 @@ function is described as doing, not on its source.
 `carrick remove` deletes the session records; `carrick doctor` reports a missing
 Stop entry with the other two, because both read `expectedCarrickHooks`.
 
-### Codex
+The same three parts run on Codex through a different event and a different
+payload reader; that is the section below.
 
-Codex reads the same hook manifest shape from `$CODEX_HOME/hooks.json` and from
-a project's `.codex/hooks.json`, and it has a `Stop` event. It cannot carry this
-nudge, for two reasons that are in its source:
+### Codex (carrick#1335)
 
-1. `additionalContext` is accepted only on `PreToolUse`, `PostToolUse`,
-   `SessionStart`, `UserPromptSubmit` and `SubagentStart`
-   (`codex-rs/hooks/src/engine/discovery.rs`, which warns "this event cannot
-   emit additionalContext" for every other event). A Codex `Stop` hook reaches
-   the model only through `decision: "block"` and its continuation prompt, which
-   is a block.
-2. The recording half would need its own payload reader: Codex's edit tool is
-   `apply_patch` with its own `tool_input`, not `Edit`/`Write`/`MultiEdit`
-   (`codex-rs/hooks/src/events/post_tool_use.rs`).
+One implementation, two delivery channels. The recording half, the per-session
+store, the line itself and the once-per-set marking are the same code on both
+hosts; what differs is the event that carries it and the payload the recorder
+reads.
 
-`carrick init` also writes no Codex hook file today — only `.agents/skills/` —
-so shipping this for Codex means a new file as well as a different trigger. The
-options are a blocking Stop hook, or a non-blocking `UserPromptSubmit` hook that
-delivers the nudge one turn late. Tracked as carrick#1335.
+**The event.** Codex accepts `additionalContext` only on `PreToolUse`,
+`PostToolUse`, `SessionStart`, `UserPromptSubmit` and `SubagentStart`, and warns
+"this event cannot emit additionalContext" for every other one
+(`codex-rs/hooks/src/engine/discovery.rs`). Its `Stop` event is therefore not
+available to a nudge that must not block, so the nudge is delivered by
+`UserPromptSubmit`: `carrick hook user-prompt` drains the same pending set and
+prints the same `hookSpecificOutput` object with `hookEventName:
+"UserPromptSubmit"` on it. The ruling of 2026-09-20 took this over a blocking
+`Stop` hook.
+
+**The limit that follows.** The line arrives with the NEXT prompt, not at the
+end of the task that earned it — and a one-shot run with no following prompt
+(`codex exec "…"`, a session closed on the nudging task) never sees it at all.
+The marking is what makes a late delivery safe: the set is spoken once, whenever
+the next prompt comes, and never again.
+
+**The payload.** Codex has no `Edit`/`Write`/`MultiEdit` with a `file_path`. It
+edits through `apply_patch`, whose `tool_input` is `{ "command": "<patch text>"
+}` (`codex-rs/core/src/tools/handlers/apply_patch.rs`), and one patch can touch
+several files. `npm/carrick/src/hook/apply-patch.ts` reads the four header lines
+out of it: `Add File` and `Update File` are re-checked, `Delete File` is dropped
+because the path is gone once the patch applies, and `Move to` replaces the
+`Update File` above it because the destination is the file that now exists. Each
+surviving path is re-checked and recorded exactly as a Claude Code edit is.
+
+**The file.** `carrick init` writes `.codex/hooks.json` — Codex's project config
+layer (`ConfigLayerSource::Project`), which nests its groups under a `hooks` key
+in the same shape a `.claude` settings file does, so the merge, the reader and
+the remover are the ones in `settings.ts`. It holds two entries: `PostToolUse`
+with matcher `apply_patch` (matchers are regexes) and `UserPromptSubmit`. A file
+the user already has is merged into entry by entry; an entry is recognised as
+ours by the command it runs, which is the same rule the `.claude` file follows.
+`carrick remove` takes those entries out, and deletes the file — and the
+`.codex` directory, if it is then empty — when nothing but our entries was in
+it. `SCAFFOLD_FILES` in `src/git_state.rs` lists the path, so a first run does
+not read its own install as a dirty tree.
+
+**One step init cannot take for you.** A project hook is untrusted until Codex
+records its hash, and an untrusted hook is discovered and never run
+(`hook_trust_status` in `discovery.rs`). Codex asks at its next start; `carrick
+init` says so on the line that reports the file.
+
+`carrick doctor` reports a missing or outdated Codex entry the way it reports
+the Claude ones, and only where the workspace holds a `.codex/` directory — that
+folder is Codex's project config layer and the one init writes into, so its
+absence means Codex is not set up here and doctor says nothing about it.
 
 ## Ordering against the cloud
 

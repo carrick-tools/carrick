@@ -22,7 +22,7 @@
 
 import { createLogger } from "../log.ts";
 import { resolveChannel } from "../channel.ts";
-import { markNudged, nudge, pending, readSession } from "./reuse.ts";
+import { drain } from "./reuse.ts";
 
 const log = createLogger("carrick-stop");
 
@@ -70,18 +70,17 @@ async function main(): Promise<void> {
     return;
   }
 
-  const record = readSession(session);
-  const waiting = pending(record);
-  if (waiting.length === 0) {
-    log(`nothing new in ${session}: ${record.found.length} found, all named`);
+  // `drain` reads the store, builds the line and marks the set as spoken, in
+  // that order. Codex's `UserPromptSubmit` hook calls the same function
+  // (carrick#1335); the difference between the two hosts is the event name on
+  // the wire and nothing else.
+  const spoken = drain(session);
+  if (spoken === null) {
+    log(`nothing new in ${session}: everything recorded has been named`);
     return;
   }
-  const line = nudge(waiting);
-  // Marked before the line is printed, not after: a nudge that is written and
-  // not recorded fires again on the next stop, and a task is several stops.
-  markNudged(session, waiting);
-  process.stdout.write(emission(line));
-  log(`named ${waiting.length} new function(s) to the model`);
+  process.stdout.write(emission(spoken.line));
+  log(`named ${spoken.named} new function(s) to the model, of ${spoken.found} recorded`);
 }
 
 await main();

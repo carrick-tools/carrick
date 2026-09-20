@@ -26,6 +26,7 @@ import { downloadHostedIndex, hostedReport, nativeRunner } from "./hosted.ts";
 import { ensureProject, projectStep, SLUG } from "./projects.ts";
 import { connectMcpClients, mcpLine, type McpOutcome } from "./mcp.ts";
 import { hookCommand, mergeCarrickHooks, removeCarrickHooks } from "./settings.ts";
+import { CODEX_HOOKS_FILE, writeCodexHooks } from "./codex.ts";
 import { ignoredSkillRoots, taskSkillLines, writeTaskSkills } from "./task-skills.ts";
 import { writeIfChanged } from "./files.ts";
 import { createOutput, DOCS, type InitOutput } from "./output.ts";
@@ -460,6 +461,22 @@ export async function init(argv: string[]): Promise<number> {
       `Could not configure Carrick hooks: ${(error as Error).message}. Fix ${settingsName} and run carrick init again.`,
     );
   }
+  // The same two-part nudge for Codex, in the file Codex reads project hooks
+  // from. Written for both hosts for the same reason the task skills are
+  // (carrick#1335): which agent opens this workspace is not a thing init can
+  // know, and a hook file for a host nobody runs costs nothing.
+  try {
+    if (writeCodexHooks(workspace, command.command) === "written") {
+      out.done(
+        `Codex hook entries written to ${CODEX_HOOKS_FILE}. Codex asks you to trust them the next time it starts; until you do, they do not run.`,
+      );
+    }
+  } catch (error) {
+    out.refuse(
+      `Could not configure the Codex hooks: ${(error as Error).message}. Fix ${CODEX_HOOKS_FILE} and run carrick init again.`,
+    );
+  }
+
   // The task skills, beside the hooks and independent of them: a settings file
   // somebody hand-edited into invalid JSON is no reason to withhold the bodies
   // an agent reads. A file this package did not write, or one somebody has

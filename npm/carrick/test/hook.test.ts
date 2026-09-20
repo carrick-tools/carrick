@@ -373,3 +373,164 @@ test("an install where the language server delivers still records for the stop h
   assert.equal(run.stdout, "", "the lsp channel owns the printing");
   assert.equal(sessionRecord(home, "sess-5").found.length, 2);
 });
+
+// ---------------------------------------------------------------------------
+// The same nudge on Codex (carrick#1335): `apply_patch` on the recording side,
+// `UserPromptSubmit` on the delivery side.
+
+/** Codex's PostToolUse payload: one patch, several files, paths from the cwd. */
+function patchPayload(workspace: { root: string }, session: string) {
+  return {
+    hook_event_name: "PostToolUse",
+    tool_name: "apply_patch",
+    cwd: workspace.root,
+    session_id: session,
+    tool_input: {
+      command: [
+        "*** Begin Patch",
+        "*** Add File: user-service/src/routes/users.ts",
+        "+export function slugify(input: string): string {",
+        '+  return input.toLowerCase();',
+        "+}",
+        "*** Update File: billing-service/src/lookup.ts",
+        "@@",
+        "-const a = 1;",
+        "+const a = 2;",
+        "*** Delete File: billing-service/src/charges.ts",
+        "*** Add File: notes/README.md",
+        "+notes",
+        "*** End Patch",
+      ].join("\n"),
+    },
+  };
+}
+
+test("a Codex patch is re-checked file by file, and the deleted one is not", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const argvLog = path.join(home, "argv.log");
+
+  const run = await runHook("post-edit.ts", {
+    payload: patchPayload(workspace, "codex-1"),
+    env: fakeEnv({
+      HOME: home,
+      CARRICK_FAKE_ARGV_LOG: argvLog,
+      CARRICK_FAKE_FIXTURE: fixturePath("check-new-functions.json"),
+    }),
+  });
+  assert.equal(run.code, 0);
+
+  const asked = fs
+    .readFileSync(argvLog, "utf8")
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => (JSON.parse(line) as { argv: string[] }).argv[1]);
+  assert.deepEqual(asked, [
+    "user-service/src/routes/users.ts",
+    "billing-service/src/lookup.ts",
+  ]);
+  // The deleted file is gone from disk, so asking about it would be asking
+  // about nothing; the markdown file has no rows in any index.
+  assert.equal(asked.includes("billing-service/src/charges.ts"), false);
+  assert.equal(asked.includes("notes/README.md"), false);
+
+  // Recorded exactly as an Edit's new functions are, and still silent about it.
+  assert.equal(sessionRecord(home, "codex-1").found.length, 2);
+});
+
+test("the Codex hook names the set on the next prompt, once", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+
+  await runHook("post-edit.ts", {
+    payload: patchPayload(workspace, "codex-2"),
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-new-functions.json") }),
+  });
+
+  const prompt = await runHook("user-prompt.ts", {
+    payload: {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "codex-2",
+      cwd: workspace.root,
+      prompt: "now write the exporter",
+    },
+    env: fakeEnv({ HOME: home }),
+  });
+  assert.equal(prompt.code, 0);
+  const parsed = JSON.parse(prompt.stdout) as {
+    hookSpecificOutput: { hookEventName: string; additionalContext: string };
+    decision?: unknown;
+    continue?: unknown;
+    systemMessage?: unknown;
+  };
+  // Codex parses this with `deny_unknown_fields` and accepts
+  // `additionalContext` on this event and not on `Stop`, so the event name is
+  // the load-bearing byte. A `decision` here would be the block the ruling
+  // refused.
+  assert.equal(parsed.hookSpecificOutput.hookEventName, "UserPromptSubmit");
+  assert.equal(parsed.decision, undefined);
+  assert.equal(parsed.continue, undefined);
+  assert.equal(parsed.systemMessage, undefined);
+  assert.match(parsed.hookSpecificOutput.additionalContext, /slugify/);
+  assert.match(parsed.hookSpecificOutput.additionalContext, /carrick-reuse/);
+
+  // The prompt after it says nothing: the set was marked when it was spoken.
+  const again = await runHook("user-prompt.ts", {
+    payload: { hook_event_name: "UserPromptSubmit", session_id: "codex-2" },
+    env: fakeEnv({ HOME: home }),
+  });
+  assert.equal(again.stdout, "");
+  assert.equal(again.code, 0);
+});
+
+test("one session is nudged once across both hosts, whichever speaks first", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+
+  await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), session_id: "codex-3" },
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-new-functions.json") }),
+  });
+  const stop = await runHook("stop.ts", {
+    payload: { hook_event_name: "Stop", session_id: "codex-3" },
+    env: fakeEnv({ HOME: home }),
+  });
+  assert.match(stop.stdout, /slugify/);
+
+  // Both hosts drain the same store through the same function, so a set one has
+  // spoken is not waiting for the other.
+  const prompt = await runHook("user-prompt.ts", {
+    payload: { hook_event_name: "UserPromptSubmit", session_id: "codex-3" },
+    env: fakeEnv({ HOME: home }),
+  });
+  assert.equal(prompt.stdout, "");
+});
+
+test("the Codex hook is silent with nothing recorded, no session, or the channel off", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+
+  for (const payload of [
+    { hook_event_name: "UserPromptSubmit", session_id: "never-edited" },
+    { hook_event_name: "UserPromptSubmit" },
+    {},
+  ]) {
+    const run = await runHook("user-prompt.ts", { payload, env: fakeEnv({ HOME: home }) });
+    assert.equal(run.stdout, "", `expected silence for ${JSON.stringify(payload)}`);
+    assert.equal(run.code, 0);
+  }
+
+  await runHook("post-edit.ts", {
+    payload: patchPayload(workspace, "codex-4"),
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-new-functions.json") }),
+  });
+  const off = await runHook("user-prompt.ts", {
+    payload: { hook_event_name: "UserPromptSubmit", session_id: "codex-4" },
+    env: fakeEnv({ HOME: home, CARRICK_CHANNEL: "off" }),
+  });
+  assert.equal(off.stdout, "");
+});

@@ -100,7 +100,8 @@ pub fn inspect(repo_path: &str) -> GitState {
 /// index describes exactly what the commit holds.
 ///
 /// Mirrors `npm/carrick/src/init/remove.ts` (`SCAFFOLD_FILES`,
-/// `SETTINGS_FILES` and the files `SECTION_CARRIERS` merges into) and
+/// `SETTINGS_FILES` and the files `SECTION_CARRIERS` merges into),
+/// `npm/carrick/src/init/codex.ts` (`CODEX_HOOKS_FILE`) and
 /// `npm/carrick/src/init/task-skills.ts` (`SKILL_ROOTS` x `TASK_SKILLS`),
 /// which mirror the scaffold tool in carrick-cloud
 /// (`lambdas/mcp-server/src/tools/scaffold.ts`). A file added there is added
@@ -121,6 +122,7 @@ const SCAFFOLD_FILES: &[&str] = &[
     ".claude/search-gate.sh",
     ".claude/settings.json",
     ".claude/settings.local.json",
+    ".codex/hooks.json",
     "AGENTS.md",
     "CLAUDE.md",
     ".gitignore",
@@ -622,6 +624,8 @@ pub(crate) mod tests {
             ".claude/turn-reminder.sh",
             ".claude/search-gate.sh",
             ".claude/settings.json",
+            // The Codex half of the same install (carrick#1335).
+            ".codex/hooks.json",
             ".carrick/.gitignore",
             ".carrick/proposal.json",
         ] {

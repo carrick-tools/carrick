@@ -37,6 +37,7 @@ import {
   SCAFFOLD_SENTENCE,
 } from "../src/init/run.ts";
 import { taskSkillPaths } from "../src/init/task-skills.ts";
+import { CODEX_HOOKS_FILE } from "../src/init/codex.ts";
 import { hostedReport } from "../src/init/hosted.ts";
 import { DOCS, interactiveOutput, plainOutput } from "../src/init/output.ts";
 import { Writable } from "node:stream";
@@ -753,6 +754,8 @@ test("a first init writes the proposal, its ignore file, the hook settings and t
         path.join(".carrick", ".gitignore"),
         PROPOSAL_FILE,
         path.join(".claude", onPath ? "settings.json" : "settings.local.json"),
+        // The same two-part nudge, for the other host (carrick#1335).
+        CODEX_HOOKS_FILE,
         ...taskSkillPaths(),
       ].sort(),
     );
@@ -760,11 +763,11 @@ test("a first init writes the proposal, its ignore file, the hook settings and t
     // The proposal is the whole derivation, including the config it would once
     // have written into the tree.
     // And the set is ignored where it has to be: all git can see in the tree
-    // after a first run is the two agent directories, which hold the settings
-    // and the skills and are meant to be committed.
+    // after a first run is the three agent directories, which hold the settings,
+    // the Codex hooks and the skills and are meant to be committed.
     assert.equal(
       execFileSync("git", ["-C", fixture.repo, "status", "--porcelain"], { encoding: "utf8" }),
-      "?? .agents/\n?? .claude/\n",
+      "?? .agents/\n?? .claude/\n?? .codex/\n",
     );
 
     const proposal = JSON.parse(fs.readFileSync(path.join(fixture.repo, PROPOSAL_FILE), "utf8"));

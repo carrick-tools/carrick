@@ -95,7 +95,7 @@ export function carrickHooks(command = "carrick"): Record<string, HookGroup[]> {
  */
 const HOOK_CALL = /^"?(.*?)"?\s+hook\s/;
 
-function isOurs(entry: unknown): boolean {
+export function isOurs(entry: unknown): boolean {
   if (typeof entry !== "object" || entry === null) return false;
   const command = (entry as HookEntry).command;
   if (typeof command !== "string") return false;
@@ -156,8 +156,13 @@ export function installedCarrickHooks(existing: string): InstalledHook[] {
 
 /** What `carrickHooks` writes, flattened the way `installedCarrickHooks` reads. */
 export function expectedCarrickHooks(command = "carrick"): InstalledHook[] {
+  return flattenHooks(carrickHooks(command));
+}
+
+/** One hook set, flattened the way `installedCarrickHooks` reads a document. */
+export function flattenHooks(set: Record<string, HookGroup[]>): InstalledHook[] {
   const expected: InstalledHook[] = [];
-  for (const [event, groups] of Object.entries(carrickHooks(command))) {
+  for (const [event, groups] of Object.entries(set)) {
     for (const group of groups) {
       for (const entry of group.hooks) {
         const one: InstalledHook = { event, command: entry.command };
@@ -218,6 +223,21 @@ export type MergeResult = {
  * edited into invalid JSON is a thing to report, never a thing to overwrite.
  */
 export function mergeCarrickHooks(existing: string | null, command: string | null = "carrick"): MergeResult {
+  return mergeHookSet(existing, command === null ? null : carrickHooks(command));
+}
+
+/**
+ * The same merge over any hook set, for the second host (carrick#1335).
+ *
+ * Codex's `hooks.json` nests its groups under a `hooks` key exactly as a
+ * `.claude` settings file does (`codex-rs/config/src/hook_config.rs`,
+ * `HooksFile`), so the documents differ only in which entries belong there and
+ * in what else the file holds. `null` removes ours and adds nothing.
+ */
+export function mergeHookSet(
+  existing: string | null,
+  set: Record<string, HookGroup[]> | null,
+): MergeResult {
   const base: Record<string, unknown> =
     existing == null || existing.trim() === ""
       ? {}
@@ -228,7 +248,7 @@ export function mergeCarrickHooks(existing: string | null, command: string | nul
   for (const [event, groups] of Object.entries(hooksBefore)) {
     hooks[event] = withoutOurs(groups);
   }
-  for (const [event, groups] of Object.entries(command === null ? {} : carrickHooks(command))) {
+  for (const [event, groups] of Object.entries(set ?? {})) {
     hooks[event] = [...((hooks[event] as HookGroup[]) ?? []), ...groups];
   }
   // An event that only ever held our entry, and no longer does, leaves no
