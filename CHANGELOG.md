@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.83](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.82...carrick-v0.3.83) (2026-09-20)
+
+
+### Features
+
+* **hooks:** carry the reuse nudge to Codex, one turn late ([#1339](https://github.com/carrick-tools/carrick/issues/1339)) ([d4f3dd5](https://github.com/carrick-tools/carrick/commit/d4f3dd5cb164698181e41cec6dba962d42d63b5f))
+* **hooks:** name a task's new functions once, at the end of it ([#1336](https://github.com/carrick-tools/carrick/issues/1336)) ([757d203](https://github.com/carrick-tools/carrick/commit/757d203db7358af0c7f9d7c0e886e5ded9a805c0))
+* **init:** keep the repo selection, and say when an install is a version behind ([#1354](https://github.com/carrick-tools/carrick/issues/1354)) ([b036084](https://github.com/carrick-tools/carrick/commit/b03608435ad34dff38c9eec789e60c462df48d98))
+* **init:** pick the repos first, and write nothing until the proposal is accepted ([#1347](https://github.com/carrick-tools/carrick/issues/1347)) ([b916aa5](https://github.com/carrick-tools/carrick/commit/b916aa53c06e5c5d34f569046a0510f2d9af1720)), closes [#1338](https://github.com/carrick-tools/carrick/issues/1338)
+* **sidecar:** name the drifting fields, and judge http pairs on the JSON wire form ([#1340](https://github.com/carrick-tools/carrick/issues/1340)) ([0c79119](https://github.com/carrick-tools/carrick/commit/0c791190be8d595414de187fed7bcbe24cd26d31))
+
+
+### Bug Fixes
+
+* **call-graph:** record call edges through require bindings ([#1355](https://github.com/carrick-tools/carrick/issues/1355)) ([7a15f98](https://github.com/carrick-tools/carrick/commit/7a15f9839d2690bec4146858606cbeb591c364c8)), closes [#1348](https://github.com/carrick-tools/carrick/issues/1348)
+
+
+### Documentation
+
+* **skills:** class every row the tool returned, and read what the answer carries ([#1351](https://github.com/carrick-tools/carrick/issues/1351)) ([f9ffc2a](https://github.com/carrick-tools/carrick/commit/f9ffc2a6cd4e725fa476133faf11934e8c9305e2)), closes [#1349](https://github.com/carrick-tools/carrick/issues/1349)
+
 ## [0.3.82](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.81...carrick-v0.3.82) (2026-09-19)
 
 
