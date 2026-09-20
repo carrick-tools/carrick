@@ -1125,6 +1125,7 @@ pub(crate) fn run_check(
                 Some(reason.clone()),
                 false,
                 Some(reason.clone()),
+                Vec::new(),
             ));
         } else {
             probing.push(pair);
@@ -1168,6 +1169,7 @@ pub(crate) fn run_check(
                             verdict.diagnostic.clone(),
                             verdict.resolved,
                             verdict.unresolved_reason.clone(),
+                            verdict.notes.clone(),
                         )),
                         None => outcomes.push(outcome_for(
                             pair,
@@ -1176,6 +1178,7 @@ pub(crate) fn run_check(
                             Some("the check returned no verdict for this pair".to_string()),
                             false,
                             Some("the check returned no verdict for this pair".to_string()),
+                            Vec::new(),
                         )),
                     }
                 }
@@ -1200,6 +1203,7 @@ pub(crate) fn run_check(
                         Some(reason.clone()),
                         false,
                         Some(reason.clone()),
+                        Vec::new(),
                     ));
                 }
             }
@@ -1220,6 +1224,12 @@ fn outcome_for(
     diagnostic: Option<String>,
     resolved: bool,
     unresolved_reason: Option<String>,
+    // `notes`: observations the check made beside the verdict (carrick#1341).
+    // Empty for every outcome this module SYNTHESISES — a pre-verdicted pair,
+    // a pair the check returned nothing for, a run that did not happen —
+    // since none of those compared anything to observe. Only a real
+    // `CheckVerdict.notes` is ever non-empty here.
+    notes: Vec<String>,
 ) -> PairCheckOutcome {
     PairCheckOutcome {
         pair_key: pair.spec.pair_key.clone(),
@@ -1237,6 +1247,7 @@ fn outcome_for(
         consumer_service: pair.consumer_service.clone(),
         resolved,
         unresolved_reason,
+        notes,
     }
 }
 

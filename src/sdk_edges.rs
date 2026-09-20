@@ -1343,6 +1343,7 @@ mod tests {
             reason: reason.map(String::from),
             resolved: true,
             unresolved_reason: None,
+            notes: Vec::new(),
         }
     }
 
@@ -1461,6 +1462,7 @@ mod tests {
             consumer_service: "ledger-sdk".to_string(),
             resolved,
             unresolved_reason: reason.map(str::to_string),
+            notes: Vec::new(),
         }
     }
 
@@ -1543,6 +1545,7 @@ mod tests {
             unresolved_reason: Some(
                 "the consumer type carries `unknown` at `body.items`".to_string(),
             ),
+            notes: Vec::new(),
         });
 
         let joined = run(

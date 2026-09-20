@@ -26,7 +26,11 @@ import type { CheckVerdict } from './api.js';
 import { decisiveAssignmentLine, type GateName, type ProbePlan, type Side } from './check-probe.js';
 import { scrubDiagnostic, scrubPaths, type ScrubContext } from './check-scrub.js';
 import type { PairDeepFindings } from './check-deep.js';
-import { describeFieldReport, type PairFieldReport } from './check-fields.js';
+import {
+  describeFieldReport,
+  fieldReportNotes,
+  type PairFieldReport,
+} from './check-fields.js';
 
 export interface RawDiagnostic {
   /** Workspace-relative, forward-slash file path (empty for global errors). */
@@ -118,7 +122,17 @@ export interface ClassifyInput {
 export function classifyPair(input: ClassifyInput): CheckVerdict {
   const { plan, probeDiags, poisonReason, scrubCtx } = input;
   const codes = [...new Set(probeDiags.map((d) => d.code))].sort((a, b) => a - b);
-  const base = { pair_id: plan.pairId, pair_key: plan.spec.pair_key, codes };
+  // `notes` sits on `base` so EVERY bucket carries it, including the
+  // compatible one (carrick#1341). The two statements it holds are true of a
+  // pair that agreed — an optionality gap assigns, and the wire allowance is
+  // exactly what made the pair agree — so a channel only reachable from the
+  // mismatch branch would be the same missing channel the ticket is about.
+  const base = {
+    pair_id: plan.pairId,
+    pair_key: plan.spec.pair_key,
+    codes,
+    notes: pairNotes(input, scrubCtx),
+  };
   // Every branch below this point except the last two returns a verdict about
   // a type nobody could read; each states that in one place rather than
   // repeating the reasoning.
@@ -307,6 +321,29 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
  * name. Scrubbed on the same terms as the tsc text: a printed member type can
  * carry a stub-absolute `import("...")` path.
  */
+/**
+ * The observations this pair states that are not its verdict (carrick#1341):
+ * the note that the comparison was made against the serialised form, and each
+ * optionality gap the walk found. Empty when the walk did not run or found
+ * nothing to add — never a claim that the two sides agree.
+ *
+ * Scrubbed on the same terms as the diagnostic: a printed member type can
+ * carry a stub-absolute `import("...")` path.
+ *
+ * A note is an OBSERVATION and never moves a bucket. Nothing in this function
+ * reaches `bucket`, `resolved` or `unresolved_reason`, and the pair's verdict
+ * is decided above before this is read.
+ */
+function pairNotes(input: ClassifyInput, scrubCtx: ScrubContext): string[] {
+  const report = input.fieldReport;
+  if (!report) return [];
+  return fieldReportNotes(
+    report,
+    input.plan.direction.sent,
+    input.plan.direction.expected
+  ).map((note) => scrubPaths(note, scrubCtx));
+}
+
 function namedFields(input: ClassifyInput, scrubCtx: ScrubContext): string {
   const report = input.fieldReport;
   if (!report) return '';

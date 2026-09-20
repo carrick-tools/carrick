@@ -120,6 +120,9 @@ function unverifiableAll(
     codes: [],
     resolved: false,
     unresolved_reason: diagnostic,
+    // Nothing was compared here, so there is nothing to observe about the
+    // comparison (carrick#1341). Empty is the honest answer, not a default.
+    notes: [],
   }));
 }
 
@@ -195,6 +198,7 @@ export async function runCheck(
         codes: [],
         resolved: false,
         unresolved_reason: 'one side of this pair has no captured type surface',
+        notes: [],
       });
     }
   }
@@ -242,6 +246,7 @@ export async function runCheck(
         hit.kind === 'budget_exhausted'
           ? `the ${hit.side} type is too deep or wide to verify at '${hit.path}'`
           : `the ${hit.side} type carries '${hit.kind}' at '${hit.path}'`,
+      notes: [],
     });
   }
   writeProbes(ws, probing);

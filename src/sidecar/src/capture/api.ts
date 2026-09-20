@@ -422,6 +422,24 @@ export interface CheckVerdict {
   resolved: boolean;
   /** Why `resolved` is false. Absent exactly when `resolved` is true. */
   unresolved_reason?: string;
+  /**
+   * Statements about THIS comparison that are neither the verdict nor an
+   * unresolution (carrick#1341).
+   *
+   * Two things the check can find are true of a pair it called COMPATIBLE, so
+   * neither can ride on `diagnostic`: an optionality gap (the sending side
+   * always provides a field the receiving side declares optional — legal,
+   * assigns, and still a drift between two sources), and the note that the
+   * comparison was made against the JSON wire form rather than the declared
+   * one (carrick#1340), which is why a producer `Date` read as a `string` is
+   * not reported.
+   *
+   * Written on EVERY bucket, empty when there is nothing to add. A note never
+   * changes `bucket` or `resolved` and is never a substitute for
+   * `diagnostic`: a reader that renders notes as a mismatch is reading an
+   * observation as a verdict.
+   */
+  notes: string[];
 }
 
 /**

@@ -9288,6 +9288,7 @@ mod tests {
             consumer_service: "consumer-svc".to_string(),
             resolved: true,
             unresolved_reason: None,
+            notes: Vec::new(),
         }];
         crate::cloud_storage::attach_compat_verdicts(
             &mut payloads,
