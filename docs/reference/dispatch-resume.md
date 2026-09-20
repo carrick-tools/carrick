@@ -169,6 +169,31 @@ pipeline.
   job, its answers sit in the cloud's content-addressed analysis cache until
   they expire. `carrick status` says so; that is a surface, not a mechanism.
 
+## Changing a prompt body means the job runs again
+
+The body is a name as well as a question, so moving one byte of it between a
+dispatch and the resume renames every question the job answered: the stored
+answers no longer match anything the resume rebuilds, so the resume joins
+none of them and every file is analysed from the start. A job that took hours
+the first time takes those hours again (carrick#1248). That is not avoidable
+— only visible, and carrick#1332 is what makes it visible.
+
+Three goldens hold the bytes:
+
+- `tests/bundle_row_id_golden_test.rs` builds a real bundle over
+  `tests/fixtures/llm-mocked-api`, offline, and asserts the row ids against
+  `tests/golden/bundle-row-ids.json`.
+- `file_analyzer_agent`'s own tests pin the digest of a body carrying every
+  OPTIONAL section — the GraphQL hints, the imported wrappers, the postMessage
+  block — which a plain HTTP fixture renders as zero bytes.
+- `local_mode::jobs` reads `tests/golden/jobs-0.3.81.json` back: the record a
+  customer's laptop is holding, which this release must still be able to read
+  or the answers it names are unreachable.
+
+A deliberate prompt or schema change updates the golden in the same PR, and
+**the PR body says that every in-flight job will miss and be analysed again
+from the start**. The failing test prints the list to check in.
+
 ## How it is proven
 
 `scripts/dispatch-smoke.sh` runs the whole path live: it copies

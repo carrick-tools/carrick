@@ -2752,6 +2752,71 @@ pub(crate) mod tests {
         );
     }
 
+    /// The split the analyzer states is the split that goes on the wire
+    /// (carrick#1332).
+    ///
+    /// The test above pins the envelope's SHAPE from a hand-built value; this
+    /// pins the mapping — `analyze_with_lambda` is four lines between a
+    /// [`GuidanceRef`] and the request, and a key swapped for a length, or a
+    /// length taken from anything but the block, is silent. The cloud slices
+    /// `utf8Bytes(user_message).subarray(guidance_prefix_bytes)` and hashes
+    /// the rest for its key, so the wrong number there keys every file in the
+    /// scan on bytes no resume ever rebuilds.
+    ///
+    /// The offline failure injector is the capture: it matches on the
+    /// SERIALIZED request body, so a failure that fires proves those exact
+    /// bytes were sent. Nothing reaches the cloud.
+    #[test]
+    #[serial]
+    fn the_guidance_split_the_caller_states_is_the_one_the_request_carries() {
+        let guidance = "## GUIDANCE — ✓\n";
+        let body = "### FILE CONTENT\nconst a = 1;\n";
+        let message = format!("{guidance}{body}");
+        // Bytes, not characters: the block holds a multi-byte character, so a
+        // char count would be a different — and wrong — number.
+        let prefix_bytes = guidance.len();
+        assert!(prefix_bytes > guidance.chars().count());
+
+        // SAFETY: serial test; env vars are process-global.
+        unsafe { env::set_var("CARRICK_MOCK_ALL", "1") };
+        inject_mock_failure(
+            "/analyze-file",
+            &format!(r#""guidance_key":"the-block","guidance_prefix_bytes":{prefix_bytes}"#),
+            1,
+        );
+        let sent = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(AgentService::new().analyze_with_lambda(
+                "/analyze-file",
+                &message,
+                None,
+                Some(GuidanceRef {
+                    key: "the-block",
+                    prefix_bytes,
+                }),
+            ))
+            .is_err();
+        // SAFETY: serial test; leave the process as it was found.
+        unsafe { env::remove_var("CARRICK_MOCK_ALL") };
+        mock_failures().lock().unwrap().clear();
+
+        assert!(
+            sent,
+            "the request did not carry the id and the byte count the caller stated, so the \
+             cloud would key this file on bytes a resume never rebuilds"
+        );
+        // And the number really does cut the message where the row's name
+        // begins: this is the slice the cloud hashes.
+        assert_eq!(
+            crate::analysis_job::body_id(
+                std::str::from_utf8(&message.as_bytes()[prefix_bytes..]).expect("a boundary")
+            ),
+            crate::analysis_job::body_id(body),
+        );
+    }
+
     /// `guidance_key` rides beside `text` on the framework-guidance envelope
     /// and is absent from every other lambda's, so its reader must treat a
     /// missing field as "no split available" rather than as a bad response.

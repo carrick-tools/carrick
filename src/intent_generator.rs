@@ -2544,4 +2544,77 @@ mod tests {
         })));
         task.join().await;
     }
+
+    // ---------------------------------- the bytes a request is named under
+    //                                                        (carrick#1332)
+
+    /// A fixed function, so the pins below depend on the request BUILDERS and
+    /// on nothing a fixture happens to contain.
+    fn fixed() -> Pending {
+        Pending {
+            name: "describeOrder".to_string(),
+            file_path: "src/orders.ts".to_string(),
+            body: "return format(order);".to_string(),
+            called_intents: vec!["Formats an order for display.".to_string()],
+            hash: "unused-here".to_string(),
+        }
+    }
+
+    /// What a `/generate-intent` request carries, byte for byte.
+    ///
+    /// Intent rows are NOT in an analysis-job bundle — `JobCounts.intent_*` is
+    /// zero by design, and intents run on the machine that resumes — so moving
+    /// these bytes orphans no dispatched answer. What it does orphan is the
+    /// cloud's own cache of them: the request body is key material there, so a
+    /// field renamed or re-ordered here regenerates every intent of every repo
+    /// already indexed, on the next scan of each.
+    ///
+    /// Pinned as serialised text rather than field by field, because ORDER is
+    /// part of it: the key is over the bytes.
+    #[test]
+    fn a_generate_intent_request_carries_these_exact_bytes() {
+        assert_eq!(
+            serde_json::to_string(&single_payload(&fixed())).expect("serialise"),
+            r#"{"body":"return format(order);","called_intents":["Formats an order for display."],"name":"describeOrder"}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&batch_payload(&[fixed()])).expect("serialise"),
+            r#"{"functions":[{"body":"return format(order);","called_intents":["Formats an order for display."],"name":"describeOrder"}]}"#,
+            "a batch is its members' own bodies under `functions`, and the lambda reads \
+             those names back"
+        );
+    }
+
+    /// The lever that re-asks every intent in every repo, and the hash it
+    /// moves.
+    ///
+    /// `compute_intent_hash` is what decides a function is unchanged since the
+    /// last scan. Bumping [`INTENT_CACHE_VERSION`] is the deliberate way to
+    /// invalidate it — the prompt and model live in the lambda, invisible from
+    /// here — so a change to the version, the field order or the length
+    /// delimiting is a full re-ask of every indexed repo. This says so out
+    /// loud.
+    #[test]
+    fn the_intent_reuse_hash_is_named_by_these_bytes() {
+        assert_eq!(INTENT_CACHE_VERSION, 2, "bumping this re-asks every intent");
+        assert_eq!(
+            compute_intent_hash(
+                "return format(order);",
+                &["Formats an order for display.".to_string()]
+            ),
+            "493d8600beecad752b171fdcd94866664d2b571b661921ce8f8fd52deb5d0429",
+        );
+        // Sorted, so two runs that discovered the same callees in a different
+        // order reuse one another's answer rather than re-asking.
+        assert_eq!(
+            compute_intent_hash("b", &["one".to_string(), "two".to_string()]),
+            compute_intent_hash("b", &["two".to_string(), "one".to_string()]),
+        );
+        // Length-delimited, so a body and a callee cannot be run together into
+        // the same bytes as a different pair.
+        assert_ne!(
+            compute_intent_hash("ab", &["c".to_string()]),
+            compute_intent_hash("a", &["bc".to_string()]),
+        );
+    }
 }
