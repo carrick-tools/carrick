@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.84](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.83...carrick-v0.3.84) (2026-09-20)
+
+
+### Features
+
+* **seams:** give a compat verdict a channel for what is not a mismatch ([#1356](https://github.com/carrick-tools/carrick/issues/1356)) ([b77da6a](https://github.com/carrick-tools/carrick/commit/b77da6a9fc63703053dff6ea0abc331c304ca66d))
+
+
+### Bug Fixes
+
+* **init:** nine first-run rough edges on a folder of repos, and a shorter session start ([#1366](https://github.com/carrick-tools/carrick/issues/1366)) ([9724bc2](https://github.com/carrick-tools/carrick/commit/9724bc2144dc473ea4c7df9c0b4e924adb52ae2e))
+* **sidecar:** a manifest alias no request reached reaches the surface, and one broken line stops decaying the rest ([#1360](https://github.com/carrick-tools/carrick/issues/1360)) ([b282a15](https://github.com/carrick-tools/carrick/commit/b282a158885ab8832aa15d7bb731fdd363f43625))
+
 ## [0.3.83](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.82...carrick-v0.3.83) (2026-09-20)
 
 
