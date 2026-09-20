@@ -44,10 +44,11 @@ import {
   hookTarget,
   installedCarrickHooks,
   ownEntryPoint,
+  SETTINGS_FILES,
   type InstalledHook,
 } from "./settings.ts";
-import { SETTINGS_FILES } from "./remove.ts";
 import { CODEX_HOOKS_FILE, codexInUse, expectedCodexHooks, readHooksFile } from "./codex.ts";
+import { inspectTaskSkills, TASK_SKILLS, type InstalledSkill } from "./task-skills.ts";
 import type { StatusResult } from "../contract.ts";
 
 export type DoctorOptions = { workspace: string };
@@ -698,6 +699,58 @@ export function checkCodexHooks(workspace: string): Line[] {
   ];
 }
 
+/**
+ * The task skills, which no check could see until now (carrick#1331).
+ *
+ * Three different things, and they are not the same finding:
+ *
+ * * **Missing** is a workspace where the bodies an agent is meant to read are
+ *   not there at all — a repo set up before this package shipped them, or one
+ *   somebody deleted them from. `carrick init` writes them.
+ * * **Written by an older version** is the upgrade nobody is told about
+ *   (carrick#1333): the file is still ours, byte for byte as it was written,
+ *   and the body this version renders has moved on. `carrick init` refreshes
+ *   exactly these.
+ * * **Edited here** is somebody's own work, and it is reported as a note
+ *   rather than a fault: a skill a team has changed is a skill they meant to
+ *   change, and `carrick init` leaves it alone. Saying it matters because it
+ *   is also the file that stops receiving what later versions ship.
+ *
+ * A file nobody here wrote — a skill of the same name from somewhere else — is
+ * not reported at all. It is not ours, and doctor has nothing to say about it.
+ */
+export function checkTaskSkills(installed: InstalledSkill[]): Line[] {
+  const lines: Line[] = [];
+  const missing = installed.filter((skill) => skill.state === "absent");
+  const stale = installed.filter((skill) => skill.state === "ours" && !skill.current);
+  const edited = installed.filter((skill) => skill.state === "edited");
+  if (missing.length > 0) {
+    lines.push(
+      warn(
+        `${missing.length} of the ${installed.length} task skill file(s) are missing here (${missing[0]!.path} and others), so your agent has no Carrick task to follow. \`carrick init\` writes them.`,
+      ),
+    );
+  }
+  if (stale.length > 0) {
+    lines.push(
+      warn(
+        `${stale.length} task skill file(s) here were written by an older version of carrick (${stale[0]!.path} and others). Re-run \`carrick init\`: it rewrites the ones still untouched and leaves the rest.`,
+      ),
+    );
+  }
+  for (const skill of edited) {
+    lines.push(
+      say(
+        `${skill.path} has been edited here, so \`carrick init\` leaves it as it is and it stays at the version you changed.`,
+      ),
+    );
+  }
+  if (findingCount(lines) === 0 && installed.some((skill) => skill.state === "ours")) {
+    lines.push(done(`Task skills installed here and current: ${TASK_SKILLS.join(", ")}.`));
+  }
+  return lines;
+}
+
 /** The MCP server entry in each agent client this machine has. */
 export function checkMcp(inspections: McpInspection[]): Line[] {
   if (inspections.length === 0) {
@@ -860,6 +913,7 @@ export async function doctor(argv: string[], out: InitOutput = createOutput()): 
     ...checkWorkflow(repos),
     ...checkHooks(workspace, realMachine()),
     ...checkCodexHooks(workspace),
+    ...checkTaskSkills(inspectTaskSkills(workspace)),
     ...checkMcp(inspectMcpClients()),
     ...(await readIndex(workspace)),
   ];

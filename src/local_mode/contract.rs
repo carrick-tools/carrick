@@ -23,7 +23,8 @@ pub const SCHEMA: &str = "carrick.check/0";
 pub enum ReadError {
     /// No `.carrick/` for this file.
     NotIndexed,
-    /// The file is not under any repo this workspace lists.
+    /// The file is not under any repo this workspace covers: not listed, or
+    /// listed and excluded.
     NotInWorkspace,
     /// The index is there and could not be read.
     IndexUnreadable,
@@ -46,8 +47,8 @@ impl ReadError {
                  folder holding your repos."
             }
             ReadError::NotInWorkspace => {
-                "this file is not under any repo the workspace lists. Add its repo to \
-                 carrick-workspace.json and re-index."
+                "this file is not under any repo this workspace covers. Check the repos and \
+                 the exclude list in carrick-workspace.json, then re-index."
             }
             ReadError::IndexUnreadable => {
                 "the local index could not be read. Re-run `carrick index --workspace <dir>`."

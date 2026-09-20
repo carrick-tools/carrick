@@ -23,6 +23,7 @@ import {
   checkHooks,
   checkIndex,
   checkMcp,
+  checkTaskSkills,
   checkWorkflow,
   configuredRepos,
   declaredServices,
@@ -36,6 +37,13 @@ import {
   type Line,
 } from "../src/init/doctor.ts";
 import { expectedCarrickHooks, installedCarrickHooks, mergeCarrickHooks } from "../src/init/settings.ts";
+import {
+  inspectTaskSkills,
+  skillFile,
+  SKILL_ROOTS,
+  stamped,
+  writeTaskSkills,
+} from "../src/init/task-skills.ts";
 import { renderTemplate, TEMPLATE_PATHS } from "../src/templates.ts";
 import { statusFixture } from "./helpers.ts";
 import type { StatusResult } from "../src/contract.ts";
@@ -386,6 +394,42 @@ test("a settings file holding last version's entries is a finding, not a pass", 
   for (const root of [noSessionStart, oldMatcher]) fs.rmSync(root, { recursive: true, force: true });
 });
 
+// carrick#1331 item 1, and carrick#1333: doctor could not see the eight skill
+// files at all, and an upgrade leaves them behind silently. Three different
+// things with three different answers, so a reader knows which of their files
+// `carrick init` will rewrite and which it will not touch.
+test("missing skills, skills an older version wrote, and skills edited here", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-doctor-skills-"));
+  try {
+    writeTaskSkills(dir, { slug: "acme-index" });
+    // Current and untouched: no finding, and one line saying so.
+    const healthy = checkTaskSkills(inspectTaskSkills(dir));
+    assert.equal(findingCount(healthy), 0, texts(healthy).join("\n"));
+    assert.match(healthy[0]!.text, /Task skills installed here and current/);
+
+    // One body an older release rendered, stamped as that release stamped it.
+    const stale = path.join(dir, skillFile(SKILL_ROOTS[0]!, "carrick-drift"));
+    const body = fs.readFileSync(stale, "utf8").split("\n<!-- carrick:skill")[0]!;
+    fs.writeFileSync(stale, stamped(`${body}\nA step an older version had.\n`));
+    // One somebody here has changed.
+    fs.appendFileSync(path.join(dir, skillFile(SKILL_ROOTS[1]!, "carrick-reuse")), "\nOurs.\n");
+    // And one deleted.
+    fs.rmSync(path.join(dir, skillFile(SKILL_ROOTS[0]!, "carrick-census")));
+
+    const lines = checkTaskSkills(inspectTaskSkills(dir));
+    const all = texts(lines).join("\n");
+    // Missing and outdated are faults; an edited file is a note, because a
+    // team that changed a skill meant to and doctor exits non-zero on faults.
+    assert.equal(findingCount(lines), 2, all);
+    assert.match(all, /1 of the 8 task skill file\(s\) are missing here/);
+    assert.match(all, /1 task skill file\(s\) here were written by an older version of carrick/);
+    assert.match(all, /carrick-reuse\/SKILL\.md has been edited here/);
+    assert.equal(lines.find((line) => line.text.includes("edited here"))?.level, "say");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("the hook reader sees exactly what the writer wrote", () => {
   for (const command of ["carrick", '"/opt/my tools/carrick/bin/carrick.mjs"']) {
     const body = mergeCarrickHooks(null, command).body;
@@ -495,11 +539,11 @@ test("how far the index is behind the branch CI indexes is a note with the numbe
   );
 });
 
-test("the whole command, on a workspace with exactly two findings", () => {
+test("the whole command, on a workspace with exactly three findings", () => {
   // One repo: an include that is not there, a workflow that matches the
-  // template, hooks that run this package, no agent client, and an index whose
-  // hosted half never arrived. Two findings, exit 1, and everything else a
-  // line that costs nothing.
+  // template, hooks that run this package, the task skills never written, no
+  // agent client, and an index whose hosted half never arrived. Three
+  // findings, exit 1, and everything else a line that costs nothing.
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-doctor-home-")));
   const entry = path.join(packageRoot, "bin", "carrick.mjs");
   const root = workspace({
@@ -553,10 +597,11 @@ test("the whole command, on a workspace with exactly two findings", () => {
     `■ ${path.basename(root)}: service "api" includes "packages/shared", which is not a directory in this repo.`,
     `◇ CI workflow matches the current template in 1 repo(s).`,
     `◇ Agent hooks are installed here and run this package (${entry}).`,
+    "▲ 8 of the 8 task skill file(s) are missing here (.claude/skills/carrick-impact/SKILL.md and others), so your agent has no Carrick task to follow. `carrick init` writes them.",
     "No agent client on this machine holds an MCP configuration, so there is none to check.",
     "▲ api: api is connected and has no hosted index yet. Run `carrick index` once to classify them. (hosted state: no_index_yet)",
     "",
-    "2 finding(s) above, marked ▲ or ■. Nothing here was changed; `carrick doctor` exits non-zero while any of them stand.",
+    "3 finding(s) above, marked ▲ or ■. Nothing here was changed; `carrick doctor` exits non-zero while any of them stand.",
   ]);
   // Read-only: the workspace holds what the test put there and nothing else.
   assert.deepEqual(fs.readdirSync(root).sort(), [".claude", ".github", "api", "carrick.json", "status.json"]);

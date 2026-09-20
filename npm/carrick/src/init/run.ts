@@ -42,6 +42,7 @@ import { hookCommand, mergeCarrickHooks, removeCarrickHooks } from "./settings.t
 import { CODEX_HOOKS_FILE, writeCodexHooks } from "./codex.ts";
 import { ignoredSkillRoots, taskSkillLines, writeTaskSkills } from "./task-skills.ts";
 import { writeIfChanged } from "./files.ts";
+import { excludedRepos, writeSelection, WORKSPACE_FILE } from "./workspace-file.ts";
 import { createOutput, DOCS, PromptCancelled, type Choice, type InitOutput } from "./output.ts";
 import { renderTemplate } from "../templates.ts";
 
@@ -363,6 +364,37 @@ export async function chooseRepos(
   return candidates.filter((repo) => kept.has(repo.path));
 }
 
+/**
+ * The excluded repos a `--repo` flag is asking for, by identity.
+ *
+ * An excluded repo is invisible to everything downstream — the scanner never
+ * derives it, so `selectRepos` sees a value matching nothing on disk and, by
+ * carrick#991's rule, attaches it to the one repo here with no GitHub identity
+ * of its own. That is a flag quietly covering a different repository, so the
+ * question is asked here instead, before any of it.
+ *
+ * Asked of the directory, not of the spelling: `--repo owner/web` and a
+ * directory called `web` are not the same claim, and the repo's own origin
+ * remote is what says whether they name one repository. A directory that is
+ * gone, or that names no GitHub repo, answers nothing and is not reported —
+ * there is no identity to have asked for.
+ */
+export function namedButExcluded(
+  workspace: string,
+  excluded: string[],
+  requested: string[],
+  identify: (repo: string) => RepoIdentity = repoIdentity,
+): string[] {
+  if (requested.length === 0 || excluded.length === 0) return [];
+  const wanted = new Set(requested.map((name) => name.toLowerCase()));
+  return excluded.filter((name) => {
+    const directory = path.join(workspace, name);
+    if (!fs.existsSync(directory)) return false;
+    const identity = identify(directory);
+    return identity.name !== null && wanted.has(identity.name.toLowerCase());
+  });
+}
+
 /** The repos this install covers, one line each, for the proposal. */
 export function coverageLines(plan: WorkspaceProposal, selected: RepoIdentity[]): string[] {
   return selected.slice(0, 10).map((repo) => {
@@ -430,7 +462,25 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   let decision: ProjectChoice;
   // The repos this run has permission to take out of another project.
   const movable = new Set<string>();
+  // The directory names this run leaves out, for the workspace file below.
+  let deselected: string[] = [];
   try {
+    // What a previous run wrote down, before anything is derived from it: the
+    // scanner has already dropped an excluded repo by the time the proposal
+    // arrives, so this is the only place that can tell a reader why the repo
+    // they just named is not here (carrick#1344).
+    const excluded = excludedRepos(workspace);
+    const asked = namedButExcluded(workspace, excluded, parsed.repos);
+    if (asked.length > 0) {
+      throw new Error(
+        `${WORKSPACE_FILE} leaves ${asked.join(" and ")} out of this workspace, so --repo cannot cover ${asked.length === 1 ? "it" : "them"}. Take ${asked.length === 1 ? "that name" : "those names"} out of the exclude list there and run carrick init again.`,
+      );
+    }
+    if (excluded.length > 0) {
+      out.say(
+        `${WORKSPACE_FILE} leaves ${excluded.join(", ")} out of this workspace, so nothing below covers ${excluded.length === 1 ? "it" : "them"}.`,
+      );
+    }
     // The derivation and the identities are local reads: they name the choice,
     // and a run nobody has chosen in yet must not have signed anything in.
     derived = deriveWorkspace(workspace);
@@ -443,6 +493,10 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     );
     if (selected.length === 0) throw new Stop(0);
     derived = selectedProposal(derived, selected.map((repo) => repo.path));
+    const kept = new Set(selected.map((repo) => repo.path));
+    deselected = candidates
+      .filter((repo) => !kept.has(repo.path))
+      .map((repo) => path.basename(repo.path));
     const dropped = candidates.length - selected.length;
     if (dropped > 0) {
       out.done(
@@ -671,6 +725,16 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     // (carrick-cloud#799).
     writeProposal(plan.workspace, derived);
     out.done(packagesLine(plan));
+    // And the selection itself, in the file every later command reads. Without
+    // it the choice lasted one run: `carrick refresh` and `carrick index` walk
+    // the folder, the editor hook answers for a file inside a repo nobody
+    // covers, and the next `init` asks again (carrick#1344).
+    const selection = writeSelection(plan.workspace, deselected);
+    if (selection !== null && selection.added.length > 0) {
+      out.done(
+        `${selection.added.join(", ")} excluded in ${WORKSPACE_FILE}, so the scans, the hooks and the next run leave ${selection.added.length === 1 ? "it" : "them"} alone`,
+      );
+    }
   } catch (error) {
     process.stderr.write(`carrick init: ${(error as Error).message}\n`);
     return 1;

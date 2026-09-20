@@ -36,12 +36,15 @@ import {
   parseArgs,
   init,
   initWith,
+  namedButExcluded,
   CANCELLED,
   NOTHING_WRITTEN,
   SCAFFOLD_SENTENCE,
   type InitOptions,
 } from "../src/init/run.ts";
 import { taskSkillPaths } from "../src/init/task-skills.ts";
+import { writeIfChanged } from "../src/init/files.ts";
+import { WORKSPACE_FILE } from "../src/init/workspace-file.ts";
 import { CODEX_HOOKS_FILE } from "../src/init/codex.ts";
 import { hostedReport } from "../src/init/hosted.ts";
 import {
@@ -491,6 +494,35 @@ test("a quoted absolute hook command is ours too, and a lookalike is not", () =>
   assert.deepEqual(commands, ["carrickctl hook post-edit", "carrick hook post-edit"]);
 });
 
+// carrick#1331. A checkout with `core.autocrlf` rewrites every tracked file to
+// CRLF on the way to disk, so a settings file and all eight skill bodies
+// differ from the rendered LF text in every line and nothing else. Compared as
+// bytes, that is ten files rewritten on every single `carrick init` — and each
+// rewrite puts LF back, which git then shows as modified work in a repository
+// somebody is using.
+test("a CRLF checkout is not rewritten by a run that changes nothing", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-crlf-"));
+  try {
+    const target = path.join(dir, "settings.json");
+    const body = mergeCarrickHooks(null, "carrick").body;
+    fs.writeFileSync(target, body.replace(/\n/g, "\r\n"));
+    const before = fs.readFileSync(target);
+
+    assert.equal(writeIfChanged(target, body), "unchanged");
+    assert.deepEqual(fs.readFileSync(target), before, "and the CRLF file is left in CRLF");
+
+    // The merge decides for itself whether a file changed, so it has to
+    // compare the same way or `carrick init` reports a write that did not
+    // happen.
+    assert.equal(mergeCarrickHooks(body.replace(/\n/g, "\r\n"), "carrick").changed, false);
+
+    // A real change is still a change.
+    assert.equal(writeIfChanged(target, `${body}\n`), "written");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("init reads its arguments", () => {
   const parsed = parseArgs(["-y", "--project", "payments", "--workspace", "/code"], "/tmp");
   assert.deepEqual(parsed, {
@@ -789,12 +821,56 @@ test("a repo left out of the selection gets no proposal entry and no assignment"
 
     // And nothing of ours is inside it. The hooks and the skills are the
     // workspace's, at the folder root, so what this pins is that the repo
-    // itself was not written into — the folder's hook still fires on an edit
-    // inside it, and `carrick refresh` still walks it, which is carrick#1344.
+    // itself was not written into.
     for (const entry of [".carrick", ".claude", ".agents"]) {
       assert.equal(fs.existsSync(path.join(fixture.web, entry)), false, entry);
     }
     assert.equal(fs.existsSync(path.join(fixture.folder, ".claude")), true);
+
+    // The half that used to be missing (carrick#1344): the answer is written
+    // down, in the file the scanner reads before it derives, scans or answers
+    // an editor hook about a file. `Workspace::load` honours the list by
+    // directory name and the read path behind `carrick check` asks the same
+    // question of the same file, both proven in `src/local_mode`.
+    const selection = JSON.parse(
+      fs.readFileSync(path.join(fixture.folder, WORKSPACE_FILE), "utf8"),
+    );
+    assert.deepEqual(selection.exclude, ["web"]);
+    // And recorded as ours, which is what `carrick remove` takes back.
+    assert.deepEqual(selection.carrick, { exclude: ["web"] });
+    assert.match(result.stdout, /web excluded in carrick-workspace\.json/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+// carrick#1344. An excluded repo is invisible to the scanner, so a `--repo`
+// naming it would reach `selectRepos` as a value matching nothing on disk —
+// and that rule attaches an unmatched value to the one repo here with no
+// GitHub identity (carrick#991). Covering a different repository silently is
+// the one outcome this cannot have.
+test("a repo the workspace file excludes is named, not quietly re-covered", posixNativeFixture, () => {
+  const fixture = folderInitFixture();
+  try {
+    fs.writeFileSync(
+      path.join(fixture.folder, WORKSPACE_FILE),
+      `${JSON.stringify({ exclude: ["web"], carrick: { exclude: ["web"] } }, null, 2)}\n`,
+    );
+    const result = spawnSync(
+      process.execPath,
+      [
+        path.join(packageRoot, "bin", "carrick.mjs"), "init",
+        "--repo", "acme/web", "--project", "payments", "--yes", fixture.folder,
+      ],
+      { cwd: fixture.folder, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 1, result.stdout);
+    assert.match(result.stderr, /carrick-workspace\.json leaves web out of this workspace/);
+    assert.match(result.stderr, /exclude list/);
+    // Nothing was asked of Carrick and nothing was written: the refusal is
+    // before the login, as every other refusal in this command is.
+    assert.deepEqual(fixture.requests(), []);
+    assert.equal(fs.existsSync(path.join(fixture.folder, ".carrick")), false);
   } finally {
     fixture.cleanup();
   }

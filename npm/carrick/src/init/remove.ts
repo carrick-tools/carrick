@@ -1,12 +1,13 @@
 // Undoing `carrick init`, on this machine.
 //
 // An install that can state its own undo is the courtesy that makes people
-// willing to try it (carrick#1034), and init now writes in nine places: the
+// willing to try it (carrick#1034), and init now writes in ten places: the
 // hook entries in a workspace's `.claude` settings, the Codex ones in
 // `.codex/hooks.json`, the task skills under `.claude/skills` and
-// `.agents/skills`, an MCP server entry in each agent client's own
-// configuration, the `.carrick` directory, the install id in `~/.carrick`, and
-// the credential in the user's configuration directory.
+// `.agents/skills`, the repo selection in `carrick-workspace.json`, an MCP
+// server entry in each agent client's own configuration, the `.carrick`
+// directory, the install id in `~/.carrick`, and the credential in the user's
+// configuration directory.
 //
 // Every step here is the inverse of a writer in this folder, and each pair
 // lives in one file so the two cannot drift: `mergeCarrickHooks` /
@@ -40,9 +41,11 @@ import { installIdPath, removeInstallId } from "./install-id.ts";
 import { removeSessions, sessionsDir } from "../hook/reuse.ts";
 import { disconnectMcpClients, type McpRemoval } from "./mcp.ts";
 import { repoRoots } from "./repos.ts";
-import { removeCarrickHooks } from "./settings.ts";
+import { removeCarrickHooks, SETTINGS_FILES } from "./settings.ts";
 import { CODEX_HOOKS_FILE, uninstallCodexHooks } from "./codex.ts";
 import { removeTaskSkills, SKILL_ROOTS } from "./task-skills.ts";
+import { removeNotice } from "./outdated.ts";
+import { removeSelection, WORKSPACE_FILE } from "./workspace-file.ts";
 import { createOutput, DOCS, type InitOutput } from "./output.ts";
 
 export type RemoveOptions = {
@@ -87,7 +90,8 @@ function help(): string {
     "server in each agent client's configuration, the .carrick directory, this",
     "machine's install id, and the saved credential.",
     "Other hooks, other MCP servers and the settings files themselves are left",
-    "as they are. The task skills it wrote are removed where they still match",
+    "as they are, and so is anything in carrick-workspace.json that init did",
+    "not put there. The task skills it wrote are removed where they still match",
     "the stamp it wrote them with, and named where they do not. Files the",
     "scaffold added to the repository are listed with the git rm line that",
     "removes them.",
@@ -98,12 +102,6 @@ function help(): string {
     `What each of those things is, and what it does: ${DOCS}`,
   ].join("\n");
 }
-
-/** The settings files a workspace can hold our hook entries in. */
-export const SETTINGS_FILES = [
-  path.join(".claude", "settings.json"),
-  path.join(".claude", "settings.local.json"),
-];
 
 /**
  * The files the scaffold pull request adds to a repository.
@@ -269,6 +267,10 @@ export async function remove(argv: string[], out: InitOutput = createOutput()): 
     out.done(`${sessions} session record(s) removed from ${sessionsDir()}`);
     removed += 1;
   }
+  // Same directory, same reason, and the same ordering it imposes: the day the
+  // refresh notice was last said means nothing once there is no install to
+  // refresh (carrick#1333).
+  removeNotice();
 
   // The install id goes with the entries that carried it: what the header
   // named is this machine's setup, and the setup is what just came off it. A
@@ -295,6 +297,26 @@ export async function remove(argv: string[], out: InitOutput = createOutput()): 
       row.state === "edited"
         ? `${row.path} has been edited since Carrick wrote it, so it was left in place. Delete it by hand to finish removing it.`
         : `${row.path} was not written by Carrick, so it was left in place.`,
+    );
+  }
+
+  // The repo selection, which is the one thing init writes into a file a user
+  // can also write to (carrick#1344). Only the names init put in the exclude
+  // list come out; a repo somebody excluded by hand stays excluded, and the
+  // file stays unless init is the whole reason it is there.
+  try {
+    const selection = removeSelection(workspace);
+    if (selection !== null) {
+      out.done(
+        selection.deleted
+          ? `${selection.file} removed, with the repo selection init wrote in it`
+          : `${selection.removed.join(", ")} taken out of the exclude list in ${selection.file}; the rest of the file is yours and was left`,
+      );
+      removed += 1;
+    }
+  } catch (error) {
+    out.refuse(
+      `Could not read ${WORKSPACE_FILE}: ${(error as Error).message}. Take the carrick exclusions out by hand.`,
     );
   }
 

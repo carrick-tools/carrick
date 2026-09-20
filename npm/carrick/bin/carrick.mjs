@@ -46,6 +46,43 @@ const argv = process.argv.slice(2);
 const [command, ...rest] = argv;
 
 /**
+ * The commands that say nothing about the state of the install (carrick#1333).
+ *
+ * `hook` and `lsp` are protocol channels — a line of prose on either is a line
+ * an agent reads as data — and `init`, `doctor` and `remove` are the commands
+ * that write, audit and undo the very files the notice would be about, so each
+ * of them says it better in its own words.
+ */
+const NO_NOTICE = new Set(["hook", "lsp", "init", "doctor", "remove"]);
+
+/**
+ * One line a day, on stderr, naming what an upgrade left behind here.
+ *
+ * `npm install -g carrick@latest` changes the binary and nothing else, so a
+ * repo keeps the hook entries and skill bodies of whichever version first ran
+ * `carrick init` in it. Nothing re-reads them, and nobody is told.
+ *
+ * It runs before the command, never instead of it, and cannot fail one: a
+ * throw, a workspace Carrick was never set up in, or an install that is
+ * current all leave it silent.
+ */
+async function refreshNoticeLine() {
+  if (command === undefined || NO_NOTICE.has(command)) return;
+  try {
+    const { initialisedRoot, refreshNotice } = await import("../dist/init/outdated.js");
+    const root = initialisedRoot(process.cwd());
+    if (root === null) return;
+    const line = refreshNotice(root);
+    if (line) process.stderr.write(`carrick: ${line}\n`);
+  } catch {
+    // A notice about the install must never be the reason a command did not
+    // run.
+  }
+}
+
+await refreshNoticeLine();
+
+/**
  * Run a build of the index and render it (carrick#1315).
  *
  * The binary writes for a log file as well as for a person: a run banner, a

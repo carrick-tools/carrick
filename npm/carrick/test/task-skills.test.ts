@@ -196,6 +196,31 @@ test("remove deletes the stamped copies and nothing else", () => {
   assert.deepEqual(removeTaskSkills(dir), { deleted: [], kept: result.kept });
 });
 
+// carrick#1331. `.agents/` exists because init wrote skills into it, so an
+// empty one left behind after `carrick remove` is litter a user has to
+// recognise before deleting. `.claude/` is theirs and holds their settings, so
+// the same call must leave it exactly where it is.
+test("removing the last skill takes the host folder init created with it", () => {
+  const dir = workspace();
+  writeTaskSkills(dir, { slug: "acme-index" });
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), "{}\n");
+
+  assert.equal(removeTaskSkills(dir).deleted.length, 8);
+  assert.equal(fs.existsSync(path.join(dir, ".agents")), false, ".agents was left behind");
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), true);
+  assert.equal(fs.existsSync(path.join(dir, ".claude")), true, "somebody's own folder went with it");
+});
+
+test("a host folder holding anything else of theirs stays", () => {
+  const dir = workspace();
+  writeTaskSkills(dir, { slug: "acme-index" });
+  fs.writeFileSync(path.join(dir, ".agents", "notes.md"), "mine\n");
+
+  removeTaskSkills(dir);
+  assert.equal(fs.existsSync(path.join(dir, ".agents", "notes.md")), true);
+});
+
 test("an ignored skills directory is reported, and a tracked one is not", () => {
   const dir = fs.realpathSync(workspace());
   const git = (...args: string[]): void => {

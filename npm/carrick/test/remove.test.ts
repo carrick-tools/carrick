@@ -14,17 +14,18 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { mergeCarrickHooks, removeCarrickHooks } from "../src/init/settings.ts";
+import { mergeCarrickHooks, removeCarrickHooks, SETTINGS_FILES } from "../src/init/settings.ts";
 import {
   parseArgs,
   repoLeftovers,
   mcpRemovalLines,
   SCAFFOLD_FILES,
-  SETTINGS_FILES,
 } from "../src/init/remove.ts";
 import { MCP_URL } from "../src/init/mcp.ts";
 import { INSTALL_ID_HEADER, installIdPath } from "../src/init/install-id.ts";
 import { sessionFile, sessionsDir } from "../src/hook/reuse.ts";
+import { noticeFile } from "../src/init/outdated.ts";
+import { WORKSPACE_FILE } from "../src/init/workspace-file.ts";
 import { CODEX_HOOKS_FILE, writeCodexHooks } from "../src/init/codex.ts";
 
 const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -234,8 +235,18 @@ process.exit(0);
     { mode: 0o600 },
   );
 
+  // The day the refresh notice was last said, which shares `~/.carrick` with
+  // the install id exactly as the session records do (carrick#1333).
+  fs.writeFileSync(noticeFile(home), "2026-09-20\n", { mode: 0o600 });
+
   fs.mkdirSync(path.join(workspace, ".carrick"), { recursive: true });
   fs.writeFileSync(path.join(workspace, ".carrick", "proposal.json"), "{}\n");
+  // A selection init wrote, beside an exclusion of the user's own: only ours
+  // comes out, and the file stays because theirs is still in it (carrick#1344).
+  fs.writeFileSync(
+    path.join(workspace, WORKSPACE_FILE),
+    `${JSON.stringify({ exclude: ["fixtures", "web"], carrick: { exclude: ["web"] } }, null, 2)}\n`,
+  );
   fs.mkdirSync(path.join(workspace, ".github", "workflows"), { recursive: true });
   fs.writeFileSync(path.join(workspace, ".github", "workflows", "carrick.yml"), "name: carrick\n");
   fs.mkdirSync(path.join(workspace, ".claude", "skills", "carrick"), { recursive: true });
@@ -357,6 +368,14 @@ test("remove takes back what init wrote, lists what it will not touch, and says 
     "mcp get carrick",
     "mcp remove --scope user carrick",
   ]);
+
+  // The selection comes out of the file the user also writes to: our name
+  // only, and the file stays because theirs is still in it (carrick#1344).
+  assert.match(first.stdout, /◇ web taken out of the exclude list in carrick-workspace\.json/);
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(path.join(state.workspace, WORKSPACE_FILE), "utf8")),
+    { exclude: ["fixtures"] },
+  );
 
   assert.equal(fs.existsSync(path.join(state.workspace, ".carrick")), false);
   assert.equal(fs.existsSync(path.join(state.root, "config", "carrick", "credentials.json")), false);

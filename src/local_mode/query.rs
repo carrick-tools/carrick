@@ -55,6 +55,12 @@ pub fn answer(
     let (repo, relative) = index
         .locate_file(file)
         .ok_or_else(|| ReadFailure::new(ReadError::NotInWorkspace))?;
+    // A repo the workspace file excludes is one this install was told not to
+    // cover, and the index keeps its rows until the next build. Same answer as
+    // a file from any other repo the workspace does not list (carrick#1344).
+    if super::workspace::excluded_repo(workspace_root, Path::new(&repo.path)) {
+        return Err(ReadFailure::new(ReadError::NotInWorkspace));
+    }
     let items = repo.files.get(&relative).cloned().unwrap_or_default();
 
     // The service is the file's own when the index holds rows for it, and
@@ -1079,6 +1085,76 @@ mod drift_tests {
         assert!(
             text.contains("monorepo: 1 file(s) changed outside every service"),
             "{text}"
+        );
+    }
+
+    /// carrick#1344. The hooks belong to the folder, so an edit inside a repo
+    /// the reader left out of the selection still reaches `carrick check` —
+    /// and the index, built before the exclusion was written, still holds that
+    /// repo's rows. The answer has to come from what the workspace covers now.
+    #[test]
+    fn a_file_in_an_excluded_repo_is_not_answered_for_from_rows_already_indexed() {
+        let folder = tempfile::tempdir().unwrap();
+        for name in ["api", "web"] {
+            std::fs::create_dir_all(folder.path().join(name).join("src")).unwrap();
+            std::fs::write(
+                folder.path().join(name).join("src/main.ts"),
+                "export const a = 1;",
+            )
+            .unwrap();
+        }
+        let repo = |name: &str| IndexedRepo {
+            path: folder
+                .path()
+                .join(name)
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            name: name.to_string(),
+            services: vec![service(None, "")],
+            files: Default::default(),
+        };
+        let index = LocalIndex {
+            hosted_identity: None,
+            hosted_workspace: None,
+            repos_detected_by: None,
+            repos_added: Vec::new(),
+            repos_excluded: Vec::new(),
+            hosted_source_key: None,
+            hosted_checked_at: None,
+            version: crate::local_mode::read_model::READ_MODEL_VERSION,
+            scanner_version: "test".to_string(),
+            indexed_at: "2026-09-12T10:00:00Z".to_string(),
+            repos: vec![repo("api"), repo("web")],
+        };
+        let index_dir = folder.path().join(crate::local_mode::workspace::INDEX_DIR);
+        std::fs::create_dir_all(&index_dir).unwrap();
+        index.write(&index_dir.join("index.json")).unwrap();
+        std::fs::write(
+            folder
+                .path()
+                .join(crate::local_mode::workspace::WORKSPACE_FILE),
+            r#"{"exclude":["web"],"carrick":{"exclude":["web"]}}"#,
+        )
+        .unwrap();
+
+        let ask = |name: &str| {
+            answer(
+                folder.path(),
+                &folder.path().join(name).join("src/main.ts"),
+                Mode::Check,
+                Freshness::Indexed,
+            )
+        };
+        assert_eq!(
+            ask("web").err().map(|failure| failure.error),
+            Some(ReadError::NotInWorkspace),
+            "the repo left out of the selection is not answered for"
+        );
+        assert!(
+            ask("api").is_ok(),
+            "and the repo this install covers still is"
         );
     }
 }
