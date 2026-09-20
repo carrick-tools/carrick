@@ -100,6 +100,75 @@ test("the drift body classes every verdict situation get_contract_pair can retur
   assert.match(flat, /gh issue create --title "<consumer> and <producer> may disagree on/);
 });
 
+test("the reuse body classes every row find_similar returned, by tests that decide", () => {
+  // Measured on the shipped body (carrick#1349): agents found the clusters and
+  // then wrote the hard ones up in free wording, because three qualitative
+  // class words describe the same pair equally well and nothing bound the
+  // column to the rows the tool returned.
+  const body = renderTaskSkill("carrick-reuse", { slug: "acme-index" });
+  const classes = body.slice(body.indexOf("\n## Class every row"), body.indexOf("\n## Report"));
+  assert.ok(classes.length > 0, "the reuse body has no classing section");
+
+  for (const head of [
+    /\*\*FALSE POSITIVE\*\*: the two contracts differ/,
+    /\*\*VARIANT\*\*: one contract, and a behavioural difference you can name/,
+    /\*\*DUPLICATE\*\*: one contract, and nothing left to name/,
+  ]) {
+    assert.match(classes, head, `no class in the classing section matches ${head}`);
+  }
+  // Ordered, so the first test that holds decides the row.
+  assert.match(classes.replace(/\s+/g, " "), /take the first of these that holds/);
+  // `find_similar` carries no field for a documented mirror, so the evidence is
+  // a comment in the file the tool points at. The head of the file counts: a
+  // run against our own index read two mirrored copies as one behaviour,
+  // because the comment naming the mirror sits above the module rather than
+  // above the function the span starts at.
+  assert.match(
+    classes.replace(/\s+/g, " "),
+    /Where a comment on the member or at the head of its file names the file it mirrors, the clause is "documented mirror"\./,
+  );
+
+  const report = body.slice(body.indexOf("\n## Report"), body.indexOf("\n## Act"));
+  const flat = report.replace(/\s+/g, " ");
+  assert.match(flat, /The class column carries one of the three words and is never empty\./);
+  assert.match(
+    flat,
+    /State `total_clusters` from the response against the number of clusters carrying rows above\./,
+  );
+});
+
+test("impact and drift bind their verdict words to the rows their tools returned", () => {
+  const impact = renderTaskSkill("carrick-impact", { slug: "acme-index" }).replace(/\s+/g, " ");
+  assert.match(
+    impact,
+    /Every consumer call site the answers returned carries one of them and the verdict column is never empty, and the report states call sites returned against call sites given a verdict\./,
+  );
+
+  const drift = renderTaskSkill("carrick-drift", { slug: "acme-index" }).replace(/\s+/g, " ");
+  assert.match(drift, /the report states operations returned against operations classed/);
+  // A live pair satisfied UNRESOLVED and PRODUCER UNTYPED at once, so the words
+  // are ordered rather than listed.
+  assert.match(
+    drift,
+    /takes the first that applies of DRIFT, PRODUCER UNTYPED, CONSUMER UNTYPED, UNRESOLVED, NOT JUDGED, MATCH/,
+  );
+});
+
+test("the bodies read what an answer carries rather than a response shape written here", () => {
+  const reuse = renderTaskSkill("carrick-reuse", { slug: "acme-index" }).replace(/\s+/g, " ");
+  assert.match(reuse, /`vector_basis` says what the cosines are over/);
+  assert.match(reuse, /every key the answer carries under `not_compared` and under `excluded`/);
+  // A body listing those keys drops the next one the lambda adds, which is how
+  // it came to name four of the five it now returns.
+  assert.doesNotMatch(reuse, /awaiting_embedding/);
+
+  // One call where the server answers both wordings, two where it does not.
+  const census = renderTaskSkill("carrick-census", { slug: "acme-index" }).replace(/\s+/g, " ");
+  assert.match(census, /also_phrased_as: \["<how it does it>"\]/);
+  assert.match(census, /Where the answer carries no `phrasings`, or the field comes back refused/);
+  assert.match(census, /`hidden_by_threshold` where the answer carries it/);
+});
+
 test("a second run writes nothing and reports nothing to fix", () => {
   const dir = workspace();
   writeTaskSkills(dir, { slug: "acme-index" });
