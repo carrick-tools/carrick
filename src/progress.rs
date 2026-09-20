@@ -401,12 +401,17 @@ const HOSTED_BYTES: &str = "hosted bytes ";
 
 /// Say how much of the hosted index came down, in the units a person reads.
 pub fn hosted_bytes(bytes: usize) {
-    let read = if bytes >= 1_048_576 {
+    announce(&format!("{HOSTED_BYTES}{}", readable_size(bytes)));
+}
+
+/// A byte count as a person reads one: whole kilobytes, rounded up so a small
+/// read is never "0 kB", and megabytes to one place above that.
+fn readable_size(bytes: usize) -> String {
+    if bytes >= 1_048_576 {
         format!("{:.1} MB", bytes as f64 / 1_048_576.0)
     } else {
         format!("{} kB", bytes.div_ceil(1024))
-    };
-    announce(&format!("{HOSTED_BYTES}{read}"));
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -521,6 +526,17 @@ impl Ticker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hosted read's size, as the download line prints it (carrick#1365).
+    #[test]
+    fn a_hosted_read_is_sized_in_the_units_a_person_reads() {
+        assert_eq!(readable_size(1), "1 kB");
+        assert_eq!(readable_size(1024), "1 kB");
+        assert_eq!(readable_size(1025), "2 kB");
+        assert_eq!(readable_size(1_048_575), "1024 kB");
+        assert_eq!(readable_size(1_048_576), "1.0 MB");
+        assert_eq!(readable_size(12_900_000), "12.3 MB");
+    }
 
     #[test]
     fn a_line_that_is_not_an_update_is_not_read_as_one() {

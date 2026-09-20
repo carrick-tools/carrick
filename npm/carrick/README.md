@@ -207,17 +207,22 @@ runs on the local machine.
 Hosted queries cover connected, indexed repositories in the selected Carrick
 project, including repositories absent from this disk, using their most recent
 default-branch indexes. They are available over MCP, and `carrick init`
-connects the agent clients it finds on the machine: Claude Code through
-`claude mcp add`, and Cursor, Windsurf and VS Code by adding a `carrick` server
-to the client's own configuration file, leaving every other entry in it alone.
-Each entry carries an `X-Carrick-Install-Id` header: a UUID generated once,
-kept in `~/.carrick/install-id`, and sent with every MCP call so a slow session
-can be told apart from a busy one. It says nothing about the machine or the
-person — `carrick remove` deletes it, and the next `carrick init` mints
-another. A `carrick` entry that is already there keeps everything on it: the
-file clients have the header merged into their entry, and Claude Code, whose
-entry can only be replaced whole, is left as it is and told the two commands
-that add it. A machine with no client on it is given the line to run, with the
+connects Claude Code through `claude mcp add`. Cursor, Windsurf and VS Code
+keep their configuration outside the workspace, so each is asked about by the
+path of its file: the terminal offers the ones whose configuration directory
+exists, ticked where the editor itself is detected, and a run with no terminal
+writes one only when `--mcp EDITOR` names it. `--yes` does not cover them. A
+`carrick` server is added to the file and every other entry in it is left
+alone.
+An entry init writes carries an `X-Carrick-Install-Id` header: a UUID generated
+once, kept in `~/.carrick/install-id`, and sent with every MCP call so a slow
+session can be told apart from a busy one. It says nothing about the machine or
+the person — `carrick remove` deletes it, and the next `carrick init` mints
+another. A `carrick` entry that is already there is left exactly as it is, with
+or without the header: the header is part of what a client keys its sign-in on,
+and nothing a user sees depends on it, so neither `init` nor `doctor` mentions
+an entry that has none.
+A machine with no client on it is given the line to run, with the
 id already in it:
 
 ```

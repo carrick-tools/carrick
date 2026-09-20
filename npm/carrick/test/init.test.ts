@@ -1853,6 +1853,11 @@ test("every hosted outcome is one line, and only an actionable one is a warning"
     text: "Hosted index for 2 services downloaded into .carrick/",
   });
   assert.deepEqual(hostedReport({ kind: "downloaded", services: 1 }).text, "Hosted index for 1 service downloaded into .carrick/");
+  // With the time the step took, which is what a wait of minutes ends on.
+  assert.equal(
+    hostedReport({ kind: "downloaded", services: 15 }, 184).text,
+    "Hosted index for 15 services downloaded into .carrick/ in 3m4s",
+  );
   const older = hostedReport({ kind: "version_mismatch", services: 2 });
   assert.equal(older.kind, "warn");
   assert.match(older.text, /run `carrick index --detach` once from main/);

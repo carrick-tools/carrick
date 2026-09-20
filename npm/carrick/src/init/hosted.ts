@@ -266,11 +266,15 @@ function stateClause(state: string): string {
  * This is the step's report, so it is also the line the spinner stops on: one
  * line for the hosted read, in a terminal as everywhere else (carrick#1032).
  */
-export function hostedReport(outcome: HostedDownload): StepReport {
+export function hostedReport(outcome: HostedDownload, seconds: number | null = null): StepReport {
   const plural = (count: number): string => `${count} service${count === 1 ? "" : "s"}`;
+  // The total and the time, on the line that stays once the ticking one is
+  // gone: a wait of minutes that ends on a line with no duration leaves the
+  // reader to guess whether that was normal (carrick#1365).
+  const took = seconds === null ? "" : ` in ${elapsed(seconds)}`;
   switch (outcome.kind) {
     case "downloaded":
-      return { kind: "done", text: `Hosted index for ${plural(outcome.services)} downloaded into .carrick/` };
+      return { kind: "done", text: `Hosted index for ${plural(outcome.services)} downloaded into .carrick/${took}` };
     case "version_mismatch":
       return {
         kind: "warn",

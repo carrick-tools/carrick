@@ -292,7 +292,7 @@ test("a large workspace gets the services worth acting on, and a pointer to the 
   // Eight of the ten that moved, the other two counted, the five quiet ones
   // nowhere, and no boundary report at all.
   assert.equal(lines.filter((line) => line.startsWith("- svc-")).length, LISTED_SERVICES);
-  assert.ok(lines.includes("- +2 more service(s) with files changed since the index"));
+  assert.ok(lines.includes("- +2 more service(s) with something to act on"));
   assert.ok(!lines.some((line) => line.includes("svc-12")));
   assert.ok(!lines.some((line) => line.includes("boundary line nobody acts on")));
   assert.equal(lines.at(-1), BOUNDARY_POINTER);

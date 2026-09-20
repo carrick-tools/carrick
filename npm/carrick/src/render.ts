@@ -501,7 +501,7 @@ export function renderSessionStart(status: StatusResult): string {
     const actionable = status.services.filter(hasSomethingToDo);
     for (const service of actionable.slice(0, LISTED_SERVICES)) lines.push(serviceLine(service));
     if (actionable.length > LISTED_SERVICES) {
-      lines.push(`- +${actionable.length - LISTED_SERVICES} more service(s) with files changed since the index`);
+      lines.push(`- +${actionable.length - LISTED_SERVICES} more service(s) with something to act on`);
     }
   }
   for (const repo of status.repos ?? []) {

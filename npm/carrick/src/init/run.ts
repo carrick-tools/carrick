@@ -1041,10 +1041,11 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     // as well as in a pipe: a spinner that stopped with its label spent a
     // second line on the same event (carrick#1032). What it says while it runs
     // is the scanner's own count of where it has got to (carrick#1365).
+    const startedAt = Date.now();
     await out.step(
       DOWNLOAD_LABEL,
       (progress) => downloadHostedIndex(plan.workspace, nativeRunner(out.quiet, progress)),
-      hostedReport,
+      (outcome) => hostedReport(outcome, (Date.now() - startedAt) / 1000),
     );
   } else {
     out.done("No index yet: your agent runs the one scan");
