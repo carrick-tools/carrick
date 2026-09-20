@@ -73,6 +73,15 @@ export function carrickHooks(command = "carrick"): Record<string, HookGroup[]> {
         hooks: [{ type: "command", command: `${command} hook session-start`, timeout: 30 }],
       },
     ],
+    // The end of a task, which is the only moment a reuse check is worth a
+    // model turn: the post-edit hook records what each edit added and this
+    // names the lot once (carrick#1330). It reads one small file and prints
+    // nothing when the task added no function, so the timeout is the short one.
+    Stop: [
+      {
+        hooks: [{ type: "command", command: `${command} hook stop`, timeout: 5 }],
+      },
+    ],
   };
 }
 

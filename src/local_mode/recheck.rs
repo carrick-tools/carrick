@@ -21,6 +21,10 @@
 //!    [`LocalJoin`] the indexer folds. Nothing is downloaded and nothing is
 //!    written outside a temporary directory this module deletes.
 //!
+//! It also answers with the functions the re-extracted file declares that the
+//! index does not hold, which is what the end-of-task reuse nudge speaks from
+//! (carrick#1330; `docs/reference/task-skills.md`, "The reuse nudge").
+//!
 //! A deadline covers both phases. On a miss the caller keeps the indexed
 //! answer and says how old it is; the re-check never blocks an edit and never
 //! leaves a scan running behind one.
@@ -72,9 +76,19 @@ impl Ran {
 pub struct Fresh {
     /// The rows the working tree states, in the shape the index holds them.
     pub items: Vec<IndexedItem>,
+    /// Functions the re-extracted file declares that the blobs the index holds
+    /// do not (carrick#1330), in line order.
+    pub new_functions: Vec<super::contract::NewFunction>,
     pub ran: Ran,
     pub elapsed: Duration,
 }
+
+/// How many new functions one answer carries.
+///
+/// The consumer is one `find_similar` call, which takes twenty entries; a list
+/// longer than that would be cut by the caller anyway, and cutting it here
+/// keeps the cut in one place.
+const MAX_NEW_FUNCTIONS: usize = 20;
 
 /// Why a re-check did not produce one.
 pub struct Degraded {
@@ -140,6 +154,13 @@ fn inside(
     {
         write_blob(&blobs.join(format!("retained-{position}.json")), blob)?;
     }
+    // What the index holds for THIS file, before the re-scan overwrites the
+    // question. The edited repo's own blobs are the ones filtered out above,
+    // and they are the only record of what was indexed here.
+    let indexed_functions = functions_in(
+        retained.iter().filter(|blob| blob.repo_name == name),
+        relative,
+    );
 
     // The hosted services, from the snapshot on disk. No request is made: a
     // re-check that waited on the network would miss its budget on the wire
@@ -164,7 +185,11 @@ fn inside(
     scan.env(super::SKIP_SIGNATURES_ENV, "1")
         .env_remove(crate::progress::PROGRESS_ENV);
     bounded(scan, "re-scan", deadline)?;
-    for (position, blob) in read_blobs(&scan_dir)?.iter().enumerate() {
+    let rescanned = read_blobs(&scan_dir)?;
+    // One set difference over work already paid for: the re-scan walked this
+    // file's AST to re-extract its rows, and its functions came back with them.
+    let new_functions = new_functions(&indexed_functions, rescanned.iter(), relative);
+    for (position, blob) in rescanned.iter().enumerate() {
         write_blob(&blobs.join(format!("local-{position}.json")), blob)?;
     }
 
@@ -199,9 +224,70 @@ fn inside(
     };
     Ok(Fresh {
         items,
+        new_functions,
         ran,
         elapsed: Duration::default(),
     })
+}
+
+/// Whether a blob's record of a function is about the file being re-checked.
+///
+/// `file_path` in a blob is repo-relative, and so is `relative`; the separator
+/// is normalised on both sides because a blob written on Windows spells it
+/// with a backslash and the index's own paths use `/`.
+fn declared_in(function: &crate::visitor::FunctionDefinition, relative: &str) -> bool {
+    // `<module>` is the file's own top-level call sites recorded under a
+    // synthetic definition (carrick#965). It is not a function anybody wrote,
+    // so a file that gains its first import would otherwise report one.
+    if function.name == crate::visitor::MODULE_SCOPE_KEY {
+        return false;
+    }
+    let declared = function.file_path.to_string_lossy().replace('\\', "/");
+    declared == relative.replace('\\', "/")
+}
+
+/// The names one set of blobs records for this file.
+fn functions_in<'a>(
+    blobs: impl Iterator<Item = &'a crate::cloud_storage::CloudRepoData>,
+    relative: &str,
+) -> std::collections::BTreeSet<String> {
+    blobs
+        .flat_map(|blob| blob.function_definitions.values())
+        .filter(|function| declared_in(function, relative))
+        .map(|function| function.name.clone())
+        .collect()
+}
+
+/// What the re-scan declares in this file that `indexed` does not name.
+///
+/// A name, not a body: the index holds no hash of the source, so a function
+/// that was renamed reads as new and one that was rewritten under its old name
+/// does not. That limit is stated wherever this list is rendered, because it
+/// decides what the answer means.
+fn new_functions<'a>(
+    indexed: &std::collections::BTreeSet<String>,
+    rescanned: impl Iterator<Item = &'a crate::cloud_storage::CloudRepoData>,
+    relative: &str,
+) -> Vec<super::contract::NewFunction> {
+    let mut found: Vec<super::contract::NewFunction> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for function in rescanned
+        .flat_map(|blob| blob.function_definitions.values())
+        .filter(|function| declared_in(function, relative))
+    {
+        if indexed.contains(&function.name) || !seen.insert(function.name.clone()) {
+            continue;
+        }
+        found.push(super::contract::NewFunction {
+            name: function.name.clone(),
+            line: function.line_number,
+        });
+    }
+    // Line order, so the list reads down the file rather than out of a hash
+    // map, and two runs over one tree produce the same answer.
+    found.sort_by(|left, right| left.line.cmp(&right.line).then(left.name.cmp(&right.name)));
+    found.truncate(MAX_NEW_FUNCTIONS);
+    found
 }
 
 /// Whether the type check reached this row: a verdict it attempted, in either

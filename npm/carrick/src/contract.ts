@@ -163,6 +163,24 @@ export type Recheck = {
   stale_since?: string;
   /** Why the re-check did not run. Only on a `none`. */
   reason?: string;
+  /**
+   * Functions the re-extracted file declares that the index does not hold
+   * under that name (carrick#1330). Absent on a `none`, which extracted
+   * nothing to compare, and absent when the edit added no function.
+   *
+   * A name comparison against `index_commit`, and both halves matter: the
+   * index holds no body hash, so a renamed function reads as new, and the
+   * commit is the one the last scan of that repo ran on.
+   */
+  new_functions?: NewFunction[];
+};
+
+/** One function the working tree declares and the index does not. */
+export type NewFunction = {
+  /** As the source spells it: `name`, or `Class.member`. */
+  name: string;
+  /** Where it starts, so a reader can open it without searching. */
+  line: number;
 };
 
 export const SCHEMA = "carrick.check/0";

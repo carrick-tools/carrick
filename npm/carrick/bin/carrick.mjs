@@ -38,6 +38,7 @@ if (nodeMajor() < NODE_FLOOR) {
 const HOOKS = {
   "post-edit": "../dist/hook/post-edit.js",
   "session-start": "../dist/hook/session-start.js",
+  stop: "../dist/hook/stop.js",
 };
 
 const argv = process.argv.slice(2);
@@ -165,6 +166,8 @@ function extraHelp() {
     "    hook post-edit               Claude Code PostToolUse hook (reads the tool",
     "                                 payload on stdin)",
     "    hook session-start           Claude Code SessionStart hook",
+    "    hook stop                    Claude Code Stop hook (one reuse nudge per",
+    "                                 task, silent when the task added no function)",
     "    templates <name>             print a file to add to a repo: workflow, or",
     "                                 carrick.json",
     "    --version                    the version of this package",

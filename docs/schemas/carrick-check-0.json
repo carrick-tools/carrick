@@ -116,6 +116,25 @@
         "reason": {
           "type": "string",
           "description": "Why the re-check did not run. Present only when ran is none."
+        },
+        "new_functions": {
+          "type": "array",
+          "description": "Functions the re-extracted file declares that the index does not hold under that name (carrick#1330). Absent when ran is none, which extracted nothing to compare, and absent when the edit added no function. At most 20. A NAME comparison against index_commit: the index holds no body hash, so a renamed function reads as new.",
+          "items": {
+            "type": "object",
+            "required": ["name", "line"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "As the source spells it: `name`, or `Class.member`."
+              },
+              "line": {
+                "type": "integer",
+                "description": "Where the function starts in the working tree."
+              }
+            },
+            "additionalProperties": true
+          }
         }
       },
       "additionalProperties": true

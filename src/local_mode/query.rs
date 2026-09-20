@@ -322,6 +322,7 @@ fn rechecked(
                     elapsed_ms: started.elapsed().as_millis() as u64,
                     stale_since: Some(indexed_at.to_string()),
                     reason: Some(reason),
+                    new_functions: Vec::new(),
                 },
             );
         }
@@ -334,6 +335,7 @@ fn rechecked(
                 elapsed_ms: fresh.elapsed.as_millis() as u64,
                 stale_since: None,
                 reason: None,
+                new_functions: fresh.new_functions,
             },
         ),
         Err(degraded) => (
@@ -343,6 +345,10 @@ fn rechecked(
                 elapsed_ms: degraded.elapsed.as_millis() as u64,
                 stale_since: Some(indexed_at.to_string()),
                 reason: Some(degraded.reason),
+                // A re-check that did not run extracted nothing, so it has
+                // nothing to compare: silence here is "not asked", never
+                // "nothing new".
+                new_functions: Vec::new(),
             },
         ),
     }

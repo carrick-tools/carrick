@@ -137,7 +137,11 @@ test("the host manifests name this CLI's commands, and travel with the package",
   const commands = Object.values(hooks["hooks"]).flatMap((groups: any) =>
     groups.flatMap((group: any) => group.hooks.map((entry: any) => entry.command)),
   );
-  assert.deepEqual(commands.sort(), ["carrick hook post-edit", "carrick hook session-start"]);
+  assert.deepEqual(commands.sort(), [
+    "carrick hook post-edit",
+    "carrick hook session-start",
+    "carrick hook stop",
+  ]);
   const lsp = readJson(path.join(repoRoot, "plugin", ".lsp.json"));
   assert.equal(lsp["carrick"]["command"], "carrick");
   assert.deepEqual(lsp["carrick"]["args"], ["lsp", "--stdio", "--hooks-installed"]);

@@ -75,6 +75,67 @@ reproducible from this package and hold nobody's work.
 does not read its own install as a dirty tree. A skill added or renamed here is
 added there in the same change.
 
+## The reuse nudge (carrick#1330)
+
+`carrick-reuse` is the one skill with a moment that can be detected rather than
+remembered, so it is the one a hook points at. Measured before it was built:
+prose alone reached the index in none of five runs, and a hook pack in five of
+five. A reuse check that waits to be remembered does not run.
+
+Three parts, in the order they fire:
+
+| Part | Governed code | What it does |
+|---|---|---|
+| `carrick check <file> --recheck` | `src/local_mode/recheck.rs` | already re-extracts the edited file; now also answers with `recheck.new_functions`, the functions it declares that the index does not hold (`docs/local-mode-output.md`) |
+| `carrick hook post-edit` | `npm/carrick/src/hook/post-edit.ts`, `npm/carrick/src/hook/reuse.ts` | records those names for the session under `~/.carrick/sessions/<session_id>.json`, outside every repository, and prints not one byte about them |
+| `carrick hook stop` | `npm/carrick/src/hook/stop.ts` | at the end of the task, names the accumulated set once and points at this skill |
+
+Why the nudge is not on the edit: most edits add no function, and every nudge
+costs a model turn. Why it is not left to the agent: see the measurement above.
+
+**The channel is the feature.** A Stop hook's
+`hookSpecificOutput.additionalContext` is delivered to the model and the
+conversation continues, which is the one Stop channel that is both model-visible
+and non-blocking. `systemMessage` is shown to the user and never reaches the
+model — a Stop hook of ours fired in 21 sessions through that field and changed
+nothing — and `decision: "block"` reaches the model by refusing to let the turn
+end, which is a block. The hook emits `hookSpecificOutput` and nothing else.
+
+**It fires once per set.** The names a nudge has spoken are marked in the same
+file, before the line is written, so the next stop of the same session says
+nothing about them. A function added after a nudge is pending on its own.
+
+**It fires even when the index is older than the branch point**, and states the
+commit it compared against in the line (the ruling of 2026-09-20 on open
+question 2). The two limits are in the text the model reads, because they decide
+what an empty answer means: a function added on this branch is compared against
+the default branch as the last scan saw it, and the comparison is on what each
+function is described as doing, not on its source.
+
+`carrick remove` deletes the session records; `carrick doctor` reports a missing
+Stop entry with the other two, because both read `expectedCarrickHooks`.
+
+### Codex
+
+Codex reads the same hook manifest shape from `$CODEX_HOME/hooks.json` and from
+a project's `.codex/hooks.json`, and it has a `Stop` event. It cannot carry this
+nudge, for two reasons that are in its source:
+
+1. `additionalContext` is accepted only on `PreToolUse`, `PostToolUse`,
+   `SessionStart`, `UserPromptSubmit` and `SubagentStart`
+   (`codex-rs/hooks/src/engine/discovery.rs`, which warns "this event cannot
+   emit additionalContext" for every other event). A Codex `Stop` hook reaches
+   the model only through `decision: "block"` and its continuation prompt, which
+   is a block.
+2. The recording half would need its own payload reader: Codex's edit tool is
+   `apply_patch` with its own `tool_input`, not `Edit`/`Write`/`MultiEdit`
+   (`codex-rs/hooks/src/events/post_tool_use.rs`).
+
+`carrick init` also writes no Codex hook file today — only `.agents/skills/` —
+so shipping this for Codex means a new file as well as a different trigger. The
+options are a blocking Stop hook, or a non-blocking `UserPromptSubmit` hook that
+delivers the nudge one turn late. Tracked as carrick#1335.
+
 ## Ordering against the cloud
 
 The bodies name MCP tools, and a skill that names a tool the deployed server

@@ -507,6 +507,129 @@ fn an_edit_is_re_judged_before_the_index_catches_up() {
     );
 }
 
+/// The re-check names the functions the file declares that the index does not
+/// hold (carrick#1330), and says nothing when an edit added none.
+///
+/// This is what the end-of-task reuse nudge lists, so both halves are the
+/// feature: a silent answer on an edit that added no function is what keeps
+/// the nudge from firing on every task.
+#[test]
+#[serial]
+fn a_re_check_names_the_functions_the_index_does_not_hold() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let route = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+    let route_file = root.join(route);
+    let budget = [("CARRICK_RECHECK_BUDGET_MS", "600000")];
+
+    index(root);
+
+    // An edit that changes a type and adds no function. The file is stale, so
+    // the re-check runs — and still has nothing to name.
+    edit(&route_file, "activeCount: number", "activeCount: string");
+    edit(&route_file, "activeCount: 3", "activeCount: \"3\"");
+    let unchanged: serde_json::Value = serde_json::from_str(&run_with_env(
+        root,
+        &["check", route, "--workspace", ".", "--recheck", "--json"],
+        &budget,
+    ))
+    .expect("check --recheck --json was not JSON");
+    // `extraction` or `extraction+types` — which of the two depends on whether
+    // a type verdict bears on this file's rows, and this test is about the
+    // functions, not the verdicts. What matters is that it is not `none`: the
+    // file WAS re-extracted, so naming nothing is an answer.
+    assert_ne!(
+        unchanged["recheck"]["ran"],
+        serde_json::json!("none"),
+        "the re-check ran, so its silence is an answer:\n{unchanged:#}"
+    );
+    assert_eq!(
+        unchanged["recheck"]["new_functions"],
+        serde_json::Value::Null,
+        "an edit that added no function names none:\n{unchanged:#}"
+    );
+
+    // Two functions the index has never seen, added below one it holds.
+    let existing = std::fs::read_to_string(&route_file).expect("read the route file");
+    std::fs::write(
+        &route_file,
+        format!(
+            "{existing}\n\
+             export function widgetLabel(widget: Widget): string {{\n  \
+             return widget.name;\n}}\n\n\
+             function countActive(widgets: Widget[]): number {{\n  \
+             return widgets.length;\n}}\n"
+        ),
+    )
+    .expect("write the route file");
+
+    let fresh: serde_json::Value = serde_json::from_str(&run_with_env(
+        root,
+        &["check", route, "--workspace", ".", "--recheck", "--json"],
+        &budget,
+    ))
+    .expect("check --recheck --json was not JSON");
+    let named: Vec<&str> = fresh["recheck"]["new_functions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no new_functions in:\n{fresh:#}"))
+        .iter()
+        .map(|entry| entry["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(
+        named,
+        ["widgetLabel", "countActive"],
+        "both new functions, in line order:\n{fresh:#}"
+    );
+    // `loader` is in this file and in the index, so an edit to the file does
+    // not make it new: the comparison is over names, not over the file.
+    assert!(
+        !named.contains(&"loader"),
+        "a function the index holds is not new:\n{fresh:#}"
+    );
+    // `<module>` is a synthetic definition for the file's own top-level call
+    // sites (carrick#965), never something a person wrote.
+    assert!(
+        !named.iter().any(|name| name.contains("module")),
+        "the module-scope row is not a function:\n{fresh:#}"
+    );
+    for entry in fresh["recheck"]["new_functions"].as_array().unwrap() {
+        assert!(
+            entry["line"].as_u64().is_some_and(|line| line > 0),
+            "each one says where it starts:\n{fresh:#}"
+        );
+    }
+
+    // The terminal says the same thing, against the commit it compared with.
+    let text = run_with_env(
+        root,
+        &["check", route, "--workspace", ".", "--recheck"],
+        &budget,
+    );
+    assert!(
+        text.contains("widgetLabel") && text.contains("countActive"),
+        "the rendered answer names them:\n{text}"
+    );
+    assert!(
+        text.contains("new since the index at"),
+        "and says what they are new since:\n{text}"
+    );
+
+    // Nothing is claimed when no re-check ran: a degraded answer extracted
+    // nothing, so it cannot say whether a function is new.
+    let degraded: serde_json::Value = serde_json::from_str(&run_with_env(
+        root,
+        &["check", route, "--workspace", ".", "--recheck", "--json"],
+        &[("CARRICK_RECHECK_BUDGET_MS", "1")],
+    ))
+    .expect("check --recheck --json was not JSON");
+    assert_eq!(degraded["recheck"]["ran"], serde_json::json!("none"));
+    assert_eq!(
+        degraded["recheck"]["new_functions"],
+        serde_json::Value::Null,
+        "a re-check that did not run names nothing:\n{degraded:#}"
+    );
+}
+
 /// The budget is real: past it the answer is the indexed one, said as such,
 /// and nothing is left running or lying about on disk.
 #[test]

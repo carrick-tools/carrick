@@ -329,6 +329,10 @@ test("the hook entries land beside everything else the settings file holds", () 
   assert.match(written.hooks.SessionStart[0].hooks[0].command, /session-start\.sh/);
   assert.equal(written.hooks.SessionStart[1].hooks[0].command, "carrick hook session-start");
   assert.equal(written.hooks.PostToolUse[0].hooks[0].command, "carrick hook post-edit");
+  // The end-of-task reuse nudge (carrick#1330). Installed beside the other two
+  // rather than by anything the user has to add.
+  assert.equal(written.hooks.Stop[0].hooks[0].command, "carrick hook stop");
+  assert.equal(written.hooks.Stop[0].matcher, undefined, "a Stop hook has no matcher");
 });
 
 test("merging twice changes nothing the second time", () => {
