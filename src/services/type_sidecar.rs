@@ -473,6 +473,16 @@ pub struct CheckVerdict {
     /// Why `resolved` is false. Absent exactly when it is true.
     #[serde(default)]
     pub unresolved_reason: Option<String>,
+    /// Statements about this comparison that are neither the verdict nor an
+    /// unresolution (carrick#1341): an optionality gap that is legal and still
+    /// a drift, and the note that the comparison was made against the JSON
+    /// wire form. Written on every bucket, empty when there is nothing to add.
+    ///
+    /// `#[serde(default)]` so a check result from a sidecar build that
+    /// predates the field reads as no notes rather than failing the whole
+    /// check — the same terms every other additive field here is read on.
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// A service whose pairs are degraded wholesale (install failure or poison).

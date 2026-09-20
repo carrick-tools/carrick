@@ -608,6 +608,10 @@ pub struct PairDirectionOutcome {
     /// Which side, and where in it, left this direction unresolved. `None`
     /// exactly when `resolved`.
     pub unresolved_reason: Option<String>,
+    /// Observations about THIS direction's comparison that are neither the
+    /// verdict nor an unresolution (carrick#1341). Empty on a direction with
+    /// nothing to add; never a substitute for `reason`.
+    pub notes: Vec<String>,
 }
 
 /// Both directions of one edge's check. Either may be absent: the check files
@@ -655,6 +659,15 @@ impl PairDirections {
     /// diagnostic is the first incompatible one in outcome order (sorted by
     /// `pair_key` upstream), and `resolved` is the conjunction — one
     /// unresolved comparison means this direction is not a fact.
+    ///
+    /// `notes` is the UNION, deduped and sorted (carrick#1341), and that is a
+    /// different rule from the other three on purpose. The verdict and the
+    /// diagnostic answer "what is this direction", so a fold has to pick one.
+    /// A note answers "what else is true of a comparison that happened", and
+    /// every collapsed pair's comparison did happen: dropping one because a
+    /// sibling call site went a different way would lose a true statement
+    /// about a real pair. Sorted rather than kept in outcome order so the
+    /// stored bytes do not depend on iteration order.
     pub fn from_outcomes(outcomes: &[PairCheckOutcome]) -> Self {
         let mut by_key: HashMap<
             (VerdictKey, crate::cloud_storage::ManifestTypeKind),
@@ -669,8 +682,10 @@ impl PairDirections {
                     reason: None,
                     resolved: true,
                     unresolved_reason: None,
+                    notes: Vec::new(),
                 });
             entry.verdict = entry.verdict.combine(verdict);
+            entry.notes.extend(outcome.notes.iter().cloned());
             if verdict == TypeVerdict::Incompatible && entry.reason.is_none() {
                 entry.reason = Some(
                     outcome
@@ -695,6 +710,11 @@ impl PairDirections {
             if entry.verdict != TypeVerdict::Incompatible {
                 entry.reason = None;
             }
+            // Deliberately NOT gated on the verdict, unlike `reason` above: a
+            // note is an observation about a comparison, not a qualifier on a
+            // mismatch, and the compatible rows are the ones it exists for.
+            entry.notes.sort();
+            entry.notes.dedup();
         }
         Self { by_key }
     }
@@ -1445,6 +1465,10 @@ pub struct PairCheckOutcome {
     pub resolved: bool,
     /// Why `resolved` is false. `None` exactly when it is true.
     pub unresolved_reason: Option<String>,
+    /// Observations the check made about this comparison that are neither the
+    /// verdict nor an unresolution (carrick#1341), carried verbatim from the
+    /// sidecar's `CheckVerdict.notes`. Empty when there is nothing to add.
+    pub notes: Vec<String>,
 }
 
 impl CoreExtractor for Analyzer {}
@@ -5845,6 +5869,7 @@ mod tests {
             consumer_service: "consumer-svc".to_string(),
             resolved: false,
             unresolved_reason: None,
+            notes: Vec::new(),
         }
     }
 

@@ -1442,6 +1442,7 @@ mod tests {
             reason: reason.map(String::from),
             resolved: true,
             unresolved_reason: None,
+            notes: Vec::new(),
         }
     }
 
@@ -1530,6 +1531,7 @@ mod tests {
             reason: None,
             resolved: false,
             unresolved_reason: Some("the consumer type carries `any` at `<0>`".to_string()),
+            notes: Vec::new(),
         });
         let output = format_analysis_results(
             result_with_sdk(vec![edge], vec![]),

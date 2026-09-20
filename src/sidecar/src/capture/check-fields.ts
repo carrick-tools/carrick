@@ -137,19 +137,31 @@ export function pairFieldReports(
     const expected = declaredConstType(source, checker, 'expected');
     if (!declared || !expected) continue;
     const wire = declaredConstType(source, checker, 'sentWire');
-    const compared = wire ?? declared;
+    // Whether serialising changes anything observable about the sent type.
+    const wireChanges =
+      wire !== undefined &&
+      !(
+        isAssignableTo(wire.type, declared.type) && isAssignableTo(declared.type, wire.type)
+      );
+    // Walk the DECLARED type unless serialising really changed it.
+    //
+    // The probe declares its wire comparand through a conditional alias that
+    // short-circuits back to the declared type whenever that already assigns,
+    // and a conditional the checker has not had to resolve carries no members
+    // to walk. Reading it unconditionally therefore emptied the report on
+    // exactly the pairs that AGREE — the ones whose only statement is an
+    // optionality gap or the wire note (carrick#1341). Where serialisation
+    // did change the type the wire form is a mapped type with real members,
+    // and it stays the thing compared, because that is what the judge judged.
+    const compared = wireChanges ? wire.type : declared.type;
     const report = diffReport(
-      compared.type,
+      compared,
       expected.type,
       checker,
       isAssignableTo,
       expected.node
     );
-    report.wireApplied =
-      wire !== undefined &&
-      !(
-        isAssignableTo(wire.type, declared.type) && isAssignableTo(declared.type, wire.type)
-      );
+    report.wireApplied = wireChanges;
     results.set(plan.pairId, report);
   }
   return results;
@@ -328,6 +340,51 @@ function printType(type: ts.Type, ctx: WalkContext): string {
 }
 
 /**
+ * The one wording for "this comparison was made against the serialised form",
+ * shared by the mismatch diagnostic and the `notes` channel so the two can
+ * never drift apart (carrick#1341).
+ */
+export function wireFormNote(sentSide: Side): string {
+  return `The ${sentSide}'s type is compared in the form JSON puts on the wire: a value with a toJSON() method (a Date, for example) travels as what it serialises to.`;
+}
+
+/**
+ * The statements this report makes that are NOT a mismatch: what belongs on
+ * `CheckVerdict.notes` (carrick#1341).
+ *
+ * Two of the things the walk can find are true of a pair the judge called
+ * COMPATIBLE, and so have no mismatch diagnostic to ride on:
+ *
+ *  - the wire note. Since carrick#1340 a producer `Date` read as a `string` is
+ *    not a drift, because that is what arrives. A reader comparing the two
+ *    declared shapes by hand sees `Date` against `string` and concludes the
+ *    check missed it, so the verdict has to say the comparison was made
+ *    against the serialised form.
+ *  - an optionality gap (`optional_in_expected`): the sending side always
+ *    provides a field the receiving side declares optional. That assigns, so
+ *    no diagnostic can exist for it, and the two sources still disagree — the
+ *    receiver carries a branch that never runs.
+ *
+ * Both are OBSERVATIONS. Nothing here is a verdict, nothing here may move one,
+ * and this is never a substitute for a mismatch reason: a caller that finds
+ * notes on an incompatible row has one statement made twice, not two
+ * statements. Returned in the report's own deterministic order.
+ */
+export function fieldReportNotes(
+  report: PairFieldReport,
+  sentSide: Side,
+  expectedSide: Side
+): string[] {
+  const notes: string[] = [];
+  if (report.wireApplied) notes.push(wireFormNote(sentSide));
+  for (const difference of report.differences) {
+    if (difference.nature !== 'optional_in_expected') continue;
+    notes.push(`${describeDifference(difference, sentSide, expectedSide)}.`);
+  }
+  return notes;
+}
+
+/**
  * The sentence appended to a mismatch diagnostic. Names the two sides as
  * producer and consumer (never the probe's internal sent/expected), so the
  * reader knows which repo to change.
@@ -339,9 +396,7 @@ export function describeFieldReport(
 ): string {
   const parts: string[] = [];
   if (report.wireApplied) {
-    parts.push(
-      `The ${sentSide}'s type is compared in the form JSON puts on the wire: a value with a toJSON() method (a Date, for example) travels as what it serialises to.`
-    );
+    parts.push(wireFormNote(sentSide));
   }
   if (report.differences.length > 0) {
     const named = report.differences

@@ -205,6 +205,26 @@ pub struct DirectionVerdict {
     /// only alongside `resolved: false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unresolved_reason: Option<String>,
+    /// Statements about this direction's comparison that are neither the
+    /// verdict nor an unresolution (carrick#1341): an optionality gap that is
+    /// legal and still a drift, and the note that the comparison was made
+    /// against the serialised form.
+    ///
+    /// This field exists because `reason` cannot hold either of them. `reason`
+    /// is present iff the verdict is `incompatible`, and both statements are
+    /// true of pairs the check called COMPATIBLE — an always-sent field the
+    /// receiver declares optional assigns, and the wire allowance
+    /// (carrick#1340) is precisely what made a producer `Date` read as a
+    /// `string` agree. Putting either in `reason` would make a compatible row
+    /// read as a mismatch on the cloud side.
+    ///
+    /// Empty on a row with nothing to add, and `skip_serializing_if` keeps it
+    /// off the wire there, so an unchanged verdict is byte-identical to what
+    /// the pre-#1341 scanner wrote. A NOTE NEVER MOVES A VERDICT: readers
+    /// render it as an observation beside the direction's sentence, and the
+    /// verdict comes from the judge (carrick#730/#734).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 impl Ord for DirectionVerdict {
@@ -220,17 +240,23 @@ impl Ord for DirectionVerdict {
                 crate::operation::TypeVerdict::Unverifiable => 2,
             }
         }
+        // Every field is in the tuple, `notes` included: `SdkEdge` derives
+        // `Ord`, so two verdicts differing only in their notes must not
+        // compare `Equal` while `PartialEq` calls them different. A field
+        // added here and not there breaks the Ord/Eq contract silently.
         (
             rank(self.verdict),
             &self.reason,
             self.resolved,
             &self.unresolved_reason,
+            &self.notes,
         )
             .cmp(&(
                 rank(other.verdict),
                 &other.reason,
                 other.resolved,
                 &other.unresolved_reason,
+                &other.notes,
             ))
     }
 }
@@ -1192,6 +1218,7 @@ pub(crate) fn direction_verdict(
         reason: outcome.reason.clone(),
         resolved: outcome.resolved,
         unresolved_reason: outcome.unresolved_reason.clone(),
+        notes: outcome.notes.clone(),
     }
 }
 
@@ -1199,14 +1226,25 @@ pub(crate) fn direction_verdict(
 /// [`crate::operation::TypeVerdict::combine`]. A direction only one side states
 /// is kept as stated: the other call site compared nothing there, and nothing
 /// never overrides an answer.
+///
+/// `notes` survives the fold either way (carrick#1341), on the same rule
+/// [`crate::analyzer::PairDirections::from_outcomes`] uses: worst-wins picks
+/// which VERDICT this direction is, and an observation is not a candidate for
+/// that. Both call sites really did compare, so both their observations stay,
+/// deduped and sorted so the stored bytes do not depend on fold order.
 fn merge_direction(stored: &mut Option<DirectionVerdict>, incoming: &Option<DirectionVerdict>) {
     let Some(incoming) = incoming else { return };
     match stored {
         None => *stored = Some(incoming.clone()),
         Some(existing) => {
+            let mut notes = std::mem::take(&mut existing.notes);
+            notes.extend(incoming.notes.iter().cloned());
             if existing.verdict.combine(incoming.verdict) != existing.verdict {
                 *existing = incoming.clone();
             }
+            notes.sort();
+            notes.dedup();
+            existing.notes = notes;
         }
     }
 }
@@ -1880,6 +1918,9 @@ mod tests {
             consumer_service: e.consumer_repo.clone(),
             resolved,
             unresolved_reason: unresolved_reason.map(String::from),
+            // Set per test with struct-update syntax where a note is the
+            // thing under test; every other fixture states none.
+            notes: Vec::new(),
         }
     }
 
@@ -1935,6 +1976,170 @@ mod tests {
         outcomes: &[crate::analyzer::PairCheckOutcome],
     ) -> crate::analyzer::PairDirections {
         crate::analyzer::PairDirections::from_outcomes(outcomes)
+    }
+
+    /// The wire spelling of `notes` and the two statements it exists to carry
+    /// (carrick#1341). A COMPATIBLE direction carries the note, and it reaches
+    /// the blob under the key `notes` as a list of strings.
+    ///
+    /// This is the test the ticket is about: before the field, both statements
+    /// were true of a compatible row and had nowhere to go, because `reason`
+    /// is present iff the verdict is `incompatible`.
+    #[test]
+    fn a_compatible_direction_carries_its_notes_to_the_blob() {
+        let wire_note = "The producer's type is compared in the form JSON puts \
+             on the wire: a value with a toJSON() method (a Date, for example) \
+             travels as what it serialises to.";
+        let gap_note = "'createdBy' is always sent by the producer and optional \
+             on the consumer.";
+        let e = edge(
+            "order-service",
+            "http|GET|/orders/:id",
+            "payments-svc",
+            "http|GET|/orders/:id",
+            None,
+            None,
+        );
+        let outcomes = vec![crate::analyzer::PairCheckOutcome {
+            notes: vec![wire_note.to_string(), gap_note.to_string()],
+            ..compatible_outcome(&e, ManifestTypeKind::Response)
+        }];
+        let mut payloads = vec![empty_repo("org/payments-svc", Some("payments-svc"))];
+        attach_compat_verdicts(&mut payloads, &[e], &directions(&outcomes));
+
+        let response = payloads[0].compat_verdicts.as_ref().unwrap()[0]
+            .response
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            response.verdict,
+            crate::operation::TypeVerdict::Compatible,
+            "a note must never move the verdict: the judge decides it"
+        );
+        assert_eq!(response.reason, None, "a note is not a mismatch reason");
+
+        let wire = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            wire["notes"],
+            serde_json::json!([gap_note, wire_note]),
+            "spelled `notes`, a list of strings, sorted"
+        );
+        assert_eq!(
+            wire["verdict"], "compatible",
+            "the serialised verdict is untouched by the note"
+        );
+    }
+
+    /// A direction with nothing to observe writes NO `notes` key at all, so a
+    /// row whose verdict has not changed is byte-identical to what the
+    /// pre-#1341 scanner wrote. Without `skip_serializing_if` this would put
+    /// `"notes":[]` on every stored verdict in every blob.
+    #[test]
+    fn a_direction_with_no_notes_writes_no_notes_key() {
+        let e = edge(
+            "order-service",
+            "http|GET|/orders/:id",
+            "payments-svc",
+            "http|GET|/orders/:id",
+            None,
+            None,
+        );
+        let outcomes = vec![compatible_outcome(&e, ManifestTypeKind::Response)];
+        let mut payloads = vec![empty_repo("org/payments-svc", Some("payments-svc"))];
+        attach_compat_verdicts(&mut payloads, &[e], &directions(&outcomes));
+
+        let response = payloads[0].compat_verdicts.as_ref().unwrap()[0]
+            .response
+            .clone()
+            .unwrap();
+        assert!(response.notes.is_empty());
+        let wire = serde_json::to_string(&response).unwrap();
+        assert!(
+            !wire.contains("notes"),
+            "an empty list must not reach the wire; got: {wire}"
+        );
+        assert_eq!(
+            wire, r#"{"verdict":"compatible","resolved":true}"#,
+            "byte-identical to the pre-#1341 spelling"
+        );
+    }
+
+    /// A stored direction written before the field existed reads as NO notes,
+    /// and states nothing (carrick#1341). The peer-blob path makes this
+    /// reachable in production: an `SdkEdge` takes its directions off a peer's
+    /// stored `CompatVerdict`, which may have been written by any older
+    /// scanner.
+    #[test]
+    fn a_stored_direction_without_notes_reads_as_none() {
+        let old: DirectionVerdict = serde_json::from_value(serde_json::json!({
+            "verdict": "incompatible",
+            "reason": "Property 'passwordHash' is missing",
+            "resolved": true
+        }))
+        .expect("a pre-#1341 direction still deserializes");
+        assert!(
+            old.notes.is_empty(),
+            "absence is no notes, never a fabricated one"
+        );
+
+        // And the same row inside a whole stored verdict, which is the shape
+        // the peer-blob path actually reads back.
+        let stored: CompatVerdict = serde_json::from_value(serde_json::json!({
+            "producer_repo": "order-service",
+            "producer_key": "http|GET|/orders/:id",
+            "consumer_repo": "payments-svc",
+            "consumer_key": "http|GET|/orders/:id",
+            "response": { "verdict": "compatible", "resolved": true },
+            "scanner_version": "0.3.82"
+        }))
+        .expect("a pre-#1341 stored verdict still deserializes");
+        assert!(stored.response.unwrap().notes.is_empty());
+    }
+
+    /// Several call sites collapsing onto one direction keep EVERY
+    /// observation, deduped and sorted, even when worst-wins picks a different
+    /// call site's verdict (carrick#1341). A note is a statement about a
+    /// comparison that happened, not a candidate for the verdict fold, so the
+    /// losing call site's note must survive.
+    #[test]
+    fn collapsing_call_sites_union_their_notes() {
+        let note_a = "'a' is always sent by the producer and optional on the consumer.";
+        let note_b = "'b' is always sent by the producer and optional on the consumer.";
+        let e = edge(
+            "order-service",
+            "http|GET|/orders/:id",
+            "payments-svc",
+            "http|GET|/orders/:id",
+            None,
+            None,
+        );
+        let outcomes = vec![
+            crate::analyzer::PairCheckOutcome {
+                notes: vec![note_b.to_string(), note_a.to_string()],
+                ..compatible_outcome(&e, ManifestTypeKind::Response)
+            },
+            crate::analyzer::PairCheckOutcome {
+                notes: vec![note_a.to_string()],
+                ..incompatible_outcome(&e, ManifestTypeKind::Response, "shapes disagree")
+            },
+        ];
+        let mut payloads = vec![empty_repo("org/payments-svc", Some("payments-svc"))];
+        attach_compat_verdicts(&mut payloads, &[e], &directions(&outcomes));
+
+        let response = payloads[0].compat_verdicts.as_ref().unwrap()[0]
+            .response
+            .clone()
+            .unwrap();
+        assert_eq!(
+            response.verdict,
+            crate::operation::TypeVerdict::Incompatible,
+            "worst-wins still decides the verdict"
+        );
+        assert_eq!(
+            response.notes,
+            vec![note_a.to_string(), note_b.to_string()],
+            "both call sites' observations survive, deduped and sorted"
+        );
     }
 
     /// carrick#822, the row this ticket is about: the request halves proved a
