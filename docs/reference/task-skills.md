@@ -105,6 +105,61 @@ reproducible from this package and hold nobody's work.
 does not read its own install as a dirty tree. A skill added or renamed here is
 added there in the same change.
 
+## Staying current (carrick#1333)
+
+`npm install -g carrick@latest` changes the binary and nothing else, so a
+workspace keeps the hook entries and skill bodies of whichever version first ran
+`carrick init` in it. Three things answer that:
+
+- **`carrick doctor`** reports the skills that are missing, the ones still ours
+  over a body an older version rendered, and the ones edited here. The first two
+  are findings; an edited file is a note, because a team that changed a skill
+  meant to and init will not touch it.
+- **One line a day**, on stderr, from any command that is not a hook, `lsp`,
+  `init`, `doctor` or `remove` (`npm/carrick/src/init/outdated.ts`). The day it
+  was last said is `~/.carrick/last-notice`, and it is only spent when there was
+  something to say.
+- **`carrick init`, run again**, is the refresh. It rewrites only what is still
+  ours and names what it left, so it is safe to run unattended.
+
+What decides "out of date" is content, never a version number. A skill is
+compared by digest against the body this version renders, and a hook entry by
+its event, matcher, command and timeout against what `expectedCarrickHooks`
+writes — so a release that changes neither leaves an install current, and a
+formatter run over somebody's settings file changes nothing this reads. Nothing
+writes a marker into a settings file or an MCP entry: those documents belong to
+the agent client that validates them, and a key it does not recognise is a key
+it may one day reject, at which point every hook in the file stops running
+silently. The cost is that a hook entry somebody edited by hand reads the same
+as one an older version wrote, and `carrick init` rewrites it either way; the
+rest of their file is never touched.
+
+Whether the refresh should instead be a `carrick update` command is open
+(carrick#1333).
+
+## The repo selection (carrick#1344)
+
+In a folder of sibling repos, `carrick init` asks which repos the install
+covers, and writes the answer to `carrick-workspace.json` in that folder:
+
+```json
+{ "exclude": ["web"], "carrick": { "exclude": ["web"] } }
+```
+
+`exclude` is the scanner's own field — `Workspace::load` drops those
+directories, so `carrick index`, `carrick refresh` and the next `carrick init`
+never derive them, and the read path behind `carrick check` withholds an answer
+for a file inside one even while the index still holds its rows
+(`src/local_mode/workspace.rs`, `excluded_repo`). The `carrick` key beside it
+records the names init added, and nothing in the scanner reads it: it exists so
+`carrick remove` takes back exactly those and leaves a name the user excluded
+themselves. A file that was nothing but init's selection goes with it.
+
+`--repo` naming an excluded repo is refused, and the refusal names the file: an
+excluded repo is invisible to the derivation, so the flag would otherwise reach
+the carrick#991 rule that attaches an unmatched value to the one repo with no
+GitHub identity.
+
 ## The reuse nudge (carrick#1330)
 
 `carrick-reuse` is the one skill with a moment that can be detected rather than

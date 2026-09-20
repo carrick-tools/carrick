@@ -15,6 +15,7 @@
 
 import path from "node:path";
 
+import { sameText } from "./files.ts";
 import { packageRoot } from "../native.ts";
 
 /**
@@ -29,6 +30,18 @@ import { packageRoot } from "../native.ts";
 export function ownEntryPoint(root: string = packageRoot()): string {
   return path.join(root, "bin", "carrick.mjs");
 }
+
+/**
+ * The settings files a workspace can hold our hook entries in.
+ *
+ * Beside the writer, with the readers that audit it: `carrick init` writes one
+ * of them, `carrick remove` clears both, and `carrick doctor` and the refresh
+ * notice read both (carrick#1333).
+ */
+export const SETTINGS_FILES = [
+  path.join(".claude", "settings.json"),
+  path.join(".claude", "settings.local.json"),
+];
 
 export type HookCommandChoice = {
   /** What a hook entry runs, quoted if it has to be. */
@@ -264,7 +277,9 @@ export function mergeHookSet(
   if (!("hooks" in merged)) merged["hooks"] = hooks;
 
   const body = `${JSON.stringify(merged, null, 2)}\n`;
-  return { body, changed: body !== existing };
+  // Compared the way `writeIfChanged` compares, so a CRLF checkout does not
+  // report every settings file as changed on every run (carrick#1331).
+  return { body, changed: !sameText(existing, body) };
 }
 
 /** Whether a settings document holds an entry of ours at all. */

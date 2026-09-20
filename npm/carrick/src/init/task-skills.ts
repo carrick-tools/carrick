@@ -130,6 +130,80 @@ export function renderTaskSkill(name: TaskSkill, scope: SkillScope): string {
   return stamped(rendered);
 }
 
+/**
+ * The scope a file on disk was written with, read back out of it.
+ *
+ * The digest below is taken over a rendered body, and a body renders
+ * differently for a workspace with a project and one without — so telling an
+ * older version's file from the current one means rendering the same scope it
+ * was written with. The rendered scope is in the file, as the only `project:
+ * "…"` a body can hold (the templates carry `{{SCOPE}}` and no literal), and a
+ * body written without one says `repo: "<owner/repo>"` instead.
+ */
+const RENDERED_SCOPE = /project: "([^"]+)"/;
+
+export function scopeOf(body: string): SkillScope {
+  const named = RENDERED_SCOPE.exec(body);
+  return { slug: named ? named[1]! : null };
+}
+
+/** The digest a file's own stamp claims, or null where it carries none. */
+function claimedDigest(existing: string): string | null {
+  const marker = existing
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .find((line) => STAMP.test(line));
+  return marker ? (STAMP.exec(marker)?.[1] ?? null) : null;
+}
+
+/** What one installed path holds, for a reader that changes nothing. */
+export type InstalledSkill = {
+  /** Relative to the workspace. */
+  path: string;
+  state: SkillState;
+  /**
+   * True where the bytes are the ones this package renders now.
+   *
+   * Only meaningful for a file in state `ours`: an upgrade that does not
+   * change a body leaves that body current, which is why this is a comparison
+   * of content and not of version numbers. A skill somebody edited is not
+   * measured against the current render at all — it is theirs now, and saying
+   * it is also out of date would be two findings about one file.
+   */
+  current: boolean;
+};
+
+/**
+ * What is installed under both roots right now.
+ *
+ * The read half of `writeTaskSkills`, for `carrick doctor` and for the line
+ * any command can print (carrick#1331, carrick#1333). It opens the eight
+ * files, renders each one against the scope its own body carries, and says
+ * nothing about a workspace — the caller decides which of these four states is
+ * worth a finding.
+ */
+export function inspectTaskSkills(workspace: string): InstalledSkill[] {
+  const installed: InstalledSkill[] = [];
+  for (const root of SKILL_ROOTS) {
+    for (const name of TASK_SKILLS) {
+      const relative = skillFile(root, name);
+      let existing: string | null;
+      try {
+        existing = fs.readFileSync(path.join(workspace, relative), "utf8");
+      } catch {
+        existing = null;
+      }
+      const state = skillState(existing);
+      const current =
+        state === "ours" && existing !== null
+          ? claimedDigest(existing) === claimedDigest(renderTaskSkill(name, scopeOf(existing)))
+          : false;
+      installed.push({ path: relative, state, current });
+    }
+  }
+  return installed;
+}
+
 /** What one path did on this run. */
 export type SkillOutcome = {
   /** Relative to the workspace. */
@@ -208,7 +282,17 @@ export function removeTaskSkills(workspace: string): { deleted: string[]; kept: 
       }
       fs.rmSync(target);
       deleted.push(relative);
-      for (const directory of [path.dirname(target), path.join(workspace, root)]) {
+      // The skill's own directory, the root that held it, and the host folder
+      // that root was the only thing in: `.agents/` exists because init wrote
+      // skills into it, and an empty one left behind is litter a user would
+      // have to recognise before deleting (carrick#1331). `.claude/` holds
+      // their settings and their own files, so the same call does nothing
+      // there — a directory that is not empty is not removed.
+      for (const directory of [
+        path.dirname(target),
+        path.join(workspace, root),
+        path.join(workspace, root.split(path.sep)[0]!),
+      ]) {
         try {
           fs.rmdirSync(directory);
         } catch {

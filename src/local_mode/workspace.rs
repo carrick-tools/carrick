@@ -24,6 +24,20 @@ pub struct WorkspaceFile {
     pub repos: Vec<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// What `carrick init` put in the lists above, so `carrick remove` can
+    /// take back exactly that and leave a user's own entries (carrick#1344).
+    /// Written and read by the CLI (`npm/carrick/src/init/workspace-file.ts`);
+    /// nothing here reads it, and it is declared so the type states the file's
+    /// real shape rather than dropping the key on a round trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrick: Option<WrittenByInit>,
+}
+
+/// The half of the workspace file `carrick init` owns.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct WrittenByInit {
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 /// An advisory result from inspecting the immediate parent once.
@@ -154,16 +168,7 @@ impl Workspace {
                     root.join(raw)
                 }
             };
-            let excluded =
-                repos_excluded.iter().any(|excluded| {
-                    Path::new(entry)
-                        .file_name()
-                        .is_some_and(|name| name == excluded.as_str())
-                        || root.join(excluded).canonicalize().ok().is_some_and(|path| {
-                            candidate.canonicalize().ok().as_ref() == Some(&path)
-                        })
-                });
-            if excluded {
+            if excludes(&root, &candidate, &repos_excluded) {
                 continue;
             }
             match candidate.canonicalize() {
@@ -246,6 +251,48 @@ impl Workspace {
 /// loaded workspace — `carrick status` answers before the index is read.
 pub fn last_scan_file(index_dir: &Path) -> PathBuf {
     index_dir.join("last-scan.json")
+}
+
+/// Whether the workspace file leaves a repo out.
+///
+/// One rule, two callers: the load above, which never derives an excluded
+/// repo, and [`excluded_repo`] below, which the read path asks about a repo
+/// the index still holds rows for. A name matches a directory name; a path
+/// matches the same directory, however either side spells it.
+fn excludes(root: &Path, candidate: &Path, exclude: &[String]) -> bool {
+    exclude.iter().any(|excluded| {
+        candidate
+            .file_name()
+            .is_some_and(|name| name == excluded.as_str())
+            || root
+                .join(excluded)
+                .canonicalize()
+                .ok()
+                .is_some_and(|path| candidate.canonicalize().ok().as_ref() == Some(&path))
+    })
+}
+
+/// Whether this workspace's file excludes a repo, read on its own.
+///
+/// The index is built from the repos the workspace listed when it was built,
+/// and an exclusion written afterwards does not reach back into it: the rows
+/// for that repo sit there until the next build. So the read path asks this
+/// directly. A repo somebody took out of the selection is a repo Carrick was
+/// told not to cover, and answering an editor hook about a file inside it
+/// from rows nobody refreshed is the same wrong answer either way
+/// (carrick#1344).
+///
+/// Best effort by design: no workspace file, an unreadable one, or one that is
+/// not JSON all mean "not excluded", because this decides whether to withhold
+/// an answer and never whether to give a wrong one.
+pub fn excluded_repo(root: &Path, repo: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(root.join(WORKSPACE_FILE)) else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_str::<WorkspaceFile>(&text) else {
+        return false;
+    };
+    !parsed.exclude.is_empty() && excludes(root, repo, &parsed.exclude)
 }
 
 /// Use detection directly, not Workspace::load, so this cannot recurse to
@@ -496,6 +543,34 @@ mod tests {
         assert_eq!(workspace.repos_added, ["./manual"]);
         assert_eq!(workspace.repos_excluded, ["web"]);
         assert!(workspace.repos.iter().any(|p| p.ends_with("manual")));
+    }
+
+    /// The file `carrick init` writes when a reader leaves a repo out
+    /// (carrick#1344): the exclusion, and beside it the record of what init
+    /// added, which `carrick remove` subtracts and nothing here reads. A key
+    /// this struct did not declare would be dropped by any round trip through
+    /// it, so it is declared.
+    #[test]
+    fn the_selection_init_persists_is_honoured_and_its_own_half_survives() {
+        let dir = workspace_with(r#"{"exclude":["web"],"carrick":{"exclude":["web"]}}"#);
+        for name in ["api", "web"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+            std::fs::write(dir.path().join(name).join("package.json"), "{}").unwrap();
+        }
+        let workspace = Workspace::load(dir.path()).unwrap();
+        assert_eq!(workspace.repos.len(), 1);
+        assert!(workspace.repos[0].ends_with("api"));
+
+        let parsed: WorkspaceFile = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(WORKSPACE_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed.carrick.unwrap().exclude, ["web"]);
+
+        // And the same rule answers for a repo on its own, which is what the
+        // read path asks about a file the index still holds rows for.
+        assert!(excluded_repo(dir.path(), &dir.path().join("web")));
+        assert!(!excluded_repo(dir.path(), &dir.path().join("api")));
     }
 
     #[test]

@@ -101,9 +101,14 @@ exists. It is the only scan a first run makes.
 
 Workspace detection handles a repo root or immediate sibling repositories.
 An optional `carrick-workspace.json` adds paths through `repos` and removes
-directory names through `exclude`; init preserves this file and does not
-create one. `carrick derive --workspace . --json` previews the Rust proposal
-without writing files or scanning.
+directory names through `exclude`. Where you leave a repo out of the selection,
+init writes that name into `exclude` and records it under a `carrick` key
+beside it: every later command reads the same answer, so the scans, the editor
+hooks and the next `init` all leave that repo alone, and `carrick remove` takes
+back the names init added and nothing you wrote yourself. `--repo` naming an
+excluded repo is refused and says which file excludes it. `carrick derive
+--workspace . --json` previews the Rust proposal without writing files or
+scanning.
 
 Deno projects use their existing `deno.json` or `deno.jsonc` and require Deno
 2.9.4 or newer on PATH. Before local indexing, prepare their dependencies with

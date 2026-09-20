@@ -15,6 +15,7 @@ import {
   ignoredSkillRoots,
   removeTaskSkills,
   renderTaskSkill,
+  scopeOf,
   skillFile,
   skillState,
   SKILL_ROOTS,
@@ -23,6 +24,7 @@ import {
   taskSkillPaths,
   writeTaskSkills,
 } from "../src/init/task-skills.ts";
+import { templatesDir } from "../src/templates.ts";
 
 function workspace(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "carrick-skills-"));
@@ -263,6 +265,55 @@ test("remove deletes the stamped copies and nothing else", () => {
   }
   // A second removal finds nothing and says so rather than failing.
   assert.deepEqual(removeTaskSkills(dir), { deleted: [], kept: result.kept });
+});
+
+// `scopeOf` reads the scope back out of an installed body to render the same
+// body again and tell an older version's file from a current one
+// (carrick#1333). It takes the first `project: "…"` there, which is the scope
+// only while the templates carry `{{SCOPE}}` and no literal of that shape. A
+// template that grew a prose example would make every file render differently
+// from what is on disk: eight findings in `carrick doctor` and a daily line
+// that never stops, both of them wrong and neither of them loud.
+test("no skill template holds a project scope of its own", () => {
+  for (const name of TASK_SKILLS) {
+    const source = fs.readFileSync(path.join(templatesDir(), "skills", `${name}.md`), "utf8");
+    assert.equal(
+      source.includes('project: "'),
+      false,
+      `${name}.md holds a literal project scope; scopeOf would read it instead of the rendered one`,
+    );
+  }
+  // And the rendered body does hold exactly one, which is what makes the
+  // assertion above worth making.
+  const rendered = renderTaskSkill("carrick-impact", { slug: "acme-index" });
+  assert.ok((rendered.match(/project: "acme-index"/g)?.length ?? 0) > 0);
+  assert.equal(scopeOf(rendered).slug, "acme-index");
+  assert.equal(scopeOf(renderTaskSkill("carrick-impact", { slug: null })).slug, null);
+});
+
+// carrick#1331. `.agents/` exists because init wrote skills into it, so an
+// empty one left behind after `carrick remove` is litter a user has to
+// recognise before deleting. `.claude/` is theirs and holds their settings, so
+// the same call must leave it exactly where it is.
+test("removing the last skill takes the host folder init created with it", () => {
+  const dir = workspace();
+  writeTaskSkills(dir, { slug: "acme-index" });
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "settings.json"), "{}\n");
+
+  assert.equal(removeTaskSkills(dir).deleted.length, 8);
+  assert.equal(fs.existsSync(path.join(dir, ".agents")), false, ".agents was left behind");
+  assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), true);
+  assert.equal(fs.existsSync(path.join(dir, ".claude")), true, "somebody's own folder went with it");
+});
+
+test("a host folder holding anything else of theirs stays", () => {
+  const dir = workspace();
+  writeTaskSkills(dir, { slug: "acme-index" });
+  fs.writeFileSync(path.join(dir, ".agents", "notes.md"), "mine\n");
+
+  removeTaskSkills(dir);
+  assert.equal(fs.existsSync(path.join(dir, ".agents", "notes.md")), true);
 });
 
 test("an ignored skills directory is reported, and a tracked one is not", () => {
