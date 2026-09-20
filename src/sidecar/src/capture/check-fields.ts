@@ -243,14 +243,23 @@ function walk(
 
   const sentProps = new Map(sent.getProperties().map((p) => [p.getName(), p]));
   const expectedProps = new Map(expected.getProperties().map((p) => [p.getName(), p]));
-  let missing = 0;
+  /** Members the receiver declares and the sender has no member for, optional
+   * ones included. Only the REQUIRED ones are a difference; the rest still
+   * count here, because a receiver waiting on a member it never gets is what
+   * makes a sender-only member worth naming beside it. */
+  let absent = 0;
 
   for (const [name, expectedProp] of expectedProps) {
     const at = join(path, name);
     const sentProp = sentProps.get(name);
     if (!sentProp) {
-      missing += 1;
-      ctx.found.push({ path: at, nature: 'missing_in_sent' });
+      absent += 1;
+      // An optional member the sender omits is what optional MEANS. Naming it
+      // would state that the receiver requires it, which is false, and it is
+      // not what the judge rejected the pair for.
+      if (!isOptional(expectedProp)) {
+        ctx.found.push({ path: at, nature: 'missing_in_sent' });
+      }
       continue;
     }
     const sentOptional = isOptional(sentProp);
@@ -285,9 +294,11 @@ function walk(
 
   // A field the sender provides that the receiver does not declare is normal
   // (a response carrying more than a call site reads), so it is only worth
-  // naming beside a field the receiver required and did not get: that pairing
-  // is what a renamed field looks like from the outside.
-  if (missing === 0) return;
+  // naming beside a member the receiver is waiting on and does not get: that
+  // pairing is what a renamed or relocated field looks like from the outside.
+  // On the common subset case — a call site reading fewer fields than the
+  // producer returns — nothing is absent and nothing is named.
+  if (absent === 0) return;
   for (const [name] of sentProps) {
     if (expectedProps.has(name)) continue;
     ctx.found.push({ path: join(path, name), nature: 'extra_in_sent' });

@@ -46,6 +46,8 @@ const KEYS = [
   'arrays',
   'tuples',
   'memberunion',
+  'optionalabsent',
+  'relocated',
   'many',
 ] as const;
 
@@ -56,6 +58,8 @@ export type indexed_Producer = { userName: string };
 export type arrays_Producer = { rows: string[] };
 export type tuples_Producer = { pair: [string, number] };
 export type memberunion_Producer = { kind: "a" | "b" };
+export type optionalabsent_Producer = { id: string; total: number };
+export type relocated_Producer = { data: { reason: string } };
 export type many_Producer = { a: string; b: string; c: string; d: string; e: string; f: string; g: string; h: string; i: string; j: string; };
 `;
 
@@ -66,6 +70,8 @@ export type indexed_Consumer = { username: string; [key: string]: string };
 export type arrays_Consumer = { rows: number[] };
 export type tuples_Consumer = { pair: [number, number] };
 export type memberunion_Consumer = { kind: "a" };
+export type optionalabsent_Consumer = { id: string; total: string; note?: string };
+export type relocated_Consumer = { reason?: string };
 export type many_Consumer = { a: number; b: number; c: number; d: number; e: number; f: number; g: number; h: number; i: number; j: number; };
 `;
 
@@ -152,6 +158,27 @@ describe('the field report never contradicts the judge', () => {
       report!.differences.map((d) => d.path),
       ['kind'],
       'a union under a named member is exactly what a reader needs told'
+    );
+  });
+
+  // Found on real stubs: every "required by the receiver" sentence in the
+  // first replay was about a member the receiver had declared OPTIONAL, which
+  // is the one thing optional means. Silence is the only true answer.
+  it('says nothing about an optional member the sender does not provide', () => {
+    assert.deepStrictEqual(
+      reportFor('optionalabsent')!.differences.map((d) => [d.path, d.nature]),
+      [['total', 'type_differs']]
+    );
+  });
+
+  // The other half of the same real row: the receiver is waiting on a member
+  // it never gets, and the sender carries one the receiver does not declare.
+  // Naming the sender's member is the whole answer even though the member the
+  // receiver waits on is optional and so goes unnamed.
+  it('names a sender-only member beside an absent one, optional or not', () => {
+    assert.deepStrictEqual(
+      reportFor('relocated')!.differences.map((d) => [d.path, d.nature]),
+      [['data', 'extra_in_sent']]
     );
   });
 
