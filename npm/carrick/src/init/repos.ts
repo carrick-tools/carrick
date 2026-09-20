@@ -44,6 +44,37 @@ export function deriveWorkspace(workspace: string): DerivedWorkspace {
   return { plan: parsed.data, document: result.stdout };
 }
 
+/**
+ * The same derivation with the repos this install does not cover taken out.
+ *
+ * A folder routinely holds a repo that must not be indexed — private data, a
+ * throwaway fixture — and the proposal is what an agent turns into
+ * `carrick.json`, so a repo left in it is a repo that gets scanned
+ * (carrick#1338). The filtering is done on the scanner's own JSON rather than
+ * on the parsed shape, so a field this client's schema does not know survives
+ * it, and a selection that keeps everything returns the scanner's bytes
+ * untouched.
+ *
+ * The dropped repos are named in `repos_excluded`, which is the field the
+ * workspace file's own `exclude` list lands in: the agent reading this
+ * document then sees which repos were left out rather than a shorter list with
+ * nothing to explain it.
+ */
+export function selectedProposal(derived: DerivedWorkspace, keep: string[]): DerivedWorkspace {
+  const kept = new Set(keep);
+  const dropped = derived.plan.repos.filter((repo) => !kept.has(repo.path));
+  if (dropped.length === 0) return derived;
+  const document = JSON.parse(derived.document) as Record<string, unknown>;
+  const repos = Array.isArray(document["repos"]) ? (document["repos"] as Array<Record<string, unknown>>) : [];
+  document["repos"] = repos.filter((repo) => kept.has(String(repo["path"])));
+  const excluded = Array.isArray(document["repos_excluded"]) ? (document["repos_excluded"] as unknown[]) : [];
+  document["repos_excluded"] = [...excluded, ...dropped.map((repo) => path.basename(repo.path))];
+  return {
+    plan: { ...derived.plan, repos: derived.plan.repos.filter((repo) => kept.has(repo.path)), repos_excluded: document["repos_excluded"] as string[] },
+    document: JSON.stringify(document),
+  };
+}
+
 /** The seam document, relative to the workspace root (carrick-cloud#799). */
 export const PROPOSAL_FILE = path.join(".carrick", "proposal.json");
 
@@ -121,6 +152,55 @@ export type RepoIdentity = {
   remote: string | null;
   problem: string | null;
 };
+
+/**
+ * The repos `--repo` names, out of the repos this folder holds.
+ *
+ * `--repo` is the answer to "which of these does this install cover" without a
+ * terminal, and it is also the only way to name a repository whose remote
+ * could not (carrick#991): a value that matches nothing on disk names the one
+ * repo here that has no GitHub identity, because that is the repo the flag was
+ * introduced for and there is no other reading of it. Two unmatched values, or
+ * one with no unnamed repo to attach it to, is a typo and is refused rather
+ * than silently covering a different repo.
+ */
+export function selectRepos(
+  candidates: RepoIdentity[],
+  requested: string[],
+): { repos: RepoIdentity[]; taken: RepoIdentity | null } | { problem: string } {
+  const wanted = [...new Set(requested.map((name) => name.toLowerCase()))];
+  const matched = new Map<string, RepoIdentity>();
+  const unmatched: string[] = [];
+  for (const name of wanted) {
+    const found = candidates.find((repo) => repo.name !== null && repo.name.toLowerCase() === name);
+    if (found) matched.set(found.path, found);
+    else unmatched.push(name);
+  }
+  const unnamed = candidates.filter((repo) => repo.name === null);
+  let taken: RepoIdentity | null = null;
+  if (unmatched.length > 0) {
+    const here = candidates
+      .map((repo) => repo.name ?? path.basename(repo.path))
+      .join(", ");
+    if (unmatched.length > 1) {
+      return { problem: `--repo ${unmatched.join(" and --repo ")} name no repo in this folder. The repos here are: ${here}.` };
+    }
+    if (unnamed.length !== 1) {
+      return {
+        problem:
+          unnamed.length === 0
+            ? `--repo ${unmatched[0]} names no repo in this folder. The repos here are: ${here}.`
+            : `--repo ${unmatched[0]} names no repo in this folder, and ${unnamed.length} repos here have no GitHub identity, so it cannot name one of those either: ${unnamed.map((repo) => repo.path).join(", ")}.`,
+      };
+    }
+    const original = requested.find((name) => name.toLowerCase() === unmatched[0])!;
+    taken = { ...unnamed[0]!, name: original, problem: null };
+    matched.set(taken.path, taken);
+  }
+  // Workspace order, whatever order the flags came in: everything downstream
+  // reads this list, and the scanner's order is the one the proposal is in.
+  return { repos: candidates.map((repo) => matched.get(repo.path)).filter((repo): repo is RepoIdentity => repo !== undefined), taken };
+}
 
 /** The two machine reads, injected so tests never spawn anything. */
 export type IdentityProbe = {

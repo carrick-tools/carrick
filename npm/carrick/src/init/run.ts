@@ -16,19 +16,32 @@ import { signIn } from "../auth/run.ts";
 import { resolveRepos, type ResolvedRepos } from "../auth/read.ts";
 import {
   deriveWorkspace,
+  selectedProposal,
+  selectRepos,
   writeProposal,
   PROPOSAL_FILE,
   repoIdentity,
+  type DerivedWorkspace,
+  type RepoIdentity,
   type WorkspaceProposal,
 } from "./repos.ts";
 import { connectRepos, reposAreInProject, projectAssignments } from "./connect.ts";
 import { downloadHostedIndex, hostedReport, nativeRunner } from "./hosted.ts";
-import { ensureProject, projectStep, SLUG } from "./projects.ts";
+import {
+  createProject,
+  listProjects,
+  planProject,
+  projectLabel,
+  projectStep,
+  SLUG,
+  type Project,
+  type ProjectChoice,
+} from "./projects.ts";
 import { connectMcpClients, mcpLine, type McpOutcome } from "./mcp.ts";
 import { hookCommand, mergeCarrickHooks, removeCarrickHooks } from "./settings.ts";
 import { ignoredSkillRoots, taskSkillLines, writeTaskSkills } from "./task-skills.ts";
 import { writeIfChanged } from "./files.ts";
-import { createOutput, DOCS, type InitOutput } from "./output.ts";
+import { createOutput, DOCS, PromptCancelled, type Choice, type InitOutput } from "./output.ts";
 import { renderTemplate } from "../templates.ts";
 
 /**
@@ -51,24 +64,36 @@ export const SCAFFOLD_SENTENCE =
 
 export type InitOptions = {
   workspace: string;
-  /** Require every proposed GitHub repo to belong to this project. */
+  /** Put the selected repos in this project, moving them where `allowMove` says. */
   project: string | null;
-  /** The `owner/repo` to use when the origin remote names none (carrick#991). */
-  repo: string | null;
-  /** Answer yes to the repo list rather than asking. */
+  /**
+   * The repos this install covers, `owner/repo` each, repeatable and
+   * comma-separable. Empty means the terminal picks them (carrick#1338).
+   *
+   * It is also how a repository whose remote names none is named
+   * (carrick#991): a value that matches nothing on disk attaches to the one
+   * repo here that has no identity.
+   */
+  repos: string[];
+  /** Answer yes to the proposal rather than asking. Never grants a move. */
   assumeYes: boolean;
+  /** Take the selected repos out of whatever project they are in now. */
+  allowMove: boolean;
 };
 
 const OWNER_REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
 export function parseArgs(argv: string[], cwd = process.cwd()): InitOptions | string {
-  const options: InitOptions = { workspace: cwd, project: null, repo: null, assumeYes: false };
+  const options: InitOptions = { workspace: cwd, project: null, repos: [], assumeYes: false, allowMove: false };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     switch (argument) {
       case "--yes":
       case "-y":
         options.assumeYes = true;
+        break;
+      case "--allow-move":
+        options.allowMove = true;
         break;
       case "--project": {
         const value = argv[index + 1];
@@ -83,8 +108,10 @@ export function parseArgs(argv: string[], cwd = process.cwd()): InitOptions | st
       case "--repo": {
         const value = argv[index + 1];
         if (!value) return "--repo needs an owner/repo";
-        if (!OWNER_REPO.test(value)) return `invalid repo "${value}": use owner/repo as GitHub spells it`;
-        options.repo = value;
+        for (const name of value.split(",")) {
+          if (!OWNER_REPO.test(name)) return `invalid repo "${name}": use owner/repo as GitHub spells it`;
+          if (!options.repos.includes(name)) options.repos.push(name);
+        }
         index += 1;
         break;
       }
@@ -109,20 +136,30 @@ export function parseArgs(argv: string[], cwd = process.cwd()): InitOptions | st
 
 function help(): string {
   return [
-    "carrick init [DIRECTORY] [--project SLUG] [--repo OWNER/REPO]",
+    "carrick init [DIRECTORY] [--repo OWNER/REPO]... [--project SLUG] [--allow-move]",
     "",
     "Sign in (here, or beforehand with carrick login), then set up a repository",
-    "or a folder of repos: the project, the repo connection, the agent hooks,",
-    "the MCP connection, and the service proposal your agent turns into",
-    "carrick.json. It writes nothing into the repository but the ignored",
-    ".carrick directory, the hook settings, and the four task skills your agent",
-    "loads. It runs no analysis: where Carrick already holds an index for these",
-    "repos, it reads that index into .carrick so this machine can answer from it.",
+    "or a folder of repos: which repos this install covers, the project, the repo",
+    "connection, the agent hooks, the MCP connection, and the service proposal",
+    "your agent turns into carrick.json. It writes nothing into the repository but",
+    "the ignored .carrick directory, the hook settings, and the four task skills",
+    "your agent loads. It runs no analysis: where Carrick already holds an index",
+    "for these repos, it reads that index into .carrick so this machine can answer",
+    "from it. Nothing is written, here or in Carrick, until you accept what it",
+    "proposes.",
     "",
     "    -w, --workspace DIR  The folder holding the repos (default: this one)",
-    "        --project SLUG   Require these repos in this Carrick project",
-    "        --repo OWNER/REPO  Name the GitHub repo whose origin remote names none",
-    "    -y, --yes            Take the repo list as proposed",
+    "        --repo OWNER/REPO  A repo this install covers: repeatable, or one",
+    "                         comma-separated list. In a folder of repos without a",
+    "                         terminal to choose in, this is required. It also names",
+    "                         the GitHub repo whose origin remote names none",
+    "        --project SLUG   Put those repos in this Carrick project, creating it",
+    "                         if it is not there. A repo that is in another project",
+    "                         is MOVED out of it, which changes what every agent",
+    "                         querying either project can see, so the move is named",
+    "                         and asked about separately",
+    "        --allow-move     Accept those moves without being asked. --yes does not",
+    "    -y, --yes            Take the proposal as printed",
     "",
     `The editor extension, the hooks, CI and a carrick.json written by hand: ${DOCS}`,
   ].join("\n");
@@ -150,6 +187,7 @@ export function absentRepos(
   identity: ResolvedRepos,
   names: string[],
   project: string | null,
+  label: (slug: string) => string = (slug) => slug,
 ): string[] {
   const onDisk = new Set(names.map((name) => name.toLowerCase()));
   const sole = identity.project_repos.length === 1;
@@ -164,7 +202,9 @@ export function absentRepos(
         ? `${absent.slice(0, 10).join(", ")} and ${absent.length - 10} more`
         : absent.join(", ");
     const where =
-      sole || entry.project_slug === project ? "this project" : `project "${entry.project_slug}"`;
+      sole || entry.project_slug === project
+        ? "this project"
+        : `project ${label(entry.project_slug)}`;
     lines.push(`Also in ${where}, not on this machine: ${shown}.`);
   }
   return lines;
@@ -243,7 +283,119 @@ export function mcpUnstampedLines(mcp: McpOutcome[]): string[] {
     .map((outcome) => `${outcome.client}: ${outcome.detail}`);
 }
 
+/**
+ * An end to the run with its own exit code, decided before anything is written.
+ *
+ * A refusal ("no terminal and no --yes") and a declined proposal are the same
+ * shape — stop here, leave everything alone — and they happen at four points
+ * in the decision. Thrown, they all end in one place, beside the cancel, which
+ * is the only way to be sure no path between them reaches a write.
+ */
+class Stop extends Error {
+  readonly code: number;
+  constructor(code: number, message = "") {
+    super(message);
+    this.name = "Stop";
+    this.code = code;
+  }
+}
+
+/** The line a run that was stopped at a question ends on (carrick#1338). */
+export const CANCELLED = "Cancelled. Nothing was written, here or in Carrick.";
+
+/**
+ * The line a declined proposal ends on.
+ *
+ * A "no" used to be silent, which beside a cancel that says so reads as two
+ * different things having happened. Both leave the machine and the server as
+ * they were, and both say it.
+ */
+export const NOTHING_WRITTEN = "Nothing written, here or in Carrick.";
+
+/** A repo as the picker lists it: what it is called, and what is in it. */
+export function repoChoices(plan: WorkspaceProposal, candidates: RepoIdentity[]): Choice[] {
+  return candidates.map((repo) => {
+    const found = plan.repos.find((entry) => entry.path === repo.path);
+    const packages = found?.services.length ?? 0;
+    const hint = [
+      `${packages} package${packages === 1 ? "" : "s"}`,
+      ...(repo.name === null ? ["no GitHub identity"] : []),
+    ].join(", ");
+    return { value: repo.path, label: repo.name ?? path.basename(repo.path), hint };
+  });
+}
+
+/**
+ * Which repos in this folder this install covers, settled before anything is
+ * read from Carrick and long before anything is written (carrick#1338).
+ *
+ * A folder routinely holds a repo that must not be scanned, and the only
+ * answer this command used to take was one yes covering every repo in it. The
+ * terminal picks; without one, `--repo` names them; with neither, there is no
+ * safe default and the run stops here, having written nothing.
+ */
+export async function chooseRepos(
+  plan: WorkspaceProposal,
+  candidates: RepoIdentity[],
+  options: { repos: string[]; assumeYes: boolean; interactive: boolean },
+  out: InitOutput,
+): Promise<RepoIdentity[]> {
+  if (options.repos.length > 0) {
+    const chosen = selectRepos(candidates, options.repos);
+    if ("problem" in chosen) throw new Error(chosen.problem);
+    if (chosen.taken !== null) {
+      out.done(`${chosen.taken.name} taken as the GitHub repository for ${chosen.taken.path}`);
+    }
+    return chosen.repos;
+  }
+  // One repo is not a choice, and `--yes` is a reader stating that the list as
+  // derived is the list they want.
+  if (candidates.length === 1 || options.assumeYes) return candidates;
+  if (!options.interactive) {
+    throw new Error(
+      `${plan.workspace} holds ${candidates.length} repos and there is no terminal to choose in. Name the ones this install covers with --repo owner/repo (repeatable), or add --yes to cover all ${candidates.length}.`,
+    );
+  }
+  const kept = new Set(
+    await out.choose("Which repos does this install cover?", repoChoices(plan, candidates)),
+  );
+  return candidates.filter((repo) => kept.has(repo.path));
+}
+
+/** The repos this install covers, one line each, for the proposal. */
+export function coverageLines(plan: WorkspaceProposal, selected: RepoIdentity[]): string[] {
+  return selected.slice(0, 10).map((repo) => {
+    const found = plan.repos.find((entry) => entry.path === repo.path);
+    const packages = found?.services.length ?? 0;
+    return `  ${repo.name ?? path.basename(repo.path)}  ${packages} package${packages === 1 ? "" : "s"}`;
+  });
+}
+
+/**
+ * What the server would be asked to change, said before it is asked.
+ *
+ * A move is named with the project it comes OUT of, display name and slug
+ * both, because that is the project whose agents stop seeing this repo and
+ * the one a reader has to find again to undo it (carrick#1338).
+ */
+export function moveLines(
+  moving: string[],
+  from: (name: string) => string,
+  target: string,
+  label: (slug: string) => string,
+): string[] {
+  return moving.map((name) => `  ${name} will move from ${label(from(name))} to ${label(target)}`);
+}
+
 export async function init(argv: string[]): Promise<number> {
+  return initWith(argv, createOutput(), process.stdin.isTTY === true);
+}
+
+/**
+ * `init` with the terminal stated rather than sniffed, so a test can be the
+ * terminal: the cancel path and the picker have no other way in.
+ */
+export async function initWith(argv: string[], out: InitOutput, interactive: boolean): Promise<number> {
   const parsed = parseArgs(argv);
   if (typeof parsed === "string") {
     process.stdout.write(`${parsed}\n`);
@@ -256,11 +408,12 @@ export async function init(argv: string[]): Promise<number> {
     return 1;
   }
 
-  const interactive = process.stdin.isTTY === true;
-  const out: InitOutput = createOutput();
-
-  // Authentication and all derivation validation precede local writes.
-  let derived: ReturnType<typeof deriveWorkspace>;
+  // Everything this run would change is decided before any of it happens: the
+  // repos it covers, the project they belong in, and the moves that would
+  // take. `--project` used to move repos on the server as its first act and
+  // print the proposal afterwards, so a reader's only chance to drop a repo
+  // came after that repo had already been moved (carrick#1338).
+  //
   // The repos the workspace read found an index for: where CI has already built
   // one, this run reads it rather than ordering a scan (carrick#993 row 2).
   const hostedIndex: string[] = [];
@@ -268,44 +421,48 @@ export async function init(argv: string[]): Promise<number> {
   // null where no repo here names a GitHub repository, and the skills then
   // tell the agent to read the scope from the git remote instead.
   let projectSlug: string | null = null;
+  let derived: DerivedWorkspace;
+  let credential: Credential;
+  let names: string[];
+  let initial: ResolvedRepos;
+  let projects: Project[] | null;
+  let decision: ProjectChoice;
+  // The repos this run has permission to take out of another project.
+  const movable = new Set<string>();
   try {
+    // The derivation and the identities are local reads: they name the choice,
+    // and a run nobody has chosen in yet must not have signed anything in.
+    derived = deriveWorkspace(workspace);
+    const candidates = derived.plan.repos.map((repo) => repoIdentity(repo.path));
+    const selected = await chooseRepos(
+      derived.plan,
+      candidates,
+      { repos: parsed.repos, assumeYes: parsed.assumeYes, interactive },
+      out,
+    );
+    if (selected.length === 0) throw new Stop(0);
+    derived = selectedProposal(derived, selected.map((repo) => repo.path));
+    const dropped = candidates.length - selected.length;
+    if (dropped > 0) {
+      out.done(
+        `${selected.length} of ${candidates.length} repos covered; ${dropped} left out of the proposal, the project and the connection`,
+      );
+    }
     // A machine that has never signed in signs in here rather than being told
     // to run another command: `carrick login` is the same browser round trip,
     // and refusing to take it was the first thing a new install did
     // (carrick#955). Without a terminal there is no browser to hand it to.
-    let credential: Credential | null = readCredential();
-    if (!credential) {
+    const saved: Credential | null = readCredential();
+    if (saved) credential = saved;
+    else {
       if (!interactive) {
         throw new Error("carrick init requires a Carrick login. Run carrick login, or set CARRICK_TOKEN.");
       }
       credential = await signIn(out.say);
     }
-    derived = deriveWorkspace(workspace);
-    const derivedIdentities = derived.plan.repos.map((repo) => repoIdentity(repo.path));
-    // `--repo` names what a remote could not: an ssh alias ssh itself cannot
-    // resolve, a mirror, a clone with no origin. It names one repository, so
-    // it is taken only when exactly one repo here is missing an identity.
-    const unnamed = derivedIdentities.filter((repo) => repo.name === null);
-    let taken: string | null = null;
-    if (parsed.repo !== null) {
-      if (unnamed.length > 1) {
-        throw new Error(
-          `--repo names one repository, but ${unnamed.length} repos here have no GitHub identity: ${unnamed.map((repo) => repo.path).join(", ")}. Run carrick init --repo in each of them, or fix their origin remotes.`,
-        );
-      }
-      if (unnamed.length === 0) {
-        out.warn(`--repo ${parsed.repo} was not needed: every repo here names its own GitHub repository.`);
-      } else {
-        taken = unnamed[0]!.path;
-        out.done(`${parsed.repo} taken as the GitHub repository for ${taken}`);
-      }
-    }
-    const repoIdentities = derivedIdentities.map((repo) =>
-      repo.path === taken ? { ...repo, name: parsed.repo, problem: null } : repo,
-    );
-    const names = [...new Set(repoIdentities.map((repo) => repo.name).filter((name): name is string => name !== null))];
+    names = [...new Set(selected.map((repo) => repo.name).filter((name): name is string => name !== null))];
     if (names.length > 200) throw new Error("This workspace has more than 200 GitHub repos. Initialise smaller workspace groups.");
-    const missingIdentities = repoIdentities.filter((repo) => repo.name === null);
+    const missingIdentities = selected.filter((repo) => repo.name === null);
     // Said before anything is requested, and said whether or not --project was
     // given: a repo with no identity is left out of the project step, the
     // connection check and the workspace read, and a run that dropped it in
@@ -338,28 +495,136 @@ export async function init(argv: string[]): Promise<number> {
       // later upload has no repo identity to resolve a project from.
       out.warn("No repo here names a GitHub repository, so this run chooses no project and checks no connection.");
     }
-    const initial = await resolveRepos(credential.token, names);
+    initial = await resolveRepos(credential.token, names);
+    // Read once, for the names: every project this run prints is printed as
+    // the dashboard shows it, with the slug beside it (carrick#1338). A
+    // workspace whose API has no such action answers null and the lines carry
+    // slugs alone, as they did.
+    projects = names.length > 0 ? await listProjects(credential.token) : null;
     // The project half of the browser round trip, where this API can do it
-    // from here: the project is created here, and `connectRepos` puts the
-    // repos in it as the grant connects them (carrick#999), so the wait is on
-    // the GitHub App grant and nothing else. Without --project the step reads
-    // the assignment the repos already have and offers the list, rather than
-    // doing nothing at all (carrick#987).
+    // from here. Nothing is created or moved in it: it settles what this run
+    // would do, and the proposal below is where that is accepted. Without
+    // --project the step reads the assignment the repos already have and
+    // offers the list, rather than doing nothing at all (carrick#987).
     const prompts = { say: out.say, ask: out.ask, confirm: out.confirm, interactive, assumeYes: parsed.assumeYes };
-    let project = parsed.project;
-    let projectExists = false;
-    if (project === null) {
-      const chosen = await projectStep(credential.token, projectAssignments(initial, names), prompts);
-      project = chosen.slug;
-      projectExists = chosen.exists;
-    } else if (!reposAreInProject(initial, names, project)) {
-      projectExists = await ensureProject(credential.token, project, prompts);
-    }
+    decision =
+      parsed.project === null
+        ? await projectStep(projectAssignments(initial, names), projects, prompts)
+        : reposAreInProject(initial, names, parsed.project)
+          ? { slug: parsed.project, exists: true, create: false }
+          : await planProject(parsed.project, projects, prompts);
+    const project = decision.slug;
     projectSlug = project;
+    const label = (slug: string): string => projectLabel(slug, projects);
+    // What the server would be asked to change, before it is asked: the repos
+    // that would leave a project somebody put them in, and the ones the grant
+    // has yet to connect at all.
+    const current = projectAssignments(initial, names);
+    const assigned = new Map(names.map((name, index) => [name, current[index] ?? null]));
+    const moving = project === null ? [] : names.filter((name) => {
+      const current = assigned.get(name);
+      return current !== null && current !== undefined && current !== project;
+    });
+    const joining = project === null ? [] : names.filter((name) => assigned.get(name) == null);
+
+    // The proposal: what this run covers, what it would change, and what the
+    // scanner said about it. Everything above is a read; everything below the
+    // confirm is a write.
+    const plan = derived.plan;
+    if (plan.parent_proposal) {
+      const parent = plan.parent_proposal;
+      const folders = parent.repos.map((repo) => path.basename(repo));
+      const shown = folders.length > 3 ? `${folders.slice(0, 3).join(", ")} and ${folders.length - 3} more` : folders.join(", ");
+      out.warn(`The parent folder ${parent.directory} holds ${parent.repos.length} ${parent.repos.length === 1 ? "repo" : "repos"}: ${shown}. Run carrick init .. to initialise that workspace.`);
+    }
+    // The scanner's own warnings about what it proposed. Capped: the proposal
+    // file carries every one of them, and it is named on the line above.
+    const warnings = plan.repos.flatMap((repo) => repo.warnings);
+    for (const warning of warnings.slice(0, 3)) out.warn(warning);
+    if (warnings.length > 3) out.warn(`${warnings.length - 3} more notes on the proposal are in ${PROPOSAL_FILE}.`);
+    for (const missing of plan.missing) out.warn(`Missing workspace override: ${missing}`);
+    if (selected.length > 1) {
+      out.say("This install covers:");
+      for (const line of coverageLines(plan, selected)) out.say(line);
+      if (selected.length > 10) out.say(`  and ${selected.length - 10} more`);
+    }
+    if (project !== null) {
+      for (const line of moveLines(moving, (name) => assigned.get(name) ?? "", project, label)) out.say(line);
+      if (joining.length > 0) {
+        out.say(`  ${joining.join(", ")} will be placed in project ${label(project)} once the browser connects ${joining.length === 1 ? "it" : "them"}`);
+      }
+      if (decision.create) out.say(`  Project "${project}" will be created in this workspace`);
+    }
+    const subject = packagesFound(plan);
+    if (!parsed.assumeYes) {
+      if (!interactive) {
+        throw new Stop(
+          1,
+          `use --yes to accept this proposal without a terminal${moving.length > 0 && !parsed.allowMove ? ", and --allow-move to accept the move above" : ""}.`,
+        );
+      }
+      // The count is in the question, because the listing that used to stand
+      // above it is gone: this is where a reader decides (carrick#1026).
+      if (!(await out.confirm(`Write the proposal for ${subject} and configure hooks?`))) {
+        out.refuse(NOTHING_WRITTEN);
+        throw new Stop(0);
+      }
+    }
+    // A move is its own question. `--yes` accepts a list of packages and a set
+    // of local files; taking a repo out of a project changes what every agent
+    // querying that project can see, and that is not the same answer
+    // (carrick#1338).
+    if (moving.length > 0 && project !== null && !parsed.allowMove) {
+      const from = [...new Set(moving.map((name) => label(assigned.get(name) ?? "")))].join(" and ");
+      if (!interactive) {
+        throw new Stop(
+          1,
+          `${moving.join(", ")} ${moving.length === 1 ? "is" : "are"} in project ${from}. Moving ${moving.length === 1 ? "it" : "them"} into ${label(project)} changes what every agent querying either project can see, so it needs --allow-move.`,
+        );
+      }
+      if (!(await out.confirm(`Move ${moving.length === 1 ? moving[0] : `${moving.length} repos`} out of ${from} into ${label(project)}?`))) {
+        out.refuse(NOTHING_WRITTEN);
+        throw new Stop(0);
+      }
+    }
+    for (const name of [...moving, ...joining]) movable.add(name.toLowerCase());
+  } catch (error) {
+    // A question the reader ended stops the run where it stands. Nothing above
+    // this line writes, so there is nothing to undo (carrick#1338).
+    if (error instanceof PromptCancelled) {
+      out.refuse(CANCELLED);
+      return 1;
+    }
+    if (error instanceof Stop) {
+      if (error.message !== "") process.stderr.write(`carrick init: ${error.message}\n`);
+      return error.code;
+    }
+    process.stderr.write(`carrick init: ${(error as Error).message}\n`);
+    return 1;
+  }
+
+  // Accepted. From here the run writes: the project, the assignment, the
+  // proposal, the hooks, the skills and the MCP entries.
+  const plan = derived.plan;
+  const project = decision.slug;
+  const label = (slug: string): string => projectLabel(slug, projects);
+  try {
+    let projectExists = decision.exists;
+    if (decision.create && project !== null) {
+      const outcome = await createProject(credential.token, project);
+      if (outcome.kind === "created") {
+        out.say(`Created project "${project}".`);
+        projectExists = true;
+      } else if (outcome.kind === "refused") {
+        out.say(`Carrick did not create "${project}": ${outcome.message}`);
+      }
+    }
     const identity = await connectRepos(credential.token, names, initial, {
       interactive,
       project: project ?? undefined,
       projectExists,
+      movable,
+      label,
       say: out.say,
     });
     // Who this machine is, and where its answers come from. The workspace slug
@@ -368,7 +633,7 @@ export async function init(argv: string[]): Promise<number> {
     out.done(
       project === null
         ? `Signed in as ${identity.workspace.slug}`
-        : `Signed in as ${identity.workspace.slug} · project ${project}`,
+        : `Signed in as ${identity.workspace.slug} · project ${label(project)}`,
     );
     if (project !== null && !reposAreInProject(identity, names, project)) {
       // An unverified project does not end the run, whether it was named on
@@ -376,7 +641,7 @@ export async function init(argv: string[]): Promise<number> {
       // their proposal for a browser step they could only take afterwards, and
       // the documented command then needed two runs (carrick#993 row 8).
       out.warn(
-        `Finish the browser steps above to put these repos in "${project}", then run carrick init --project ${project} again to verify.`,
+        `Finish the browser steps above to put these repos in ${label(project)}, then run carrick init --project ${project} again to verify.`,
       );
     }
     if (identity.allowance_sentence) out.say(identity.allowance_sentence);
@@ -393,34 +658,10 @@ export async function init(argv: string[]): Promise<number> {
     // answers across every repo in a project, so a folder holding half of one
     // is a partial index and nothing here would otherwise say so
     // (carrick#993 row 18).
-    for (const line of absentRepos(identity, names, project)) out.warn(line);
+    for (const line of absentRepos(identity, names, project, label)) out.warn(line);
   } catch (error) {
     process.stderr.write(`carrick init: ${(error as Error).message}\n`);
     return 1;
-  }
-  const plan = derived.plan;
-  if (plan.parent_proposal) {
-    const parent = plan.parent_proposal;
-    const names = parent.repos.map((repo) => path.basename(repo));
-    const shown = names.length > 3 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", ");
-    out.warn(`The parent folder ${parent.directory} holds ${parent.repos.length} ${parent.repos.length === 1 ? "repo" : "repos"}: ${shown}. Run carrick init .. to initialise that workspace.`);
-  }
-  // The scanner's own warnings about what it proposed. Capped: the proposal
-  // file carries every one of them, and it is named on the line above.
-  const warnings = plan.repos.flatMap((repo) => repo.warnings);
-  for (const warning of warnings.slice(0, 3)) out.warn(warning);
-  if (warnings.length > 3) out.warn(`${warnings.length - 3} more notes on the proposal are in ${PROPOSAL_FILE}.`);
-  for (const missing of plan.missing) out.warn(`Missing workspace override: ${missing}`);
-  const proposed = packagesLine(plan);
-  const subject = packagesFound(plan);
-  if (!parsed.assumeYes) {
-    if (!process.stdin.isTTY) {
-      process.stderr.write("carrick init: use --yes to accept this proposal without a terminal.\n");
-      return 1;
-    }
-    // The count is in the question, because the listing that used to stand
-    // above it is gone: this is where a reader decides (carrick#1026).
-    if (!await out.confirm(`Write the proposal for ${subject} and configure hooks?`)) return 0;
   }
   try {
     // The proposal is a seed for an agent, not a config: nothing derived
@@ -428,7 +669,7 @@ export async function init(argv: string[]): Promise<number> {
     // is the paid one and it has to run against a config someone has read
     // (carrick-cloud#799).
     writeProposal(plan.workspace, derived);
-    out.done(proposed);
+    out.done(packagesLine(plan));
   } catch (error) {
     process.stderr.write(`carrick init: ${(error as Error).message}\n`);
     return 1;

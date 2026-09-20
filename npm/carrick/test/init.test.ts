@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import {
   deriveWorkspace,
   repoIdentity,
+  selectedProposal,
   writeProposal,
   PROPOSAL_FILE,
   type WorkspaceProposal,
@@ -34,12 +35,23 @@ import {
   packagesLine,
   parseArgs,
   init,
+  initWith,
+  CANCELLED,
+  NOTHING_WRITTEN,
   SCAFFOLD_SENTENCE,
+  type InitOptions,
 } from "../src/init/run.ts";
 import { taskSkillPaths } from "../src/init/task-skills.ts";
 import { hostedReport } from "../src/init/hosted.ts";
-import { DOCS, interactiveOutput, plainOutput } from "../src/init/output.ts";
-import { Writable } from "node:stream";
+import {
+  chosenNumbers,
+  DOCS,
+  interactiveOutput,
+  plainOutput,
+  PromptCancelled,
+  type InitOutput,
+} from "../src/init/output.ts";
+import { PassThrough, Writable } from "node:stream";
 import type { ResolvedRepos } from "../src/auth/read.ts";
 
 const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -116,6 +128,8 @@ function executableInitFixture(
   root: string;
   repo: string;
   env: NodeJS.ProcessEnv;
+  /** The actions this fixture's server was asked for, in order. */
+  requests: () => string[];
   cleanup: () => void;
 } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-init-cli-"));
@@ -167,6 +181,11 @@ process.stdout.write(JSON.stringify(proposal).replaceAll("WORKSPACE", workspace)
 
   const mockHttp = path.join(root, "mock-http.mjs");
   fs.writeFileSync(mockHttp, `
+import fs from "node:fs";
+// Every action this run asked of the server, in order. What a run must NOT
+// ask is as much of the contract as what it asks: a move issued before the
+// proposal was answered is invisible in stdout and plain here (carrick#1338).
+const log = ${JSON.stringify(path.join(root, "requests.log"))};
 const created = new Set();
 // The assignment this workspace currently holds, which \`assign-repos\` moves
 // and \`resolve-repos\` then reads back: the CLI claims nothing it has not read.
@@ -174,6 +193,7 @@ let placed = ${JSON.stringify(projectSlug)};
 globalThis.fetch = async (input, init) => {
   if (String(input) !== "https://api.carrick.tools/types/check-or-upload") throw new Error("unexpected URL");
   const body = JSON.parse(String(init.body));
+  fs.appendFileSync(log, body.action + (Array.isArray(body.repos) ? " " + body.repos.join(",") : "") + "\\n");
   if (body.action === "list-projects" || body.action === "create-project" || body.action === "assign-repos") {
     if (${JSON.stringify(projectActions)} === "absent") {
       return Response.json({ error: "MCP keys cannot authenticate scan traffic." }, { status: 403 });
@@ -206,6 +226,10 @@ globalThis.fetch = async (input, init) => {
       schema: "carrick.list-projects/0",
       projects: [
         { slug: "default", name: "Default", archived: false, repo_count: 1 },
+        // A project whose display name is not its slug: the CLI named projects
+        // by slug alone and the dashboard's picker names them by display name,
+        // with nothing connecting the two (carrick#1338).
+        { slug: "default-project", name: "Acme Default", archived: false, repo_count: 1 },
         ...[...created].map((slug) => ({ slug, name: slug, archived: false, repo_count: 0 })),
       ],
     });
@@ -239,6 +263,10 @@ globalThis.fetch = async (input, init) => {
   return {
     root,
     repo,
+    requests: () =>
+      fs.existsSync(path.join(root, "requests.log"))
+        ? fs.readFileSync(path.join(root, "requests.log"), "utf8").split("\n").filter((line) => line !== "")
+        : [],
     env: {
       ...process.env,
       CARRICK_BIN: native,
@@ -283,10 +311,27 @@ test("the proposal is written as the scanner printed it, into an ignored directo
 
     // And it is the only thing written: no carrick.json, at any depth.
     assert.deepEqual(fs.readdirSync(dir).sort(), [".carrick"]);
+
+    // A selection that keeps every repo is the scanner's own document, not a
+    // re-serialisation of it: the filtering that scopes a folder's proposal to
+    // the repos this install covers hands back what it was given
+    // (carrick#1338).
+    const derived = { plan, document };
+    assert.equal(selectedProposal(derived, [dir]), derived);
+    // And a selection that drops one keeps every field this client's schema
+    // does not know, because it filters the scanner's JSON rather than the
+    // shape that parsed out of it.
+    const dropped = selectedProposal(derived, []);
+    assert.deepEqual(dropped.plan.repos, []);
+    assert.deepEqual(dropped.plan.repos_excluded, [path.basename(dir)]);
+    assert.deepEqual(JSON.parse(dropped.document).unknown_to_this_client, ["keep me"]);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("unsigned init refuses GH_TOKEN before deriving, writing or requesting the network", async () => {
+// The derive that now precedes this is a local read of the folder: it names
+// the repos there so they can be chosen between, and it spawns no network and
+// writes nothing (carrick#1338).
+test("unsigned init refuses GH_TOKEN before writing or requesting the network", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-init-"));
   const previous = { ...process.env };
   const fetchBefore = globalThis.fetch;
@@ -447,8 +492,30 @@ test("a quoted absolute hook command is ours too, and a lookalike is not", () =>
 
 test("init reads its arguments", () => {
   const parsed = parseArgs(["-y", "--project", "payments", "--workspace", "/code"], "/tmp");
-  assert.deepEqual(parsed, { workspace: "/code", assumeYes: true, project: "payments", repo: null });
-  assert.equal((parseArgs(["--repo", "acme/api"]) as { repo: string }).repo, "acme/api");
+  assert.deepEqual(parsed, {
+    workspace: "/code",
+    assumeYes: true,
+    allowMove: false,
+    project: "payments",
+    repos: [],
+  });
+  // Repeatable, and comma-separable: a folder of repos is named one way or the
+  // other, and both are the same list (carrick#1338).
+  assert.deepEqual((parseArgs(["--repo", "acme/api"]) as InitOptions).repos, ["acme/api"]);
+  assert.deepEqual(
+    (parseArgs(["--repo", "acme/api", "--repo", "acme/web"]) as InitOptions).repos,
+    ["acme/api", "acme/web"],
+  );
+  assert.deepEqual((parseArgs(["--repo", "acme/api,acme/web"]) as InitOptions).repos, [
+    "acme/api",
+    "acme/web",
+  ]);
+  assert.deepEqual((parseArgs(["--repo", "acme/api", "--repo", "acme/api"]) as InitOptions).repos, [
+    "acme/api",
+  ]);
+  // A move is never granted by --yes, so it has a flag of its own.
+  assert.equal((parseArgs(["--yes"]) as InitOptions).allowMove, false);
+  assert.equal((parseArgs(["--allow-move"]) as InitOptions).allowMove, true);
   assert.match(parseArgs(["--repo"]) as string, /needs an owner\/repo/);
   for (const name of ["acme", "acme/api/extra", "https://github.com/acme/api"]) {
     assert.match(parseArgs(["--repo", name]) as string, /invalid repo/);
@@ -461,7 +528,12 @@ test("init reads its arguments", () => {
     assert.match(parseArgs(["--project", slug]) as string, /invalid project slug/);
   }
   assert.match(parseArgs(["--nope"]) as string, /unknown option/);
-  assert.match(parseArgs(["--help"]) as string, /--project SLUG/);
+  const help = parseArgs(["--help"]) as string;
+  assert.match(help, /--project SLUG/);
+  // The help said "Require these repos in this Carrick project" and never that
+  // it moves them out of the one they are in (carrick#1338).
+  assert.match(help, /is MOVED out of it/);
+  assert.match(help, /--allow-move/);
 });
 
 // The native override is an executable shebang fixture, which Windows cannot launch.
@@ -504,11 +576,11 @@ test("the executable CLI finishes setup when the named project is not verified",
   try {
     const result = spawnSync(
       process.execPath,
-      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", fixture.repo],
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", "--allow-move", fixture.repo],
       { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
     );
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /acme\/api is currently in project "default-project"/);
+    assert.match(result.stdout, /acme\/api is currently in project default-project/);
     assert.match(result.stdout, /Create project "payments" if needed/);
     // This API serves no assignment action, so the browser keeps that step.
     assert.match(result.stdout, /Assign the requested repos/);
@@ -519,7 +591,7 @@ test("the executable CLI finishes setup when the named project is not verified",
     assert.doesNotMatch(result.stdout, /Verified/);
     assert.ok(
       result.stdout.includes(
-        '▲ Finish the browser steps above to put these repos in "payments", then run carrick init --project payments again to verify.',
+        "▲ Finish the browser steps above to put these repos in payments, then run carrick init --project payments again to verify.",
       ),
       result.stdout,
     );
@@ -527,6 +599,223 @@ test("the executable CLI finishes setup when the named project is not verified",
     assert.equal(fs.existsSync(path.join(fixture.repo, "carrick.json")), false);
     assert.equal(fs.existsSync(path.join(fixture.repo, ".claude")), true);
     assert.equal(fs.existsSync(path.join(fixture.repo, PROPOSAL_FILE)), true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+// carrick#1338. `carrick init -w <folder> --project <slug>` moved two repos
+// out of their projects as its FIRST act, printed the proposal afterwards, and
+// then refused to go on for want of a terminal. The moves were already done;
+// nothing was written locally. The order is the fix, and the order is what
+// these pin: every question is asked before the first request that changes
+// anything, so a run that stops leaves both sides as it found them.
+test("no assignment is issued before the proposal is answered", posixNativeFixture, () => {
+  const fixture = executableInitFixture("default-project", "deployed");
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 1, result.stdout);
+    // Reads, and only reads. `assign-repos` and `create-project` are the two
+    // actions that change the server, and neither was asked for.
+    assert.deepEqual(fixture.requests(), ["resolve-repos acme/api", "list-projects"]);
+    // The move the run would have made, named with the project it comes out
+    // of — display name and slug, which is what the dashboard shows it under.
+    assert.match(
+      result.stdout,
+      /acme\/api will move from Acme Default \(default-project\) to payments/,
+    );
+    assert.match(result.stderr, /use --yes to accept this proposal without a terminal, and --allow-move/);
+    assert.equal(fs.existsSync(path.join(fixture.repo, ".carrick")), false);
+    assert.equal(fs.existsSync(path.join(fixture.repo, ".claude")), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("--yes accepts the proposal and still does not grant a move", posixNativeFixture, () => {
+  const fixture = executableInitFixture("default-project", "deployed");
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", fixture.repo],
+      { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 1, result.stdout);
+    assert.deepEqual(fixture.requests(), ["resolve-repos acme/api", "list-projects"]);
+    assert.match(result.stderr, /acme\/api is in project Acme Default \(default-project\)/);
+    assert.match(result.stderr, /needs --allow-move/);
+    // A refused move writes nothing either: the hooks and the proposal are
+    // scoped to a project this run could not settle.
+    assert.equal(fs.existsSync(path.join(fixture.repo, ".carrick")), false);
+    assert.equal(fs.existsSync(path.join(fixture.repo, ".claude")), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+/**
+ * A folder of sibling repos, which is the shape carrick#1338 was reported on.
+ *
+ * Two repos, one of them the one a reader would drop: a folder routinely holds
+ * a repo that must not be scanned, and there was no step at which to say so.
+ * The server answers every read; what it is ASKED is the assertion.
+ */
+function folderInitFixture(): {
+  folder: string;
+  api: string;
+  web: string;
+  env: NodeJS.ProcessEnv;
+  requests: () => string[];
+  cleanup: () => void;
+} {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-init-folder-")));
+  const folder = path.join(root, "folder");
+  fs.mkdirSync(folder);
+  const made: Record<string, string> = {};
+  for (const name of ["api", "web"]) {
+    const repo = path.join(folder, name);
+    fs.mkdirSync(repo);
+    execFileSync("git", ["init", "-q", repo]);
+    execFileSync("git", ["-C", repo, "remote", "add", "origin", `git@github.com:acme/${name}.git`]);
+    made[name] = repo;
+  }
+  const native = path.join(root, "native.mjs");
+  fs.writeFileSync(native, `#!/usr/bin/env node
+const argv = process.argv.slice(2);
+if (argv[0] !== "derive") process.exit(2);
+const workspace = argv[argv.indexOf("--workspace") + 1];
+process.stdout.write(JSON.stringify({
+  schema: "carrick.derive/0", workspace, repos_detected_by: "sibling repositories",
+  repos_added: [], repos_excluded: [], missing: [], parent_proposal: null,
+  repos: [
+    { path: ${JSON.stringify(made["api"])}, reason: "single repository", services: [{ serviceName: "api" }], config: null, warnings: [] },
+    { path: ${JSON.stringify(made["web"])}, reason: "npm workspaces", services: [{ serviceName: "web" }, { serviceName: "admin" }], config: null, warnings: [] },
+  ],
+}));
+`);
+  fs.chmodSync(native, 0o755);
+
+  const mockHttp = path.join(root, "mock-http.mjs");
+  fs.writeFileSync(mockHttp, `
+import fs from "node:fs";
+const log = ${JSON.stringify(path.join(root, "requests.log"))};
+let placed = "default-project";
+globalThis.fetch = async (input, init) => {
+  if (String(input) !== "https://api.carrick.tools/types/check-or-upload") throw new Error("unexpected URL");
+  const body = JSON.parse(String(init.body));
+  fs.appendFileSync(log, body.action + (Array.isArray(body.repos) ? " " + body.repos.join(",") : "") + "\\n");
+  if (body.action === "list-projects") {
+    return Response.json({
+      schema: "carrick.list-projects/0",
+      projects: [
+        { slug: "default-project", name: "Acme Default", archived: false, repo_count: 2 },
+        { slug: "payments", name: "Payments", archived: false, repo_count: 0 },
+      ],
+    });
+  }
+  if (body.action === "assign-repos") {
+    const moved = placed !== body.project;
+    placed = body.project;
+    return Response.json({
+      schema: "carrick.assign-repos/0", project_slug: body.project,
+      repos: body.repos.map((name) => ({ full_name: name, assigned: true, moved, project_slug: body.project, reason: null })),
+    });
+  }
+  if (body.action !== "resolve-repos") throw new Error("unexpected action " + body.action);
+  return Response.json({
+    schema: "carrick.resolve-repos/0",
+    workspace: { slug: "acme", billing_tier: "free", installed: true },
+    allowance_sentence: null,
+    repos: body.repos.map((name) => ({ full_name: name, connected: true, project_id: "p1", project_slug: placed, services: [] })),
+    project_repos: [{ project_slug: placed, repos: body.repos }],
+  });
+};
+`);
+
+  return {
+    folder,
+    api: made["api"]!,
+    web: made["web"]!,
+    requests: () =>
+      fs.existsSync(path.join(root, "requests.log"))
+        ? fs.readFileSync(path.join(root, "requests.log"), "utf8").split("\n").filter((line) => line !== "")
+        : [],
+    env: {
+      ...process.env,
+      CARRICK_BIN: native,
+      CARRICK_TOKEN: "test-token",
+      XDG_CONFIG_HOME: path.join(root, "config"),
+      HOME: path.join(root, "home"),
+      USERPROFILE: path.join(root, "home"),
+      NODE_OPTIONS: `--import=${mockHttp}`,
+    },
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+// carrick#1338 item 4: the only answer this command took was one yes covering
+// every repo in the folder, so the only safe answer for a folder holding a repo
+// that must not be scanned was No — which also skipped the hooks and the skills
+// for the repos that did belong.
+test("a repo left out of the selection gets no proposal entry and no assignment", posixNativeFixture, () => {
+  const fixture = folderInitFixture();
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [
+        path.join(packageRoot, "bin", "carrick.mjs"), "init",
+        "--repo", "acme/api", "--project", "payments", "--yes", "--allow-move", fixture.folder,
+      ],
+      { cwd: fixture.folder, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /1 of 2 repos covered/);
+
+    // The proposal an agent turns into carrick.json holds the covered repo and
+    // nothing else, and says which repo was left out.
+    const proposal = JSON.parse(fs.readFileSync(path.join(fixture.folder, PROPOSAL_FILE), "utf8"));
+    assert.deepEqual(proposal.repos.map((repo: { path: string }) => repo.path), [fixture.api]);
+    assert.deepEqual(proposal.repos_excluded, ["web"]);
+
+    // Carrick was never told about it: not in the workspace read, not in the
+    // assignment, not in the project.
+    for (const request of fixture.requests()) assert.doesNotMatch(request, /acme\/web/);
+    assert.ok(fixture.requests().includes("assign-repos acme/api"), fixture.requests().join("\n"));
+
+    // And nothing of ours is inside it. The hooks and the skills are the
+    // workspace's, at the folder root, so what this pins is that the repo
+    // itself was not written into — the folder's hook still fires on an edit
+    // inside it, and `carrick refresh` still walks it, which is carrick#1344.
+    for (const entry of [".carrick", ".claude", ".agents"]) {
+      assert.equal(fs.existsSync(path.join(fixture.web, entry)), false, entry);
+    }
+    assert.equal(fs.existsSync(path.join(fixture.folder, ".claude")), true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("a folder of repos with nothing naming a selection writes nothing at all", posixNativeFixture, () => {
+  const fixture = folderInitFixture();
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", fixture.folder],
+      { cwd: fixture.folder, env: fixture.env, encoding: "utf8" },
+    );
+    assert.equal(result.status, 1, result.stdout);
+    assert.match(result.stderr, /holds 2 repos and there is no terminal to choose in/);
+    assert.match(result.stderr, /--repo owner\/repo/);
+    // Before the login, before the workspace read: nothing was asked of
+    // Carrick and nothing was written on this machine.
+    assert.deepEqual(fixture.requests(), []);
+    for (const entry of [".carrick", ".claude", ".agents"]) {
+      assert.equal(fs.existsSync(path.join(fixture.folder, entry)), false, entry);
+    }
   } finally {
     fixture.cleanup();
   }
@@ -585,15 +874,22 @@ test("the executable CLI creates the named project and puts the repos in it", po
   try {
     const result = spawnSync(
       process.execPath,
-      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", fixture.repo],
+      [path.join(packageRoot, "bin", "carrick.mjs"), "init", "--project", "payments", "--yes", "--allow-move", fixture.repo],
       { cwd: fixture.repo, env: fixture.env, encoding: "utf8" },
     );
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /Projects in this workspace:/);
-    assert.match(result.stdout, /^ {2}default {2}Default {2}1 repo$/m);
+    // Display name beside slug, wherever a project is printed: the dashboard's
+    // picker shows the name and every CLI line showed the slug (carrick#1338).
+    assert.match(result.stdout, /^ {2}Default \(default\) {2}1 repo$/m);
     assert.match(result.stdout, /Created project "payments"\./);
     assert.doesNotMatch(result.stdout, /Create project "payments" if needed/);
-    assert.match(result.stdout, /Moved acme\/api into project "payments"\./);
+    assert.match(result.stdout, /Moved acme\/api into project payments\./);
+    // The move is named in the proposal, with the project it comes out of, and
+    // it is named BEFORE the request that performs it.
+    const proposed = result.stdout.indexOf("acme/api will move from Acme Default (default-project) to payments");
+    assert.ok(proposed >= 0, result.stdout);
+    assert.ok(proposed < result.stdout.indexOf("Moved acme/api"), result.stdout);
     // Claimed only because resolve-repos read it back afterwards.
     assert.ok(result.stdout.includes("◇ Signed in as acme · project payments"), result.stdout);
     // And no browser step is asked for, because none is left.
@@ -814,8 +1110,6 @@ function recordingPrompts(
     },
     interactive: false,
     assumeYes: false,
-    list: async () => null,
-    create: async () => ({ kind: "absent" }),
     ...overrides,
   };
 }
@@ -828,14 +1122,11 @@ const LISTED: Project[] = [
 // carrick#987 item 3: a plain `carrick init` used to skip the project step
 // entirely, so a first run never saw the workspace's projects.
 test("a plain init takes the project the repos are already in", async () => {
-  const prompts = recordingPrompts({
-    list: async () => {
-      throw new Error("a settled assignment is not a question to ask the API");
-    },
-  });
-  assert.deepEqual(await projectStep("token", ["payments", "payments"], prompts), {
+  const prompts = recordingPrompts();
+  assert.deepEqual(await projectStep(["payments", "payments"], LISTED, prompts), {
     slug: "payments",
     exists: true,
+    create: false,
   });
   // The caller prints the assignment it then verifies, so this step adds no
   // second sentence about it.
@@ -846,28 +1137,24 @@ test("a plain init takes the project the repos are already in", async () => {
 test("a plain init asks nothing without a terminal, and settles nothing it would have to guess", async () => {
   for (const current of [["payments", "billing"], [null], []]) {
     const prompts = recordingPrompts();
-    assert.deepEqual(await projectStep("token", current, prompts), { slug: null, exists: false });
+    assert.deepEqual(await projectStep(current, LISTED, prompts), { slug: null, exists: false, create: false });
     assert.deepEqual(prompts.asked, []);
   }
 });
 
 test("a plain init offers the list, and creates the project the terminal names", async () => {
-  const created: string[] = [];
   const prompts = recordingPrompts({
     interactive: true,
-    list: async () => LISTED,
     ask: async () => "search",
     confirm: async () => true,
-    create: async (_token, slug) => {
-      created.push(slug);
-      return { kind: "created", project: { slug, name: slug, archived: false, repo_count: 0 } };
-    },
   });
-  assert.deepEqual(await projectStep("token", [null, "payments"], prompts), {
+  // Named, and asked for: the creation itself waits for the proposal, so what
+  // this step answers is what the run has permission to do (carrick#1338).
+  assert.deepEqual(await projectStep([null, "payments"], LISTED, prompts), {
     slug: "search",
-    exists: true,
+    exists: false,
+    create: true,
   });
-  assert.deepEqual(created, ["search"]);
   assert.ok(prompts.lines.some((line) => line.includes("Projects in this workspace:")));
   assert.ok(prompts.lines.some((line) => line.includes("payments")));
   // What a project is, said above the question rather than in the docs: a
@@ -882,29 +1169,32 @@ test("a plain init offers the list, and creates the project the terminal names",
 test("a plain init takes a listed project without creating anything", async () => {
   const prompts = recordingPrompts({
     interactive: true,
-    list: async () => LISTED,
     ask: async () => "default",
-    create: async () => {
-      throw new Error("an existing project is not one to create");
+    confirm: async () => {
+      throw new Error("an existing project is not one to offer to create");
     },
   });
-  assert.deepEqual(await projectStep("token", [null], prompts), { slug: "default", exists: true });
+  assert.deepEqual(await projectStep([null], LISTED, prompts), {
+    slug: "default",
+    exists: true,
+    create: false,
+  });
 });
 
 test("a plain init leaves the step to the browser on a refusal, an absent API or an unusable name", async () => {
+  const none = { slug: null, exists: false, create: false };
   // An API without the actions is every workspace until the cloud half ships.
-  const absent = recordingPrompts({ interactive: true, list: async () => null });
-  assert.deepEqual(await projectStep("token", [null], absent), { slug: null, exists: false });
+  const absent = recordingPrompts({ interactive: true });
+  assert.deepEqual(await projectStep([null], null, absent), none);
 
-  const empty = recordingPrompts({ interactive: true, list: async () => LISTED, ask: async () => "" });
-  assert.deepEqual(await projectStep("token", [null], empty), { slug: null, exists: false });
+  const empty = recordingPrompts({ interactive: true, ask: async () => "" });
+  assert.deepEqual(await projectStep([null], LISTED, empty), none);
 
   const invalid = recordingPrompts({
     interactive: true,
-    list: async () => LISTED,
     ask: async () => "Not A Slug",
   });
-  assert.deepEqual(await projectStep("token", [null], invalid), { slug: null, exists: false });
+  assert.deepEqual(await projectStep([null], LISTED, invalid), none);
   assert.ok(invalid.lines.some((line) => line.includes("is not a project slug")));
 });
 
@@ -1114,8 +1404,8 @@ test("the rest of the project is named, capped, and never guessed at", () => {
       null,
     ),
     [
-      'Also in project "payments", not on this machine: acme/web.',
-      'Also in project "search", not on this machine: acme/index.',
+      'Also in project payments, not on this machine: acme/web.',
+      'Also in project search, not on this machine: acme/index.',
     ],
   );
 
@@ -1132,6 +1422,231 @@ test("the rest of the project is named, capped, and never guessed at", () => {
 // The three markers are `@clack/prompts`'s own, so the terminal and the pipe
 // say the same words with the same symbols; only the gutter, the colour and the
 // spinner are the terminal's.
+// carrick#1338 item 3. Ctrl-C at "Which project should these repos be in?" was
+// read as the prompt's own quiet answer — clack returns a cancel symbol, and
+// both renderings turned it into "" or false — so the run carried on into the
+// steps that question governed. A cancel ends the run.
+// The picker itself, in the rendering a terminal gets: every repo chosen to
+// begin with, one keystroke to drop the one that should not be indexed
+// (carrick#1338).
+test("the picker starts with every repo chosen and drops the one deselected", async () => {
+  const keys = new PassThrough();
+  const rendered = new PassThrough();
+  let seen = "";
+  rendered.on("data", (chunk: Buffer) => void (seen += String(chunk)));
+  const chosen = interactiveOutput(rendered, keys).choose("Which repos does this install cover?", [
+    { value: "/repos/api", label: "acme/api", hint: "1 package" },
+    { value: "/repos/data", label: "acme/data", hint: "3 packages" },
+  ]);
+  setTimeout(() => keys.write(" "), 30);
+  setTimeout(() => keys.write("\r"), 60);
+  assert.deepEqual(await chosen, ["/repos/data"]);
+  assert.match(seen, /acme\/api \(1 package\)/);
+  assert.match(seen, /acme\/data \(3 packages\)/);
+});
+
+// The plain rendering has no cursor to move, so the picker is a numbered list
+// and an answer naming numbers. Enter covers everything, which is the answer
+// a folder of repos that all belong wants (carrick#1338).
+test("the numbered picker takes numbers, all, or nothing at all", () => {
+  assert.deepEqual(chosenNumbers("", 3), [0, 1, 2]);
+  assert.deepEqual(chosenNumbers("  ", 3), [0, 1, 2]);
+  assert.deepEqual(chosenNumbers("ALL", 3), [0, 1, 2]);
+  assert.deepEqual(chosenNumbers("1,3", 3), [0, 2]);
+  assert.deepEqual(chosenNumbers("3 1 3", 3), [2, 0]);
+  for (const answer of ["0", "4", "x", "1,x", "-1", "1.5"]) {
+    assert.equal(chosenNumbers(answer, 3), null, answer);
+  }
+});
+
+test("a cancelled question is not an answer, in either rendering", async () => {
+  const closing = new PassThrough();
+  const plain = plainOutput(() => {}, { input: closing, output: new PassThrough() });
+  const asked = plain.confirm("Write the proposal?");
+  closing.end();
+  await assert.rejects(asked, PromptCancelled);
+
+  const ending = new PassThrough();
+  const typed = plainOutput(() => {}, { input: ending, output: new PassThrough() });
+  const question = typed.ask("Which project should these repos be in?");
+  ending.end();
+  await assert.rejects(question, PromptCancelled);
+
+  // The library's own cancel, which is the one the report was made on: clack
+  // answers Ctrl-C with a symbol rather than an error.
+  const keys = new PassThrough();
+  const rendered = new PassThrough();
+  rendered.resume();
+  const interactive = interactiveOutput(rendered, keys);
+  // One at a time: two prompts reading one stream would let a single Ctrl-C
+  // stand in for both, and each of the three has its own cancel to answer.
+  for (const prompt of [
+    () => interactive.confirm("Keep them there?"),
+    () => interactive.ask("Which project should these repos be in?"),
+    () =>
+      interactive.choose("Which repos does this install cover?", [
+        { value: "/repos/api", label: "acme/api" },
+      ]),
+  ]) {
+    const pending = prompt();
+    setImmediate(() => keys.write("\u0003"));
+    await assert.rejects(pending, PromptCancelled);
+  }
+});
+
+/** An `InitOutput` a test can be: every line kept, every question answered. */
+function recordingOutput(
+  overrides: Partial<InitOutput> = {},
+): InitOutput & { lines: string[] } {
+  const lines: string[] = [];
+  const keep = (marker: string) => (text: string) => void lines.push(`${marker} ${text}`);
+  return {
+    lines,
+    done: keep("◇"),
+    warn: keep("▲"),
+    refuse: keep("■"),
+    say: keep(""),
+    intro: keep(""),
+    outro: keep(""),
+    note: (title, body) => void lines.push([title, ...body].join("\n")),
+    step: async (_label, work, report) => {
+      const value = await work(() => {});
+      lines.push(report(value).text);
+      return value;
+    },
+    confirm: async () => true,
+    ask: async () => "",
+    choose: async (_question, options) => options.map((option) => option.value),
+    accent: (text) => text,
+    quiet: false,
+    ...overrides,
+  };
+}
+
+/**
+ * One repo, in project `default-project`, with the server answered in this
+ * process: the run-level questions are what these tests are about, so the
+ * output is a fake and the terminal is stated rather than sniffed.
+ */
+function inProcessRepo(name: string): {
+  repo: string;
+  asked: string[];
+  restore: () => void;
+} {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `carrick-init-${name}-`)));
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "remote", "add", "origin", "git@github.com:acme/api.git"]);
+  const native = path.join(root, "native.mjs");
+  fs.writeFileSync(native, `#!/usr/bin/env node
+const argv = process.argv.slice(2);
+if (argv[0] !== "derive") process.exit(2);
+const workspace = argv[argv.indexOf("--workspace") + 1];
+process.stdout.write(JSON.stringify({
+  schema: "carrick.derive/0", workspace, repos_detected_by: "single repository",
+  repos_added: [], repos_excluded: [], missing: [], parent_proposal: null,
+  repos: [{ path: workspace, reason: "single repository", services: [{ serviceName: "api" }], config: null, warnings: [] }],
+}));
+`);
+  fs.chmodSync(native, 0o755);
+  const previous = { ...process.env };
+  const fetchBefore = globalThis.fetch;
+  const asked: string[] = [];
+  process.env["CARRICK_BIN"] = native;
+  process.env["CARRICK_TOKEN"] = "test-token";
+  process.env["XDG_CONFIG_HOME"] = path.join(root, "config");
+  process.env["HOME"] = path.join(root, "home");
+  globalThis.fetch = (async (_input: string, init: { body: string }) => {
+    const body = JSON.parse(String(init.body));
+    asked.push(body.action);
+    if (body.action === "resolve-repos") {
+      return Response.json({
+        schema: "carrick.resolve-repos/0",
+        workspace: { slug: "acme", billing_tier: "free", installed: true },
+        allowance_sentence: null,
+        repos: [{ full_name: "acme/api", connected: true, project_id: "p1", project_slug: "default-project", services: [] }],
+        project_repos: [{ project_slug: "default-project", repos: ["acme/api"] }],
+      });
+    }
+    return Response.json({
+      schema: "carrick.list-projects/0",
+      projects: [
+        { slug: "default-project", name: "Acme Default", archived: false, repo_count: 1 },
+        { slug: "payments", name: "Payments", archived: false, repo_count: 0 },
+      ],
+    });
+  }) as unknown as typeof fetch;
+
+  return {
+    repo,
+    asked,
+    restore: () => {
+      process.env = previous;
+      globalThis.fetch = fetchBefore;
+      fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+test("a cancel at the project question ends the run with nothing written", async () => {
+  const fixture = inProcessRepo("cancel");
+  try {
+    // The terminal is here, and the reader ends the question rather than
+    // answering it.
+    const out = recordingOutput({
+      confirm: async () => {
+        throw new PromptCancelled();
+      },
+    });
+    assert.equal(await initWith([fixture.repo], out, true), 1);
+    assert.ok(out.lines.includes(`■ ${CANCELLED}`), out.lines.join("\n"));
+    // Nothing on this machine, and nothing the server was asked to change.
+    assert.deepEqual(fs.readdirSync(fixture.repo), [".git"]);
+    assert.deepEqual(fixture.asked, ["resolve-repos", "list-projects"]);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test("a declined proposal says so, and is the same nothing as a cancel", async () => {
+  const fixture = inProcessRepo("declined");
+  try {
+    const out = recordingOutput({ confirm: async () => false });
+    assert.equal(await initWith([fixture.repo], out, true), 0);
+    assert.ok(out.lines.includes(`■ ${NOTHING_WRITTEN}`), out.lines.join("\n"));
+    assert.deepEqual(fs.readdirSync(fixture.repo), [".git"]);
+    assert.deepEqual(fixture.asked, ["resolve-repos", "list-projects"]);
+  } finally {
+    fixture.restore();
+  }
+});
+
+// `--yes` is an answer to the proposal, not to a move: with a terminal it
+// skips the picker and the proposal question and still asks this one
+// (carrick#1338).
+test("--yes leaves one question, and it is the move", async () => {
+  const fixture = inProcessRepo("yes");
+  try {
+    const questions: string[] = [];
+    const out = recordingOutput({
+      confirm: async (question: string) => {
+        questions.push(question);
+        return false;
+      },
+      choose: async () => {
+        throw new Error("--yes takes the repo list as derived");
+      },
+    });
+    assert.equal(await initWith(["--yes", "--project", "payments", fixture.repo], out, true), 0);
+    assert.deepEqual(questions, ["Move acme/api out of Acme Default (default-project) into Payments (payments)?"]);
+    assert.deepEqual(fs.readdirSync(fixture.repo), [".git"]);
+    assert.deepEqual(fixture.asked, ["resolve-repos", "list-projects"]);
+  } finally {
+    fixture.restore();
+  }
+});
+
 test("the plain rendering is one line per thing, with no colour and no box", () => {
   const written: string[] = [];
   const out = plainOutput((text) => void written.push(text));

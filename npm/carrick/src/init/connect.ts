@@ -10,6 +10,19 @@ type ConnectOptions = {
   project?: string;
   /** True when this run has already seen or created the project (carrick#955). */
   projectExists?: boolean;
+  /**
+   * The repos this run may take OUT of another project, lowercased.
+   *
+   * A move changes what every agent querying either project can see, so it is
+   * named in the proposal and consented to there; this set is that consent
+   * arriving (carrick#1338). A repo that was not connected at all when the
+   * proposal was read is in it too: the App grant lands it in the workspace's
+   * default project seconds later, and placing it where the run asked for is
+   * the grant finishing rather than a move out of a project anyone chose.
+   */
+  movable?: Set<string>;
+  /** How a project is printed: display name beside slug, where one is known. */
+  label?: (slug: string) => string;
   open?: (url: string) => Promise<boolean>;
   poll?: (signal?: AbortSignal) => Promise<ResolvedRepos>;
   /** Placing repos in the project, injected so tests state the server (carrick#999). */
@@ -75,6 +88,7 @@ function reportAssignments(
   repos: string[],
   previous: Map<string, string>,
   say: (message: string) => void,
+  label: (slug: string) => string,
 ): void {
   for (const name of repos) {
     const current = assignment(identity, name);
@@ -86,22 +100,33 @@ function reportAssignments(
     say(
       current === "not connected"
         ? `${actualName} is not connected to this workspace.`
-        : `${actualName} is currently in project "${current}".`,
+        : `${actualName} is currently in project ${label(current)}.`,
     );
     previous.set(name.toLowerCase(), current);
   }
 }
 
 /**
- * The repos this run may still place: connected to the workspace, and in some
- * other project than the one asked for.
+ * The repos this run may still place: connected to the workspace, in some
+ * other project than the one asked for, and consented to in the proposal.
+ *
+ * A connected repo that was not consented to is left exactly where it is. The
+ * caller says so once and prints the browser step, because a project move is
+ * not something a `--yes` to a list of packages grants (carrick#1338).
  */
-function misplaced(identity: ResolvedRepos, repos: string[], project: string): string[] {
+function misplaced(
+  identity: ResolvedRepos,
+  repos: string[],
+  project: string,
+  movable: Set<string>,
+): string[] {
   return repos.filter((name) => {
     const repo = identity.repos.find(
       (candidate) => candidate.full_name.toLowerCase() === name.toLowerCase(),
     );
-    return repo?.connected === true && repo.project_slug !== project;
+    return (
+      repo?.connected === true && repo.project_slug !== project && movable.has(name.toLowerCase())
+    );
   });
 }
 
@@ -123,6 +148,8 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
   const assignments = new Map<string, string>();
   const poll = options.poll ?? ((signal?: AbortSignal) => resolveRepos(token, repos, fetch, signal));
   const project = options.project;
+  const label = options.label ?? ((slug: string) => slug);
+  const movable = options.movable ?? new Set<string>();
   // A repo that is already where it was asked to be is not news: the run states
   // the project once, on the line naming the login (carrick#1026). Seeding the
   // map with those repos leaves this reporting only what CHANGED or what is
@@ -159,7 +186,7 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
   /** Place what can be placed; true when something moved and is worth re-reading. */
   const place = async (identity: ResolvedRepos, signal?: AbortSignal): Promise<boolean> => {
     if (!placeable || project === undefined) return false;
-    const pending = misplaced(identity, repos, project);
+    const pending = misplaced(identity, repos, project, movable);
     if (pending.length === 0) return false;
     const outcome = await assign(pending, signal);
     if (outcome.kind !== "placed") {
@@ -168,7 +195,7 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
       // is printed by the caller, after the steps that come before it.
       placeable = false;
       if (outcome.kind === "refused") {
-        options.say(`Carrick did not assign the requested repos to "${project}": ${outcome.message}`);
+        options.say(`Carrick did not assign the requested repos to ${label(project)}: ${outcome.message}`);
       }
       return false;
     }
@@ -176,7 +203,7 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
     for (const repo of outcome.repos) {
       if (repo.assigned) {
         moved = moved || repo.moved;
-        if (repo.moved) sayOnce(`Moved ${repo.full_name} into project "${project}".`);
+        if (repo.moved) sayOnce(`Moved ${repo.full_name} into project ${label(project)}.`);
       } else {
         sayOnce(`${repo.full_name} was not moved: ${repo.reason ?? "Carrick gave no reason."}`);
       }
@@ -188,13 +215,13 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
   const settle = async (identity: ResolvedRepos, signal?: AbortSignal): Promise<ResolvedRepos> => {
     if (!(await place(identity, signal))) return identity;
     const latest = await poll(signal);
-    reportAssignments(latest, repos, assignments, options.say);
+    reportAssignments(latest, repos, assignments, options.say, label);
     return latest;
   };
 
   let latest = initial;
   if (project !== undefined) {
-    reportAssignments(latest, repos, assignments, options.say);
+    reportAssignments(latest, repos, assignments, options.say, label);
     if (reposAreInProject(latest, repos, project)) {
       return latest;
     }
@@ -220,14 +247,14 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
   }
   if (!options.interactive) {
     if (project !== undefined) {
-      options.say(`Project "${project}" is not verified for every requested repo.`);
+      options.say(`Project ${label(project)} is not verified for every requested repo.`);
     }
     return latest;
   }
   options.say(ADMIN_WAIT);
   options.say(
     project !== undefined
-      ? `Waiting for every requested repo to reach project "${project}". Press Ctrl-C to stop.`
+      ? `Waiting for every requested repo to reach project ${label(project)}. Press Ctrl-C to stop.`
       : "Waiting for repository connections. Press Ctrl-C to continue setup without waiting.",
   );
   const controller = new AbortController();
@@ -253,7 +280,7 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
       signal.throwIfAborted();
       latest = await poll(signal);
       if (project !== undefined) {
-        reportAssignments(latest, repos, assignments, options.say);
+        reportAssignments(latest, repos, assignments, options.say, label);
         latest = await settle(latest, signal);
         if (reposAreInProject(latest, repos, project)) {
           return latest;
@@ -273,7 +300,7 @@ export async function connectRepos(token: string, repos: string[], initial: Reso
   finally { process.removeListener("SIGINT", cancel); }
   options.say(
     project !== undefined
-      ? `Stopped waiting; project "${project}" is not verified for every requested repo.`
+      ? `Stopped waiting; project ${label(project)} is not verified for every requested repo.`
       : "Stopped waiting for repository connections; continuing local setup.",
   );
   return latest;
