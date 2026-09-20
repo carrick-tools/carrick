@@ -1,19 +1,20 @@
-//! The bytes a dispatched job's answers are bought under, pinned to a
+//! The bytes a dispatched job's answers are named by, pinned to a
 //! checked-in list (carrick#1332).
 //!
 //! A dispatched row's `id` is `sha256(body)` and the cloud hands the answer
 //! back under it. So the prompt body is a NAME as well as a question: a
 //! release that moves one byte of it between the `dispatch` and the `resume`
-//! renames every question the job was paid to answer, the resume joins nothing,
-//! and the whole job is bought again (carrick#1248). Nothing failed when that
-//! happened — the rule lived in prose.
+//! renames every question the job answered: the stored answers match nothing
+//! the resume rebuilds, so every file is analysed from the start and the whole
+//! job takes as long as it did the first time (carrick#1248). Nothing failed
+//! when that happened — the rule lived in prose.
 //!
 //! This is the test that fails instead. It builds a real bundle over a fixed
 //! fixture, offline, and asserts the ids against `tests/golden/bundle-row-ids.json`.
 //!
 //! **A deliberate prompt change updates the golden file in the same PR, and
-//! the PR body says that every in-flight job will miss.** That is the whole
-//! point: the cost is not avoidable, only visible.
+//! the PR body says that every in-flight job will miss and run again from the
+//! start.** That is the whole point: the time is not avoidable, only visible.
 //!
 //! What is pinned and why:
 //!
@@ -21,7 +22,7 @@
 //! * **`schema_sha`** — the response schema the row names. Not part of `id`,
 //!   so it does not orphan a job's answers, but the cloud's analysis cache
 //!   keys the schema too (canonicalised, in the file-analyzer's cache module),
-//!   so a change there re-pays every file of every repo already indexed.
+//!   so a change there re-analyses every file of every repo already indexed.
 //! * **the path each id belongs to** — so a failure names the file whose
 //!   prompt moved rather than printing two lists of hex.
 //!
@@ -32,7 +33,7 @@
 //! have served. `a_reworded_guidance_block_leaves_every_id_alone` asserts that
 //! directly.
 //!
-//! Offline: `CARRICK_MOCK_ALL=1`, no cloud, no model, no cost.
+//! Offline: `CARRICK_MOCK_ALL=1`, no cloud, no model.
 //!
 //! Reference: `docs/reference/dispatch-resume.md`.
 
@@ -173,7 +174,7 @@ fn rendered(rows: &[AnalyzeRow]) -> serde_json::Value {
 ///   the response schema moved without anyone meaning it to. Revert it.
 /// * a deliberate change — then paste the printed list into
 ///   `tests/golden/bundle-row-ids.json` in the same PR and say in the PR body
-///   that every in-flight job will miss and be bought again.
+///   that every in-flight job will miss and run again from the start.
 #[tokio::test]
 #[serial]
 async fn every_dispatched_row_is_named_by_the_bytes_the_golden_file_pins() {
@@ -199,8 +200,9 @@ async fn every_dispatched_row_is_named_by_the_bytes_the_golden_file_pins() {
     assert_eq!(
         actual,
         expected,
-        "the bytes a dispatched job's answers are bought under have moved. Every job in \
-         flight now misses on every row and is paid for twice.\n\nIf that is deliberate, \
+        "the bytes a dispatched job's answers are named by have moved. Every job in \
+         flight now misses on every row and is analysed again from the start.\n\nIf that \
+         is deliberate, \
          this is the list to check in, and the PR body has to say so:\n{}\n",
         serde_json::to_string_pretty(&actual).expect("render the actual list")
     );
@@ -247,6 +249,6 @@ async fn a_reworded_guidance_block_leaves_every_id_alone() {
         plain.iter().map(|row| &row.id).collect::<Vec<_>>(),
         after.iter().map(|row| &row.id).collect::<Vec<_>>(),
         "guidance that regenerated into different words renamed every prompt; a resume \
-         would rebuy the whole job"
+         would re-analyse the whole job"
     );
 }

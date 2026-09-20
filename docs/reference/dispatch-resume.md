@@ -169,12 +169,14 @@ pipeline.
   job, its answers sit in the cloud's content-addressed analysis cache until
   they expire. `carrick status` says so; that is a surface, not a mechanism.
 
-## Changing a prompt body is a purchase
+## Changing a prompt body means the job runs again
 
 The body is a name as well as a question, so moving one byte of it between a
-dispatch and the resume renames every question the job was paid to answer: the
-resume joins nothing and the job is bought again (carrick#1248). That is not
-avoidable — only visible, and carrick#1332 is what makes it visible.
+dispatch and the resume renames every question the job answered: the stored
+answers no longer match anything the resume rebuilds, so the resume joins
+none of them and every file is analysed from the start. A job that took hours
+the first time takes those hours again (carrick#1248). That is not avoidable
+— only visible, and carrick#1332 is what makes it visible.
 
 Three goldens hold the bytes:
 
@@ -189,8 +191,8 @@ Three goldens hold the bytes:
   or the answers it names are unreachable.
 
 A deliberate prompt or schema change updates the golden in the same PR, and
-**the PR body says that every in-flight job will miss**. The failing test
-prints the list to check in.
+**the PR body says that every in-flight job will miss and be analysed again
+from the start**. The failing test prints the list to check in.
 
 ## How it is proven
 

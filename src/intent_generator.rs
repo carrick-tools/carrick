@@ -2545,7 +2545,7 @@ mod tests {
         task.join().await;
     }
 
-    // --------------------------------- the bytes a request is bought under
+    // ---------------------------------- the bytes a request is named under
     //                                                        (carrick#1332)
 
     /// A fixed function, so the pins below depend on the request BUILDERS and
@@ -2566,7 +2566,7 @@ mod tests {
     /// zero by design, and intents run on the machine that resumes — so moving
     /// these bytes orphans no dispatched answer. What it does orphan is the
     /// cloud's own cache of them: the request body is key material there, so a
-    /// field renamed or re-ordered here re-pays every intent of every repo
+    /// field renamed or re-ordered here regenerates every intent of every repo
     /// already indexed, on the next scan of each.
     ///
     /// Pinned as serialised text rather than field by field, because ORDER is

@@ -3070,7 +3070,7 @@ const data = await fetch('/api/users').then(resp => resp.json());
             id,
             "3dcb4efafcbd9c6e3cc0cb8e7e9b48080e2d57fb8eaa97e4dddf78b4373a70c9",
             "an optional prompt section moved; every dispatched row carrying it is renamed \
-             and every answer already bought for it is orphaned.\n\nIf that is deliberate, \
+             and every answer already held for it is orphaned.\n\nIf that is deliberate, \
              this is the digest to check in:\n{id}\nBody was:\n{}",
             prompt.body()
         );

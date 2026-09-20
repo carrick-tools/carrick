@@ -1,5 +1,5 @@
 {
-  "note": "The names a dispatched job's answers come back under (carrick#1332). Each `id` is sha256 of that file's analyze-file prompt body -- the bytes after the framework-guidance prefix. Moving one of them orphans every answer an in-flight job has already been paid for. Regenerate ONLY as part of a deliberate prompt or schema change, paste the list the failing test prints, and say in the PR body that in-flight jobs will miss. Owned by tests/bundle_row_id_golden_test.rs.",
+  "note": "The names a dispatched job's answers come back under (carrick#1332). Each `id` is sha256 of that file's analyze-file prompt body -- the bytes after the framework-guidance prefix. Moving one of them orphans every answer an in-flight job already holds, so the whole job is analysed again from the start. Regenerate ONLY as part of a deliberate prompt or schema change, paste the list the failing test prints, and say in the PR body that in-flight jobs will miss. Owned by tests/bundle_row_id_golden_test.rs.",
   "fixture": "tests/fixtures/llm-mocked-api",
   "guidance_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "rows": [
