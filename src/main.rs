@@ -9,6 +9,7 @@ mod call_base;
 mod call_graph;
 mod call_site_extractor;
 mod cloud_storage;
+mod commonjs;
 mod config;
 mod credentials;
 mod current_service;

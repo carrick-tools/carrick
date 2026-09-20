@@ -9,6 +9,7 @@ pub mod call_base;
 pub mod call_graph;
 pub mod call_site_extractor;
 pub mod cloud_storage;
+pub mod commonjs;
 pub mod config;
 pub mod credentials;
 pub mod current_service;

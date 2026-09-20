@@ -61,6 +61,50 @@ The compiler is the test oracle instead:
 `ts.resolveModuleName` and with this resolver, and fails on any disagreement.
 Deno maps are pinned by the Deno fixture in `tests/alias_import_callers_test.rs`.
 
+## CommonJS
+
+A module states the same two facts in two grammars, and the call graph reads
+both (`src/commonjs.rs`, carrick#1348). Everything above — the specifier order,
+the probe, the re-export hops — is unchanged: a `require` specifier resolves
+exactly as the same string in an `import` would.
+
+Read on the BINDING side, at module scope only:
+
+| Written | Read as |
+|---|---|
+| `const { x } = require("./m")` | a named import of `x` |
+| `const { a: b } = require("./m")` | a named import of `a` bound to `b` |
+| `const m = require("./m")` | a namespace import: `m.x()` is `./m`'s own `x` |
+| `const x = require("./m").x` | a named import of `x` |
+| `import x = require("./m")` | a namespace import |
+
+Read on the EXPORT side: `module.exports = { x }`, `module.exports = { a: impl }`,
+`module.exports = name`, `module.exports.x = …`, `exports.x = …`, and
+`module.exports = require("./other")`, which republishes another module's table
+the way `export * from` does. A name published both ways keeps its ESM meaning.
+
+Two forms are not read, and each has a reason rather than an omission:
+
+- **A computed specifier** (`require(name)`): nothing in the source says which
+  module it loads. The binding is not recorded, and the count is stated at
+  `info` with what to write instead.
+- **A require inside a function body**: the per-file table has one entry per
+  name, and two functions may bind one name to different modules. Reading them
+  by name alone would let one answer for the other, which is a wrong edge
+  rather than a missing one (carrick#1352). The lexical receiver walk keys by
+  scope, so a member call on such a binding does resolve.
+- **A whole-module binding that is CALLED** (`const fn = require("./m"); fn()`)
+  is looked up as `./m`'s own `fn`, so it resolves where the binding name
+  matches a definition in that module — the usual case. A module that publishes
+  its function under a different name (`module.exports = otherName`) records no
+  edge for it.
+
+The four passes that build ANALYZER inputs — mount, wrapper, SDK surface,
+GraphQL — do not read CommonJS exports, for the reason the section below gives
+for aliases: a module they newly resolve changes what the model is asked.
+`BindingResolver::reading_commonjs` is taken by the call graph alone, and
+carrick#1353 removes the split.
+
 ## What is not read, and how it is reported
 
 - **Aliases defined in code**: a bundler's `resolve.alias`, a Babel
