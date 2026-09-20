@@ -39,6 +39,7 @@ import { inspectMcpClients, mcpLine, type McpInspection } from "./mcp.ts";
 import { readInstallId } from "./install-id.ts";
 import { createOutput, DOCS, type InitOutput } from "./output.ts";
 import { repoRoots } from "./repos.ts";
+import { excludedRepos } from "./workspace-file.ts";
 import {
   expectedCarrickHooks,
   hookTarget,
@@ -116,8 +117,37 @@ export type ConfiguredRepo = {
   problem: string | null;
 };
 
+/**
+ * The repos this workspace is made of, as every other command counts them.
+ *
+ * Two of `repoRoots`' answers are not repos of this workspace, and reporting
+ * on either is reporting on something nobody asked to be indexed
+ * (carrick#1365):
+ *
+ * 1. **A repo the workspace file excludes.** `Workspace::load` never derives
+ *    one, the scans never walk one, and the read path refuses to answer from
+ *    one — so a doctor that audited it was the one surface still talking about
+ *    a repo the reader had taken out.
+ * 2. **The container, when the container is not a repo.** `repoRoots` always
+ *    includes the root, because in a single-repo workspace the root IS the
+ *    repo. In a folder of repos it is the folder: it holds no `.git` and no
+ *    `carrick.json`, and it was reported as a repo with no configuration —
+ *    under its own basename, which in a folder named after one of its repos
+ *    reads as a false statement about that repo. Both tests, not just the
+ *    first: a root holding a config is a root somebody configured, whether or
+ *    not this checkout has its `.git`.
+ */
+export function workspaceRepos(workspace: string): string[] {
+  const excluded = new Set(excludedRepos(workspace).map((name) => name.toLowerCase()));
+  const roots = repoRoots(workspace).filter((root) => !excluded.has(path.basename(root).toLowerCase()));
+  const container =
+    !fs.existsSync(path.join(workspace, ".git")) && !fs.existsSync(path.join(workspace, "carrick.json"));
+  if (roots.length > 1 && container) return roots.filter((root) => root !== workspace);
+  return roots;
+}
+
 export function configuredRepos(workspace: string): ConfiguredRepo[] {
-  return repoRoots(workspace).map((root) => {
+  return workspaceRepos(workspace).map((root) => {
     const label = path.relative(workspace, root) || path.basename(root);
     const file = path.join(root, "carrick.json");
     if (!fs.existsSync(file)) return { root, label, config: null, problem: null };
@@ -777,6 +807,11 @@ export function checkMcp(inspections: McpInspection[]): Line[] {
     }
     lines.push(warn(`${client.client}: ${client.detail}.`));
   }
+  // An entry whose host is somebody else's, or a file that will not parse, is
+  // a finding. An entry that works is not, and there is nothing else this
+  // command has to say about one: the install id it used to report missing is
+  // a log field, and the repair it printed cost the reader their sign-in
+  // (`mcp.ts`, carrick#1365).
   if (connected.length > 0 && findingCount(lines) === 0) {
     lines.push(done(`MCP server connected for ${connected.join(", ")}.`));
   }

@@ -1302,7 +1302,11 @@ fn status_attributes_a_repo_level_file_to_the_repo_and_not_to_every_service() {
         "the one repo-level SOURCE file, stated once:\n{:#}",
         repos[0]
     );
-    assert_eq!(repos[0]["changed_since_index"], serde_json::json!(5));
+    // Five files moved and two of them are files a scan reads: the one inside
+    // the service and the one outside every service. The other three hold no
+    // row in any index, so they are not what "changed since this index was
+    // built" is about (carrick#1365).
+    assert_eq!(repos[0]["changed_since_index"], serde_json::json!(2));
     let outside: Vec<&str> = repos[0]["stale_files"]
         .as_array()
         .expect("stale_files")

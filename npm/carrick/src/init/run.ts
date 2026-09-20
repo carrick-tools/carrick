@@ -665,7 +665,13 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     let known: ResolvedRepos | null = null;
     projects = null;
     const knownNames = [...new Set(candidates.map((repo) => repo.name).filter((name): name is string => name !== null))];
-    if (saved !== null && knownNames.length > 0 && candidates.length > 1) {
+    // Only where a picker is actually going to draw. Every other path has its
+    // answer already — `--repo` names it, `--yes` takes the list as derived, a
+    // single repo is not a choice — and asking about a repo whose name the
+    // reader never offered is a request that buys nothing (carrick#1338's
+    // test pins it: a repo left out is named in no request at all).
+    const picking = parsed.repos.length === 0 && !parsed.assumeYes && interactive && candidates.length > 1;
+    if (picking && saved !== null && knownNames.length > 0) {
       try {
         known = await resolveRepos(saved.token, knownNames);
         projects = await listProjects(saved.token);
