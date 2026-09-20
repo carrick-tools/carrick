@@ -285,11 +285,23 @@ fn blind_inference_aliases(
 /// `anchor_origin` mapping is pragmatic for WP3: symbol/literal anchors are
 /// LLM-sourced (`llm-symbol`), infer-derived anchors are locator-driven
 /// (`deterministic-infer`). Refining backfill attribution is follow-up work.
+/// `manifest_aliases` is every alias the service's `type_manifest` declares —
+/// the exact set the check phase will later import from this service's
+/// surface. The manifest is derived from the mount graph (one alias per
+/// operation x role x kind) while the anchors above are derived from the
+/// collected type REQUESTS, and nothing reconciled the two: an operation
+/// extraction could not type got a manifest alias, no anchor, no surface
+/// export, and its pairs read *"the surface export is missing or renamed"* —
+/// false, and it sends a reader hunting for a rename that does not exist
+/// (carrick-cloud#1184). Every unrequested alias therefore ships as an
+/// `unknown` placeholder, so the surface carries what the probe imports and
+/// the check's IsUnknown gate states the truth: the type is unknown.
 pub(crate) fn derive_capture_anchors(
     explicit: &[SymbolRequest],
     infer: &[InferRequestItem],
     inline_aliases: &[(String, String)],
     inferred: &[crate::services::type_sidecar::InferredType],
+    manifest_aliases: &[String],
     repo_root: &str,
 ) -> Vec<CaptureAnchor> {
     let mut seen: HashSet<String> = HashSet::new();
@@ -421,6 +433,25 @@ pub(crate) fn derive_capture_anchors(
             alias: alias.clone(),
             type_text: type_text.clone(),
             anchor_origin: AnchorOrigin::LlmSymbol,
+            source_file: None,
+        });
+    }
+
+    // Manifest aliases no request reached. Sorted so a stub's surface order is
+    // a function of the manifest, not of hash iteration.
+    let mut placeholders: Vec<&str> = manifest_aliases
+        .iter()
+        .map(String::as_str)
+        .filter(|alias| !seen.contains(*alias))
+        .collect();
+    placeholders.sort_unstable();
+    placeholders.dedup();
+    for alias in placeholders {
+        anchors.push(CaptureAnchor::Literal {
+            alias: alias.to_string(),
+            type_text: "unknown".to_string(),
+            anchor_origin: AnchorOrigin::ManifestPlaceholder,
+            // `unknown` names nothing, so no file needs to join the program.
             source_file: None,
         });
     }
@@ -1511,7 +1542,7 @@ mod tests {
             ),
         ];
 
-        let anchors = derive_capture_anchors(&explicit, &infer, &inline, &[], "/repo");
+        let anchors = derive_capture_anchors(&explicit, &infer, &inline, &[], &[], "/repo");
         assert_eq!(anchors.len(), 3);
 
         match &anchors[0] {
@@ -1601,6 +1632,67 @@ mod tests {
         }
     }
 
+    /// A manifest alias no type request reached still has to reach the
+    /// surface, or the check's probe import fails and the pair reads "the
+    /// surface export is missing or renamed" — a false statement that sends a
+    /// reader hunting for a rename (carrick-cloud#1184).
+    ///
+    /// Live repro: on `scanner-evals` the producing service's manifest carried
+    /// two route aliases (`type_state: unknown`, `line_number: 1`) while its
+    /// capture stub listed 12 aliases, none of them those two. Every one of
+    /// the project's 52 judged probe rows failed on that missing import.
+    #[test]
+    fn an_unrequested_manifest_alias_ships_as_an_unknown_placeholder() {
+        let explicit = vec![order_explicit("Endpoint_requested_Response")];
+        let manifest = vec![
+            "Endpoint_unrequested_Response".to_string(),
+            "Endpoint_requested_Response".to_string(),
+            "Endpoint_alsoMissing_Request".to_string(),
+            // A manifest can name the same alias on several rows (one per
+            // dispatch case on a body-dispatch route); the surface declares it
+            // once.
+            "Endpoint_alsoMissing_Request".to_string(),
+        ];
+
+        let anchors = derive_capture_anchors(&explicit, &[], &[], &[], &manifest, "/repo");
+
+        assert_eq!(
+            anchors.len(),
+            3,
+            "one anchor per distinct alias, requested or not: {anchors:?}"
+        );
+        assert!(
+            matches!(&anchors[0], CaptureAnchor::Symbol { alias, .. }
+                if alias == "Endpoint_requested_Response"),
+            "a requested alias keeps its real anchor: {:?}",
+            anchors[0]
+        );
+        let placeholders: Vec<(&str, &str)> = anchors[1..]
+            .iter()
+            .map(|anchor| match anchor {
+                CaptureAnchor::Literal {
+                    alias,
+                    type_text,
+                    anchor_origin,
+                    source_file,
+                } => {
+                    assert_eq!(*anchor_origin, AnchorOrigin::ManifestPlaceholder);
+                    assert_eq!(*source_file, None, "`unknown` names no file to load");
+                    (alias.as_str(), type_text.as_str())
+                }
+                other => panic!("expected a placeholder literal, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            placeholders,
+            vec![
+                ("Endpoint_alsoMissing_Request", "unknown"),
+                ("Endpoint_unrequested_Response", "unknown"),
+            ],
+            "sorted, so the surface order follows the manifest and not a hash walk"
+        );
+    }
+
     /// A blind inference must never let the LLM's bare element symbol ride as
     /// a confident contract.
     ///
@@ -1626,7 +1718,7 @@ mod tests {
         let infer = vec![response_body_infer("Endpoint_blind_Response")];
         let inferred_types = vec![inferred("Endpoint_blind_Response", "any", None, None)];
 
-        let anchors = derive_capture_anchors(&explicit, &infer, &[], &inferred_types, "/repo");
+        let anchors = derive_capture_anchors(&explicit, &infer, &[], &inferred_types, &[], "/repo");
 
         assert_eq!(
             anchors.len(),
@@ -1666,7 +1758,7 @@ mod tests {
             response_body_infer("Endpoint_blind_Response"),
         ];
 
-        let anchors = derive_capture_anchors(&[], &infer, &[], &[decided, blind], "/repo");
+        let anchors = derive_capture_anchors(&[], &infer, &[], &[decided, blind], &[], "/repo");
 
         assert_eq!(anchors.len(), 2, "{anchors:?}");
         match &anchors[0] {
@@ -1693,7 +1785,7 @@ mod tests {
         let infer = vec![response_body_infer("Endpoint_blind_Response")];
         let inferred_types = vec![inferred("Endpoint_blind_Response", "unknown", None, None)];
 
-        let anchors = derive_capture_anchors(&explicit, &infer, &[], &inferred_types, "/repo");
+        let anchors = derive_capture_anchors(&explicit, &infer, &[], &inferred_types, &[], "/repo");
         assert!(
             matches!(anchors.as_slice(), [CaptureAnchor::Infer { .. }]),
             "got {:?}",
@@ -1720,6 +1812,7 @@ mod tests {
                 Some("Order"),
                 Some(1),
             )],
+            &[],
             "/repo",
         );
         assert!(
@@ -1748,6 +1841,7 @@ mod tests {
                 None,
                 None,
             )],
+            &[],
             "/repo",
         );
         assert!(
@@ -1760,6 +1854,7 @@ mod tests {
         //     anchors): the guard is structurally inert.
         let no_inference = derive_capture_anchors(
             &[order_explicit("Endpoint_c_Response")],
+            &[],
             &[],
             &[],
             &[],
@@ -1781,6 +1876,7 @@ mod tests {
                 inferred("Endpoint_d_Response", "any", None, None),
                 inferred("Endpoint_d_Response", "Order[]", Some("Order"), Some(1)),
             ],
+            &[],
             "/repo",
         );
         assert!(
@@ -1799,6 +1895,7 @@ mod tests {
             &[response_body_infer("Endpoint_e_Response")],
             &[],
             &[inferred("Endpoint_e_Response", "any", None, None)],
+            &[],
             "/repo",
         );
         assert!(
@@ -1910,7 +2007,7 @@ mod tests {
             inferred_type("Pub_Clean", "{ ok: boolean }"),
         ];
 
-        let anchors = derive_capture_anchors(&[], &infer, &[], &inferred, ".");
+        let anchors = derive_capture_anchors(&[], &infer, &[], &inferred, &[], ".");
         assert_eq!(anchors.len(), 4);
         for (anchor, alias) in
             anchors
@@ -1970,7 +2067,7 @@ mod tests {
             request("Pub_Consumer", InferKind::Expression, Some("msg")),
         ];
 
-        let anchors = derive_capture_anchors(&[], &infer, &[], &[], ".");
+        let anchors = derive_capture_anchors(&[], &infer, &[], &[], &[], ".");
         assert_eq!(anchors.len(), 3);
         let param_of = |index: usize| match &anchors[index] {
             CaptureAnchor::Infer {
@@ -2030,7 +2127,7 @@ mod tests {
             inferred_type("Pub_Unresolved", "unknown"),
         ];
 
-        let anchors = derive_capture_anchors(&[], &infer, &[], &inferred, ".");
+        let anchors = derive_capture_anchors(&[], &infer, &[], &inferred, &[], ".");
         assert_eq!(anchors.len(), 2);
         match &anchors[0] {
             CaptureAnchor::Literal {

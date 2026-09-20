@@ -206,7 +206,11 @@ An anchor is one of four kinds, discriminated on `kind`:
 }
 ```
 
-`anchor_origin` is one of `llm-symbol`, `deterministic-infer`, `anchor-backfill`.
+`anchor_origin` is one of `llm-symbol`, `deterministic-infer`, `anchor-backfill`,
+`manifest-placeholder`. The last one is an alias the driver's type manifest
+declares but no type request reached: it is sent as a literal `unknown` so the
+surface carries every alias the check will import, and the check's IsUnknown
+gate reports the type as unknown rather than the export as missing.
 A literal anchor's optional `source_file` names the file its text was printed
 from; it joins the analysis program so names the text prints bare are found
 declared, and is omitted for inline text that has no file.
