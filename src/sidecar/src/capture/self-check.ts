@@ -22,7 +22,12 @@
  * Attribution is per-alias closure: failed specifiers are blamed on an alias
  * only if they occur in a file reachable from that alias's surface statement
  * (import-type seeds, then BFS over relative imports). The spike's
- * file-granularity shortcut is gone.
+ * file-granularity shortcut is gone -- including on the SURFACE file itself,
+ * which holds every alias, so a file-granular bucket there blamed the whole
+ * service for one alias's dangling specifier (cloud#1184). A surface
+ * diagnostic is attributed by `export type` statement span, exactly as
+ * check-poison.ts contains poison; one that no statement covers keeps the
+ * service-wide bucket.
  */
 
 import ts from 'typescript';
@@ -97,13 +102,27 @@ function runSelfCheck(args: SelfCheckArgs, treeFiles: string[]): CaptureAliasRec
   const checker = program.getTypeChecker();
   const diagnostics = ts.getPreEmitDiagnostics(program);
 
-  // Failed module specifiers, split external-pinned vs internal, per FILE.
+  const surfaceAbs = path.resolve(args.surfaceAbsPath);
+  const surfaceSource = program.getSourceFile(surfaceAbs);
+  // The surface holds EVERY alias, and every alias's closure starts there, so
+  // a file-granular failure bucket on it blames the whole service for one
+  // alias's dangling specifier (cloud#1184). Attribute by `export type`
+  // statement span, exactly as check-poison.ts contains poison.
+  const aliasAtSurfacePosition = buildSurfaceSpanIndex(surfaceSource);
+
+  // Failed module specifiers, split external-pinned vs internal, per FILE —
+  // except on the surface, where they are per ALIAS.
   const failuresByFile = new Map<string, FileFailures>();
-  const failuresFor = (fileName: string): FileFailures => {
-    let entry = failuresByFile.get(fileName);
+  const surfaceFailuresByAlias = new Map<string, FileFailures>();
+  const emptyFailures = (): FileFailures => ({
+    externalPinned: new Set(),
+    internal: new Set(),
+  });
+  const bucketIn = (map: Map<string, FileFailures>, key: string): FileFailures => {
+    let entry = map.get(key);
     if (!entry) {
-      entry = { externalPinned: new Set(), internal: new Set() };
-      failuresByFile.set(fileName, entry);
+      entry = emptyFailures();
+      map.set(key, entry);
     }
     return entry;
   };
@@ -113,7 +132,15 @@ function runSelfCheck(args: SelfCheckArgs, treeFiles: string[]): CaptureAliasRec
     const m = /Cannot find module '([^']+)'/.exec(msg);
     if (!m) continue;
     const spec = m[1];
-    const bucket = failuresFor(path.resolve(d.file.fileName));
+    const abs = path.resolve(d.file.fileName);
+    // A surface diagnostic outside every alias statement (a file-level import,
+    // a reference directive) is attributable to no alias and keeps the
+    // service-wide file bucket: soundness over precision, the same fallback
+    // check-poison.ts makes.
+    const owner = abs === surfaceAbs ? aliasAtSurfacePosition(d.start) : undefined;
+    const bucket = owner
+      ? bucketIn(surfaceFailuresByAlias, owner)
+      : bucketIn(failuresByFile, abs);
     if (!isRelative(spec) && args.pinned[packageNameOf(spec)]) {
       bucket.externalPinned.add(spec);
     } else {
@@ -135,9 +162,6 @@ function runSelfCheck(args: SelfCheckArgs, treeFiles: string[]): CaptureAliasRec
     adjacency.set(abs, neighbors);
   }
 
-  const surfaceAbs = path.resolve(args.surfaceAbsPath);
-  const surfaceSource = program.getSourceFile(surfaceAbs);
-
   const records: CaptureAliasRecord[] = [];
   for (const anchor of args.resolved) {
     // Demotions (failureReason present) never reached the surface with a
@@ -155,10 +179,35 @@ function runSelfCheck(args: SelfCheckArgs, treeFiles: string[]): CaptureAliasRec
             surfaceSource,
             adjacency,
             failuresByFile,
+            surfaceFailuresByAlias,
           })
     );
   }
   return records;
+}
+
+/**
+ * Position -> the alias whose `export type` statement span covers it, for
+ * diagnostics reported on the surface file. `undefined` when no alias
+ * statement covers the position, or when the surface is not in the program.
+ */
+function buildSurfaceSpanIndex(
+  surfaceSource: ts.SourceFile | undefined
+): (position: number | undefined) => string | undefined {
+  if (!surfaceSource) return () => undefined;
+  const spans: Array<{ alias: string; start: number; end: number }> = [];
+  for (const stmt of surfaceSource.statements) {
+    if (!ts.isTypeAliasDeclaration(stmt)) continue;
+    spans.push({
+      alias: stmt.name.text,
+      start: stmt.getStart(surfaceSource),
+      end: stmt.getEnd(),
+    });
+  }
+  return (position) => {
+    if (position === undefined) return undefined;
+    return spans.find((span) => position >= span.start && position <= span.end)?.alias;
+  };
 }
 
 /** An alias that never reached a capture-native tier: the failure reason was
@@ -188,6 +237,7 @@ function checkedRecord(
     surfaceSource: ts.SourceFile | undefined;
     adjacency: Map<string, string[]>;
     failuresByFile: Map<string, FileFailures>;
+    surfaceFailuresByAlias: Map<string, FileFailures>;
   }
 ): CaptureAliasRecord {
   const alias = anchor.request.alias;
@@ -241,8 +291,13 @@ function checkedRecord(
   let blamedExternal: string | undefined;
   let internalFailure: string | undefined;
   const danglingSpecifiers = new Set<string>();
-  for (const file of closure) {
-    const failures = ctx.failuresByFile.get(file);
+  // This alias's own surface statement, then the closure's files. The surface
+  // file bucket now holds only the diagnostics no alias statement covers.
+  const closureFailures = [
+    ctx.surfaceFailuresByAlias.get(alias),
+    ...[...closure].map((file) => ctx.failuresByFile.get(file)),
+  ];
+  for (const failures of closureFailures) {
     if (!failures) continue;
     if (!blamedExternal) blamedExternal = [...failures.externalPinned][0];
     if (!internalFailure) internalFailure = [...failures.internal][0];

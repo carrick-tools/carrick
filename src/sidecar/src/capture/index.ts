@@ -114,7 +114,12 @@ function emptyFidelity(): CaptureFidelity {
     total_aliases: 0,
     by_serialization: { emitted: 0, node_builder: 0, structural_fallback: 0 },
     by_self_check: { ok: 0, allowlisted_external: 0, decayed_internal: 0 },
-    by_anchor_origin: { 'llm-symbol': 0, 'deterministic-infer': 0, 'anchor-backfill': 0 },
+    by_anchor_origin: {
+      'llm-symbol': 0,
+      'deterministic-infer': 0,
+      'anchor-backfill': 0,
+      'manifest-placeholder': 0,
+    },
     usable_rate: 0,
   };
 }

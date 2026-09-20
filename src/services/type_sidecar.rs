@@ -191,6 +191,11 @@ pub enum AnchorOrigin {
     DeterministicInfer,
     #[serde(rename = "anchor-backfill")]
     AnchorBackfill,
+    /// No type request reached capture for a manifest alias, so the driver
+    /// sends an `unknown` placeholder rather than letting the surface omit it
+    /// (cloud#1184).
+    #[serde(rename = "manifest-placeholder")]
+    ManifestPlaceholder,
 }
 
 /// One anchor for the `capture_v2` action. Mirrors the sidecar's

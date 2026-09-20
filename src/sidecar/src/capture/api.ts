@@ -14,7 +14,14 @@
  * (Named anchor_origin because `provenance` is taken by the op-level
  * producer-provenance fields in src/eval_output.rs.)
  */
-export type AnchorOrigin = 'llm-symbol' | 'deterministic-infer' | 'anchor-backfill';
+export type AnchorOrigin =
+  | 'llm-symbol'
+  | 'deterministic-infer'
+  | 'anchor-backfill'
+  /** No type request reached capture for a manifest alias, so the driver sent
+   * an `unknown` placeholder: the surface carries every alias the check will
+   * probe, and the check's IsUnknown gate answers for it (cloud#1184). */
+  | 'manifest-placeholder';
 
 /**
  * Serialization tier of a captured alias (design doc, Capture step 5):

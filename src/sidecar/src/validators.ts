@@ -223,7 +223,12 @@ export const EmitSurfaceRequestSchema = BaseRequestSchema.extend({
 });
 
 /** v2 "tsc as serializer" capture (contract in ./capture/api.ts). */
-const AnchorOriginSchema = z.enum(['llm-symbol', 'deterministic-infer', 'anchor-backfill']);
+const AnchorOriginSchema = z.enum([
+  'llm-symbol',
+  'deterministic-infer',
+  'anchor-backfill',
+  'manifest-placeholder',
+]);
 
 const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
   z.object({

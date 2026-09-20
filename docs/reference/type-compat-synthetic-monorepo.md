@@ -218,7 +218,7 @@ Generation:
    (`serialization: emitted | node_builder | structural_fallback`) so fidelity
    is measurable and ratchetable. Alongside `serialization`, every alias
    records how its anchor was produced: `anchor_origin: llm-symbol |
-   deterministic-infer | anchor-backfill`. (Named `anchor_origin` because
+   deterministic-infer | anchor-backfill | manifest-placeholder`. (Named `anchor_origin` because
    `provenance` is already taken by the op-level producer-provenance fields
    in `src/eval_output.rs`.) The two dimensions answer different questions:
    `anchor_origin` measures anchor recall (did we point at the right symbol

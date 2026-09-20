@@ -4954,11 +4954,24 @@ fn run_capture_for_service(
                 .into_owned();
         }
     }
+    // Every alias the check phase will import from this service's surface. The
+    // manifest is already on `cloud_data` by the time capture runs.
+    let manifest_aliases: Vec<String> = cloud_data
+        .type_manifest
+        .as_ref()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| entry.type_alias.clone())
+                .collect()
+        })
+        .unwrap_or_default();
     let anchors = type_compat_v2::derive_capture_anchors(
         &explicit,
         &infer,
         &inline_aliases,
         &type_resolution.inferred_types,
+        &manifest_aliases,
         &capture_root,
     );
     if anchors.is_empty() {
