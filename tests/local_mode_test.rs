@@ -558,7 +558,8 @@ fn a_re_check_names_the_functions_the_index_does_not_hold() {
              export function widgetLabel(widget: Widget): string {{\n  \
              return widget.name;\n}}\n\n\
              function countActive(widgets: Widget[]): number {{\n  \
-             return widgets.length;\n}}\n"
+             return widgets.length;\n}}\n\n\
+             export const DEFAULT_LABEL = widgetLabel({{ id: \"\", name: \"\", activeCount: \"0\" }});\n"
         ),
     )
     .expect("write the route file");

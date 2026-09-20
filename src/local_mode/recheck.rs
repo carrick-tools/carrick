@@ -186,7 +186,7 @@ fn inside(
         .env_remove(crate::progress::PROGRESS_ENV);
     bounded(scan, "re-scan", deadline)?;
     let rescanned = read_blobs(&scan_dir)?;
-    // One set difference over work already paid for: the re-scan walked this
+    // One set difference over work already done: the re-scan walked this
     // file's AST to re-extract its rows, and its functions came back with them.
     let new_functions = new_functions(&indexed_functions, rescanned.iter(), relative);
     for (position, blob) in rescanned.iter().enumerate() {
