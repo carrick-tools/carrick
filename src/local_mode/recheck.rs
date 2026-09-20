@@ -154,14 +154,6 @@ fn inside(
     {
         write_blob(&blobs.join(format!("retained-{position}.json")), blob)?;
     }
-    // What the index holds for THIS file, before the re-scan overwrites the
-    // question. The edited repo's own blobs are the ones filtered out above,
-    // and they are the only record of what was indexed here.
-    let indexed_functions = functions_in(
-        retained.iter().filter(|blob| blob.repo_name == name),
-        relative,
-    );
-
     // The hosted services, from the snapshot on disk. No request is made: a
     // re-check that waited on the network would miss its budget on the wire
     // rather than on the work.
@@ -174,12 +166,29 @@ fn inside(
 
     // Phase 1. `previous_data` is what the last index held for this repo, so
     // an unchanged file replays its hosted answers instead of losing them.
+    let previous_data = hosted.local_blobs(repo);
     let previous = generation.join("previous.json");
     std::fs::write(
         &previous,
-        serde_json::to_vec(&hosted.local_blobs(repo)).map_err(|e| e.to_string())?,
+        serde_json::to_vec(&previous_data).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
+
+    // What the index holds for THIS file, before the re-scan answers the same
+    // question about the working tree. BOTH records of it, because neither is
+    // present on every install: `index` keeps only the blobs of services it
+    // scanned locally in `.carrick/repos` (the write there filters out every
+    // service the hosted snapshot answers for), and the hosted half is empty
+    // on a machine that is not signed in. A union is also the truer reading of
+    // "the index": the hosted blob is this repo on its default branch, which
+    // is what a nudge built on this tells the agent it was compared against.
+    // Either one alone would report every function in an edited file as new on
+    // the install the other covers.
+    let mut indexed_functions = functions_in(
+        retained.iter().filter(|blob| blob.repo_name == name),
+        relative,
+    );
+    indexed_functions.extend(functions_in(previous_data.iter(), relative));
     let scan_dir = generation.join("scan");
     let mut scan = scan_command(&exe, repo, &scan_dir, &previous, &super::index::Pass::Facts);
     scan.env(super::SKIP_SIGNATURES_ENV, "1")

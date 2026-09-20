@@ -187,8 +187,10 @@ has not moved past: nothing needed re-judging, so nothing was.
 | `reason` | string | why the re-check did not run, in one sentence. Present only on a `none` |
 | `new_functions` | array \| absent | functions this file declares in the working tree that the index does not hold under that name, `{ "name": string, "line": int }`, in line order, at most 20. Absent on a `none` (nothing was extracted to compare) and absent when the edit added no function |
 
-`new_functions` is a NAME comparison against `index_commit`, and both halves of
-that decide what it means. The commit is the one the last scan of that repo ran
+`new_functions` is a NAME comparison against everything the index holds for that
+file — the blobs the last local scan wrote AND the hosted record of the same
+repo, because neither is present on every install — and both halves of that
+decide what it means. The commit is the one the last scan of that repo ran
 on — the default branch, in the ordinary case — so a function written earlier on
 the current branch is listed here too. And the index holds no hash of a body, so
 a function that was renamed appears as new and one rewritten under its old name
