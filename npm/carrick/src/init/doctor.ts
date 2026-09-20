@@ -47,6 +47,7 @@ import {
   type InstalledHook,
 } from "./settings.ts";
 import { SETTINGS_FILES } from "./remove.ts";
+import { CODEX_HOOKS_FILE, codexInUse, expectedCodexHooks, readHooksFile } from "./codex.ts";
 import type { StatusResult } from "../contract.ts";
 
 export type DoctorOptions = { workspace: string };
@@ -633,6 +634,70 @@ function isTransient(target: string): boolean {
   return target.includes(`${path.sep}_npx${path.sep}`);
 }
 
+/**
+ * The hook entries in this workspace's Codex config (carrick#1335).
+ *
+ * Asked only where Codex is set up for this workspace, and the test for that is
+ * its project config folder: `.codex/` is the layer Codex reads project hooks
+ * from, and it is the folder `carrick init` writes the entries into. A
+ * workspace without one runs Codex nowhere near this repository, and a warning
+ * there would fire on every Claude Code user for a host they do not have.
+ *
+ * What it does NOT re-ask is whether the command still resolves. That is one
+ * machine-wide question about one install, `checkHooks` above asks it of the
+ * same command string, and asking twice would print the same finding twice.
+ */
+export function checkCodexHooks(workspace: string): Line[] {
+  if (!codexInUse(workspace)) return [];
+  const body = readHooksFile(workspace);
+  if (body === null) {
+    return [
+      warn(
+        `Codex is set up in this folder and ${CODEX_HOOKS_FILE} is not there, so nothing records or names what a task adds under Codex. \`carrick init\` writes it.`,
+      ),
+    ];
+  }
+  let installed: InstalledHook[];
+  try {
+    installed = installedCarrickHooks(body);
+  } catch (error) {
+    return [
+      refuse(`${CODEX_HOOKS_FILE} is not valid JSON (${(error as Error).message}), so no hook in it runs.`),
+    ];
+  }
+  if (installed.length === 0) {
+    return [
+      warn(
+        `No Carrick hook entries in ${CODEX_HOOKS_FILE}, so nothing records or names what a task adds under Codex. \`carrick init\` writes them.`,
+      ),
+    ];
+  }
+  // The prefix the file itself names, so an install that had to write an
+  // absolute path is compared against its own entries and not against a bare
+  // `carrick` it never wrote.
+  const prefix = installed[0]!.command.split(/\s+hook\s+/)[0]!;
+  const missing = expectedCodexHooks(prefix).filter(
+    (want) =>
+      !installed.some(
+        (have) =>
+          have.event === want.event &&
+          have.command === want.command &&
+          have.matcher === want.matcher &&
+          have.timeout === want.timeout,
+      ),
+  );
+  if (missing.length === 0) {
+    return [done(`Codex hook entries are installed here, in ${CODEX_HOOKS_FILE}.`)];
+  }
+  return [
+    warn(
+      `The Codex hook entries here are not the ones this version installs: ${missing
+        .map((entry) => `${entry.event} \`${entry.command}\`${entry.matcher ? ` (matcher ${entry.matcher})` : ""}`)
+        .join(", ")} ${missing.length === 1 ? "is" : "are"} not in ${CODEX_HOOKS_FILE}. Re-run \`carrick init\`.`,
+    ),
+  ];
+}
+
 /** The MCP server entry in each agent client this machine has. */
 export function checkMcp(inspections: McpInspection[]): Line[] {
   if (inspections.length === 0) {
@@ -794,6 +859,7 @@ export async function doctor(argv: string[], out: InitOutput = createOutput()): 
     ...checkDeclaredPaths(repos),
     ...checkWorkflow(repos),
     ...checkHooks(workspace, realMachine()),
+    ...checkCodexHooks(workspace),
     ...checkMcp(inspectMcpClients()),
     ...(await readIndex(workspace)),
   ];

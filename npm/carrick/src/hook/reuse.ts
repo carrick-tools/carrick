@@ -214,6 +214,37 @@ export function markNudged(sessionId: string, entries: NewFunction[], home?: str
   write(sessionId, current, home);
 }
 
+/** What one delivery of the nudge said, for the hook that delivered it. */
+export type Drained = {
+  /** The line to hand the model. */
+  line: string;
+  /** How many functions it names. */
+  named: number;
+  /** How many the session has recorded in all, named or not. */
+  found: number;
+};
+
+/**
+ * The nudge for one session, marked as spoken, or nothing to say (carrick#1335).
+ *
+ * The one place the sequence lives, because two hooks deliver it: Claude Code's
+ * `Stop`, and Codex's `UserPromptSubmit`, which is the only non-blocking
+ * model-visible event Codex gives us. Both read the same store, speak the same
+ * line and mark the same set; only the event name on the wire differs.
+ *
+ * The marking happens here, before the caller writes anything, and that order
+ * is the point: a nudge that is written and not recorded fires again on the
+ * next stop, and a task is several stops.
+ */
+export function drain(sessionId: string, home?: string): Drained | null {
+  const current = readSession(sessionId, home);
+  const waiting = pending(current);
+  if (waiting.length === 0) return null;
+  const line = nudge(waiting);
+  markNudged(sessionId, waiting, home);
+  return { line, named: waiting.length, found: current.found.length };
+}
+
 /**
  * The one line the Stop hook hands the model.
  *

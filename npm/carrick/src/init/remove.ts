@@ -1,11 +1,12 @@
 // Undoing `carrick init`, on this machine.
 //
 // An install that can state its own undo is the courtesy that makes people
-// willing to try it (carrick#1034), and init now writes in eight places: the
-// hook entries in a workspace's `.claude` settings, the task skills under
-// `.claude/skills` and `.agents/skills`, an MCP server entry in each agent
-// client's own configuration, the `.carrick` directory, the install id in
-// `~/.carrick`, and the credential in the user's configuration directory.
+// willing to try it (carrick#1034), and init now writes in nine places: the
+// hook entries in a workspace's `.claude` settings, the Codex ones in
+// `.codex/hooks.json`, the task skills under `.claude/skills` and
+// `.agents/skills`, an MCP server entry in each agent client's own
+// configuration, the `.carrick` directory, the install id in `~/.carrick`, and
+// the credential in the user's configuration directory.
 //
 // Every step here is the inverse of a writer in this folder, and each pair
 // lives in one file so the two cannot drift: `mergeCarrickHooks` /
@@ -40,6 +41,7 @@ import { removeSessions, sessionsDir } from "../hook/reuse.ts";
 import { disconnectMcpClients, type McpRemoval } from "./mcp.ts";
 import { repoRoots } from "./repos.ts";
 import { removeCarrickHooks } from "./settings.ts";
+import { CODEX_HOOKS_FILE, uninstallCodexHooks } from "./codex.ts";
 import { removeTaskSkills, SKILL_ROOTS } from "./task-skills.ts";
 import { createOutput, DOCS, type InitOutput } from "./output.ts";
 
@@ -81,9 +83,9 @@ function help(): string {
     "carrick remove [DIRECTORY] [--keep-login]",
     "",
     "Undo what carrick init wrote on this machine: the Carrick hook entries in",
-    "this folder's .claude settings, the carrick MCP server in each agent",
-    "client's configuration, the .carrick directory, this machine's install id,",
-    "and the saved credential.",
+    "this folder's .claude settings and in .codex/hooks.json, the carrick MCP",
+    "server in each agent client's configuration, the .carrick directory, this",
+    "machine's install id, and the saved credential.",
     "Other hooks, other MCP servers and the settings files themselves are left",
     "as they are. The task skills it wrote are removed where they still match",
     "the stamp it wrote them with, and named where they do not. Files the",
@@ -230,6 +232,25 @@ export async function remove(argv: string[], out: InitOutput = createOutput()): 
     } catch (error) {
       out.refuse(`Could not read ${relative}: ${(error as Error).message}. Remove the carrick hook entries there by hand.`);
     }
+  }
+
+  // Codex's half of the same pair. Unlike a settings file, this one exists
+  // because init wrote it, so a file left holding no hooks at all goes with the
+  // entries (carrick#1335).
+  try {
+    const codex = uninstallCodexHooks(workspace);
+    if (codex !== null) {
+      out.done(
+        codex === "file removed"
+          ? `${CODEX_HOOKS_FILE} removed, with the Carrick hook entries that were the whole of it`
+          : `Carrick hook entries removed from ${CODEX_HOOKS_FILE}`,
+      );
+      removed += 1;
+    }
+  } catch (error) {
+    out.refuse(
+      `Could not read ${CODEX_HOOKS_FILE}: ${(error as Error).message}. Remove the carrick hook entries there by hand.`,
+    );
   }
 
   const { done, warn } = mcpRemovalLines(disconnectMcpClients());

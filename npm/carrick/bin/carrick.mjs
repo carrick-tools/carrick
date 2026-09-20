@@ -39,6 +39,7 @@ const HOOKS = {
   "post-edit": "../dist/hook/post-edit.js",
   "session-start": "../dist/hook/session-start.js",
   stop: "../dist/hook/stop.js",
+  "user-prompt": "../dist/hook/user-prompt.js",
 };
 
 const argv = process.argv.slice(2);
@@ -163,11 +164,13 @@ function extraHelp() {
     "INTEGRATION:",
     "    lsp --stdio                  the language server, for an editor or an agent",
     "                                 that speaks LSP",
-    "    hook post-edit               Claude Code PostToolUse hook (reads the tool",
-    "                                 payload on stdin)",
+    "    hook post-edit               PostToolUse hook for either host (reads the",
+    "                                 tool payload on stdin)",
     "    hook session-start           Claude Code SessionStart hook",
     "    hook stop                    Claude Code Stop hook (one reuse nudge per",
     "                                 task, silent when the task added no function)",
+    "    hook user-prompt             Codex UserPromptSubmit hook (the same nudge,",
+    "                                 delivered on the next prompt)",
     "    templates <name>             print a file to add to a repo: workflow, or",
     "                                 carrick.json",
     "    --version                    the version of this package",

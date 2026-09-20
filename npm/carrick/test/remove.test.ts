@@ -25,6 +25,7 @@ import {
 import { MCP_URL } from "../src/init/mcp.ts";
 import { INSTALL_ID_HEADER, installIdPath } from "../src/init/install-id.ts";
 import { sessionFile, sessionsDir } from "../src/hook/reuse.ts";
+import { CODEX_HOOKS_FILE, writeCodexHooks } from "../src/init/codex.ts";
 
 const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 /** What this machine calls itself to the index, until this command deletes it. */
@@ -260,6 +261,15 @@ process.exit(0);
     ).body,
   );
 
+  // The Codex half of the same install (carrick#1335), in a file that also
+  // holds a hook of the user's own: the entries come out and the file stays.
+  writeCodexHooks(workspace, "carrick");
+  const codex = JSON.parse(fs.readFileSync(path.join(workspace, CODEX_HOOKS_FILE), "utf8")) as {
+    hooks: Record<string, unknown[]>;
+  };
+  codex.hooks["SessionStart"] = [{ hooks: [{ type: "command", command: "./scripts/orient.sh" }] }];
+  fs.writeFileSync(path.join(workspace, CODEX_HOOKS_FILE), `${JSON.stringify(codex, null, 2)}\n`);
+
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     HOME: home,
@@ -291,6 +301,7 @@ test("remove takes back what init wrote, lists what it will not touch, and says 
   const settingsFile = path.join(state.workspace, SETTINGS_FILES[0]!);
   for (const line of [
     `◇ Carrick hook entries removed from ${SETTINGS_FILES[0]}`,
+    `◇ Carrick hook entries removed from ${CODEX_HOOKS_FILE}`,
     "◇ MCP server removed for Claude Code",
     `◇ MCP server removed for Cursor: ${path.join(state.home, ".cursor", "mcp.json")}`,
     "◇ This machine's install id removed",
@@ -319,6 +330,15 @@ test("remove takes back what init wrote, lists what it will not touch, and says 
   assert.match(settings.hooks.SessionStart[0].hooks[0].command, /session-start\.sh/);
   assert.equal(settings.hooks.PostToolUse, undefined);
   assert.equal(settings.hooks.Stop, undefined);
+
+  // Codex's file keeps the hook that is not ours, and loses both of ours: the
+  // file itself stays because it was not only ours (carrick#1335).
+  const codexLeft = JSON.parse(
+    fs.readFileSync(path.join(state.workspace, CODEX_HOOKS_FILE), "utf8"),
+  ) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> };
+  assert.equal(codexLeft.hooks["SessionStart"]![0]!.hooks[0]!.command, "./scripts/orient.sh");
+  assert.equal(codexLeft.hooks["PostToolUse"], undefined);
+  assert.equal(codexLeft.hooks["UserPromptSubmit"], undefined);
 
   // The client's own file keeps the server that is not ours, and the header
   // went with the entry it was on.
