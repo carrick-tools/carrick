@@ -228,8 +228,14 @@ pub(crate) fn text_is_bare_top_type(text: &str) -> bool {
 /// no contract, as opposed to failing to see one. `no_success_payload`: every
 /// response the route's handler sends is an error or a redirect (carrick#1161).
 /// `no_request_body`: the located request read is a validated non-body part
-/// (carrick#1166).
-const DECIDED_ABSTAIN_REASONS: &[&str] = &["no_success_payload", "no_request_body"];
+/// (carrick#1166). `projected_value_only`: every read of the call's result
+/// takes a member out of it, so the site states a part of a payload and not a
+/// payload (carrick#1375).
+const DECIDED_ABSTAIN_REASONS: &[&str] = &[
+    "no_success_payload",
+    "no_request_body",
+    "projected_value_only",
+];
 
 /// True when an inference answered a bare top type because the inferrer read
 /// the use site and decided nothing there is a contract.
@@ -1786,6 +1792,48 @@ mod tests {
             "a blind inference without a decision keeps its infer anchor, got {:?}",
             anchors[1]
         );
+    }
+
+    /// carrick#1375: one operation is one alias, and a consumer's call sites
+    /// for it are several inferences. A site the inferrer decided states no
+    /// contract (a hook reading members off a query result) must not speak for
+    /// the alias while a sibling site (the fetcher, which parses the declared
+    /// envelope) answered it — the decision keeps a raw locator re-run away,
+    /// it does not outrank a payload another site stated. Order matters: the
+    /// abstain is listed first, as the file-order request that produced the
+    /// live false mismatch was.
+    #[test]
+    fn derive_anchors_prefer_a_sighted_sibling_over_a_decided_abstain() {
+        let mut abstained = inferred("Endpoint_prefs_Response", "unknown", None, None);
+        abstained.any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "projected_value_only".to_string(),
+            detail: None,
+        }];
+        let sighted = inferred(
+            "Endpoint_prefs_Response",
+            "{ flags: { [key: string]: boolean; }; version: string; }",
+            Some("PreferenceEnvelope"),
+            None,
+        );
+        let infer = vec![response_body_infer("Endpoint_prefs_Response")];
+
+        let anchors = derive_capture_anchors(&[], &infer, &[], &[abstained, sighted], &[], "/repo");
+
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        match &anchors[0] {
+            CaptureAnchor::Literal {
+                alias, type_text, ..
+            } => {
+                assert_eq!(alias, "Endpoint_prefs_Response");
+                assert_eq!(
+                    type_text, "{ flags: { [key: string]: boolean; }; version: string; }",
+                    "the site that stated a payload owns the alias"
+                );
+            }
+            other => panic!("a sighted sibling must carry the alias, got {other:?}"),
+        }
     }
 
     /// `unknown` is the scrubbers' failed-inference placeholder and means the
