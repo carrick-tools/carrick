@@ -2678,6 +2678,11 @@ async fn analyze_current_repo_incremental(
             let normalizer = UrlNormalizer::new(config);
             let service_root = service_scan_root(repo_path, config);
             crate::phase_timing::mark(crate::phase_timing::Phase::Cache);
+            // One index for this service, built before the analysis and shared
+            // with the type requests below (carrick#1416): the join passes that
+            // run after the model resolve a call's specifier with the same
+            // resolver the sidecar's requests do.
+            let service_modules = service_module_index(repo_path, config);
             // Analysis runs over EVERY discovered file, cached or not: the
             // deterministic layer is re-derived from the AST on every scan and
             // only the model's answer is replayed. That is what lets a resolver
@@ -2697,6 +2702,7 @@ async fn analyze_current_repo_incremental(
                     &graphql_producer_hints,
                     &graphql_consumer_hints,
                     &normalizer,
+                    &service_modules,
                     sidecar,
                 )
                 .await?;
@@ -2825,10 +2831,9 @@ async fn analyze_current_repo_incremental(
             // Every type request below names the file a type was imported
             // from, and the specifier it was imported by is the repo's to
             // resolve: one index reads the config that governs each file
-            // (carrick#1416), built once for this service and shared by the
-            // request builders and the anchor stamp.
-            let service_modules = service_module_index(repo_path, config);
-
+            // (carrick#1416). It is the one built before the analysis above,
+            // so the join passes and the request builders resolve alike.
+            //
             // Build type manifest
             let mut manifest_entries = build_type_manifest_entries(&mount_graph, config, repo_path);
             stamp_manifest_anchor_symbols(
@@ -6264,6 +6269,9 @@ async fn analyze_current_repo(
     // 4. Run the complete multi-agent analysis
     let normalizer = UrlNormalizer::new(config);
     let service_root = service_scan_root(repo_path, config);
+    // One index for this service's join passes and, below, its type requests
+    // and anchor stamps (carrick#1416).
+    let service_modules = service_module_index(repo_path, config);
     enter_stage(crate::scan_stage::Stage::FileAnalysis)?;
     let analysis_result = orchestrator
         .run_complete_analysis(
@@ -6275,6 +6283,7 @@ async fn analyze_current_repo(
             &graphql_producer_hints,
             &graphql_consumer_hints,
             &normalizer,
+            &service_modules,
             sidecar,
         )
         .await?;
@@ -6357,11 +6366,9 @@ async fn analyze_current_repo(
     attach_sdk_surface(&mut cloud_data, repo_path, config);
     crate::phase_timing::mark(crate::phase_timing::Phase::Surface);
 
-    // One index for this service's type requests and anchor stamps: the
-    // specifier a type was imported by is the repo's config to resolve
-    // (carrick#1416).
-    let service_modules = service_module_index(repo_path, config);
-
+    // The type requests and anchor stamps below read the same index the
+    // analysis above was given: the specifier a type was imported by is the
+    // repo's config to resolve (carrick#1416).
     let mut manifest_entries =
         build_type_manifest_entries(&analysis_result.mount_graph, config, repo_path);
     stamp_manifest_anchor_symbols(

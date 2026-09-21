@@ -223,6 +223,7 @@ async fn deterministic_rows(installed: bool, source: &str) -> Option<Rows> {
             &Default::default(),
             &Default::default(),
             &carrick::url_normalizer::UrlNormalizer::default_permissive(),
+            &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(&root, None),
             Some(&sidecar),
         )
         .await

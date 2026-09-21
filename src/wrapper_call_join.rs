@@ -150,7 +150,13 @@ pub fn join_wrapper_calls(
             let Some(import) = imports.get(&site.root) else {
                 continue; // declared here, or a name this file never imported
             };
-            let Some(module) = resolve_module(workspace, file, &import.specifier) else {
+            // Canonical, because every file's rows are keyed that way and the
+            // resolver's ALIAS branch answers with the path as joined: on a
+            // checkout reached through a link, `/var/…` and `/private/var/…`
+            // are one file and only one of them matches a row.
+            let Some(module) = resolve_module(workspace, file, &import.specifier)
+                .map(|module| module.canonicalize().unwrap_or(module))
+            else {
                 continue;
             };
             // The module that DECLARES the binding, which is the module whose
@@ -421,6 +427,16 @@ export function useShelves() {
     fn join(
         files: Vec<(String, Vec<DataCallResult>)>,
     ) -> (HashMap<String, FileAnalysisResult>, WrapperCallJoins) {
+        join_with(files, None)
+    }
+
+    /// The same, with the module index a scan hands the pass. `None` follows
+    /// relative specifiers only, which is what a repo's declared aliases are
+    /// tested against.
+    fn join_with(
+        files: Vec<(String, Vec<DataCallResult>)>,
+        workspace: Option<&WorkspaceIndex>,
+    ) -> (HashMap<String, FileAnalysisResult>, WrapperCallJoins) {
         let mut results: HashMap<String, FileAnalysisResult> = files
             .into_iter()
             .map(|(path, data_calls)| {
@@ -433,12 +449,77 @@ export function useShelves() {
                 )
             })
             .collect();
-        let joins = join_wrapper_calls(&mut results, &UrlNormalizer::default_permissive(), None);
+        let joins = join_wrapper_calls(
+            &mut results,
+            &UrlNormalizer::default_permissive(),
+            workspace,
+        );
         (results, joins)
     }
 
     fn link(results: &HashMap<String, FileAnalysisResult>, file: &str) -> Option<String> {
         results[file].data_calls[0].reaches_request.clone()
+    }
+
+    /// A client imported by an alias the repo declares, which is how a repo
+    /// that declares one writes every import. The index the scan hands this
+    /// pass is what reaches the module; without it the specifier resolves to
+    /// nothing and the row is left alone.
+    #[test]
+    fn a_client_imported_through_a_declared_alias_is_reached() {
+        for (config, contents) in [
+            (
+                "tsconfig.json",
+                "{\n  \"compilerOptions\": {\n    \"baseUrl\": \".\",\n    \"paths\": { \"@/*\": [\"src/*\"] }\n  }\n}\n",
+            ),
+            (
+                "deno.jsonc",
+                "{\n  // the import map a Deno repo declares\n  \"imports\": { \"@/\": \"./src/\" }\n}\n",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            write(root, config, contents);
+            let client = write(root, "src/lib/shelves.ts", CLIENT);
+            let source = CONSUMER.replace("../lib/shelves", "@/lib/shelves");
+            let consumer = write(root, "src/hooks/useShelves.ts", &source);
+
+            let rows = || {
+                vec![
+                    (
+                        client.clone(),
+                        vec![request_row(
+                            CLIENT,
+                            "fetch(\"/v1/shelves\")",
+                            "GET",
+                            "/v1/shelves",
+                        )],
+                    ),
+                    (
+                        consumer.clone(),
+                        vec![row(&source, "shelvesApi.list()", "GET", "/v1/shelves")],
+                    ),
+                ]
+            };
+
+            let workspace = WorkspaceIndex::build_with_aliases(root, None);
+            let (linked, joins) = join_with(rows(), Some(&workspace));
+            assert_eq!(
+                link(&linked, &consumer),
+                Some(format!("{client}:3")),
+                "{config}: the alias the repo declares reaches the declaring module"
+            );
+            assert_eq!(joins.linked, 1, "{config}");
+
+            let (relative_only, joins) = join_with(rows(), None);
+            assert_eq!(
+                link(&relative_only, &consumer),
+                None,
+                "{config}: without the repo's own resolver the specifier reaches nothing, \
+                 and the pass says nothing rather than guessing"
+            );
+            assert_eq!(joins, WrapperCallJoins::default(), "{config}");
+        }
     }
 
     /// The line below carries two calls, so it says nothing on its own — a row

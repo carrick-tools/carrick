@@ -946,6 +946,7 @@ app.post('/users', (req, res) => res.json({ created: true }));
             &Default::default(),
             &Default::default(),
             &carrick::url_normalizer::UrlNormalizer::default_permissive(),
+            &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(temp_dir.path(), None),
             None,
         )
         .await;
@@ -991,6 +992,7 @@ async fn test_file_orchestrator_handles_empty_files() {
             &Default::default(),
             &Default::default(),
             &carrick::url_normalizer::UrlNormalizer::default_permissive(),
+            &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(temp_dir.path(), None),
             None,
         )
         .await;
@@ -1035,6 +1037,10 @@ async fn test_file_orchestrator_handles_missing_files() {
             &Default::default(),
             &Default::default(),
             &carrick::url_normalizer::UrlNormalizer::default_permissive(),
+            &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(
+                empty_root.path(),
+                None,
+            ),
             None,
         )
         .await;

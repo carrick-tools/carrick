@@ -1040,6 +1040,15 @@ impl FileOrchestrator {
         graphql_producer_hints: &crate::graphql::GraphqlProducerHints,
         graphql_consumer_hints: &crate::graphql::GraphqlConsumerHints,
         normalizer: &UrlNormalizer,
+        // The one module resolver for THIS service (`engine::service_module_index`,
+        // carrick#1416): every alias the repo's config files declare — tsconfig
+        // `paths`, a Deno import map, package `imports` — plus the tsconfig
+        // `carrick.json` names for this service, which governs the files under
+        // its directory in place of the nearest config. Read by the passes that
+        // run AFTER the model and resolve a specifier to a module
+        // (carrick#1403, carrick#1384); the analyzer-input path still resolves
+        // relatively until carrick#474.
+        service_modules: &WorkspaceIndex,
         // The warm type sidecar for THIS service, when one is up. Read once,
         // before the model pass, to answer what the receiver of a bare
         // `x.verb("/lit", arg)` site is (carrick#695). `None` — no sidecar, a
@@ -2896,10 +2905,16 @@ impl FileOrchestrator {
         // Runs after 5d for the same reason 5d runs late — it reads the rows'
         // final targets — and after it, so a row the fold dropped is not
         // linked to.
+        //
+        // Resolves through the service's own index (carrick#1416), not the
+        // repo-root one built above: a client imported by an alias this
+        // service's tsconfig declares has to reach its module, and on a repo
+        // whose specifiers are all aliased the relative-only resolver reaches
+        // nothing at all.
         let wrapper_call_joins = crate::wrapper_call_join::join_wrapper_calls(
             &mut file_results,
             normalizer,
-            Some(&alias_workspace),
+            Some(service_modules),
         );
         stats.wrapper_call_joins = wrapper_call_joins;
         if wrapper_call_joins != crate::wrapper_call_join::WrapperCallJoins::default() {
