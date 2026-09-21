@@ -1437,12 +1437,12 @@ export class TypeInferrer {
     }
 
     // carrick#1375: the source never read this call's result whole — every
-    // read took a member out of it. What the site states is a part of a
-    // payload, so it states no wire contract, and both answers available here
-    // are wrong: the projection is a fragment, and the value it was projected
-    // out of is the machinery the source is unwrapping by hand. A wrapper
-    // rule that DID unwrap the envelope, or a type the source itself states,
-    // is a contract and keeps its answer.
+    // read took a member out of it, and one of those members is the generic
+    // this result was instantiated with. That is a source unwrapping an
+    // envelope by hand, so both answers available here are wrong: the
+    // projection is a fragment of the payload, and the envelope around it is
+    // machinery. A wrapper rule that DID unwrap the envelope, or a type the
+    // source itself states, is a contract and keeps its answer.
     //
     // A single explicit call generic (`client.get<Order[]>(url)`) is the
     // caller's own payload claim and states the contract as plainly as an
