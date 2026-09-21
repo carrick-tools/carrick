@@ -1032,6 +1032,21 @@ pub fn interrupted(signal: &str) {
     super::scan_state::interrupted(signal);
 }
 
+/// Pass a signal on to the scan this build is waiting on (carrick#1379).
+///
+/// Here for the same reason [`interrupted`] is: `main` races the build against
+/// the signal, and this is the build's side of what the race then has to do.
+/// See [`super::index::forward_to_running_scan`] for which signals travel and
+/// why only those.
+pub fn forward_to_running_scan(signal: crate::shutdown::Shutdown) -> bool {
+    super::index::forward_to_running_scan(signal)
+}
+
+/// How long the build waits for a scan it has just signalled.
+pub fn forwarded_exit_grace() -> std::time::Duration {
+    super::index::forwarded_exit_grace()
+}
+
 /// Where a build acts, before anything is loaded from it.
 ///
 /// Build detection starts where the user asked. A parent's existing index is

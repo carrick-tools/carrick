@@ -189,3 +189,157 @@ fn a_run_whose_output_nobody_reads_still_finishes() {
         "the run panicked on a print: {said}"
     );
 }
+
+/// A SIGTERM to a BUILD reaches the scan it is waiting on (carrick#1379).
+///
+/// A terminal sends Ctrl-C to the whole foreground process group, so both
+/// processes hear it and the two agree. `kill <build pid>` does not: before
+/// the forward, only the build heard it, wrote `interrupted by SIGTERM` into
+/// its scan record and exited, while the scan it was waiting on carried on
+/// writing an index — and a second `carrick index` in that window was refused
+/// by a slot whose run the user had been told had stopped.
+///
+/// The scan here is held on the sidecar readiness budget, set far past this
+/// test's deadline, so the child cannot end on its own inside the test: what
+/// ends it is the forwarded signal or nothing.
+#[test]
+fn a_signal_to_a_build_reaches_the_scan_it_is_waiting_on() {
+    let home = tempfile::tempdir().expect("a home for the run");
+    let sidecar = home.path().join("sidecar/dist/src");
+    std::fs::create_dir_all(&sidecar).expect("a directory for the sidecar");
+    std::fs::write(
+        sidecar.join("index.js"),
+        "process.stdin.resume();\nsetInterval(() => {}, 60000);\n",
+    )
+    .expect("write the sidecar that never answers");
+
+    let workspace = tempfile::tempdir().expect("a workspace for the build");
+    let repo = workspace.path().join("api");
+    copy_tree(&repo_root().join("examples/express-single"), &repo);
+    git(&repo, &["init", "-q", "."]);
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.email=fixture@carrick.test",
+            "-c",
+            "user.name=fixture",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    );
+    std::fs::write(
+        workspace.path().join("carrick-workspace.json"),
+        "{ \"repos\": [\"./api\"] }\n",
+    )
+    .expect("write the workspace file");
+
+    let mut build = Command::new(env!("CARGO_BIN_EXE_carrick"))
+        .args(["refresh", "--workspace", "."])
+        .current_dir(workspace.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", workspace.path().join(".credentials"))
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_ALLOW_MISSING_TYPES", "1")
+        .env("CARRICK_SIDECAR_DIR", home.path().join("sidecar"))
+        .env("CARRICK_SIDECAR_READY_TIMEOUT_SECS", "600")
+        .env_remove("CARRICK_TOKEN")
+        .env_remove("CARRICK_RUN_ID")
+        .env_remove("CARRICK_RUN_PHASE")
+        .env_remove("GITHUB_REPOSITORY")
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("CI")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start a build");
+
+    let scan = first_child_of(build.id(), DEADLINE);
+    send(&build, libc::SIGTERM);
+
+    let code = code_within(&mut build, DEADLINE, "the build never ended");
+    assert_eq!(code, TERMINATED);
+
+    // The point of the ticket. Without the forward this child serves the whole
+    // readiness budget, which is set past this deadline on purpose.
+    let start = Instant::now();
+    while alive(scan) {
+        if start.elapsed() > DEADLINE {
+            // SAFETY: a descendant this test started, left running by a
+            // failure it is about to report.
+            unsafe { libc::kill(scan, libc::SIGKILL) };
+            panic!(
+                "the scan the build was waiting on was still running {:.0}s after the build was \
+                 signalled",
+                start.elapsed().as_secs_f64()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whether `pid` still names a process. `kill(pid, 0)` answers exactly that
+/// and sends nothing.
+fn alive(pid: libc::pid_t) -> bool {
+    // SAFETY: signal zero performs no delivery; it is the existence check.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// The first child `parent` spawns, waited for rather than assumed.
+///
+/// A build's phases start one subprocess at a time, and which moment the first
+/// one appears in is the machine's to decide — so this waits for it instead of
+/// sleeping for a guess.
+fn first_child_of(parent: u32, deadline: Duration) -> libc::pid_t {
+    let start = Instant::now();
+    loop {
+        let listed = Command::new("pgrep")
+            .args(["-P", &parent.to_string()])
+            .output()
+            .expect("pgrep is what lists a process's children on both platforms this runs on");
+        let first = String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .find_map(|line| line.trim().parse::<libc::pid_t>().ok());
+        if let Some(pid) = first {
+            return pid;
+        }
+        assert!(
+            start.elapsed() <= deadline,
+            "the build started no scan in {:.0}s",
+            start.elapsed().as_secs_f64()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A copy of one fixture tree, without the build artefacts a checkout carries.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create the copy's directory");
+    for entry in std::fs::read_dir(from).expect("read the fixture") {
+        let entry = entry.expect("a fixture entry");
+        let name = entry.file_name();
+        if name == "node_modules" || name == ".git" {
+            continue;
+        }
+        let target = to.join(&name);
+        if entry.file_type().expect("a file type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy a fixture file");
+        }
+    }
+}
+
+fn git(repo: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?} failed");
+}

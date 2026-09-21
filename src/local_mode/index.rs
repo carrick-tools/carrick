@@ -688,6 +688,9 @@ fn run_scan(
     let mut child = command
         .spawn()
         .map_err(|e| format!("could not start the {what}: {e}"))?;
+    // From here until the wait below, this is the child a signal to the build
+    // has to reach (carrick#1379).
+    RUNNING_SCAN.store(child.id() as i32, std::sync::atomic::Ordering::Relaxed);
     let stderr = child
         .stderr
         .take()
@@ -827,9 +830,12 @@ fn run_scan(
         tail.push_back(line);
     }
     let _ = reader.join();
-    let status = child
-        .wait()
-        .map_err(|e| format!("could not wait for the {what}: {e}"))?;
+    let waited = child.wait();
+    // Cleared before anything can leave this function: a signal arriving
+    // between phases has no child to reach, and a pid the system has already
+    // reused is not one to send anything to.
+    RUNNING_SCAN.store(0, std::sync::atomic::Ordering::Relaxed);
+    let status = waited.map_err(|e| format!("could not wait for the {what}: {e}"))?;
     if status.success() {
         if pending.is_empty() {
             crate::logging::finish_spinner(&bar, &reporting.done);
@@ -893,6 +899,78 @@ fn bar_message(
 /// Shorter than the log's own pulse, so the pulse decides how often a line is
 /// written and this only decides how often it is offered one.
 const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The scan subprocess this build is waiting on, or zero (carrick#1379).
+///
+/// A build runs its phases one at a time — every repo's scan and then the
+/// join, all through [`run_scan`] — so there is exactly one such child at any
+/// moment, and exactly one answer to keep. Process-global for the reason
+/// [`crate::shutdown`]'s own flag is: the code that has to read it sits in
+/// `main`, on the other side of the `spawn_blocking` the build runs on, and
+/// one process is one build.
+static RUNNING_SCAN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Send `signal` to the scan this build is waiting on, and say whether there
+/// was one (carrick#1379).
+///
+/// A terminal sends Ctrl-C to the whole foreground process group, so both this
+/// process and its scan hear it and each reports itself. `kill <build pid>`
+/// does not: only this process hears it, writes `interrupted by SIGTERM` into
+/// its scan record and exits, while the scan it was waiting on carries on
+/// running. Nothing is stranded — the child opened its own scan and closes it
+/// the normal way — but for as long as it runs the two disagree, and a second
+/// `carrick index` in that window is refused by a slot whose run the user was
+/// told had stopped.
+///
+/// **Only SIGTERM is forwarded**, and that is a decision about what the kernel
+/// has already done rather than about what the signals mean. SIGINT and SIGHUP
+/// are both delivered to the whole foreground process group — Ctrl-C by the
+/// line discipline, a hangup by the kernel when the controlling terminal goes
+/// — so the child has them already, and a second one arriving while it makes
+/// its own bounded report is read as "go now" and abandons that report
+/// (carrick#1235). SIGTERM is the one signal a terminal never delivers to the
+/// group, so forwarding it can never be a duplicate. The cost of the
+/// exclusion is an explicit `kill -HUP <build pid>`, which leaves today's
+/// behaviour.
+pub(crate) fn forward_to_running_scan(signal: crate::shutdown::Shutdown) -> bool {
+    if !travels(signal) {
+        return false;
+    }
+    let pid = RUNNING_SCAN.load(std::sync::atomic::Ordering::Relaxed);
+    if pid <= 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        // A pid that has already exited is an error this does not act on: the
+        // build is on its way out either way, and the only thing the answer
+        // decides is whether to wait for a child that is already gone.
+        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+            return false;
+        }
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Whether a signal the build was sent has to be passed on, or the child has
+/// it already. See [`forward_to_running_scan`] for the reasoning.
+fn travels(signal: crate::shutdown::Shutdown) -> bool {
+    matches!(signal, crate::shutdown::Shutdown::Terminate)
+}
+
+/// How long the build waits for a scan it has just signalled.
+///
+/// At least the child's own report budget, because the forward is what ASKS
+/// for that report and a shorter wait would take back the thing it just asked
+/// for. The margin on top is for the child's exit itself: the report is the
+/// long half, and what follows it is dropping a sidecar and closing a file.
+pub(crate) fn forwarded_exit_grace() -> std::time::Duration {
+    crate::shutdown::INTERRUPTION_REPORT_BUDGET + std::time::Duration::from_secs(2)
+}
 
 /// How many lines of a failed child's stderr are kept from each end.
 const KEPT_LINES: usize = 12;
@@ -1494,6 +1572,35 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// carrick#1379: only SIGTERM is passed on, and the reason is what the
+    /// kernel has already done rather than what the signals mean.
+    ///
+    /// SIGINT and SIGHUP reach the whole foreground process group, so the
+    /// child has them already and a second one arriving while it makes its
+    /// bounded report is read as "go now" and abandons that report.
+    ///
+    /// Asserted on the predicate rather than on [`forward_to_running_scan`],
+    /// which reads [`RUNNING_SCAN`]: every other test in this binary that
+    /// runs a subprocess writes that global, so a test that reached the kill
+    /// could signal another test's child. What a forward does to a real one
+    /// is proven at the built binary, in `tests/interrupted_scan_test.rs`.
+    #[test]
+    fn only_a_signal_a_terminal_never_sends_to_the_group_is_forwarded() {
+        assert!(travels(crate::shutdown::Shutdown::Terminate));
+        assert!(!travels(crate::shutdown::Shutdown::Interrupt));
+        assert!(!travels(crate::shutdown::Shutdown::Hangup));
+    }
+
+    /// The build's wait covers the report the forward just asked for.
+    ///
+    /// A grace shorter than [`crate::shutdown::INTERRUPTION_REPORT_BUDGET`]
+    /// would signal the scan and then leave before it could say it had
+    /// stopped, which is the state this whole change exists to close.
+    #[test]
+    fn the_wait_for_a_signalled_scan_covers_its_own_report() {
+        assert!(forwarded_exit_grace() > crate::shutdown::INTERRUPTION_REPORT_BUDGET);
+    }
 
     /// What the phase-1 subprocess is asked to be, read off the command
     /// itself. The whole difference between a free pass and a paid one lives
