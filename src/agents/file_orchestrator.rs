@@ -3226,14 +3226,23 @@ impl FileOrchestrator {
                 // the whole handler declaration, which the response-body locators
                 // would misread as the payload — so request a `FunctionReturn`
                 // anchored on the handler line instead, which the sidecar resolves
-                // via `findFunctionByLine` and Promise-unwraps. Request-body
-                // inference is skipped: a Next.js request body isn't recoverable
-                // from the signature.
+                // via `findFunctionByLine` and Promise-unwraps.
+                //
+                // The request side is a body the handler READS, which no
+                // signature states and no line locates (a line-anchored
+                // request resolves through a registration call this route has
+                // none of). The only anchor is the payload expression a model
+                // that read the file located, folded onto this row at the join
+                // (carrick#1401); `push_infer` abstains when the row carries
+                // none, so a row with no anchor asks nothing and the manifest
+                // entry stays honestly unknown (carrick#1420).
                 if endpoint.owner_node == FILE_BASED_ROUTE_OWNER {
                     // Structurally derived endpoints never carry an
                     // emission_style today, but the no-payload gate must hold
-                    // here too if that ever changes — a no-payload claim means
-                    // the manifest stays honestly unknown, with no inference.
+                    // here too if that ever changes — a no-payload claim is
+                    // about what the handler SENDS, so the response entry
+                    // stays honestly unknown while the request side, which the
+                    // claim says nothing about, is asked for as usual.
                     if !no_payload {
                         // The Line locator is infallible, so no inline-alias
                         // fallback is needed here.
@@ -3243,6 +3252,18 @@ impl FileOrchestrator {
                             InferKind::FunctionReturn,
                             response_alias.clone(),
                             InferLocator::Line,
+                        );
+                    }
+                    if should_infer_request_body(&method) {
+                        let _ = push_infer(
+                            &file_path_absolute,
+                            line_number,
+                            InferKind::RequestBody,
+                            request_alias.clone(),
+                            InferLocator::Text {
+                                expression_text: endpoint.payload_expression_text.as_deref(),
+                                expression_line: endpoint.payload_expression_line,
+                            },
                         );
                     }
                     continue;
@@ -12054,8 +12075,8 @@ export * from "./aFetch.js";"#,
         let (_explicit, infer, _inline) =
             orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
 
-        // Exactly one inference: the response. No request-body inference for a
-        // file-based GET (and none even for POST — not recoverable from the sig).
+        // Exactly one inference: the response. A GET asks no request-body
+        // question at all, whatever it carries.
         assert_eq!(infer.len(), 1);
         let item = &infer[0];
         assert_eq!(item.infer_kind, InferKind::FunctionReturn);
@@ -12067,6 +12088,143 @@ export * from "./aFetch.js";"#,
         assert!(item.expression_text.is_none());
         let alias = item.alias.as_deref().unwrap_or_default();
         assert!(alias.contains("Response"), "alias was {alias}");
+    }
+
+    /// A file-based route row in the shape the file-layout pass emits: the
+    /// sentinel owner, the export's own line, the whole declaration as the
+    /// span, and whatever payload anchor the model's reading of the file
+    /// carried onto it (carrick#1401).
+    fn file_route_endpoint(
+        method: &str,
+        line_number: i32,
+        payload: Option<(&str, i32)>,
+    ) -> EndpointResult {
+        EndpointResult {
+            handler_declaration_line: None,
+            registration_literal: None,
+            view_module: false,
+            candidate_id: format!("file-route:{}:{}", method, line_number),
+            line_number,
+            owner_node: FILE_BASED_ROUTE_OWNER.to_string(),
+            method: method.to_string(),
+            path: "/tokens".to_string(),
+            handler_name: method.to_string(),
+            pattern_matched: "file-route".to_string(),
+            call_expression_span_start: Some(42),
+            call_expression_span_end: Some(300),
+            payload_expression_text: payload.map(|(text, _)| text.to_string()),
+            payload_expression_line: payload.map(|(_, line)| line),
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            resolution_source: None,
+            dispatch: None,
+        }
+    }
+
+    fn collect_file_route_requests(endpoints: Vec<EndpointResult>) -> Vec<InferRequestItem> {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "app/tokens/route.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints,
+                data_calls: vec![],
+                graphql_operations: vec![],
+                pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
+            },
+        );
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        let config = Config::default();
+        let (_explicit, infer, _inline) =
+            orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
+        infer
+    }
+
+    #[test]
+    fn test_collect_type_requests_file_based_route_asks_for_the_located_payload() {
+        // The request side of a file-based route is a body the handler reads,
+        // not a parameter this layer can name — but a row the #1401 fold
+        // reconciled carries the expression the model located, and that anchor
+        // resolves (carrick#1420). A body-carrying method must ask.
+        let infer = collect_file_route_requests(vec![file_route_endpoint(
+            "POST",
+            7,
+            Some(("(await request.json()) as TokenRequest", 21)),
+        )]);
+
+        let requests: Vec<&InferRequestItem> = infer
+            .iter()
+            .filter(|item| item.infer_kind == InferKind::RequestBody)
+            .collect();
+        assert_eq!(requests.len(), 1, "one request question, got {infer:?}");
+        let item = requests[0];
+        // The row's own line addresses the operation; the model's line
+        // addresses the expression inside the handler.
+        assert_eq!(item.line_number, 7);
+        assert_eq!(
+            item.expression_text.as_deref(),
+            Some("(await request.json()) as TokenRequest")
+        );
+        assert_eq!(item.expression_line, Some(21));
+        // A text locator carries no span: a file-route span is the whole
+        // declaration, which resolves to the handler, never to the body.
+        assert!(item.span_start.is_none());
+        assert!(item.span_end.is_none());
+        let alias = item.alias.as_deref().unwrap_or_default();
+        assert!(alias.contains("Request"), "alias was {alias}");
+        // The response question the branch already asked is untouched.
+        assert!(
+            infer
+                .iter()
+                .any(|item| item.infer_kind == InferKind::FunctionReturn)
+        );
+    }
+
+    #[test]
+    fn test_collect_type_requests_file_based_route_module_asks_per_method() {
+        // Two exports of one route module: both responses are asked for, and
+        // only the body-carrying method asks for a request.
+        let infer = collect_file_route_requests(vec![
+            file_route_endpoint("GET", 5, Some(("req.body", 6))),
+            file_route_endpoint("POST", 11, Some(("(await request.json()) as NewToken", 13))),
+        ]);
+
+        let returns = infer
+            .iter()
+            .filter(|item| item.infer_kind == InferKind::FunctionReturn)
+            .count();
+        let requests: Vec<&InferRequestItem> = infer
+            .iter()
+            .filter(|item| item.infer_kind == InferKind::RequestBody)
+            .collect();
+        assert_eq!(returns, 2, "one response per export, got {infer:?}");
+        assert_eq!(requests.len(), 1, "only POST has a body, got {infer:?}");
+        assert_eq!(requests[0].line_number, 11);
+        assert_eq!(infer.len(), 3);
+    }
+
+    #[test]
+    fn test_collect_type_requests_file_based_route_abstains_with_no_payload_anchor() {
+        // No model row for the file, or a fold that carried no payload: there
+        // is no anchor, so the request question is not asked at all rather
+        // than asked about the wrong node. The manifest entry stays honestly
+        // unknown.
+        let infer = collect_file_route_requests(vec![file_route_endpoint("POST", 7, None)]);
+
+        assert_eq!(infer.len(), 1, "response only, got {infer:?}");
+        assert_eq!(infer[0].infer_kind, InferKind::FunctionReturn);
     }
 
     /// A route emitted from a controller class, in the shape both controller
