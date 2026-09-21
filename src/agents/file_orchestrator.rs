@@ -209,6 +209,12 @@ pub struct ProcessingStats {
     /// Model rows that joined a deterministic row at their span and
     /// contributed only what determinism did not state.
     pub model_rows_joined: usize,
+    /// Model endpoint rows that named no site this file could have registered
+    /// a route at, and whose type anchors were folded onto the deterministic
+    /// row already stating that route instead of being dropped with the row
+    /// (carrick#1395). A route registered by the file's own location states no
+    /// call for the model to echo, so this is the normal path for one.
+    pub model_rows_reconciled: usize,
     /// Model methods, targets and paths discarded because the source states
     /// something else at the same span. Each one is logged with both values.
     pub model_contradictions_discarded: usize,
@@ -2744,6 +2750,10 @@ impl FileOrchestrator {
             debug!("  - Deterministic rows ({source:?}): {count}");
         }
         debug!("  - Model rows joined: {}", stats.model_rows_joined);
+        debug!(
+            "  - Model rows folded onto the route a deterministic source states: {}",
+            stats.model_rows_reconciled
+        );
         debug!(
             "  - Model statements discarded as contradictions: {}",
             stats.model_contradictions_discarded
@@ -6170,21 +6180,79 @@ impl FileOrchestrator {
 
         // --- the producer side -------------------------------------------
         //
-        // An endpoint whose `candidate_id` joins nothing is dropped: without a
-        // candidate behind it there is no evidence the registration exists.
+        // An endpoint whose `candidate_id` names no site this file could have
+        // registered a route at has no anchor of its own. Where a deterministic
+        // row already states that route, the model's reading of it is folded
+        // onto that row; where nothing states it, there is no evidence the
+        // registration exists and the row is dropped (carrick#1395).
         let mut dropped: Vec<String> = Vec::new();
+        // Deterministic rows a model row with no site of its own has already
+        // been folded onto, by the row's `candidate_id`. Keyed on the id rather
+        // than the index because the twin fold below REMOVES rows from the
+        // deterministic region, which shifts every index after it.
+        let mut reconciled: HashSet<String> = HashSet::new();
         // The rows the emit phase produced, which are the only ones a model
         // row can be the twin OF: every row this loop pushes is appended after
         // them, and a second model row for one route must not fold into the
         // first one's joined row (that would drop a row rather than label it).
         let mut deterministic_rows = result.endpoints.len();
         for mut endpoint in endpoints {
-            let Some(candidate) = candidate_map.get(&endpoint.candidate_id) else {
-                dropped.push(format!(
-                    "{} {} (candidate_id '{}')",
-                    endpoint.method, endpoint.path, endpoint.candidate_id
-                ));
-                continue;
+            // The id the model echoed, and whether the site it names could be
+            // the one this route is registered at. A route registration is a
+            // call that states a path or a method, or — for a route whose
+            // registration states neither, which is every file-based one — the
+            // site the model itself answered at. Any OTHER listed site is a
+            // call the handler MAKES, and anchoring a route to one moves the
+            // row off its registration (carrick#1395).
+            let listed = candidate_map.get(&endpoint.candidate_id);
+            let site = listed.filter(|candidate| {
+                Self::candidate_can_register_a_route(candidate, endpoint.line_number)
+            });
+            let candidate = match site {
+                Some(candidate) => candidate,
+                None => {
+                    // (a) The route may already be stated deterministically —
+                    // by the file layout, by route data, by a decorator. That
+                    // row is the registration; the model's row is a reading of
+                    // the same route that carries the type anchors the
+                    // deterministic layer cannot state. Fold the anchors onto
+                    // it rather than dropping them, and never emit a second
+                    // row for one route.
+                    if let Some(index) = Self::route_stated_deterministically(
+                        &result.endpoints[..deterministic_rows],
+                        &endpoint,
+                        route_module_claimed,
+                        &reconciled,
+                    ) {
+                        let twin = &mut result.endpoints[index];
+                        debug!(
+                            "Folding the model's reading of {} {} in {} onto the row {:?} states for it: \
+                             the id it echoed ('{}') names no site this route could be registered at",
+                            endpoint.method,
+                            endpoint.path,
+                            file_path,
+                            twin.resolution_source,
+                            endpoint.candidate_id
+                        );
+                        reconciled.insert(twin.candidate_id.clone());
+                        Self::carry_type_anchors(twin, &endpoint);
+                        stats.model_rows_reconciled += 1;
+                        continue;
+                    }
+                    match listed {
+                        // Nothing states this route, so the site the model
+                        // named is the only anchor there is. Wrong as it may
+                        // be, it is better than no row at all.
+                        Some(candidate) => candidate,
+                        None => {
+                            dropped.push(format!(
+                                "{} {} (candidate_id '{}')",
+                                endpoint.method, endpoint.path, endpoint.candidate_id
+                            ));
+                            continue;
+                        }
+                    }
+                }
             };
             endpoint.line_number = candidate.line_number as i32;
             endpoint.call_expression_span_start = Some(candidate.span_start);
@@ -6354,6 +6422,13 @@ impl FileOrchestrator {
                     endpoint.view_module = result.endpoints[index].view_module;
                     endpoint.handler_declaration_line =
                         result.endpoints[index].handler_declaration_line;
+                    // Anchors an earlier model row with no site of its own
+                    // already folded onto this twin are this route's, and the
+                    // row pushed here is the one that reaches the index — so
+                    // they travel with it. A deterministic row states none of
+                    // its own, so nothing else can arrive this way.
+                    let twin = result.endpoints[index].clone();
+                    Self::carry_type_anchors(&mut endpoint, &twin);
                     result.endpoints.remove(index);
                     deterministic_rows -= 1;
                     stats.model_rows_joined += 1;
@@ -6712,6 +6787,124 @@ impl FileOrchestrator {
             return RegistrationLiteral::ExtendsWithPrefix(canonical_literal);
         }
         RegistrationLiteral::Contradicts(canonical_literal)
+    }
+
+    /// Could this candidate be the site the model's endpoint row is registered
+    /// at (carrick#1395)?
+    ///
+    /// One candidate map holds every call a file makes AND every call that
+    /// registers a route, and the join has always trusted the id the model
+    /// echoed. On a route whose registration is not a call at all — a route
+    /// stated by the file's own location, by route data, by a decorator — the
+    /// map offers no site at the registration, so a model asked for an id
+    /// reaches for the nearest listed one, which is a call the handler makes
+    /// (a body read, a response send). Joining that moves the route off its
+    /// registration and onto a line inside its own handler.
+    ///
+    /// Two structural readings say a site could be the registration, and
+    /// neither names a framework:
+    ///
+    /// - the site STATES a route path — a literal that could be served on this
+    ///   origin ([`is_producer_route_path`]), written as its first argument or
+    ///   as the `url` of a request spec. Only a registration does that;
+    /// - the model answered AT the site: the line it reported for the row lies
+    ///   inside the site's own lines. A handler's response send carries no path
+    ///   at all, and a route registered at one is exactly the shape
+    ///   carrick#1007 folds, so the containment reading is what keeps it.
+    ///
+    /// A verb-spelled member name is NOT a third reading. `searchParams.get`,
+    /// `form.get` and `headers.get` are members of request data, not routers,
+    /// and they are the commonest listed sites inside a handler — reading the
+    /// verb as a registration would let exactly the borrowed id this guard is
+    /// for straight back through. Nothing is lost by leaving it out: a
+    /// registration written as a call spans its own handler, so the containment
+    /// reading already covers every one the model answers at, and a row this
+    /// returns false for is still joined to the site it named when no
+    /// deterministic row states its route.
+    ///
+    /// A row whose line the model did not state cannot be placed either way,
+    /// and is left to join as it always did.
+    fn candidate_can_register_a_route(candidate: &CandidateTarget, model_line: i32) -> bool {
+        let states_a_route_path =
+            Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
+                .is_some_and(|literal| is_producer_route_path(&literal))
+                || candidate
+                    .request_spec
+                    .as_ref()
+                    .is_some_and(|spec| is_producer_route_path(&spec.url));
+        if states_a_route_path {
+            return true;
+        }
+        if model_line <= 0 {
+            return true;
+        }
+        let model_line = model_line as usize;
+        candidate.line_number <= model_line && model_line <= candidate.end_line
+    }
+
+    /// The deterministic row that already states the route this model row
+    /// describes, if there is one (carrick#1395).
+    ///
+    /// The method always has to agree. The path has to agree as well UNLESS a
+    /// routing convention states this module's whole route set: there the
+    /// derived rows ARE the routes, so a model row that matched none of their
+    /// paths still describes one of them (it named the route after its handler,
+    /// or copied a prefix), and the method is what separates them. In any other
+    /// module two unrelated routes can share a method, so the path is the only
+    /// thing that says these two rows are one route.
+    ///
+    /// A row already folded onto is not offered again: a second model row for
+    /// one route is a restatement, not a second source of anchors.
+    fn route_stated_deterministically(
+        deterministic: &[EndpointResult],
+        endpoint: &EndpointResult,
+        route_module_claimed: bool,
+        reconciled: &HashSet<String>,
+    ) -> Option<usize> {
+        let canonical = Self::canonicalize_route_path(&endpoint.path);
+        let mut matches = deterministic.iter().enumerate().filter(|(_, existing)| {
+            existing.resolution_source != Some(ResolutionSource::Model)
+                && existing.method.eq_ignore_ascii_case(&endpoint.method)
+                && !reconciled.contains(&existing.candidate_id)
+                && (route_module_claimed
+                    || Self::canonicalize_route_path(&existing.path) == canonical)
+        });
+        let (index, _) = matches.next()?;
+        // Two rows this row could equally be: nothing says which, so it stays
+        // the model's own reading rather than being folded onto a guess.
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(index)
+    }
+
+    /// Fill every type anchor `into` leaves unstated from `from`, and nothing
+    /// else: the row being filled keeps its own identity (method, path,
+    /// handler, line, span, provenance) and every anchor it already states.
+    ///
+    /// A dispatch case is deliberately NOT an anchor. It is part of a row's
+    /// identity — [`Self::model_row_key`] separates two rows by it, and the
+    /// index keys an operation on it — so writing one onto a route that was
+    /// stated without it would narrow the route to a single case and take
+    /// every other case's consumers off it. A handler that dispatches on its
+    /// body states one row per case and only the first would ever be folded;
+    /// the route stays the general one it was derived as.
+    fn carry_type_anchors(into: &mut EndpointResult, from: &EndpointResult) {
+        if into.payload_expression_text.is_none() {
+            into.payload_expression_text = from.payload_expression_text.clone();
+            into.payload_expression_line = from.payload_expression_line;
+        }
+        if into.response_expression_text.is_none() {
+            into.response_expression_text = from.response_expression_text.clone();
+            into.response_expression_line = from.response_expression_line;
+        }
+        if into.emission_style.is_none() {
+            into.emission_style = from.emission_style;
+        }
+        if into.primary_type_symbol.is_none() {
+            into.primary_type_symbol = from.primary_type_symbol.clone();
+            into.type_import_source = from.type_import_source.clone();
+        }
     }
 
     /// Why a reported operation failed the candidate join, phrased so the two
@@ -13666,6 +13859,9 @@ export { routes };
         // only the file layout states, and it survives untouched.
         let mut reported = synthetic_endpoint("GET", "/users");
         reported.candidate_id = "c1".to_string();
+        // Reported AT that candidate, which `candidate_with_snippet` puts on
+        // line 12 (carrick#1395).
+        reported.line_number = 12;
         reported.handler_name = "GET".to_string();
         let model = FileAnalysisResult {
             endpoints: vec![reported],
@@ -13888,6 +14084,7 @@ export { routes };
             span_start: 100,
             span_end: 140,
             line_number: 12,
+            end_line: 12,
             callee_object: receiver.to_string(),
             callee_property: Some("get".to_string()),
             enclosing_function: None,
@@ -14186,6 +14383,7 @@ export { routes };
             span_start: 100,
             span_end: 140,
             line_number: 12,
+            end_line: 12,
             callee_object: "router".to_string(),
             callee_property: Some("get".to_string()),
             enclosing_function: None,
@@ -14498,9 +14696,15 @@ export { routes };
             .unwrap_or(0)
     }
 
+    /// A model row reported AT a candidate: it echoes that candidate's id and
+    /// states that candidate's line, which is what a row the model answered at
+    /// a site looks like. `candidate_with_snippet` puts every such site on line
+    /// 12 (carrick#1395 reads the line to tell a row answered at a site from
+    /// one that borrowed a neighbouring span).
     fn endpoint_with_candidate(path: &str, candidate_id: &str) -> EndpointResult {
         let mut ep = synthetic_endpoint("GET", path);
         ep.candidate_id = candidate_id.to_string();
+        ep.line_number = 12;
         ep
     }
 
@@ -17528,5 +17732,411 @@ export function run(evt: object, label: string, tail: string): void {
         assert!(!is_literal_http_origin("https://api.example.test/v1"));
         assert!(!is_literal_http_origin("https://api.example.test:port"));
         assert!(!is_literal_http_origin("https://"));
+    }
+
+    // --- carrick#1395: a route whose registration is not a call ------------
+    //
+    // A file-based route is stated by the file's own location, so the file
+    // raises no candidate at the registration and every candidate it DOES
+    // raise is a call the handler makes. The model, required to echo an id,
+    // either invents one (the row used to be dropped) or reaches for a listed
+    // body read (the row used to be re-anchored onto it).
+
+    /// One exported handler, a body read and a query read inside it, and a
+    /// typed response. The shape names no framework: the convention is passed
+    /// in. The query read is there because it is the listed site that LOOKS
+    /// most like a registration — a member call named for an HTTP verb.
+    const FILE_ROUTE_SOURCE: &str = r#"import type { Thing } from "./types";
+
+export async function POST(request: Request): Promise<Response> {
+  const body = await request.formData();
+  const id = new URL(request.url).searchParams.get("id");
+  const thing: Thing = { id: String(id ?? body) };
+  return Response.json(thing);
+}
+"#;
+
+    /// Two exported handlers in one module: the fixture that breaks what the
+    /// others share, since a method key alone has to pick one of two rows.
+    const TWO_METHOD_SOURCE: &str = r#"import type { Thing } from "./types";
+
+export async function GET(): Promise<Response> {
+  const thing: Thing = { id: "1" };
+  return Response.json(thing);
+}
+
+export async function POST(request: Request): Promise<Response> {
+  const body = await request.formData();
+  const thing: Thing = { id: String(body) };
+  return Response.json(thing);
+}
+"#;
+
+    /// Drive the real deriver and the real SWC gatekeeper over an inline
+    /// module, the way `analyze_files` does: the structural rows the file
+    /// layout states, the candidate map the prompt was offered, and whether
+    /// the convention claims the module's whole route set.
+    fn file_route_fixture(
+        source: &str,
+    ) -> (Vec<EndpointResult>, HashMap<String, CandidateTarget>, bool) {
+        let scanner = SwcScanner::new();
+        let rel = Path::new("app/things/route.ts");
+        let derivation = FileOrchestrator::file_based_endpoints(
+            &scanner,
+            rel,
+            rel,
+            source,
+            &[RoutingConvention::nextjs_app()],
+        );
+        let scan = scanner.scan_content(rel, source, &[], &[]);
+        let candidates = scan
+            .candidates
+            .into_iter()
+            .filter(|candidate| candidate.protocol == Protocol::Http)
+            .map(|candidate| (candidate.candidate_id.clone(), candidate))
+            .collect();
+        (derivation.endpoints, candidates, derivation.claimed)
+    }
+
+    /// The model's reading of the route: the anchors the deterministic layer
+    /// cannot state, hung on whatever id the model echoed.
+    fn model_route_row(candidate_id: &str, method: &str, line: i32) -> EndpointResult {
+        EndpointResult {
+            handler_declaration_line: None,
+            registration_literal: None,
+            view_module: false,
+            candidate_id: candidate_id.to_string(),
+            line_number: line,
+            owner_node: String::new(),
+            method: method.to_string(),
+            path: "/things".to_string(),
+            handler_name: "<anonymous>".to_string(),
+            pattern_matched: String::new(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: Some("thing".to_string()),
+            response_expression_line: Some(7),
+            emission_style: Some(EmissionStyle::ReturnValue),
+            primary_type_symbol: Some("Thing".to_string()),
+            type_import_source: Some("./types".to_string()),
+            resolution_source: None,
+            dispatch: None,
+        }
+    }
+
+    /// The id of the body read inside the handler — `request.formData()`: a
+    /// listed site with no path and no verb, which is what a model reaches for
+    /// when the registration itself is not a call.
+    fn body_read_id(candidates: &HashMap<String, CandidateTarget>) -> String {
+        candidates
+            .values()
+            .find(|candidate| candidate.callee_property.as_deref() == Some("formData"))
+            .expect("the body read is a candidate")
+            .candidate_id
+            .clone()
+    }
+
+    /// An id the Candidate Context never offered. The route reaches the index
+    /// as the structural row, and the model's anchors travel onto it instead
+    /// of being dropped with the row.
+    #[test]
+    fn model_route_row_with_an_unlisted_id_is_folded_onto_the_structural_row() {
+        let (route_endpoints, candidates, claimed) = file_route_fixture(FILE_ROUTE_SOURCE);
+        assert_eq!(route_endpoints.len(), 1, "one exported handler, one route");
+
+        let (result, stats) = emit_and_join_with(
+            FileAnalysisResult {
+                endpoints: vec![model_route_row("endpoint:route.ts:POST", "POST", 3)],
+                ..Default::default()
+            },
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &route_endpoints,
+            "app/things/route.ts",
+            claimed,
+        );
+
+        assert_eq!(result.endpoints.len(), 1, "one route, one row");
+        let row = &result.endpoints[0];
+        assert_eq!(row.method, "POST");
+        assert_eq!(row.path, "/things");
+        assert_eq!(
+            row.resolution_source,
+            Some(ResolutionSource::FileBasedRoute),
+            "the file layout states this route, not the model"
+        );
+        assert_eq!(row.line_number, 3, "anchored on the export, not moved");
+        assert_eq!(row.handler_name, "POST");
+        assert_eq!(row.primary_type_symbol.as_deref(), Some("Thing"));
+        assert_eq!(row.type_import_source.as_deref(), Some("./types"));
+        assert_eq!(row.response_expression_text.as_deref(), Some("thing"));
+        assert_eq!(row.response_expression_line, Some(7));
+        assert_eq!(row.emission_style, Some(EmissionStyle::ReturnValue));
+        assert_eq!(stats.model_rows_reconciled, 1);
+    }
+
+    /// The id of a real site the handler CALLS. It joins, so the row used to
+    /// survive re-anchored onto the body read — a line inside the handler,
+    /// which is not where the route is registered and not where the type layer
+    /// looks.
+    #[test]
+    fn model_route_row_may_not_anchor_on_a_call_the_handler_makes() {
+        let (route_endpoints, candidates, claimed) = file_route_fixture(FILE_ROUTE_SOURCE);
+        let body_read = body_read_id(&candidates);
+        let body_read_line = candidates[&body_read].line_number as i32;
+        assert_eq!(body_read_line, 4, "the body read is inside the handler");
+
+        let (result, stats) = emit_and_join_with(
+            FileAnalysisResult {
+                endpoints: vec![model_route_row(&body_read, "POST", 3)],
+                ..Default::default()
+            },
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &route_endpoints,
+            "app/things/route.ts",
+            claimed,
+        );
+
+        assert_eq!(result.endpoints.len(), 1, "one route, one row");
+        let row = &result.endpoints[0];
+        assert_eq!(
+            row.line_number, 3,
+            "the registration's line, not the body read's"
+        );
+        assert_eq!(
+            row.call_expression_span_start, route_endpoints[0].call_expression_span_start,
+            "the handler's own span, not the body read's"
+        );
+        assert_eq!(
+            row.resolution_source,
+            Some(ResolutionSource::FileBasedRoute)
+        );
+        assert_eq!(row.primary_type_symbol.as_deref(), Some("Thing"));
+        assert_eq!(stats.model_rows_reconciled, 1);
+    }
+
+    /// The control: a site the model ANSWERED AT still joins. A response send
+    /// carries no path and no verb, so only the line containment keeps it —
+    /// and it is the shape carrick#1007 folds onto one row.
+    #[test]
+    fn model_route_row_still_joins_the_site_it_was_reported_at() {
+        let (route_endpoints, candidates, claimed) = file_route_fixture(FILE_ROUTE_SOURCE);
+        let send = candidates
+            .values()
+            .find(|candidate| candidate.callee_property.as_deref() == Some("json"))
+            .expect("the response send is a candidate");
+        let (send_id, send_line) = (send.candidate_id.clone(), send.line_number as i32);
+
+        let (result, stats) = emit_and_join_with(
+            FileAnalysisResult {
+                endpoints: vec![model_route_row(&send_id, "POST", send_line)],
+                ..Default::default()
+            },
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &route_endpoints,
+            "app/things/route.ts",
+            claimed,
+        );
+
+        assert_eq!(result.endpoints.len(), 1, "one route, one row");
+        assert_eq!(result.endpoints[0].line_number, send_line);
+        assert_eq!(stats.model_rows_joined, 1);
+        assert_eq!(stats.model_rows_reconciled, 0);
+    }
+
+    /// Two exported handlers: the fold takes the row for the method the model
+    /// answered about and leaves the other alone.
+    #[test]
+    fn only_the_structural_row_for_the_stated_method_takes_the_anchors() {
+        let (route_endpoints, candidates, claimed) = file_route_fixture(TWO_METHOD_SOURCE);
+        assert_eq!(route_endpoints.len(), 2, "two exported handlers");
+
+        let (result, stats) = emit_and_join_with(
+            FileAnalysisResult {
+                endpoints: vec![model_route_row("endpoint:route.ts:POST", "POST", 8)],
+                ..Default::default()
+            },
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &route_endpoints,
+            "app/things/route.ts",
+            claimed,
+        );
+
+        assert_eq!(result.endpoints.len(), 2, "both routes survive");
+        let post = result
+            .endpoints
+            .iter()
+            .find(|row| row.method == "POST")
+            .expect("the POST row");
+        let get = result
+            .endpoints
+            .iter()
+            .find(|row| row.method == "GET")
+            .expect("the GET row");
+        assert_eq!(post.primary_type_symbol.as_deref(), Some("Thing"));
+        assert_eq!(
+            get.primary_type_symbol, None,
+            "the model said nothing about GET"
+        );
+        assert_eq!(get.response_expression_text, None);
+        assert_eq!(stats.model_rows_reconciled, 1);
+    }
+
+    /// A row whose method matches no structural row states a route nothing
+    /// registers. It is dropped, as it always was: the fold is for the route
+    /// the file DOES state, never a way to invent one.
+    #[test]
+    fn a_model_route_row_whose_method_matches_no_structural_row_is_dropped() {
+        let (route_endpoints, candidates, claimed) = file_route_fixture(FILE_ROUTE_SOURCE);
+
+        let (result, stats) = emit_and_join_with(
+            FileAnalysisResult {
+                endpoints: vec![model_route_row("endpoint:route.ts:DELETE", "DELETE", 3)],
+                ..Default::default()
+            },
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &route_endpoints,
+            "app/things/route.ts",
+            claimed,
+        );
+
+        assert_eq!(result.endpoints.len(), 1, "the structural POST row alone");
+        assert_eq!(result.endpoints[0].method, "POST");
+        assert_eq!(result.endpoints[0].primary_type_symbol, None);
+        assert_eq!(stats.model_rows_reconciled, 0);
+    }
+
+    /// The query read — a member call spelled for an HTTP verb, with a string
+    /// literal argument, sitting inside the handler. It is the listed site a
+    /// row most plausibly borrows, and reading its verb as a registration
+    /// would put the route on its line.
+    #[test]
+    fn a_verb_spelled_member_inside_the_handler_is_not_a_registration() {
+        let (route_endpoints, candidates, claimed) = file_route_fixture(FILE_ROUTE_SOURCE);
+        let query_read = candidates
+            .values()
+            .find(|candidate| {
+                candidate.callee_property.as_deref() == Some("get")
+                    && candidate.callee_object != "Response"
+            })
+            .expect("the query read is a candidate");
+        assert_eq!(
+            query_read.line_number, 5,
+            "the query read is inside the handler"
+        );
+        let query_read_id = query_read.candidate_id.clone();
+
+        let (result, stats) = emit_and_join_with(
+            FileAnalysisResult {
+                endpoints: vec![model_route_row(&query_read_id, "POST", 3)],
+                ..Default::default()
+            },
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &route_endpoints,
+            "app/things/route.ts",
+            claimed,
+        );
+
+        assert_eq!(result.endpoints.len(), 1, "one route, one row");
+        assert_eq!(
+            result.endpoints[0].line_number, 3,
+            "the registration's line, not the query read's"
+        );
+        assert_eq!(stats.model_rows_reconciled, 1);
+    }
+
+    /// A handler that dispatches on its body states one row per case, and none
+    /// of them joins. A dispatch case is IDENTITY, not an anchor: writing one
+    /// onto the derived route would narrow it to that case and take every
+    /// other case's consumers off it.
+    #[test]
+    fn a_dispatch_case_never_narrows_the_route_it_is_folded_onto() {
+        let (route_endpoints, candidates, claimed) = file_route_fixture(FILE_ROUTE_SOURCE);
+        let case = |value: &str| {
+            let mut row = model_route_row("endpoint:route.ts:POST", "POST", 3);
+            row.dispatch = Some(crate::dispatch::Dispatch {
+                location: crate::dispatch::DispatchLocation::Body,
+                field: "action".to_string(),
+                value: value.to_string(),
+            });
+            row
+        };
+
+        let (result, stats) = emit_and_join_with(
+            FileAnalysisResult {
+                endpoints: vec![case("create"), case("archive")],
+                ..Default::default()
+            },
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &route_endpoints,
+            "app/things/route.ts",
+            claimed,
+        );
+
+        assert_eq!(result.endpoints.len(), 1, "one route, one row");
+        let row = &result.endpoints[0];
+        assert_eq!(
+            row.dispatch, None,
+            "the route is still the general one the layout states"
+        );
+        assert_eq!(row.primary_type_symbol.as_deref(), Some("Thing"));
+        assert_eq!(stats.model_rows_reconciled, 1);
+    }
+
+    /// Two model rows for one route: the first states the anchors, the second
+    /// is a restatement and adds no row and no second fold.
+    #[test]
+    fn a_second_unanchored_model_row_for_one_route_adds_nothing() {
+        let (route_endpoints, candidates, claimed) = file_route_fixture(FILE_ROUTE_SOURCE);
+
+        let (result, stats) = emit_and_join_with(
+            FileAnalysisResult {
+                endpoints: vec![
+                    model_route_row("endpoint:route.ts:POST#1", "POST", 3),
+                    model_route_row("endpoint:route.ts:POST#2", "POST", 3),
+                ],
+                ..Default::default()
+            },
+            &candidates,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            &route_endpoints,
+            "app/things/route.ts",
+            claimed,
+        );
+
+        assert_eq!(result.endpoints.len(), 1, "one route, one row");
+        assert_eq!(stats.model_rows_reconciled, 1);
     }
 }

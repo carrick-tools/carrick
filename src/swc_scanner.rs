@@ -64,6 +64,17 @@ pub struct CandidateTarget {
     pub span_end: u32,
     /// 1-based line number where the call was detected
     pub line_number: usize,
+    /// 1-based line the call expression ENDS on. Equal to `line_number` for a
+    /// single-line call; for a registration written across several lines it is
+    /// the closing line, so `line_number..=end_line` is the range of lines this
+    /// site occupies.
+    ///
+    /// Read by the model-row join to ask whether a row the model reported at
+    /// its own line was reported AT this site (carrick#1395). Not serialized:
+    /// the JSON candidate context the prompt receives stays exactly as before,
+    /// for the same reason as `request_spec`.
+    #[serde(skip)]
+    pub end_line: usize,
     /// The callee object (e.g., "app", "router", "fetch")
     pub callee_object: String,
     /// The callee property/method (e.g., "get", "post", "use")
@@ -2644,6 +2655,7 @@ impl CandidateVisitor {
             return;
         }
         let line_number = self.get_line_number(call.span);
+        let end_line = self.get_end_line(call.span);
         let candidate_id = self.candidate_id(span_start, span_end);
         let code_snippet = self.get_code_snippet(call.span);
         // A request-spec call carries its URL as a property, not positionally.
@@ -2677,6 +2689,7 @@ impl CandidateVisitor {
             span_start,
             span_end,
             line_number,
+            end_line,
             callee_object,
             callee_property,
             enclosing_function: self.current_function(),
@@ -2707,6 +2720,7 @@ impl CandidateVisitor {
             return;
         }
         let line_number = self.get_line_number(span);
+        let end_line = self.get_end_line(span);
         let candidate_id = self.candidate_id(span_start, span_end);
         let code_snippet = self.get_code_snippet(span);
         self.candidates.push(CandidateTarget {
@@ -2715,6 +2729,7 @@ impl CandidateVisitor {
             span_start,
             span_end,
             line_number,
+            end_line,
             callee_object,
             callee_property,
             enclosing_function: self.current_function(),
@@ -2745,6 +2760,12 @@ impl CandidateVisitor {
     /// Get line number from span
     fn get_line_number(&self, span: swc_common::Span) -> usize {
         self.source_map.lookup_char_pos(span.lo).line
+    }
+
+    /// The line the span CLOSES on. Read off the same source map as
+    /// [`Self::get_line_number`], so the two are always in the same numbering.
+    fn get_end_line(&self, span: swc_common::Span) -> usize {
+        self.source_map.lookup_char_pos(span.hi).line
     }
 
     fn span_range(&self, span: swc_common::Span) -> (u32, u32) {
@@ -5336,6 +5357,7 @@ async function fetchUser(id: string) {
             span_start: 100,
             span_end: 140,
             line_number: 15,
+            end_line: 15,
             callee_object: "app".to_string(),
             callee_property: Some("get".to_string()),
             enclosing_function: Some("handler".to_string()),
