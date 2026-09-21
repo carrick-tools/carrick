@@ -1,0 +1,6 @@
+{
+  "frameworks": ["hono"],
+  "data_fetchers": [],
+  "messaging_clients": [],
+  "notes": "Hono routers; every response type is imported through an alias the repo's own config declares."
+}

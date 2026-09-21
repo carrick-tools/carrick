@@ -178,6 +178,7 @@ fn emitted_infer_item(repo: &Path, source: &str) -> InferRequestItem {
         &repo.to_string_lossy(),
         &mount_graph,
         &Config::default(),
+        &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(repo, None),
     );
 
     infer

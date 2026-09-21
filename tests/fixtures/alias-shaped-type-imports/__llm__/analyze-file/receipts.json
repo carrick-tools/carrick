@@ -1,0 +1,21 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:6",
+      "line_number": 6,
+      "owner_node": "receipts",
+      "method": "GET",
+      "path": "/receipts/:reference",
+      "handler_name": "anonymous",
+      "pattern_matched": ".get(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": "receipt",
+      "response_expression_line": 8,
+      "primary_type_symbol": "Receipt",
+      "type_import_source": "~receipts/receipt"
+    }
+  ],
+  "data_calls": []
+}

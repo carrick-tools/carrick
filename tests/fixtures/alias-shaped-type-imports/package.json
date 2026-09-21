@@ -1,0 +1,8 @@
+{
+  "name": "alias-api",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "hono": "^4.6.0"
+  }
+}

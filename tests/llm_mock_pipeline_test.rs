@@ -234,6 +234,7 @@ async fn mock_llm_output_flows_through_validation_and_mount_graph() {
         &root.to_string_lossy(),
         &result.mount_graph,
         &Config::default(),
+        &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(&root, None),
     );
     let reports_items: Vec<_> = infer
         .iter()
