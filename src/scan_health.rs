@@ -57,6 +57,17 @@ pub const ALLOW_MISSING_TYPES_ENV: &str = "CARRICK_ALLOW_MISSING_TYPES";
 /// How many lost files are named individually before the list is truncated.
 const MAX_NAMED_FILES: usize = 10;
 
+/// What the run says about a refusal the cloud sent no sentence with.
+///
+/// Only ever a fallback. The cloud knows which budget refused and when
+/// inference resumes; the scanner does not, and the refusal's `details.reason`
+/// is an open set it deliberately never reads, so a refusal whose sentence is
+/// missing is the only case this describes in the scanner's own words.
+const REFUSAL_WITHOUT_A_SENTENCE: &str = concat!(
+    "This workspace is past an inference allowance. They keep the rows the ",
+    "deterministic layer stated and their candidates were not refreshed this run."
+);
+
 /// The counters themselves, owned rather than reached through the global.
 ///
 /// Every rule about what a run lost lives on this value, so it can be built,
@@ -83,6 +94,11 @@ struct Registry {
     /// and not a reason to fail: the file keeps its deterministic rows and its
     /// candidates are simply not refreshed this run (carrick#555).
     not_refreshed: Vec<String>,
+    /// The sentence the cloud refused with, from the first refusal of the run
+    /// that carried one. Every refusal in a run carries the same words, so the
+    /// summary prints them once however many files were refused
+    /// (carrick#1413).
+    refusal_sentence: Option<String>,
     /// One entry per scope that got no type layer: (scope, reason). The scope
     /// is a service name, or [`WHOLE_SCAN`] when the sidecar never became
     /// ready at all and every service in the run is typeless.
@@ -178,26 +194,40 @@ impl Registry {
             .collect()
     }
 
-    /// Records that the model was not asked about `path`, on purpose.
-    fn record_candidates_not_refreshed(&mut self, path: &str) {
+    /// Records that the model was not asked about `path`, on purpose, and the
+    /// sentence the cloud refused with.
+    ///
+    /// The first non-empty sentence wins and the rest are dropped: they are
+    /// the same words repeated once per refused file.
+    fn record_candidates_not_refreshed(&mut self, path: &str, sentence: Option<&str>) {
         self.not_refreshed.push(path.to_string());
+        if self.refusal_sentence.is_none() {
+            self.refusal_sentence = sentence
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+        }
     }
 
     /// One line naming how many files the budget refused, or `None`.
     ///
-    /// Deliberately says nothing about which budget or until when: the cloud
-    /// owns that sentence (`allowance_sentence`, printed at the top of the
-    /// run) and a second, guessed version of it here would contradict it.
+    /// The cause is the cloud's own words, verbatim: which budget refused and
+    /// when inference resumes are facts about the account that only the cloud
+    /// holds, and the reason code beside them is an open set, so a scanner
+    /// that described the cause itself would eventually describe it wrongly
+    /// (carrick#1413). [`REFUSAL_WITHOUT_A_SENTENCE`] covers a refusal that
+    /// carried no words.
     fn not_refreshed_line(&self) -> Option<String> {
         if self.not_refreshed.is_empty() {
             return None;
         }
         Some(format!(
-            "{} of {} files were not sent to the model: this workspace is past an inference \
-             allowance. They keep the rows the deterministic layer stated and their candidates \
-             were not refreshed this run",
+            "{} of {} files were not sent to the model. {}",
             self.not_refreshed.len(),
-            self.attempted
+            self.attempted,
+            self.refusal_sentence
+                .as_deref()
+                .unwrap_or(REFUSAL_WITHOUT_A_SENTENCE),
         ))
     }
 
@@ -327,16 +357,17 @@ pub fn record_unanalysed_file(path: &str, reason: &str) {
         .record_unanalysed_file(path, reason);
 }
 
-/// Records that the model was deliberately not asked about `path`.
+/// Records that the model was deliberately not asked about `path`, with the
+/// sentence the cloud refused with when it sent one ([`refusal_sentence`]).
 ///
 /// Not a lost file: nothing failed, a budget said no. The run does not fail,
 /// the file is not named in `unanalysed_files` on the upload, and the index
 /// keeps every row the deterministic layer stated about it.
-pub fn record_candidates_not_refreshed(path: &str) {
+pub fn record_candidates_not_refreshed(path: &str, sentence: Option<&str>) {
     registry()
         .lock()
         .expect("scan health lock")
-        .record_candidates_not_refreshed(path);
+        .record_candidates_not_refreshed(path, sentence);
 }
 
 /// Whether a failed analyzer call is a file this run LOST, as opposed to one
@@ -364,6 +395,20 @@ pub fn is_budget_refusal(error: &(dyn std::error::Error + 'static)) -> bool {
     error
         .downcast_ref::<crate::agent_service::AgentCallError>()
         .is_some_and(|e| e.is_budget_refusal())
+}
+
+/// The sentence a refusal carried, when the failure is one and the cloud sent
+/// words with it.
+///
+/// The refusal's `details.reason` stays unread here, as it does everywhere a
+/// refusal is handled: it is an open set, and a reason this build has never
+/// heard of must change nothing about what the scan does. The message is what
+/// the person running the scan should read, so it is what the summary prints.
+pub fn refusal_sentence<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a str> {
+    let call = error.downcast_ref::<crate::agent_service::AgentCallError>()?;
+    call.is_budget_refusal()
+        .then(|| call.message.trim())
+        .filter(|sentence| !sentence.is_empty())
 }
 
 /// Reason code for a failed file analysis, for [`record_unanalysed_file`].
@@ -542,7 +587,7 @@ mod tests {
         registry.record_files_attempted(3);
         for path in ["src/a.ts", "src/b.ts", "src/c.ts"] {
             assert!(!counts_as_lost_file(&refused));
-            registry.record_candidates_not_refreshed(path);
+            registry.record_candidates_not_refreshed(path, refusal_sentence(&refused));
         }
 
         assert_eq!(registry.lost_file_count(), 0);
@@ -554,7 +599,99 @@ mod tests {
             line.contains("3 of 3 files were not sent to the model"),
             "{line}"
         );
-        assert!(line.contains("not refreshed"), "{line}");
+        assert!(line.contains("past the monthly allowance"), "{line}");
+    }
+
+    /// The reason the sentence is quoted rather than written here: a refusal
+    /// the scanner has no vocabulary for still says the right thing. This one
+    /// is refused for a cause the scanner knows nothing about, and the line
+    /// reads back the cloud's words and nothing of its own.
+    #[test]
+    fn the_line_quotes_the_refusal_the_cloud_sent() {
+        const SENT: &str = "Carrick has reached today's limit. This scan finished with facts only; \
+             inferred results resume after 00:00 UTC.";
+        let refused = AgentCallError {
+            code: crate::agent_service::LLM_DISABLED_CODE.to_string(),
+            message: SENT.to_string(),
+            retriable: false,
+        };
+        assert_eq!(refusal_sentence(&refused), Some(SENT));
+
+        let mut registry = run();
+        registry.record_files_attempted(4);
+        registry.record_candidates_not_refreshed("src/a.ts", refusal_sentence(&refused));
+
+        let line = registry.not_refreshed_line().expect("the run says so");
+        assert_eq!(
+            line,
+            format!("1 of 4 files were not sent to the model. {SENT}")
+        );
+        assert!(
+            !line.contains("inference allowance"),
+            "the scanner's own guess must not follow the cloud's sentence: {line}"
+        );
+    }
+
+    /// Every refused file carries the same words, so the run prints them once.
+    /// The first sentence wins; nothing after it is read.
+    #[test]
+    fn many_refused_files_print_one_sentence() {
+        let mut registry = run();
+        registry.record_files_attempted(9);
+        for path in ["src/a.ts", "src/b.ts", "src/c.ts"] {
+            registry.record_candidates_not_refreshed(path, Some("Inference is paused."));
+        }
+
+        let line = registry.not_refreshed_line().expect("the run says so");
+        assert_eq!(
+            line,
+            "3 of 9 files were not sent to the model. Inference is paused."
+        );
+        assert_eq!(
+            line.matches("Inference is paused.").count(),
+            1,
+            "one sentence, however many files: {line}"
+        );
+    }
+
+    /// A refusal with no words of its own — an older cloud, or an empty
+    /// message — still gets a line, in the scanner's own fallback.
+    #[test]
+    fn a_refusal_that_carried_no_sentence_falls_back() {
+        let wordless = AgentCallError {
+            code: crate::agent_service::LLM_DISABLED_CODE.to_string(),
+            message: "   ".to_string(),
+            retriable: false,
+        };
+        assert_eq!(refusal_sentence(&wordless), None, "blank is not a sentence");
+
+        let mut registry = run();
+        registry.record_files_attempted(2);
+        registry.record_candidates_not_refreshed("src/a.ts", refusal_sentence(&wordless));
+        registry.record_candidates_not_refreshed("src/b.ts", None);
+
+        let line = registry.not_refreshed_line().expect("the run says so");
+        assert_eq!(
+            line,
+            format!("2 of 2 files were not sent to the model. {REFUSAL_WITHOUT_A_SENTENCE}")
+        );
+    }
+
+    /// Only a refusal has a sentence to quote. A failure's message is our own
+    /// diagnostic text and belongs in the lost-file report, not in a line that
+    /// tells somebody why their scan was facts-only.
+    #[test]
+    fn a_failure_that_is_not_a_refusal_has_no_sentence() {
+        let failed = AgentCallError {
+            code: "model_error".to_string(),
+            message: "the model returned nothing".to_string(),
+            retriable: true,
+        };
+        assert_eq!(refusal_sentence(&failed), None);
+        assert_eq!(
+            refusal_sentence(&std::io::Error::other("connection reset")),
+            None
+        );
     }
 
     /// The other half of the split, which must keep working exactly as it did:

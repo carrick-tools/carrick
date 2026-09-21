@@ -15,6 +15,8 @@
 //!   (carrick-cloud#892);
 //! - a detection a budget refused is pending too, so a first index whose
 //!   ceiling is spent stays open for a raised ceiling to govern its re-run;
+//! - a FILE a budget refused is not a loss, and the next scan asks about it
+//!   again while its unchanged siblings replay (carrick#1413);
 //! - the rescan asks for service 2's detection and nobody else's.
 //!
 //! Its own test binary, `#[serial]`, and every count read as a delta: the
@@ -287,6 +289,17 @@ fn detect_requests() -> usize {
     requests_to("/framework-detect")
 }
 
+fn analyze_file_requests() -> usize {
+    requests_to("/analyze-file")
+}
+
+/// Stands in for whatever the cloud refuses with. Deliberately not a copy of
+/// any sentence the cloud ships: the point of quoting `error.message` is that
+/// the scanner holds no opinion about the words, so a test that asserted the
+/// cloud's current wording would be asserting the opposite.
+const REFUSAL_SENTENCE: &str =
+    "A budget refused this scan. It finished with facts only; inference resumes later.";
+
 /// Matches the one `general` guidance request each service makes, and none of
 /// the pattern or extraction-config requests beside it.
 const GENERAL_GUIDANCE: &str = "\"task\":\"general\"";
@@ -473,6 +486,7 @@ async fn a_budget_refusal_keeps_the_first_index_open() {
         "/framework-detect",
         BETA_ONLY_DEPENDENCY,
         1,
+        REFUSAL_SENTENCE,
     );
     let before = detect_requests();
     run_analysis_engine_with_sidecar(storage.clone(), repo.to_str().unwrap(), None, false)
@@ -493,6 +507,138 @@ async fn a_budget_refusal_keeps_the_first_index_open() {
         [vec!["beta".to_string()]]
     );
     assert!(storage.scan_failed.lock().unwrap().is_empty());
+}
+
+/// Only beta's `server.ts` holds this, so it is the needle that refuses one
+/// file's analysis and no other.
+const BETA_ONLY_ROUTE: &str = "/beta/status";
+
+/// A file a budget refused is asked about again on the next scan, and the run
+/// says so in the cloud's own words.
+///
+/// The refusal is the one case where a file the scan dispatched comes back
+/// with nothing and the scan is still right: nothing failed, so the file is
+/// not lost, the service is not held back, and the only thing owed is the
+/// question itself. Nothing chained two scans to prove the question is
+/// re-asked — it is true by construction (a refused call records no answer, so
+/// the next scan has nothing to replay), and construction is exactly what a
+/// later change can quietly alter.
+#[tokio::test]
+#[serial]
+async fn a_refused_file_is_asked_about_again_on_the_next_scan() {
+    offline_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = three_service_repo(tmp.path());
+    let storage = StubStorage::laptop_on_current_cloud(&[]);
+
+    // Scan 1: beta's one file is refused, alpha's and gamma's are answered.
+    carrick::agent_service::inject_mock_budget_refusal(
+        "/analyze-file",
+        BETA_ONLY_ROUTE,
+        1,
+        REFUSAL_SENTENCE,
+    );
+    let before = analyze_file_requests();
+    run_analysis_engine_with_sidecar(storage.clone(), repo.to_str().unwrap(), None, false)
+        .await
+        .expect("a refused file does not fail the run");
+    let first_scan_requests = analyze_file_requests() - before;
+    assert_eq!(
+        first_scan_requests, 3,
+        "one file per service is dispatched on a first index"
+    );
+    assert_eq!(storage.uploaded_services(), ["alpha", "beta", "gamma"]);
+
+    // The run's own sentence about it is the cloud's, once.
+    let line = carrick::scan_health::not_refreshed_line().expect("the run says a file was refused");
+    assert!(line.contains(REFUSAL_SENTENCE), "{line}");
+    assert_eq!(
+        line.matches(REFUSAL_SENTENCE).count(),
+        1,
+        "one sentence per run: {line}"
+    );
+
+    // A refusal is not a loss: the service lands, closes the scan, is not
+    // named pending, and its boundary counts no lost file.
+    assert!(storage.uploads().last().unwrap().final_in_run);
+    assert!(
+        storage.pending_named.lock().unwrap().is_empty(),
+        "a refused FILE leaves no service pending, so the cloud is never asked \
+         to hold a first index open for one"
+    );
+    assert!(storage.scan_failed.lock().unwrap().is_empty());
+    // Counted in the boundary, in the scanner's own words. Until carrick#1419
+    // gives a refusal a bucket of its own, `files_lost` is the only one a file
+    // with no model answer has, and a boundary that counted nothing here would
+    // say this service's index is complete.
+    let beta = storage.latest("beta").unwrap();
+    let files_lost = &beta.boundary.as_ref().unwrap().files_lost;
+    assert_eq!(
+        files_lost.total, 1,
+        "a refused file is counted, not hidden: {files_lost:?}"
+    );
+    assert!(
+        files_lost
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("server.ts") && reason.contains("not sent to the model")),
+        "the reason names the file and says it was not sent: {files_lost:?}"
+    );
+    assert!(
+        !files_lost
+            .reasons
+            .iter()
+            .any(|reason| reason.contains(REFUSAL_SENTENCE)),
+        "the cloud's sentence belongs to the run's single line, not to one row \
+         per refused file: {files_lost:?}"
+    );
+
+    // The mechanism the re-ask rests on: no answer was recorded for the
+    // refused file, while its siblings' answers were.
+    let refused_answers = beta.file_results.clone().unwrap_or_default();
+    assert!(
+        !refused_answers
+            .keys()
+            .any(|path| path.ends_with("server.ts")),
+        "a refused file records no answer: {:?}",
+        refused_answers.keys().collect::<Vec<_>>()
+    );
+    let answered = storage
+        .latest("alpha")
+        .unwrap()
+        .file_results
+        .unwrap_or_default();
+    assert!(
+        answered.keys().any(|path| path.ends_with("server.ts")),
+        "an answered file records its answer: {:?}",
+        answered.keys().collect::<Vec<_>>()
+    );
+
+    // Scan 2: same commit, nothing edited, every service indexed. alpha and
+    // gamma replay their cached answers and cost no request; beta's refused
+    // file is the only one asked about again.
+    let rescan = StubStorage {
+        indexed: Some(vec!["alpha".into(), "beta".into(), "gamma".into()]),
+        ..storage.clone()
+    };
+    let before = analyze_file_requests();
+    run_analysis_engine_with_sidecar(rescan.clone(), repo.to_str().unwrap(), None, false)
+        .await
+        .expect("the rescan succeeds");
+    assert_eq!(
+        analyze_file_requests() - before,
+        1,
+        "the refused file is asked about again, and only it"
+    );
+    let beta = rescan.latest("beta").unwrap();
+    assert!(
+        beta.file_results
+            .unwrap_or_default()
+            .keys()
+            .any(|path| path.ends_with("server.ts")),
+        "the second scan records the answer the first was refused"
+    );
+    assert!(rescan.scan_failed.lock().unwrap().is_empty());
 }
 
 /// On CI the same failure lands services 1 and 3 and ends non-zero naming

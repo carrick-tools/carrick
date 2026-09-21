@@ -848,6 +848,12 @@ enum ModelAnswer {
     Answered(FileAnalysisResult),
     /// The analyzer was asked and did not answer; the string is why.
     Failed(String),
+    /// A budget refused the call before the model was asked; the string is the
+    /// refusal. Its own variant because it is not a failure: nothing was lost,
+    /// the run says so once on its own line, and repeating the refusal per
+    /// file would print the cloud's sentence once per refused file
+    /// (carrick#555, carrick#1413).
+    Refused(String),
     /// No model stage ran (local mode).
     NotAsked,
 }
@@ -2494,7 +2500,7 @@ impl FileOrchestrator {
         // registered as it happens (#461). A file replaying a cached answer is
         // not dispatched and so is not attempted.
         crate::scan_health::record_files_attempted(to_dispatch.len());
-        let dispatched: Vec<(PendingFile, Result<FileAnalysisResult, String>)> =
+        let dispatched: Vec<(PendingFile, Result<FileAnalysisResult, ModelAnswer>)> =
             futures::stream::iter(to_dispatch.into_iter().map(|pf| async move {
                 let result = self
                     .file_analyzer
@@ -2524,9 +2530,16 @@ impl FileOrchestrator {
                                 &crate::scan_health::analysis_failure_reason(e.as_ref()),
                             );
                         } else if crate::scan_health::is_budget_refusal(e.as_ref()) {
-                            crate::scan_health::record_candidates_not_refreshed(&pf.path_str);
+                            // The refusal's own sentence, while the error is
+                            // still typed: the summary quotes it rather than
+                            // describing the budget itself (carrick#1413).
+                            crate::scan_health::record_candidates_not_refreshed(
+                                &pf.path_str,
+                                crate::scan_health::refusal_sentence(e.as_ref()),
+                            );
+                            return ModelAnswer::Refused(e.to_string());
                         }
-                        e.to_string()
+                        ModelAnswer::Failed(e.to_string())
                     });
                 (pf, result)
             }))
@@ -2556,7 +2569,7 @@ impl FileOrchestrator {
             )
             .chain(dispatched.into_iter().map(|(pf, result)| match result {
                 Ok(model) => (pf, ModelAnswer::Answered(model)),
-                Err(e) => (pf, ModelAnswer::Failed(e)),
+                Err(unanswered) => (pf, unanswered),
             }))
             .chain(not_asked.into_iter().map(|pf| (pf, ModelAnswer::NotAsked)))
             .collect();
@@ -2620,22 +2633,52 @@ impl FileOrchestrator {
                     // a transient gateway failure (and a laptop with no model)
                     // from also deleting the routes and calls the source states
                     // outright.
-                    if let ModelAnswer::Failed(e) = &unanswered {
-                        // Warn rather than collect quietly: `stats.errors` is
-                        // only ever printed at debug, which is how this loss
-                        // stayed invisible (#461). The run-level verdict is in
-                        // `scan_health`, recorded at dispatch, and it is
-                        // unchanged: this file is still one the analyzer never
-                        // answered for, and the run still says so.
-                        //
-                        // A NOT-ASKED file records none of this: nothing was
-                        // lost, so nothing is reported lost.
-                        warn!("Failed to analyze {}: {}", pf.path_str, e);
-                        stats
-                            .errors
-                            .push(format!("Failed to analyze {}: {}", pf.path_str, e));
-                        stats.files_skipped += 1;
-                        stats.files_analysis_failed += 1;
+                    match &unanswered {
+                        ModelAnswer::Failed(e) => {
+                            // Warn rather than collect quietly: `stats.errors`
+                            // is only ever printed at debug, which is how this
+                            // loss stayed invisible (#461). The run-level
+                            // verdict is in `scan_health`, recorded at
+                            // dispatch, and it is unchanged: this file is
+                            // still one the analyzer never answered for, and
+                            // the run still says so.
+                            //
+                            // A NOT-ASKED file records none of this: nothing
+                            // was lost, so nothing is reported lost.
+                            warn!("Failed to analyze {}: {}", pf.path_str, e);
+                            stats
+                                .errors
+                                .push(format!("Failed to analyze {}: {}", pf.path_str, e));
+                            stats.files_skipped += 1;
+                            stats.files_analysis_failed += 1;
+                        }
+                        ModelAnswer::Refused(e) => {
+                            // Debug, not warn: the run says what happened
+                            // once, in `scan_health::not_refreshed_line`, in
+                            // the cloud's own words, and warning here would
+                            // repeat that sentence once per refused file
+                            // (carrick#1413).
+                            debug!("The model was not asked about {}: {}", pf.path_str, e);
+                            // Counted in the boundary all the same, with a
+                            // fixed reason of its own. `files_lost` is the
+                            // only bucket a file with no model answer has
+                            // until carrick#1419 gives a refusal one, and a
+                            // boundary that counted nothing here would report
+                            // this service complete while every candidate
+                            // these files hold went unclassified — a read
+                            // must count what it hid, and silence is the
+                            // worse of the two wrong answers. The reason is
+                            // the scanner's own short phrase, never the
+                            // cloud's sentence, which stays on the run's
+                            // single line.
+                            stats.errors.push(format!(
+                                "{}: not sent to the model (inference limit)",
+                                pf.path_str
+                            ));
+                            stats.files_skipped += 1;
+                            stats.files_analysis_failed += 1;
+                        }
+                        ModelAnswer::Answered(_) | ModelAnswer::NotAsked => {}
                     }
 
                     let mut deterministic = FileAnalysisResult::default();
@@ -2662,7 +2705,10 @@ impl FileOrchestrator {
                     );
                     // Only the not-asked arm: a file the analyzer answered for
                     // and a file whose call failed have both been asked, and
-                    // nothing about them is waiting for a later scan.
+                    // nothing about them is waiting for a later scan. A
+                    // refused file is waiting, but this count is documented as
+                    // zero on any scan that ran the model at all and the cloud
+                    // reads it that way, so it stays out of here.
                     if matches!(unanswered, ModelAnswer::NotAsked) {
                         Self::count_candidates_awaiting_model(
                             &deterministic,
