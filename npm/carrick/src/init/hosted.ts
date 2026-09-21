@@ -85,6 +85,16 @@ function spawnNative(
     let stderr = "";
     let rest = "";
     const report = progress === null ? null : downloadProgress(progress);
+    // The clock half of the cadence (carrick#1373). The hosted request in
+    // front of the markers is one call that can run for minutes, so a run
+    // driven by markers alone is silent through exactly the wait that needs a
+    // line. Unref'd: a ticker is not a reason for the process to stay up.
+    const beating = report === null ? null : setInterval(report.beat, BEAT_MS);
+    beating?.unref();
+    const settle = (value: { status: number | null; stdout: string; stderr: string }): void => {
+      if (beating !== null) clearInterval(beating);
+      resolve(value);
+    };
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       stdout += chunk;
@@ -97,7 +107,7 @@ function spawnNative(
       if (report !== null) {
         const lines = (rest + chunk).split("\n");
         rest = lines.pop() ?? "";
-        for (const line of lines) report(line);
+        for (const line of lines) report.read(line);
       }
       // Quiet under a spinner: a spinner owns its line and rewrites it, and a
       // scanner line landing in the middle of that is a corrupted terminal.
@@ -106,8 +116,8 @@ function spawnNative(
       // marker lines are the spinner's own input and are never written through.
       if (!quiet && !args.includes("--json")) process.stderr.write(withoutMarkers(chunk));
     });
-    child.on("error", (error) => resolve({ status: 1, stdout: "", stderr: error.message }));
-    child.on("close", (code) => resolve({ status: code, stdout, stderr }));
+    child.on("error", (error) => settle({ status: 1, stdout: "", stderr: error.message }));
+    child.on("close", (code) => settle({ status: code, stdout, stderr }));
   });
 }
 
@@ -134,27 +144,69 @@ function withoutMarkers(chunk: string): string {
  * local half is a re-scan whose services differ in size by two orders of
  * magnitude (carrick#1365). A number that cannot be derived is not shown.
  */
-export function downloadProgress(say: StepProgress, now: () => number = Date.now): (line: string) => void {
+export function downloadProgress(say: StepProgress, now: () => number = Date.now): DownloadProgress {
   const startedAt = now();
   let services = "";
   let bytes = "";
-  return (line: string): void => {
-    const marker = parseMarker(line);
-    if (marker === null) return;
-    if (marker.kind === "progress") {
-      const update = marker.update;
-      services = `${update.service_index} of ${update.service_total} services`;
-      say([DOWNLOAD_LABEL, `${services}${bytes}, ${elapsed((now() - startedAt) / 1000)}`].join(": "));
-      return;
-    }
-    // The hosted half says how much it read; the scanner states it as a notice
-    // because it is one fact, once, not a count that ticks.
-    if (marker.kind === "notice" && marker.text.startsWith(HOSTED_BYTES)) {
-      bytes = `, ${marker.text.slice(HOSTED_BYTES.length)}`;
-      say([DOWNLOAD_LABEL, `${services || "reading"}${bytes}, ${elapsed((now() - startedAt) / 1000)}`].join(": "));
-    }
+  let saidAt: number | null = null;
+  // One line at a time, and never two inside one beat. Both callers below can
+  // reach this in the same second — a marker arrives, the ticker fires — and a
+  // reader on a pipe gets the cadence, not every marker a large workspace
+  // raises (carrick#1315).
+  const emit = (): void => {
+    const at = now();
+    if (saidAt !== null && at - saidAt < BEAT_MS) return;
+    saidAt = at;
+    say([DOWNLOAD_LABEL, `${services || "reading"}${bytes}, ${elapsed((at - startedAt) / 1000)}`].join(": "));
+  };
+  return {
+    read: (line: string): void => {
+      const marker = parseMarker(line);
+      if (marker === null) return;
+      if (marker.kind === "progress") {
+        const update = marker.update;
+        services = `${update.service_index} of ${update.service_total} services`;
+        emit();
+        return;
+      }
+      // The hosted half says how much it read; the scanner states it as a
+      // notice because it is one fact, once, not a count that ticks.
+      if (marker.kind === "notice" && marker.text.startsWith(HOSTED_BYTES)) {
+        bytes = `, ${marker.text.slice(HOSTED_BYTES.length)}`;
+        emit();
+      }
+    },
+    beat: emit,
   };
 }
+
+/**
+ * The two ways the download's line is written: off the scanner's own markers,
+ * and off a clock.
+ *
+ * The clock is the half carrick#1373 is about. The markers arrive when the
+ * scanner finishes a service, and the hosted request in front of them is one
+ * call that can take minutes on a large project — so a run driven by markers
+ * alone says nothing at all through exactly the wait a reader needs told
+ * about. An agent harness with a tool timeout cannot tell that wait from a
+ * hang, and it is the silence that ends the run.
+ */
+export type DownloadProgress = {
+  /** One line of the scanner's stderr. */
+  read(line: string): void;
+  /** The clock: say where it has got to, whether or not anything moved. */
+  beat(): void;
+};
+
+/**
+ * How often the download says where it is, at most and at least.
+ *
+ * At most, because the markers of a large workspace would otherwise be
+ * thousands of lines; at least, because a reader on a pipe reads silence as a
+ * hang. One constant for both halves is what makes the cadence a promise
+ * rather than an average.
+ */
+export const BEAT_MS = 5000;
 
 /** The label the step carries, and the stem of every line it writes. */
 export const DOWNLOAD_LABEL = "Downloading your index";
