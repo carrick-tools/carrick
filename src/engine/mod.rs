@@ -4249,7 +4249,6 @@ fn add_graphql_request_entry(
         primary_type_symbol: symbol,
         defined_in: None,
         any_provenance: Vec::new(),
-        v1_unresolved: false,
     });
 }
 
@@ -4308,7 +4307,6 @@ fn add_protocol_manifest_entry(
         primary_type_symbol,
         defined_in: None,
         any_provenance: Vec::new(),
-        v1_unresolved: false,
     });
 }
 
@@ -5519,14 +5517,18 @@ fn resolve_per_endpoint_definitions(
     }
 }
 
-/// The aliases to ask the capture stub about: every entry carrying a type, plus
-/// every entry the v1 side abstained on (carrick#780).
+/// The aliases to ask the capture stub about: every entry in the manifest.
 ///
-/// The second half is the division of labour the capture exists for — an infer
-/// anchor is derived precisely for the aliases v1 inference could not resolve —
-/// and it used to happen by accident, because v1's unmarked placeholder read as
-/// a declaration and left the entry `Implicit`. Marking the placeholder without
-/// asking here would have silently dropped the shapes the capture does resolve.
+/// The filter this used to carry asked only about entries v1 carried a type
+/// for, plus the ones v1 abstained on with a BARE top type. An entry whose v1
+/// answer was a real shape with a top type somewhere INSIDE it fell between the
+/// two — `contains_disqualifying_top_type` demoted it to `Unknown`, nothing
+/// marked it an abstention, and the capture was never asked (carrick#1441). On
+/// one real monorepo that silently discarded a clean capture answer for 48
+/// entries. There is nothing to gain by guessing which aliases are worth
+/// asking about: the answers are filtered on their own merits below, the call
+/// is one round trip, and the capture exists precisely to resolve what v1
+/// could not.
 ///
 /// A `BTreeSet`, not a `HashSet`: the sidecar resolves the aliases in the order
 /// they arrive, and the compiler hands out type ids in the order it creates
@@ -5537,7 +5539,6 @@ fn resolve_per_endpoint_definitions(
 fn aliases_to_resolve(manifest: &[TypeManifestEntry]) -> Vec<String> {
     manifest
         .iter()
-        .filter(|e| e.type_state != ManifestTypeState::Unknown || e.v1_unresolved)
         .map(|e| e.type_alias.clone())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -5545,7 +5546,7 @@ fn aliases_to_resolve(manifest: &[TypeManifestEntry]) -> Vec<String> {
 }
 
 /// Write the capture's answers onto the manifest, and let a real shape settle
-/// the state of an entry the v1 side abstained on.
+/// the state of an entry the v1 side did not answer.
 ///
 /// Two different questions are asked of the capture's answer for such an entry,
 /// and they have different thresholds:
@@ -5569,9 +5570,11 @@ fn aliases_to_resolve(manifest: &[TypeManifestEntry]) -> Vec<String> {
 ///    name is, and publishing them counts the operation typed.
 ///  - **does it settle the state?** Only a shape with no disqualifying top type
 ///    anywhere in it, the same notion the check phase uses. That promotion is
-///    scoped to entries the v1 side abstained on; `type_state` reflecting the
-///    capture surface for entries v1 DID answer is carrick#449 and is untouched
-///    here.
+///    scoped to entries whose state is `Unknown` — the ones no layer has said
+///    anything about yet (carrick#449, carrick#1441). What the SOURCE states
+///    about an entry v1 DID answer for is never overwritten from here: a
+///    capture answer cannot make a declared type implicit or an inferred one
+///    explicit.
 ///
 /// Returns how many aliases the capture answered for.
 fn apply_resolved_definitions(
@@ -5587,7 +5590,11 @@ fn apply_resolved_definitions(
         let Some(r) = lookup.get(&entry.type_alias) else {
             continue;
         };
-        let v1_abstained = entry.v1_unresolved && entry.type_state == ManifestTypeState::Unknown;
+        // "No layer has stated this type yet" — the v1 side either abstained,
+        // answered with something `contains_disqualifying_top_type` refused, or
+        // was never asked. All three leave the entry `Unknown`, and the capture
+        // is the layer that answers for all three (carrick#1441).
+        let v1_unanswered = entry.type_state == ManifestTypeState::Unknown;
 
         // An answer that IS a bare top type describes nothing, and describes
         // nothing whoever asked for it. The rule used to be scoped to entries
@@ -5598,12 +5605,12 @@ fn apply_resolved_definitions(
         // answer (carrick#852). Publishing it also offers a producer side to a
         // compatibility check with nothing in it.
         //
-        // The empty answer stays scoped to the abstention: an entry v1 answered
-        // for has a shape behind it, and an empty expansion there is the
-        // capture failing to print one rather than the capture saying there is
-        // none.
+        // The empty answer stays scoped to the unanswered entry: an entry v1
+        // answered for has a shape behind it, and an empty expansion there is
+        // the capture failing to print one rather than the capture saying there
+        // is none.
         if type_compat_v2::text_is_bare_top_type(&r.expanded)
-            || (v1_abstained && r.expanded.trim().is_empty())
+            || (v1_unanswered && r.expanded.trim().is_empty())
         {
             continue;
         }
@@ -5621,7 +5628,7 @@ fn apply_resolved_definitions(
         entry.resolved_definition = Some(r.definition.clone());
         entry.expanded_definition = Some(r.expanded.clone());
 
-        if v1_abstained && !type_compat_v2::contains_disqualifying_top_type(&r.expanded) {
+        if v1_unanswered && !type_compat_v2::contains_disqualifying_top_type(&r.expanded) {
             entry.is_explicit = false;
             entry.type_state = ManifestTypeState::Implicit;
             entry.evidence.is_explicit = false;
@@ -5953,7 +5960,6 @@ fn add_manifest_pair(
             primary_type_symbol: None,
             defined_in: None,
             any_provenance: Vec::new(),
-            v1_unresolved: false,
         });
     }
 }
@@ -6063,24 +6069,6 @@ fn enrich_manifest_with_type_resolution(
 
     // Update manifest entries
     for entry in manifest.iter_mut() {
-        // The v1 side was asked for this alias and answered with a placeholder.
-        // Recorded on the entry because the two facts that follow from it are
-        // read at different moments: the state below (which must not claim a
-        // shape v1 does not have) and the capture consultation in
-        // `resolve_per_endpoint_definitions` (which must still happen — the
-        // capture is the layer that resolves what v1 could not). An alias the
-        // bundle says NOTHING about is a different fact: no v1 request was ever
-        // built for it, so there is nothing for it to have abstained from.
-        //
-        // A v1 answer that is itself a bare `any`/`unknown` is the same
-        // abstention without the marker (carrick#1165): it describes nothing,
-        // so the capture is asked too, and its shape is published if it has
-        // one.
-        entry.v1_unresolved = dts_trivially_unknown(&entry.type_alias)
-            || resolved_types
-                .get(&entry.type_alias)
-                .is_some_and(|(type_string, _)| type_compat_v2::text_is_bare_top_type(type_string));
-
         // Fill the deterministic anchor ONLY when the LLM left it unset, so the
         // ops where the model already emitted a correct symbol (POST /payments,
         // socket) are never regressed. Stamping runs before enrichment, so any
@@ -8250,7 +8238,6 @@ mod tests {
                 primary_type_symbol: None,
                 defined_in: None,
                 any_provenance: Vec::new(),
-                v1_unresolved: false,
             }]),
             file_results: Some(file_results),
             cached_detection: None,
@@ -10355,7 +10342,6 @@ mod tests {
             primary_type_symbol: None,
             defined_in: None,
             any_provenance: Vec::new(),
-            v1_unresolved: false,
         }
     }
 
@@ -10605,10 +10591,6 @@ mod tests {
             ManifestTypeState::Unknown,
             "v1's own placeholder must not read as a defined type: {dts}"
         );
-        assert!(
-            manifest[0].v1_unresolved,
-            "the entry must record that the v1 side abstained, so the capture is still asked"
-        );
         assert_eq!(
             aliases_to_resolve(&manifest),
             vec!["OrderView".to_string()],
@@ -10628,11 +10610,11 @@ mod tests {
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, Some(authored));
 
-        assert!(
-            !manifest[0].v1_unresolved,
+        assert_ne!(
+            manifest[0].type_state,
+            ManifestTypeState::Unknown,
             "a developer's own `= unknown` is not the v1 side abstaining"
         );
-        assert_ne!(manifest[0].type_state, ManifestTypeState::Unknown);
     }
 
     /// The Carrick-injected `= unknown` placeholder (carrying the marker) in the
@@ -10740,7 +10722,7 @@ mod tests {
     #[test]
     fn a_real_capture_shape_settles_a_v1_abstention() {
         let mut manifest = vec![consumer_entry("OrderView")];
-        manifest[0].v1_unresolved = true;
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
 
         let count = apply_resolved_definitions(
             &mut manifest,
@@ -10761,7 +10743,7 @@ mod tests {
     #[test]
     fn a_shapeless_capture_answer_publishes_nothing() {
         let mut manifest = vec![consumer_entry("OrderView")];
-        manifest[0].v1_unresolved = true;
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
 
         apply_resolved_definitions(
             &mut manifest,
@@ -10787,7 +10769,6 @@ mod tests {
         let mut manifest = vec![consumer_entry("OrderView")];
         manifest[0].type_state = ManifestTypeState::Implicit;
         manifest[0].is_explicit = false;
-        assert!(!manifest[0].v1_unresolved, "v1 answered for this one");
 
         apply_resolved_definitions(
             &mut manifest,
@@ -10814,7 +10795,7 @@ mod tests {
     #[test]
     fn a_partly_decayed_capture_shape_is_published_but_stays_unknown() {
         let mut manifest = vec![consumer_entry("OrderView")];
-        manifest[0].v1_unresolved = true;
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
 
         apply_resolved_definitions(
             &mut manifest,
@@ -10830,13 +10811,63 @@ mod tests {
         );
     }
 
-    /// The promotion is scoped to entries v1 abstained on. An entry that is
-    /// `Unknown` for any other reason keeps that state whatever the capture
-    /// says; reflecting the capture surface generally is carrick#449.
+    /// carrick#1441: a v1 answer that is a real shape with a top type INSIDE it
+    /// is neither a type nor an abstention. `contains_disqualifying_top_type`
+    /// demotes the entry to `Unknown`, and the capture — which has the shape —
+    /// used to be skipped for it, because the filter asked only about entries
+    /// carrying a type or marked as a bare-top abstention. 48 entries of one
+    /// real monorepo published nothing this way.
     #[test]
-    fn the_capture_does_not_promote_an_entry_v1_never_abstained_on() {
+    fn a_v1_shape_with_a_top_type_inside_still_asks_the_capture() {
         let mut manifest = vec![consumer_entry("OrderView")];
-        assert!(!manifest[0].v1_unresolved);
+        let mut resolution = empty_resolution();
+        let mut inferred = inferred_with_symbol("OrderView");
+        inferred.type_string = "{ relation: any; } & { id: string; }".to_string();
+        inferred.primary_type_symbol = None;
+        resolution.inferred_types.push(inferred);
+
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+
+        assert_eq!(
+            manifest[0].type_state,
+            ManifestTypeState::Unknown,
+            "a shape carrying a top type does not state a contract"
+        );
+        assert_eq!(
+            aliases_to_resolve(&manifest),
+            vec!["OrderView".to_string()],
+            "the capture must be asked: it is the layer that resolves what v1 could not"
+        );
+
+        apply_resolved_definitions(
+            &mut manifest,
+            vec![captured(
+                "OrderView",
+                "{ relation: { id: string; }; id: string; }",
+            )],
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            manifest[0].expanded_definition.as_deref(),
+            Some("{ relation: { id: string; }; id: string; }")
+        );
+        assert_eq!(
+            manifest[0].type_state,
+            ManifestTypeState::Implicit,
+            "a clean capture shape settles an entry no other layer stated"
+        );
+        assert!(!manifest[0].is_explicit, "the capture inferred it");
+    }
+
+    /// The promotion only reaches entries nothing has stated. What the SOURCE
+    /// says about an entry v1 answered for is the source's to say: a capture
+    /// answer publishes beside it and never restates it.
+    #[test]
+    fn the_capture_does_not_restate_an_entry_v1_answered_for() {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        manifest[0].type_state = ManifestTypeState::Explicit;
+        manifest[0].is_explicit = true;
 
         apply_resolved_definitions(
             &mut manifest,
@@ -10844,7 +10875,8 @@ mod tests {
             &HashMap::new(),
         );
 
-        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Explicit);
+        assert!(manifest[0].is_explicit, "the source declared this one");
         assert_eq!(
             manifest[0].resolved_definition.as_deref(),
             Some("{ id: string; }")
@@ -11010,8 +11042,11 @@ mod tests {
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
 
-        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
-        assert!(manifest[0].v1_unresolved, "a bare `any` is an abstention");
+        assert_eq!(
+            manifest[0].type_state,
+            ManifestTypeState::Unknown,
+            "a bare `any` is an abstention"
+        );
         assert_eq!(aliases_to_resolve(&manifest), vec!["OrderView".to_string()]);
 
         apply_resolved_definitions(

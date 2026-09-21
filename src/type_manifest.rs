@@ -761,7 +761,6 @@ mod tests {
             primary_type_symbol: None,
             defined_in: None,
             any_provenance: Vec::new(),
-            v1_unresolved: false,
         }
     }
 }
