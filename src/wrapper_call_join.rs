@@ -111,8 +111,8 @@ pub fn join_wrapper_calls(
         return joins;
     }
 
-    // Only a file with a spanned model row has a site to classify; nothing
-    // else is parsed.
+    // Only a file with a model row has a site to classify; nothing else is
+    // parsed.
     let mut keys: Vec<String> = file_results
         .iter()
         .filter(|(_, result)| result.data_calls.iter().any(is_linkable_row))
@@ -130,7 +130,7 @@ pub fn join_wrapper_calls(
         let Ok(canonical) = file.canonicalize() else {
             continue;
         };
-        let Some((callees, imports)) = read_call_sites(file) else {
+        let Some((sites, imports)) = read_call_sites(file) else {
             continue;
         };
 
@@ -144,13 +144,10 @@ pub fn join_wrapper_calls(
             if !is_linkable_row(call) {
                 continue;
             }
-            let Some(span) = call.call_expression_span_start else {
+            let Some(site) = site_of(&sites, call) else {
                 continue;
             };
-            let Some(root) = callees.get(&span) else {
-                continue;
-            };
-            let Some(import) = imports.get(root) else {
+            let Some(import) = imports.get(&site.root) else {
                 continue; // declared here, or a name this file never imported
             };
             let Some(module) = resolve_module(workspace, file, &import.specifier) else {
@@ -216,13 +213,30 @@ struct RequestRow {
     site: String,
 }
 
-/// Whether this row is one the join may classify: the model's own reading, at a
-/// call site the scanner raised a candidate for (so the span names the call
-/// whose callee is read below).
+/// Whether this row is one the join may classify: the model's own reading,
+/// which has not been linked already.
+///
+/// Deliberately NOT restricted to a row with a span. A call written on an
+/// imported binding raises no HTTP candidate of its own unless the binding
+/// comes from a package detection flagged as a data fetcher, so a row at the
+/// shape this join exists for routinely has no span and is placed by its line.
 fn is_linkable_row(call: &DataCallResult) -> bool {
-    call.resolution_source == Some(ResolutionSource::Model)
-        && call.call_expression_span_start.is_some()
-        && call.reaches_request.is_none()
+    call.resolution_source == Some(ResolutionSource::Model) && call.reaches_request.is_none()
+}
+
+/// The call a row was recorded at: the one at its span, or — for a row the
+/// candidate scanner raised nothing for — the only call on its line.
+///
+/// A line carrying more than one call states nothing about which of them the
+/// row is, and answers `None` rather than picking one.
+pub(crate) fn site_of<'a>(sites: &'a [CallSite], call: &DataCallResult) -> Option<&'a CallSite> {
+    if let Some(span) = call.call_expression_span_start {
+        return sites.iter().find(|site| site.span == span);
+    }
+    let line = u32::try_from(call.line_number).ok()?;
+    let mut on_line = sites.iter().filter(|site| site.line == line);
+    let first = on_line.next()?;
+    on_line.next().is_none().then_some(first)
 }
 
 /// The operation a row states: the method it will be indexed under and its
@@ -251,20 +265,31 @@ fn resolve_module(
     }
 }
 
-/// Each call's span mapped to the root binding its callee is written on
-/// (`client.getMine()` → `client`), with the file's import table.
-fn read_call_sites(file: &Path) -> Option<(HashMap<u32, String>, HashMap<String, Import>)> {
+/// One call in a file: where it is, and the binding it is written on.
+pub(crate) struct CallSite {
+    /// Start of the call expression, in candidate span units.
+    pub(crate) span: u32,
+    /// 1-based line the call opens on, which is how a row with no span is
+    /// placed.
+    pub(crate) line: u32,
+    /// The root binding the callee is written on (`client` in
+    /// `client.list()`).
+    pub(crate) root: String,
+}
+
+/// Every call written on a binding, with the file's import table.
+fn read_call_sites(file: &Path) -> Option<(Vec<CallSite>, HashMap<String, Import>)> {
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
     let module = parse_file(file, &cm, &handler)?;
-    Some((callee_roots(&module, &cm), import_table(&module)))
+    Some((call_sites(&module, &cm), import_table(&module)))
 }
 
-fn callee_roots(module: &Module, cm: &Lrc<SourceMap>) -> HashMap<u32, String> {
-    let mut collector = CalleeRoots::default();
+fn call_sites(module: &Module, cm: &Lrc<SourceMap>) -> Vec<CallSite> {
+    let mut collector = CallCollector::default();
     module.visit_with(&mut collector);
     collector
-        .roots
+        .calls
         .into_iter()
         .filter_map(|(pos, root)| {
             let span = cm
@@ -272,25 +297,29 @@ fn callee_roots(module: &Module, cm: &Lrc<SourceMap>) -> HashMap<u32, String> {
                 .pos
                 .0
                 .checked_add(SWC_SPAN_BASE)?;
-            Some((span, root))
+            Some(CallSite {
+                span,
+                line: cm.lookup_char_pos(pos).line as u32,
+                root,
+            })
         })
         .collect()
 }
 
-/// The root identifier of every call's callee. A callee that is not written on
-/// an identifier (an immediately invoked expression, a call on a call) states
-/// no binding to resolve and is left out.
+/// Every call written on an identifier. A callee that is not (an immediately
+/// invoked expression, a call on a call) states no binding to resolve and is
+/// left out.
 #[derive(Default)]
-struct CalleeRoots {
-    roots: Vec<(swc_common::BytePos, String)>,
+struct CallCollector {
+    calls: Vec<(swc_common::BytePos, String)>,
 }
 
-impl Visit for CalleeRoots {
+impl Visit for CallCollector {
     fn visit_call_expr(&mut self, node: &CallExpr) {
         if let Callee::Expr(expr) = &node.callee
             && let Some(root) = callee_root(expr)
         {
-            self.roots.push((node.span.lo, root));
+            self.calls.push((node.span.lo, root));
         }
         node.visit_children_with(self);
     }
@@ -312,9 +341,9 @@ mod tests {
 
     /// The client module: one member, one request written in its own source.
     /// The row for line 4 is what a deterministic pass emits for it.
-    const CLIENT: &str = r#"export const capabilitiesApi = {
-  getMine: async () => {
-    const response = await fetch("/v1/me/capabilities");
+    const CLIENT: &str = r#"export const shelvesApi = {
+  list: async () => {
+    const response = await fetch("/v1/shelves");
     return response.json();
   },
 };
@@ -322,12 +351,12 @@ mod tests {
 
     /// The consumer: the call through the client member, which states neither
     /// the method nor the path.
-    const CONSUMER: &str = r#"import { capabilitiesApi } from "../lib/capabilities";
+    const CONSUMER: &str = r#"import { shelvesApi } from "../lib/shelves";
 
-export function useCapabilities() {
+export function useShelves() {
   return useQuery({
-    queryKey: ["capabilities"],
-    queryFn: () => capabilitiesApi.getMine(),
+    queryKey: ["shelves"],
+    queryFn: () => shelvesApi.list(),
   });
 }
 "#;
@@ -339,8 +368,20 @@ export function useCapabilities() {
         path.to_string_lossy().into_owned()
     }
 
-    /// A row at the call that starts at `needle`, in candidate span units.
+    /// A row at the call that starts at `needle`, placed by its LINE and
+    /// carrying no span — the shape a call through an imported binding has,
+    /// because the candidate scanner raises nothing at such a site.
     fn row(content: &str, needle: &str, method: &str, target: &str) -> DataCallResult {
+        DataCallResult {
+            candidate_id: "model".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            ..spanned_row(content, needle, method, target)
+        }
+    }
+
+    /// The same row as the candidate scanner joined it: with its span.
+    fn spanned_row(content: &str, needle: &str, method: &str, target: &str) -> DataCallResult {
         let offset = content.find(needle).expect("needle is in the source") as u32;
         let span = offset + SWC_SPAN_BASE;
         let line = content[..offset as usize].lines().count() as i32;
@@ -368,10 +409,12 @@ export function useCapabilities() {
         }
     }
 
+    /// A deterministic row: the request the declaring module writes, which a
+    /// pass read off that module's own source at its span.
     fn request_row(content: &str, needle: &str, method: &str, target: &str) -> DataCallResult {
         DataCallResult {
             resolution_source: Some(ResolutionSource::SameFileWrapper),
-            ..row(content, needle, method, target)
+            ..spanned_row(content, needle, method, target)
         }
     }
 
@@ -398,31 +441,97 @@ export function useCapabilities() {
         results[file].data_calls[0].reaches_request.clone()
     }
 
+    /// The line below carries two calls, so it says nothing on its own — a row
+    /// the candidate scanner DID raise a span for is still placed exactly.
     #[test]
-    fn a_call_through_an_imported_member_reaches_the_request_that_member_writes() {
+    fn a_row_with_a_span_is_placed_at_the_call_that_span_names() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let client = write(root, "src/lib/capabilities.ts", CLIENT);
-        let consumer = write(root, "src/hooks/useCapabilities.ts", CONSUMER);
+        let client = write(root, "src/lib/shelves.ts", CLIENT);
+        let source = CONSUMER.replace(
+            "queryFn: () => shelvesApi.list(),",
+            "queryFn: () => shelvesApi.list() ?? fallback(),",
+        );
+        let consumer = write(root, "src/hooks/useShelves.ts", &source);
 
         let (results, joins) = join(vec![
             (
                 client.clone(),
                 vec![request_row(
                     CLIENT,
-                    "fetch(\"/v1/me/capabilities\")",
+                    "fetch(\"/v1/shelves\")",
                     "GET",
-                    "/v1/me/capabilities",
+                    "/v1/shelves",
                 )],
             ),
             (
                 consumer.clone(),
-                vec![row(
-                    CONSUMER,
-                    "capabilitiesApi.getMine()",
+                vec![spanned_row(
+                    &source,
+                    "shelvesApi.list()",
                     "GET",
-                    "/v1/me/capabilities",
+                    "/v1/shelves",
                 )],
+            ),
+        ]);
+
+        assert_eq!(link(&results, &consumer), Some(format!("{client}:3")));
+        assert_eq!(joins.linked, 1);
+    }
+
+    /// A row with no span sits on a line carrying a second call, so which of
+    /// them it is, is not something the line says.
+    #[test]
+    fn a_line_carrying_more_than_one_call_states_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let client = write(root, "src/lib/shelves.ts", CLIENT);
+        let source = CONSUMER.replace(
+            "queryFn: () => shelvesApi.list(),",
+            "queryFn: () => shelvesApi.list() ?? fallback(),",
+        );
+        let consumer = write(root, "src/hooks/useShelves.ts", &source);
+
+        let (results, joins) = join(vec![
+            (
+                client,
+                vec![request_row(
+                    CLIENT,
+                    "fetch(\"/v1/shelves\")",
+                    "GET",
+                    "/v1/shelves",
+                )],
+            ),
+            (
+                consumer.clone(),
+                vec![row(&source, "shelvesApi.list()", "GET", "/v1/shelves")],
+            ),
+        ]);
+
+        assert_eq!(link(&results, &consumer), None);
+        assert_eq!(joins, WrapperCallJoins::default());
+    }
+
+    #[test]
+    fn a_call_through_an_imported_member_reaches_the_request_that_member_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let client = write(root, "src/lib/shelves.ts", CLIENT);
+        let consumer = write(root, "src/hooks/useShelves.ts", CONSUMER);
+
+        let (results, joins) = join(vec![
+            (
+                client.clone(),
+                vec![request_row(
+                    CLIENT,
+                    "fetch(\"/v1/shelves\")",
+                    "GET",
+                    "/v1/shelves",
+                )],
+            ),
+            (
+                consumer.clone(),
+                vec![row(CONSUMER, "shelvesApi.list()", "GET", "/v1/shelves")],
             ),
         ]);
 
@@ -449,33 +558,28 @@ export function useCapabilities() {
     fn a_member_reached_through_a_barrel_still_names_the_declaring_module() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let client = write(root, "src/lib/capabilities.ts", CLIENT);
+        let client = write(root, "src/lib/shelves.ts", CLIENT);
         write(
             root,
             "src/lib/index.ts",
-            "export { capabilitiesApi } from \"./capabilities\";\n",
+            "export { shelvesApi } from \"./shelves\";\n",
         );
-        let source = CONSUMER.replace("../lib/capabilities", "../lib");
-        let consumer = write(root, "src/hooks/useCapabilities.ts", &source);
+        let source = CONSUMER.replace("../lib/shelves", "../lib");
+        let consumer = write(root, "src/hooks/useShelves.ts", &source);
 
         let (results, joins) = join(vec![
             (
                 client.clone(),
                 vec![request_row(
                     CLIENT,
-                    "fetch(\"/v1/me/capabilities\")",
+                    "fetch(\"/v1/shelves\")",
                     "GET",
-                    "/v1/me/capabilities",
+                    "/v1/shelves",
                 )],
             ),
             (
                 consumer.clone(),
-                vec![row(
-                    &source,
-                    "capabilitiesApi.getMine()",
-                    "GET",
-                    "/v1/me/capabilities",
-                )],
+                vec![row(&source, "shelvesApi.list()", "GET", "/v1/shelves")],
             ),
         ]);
 
@@ -497,30 +601,20 @@ export function useCapabilities() {
         write(
             root,
             "src/lib/index.ts",
-            "export { capabilitiesApi } from \"./capabilities\";\n",
+            "export { shelvesApi } from \"./shelves\";\n",
         );
         // The client module reaches its own binding through the barrel beside
         // it, which is how a circular barrel import is written.
         let source = format!(
-            "import {{ capabilitiesApi }} from \"./index\";\n\n{CLIENT}\nexport const mine = () => capabilitiesApi.getMine();\n"
+            "import {{ shelvesApi }} from \"./index\";\n\n{CLIENT}\nexport const mine = () => shelvesApi.list();\n"
         );
-        let client = write(root, "src/lib/capabilities.ts", &source);
+        let client = write(root, "src/lib/shelves.ts", &source);
 
         let (results, joins) = join(vec![(
             client.clone(),
             vec![
-                request_row(
-                    &source,
-                    "fetch(\"/v1/me/capabilities\")",
-                    "GET",
-                    "/v1/me/capabilities",
-                ),
-                row(
-                    &source,
-                    "capabilitiesApi.getMine()",
-                    "GET",
-                    "/v1/me/capabilities",
-                ),
+                request_row(&source, "fetch(\"/v1/shelves\")", "GET", "/v1/shelves"),
+                row(&source, "shelvesApi.list()", "GET", "/v1/shelves"),
             ],
         )]);
 
@@ -540,30 +634,27 @@ export function useCapabilities() {
         let root = tmp.path();
         let client = write(
             root,
-            "src/lib/capabilities.ts",
-            &format!("{CLIENT}\nexport function formatCapabilities() {{\n  return {{}};\n}}\n"),
+            "src/lib/shelves.ts",
+            &format!("{CLIENT}\nexport function formatShelves() {{\n  return {{}};\n}}\n"),
         );
-        let local = "import { formatCapabilities } from \"../lib/capabilities\";\n\nconst capabilitiesApi = makeClient();\n\nexport function useCapabilities() {\n  return formatCapabilities(capabilitiesApi.getMine());\n}\n";
-        let consumer = write(root, "src/hooks/useCapabilities.ts", local);
+        // The call is alone on its line, so only the import guard stands
+        // between this row and a link.
+        let local = "import { formatShelves } from \"../lib/shelves\";\n\nconst shelvesApi = makeClient();\n\nexport function useShelves() {\n  const rows = shelvesApi.list();\n  return formatShelves(rows);\n}\n";
+        let consumer = write(root, "src/hooks/useShelves.ts", local);
 
         let (results, joins) = join(vec![
             (
                 client,
                 vec![request_row(
                     CLIENT,
-                    "fetch(\"/v1/me/capabilities\")",
+                    "fetch(\"/v1/shelves\")",
                     "GET",
-                    "/v1/me/capabilities",
+                    "/v1/shelves",
                 )],
             ),
             (
                 consumer.clone(),
-                vec![row(
-                    local,
-                    "capabilitiesApi.getMine()",
-                    "GET",
-                    "/v1/me/capabilities",
-                )],
+                vec![row(local, "shelvesApi.list()", "GET", "/v1/shelves")],
             ),
         ]);
 
@@ -582,10 +673,10 @@ export function useCapabilities() {
         let root = tmp.path();
         let two_requests = CLIENT.replace(
             "  },\n};",
-            "  },\n  getMineAgain: async () => fetch(\"/v1/me/capabilities\"),\n};",
+            "  },\n  listAgain: async () => fetch(\"/v1/shelves\"),\n};",
         );
-        let client = write(root, "src/lib/capabilities.ts", &two_requests);
-        let consumer = write(root, "src/hooks/useCapabilities.ts", CONSUMER);
+        let client = write(root, "src/lib/shelves.ts", &two_requests);
+        let consumer = write(root, "src/hooks/useShelves.ts", CONSUMER);
 
         let (results, joins) = join(vec![
             (
@@ -593,26 +684,21 @@ export function useCapabilities() {
                 vec![
                     request_row(
                         &two_requests,
-                        "fetch(\"/v1/me/capabilities\")",
+                        "fetch(\"/v1/shelves\")",
                         "GET",
-                        "/v1/me/capabilities",
+                        "/v1/shelves",
                     ),
                     request_row(
                         &two_requests,
-                        "getMineAgain: async () => fetch",
+                        "listAgain: async () => fetch",
                         "GET",
-                        "/v1/me/capabilities",
+                        "/v1/shelves",
                     ),
                 ],
             ),
             (
                 consumer.clone(),
-                vec![row(
-                    CONSUMER,
-                    "capabilitiesApi.getMine()",
-                    "GET",
-                    "/v1/me/capabilities",
-                )],
+                vec![row(CONSUMER, "shelvesApi.list()", "GET", "/v1/shelves")],
             ),
         ]);
 
@@ -635,27 +721,22 @@ export function useCapabilities() {
     fn a_row_for_another_operation_reaches_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let client = write(root, "src/lib/capabilities.ts", CLIENT);
-        let consumer = write(root, "src/hooks/useCapabilities.ts", CONSUMER);
+        let client = write(root, "src/lib/shelves.ts", CLIENT);
+        let consumer = write(root, "src/hooks/useShelves.ts", CONSUMER);
 
         let (results, joins) = join(vec![
             (
                 client,
                 vec![request_row(
                     CLIENT,
-                    "fetch(\"/v1/me/capabilities\")",
+                    "fetch(\"/v1/shelves\")",
                     "GET",
-                    "/v1/me/capabilities",
+                    "/v1/shelves",
                 )],
             ),
             (
                 consumer.clone(),
-                vec![row(
-                    CONSUMER,
-                    "capabilitiesApi.getMine()",
-                    "GET",
-                    "/v1/me/settings",
-                )],
+                vec![row(CONSUMER, "shelvesApi.list()", "GET", "/v1/crates")],
             ),
         ]);
 
@@ -671,17 +752,17 @@ export function useCapabilities() {
     fn a_deterministic_row_is_never_relabelled() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let client = write(root, "src/lib/capabilities.ts", CLIENT);
-        let consumer = write(root, "src/hooks/useCapabilities.ts", CONSUMER);
+        let client = write(root, "src/lib/shelves.ts", CLIENT);
+        let consumer = write(root, "src/hooks/useShelves.ts", CONSUMER);
 
         let (results, joins) = join(vec![
             (
                 client,
                 vec![request_row(
                     CLIENT,
-                    "fetch(\"/v1/me/capabilities\")",
+                    "fetch(\"/v1/shelves\")",
                     "GET",
-                    "/v1/me/capabilities",
+                    "/v1/shelves",
                 )],
             ),
             (
@@ -690,12 +771,7 @@ export function useCapabilities() {
                     // The imported-member pass read this row out of the
                     // declaring module itself: it already says what it is.
                     resolution_source: Some(ResolutionSource::ImportedMember),
-                    ..row(
-                        CONSUMER,
-                        "capabilitiesApi.getMine()",
-                        "GET",
-                        "/v1/me/capabilities",
-                    )
+                    ..row(CONSUMER, "shelvesApi.list()", "GET", "/v1/shelves")
                 }],
             ),
         ]);

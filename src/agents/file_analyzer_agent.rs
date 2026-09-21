@@ -482,6 +482,11 @@ pub struct DataCallResult {
     /// Carrying it makes the row a `wrapper_call` in the graph
     /// ([`crate::mount_graph::ConsumerRole`]) and names the row it should be
     /// grouped with, which is what a reader needs to count one request once.
+    ///
+    /// Unlike `consumers_not_resolved`, this cannot go stale on an incremental
+    /// scan: the cache holds the model's RAW answer, so the join runs again
+    /// over every file's rows on every scan and computes this from the lines
+    /// the declaring module has now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reaches_request: Option<String>,
 }
