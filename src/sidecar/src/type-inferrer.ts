@@ -2224,11 +2224,6 @@ export class TypeInferrer {
       return undefined;
     }
 
-    const succeeded = carried.filter((arg) => !this.isErrorShaped(arg, at));
-    if (succeeded.length === 1 && succeeded.length < carried.length) {
-      return succeeded[0];
-    }
-
     const argTexts = new Map(carried.map((arg) => [arg.getText(), arg]));
     const read = new Set<string>();
     for (const projection of projections) {
@@ -2237,8 +2232,29 @@ export class TypeInferrer {
         read.add(projected.getText());
       }
     }
-    if (read.size === 1) {
-      return argTexts.get([...read][0]);
+    const byRead = read.size === 1 ? argTexts.get([...read][0]) : undefined;
+
+    const succeeded = carried.filter((arg) => !this.isErrorShaped(arg, at));
+    const byShape =
+      succeeded.length === 1 && succeeded.length < carried.length ? succeeded[0] : undefined;
+
+    // The two tests must agree where both answer. An error shape is a shape,
+    // and a payload is free to have one — a contact form declares a `name` and
+    // a `message` too, and a service whose failure side is `{ code: number }`
+    // would then read as the success side. Where the source reads a DIFFERENT
+    // argument out than the shape test picked, the two disagree about which
+    // side is which and nothing here knows better than the source does.
+    if (byShape && byRead && byShape !== byRead) {
+      this.log(
+        `Call result at ${where} answers a carrier (${typeText(carrier, at)}) whose error ` +
+          `shape names '${typeText(byShape, at)}' as the payload while the source reads ` +
+          `'${typeText(byRead, at)}' out of it. Publishing the carrier as written rather ` +
+          'than picking one'
+      );
+      return undefined;
+    }
+    if (byShape ?? byRead) {
+      return byShape ?? byRead;
     }
 
     this.log(
@@ -2283,23 +2299,35 @@ export class TypeInferrer {
   }
 
   /**
-   * The platform's error shape: a `name` and a `message`, both strings. Every
-   * `Error` subclass has them and no payload a JSON body describes needs to.
-   * A union is error-shaped when every member of it is.
+   * The platform's error shape, in full: `name` and `message` strings AND a
+   * `stack`, which is what the `Error` interface declares and every subclass
+   * of it inherits.
+   *
+   * `stack` is what makes the test a test. A name and a message alone are a
+   * shape a PAYLOAD can have — a contact form declares both — and reading such
+   * a payload as the failure side would publish the other argument, which is
+   * the concrete-but-wrong answer this whole rule exists to avoid. A union is
+   * error-shaped when every member of it is.
    */
   private isErrorShaped(type: Type, at: Node): boolean {
     if (type.isUnion()) {
       return type.getUnionTypes().every((part) => this.isErrorShaped(part, at));
     }
-    const stringy = (property: TsSymbol | undefined): boolean => {
-      if (!property) return false;
+    const typeOf = (property: TsSymbol | undefined): Type | undefined => {
+      if (!property) return undefined;
       try {
-        return property.getTypeAtLocation(at).getText() === 'string';
+        return property.getTypeAtLocation(at);
       } catch {
-        return false;
+        return undefined;
       }
     };
-    return stringy(type.getProperty('name')) && stringy(type.getProperty('message'));
+    const stringy = (property: TsSymbol | undefined): boolean =>
+      typeOf(property)?.getNonNullableType().getText() === 'string';
+    return (
+      stringy(type.getProperty('name')) &&
+      stringy(type.getProperty('message')) &&
+      stringy(type.getProperty('stack'))
+    );
   }
 
   /**

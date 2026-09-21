@@ -16,10 +16,13 @@
  *
  * Nothing here matches a library or a package. The shape is "a union of object
  * branches, instantiated with type arguments, one of which a branch carries as
- * a member"; success is told from failure by the platform's own error shape,
- * and where that cannot tell them apart, by which argument the source itself
- * reads out. Where neither can, the carrier is left alone and the limit is
- * logged.
+ * a member". Success is told from failure two ways: by the platform's own
+ * error shape (a `name`, a `message` and a `stack`), and by which argument the
+ * source itself reads out of the carrier. Either answers alone — the whole-read
+ * case has no projection and the look-alike case has no error shape — but where
+ * both answer and DISAGREE, neither is published: an error shape is a shape a
+ * payload may have, and a payload may be an error report, so a disagreement
+ * means nothing here knows better than the source does.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -46,6 +49,19 @@ interface Attempt<T, E> {
 
 type Flagged<T, E> = { ok: true; items: T[] } | { ok: false; errors: E[] };
 
+interface ContactForm {
+  name: string;
+  message: string;
+}
+
+interface ValidationFailure {
+  code: number;
+}
+
+declare class ProblemReport extends Error {
+  code: number;
+}
+
 interface Future<T> {
   then<R>(onValue: (value: T) => R): Future<R>;
 }
@@ -58,6 +74,8 @@ declare function requestJson<T>(
 declare function requestPair(path: string): Promise<Pair<PreferenceEnvelope, string>>;
 declare function requestAttempt(path: string): Promise<Attempt<PreferenceEnvelope, Error>>;
 declare function requestFlagged(path: string): Promise<Flagged<PreferenceEnvelope, Error>>;
+declare function requestContact(path: string): Promise<Outcome<ContactForm, ValidationFailure>>;
+declare function requestProblem(path: string): Promise<Outcome<ProblemReport, string>>;
 declare function note(value: unknown): void;
 
 export async function loadPreferences(): Promise<PreferenceEnvelope | null> {
@@ -70,6 +88,32 @@ export async function loadPreferences(): Promise<PreferenceEnvelope | null> {
 
 export function fetchPreferences(): Future<Outcome<PreferenceEnvelope, Error>> {
   return requestJson("/v1/me/fetch", parseEnvelope);
+}
+
+export async function loadWhole(): Promise<unknown> {
+  const outcome = await requestJson("/v1/me/whole", parseEnvelope);
+  return outcome;
+}
+
+export async function loadContact(): Promise<ContactForm | null> {
+  const outcome = await requestContact("/v1/me/contact");
+  if (!outcome.ok) {
+    return null;
+  }
+  return outcome.value;
+}
+
+export async function loadContactWhole(): Promise<unknown> {
+  const outcome = await requestContact("/v1/me/contact-whole");
+  return outcome;
+}
+
+export async function loadProblem(): Promise<ProblemReport | null> {
+  const outcome = await requestProblem("/v1/me/problem");
+  if (!outcome.ok) {
+    return null;
+  }
+  return outcome.value;
 }
 
 export async function loadPair(): Promise<void> {
@@ -100,12 +144,16 @@ export async function loadFlagged(): Promise<PreferenceEnvelope[]> {
 `;
 
 /** 1-based lines in SERVICE_TS, read off the source above. */
-const AWAITED_LINE = 33;
-const RETURNED_LINE = 41;
-const AMBIGUOUS_LINE = 45;
-const READ_LINE = 50;
-const ATTEMPT_LINE = 58;
-const FLAGGED_LINE = 63;
+const AWAITED_LINE = 48;
+const RETURNED_LINE = 56;
+const WHOLE_LINE = 60;
+const CONTACT_LINE = 65;
+const CONTACT_WHOLE_LINE = 73;
+const PROBLEM_LINE = 78;
+const AMBIGUOUS_LINE = 86;
+const READ_LINE = 91;
+const ATTEMPT_LINE = 99;
+const FLAGGED_LINE = 104;
 
 interface InferShape {
   inferred_types?: Array<{
@@ -245,6 +293,80 @@ describe('carrick#1376: a result carrier is not the payload it carries', () => {
       'requestAttempt("/v1/me/attempt")'
     );
     assert.ok(inferred, 'the row must be answered');
+    assert.strictEqual(collapse(inferred.type_string), 'unknown');
+  });
+
+  it('resolves by the error shape alone where the source reads nothing out', async () => {
+    // Read whole, so there is no projection to fall back on: this is the case
+    // the platform's error shape has to answer by itself.
+    const inferred = await infer(
+      'Endpoint_Whole_Response',
+      WHOLE_LINE,
+      'requestJson("/v1/me/whole", parseEnvelope)'
+    );
+    assert.ok(inferred, 'the row must be answered');
+    assert.strictEqual(collapse(inferred.type_string), ENVELOPE_TEXT);
+  });
+
+  it('leaves a carrier alone where the shape test and the source disagree', async () => {
+    // `Outcome<ContactForm, ValidationFailure>`: a contact form declares a
+    // `name` and a `message`, so a looser error shape would read it as the
+    // FAILURE side and publish `ValidationFailure` as the payload. The source
+    // reads `outcome.value` — the contact form — so the two disagree, and
+    // nothing here knows better than the source does.
+    const inferred = await infer(
+      'Endpoint_Contact_Response',
+      CONTACT_LINE,
+      'requestContact("/v1/me/contact")'
+    );
+    assert.ok(inferred, 'the row must be answered');
+    assert.doesNotMatch(
+      inferred.type_string,
+      /code: number/,
+      'the failure side must never be published as the payload'
+    );
+  });
+
+  it('does not read a payload that merely has a name and a message as the failure side', async () => {
+    // `Outcome<ContactForm, ValidationFailure>` read WHOLE, so there is no
+    // source read to disagree with the shape test. A contact form declares a
+    // `name` and a `message`; only the `stack` half of the platform's error
+    // shape keeps it from being taken for the failure side and the other
+    // argument published as the body.
+    const inferred = await infer(
+      'Endpoint_ContactWhole_Response',
+      CONTACT_WHOLE_LINE,
+      'requestContact("/v1/me/contact-whole")'
+    );
+    assert.ok(inferred, 'the row must be answered');
+    assert.doesNotMatch(
+      inferred.type_string,
+      /code: number/,
+      'a payload with a name and a message is not an error'
+    );
+    assert.match(inferred.type_string, /ok:/, 'the carrier keeps its own answer here');
+  });
+
+  it('leaves a carrier alone where an error-shaped argument is what the source reads', async () => {
+    // `Outcome<ProblemReport, string>`: the SUCCESS side is a real `Error`
+    // subclass — a service whose body is a problem report — so the error shape
+    // names the other argument, `string`, as the payload. The source reads the
+    // report out. They disagree, so neither is published; publishing `string`
+    // as a response body would be a concrete answer of the wrong shape.
+    const inferred = await infer(
+      'Endpoint_Problem_Response',
+      PROBLEM_LINE,
+      'requestProblem("/v1/me/problem")'
+    );
+    assert.ok(inferred, 'the row must be answered');
+    assert.notStrictEqual(
+      collapse(inferred.type_string),
+      'string',
+      'the failure side must never be published as the payload'
+    );
+    // With the carrier declining, carrick#1375 has the last word: every read
+    // of this result is a member read that resolves to a type argument, so
+    // the site states no contract and a sibling site answers the alias.
     assert.strictEqual(collapse(inferred.type_string), 'unknown');
   });
 
