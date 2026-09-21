@@ -257,7 +257,7 @@ fn a_signal_to_a_build_reaches_the_scan_it_is_waiting_on() {
         .spawn()
         .expect("start a build");
 
-    let scan = first_child_of(build.id(), DEADLINE);
+    let scan = scan_child_of(build.id(), DEADLINE);
     send(&build, libc::SIGTERM);
 
     let code = code_within(&mut build, DEADLINE, "the build never ended");
@@ -288,16 +288,21 @@ fn alive(pid: libc::pid_t) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
-/// The first child `parent` spawns, waited for rather than assumed.
+/// The scan subprocess `parent` starts, waited for rather than assumed.
 ///
-/// A build's phases start one subprocess at a time, and which moment the first
-/// one appears in is the machine's to decide — so this waits for it instead of
-/// sleeping for a guess.
-fn first_child_of(parent: u32, deadline: Duration) -> libc::pid_t {
+/// Matched by NAME, not by being the first child listed. A build runs `git`
+/// subprocesses of its own before it starts a scan, each of which lives a few
+/// milliseconds — and a test that caught one of those would be watching a pid
+/// that was about to exit whatever happened, which answers green to the
+/// question this test asks whether the signal was forwarded or not.
+///
+/// Which moment the scan appears in is the machine's to decide, so this waits
+/// for it rather than sleeping for a guess.
+fn scan_child_of(parent: u32, deadline: Duration) -> libc::pid_t {
     let start = Instant::now();
     loop {
         let listed = Command::new("pgrep")
-            .args(["-P", &parent.to_string()])
+            .args(["-P", &parent.to_string(), "-x", "carrick"])
             .output()
             .expect("pgrep is what lists a process's children on both platforms this runs on");
         let first = String::from_utf8_lossy(&listed.stdout)
