@@ -84,6 +84,12 @@ const PAIRS: CheckPairSpec[] = [
   }),
   mk('wirebigint', 'Wire_Bigint_Producer', 'Wire_Bigint_Consumer'),
   mk('wirepartial', 'Wire_Partial_Producer', 'Wire_Partial_Consumer'),
+  // carrick#1375, both halves of the ticket's "done when": the envelope the
+  // client declares reads compatible against the producer's, and the
+  // projection a hook derives off it does not. The type layer's job is to
+  // hand the judge the first of those and never the second.
+  mk('envelope', 'Envelope_Producer', 'Envelope_Consumer'),
+  mk('envelopeprojection', 'Envelope_Producer', 'Envelope_Projection'),
 ];
 
 function byKey(verdicts: CheckVerdict[]): Map<string, CheckVerdict> {
@@ -115,6 +121,7 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type Wire_Req_Producer = { at: string; };',
         'export type Wire_Bigint_Producer = { id: string; size: bigint; };',
         'export type Wire_Partial_Producer = { createdAt: Date; size: number; };',
+        'export type Envelope_Producer = { flags: { [key: string]: boolean; }; list: string[]; version: string; };',
       ].join('\n') + '\n'
     );
     writeStub(
@@ -139,6 +146,8 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
         'export type Wire_Req_Consumer = { at: Date; };',
         'export type Wire_Bigint_Consumer = { id: string; size: string; };',
         'export type Wire_Partial_Consumer = { createdAt: string; size: string; };',
+        'export type Envelope_Consumer = { flags: { [key: string]: boolean; }; list: string[]; version: string; };',
+        'export type Envelope_Projection = { [key: string]: boolean; };',
       ].join('\n') + '\n'
     );
     stubs = [
@@ -189,6 +198,21 @@ describe('check_v2 core: four buckets + determinism (real pnpm + tsc)', () => {
     assert.strictEqual(v.bucket, 'incompatible');
     assert.match(v.diagnostic!, /Property 'b' is missing/);
     assert.ok(v.codes.includes(2741));
+  });
+
+  // carrick#1375: the producer's envelope and the client's declared envelope
+  // agree, and the map the hook derives off one member of it does not. Both
+  // verdicts are right; which one a reader gets is decided by which type the
+  // consumer row carries, which is why a projection must never reach here.
+  it('an envelope both sides declare is compatible; its projection is not', () => {
+    const agreed = verdicts.get('envelope')!;
+    assert.strictEqual(
+      agreed.bucket,
+      'compatible',
+      `declared envelope vs declared envelope: ${agreed.diagnostic}`
+    );
+    const projected = verdicts.get('envelopeprojection')!;
+    assert.strictEqual(projected.bucket, 'incompatible');
   });
 
   it('bucket 3 — unverifiable: a side decayed to unknown (gate fired)', () => {

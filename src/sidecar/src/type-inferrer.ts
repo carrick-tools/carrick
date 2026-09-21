@@ -406,6 +406,8 @@ interface CallResultUse {
    * a projection prints is not a wire contract and must not be judged as one.
    */
   projectionOnly: boolean;
+  /** The member reads themselves, so a caller can ask what they resolve to. */
+  projections: Node[];
 }
 
 /**
@@ -1454,6 +1456,7 @@ export class TypeInferrer {
     // row also reads as blind rather than as a sighted answer.
     if (
       use.projectionOnly &&
+      this.projectionReadsGenericPayload(callExpr, use.projections) &&
       !unwrapResult.wasUnwrapped &&
       !explicitType &&
       callExpr.getTypeArguments().length !== 1
@@ -1962,7 +1965,7 @@ export class TypeInferrer {
     if (returnStmt) {
       const returnExpr = returnStmt.getExpression();
       if (returnExpr) {
-        return { terminal: returnExpr, projectionOnly: false };
+        return { terminal: returnExpr, projectionOnly: false, projections: [] };
       }
     }
 
@@ -1970,8 +1973,8 @@ export class TypeInferrer {
     if (binding && func) {
       let currentNames = binding.names;
       let lastNode: Node = binding.node;
-      /** A member was read OUT of the tracked value (carrick#1375). */
-      let sawProjection = false;
+      /** The member reads taken OUT of the tracked value (carrick#1375). */
+      const projections: Node[] = [];
       /** The value itself was read: returned, passed, aliased, or body-read. */
       let sawWholeRead = false;
       const startPos = callExpr.getStart();
@@ -2006,8 +2009,9 @@ export class TypeInferrer {
           // carrick#1375: how the source reads the value decides whether this
           // site states a payload at all. A member read takes a PART of it; a
           // return, an argument, an alias or a parse reads the value itself.
-          if (this.projectionOnReceiver(expr)) {
-            sawProjection = true;
+          const projection = this.projectionOnReceiver(expr);
+          if (projection) {
+            projections.push(projection);
           } else {
             sawWholeRead = true;
           }
@@ -2057,11 +2061,43 @@ export class TypeInferrer {
 
       return {
         terminal: lastNode,
-        projectionOnly: sawProjection && !sawWholeRead,
+        projectionOnly: projections.length > 0 && !sawWholeRead,
+        projections,
       };
     }
 
-    return { terminal: callExpr, projectionOnly: false };
+    return { terminal: callExpr, projectionOnly: false, projections: [] };
+  }
+
+  /**
+   * True when a member read on the call's result resolves to one of that
+   * result's own TYPE ARGUMENTS — the source is unwrapping a generic envelope
+   * by hand (`state.data` off a `ResourceState<Envelope>`), and the payload it
+   * carries is the instantiation, not the envelope (carrick#1375).
+   *
+   * The generic is what tells the two apart. A call that answers its payload
+   * directly is read member by member too, and its declared result IS the
+   * contract; abstaining there would throw away the type the request boundary
+   * states, which a replay over a real repo's consumer rows showed on a
+   * `{ ok: true } | { ok: false; reason: string }` result read as `sent.ok`.
+   */
+  private projectionReadsGenericPayload(
+    callExpr: CallExpression,
+    projections: Node[]
+  ): boolean {
+    if (projections.length === 0) return false;
+    const result = this.unwrapPromiseType(callExpr.getType());
+    const args = [...result.getTypeArguments(), ...result.getAliasTypeArguments()];
+    if (args.length === 0) return false;
+    const argTexts = new Set(args.map((arg) => arg.getText()));
+    return projections.some((projection) => {
+      const read = this.unwrapPromiseType(projection.getType());
+      const parts = [read, read.getNonNullableType()];
+      for (const part of [...parts]) {
+        if (part.isUnion()) parts.push(...part.getUnionTypes());
+      }
+      return parts.some((part) => argTexts.has(part.getText()));
+    });
   }
 
   /**

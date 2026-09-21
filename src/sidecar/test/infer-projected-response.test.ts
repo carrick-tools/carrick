@@ -76,6 +76,18 @@ export function usePreferences() {
   return { flags, pending: query.isPending };
 }
 
+type SendOutcome = { ok: true } | { ok: false; reason: string };
+
+declare function sendConfirmation(address: string): Promise<SendOutcome>;
+
+export async function confirm(address: string): Promise<boolean> {
+  const sent = await sendConfirmation(address);
+  if (!sent.ok) {
+    return false;
+  }
+  return true;
+}
+
 export async function cachePreferences(): Promise<PreferenceEnvelope> {
   const envelope = await loadPreferences();
   const size = envelope.list.length;
@@ -88,7 +100,8 @@ export async function cachePreferences(): Promise<PreferenceEnvelope> {
 const FETCHER_LINE = 17;
 const PARSED_FETCHER_LINE = 22;
 const HOOK_LINE = 43;
-const WHOLE_READ_LINE = 49;
+const NON_GENERIC_LINE = 53;
+const WHOLE_READ_LINE = 61;
 
 const ENVELOPE_TEXT =
   '{ flags: { [key: string]: boolean; }; list: string[]; version: string; }';
@@ -209,6 +222,25 @@ describe('carrick#1375: a projection of the response is not the response', () =>
       'PreferenceEnvelope',
       'a parsed value is derived, but it is the payload itself and not a part of it'
     );
+  });
+
+  it('answers the declared result where the call is not a generic envelope', async () => {
+    // The live shape this rule had to be narrowed for: a result read only
+    // through its members (`sent.ok`), whose declared type IS the payload.
+    // A generic is what marks an envelope the source unwraps by hand; without
+    // one, the call states the contract and abstaining would discard it.
+    const inferred = await infer(
+      'Endpoint_Confirm_Response',
+      NON_GENERIC_LINE,
+      'sendConfirmation(address)'
+    );
+    assert.ok(inferred, 'the declared result is the contract here');
+    assert.notStrictEqual(
+      collapse(inferred.type_string),
+      'unknown',
+      'a non-generic result read member by member still states its own payload'
+    );
+    assert.match(inferred.type_string, /ok/);
   });
 
   it('answers the payload where the value is also read whole', async () => {
