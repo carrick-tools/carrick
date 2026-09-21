@@ -789,6 +789,7 @@ mod tests {
             S::SameFileWrapper,
             S::WholeUrlEnv,
             S::EnvBasePath,
+            S::LiteralBasePath,
             S::NewUrl,
             S::ReceiverType,
             S::InlineLiteral,
