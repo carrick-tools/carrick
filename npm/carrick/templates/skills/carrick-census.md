@@ -53,6 +53,11 @@ Report these numbers before the list, per query where the field is per query:
 - `hidden_by_threshold` where the answer carries it: how many rows the floor
   removed, and `best` where it names the closest of them. A count above zero is
   the case for one more search at a lower `similarity_threshold`;
+- `hidden_by_lexical_floor` where the answer carries it: how many rows matched a
+  word of the query but too little of its word weight to rank, and `best` where
+  it names the nearest of them, with the weight it reached against the bar it
+  had to clear. A lower `similarity_threshold` does not reach these rows. The
+  search that does names the identifier or the rare term itself;
 - `total_without_intent`, which is index-wide: functions carrying no intent
   text, which the search ranked on their name, signature and body tokens
   alone, so a query that names one finds it and a query that describes what

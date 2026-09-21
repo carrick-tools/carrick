@@ -57,10 +57,17 @@ For each consumer service the step above listed:
 check_compatibility({{SCOPE}}, consumer_service: "<consumer>", producer_service: "<producer>", path: "<path>")
 ```
 
-Pass `path`. Without it a large producer returns hundreds of rows. Read
-`type_verdicts` (`compatible`, `incompatible`, `unresolved`, `not_compared`) and
-the `issues` rows for this operation. A `not_compared` pair has no stored
-verdict, which is never agreement.
+Pass `path`. Without it a large producer returns hundreds of rows.
+
+Read `status` before the buckets: `compatible`, `incompatible`,
+`partially_checked`, or `unresolved` where the check compared nothing, with
+`pairs_compared` and `pairs_uncompared` saying how much of the pair it reached.
+A `status` of `unresolved` is not a pass. It means the answer holds no evidence
+either way, and `type_verdicts` says where the gap is.
+
+Then read `type_verdicts` (`compatible`, `incompatible`, `unresolved`,
+`not_compared`) and the `issues` rows for this operation. A `not_compared` pair
+has no stored verdict, which is never agreement.
 
 ## 4. A file you have already edited
 
