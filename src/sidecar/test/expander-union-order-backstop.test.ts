@@ -21,7 +21,9 @@ import { Project, type Type } from 'ts-morph';
 import {
   expandTypeStructural,
   MAX_EXPANSION_DEPTH,
+  type ExpandOrigin,
 } from '../src/type-structural-expander.js';
+import { expandOriginOf } from './helpers.js';
 
 const MEMBERS_JOB = `'PENDING' | 'TIMED_OUT' | 'CANCELED' | 'RUNNING'`;
 const MEMBERS_RUN = `'CANCELED' | 'RUNNING' | 'TIMED_OUT' | 'PENDING'`;
@@ -65,21 +67,25 @@ function expandInOrder(aliases: string[]): Map<string, string> {
   const sf = project.createSourceFile('surface.ts', SOURCE);
   const out = new Map<string, string>();
   for (const alias of aliases) {
-    out.set(alias, expandTypeStructural(sf.getTypeAliasOrThrow(alias).getType()));
+    out.set(
+      alias,
+      expandTypeStructural(sf.getTypeAliasOrThrow(alias).getType(), expandOriginOf(project)),
+    );
   }
   return out;
 }
 
-/** A fresh program's type for one alias, for the direct-depth cases. */
-function aliasType(alias: string, source = SOURCE): Type {
+/** A fresh program's type for one alias, with its origin, for the direct-depth cases. */
+function aliasType(alias: string, source = SOURCE): { type: Type; origin: ExpandOrigin } {
   const project = new Project({
     useInMemoryFileSystem: true,
     compilerOptions: { strict: true },
   });
-  return project
+  const type = project
     .createSourceFile('surface.ts', source)
     .getTypeAliasOrThrow(alias)
     .getType();
+  return { type, origin: expandOriginOf(project) };
 }
 
 describe('expandTypeStructural union order at the depth backstop (#775)', () => {
@@ -128,7 +134,7 @@ describe('expandTypeStructural union order at the depth backstop (#775)', () => 
     // canonical order the expanded path produces.
     const union = aliasType('Status', `export type Status = ${MEMBERS_JOB};`);
     assert.strictEqual(
-      expandTypeStructural(union, new Set(), MAX_EXPANSION_DEPTH + 1),
+      expandTypeStructural(union.type, union.origin, { depth: MAX_EXPANSION_DEPTH + 1 }),
       '"CANCELED" | "PENDING" | "RUNNING" | "TIMED_OUT"',
     );
   });
@@ -140,12 +146,10 @@ describe('expandTypeStructural union order at the depth backstop (#775)', () => 
       'Maybe',
       `export type Maybe = 'b' | null | 'a' | number;`,
     );
-    const atBackstop = expandTypeStructural(
-      union,
-      new Set(),
-      MAX_EXPANSION_DEPTH + 1,
-    );
-    const aboveIt = expandTypeStructural(union, new Set(), 0);
+    const atBackstop = expandTypeStructural(union.type, union.origin, {
+      depth: MAX_EXPANSION_DEPTH + 1,
+    });
+    const aboveIt = expandTypeStructural(union.type, union.origin);
     assert.strictEqual(atBackstop, aboveIt);
     assert.strictEqual(atBackstop, '"a" | "b" | null | number');
   });
@@ -153,7 +157,7 @@ describe('expandTypeStructural union order at the depth backstop (#775)', () => 
   it('leaves a non-union backstop print alone', () => {
     const marker = aliasType('Marker2', 'export type Marker2 = { a: string };');
     assert.strictEqual(
-      expandTypeStructural(marker, new Set(), MAX_EXPANSION_DEPTH + 1),
+      expandTypeStructural(marker.type, marker.origin, { depth: MAX_EXPANSION_DEPTH + 1 }),
       '{ a: string; }',
     );
   });

@@ -27,7 +27,10 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { Project, Node, type SourceFile } from 'ts-morph';
-import { expandTypeStructural } from './type-structural-expander.js';
+import {
+  expandTypeStructural,
+  type ExpandOrigin,
+} from './type-structural-expander.js';
 
 export interface ResolvedDefinition {
   type_alias: string;
@@ -85,7 +88,10 @@ export class DefinitionResolver {
 
       const results: ResolvedDefinition[] = [];
       for (const alias of aliases) {
-        const result = this.resolveAlias(surface, alias);
+        const result = this.resolveAlias(surface, alias, {
+          program: stubProject.getProgram().compilerObject,
+          repoRoot: stubDir,
+        });
         if (result) {
           results.push(result);
         } else {
@@ -107,6 +113,7 @@ export class DefinitionResolver {
   private resolveAlias(
     sourceFile: SourceFile,
     alias: string,
+    origin: ExpandOrigin,
   ): ResolvedDefinition | null {
     const decl =
       sourceFile.getTypeAlias(alias) ??
@@ -142,7 +149,7 @@ export class DefinitionResolver {
       }
 
       // Structural form — every named member inlined to its shape.
-      const expanded = expandTypeStructural(type);
+      const expanded = expandTypeStructural(type, origin);
 
       return { type_alias: alias, definition, expanded };
     } catch (err) {

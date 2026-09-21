@@ -3,6 +3,8 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import type { Project } from 'ts-morph';
+import type { ExpandOrigin } from '../src/type-structural-expander.js';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -31,6 +33,16 @@ export function stubDirFor(dts: string): string {
   fs.mkdirSync(path.join(dir, 'types'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'types', 'surface.d.ts'), dts);
   return dir;
+}
+
+/**
+ * The `ExpandOrigin` for a test project: the structural printer decides
+ * library origin from the program, so every caller has to hand it one.
+ * `repoRoot` defaults to the root, which is what an in-memory project's files
+ * sit under.
+ */
+export function expandOriginOf(project: Project, repoRoot = '/'): ExpandOrigin {
+  return { program: project.getProgram().compilerObject, repoRoot };
 }
 
 /**

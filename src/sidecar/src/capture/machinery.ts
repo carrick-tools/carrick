@@ -185,7 +185,7 @@ function isFrameworkMachinery(scope: OriginScope, type: ts.Type): boolean {
  *     inside the checkout (the nearest `.git` above the service root) that
  *     carries no `node_modules` segment stays user source.
  *
- * Lockstep mirror of `isExternalOrigin` in `type-inferrer.ts` (the capture seam
+ * Lockstep mirror of `isExternalOrigin` in `origin.ts` (the capture seam
  * forbids sharing a module); `machinery-indicator-mirror.test.ts` guards the
  * pair on a real program.
  */

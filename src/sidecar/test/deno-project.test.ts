@@ -9,7 +9,8 @@ import { captureStub, runCheck } from '../src/capture/index.js';
 import ts from 'typescript';
 import { DenoProject, findDenoConfig } from '../src/capture/index.js';
 import { SidecarClient } from './helpers.js';
-import { TypeInferrer, isExternalOrigin } from '../src/type-inferrer.js';
+import { TypeInferrer } from '../src/type-inferrer.js';
+import { isExternalOrigin } from '../src/origin.js';
 
 const hasDeno = spawnSync('deno', ['--version']).status === 0;
 

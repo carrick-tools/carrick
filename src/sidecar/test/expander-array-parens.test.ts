@@ -11,6 +11,7 @@ import { describe, it } from 'node:test';
 import * as assert from 'node:assert';
 import { Project } from 'ts-morph';
 import { expandTypeStructural } from '../src/type-structural-expander.js';
+import { expandOriginOf } from './helpers.js';
 
 const noWs = (s: string) => s.replace(/\s/g, '');
 
@@ -30,7 +31,7 @@ describe('expandTypeStructural array parenthesisation (#257)', () => {
     `,
   );
   const expand = (name: string) =>
-    expandTypeStructural(sf.getTypeAliasOrThrow(name).getType());
+    expandTypeStructural(sf.getTypeAliasOrThrow(name).getType(), expandOriginOf(project));
 
   it('parenthesises a union array element', () => {
     const out = expand('ArrOfUnion');

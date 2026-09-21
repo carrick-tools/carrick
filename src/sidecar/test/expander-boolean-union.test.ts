@@ -15,6 +15,7 @@ import { describe, it } from 'node:test';
 import * as assert from 'node:assert';
 import { Project } from 'ts-morph';
 import { expandTypeStructural } from '../src/type-structural-expander.js';
+import { expandOriginOf } from './helpers.js';
 import { canonicalizeUnionsInText } from '../src/type-text-canonicalizer.js';
 
 const SOURCE = `
@@ -35,7 +36,10 @@ function expand(): string {
     compilerOptions: { strict: true },
   });
   const sf = project.createSourceFile('surface.ts', SOURCE);
-  return expandTypeStructural(sf.getTypeAliasOrThrow('Surface').getType());
+  return expandTypeStructural(
+    sf.getTypeAliasOrThrow('Surface').getType(),
+    expandOriginOf(project),
+  );
 }
 
 describe('boolean prints as boolean (#1165)', () => {
