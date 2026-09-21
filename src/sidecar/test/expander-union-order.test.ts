@@ -18,6 +18,7 @@ import { describe, it } from 'node:test';
 import * as assert from 'node:assert';
 import { Project } from 'ts-morph';
 import { expandTypeStructural } from '../src/type-structural-expander.js';
+import { expandOriginOf } from './helpers.js';
 
 const SOURCE = `
   interface Job { status: 'PENDING' | 'TIMED_OUT' | 'CANCELED' | 'RUNNING' }
@@ -35,7 +36,10 @@ function expandInOrder(aliases: string[]): Map<string, string> {
   const sf = project.createSourceFile('surface.ts', SOURCE);
   const out = new Map<string, string>();
   for (const alias of aliases) {
-    out.set(alias, expandTypeStructural(sf.getTypeAliasOrThrow(alias).getType()));
+    out.set(
+      alias,
+      expandTypeStructural(sf.getTypeAliasOrThrow(alias).getType(), expandOriginOf(project)),
+    );
   }
   return out;
 }
@@ -80,7 +84,10 @@ describe('expandTypeStructural union member order (#735)', () => {
       export type Mixed = number | null | undefined | Zebra | 'lit';
       `,
     );
-    const expanded = expandTypeStructural(sf.getTypeAliasOrThrow('Mixed').getType());
+    const expanded = expandTypeStructural(
+      sf.getTypeAliasOrThrow('Mixed').getType(),
+      expandOriginOf(project),
+    );
     // This used to keep the intrinsics ahead of the rest in compiler-id order,
     // on the grounds that it reproduced the compiler's own print. It does not:
     // `typeToString` prints `number | null` where the ids say `null | number`.
@@ -107,8 +114,8 @@ describe('expandTypeStructural union member order (#735)', () => {
       export type AZ = A & B;
       `,
     );
-    const za = expandTypeStructural(sf.getTypeAliasOrThrow('ZA').getType());
-    const az = expandTypeStructural(sf.getTypeAliasOrThrow('AZ').getType());
+    const za = expandTypeStructural(sf.getTypeAliasOrThrow('ZA').getType(), expandOriginOf(project));
+    const az = expandTypeStructural(sf.getTypeAliasOrThrow('AZ').getType(), expandOriginOf(project));
     assert.strictEqual(za, az, 'an intersection must print the same either way round');
   });
 });

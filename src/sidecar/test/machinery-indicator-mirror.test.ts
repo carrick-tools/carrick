@@ -19,10 +19,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import ts from 'typescript';
-import {
-  MACHINERY_MEMBER_INDICATORS as INFERRER_SET,
-  isExternalOrigin as inferrerIsExternalOrigin,
-} from '../src/type-inferrer.js';
+import { MACHINERY_MEMBER_INDICATORS as INFERRER_SET } from '../src/type-inferrer.js';
+import { isExternalOrigin as inferrerIsExternalOrigin } from '../src/origin.js';
 import {
   MACHINERY_MEMBER_INDICATORS as CAPTURE_SET,
   isExternalOrigin as captureIsExternalOrigin,

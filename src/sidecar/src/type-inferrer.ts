@@ -37,8 +37,6 @@ import {
   type Symbol as TsSymbol,
   ts,
 } from 'ts-morph';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import type {
   InferRequestItem,
   InferResult,
@@ -51,8 +49,10 @@ import type {
   TypeProvenance,
 } from './types.js';
 import { validateInferRequestItem } from './validators.js';
+import { isExternalOrigin } from './origin.js';
 import {
   expandTypeStructural,
+  type ExpandOrigin,
   type MemberOverrides,
   type WireFormat,
 } from './type-structural-expander.js';
@@ -193,81 +193,6 @@ const RESPONSE_INIT_MEMBER_NAMES = new Set<string>([
   'statusText',
   'headers',
 ]);
-
-/**
- * True when a declaration's source file is runtime/library origin rather than
- * user source. Four answers, in order:
- *
- *  1. The runtime declarations Carrick materialises for a non-Node runtime
- *     under `.carrick/deno/` (carrick#1017), and the remote (JSR, `https:`)
- *     modules it copies beside them. Carrick's own artefact layout, not a
- *     guess about anyone else's.
- *  2. A TypeScript default library (`lib.dom.d.ts`, ...), as the program
- *     classifies it; on a bare checkout the DOM `Response` resolves from here.
- *  3. An install under a `node_modules` segment, however it entered the
- *     program (an import, or a root the loader registered).
- *  4. A file the PROGRAM'S RESOLVER marked as an external library import.
- *     This is the graph-backed answer for a project whose resolution does not
- *     go through `node_modules` (carrick#1264): Deno serves an npm dependency's
- *     types from its own cache, a path with no `node_modules` segment, and
- *     `DenoProject.resolve` hands the compiler `isExternalLibraryImport` from
- *     the graph, which the compiler records on the file. Nothing crosses the
- *     capture seam; both programs are built with that host. One exclusion: a
- *     workspace package reached through a `node_modules` symlink is also
- *     marked external by the compiler but is the user's own source, so a file
- *     inside the checkout (the nearest `.git` above the service root) that
- *     carries no `node_modules` segment stays user source.
- *
- * Lockstep mirror of `isExternalOrigin` in `capture/machinery.ts` (the capture
- * seam forbids sharing a module); `machinery-indicator-mirror.test.ts` guards
- * the pair on a real program.
- */
-export function isExternalOrigin(
-  program: ts.Program,
-  sourceFile: ts.SourceFile,
-  repoRoot: string
-): boolean {
-  const file = sourceFile.fileName.replace(/\\/g, '/');
-  if (file.includes('/.carrick/deno/')) {
-    return true;
-  }
-  if (program.isSourceFileDefaultLibrary(sourceFile)) {
-    return true;
-  }
-  if (file.includes('/node_modules/')) {
-    return true;
-  }
-  return program.isSourceFileFromExternalLibrary(sourceFile) && !isInsideCheckout(file, repoRoot);
-}
-
-const checkoutRoots = new Map<string, string>();
-
-/** The checkout the service root sits in: the nearest ancestor holding a
- * `.git` entry (a directory, or the file a worktree carries), else the service
- * root itself. */
-function checkoutRootOf(repoRoot: string): string {
-  const key = path.resolve(repoRoot);
-  const cached = checkoutRoots.get(key);
-  if (cached) return cached;
-  let dir = key;
-  let root = key;
-  for (;;) {
-    if (fs.existsSync(path.join(dir, '.git'))) {
-      root = dir;
-      break;
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  checkoutRoots.set(key, root);
-  return root;
-}
-
-function isInsideCheckout(file: string, repoRoot: string): boolean {
-  const root = checkoutRootOf(repoRoot).replace(/\\/g, '/');
-  return file === root || file.startsWith(root.endsWith('/') ? root : root + '/');
-}
 
 /**
  * How far the response-helper recovery (carrick#631) descends through nested
@@ -501,6 +426,19 @@ export class TypeInferrer {
     this.project = options.project;
     this.packageOf = options.packageOf;
     this.repoRoot = options.repoRoot;
+  }
+
+  /**
+   * What the structural printer needs to tell the user's own declarations from
+   * the runtime's and its packages' — the same program and service root this
+   * class asks `isExternalOrigin` about machinery, so the two layers cannot
+   * classify one declaration two ways.
+   */
+  private expandOrigin(): ExpandOrigin {
+    return {
+      program: this.project.getProgram().compilerObject,
+      repoRoot: this.repoRoot,
+    };
   }
 
   /**
@@ -3397,14 +3335,14 @@ export class TypeInferrer {
     const fallback = typeNode.getText();
     try {
       const annotationType = this.unwrapPromiseType(typeNode.getType());
-      const expanded = expandTypeStructural(annotationType, new Set(), 0, undefined, wire);
+      const expanded = expandTypeStructural(annotationType, this.expandOrigin(), { wire });
       // Only prefer the structural form when expansion actually inlined an
       // object shape; otherwise keep the annotation text (e.g. a bare
       // primitive or a library type the expander leaves by name). A wire
       // print that differs from the declared one is a real answer too: a
       // `Date` annotation sends a string (carrick#1163).
       if (expanded.startsWith('{')) return expanded;
-      return wire === 'json' && expanded !== expandTypeStructural(annotationType)
+      return wire === 'json' && expanded !== expandTypeStructural(annotationType, this.expandOrigin())
         ? expanded
         : fallback;
     } catch {
@@ -3434,13 +3372,13 @@ export class TypeInferrer {
     wire: WireFormat = 'declared'
   ): string {
     try {
-      const expanded = expandTypeStructural(type, new Set(), 0, undefined, wire);
+      const expanded = expandTypeStructural(type, this.expandOrigin(), { wire });
       // A wire print that differs from the declared one is the answer even
       // without an inlined object: a bare `Date` payload sends a string.
       if (
         wire === 'json' &&
         !expanded.includes('{') &&
-        expanded !== expandTypeStructural(type)
+        expanded !== expandTypeStructural(type, this.expandOrigin())
       ) {
         return expanded;
       }
@@ -5546,7 +5484,9 @@ export class TypeInferrer {
     const overrides: MemberOverrides = { types, applied: new Set(), at };
     let text: string;
     try {
-      text = expandTypeStructural(this.unwrapPromiseType(input), new Set(), 0, overrides);
+      text = expandTypeStructural(this.unwrapPromiseType(input), this.expandOrigin(), {
+        overrides,
+      });
     } catch {
       return null;
     }

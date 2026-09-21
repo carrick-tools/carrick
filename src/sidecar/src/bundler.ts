@@ -34,7 +34,10 @@ import type {
   ManifestEntry,
   SymbolFailure,
 } from './types.js';
-import { expandTypeStructural } from './type-structural-expander.js';
+import {
+  expandTypeStructural,
+  type ExpandOrigin,
+} from './type-structural-expander.js';
 
 /**
  * #248: upper bound on `SymbolRequest.array_depth`. SDL list nesting is
@@ -585,11 +588,22 @@ export class TypeBundler {
    */
   private expandObjectBody(type: Type): string | null {
     try {
-      const expanded = expandTypeStructural(type);
+      const expanded = expandTypeStructural(type, this.expandOrigin());
       return expanded.startsWith('{') ? expanded : null;
     } catch {
       return null;
     }
+  }
+
+  /**
+   * The program and service root the printer decides library origin from; see
+   * `ExpandOrigin`.
+   */
+  private expandOrigin(): ExpandOrigin {
+    return {
+      program: this.project.getProgram().compilerObject,
+      repoRoot: this.repoRoot,
+    };
   }
 
   private extractTypeDefinition(
@@ -709,7 +723,7 @@ export class TypeBundler {
       // structural expander renders each correctly and keeps builtins/library
       // types by name, so the alias RHS is always emittable.
       const text = typeAlias.getText();
-      const expanded = expandTypeStructural(typeAlias.getType());
+      const expanded = expandTypeStructural(typeAlias.getType(), this.expandOrigin());
       if (expanded && expanded !== 'unknown') {
         const definition = `export type ${alias} = ${expanded};`;
         return { definition, typeString: expanded, typeStringIsExpression: true };

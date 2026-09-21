@@ -28,7 +28,9 @@ import { Project, type SourceFile } from 'ts-morph';
 import {
   expandTypeStructural,
   namedText,
+  type ExpandOrigin,
 } from '../src/type-structural-expander.js';
+import { expandOriginOf } from './helpers.js';
 
 const MEMBERS_A = `'sum' | 'count' | 'min'`;
 const MEMBERS_B = `'min' | 'sum' | 'count'`;
@@ -57,25 +59,26 @@ export type Coded${suffix} = { code: Enum<${members}>; marker: Marker };
 `;
 }
 
-function projectWith(): SourceFile {
+function projectWith(): { sf: SourceFile; origin: ExpandOrigin } {
   const project = new Project({
     useInMemoryFileSystem: true,
     compilerOptions: { strict: true },
   });
   project.createSourceFile('/node_modules/lib/index.d.ts', LIB);
   project.createSourceFile('/node_modules/lib/package.json', '{"types":"index.d.ts"}');
-  return project.createSourceFile(
+  const sf = project.createSourceFile(
     '/surface.ts',
     [source(MEMBERS_A, 'A'), source(MEMBERS_B, 'B')].join('\n'),
   );
+  return { sf, origin: expandOriginOf(project) };
 }
 
 /** Expand the named aliases in the given order, over a fresh program. */
 function expandInOrder(aliases: string[]): Map<string, string> {
-  const sf = projectWith();
+  const { sf, origin } = projectWith();
   const out = new Map<string, string>();
   for (const alias of aliases) {
-    out.set(alias, expandTypeStructural(sf.getTypeAliasOrThrow(alias).getType()));
+    out.set(alias, expandTypeStructural(sf.getTypeAliasOrThrow(alias).getType(), origin));
   }
   return out;
 }
@@ -162,7 +165,7 @@ describe('union order inside a compiler print (#775)', () => {
       .getTypeAliasOrThrow('Mixed')
       .getType();
 
-    assert.strictEqual(expandTypeStructural(mixed), namedText(mixed));
+    assert.strictEqual(expandTypeStructural(mixed, expandOriginOf(project)), namedText(mixed));
   });
 
   it('keeps every member of a printed union', () => {

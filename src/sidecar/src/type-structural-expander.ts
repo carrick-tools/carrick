@@ -34,6 +34,7 @@ import {
   canonicalizeUnionsInText,
   foldBooleanLiterals,
 } from './type-text-canonicalizer.js';
+import { isExternalOrigin } from './origin.js';
 
 /**
  * Bound on the structural-expansion recursion. Deep enough for every realistic
@@ -116,28 +117,62 @@ function childCursor(
 export type WireFormat = 'declared' | 'json';
 
 /**
+ * The program the walked type belongs to, and the service root inside it.
+ *
+ * Required, not optional, because the walk cannot decide from a type alone
+ * whether a declaration is the user's source or something the runtime
+ * installed: a path test answers that only where resolution goes through
+ * `node_modules`, and a runtime that serves an npm dependency's types out of
+ * its own cache leaves no such segment in the path (carrick#1264). The program
+ * carries the resolver's own verdict, so it is what `isExternalOrigin` is
+ * asked — the same instrument the inference path uses, so the two layers
+ * cannot disagree about which types to inline.
+ */
+export interface ExpandOrigin {
+  readonly program: ts.Program;
+  readonly repoRoot: string;
+}
+
+/** Everything `expandTypeStructural` takes besides the type and its origin. */
+export interface ExpandOptions {
+  /** Substitutions at named member positions; see `MemberOverrides`. */
+  readonly overrides?: MemberOverrides;
+  /** Which representation to print; see `WireFormat`. */
+  readonly wire?: WireFormat;
+  /**
+   * Where in the recursion the walk starts. Production callers never set it —
+   * depth is walk state — but the `MAX_EXPANSION_DEPTH` backstop is reachable
+   * from a shallow type only by starting the walk at the bound, which is how
+   * its union ordering is tested.
+   */
+  readonly depth?: number;
+}
+
+/**
  * Recursively render a `Type` as fully-inlined structural text.
  *
  * Named object/interface types are expanded to their member structure;
  * primitives, literals, library types (`Date`, `Promise`, tuples, …) and
- * functions stay by name. The `seen` set (object type ids on the current
- * branch) breaks reference cycles; `depth` is a hard backstop. `overrides`
- * substitutes a type at named member positions (`MemberOverrides`); without
- * it the print is unchanged. `wire` picks the representation (`WireFormat`).
+ * functions stay by name — `origin` is what decides which is which. A cycle
+ * set (object type ids on the current branch) breaks reference cycles and
+ * `MAX_EXPANSION_DEPTH` is a hard backstop; both are walk state, not caller
+ * state. `overrides` substitutes a type at named member positions
+ * (`MemberOverrides`); without it the print is unchanged. `wire` picks the
+ * representation (`WireFormat`).
  */
 export function expandTypeStructural(
   type: Type,
-  seen: Set<number> = new Set(),
-  depth = 0,
-  overrides?: MemberOverrides,
-  wire: WireFormat = 'declared',
+  origin: ExpandOrigin,
+  options: ExpandOptions = {},
 ): string {
+  const { overrides, wire = 'declared', depth = 0 } = options;
   return expandAt(
     type,
-    seen,
+    new Set(),
     depth,
     overrides ? { overrides, position: '' } : undefined,
     wire,
+    origin,
   );
 }
 
@@ -157,7 +192,7 @@ export function jsonWireType(type: Type): Type | undefined {
   const declaration = member.getValueDeclaration() ?? member.getDeclarations()[0];
   const memberType = declaration
     ? member.getTypeAtLocation(declaration)
-    : member.getDeclaredType();
+    : memberTypeWithoutDeclaration(member, type);
   const signature = memberType.getCallSignatures()[0];
   if (!signature) return undefined;
   const serialised = signature.getReturnType();
@@ -174,6 +209,7 @@ function expandAt(
   depth: number,
   at: OverrideCursor | undefined,
   wire: WireFormat,
+  origin: ExpandOrigin,
 ): string {
   if (depth > MAX_EXPANSION_DEPTH) return backstopText(type);
 
@@ -182,7 +218,7 @@ function expandAt(
     const replacement = cursor.overrides.types.get(cursor.position);
     if (replacement) {
       cursor.overrides.applied.add(cursor.position);
-      return expandAt(replacement, seen, depth, undefined, wire);
+      return expandAt(replacement, seen, depth, undefined, wire, origin);
     }
     // Nothing to substitute below here: print exactly as without overrides.
     if (!hasOverrideBelow(cursor)) cursor = undefined;
@@ -215,6 +251,7 @@ function expandAt(
       depth,
       cursor,
       wire,
+      origin,
     ).join(' | ');
   }
   if (type.isIntersection()) {
@@ -224,6 +261,7 @@ function expandAt(
       depth,
       cursor,
       wire,
+      origin,
     ).join(' & ');
   }
 
@@ -242,6 +280,7 @@ function expandAt(
       depth + 1,
       childCursor(cursor, '<0>'),
       wire,
+      origin,
     );
     // Parenthesise a union/intersection element so `(A | B)[]` doesn't misparse
     // as `A | B[]`. Decide from the TYPE, not the string: a single object
@@ -255,13 +294,13 @@ function expandAt(
   // type or not, so this runs before the by-name bail-out below.
   if (wire === 'json') {
     const serialised = jsonWireType(type);
-    if (serialised) return expandAt(serialised, seen, depth + 1, undefined, wire);
+    if (serialised) return expandAt(serialised, seen, depth + 1, undefined, wire, origin);
   }
 
   // Library / built-in types (Date, Promise, RegExp, …): keep by name, unless
   // a member below has to be substituted — a schema library declares its
   // inferred object types itself, and they are only walkable, not by-name.
-  if (!cursor && isLibraryType(type)) {
+  if (!cursor && isLibraryType(type, origin)) {
     return namedText(type);
   }
 
@@ -283,7 +322,7 @@ function expandAt(
     if (props.length === 0) return namedText(type);
 
     const parts = props.map((prop) =>
-      expandProperty(prop, nextSeen, depth, cursor, wire),
+      expandProperty(prop, type, nextSeen, depth, cursor, wire, origin),
     );
     return `{ ${parts.join('; ')}; }`;
   }
@@ -352,9 +391,10 @@ function canonicalMembers(
   depth: number,
   cursor: OverrideCursor | undefined,
   wire: WireFormat,
+  origin: ExpandOrigin,
 ): string[] {
   return orderMembers(members, (member) =>
-    expandAt(member, seen, depth + 1, cursor, wire),
+    expandAt(member, seen, depth + 1, cursor, wire, origin),
   );
 }
 
@@ -382,10 +422,12 @@ function orderMembers(
 /** Render a single property as `name[?]: <expanded>`. */
 function expandProperty(
   prop: Symbol,
+  owner: Type,
   seen: Set<number>,
   depth: number,
   at: OverrideCursor | undefined,
   wire: WireFormat,
+  origin: ExpandOrigin,
 ): string {
   const optional = (prop.getFlags() & ts.SymbolFlags.Optional) !== 0;
 
@@ -398,7 +440,7 @@ function expandProperty(
     ? prop.getTypeAtLocation(at.overrides.at)
     : propDecl
       ? prop.getTypeAtLocation(propDecl)
-      : prop.getDeclaredType();
+      : memberTypeWithoutDeclaration(prop, owner);
 
   // A substituted member takes the override's TYPE but keeps this key's
   // optionality, and is looked up before the `undefined` strip below so an
@@ -426,13 +468,38 @@ function expandProperty(
         depth,
         cursor,
         wire,
+        origin,
       ).join(' | ');
       return `${name}?: ${inner}`;
     }
   }
 
-  const inner = expandAt(propType, seen, depth + 1, cursor, wire);
+  const inner = expandAt(propType, seen, depth + 1, cursor, wire, origin);
   return `${name}${optional ? '?' : ''}: ${inner}`;
+}
+
+/**
+ * The type of a member the CHECKER synthesised, which has no declaration of
+ * its own to be read at (carrick#1433).
+ *
+ * A mapped type's members — what a query builder's projection, a
+ * `GetPayload<…>`-style generic or any homomorphic mapping produces — carry no
+ * declaration node. `Symbol.getDeclaredType()` answers `any` for such a symbol
+ * (it is the DECLARED type of a type symbol, and a value member declares
+ * none), so the printed contract lost every field the compiler had resolved:
+ * `{ id: string; createdAt: Date }` printed as `{ id: any; createdAt: any }`
+ * and the row was demoted for carrying a top type.
+ *
+ * The member is read at the owning type's own declaration instead — the mapped
+ * type node the checker instantiated. A synthesised member's type does not
+ * depend on the location it is read at (only narrowing and `this` do, and it
+ * has neither), so this is the instantiated member type; it is the same answer
+ * the caller's own node gives. With no declaration anywhere to read at, the
+ * declared type is still the only thing left to ask for.
+ */
+function memberTypeWithoutDeclaration(prop: Symbol, owner: Type): Type {
+  const ownerDecl = (owner.getSymbol() ?? owner.getAliasSymbol())?.getDeclarations()?.[0];
+  return ownerDecl ? prop.getTypeAtLocation(ownerDecl) : prop.getDeclaredType();
 }
 
 /**
@@ -460,23 +527,26 @@ function isTuple(type: Type): boolean {
 }
 
 /**
- * True for types declared in `node_modules` or a TS `lib.*.d.ts` (Date,
- * Promise, RegExp, …). These stay by name rather than being inlined.
+ * True for types the runtime or an installed package declares (Date, Promise,
+ * RegExp, a framework's own types, …). These stay by name rather than being
+ * inlined.
+ *
+ * Asked of the program (`isExternalOrigin`), not of the path: where resolution
+ * does not go through `node_modules` — a runtime serving an npm dependency's
+ * types from its own cache — a path test recognises nothing, and the walk
+ * inlines a library's internals as if they were the user's contract. An
+ * interface that extends `Array<T>` then prints as the whole array prototype,
+ * whose signatures carry `thisArg?: any`, and the row is demoted for a top
+ * type that is not in the contract at all (carrick#1264).
  */
-function isLibraryType(type: Type): boolean {
+function isLibraryType(type: Type, origin: ExpandOrigin): boolean {
   const symbol = type.getSymbol() ?? type.getAliasSymbol();
   if (!symbol) return false;
   const decls = symbol.getDeclarations();
   if (decls.length === 0) return false;
-  return decls.some((decl) => {
-    const sf = decl.getSourceFile();
-    if (sf.isInNodeModules()) return true;
-    return (
-      sf.isDeclarationFile() &&
-      // Normalize separators so a Windows `\\` path still matches lib.*.d.ts.
-      /(^|\/)lib\.[^/]*\.d\.ts$/.test(sf.getFilePath().replace(/\\/g, '/'))
-    );
-  });
+  return decls.some((decl) =>
+    isExternalOrigin(origin.program, decl.getSourceFile().compilerNode, origin.repoRoot),
+  );
 }
 
 /**
