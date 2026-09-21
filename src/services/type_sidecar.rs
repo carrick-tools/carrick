@@ -778,6 +778,14 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(900);
 /// on purpose: the process is killed straight after.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a blocking wait on the sidecar goes without asking whether this
+/// process has been signalled (carrick#1387).
+///
+/// Every wait here is a wait a person may be standing over: a tenth of a
+/// second is below what they can tell from an immediate stop, and it costs one
+/// atomic load to buy it.
+const INTERRUPT_CHECK: Duration = Duration::from_millis(100);
+
 /// The readiness budget for this run: [`READY_TIMEOUT_DEFAULT`] unless
 /// [`READY_TIMEOUT_ENV`] overrides it.
 pub fn ready_budget() -> Duration {
@@ -1189,6 +1197,10 @@ impl TypeSidecar {
 
         // Poll state until ready or timeout
         while start.elapsed() < timeout {
+            // A readiness budget is three minutes by default, and a scan that
+            // is signalled while it waits one out must not serve the whole of
+            // it first (carrick#1387).
+            crate::shutdown::check().map_err(SidecarError::Interrupted)?;
             let state = self.state.lock().unwrap();
             match &*state {
                 SidecarState::Ready => return Ok(()),
@@ -1738,9 +1750,16 @@ impl TypeSidecar {
             if remaining.is_zero() {
                 return Err(SidecarError::Timeout);
             }
-            let line = match responses.recv_timeout(remaining) {
+            // This is where a scan of a large repo spends its minutes, and it
+            // blocks: the thread is inside `recv_timeout`, so the race in
+            // `main` is not polled and a Ctrl-C at this point used to be acted
+            // on only when the answer came (carrick#1387). Waiting in slices
+            // is what gives the signal somewhere to be noticed.
+            crate::shutdown::check().map_err(SidecarError::Interrupted)?;
+            let line = match responses.recv_timeout(remaining.min(INTERRUPT_CHECK)) {
                 Ok(line) => line,
-                Err(RecvTimeoutError::Timeout) => return Err(SidecarError::Timeout),
+                // The slice ran out, not the budget: back round to the checks.
+                Err(RecvTimeoutError::Timeout) => continue,
                 // stdout hit EOF: the process is gone.
                 Err(RecvTimeoutError::Disconnected) => return Err(SidecarError::ProcessDied),
             };
@@ -1990,6 +2009,8 @@ pub enum SidecarError {
     CaptureFailed(String),
     /// v2 check failed
     CheckFailed(String),
+    /// This process was signalled while the wait was on (carrick#1387).
+    Interrupted(crate::shutdown::Interrupted),
 }
 
 impl SidecarError {
@@ -2024,6 +2045,7 @@ impl std::fmt::Display for SidecarError {
             SidecarError::ResolutionFailed(e) => write!(f, "Definition resolution failed: {}", e),
             SidecarError::CaptureFailed(e) => write!(f, "v2 capture failed: {}", e),
             SidecarError::CheckFailed(e) => write!(f, "v2 check failed: {}", e),
+            SidecarError::Interrupted(e) => write!(f, "{e}"),
         }
     }
 }

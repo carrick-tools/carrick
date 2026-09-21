@@ -11,6 +11,7 @@ mod call_site_extractor;
 mod cloud_storage;
 mod commonjs;
 mod config;
+mod console;
 mod consumer_row_fold;
 mod credentials;
 mod current_service;
@@ -61,6 +62,7 @@ mod sdk_edges;
 mod sdk_surface;
 mod service_derivation;
 mod services;
+mod shutdown;
 mod signature_pass;
 mod socket_io;
 mod swc_scanner;
@@ -116,7 +118,7 @@ impl CliArgs {
                 // What the npm shim asks an overridden binary before it runs
                 // it, so the run says which build it was (carrick#1100).
                 "--version" | "-V" => {
-                    println!("carrick {}", env!("CARGO_PKG_VERSION"));
+                    crate::outln!("carrick {}", env!("CARGO_PKG_VERSION"));
                     std::process::exit(0);
                 }
                 "--verbose" | "-v" => {
@@ -132,7 +134,7 @@ impl CliArgs {
                     repo_path = arg.to_string();
                 }
                 _ => {
-                    eprintln!("Unknown argument: {}", args[i]);
+                    crate::errln!("Unknown argument: {}", args[i]);
                     Self::print_help();
                     std::process::exit(1);
                 }
@@ -149,7 +151,7 @@ impl CliArgs {
     }
 
     fn print_help() {
-        eprintln!("{}", crate::help::HELP);
+        crate::errln!("{}", crate::help::HELP);
     }
 }
 
@@ -179,14 +181,14 @@ async fn main() {
                 std::process::exit(run_build(command).await);
             }
             Err(message) => {
-                eprintln!("carrick: {message}");
+                crate::errln!("carrick: {message}");
                 std::process::exit(2);
             }
         }
     }
 
     if let Some(problem) = unknown_command(&argv) {
-        eprintln!("carrick: {problem}");
+        crate::errln!("carrick: {problem}");
         std::process::exit(2);
     }
 
@@ -216,7 +218,14 @@ async fn main() {
     // The listener outlives the race so the report can be raced against it in
     // turn: a second Ctrl-C ends this process where it stands rather than
     // being swallowed by the handler that is still installed (carrick#1235).
-    let mut shutdown = ShutdownListener::install();
+    //
+    // The race is only half the reach, and the smaller half: both its arms are
+    // polled by this one task, so a CPU-bound pass or the blocking sidecar wait
+    // is a stretch in which the signal arm is never reached (carrick#1387).
+    // What covers those is the watcher's own task, which records the signal
+    // where the passes read it; a pass that notices returns and the run ends
+    // through the failure path below.
+    let mut shutdown = shutdown::watch();
     let raced = tokio::select! {
         biased;
         signal = shutdown.recv() => Err(signal),
@@ -230,10 +239,10 @@ async fn main() {
                 signal.name(),
                 scan_stage::current().as_str()
             );
-            let ended = within_budget(
+            let ended = shutdown::within_budget(
                 report_interruption(&repo_path),
                 shutdown.recv(),
-                INTERRUPTION_REPORT_BUDGET,
+                shutdown::INTERRUPTION_REPORT_BUDGET,
             )
             .await;
             debug!("This run's report of its own interruption: {ended:?}");
@@ -242,6 +251,35 @@ async fn main() {
     };
 
     if let Err(e) = finished {
+        // A pass noticed the signal and ended the run from inside it
+        // (carrick#1387). Everything the cloud is owed has already been sent on
+        // the way out: an open scan is marked failed by the engine's own `Err`
+        // branch, with this error's words as the reason, and the log is shipped
+        // after it. What is left is to say so and to leave with the code the
+        // signal names rather than with 1.
+        if let Some(signal) = shutdown::requested() {
+            error!(
+                "Scan interrupted by {} during {}: {}",
+                signal.name(),
+                scan_stage::current().as_str(),
+                e
+            );
+            progress::failed(scan_stage::current().as_str(), &e.to_string());
+            // A run interrupted before `start-scan` opened a scan has had
+            // nothing reported for it, and this is the one event it can send.
+            // Drained first: the signal that ended the run was recorded, never
+            // received, and racing the report against it unread would abandon
+            // the report in its first poll.
+            shutdown.drain();
+            let ended = shutdown::within_budget(
+                report_failure_before_scan(&repo_path, e.as_ref()),
+                shutdown.recv(),
+                shutdown::INTERRUPTION_REPORT_BUDGET,
+            )
+            .await;
+            debug!("This run's report of its own interruption: {ended:?}");
+            std::process::exit(signal.exit_code());
+        }
         // The stage is in the line a user pastes. The same token goes to the
         // cloud as the fail marker's `stage` (carrick#1063), so a terminal and
         // a dashboard name the same thing, and a run that could reach neither
@@ -271,7 +309,7 @@ async fn main() {
 /// build drives share its process group and hear the same Ctrl-C, and each
 /// reports its own interruption to the cloud.
 async fn run_build(command: local_mode::cli::LocalCommand) -> i32 {
-    let mut shutdown = ShutdownListener::install();
+    let mut shutdown = shutdown::watch();
     let build = tokio::task::spawn_blocking(move || local_mode::cli::run(command));
     tokio::select! {
         biased;
@@ -309,141 +347,6 @@ async fn report_failure_before_scan(repo_path: &str, error: &dyn std::error::Err
                 .await
         }
         Err(e) => debug!("No pre-scan failure report: {e}"),
-    }
-}
-
-/// A signal that ends a scan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Shutdown {
-    Interrupt,
-    Terminate,
-    /// The terminal this run was started from went away. Its default action
-    /// ends the process too, and a run that does not listen for it dies with
-    /// its slot still held (carrick#1235) — the same outcome a Ctrl-C had
-    /// before either was listened for.
-    Hangup,
-}
-
-impl Shutdown {
-    fn name(self) -> &'static str {
-        match self {
-            Shutdown::Interrupt => "SIGINT",
-            Shutdown::Terminate => "SIGTERM",
-            Shutdown::Hangup => "SIGHUP",
-        }
-    }
-
-    /// 128 plus the signal number, the code a shell reports for a process a
-    /// signal ended, so a caller reading the status sees the same thing it
-    /// would have without the handler.
-    fn exit_code(self) -> i32 {
-        match self {
-            Shutdown::Interrupt => 130,
-            Shutdown::Terminate => 143,
-            Shutdown::Hangup => 129,
-        }
-    }
-}
-
-/// SIGINT, SIGTERM and SIGHUP, listened for from the moment [`Self::install`]
-/// runs.
-struct ShutdownListener {
-    #[cfg(unix)]
-    interrupt: Option<tokio::signal::unix::Signal>,
-    #[cfg(unix)]
-    terminate: Option<tokio::signal::unix::Signal>,
-    #[cfg(unix)]
-    hangup: Option<tokio::signal::unix::Signal>,
-}
-
-impl ShutdownListener {
-    /// Register every handler now. A signal that cannot be listened for is
-    /// left with its default action.
-    fn install() -> Self {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            Self {
-                interrupt: signal(SignalKind::interrupt()).ok(),
-                terminate: signal(SignalKind::terminate()).ok(),
-                hangup: signal(SignalKind::hangup()).ok(),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            Self {}
-        }
-    }
-
-    /// The next signal. Never resolves when none could be listened for.
-    async fn recv(&mut self) -> Shutdown {
-        #[cfg(unix)]
-        {
-            async fn next(stream: Option<&mut tokio::signal::unix::Signal>) {
-                match stream {
-                    Some(stream) => {
-                        stream.recv().await;
-                    }
-                    None => std::future::pending::<()>().await,
-                }
-            }
-            tokio::select! {
-                () = next(self.interrupt.as_mut()) => Shutdown::Interrupt,
-                () = next(self.terminate.as_mut()) => Shutdown::Terminate,
-                () = next(self.hangup.as_mut()) => Shutdown::Hangup,
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            match tokio::signal::ctrl_c().await {
-                Ok(()) => Shutdown::Interrupt,
-                Err(_) => std::future::pending().await,
-            }
-        }
-    }
-}
-
-/// The reason an interrupted run reports, on either failure event.
-const INTERRUPTED_REASON: &str = "interrupted";
-
-/// How long an interrupted run may spend telling the cloud it stopped.
-///
-/// Deliberately shorter than the request timeout the marker itself carries:
-/// someone who pressed Ctrl-C is waiting for the process to go, and the whole
-/// report — reading the credential, asking git for the remote on the pre-scan
-/// branch, the POST — has to fit inside what they will wait for. The slot's
-/// own expiry is what covers a report that does not fit (carrick#1235).
-const INTERRUPTION_REPORT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// How an interrupted run's report to the cloud ended.
-#[derive(Debug, PartialEq, Eq)]
-enum Ended {
-    /// The report was made, whatever the cloud did with it.
-    Reported,
-    /// A second signal arrived while it was being made. Someone is asking
-    /// this process to go now, and it goes.
-    SecondSignal(Shutdown),
-    /// [`INTERRUPTION_REPORT_BUDGET`] ran out first.
-    Budget,
-}
-
-/// Run `report` with a way out of it: a second signal, or a budget.
-///
-/// The report is best effort on a process that is already ending, so nothing
-/// here waits on it — both escapes abandon it where it stands. `biased`, so a
-/// second signal that is already pending wins over a budget that expired in
-/// the same poll: what the user did beats what the clock did.
-async fn within_budget<R, S>(report: R, second_signal: S, budget: std::time::Duration) -> Ended
-where
-    R: std::future::Future<Output = ()>,
-    S: std::future::Future<Output = Shutdown>,
-{
-    tokio::pin!(report, second_signal);
-    tokio::select! {
-        biased;
-        signal = &mut second_signal => Ended::SecondSignal(signal),
-        () = &mut report => Ended::Reported,
-        () = tokio::time::sleep(budget) => Ended::Budget,
     }
 }
 
@@ -490,11 +393,11 @@ async fn report_interruption(repo_path: &str) {
     match (report, scan_id) {
         (InterruptionReport::ScanFailed, Some(scan_id)) => {
             storage
-                .report_scan_failed_for(scan_id, stage.as_str(), INTERRUPTED_REASON)
+                .report_scan_failed_for(scan_id, stage.as_str(), shutdown::INTERRUPTED_REASON)
                 .await
         }
         _ => {
-            let error = std::io::Error::other(INTERRUPTED_REASON);
+            let error = std::io::Error::other(shutdown::INTERRUPTED_REASON);
             engine::report_preflight_failure(&storage, repo_path, stage, &error).await
         }
     }
@@ -634,6 +537,11 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
                 true
             }
             Err(e) => {
+                // A wait this process was signalled out of says nothing about
+                // the sidecar, and the run stops for the reason it really
+                // stopped for rather than for a readiness budget it never
+                // served (carrick#1387).
+                shutdown::check()?;
                 logging::finish_spinner_warn(&sp, "Sidecar unavailable");
                 // Without the sidecar every endpoint this run indexes carries
                 // no request or response type. The scan can still produce a
@@ -939,75 +847,8 @@ mod tests {
             interruption_report(true, false),
             InterruptionReport::Nothing
         );
-        assert_eq!(Shutdown::Interrupt.exit_code(), 130);
-        assert_eq!(Shutdown::Terminate.exit_code(), 143);
-    }
-
-    /// Closing the terminal a scan is running in is one of the three ways a
-    /// laptop scan ends without asking, and the one that used to leave no
-    /// handler between the signal and the process (carrick#1235). Under test
-    /// it is raised at this process, which is why the listener is installed
-    /// first: without the handler this signal's default action ends the test
-    /// binary rather than failing the test.
-    #[tokio::test]
-    async fn a_closed_terminal_reaches_the_listener_that_reports_it() {
-        let mut shutdown = ShutdownListener::install();
-        // SAFETY: a signal to this process, whose handler was installed above.
-        unsafe { libc::raise(libc::SIGHUP) };
-        let caught = tokio::time::timeout(std::time::Duration::from_secs(30), shutdown.recv())
-            .await
-            .expect("SIGHUP reached the listener");
-        assert_eq!(caught, Shutdown::Hangup);
-        assert_eq!(caught.name(), "SIGHUP");
-        assert_eq!(caught.exit_code(), 129);
-    }
-
-    /// The report is made if it can be, and abandoned if it cannot: a user who
-    /// pressed Ctrl-C is waiting on this process, not on a request about it.
-    ///
-    /// Every case is wrapped in a timeout an order of magnitude past the
-    /// budget, because the failure this guards against is a report with no way
-    /// out of it — which hangs rather than fails.
-    #[tokio::test(start_paused = true)]
-    async fn an_interrupted_run_abandons_a_report_it_cannot_finish() {
-        let budget = std::time::Duration::from_secs(5);
-        let outer = std::time::Duration::from_secs(300);
-
-        let ended = tokio::time::timeout(
-            outer,
-            within_budget(
-                std::future::pending(),
-                std::future::pending::<Shutdown>(),
-                budget,
-            ),
-        )
-        .await
-        .expect("a report nobody stops still ends on the budget");
-        assert_eq!(ended, Ended::Budget);
-
-        let ended = tokio::time::timeout(
-            outer,
-            within_budget(
-                std::future::pending(),
-                std::future::ready(Shutdown::Interrupt),
-                budget,
-            ),
-        )
-        .await
-        .expect("a second Ctrl-C ends it at once");
-        assert_eq!(ended, Ended::SecondSignal(Shutdown::Interrupt));
-
-        let ended = tokio::time::timeout(
-            outer,
-            within_budget(
-                std::future::ready(()),
-                std::future::pending::<Shutdown>(),
-                budget,
-            ),
-        )
-        .await
-        .expect("a report that lands, lands");
-        assert_eq!(ended, Ended::Reported);
+        assert_eq!(shutdown::Shutdown::Interrupt.exit_code(), 130);
+        assert_eq!(shutdown::Shutdown::Terminate.exit_code(), 143);
     }
 
     /// A mistyped command is answered as a command, and the answer names the

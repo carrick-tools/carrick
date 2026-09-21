@@ -147,6 +147,7 @@ jobs:
           --test hosted_enrichment_test
           --test imported_request_member_test
           --test integration_test
+          --test interrupted_scan_test
           --test llm_cassette_hard_gate_test
           --test one_row_per_request_test
           --test pubsub_wrapper_type_capture_test

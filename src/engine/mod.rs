@@ -365,6 +365,25 @@ fn fail_reason(error: &str, redaction: &logging::Redaction) -> String {
 /// The wire limit on a fail marker's `reason`.
 const FAIL_REASON_LIMIT: usize = 500;
 
+/// Say the scan has reached `stage`, and stop it here if this process has been
+/// signalled (carrick#1387).
+///
+/// A phase boundary is where an interrupted run can be abandoned without
+/// leaving half a pass behind, and the only place a CPU-bound stage gives the
+/// signal to notice it: nothing inside a parse or an analysis pass awaits, so
+/// the race in `main` is not polled for as long as one runs. Returning here
+/// ends the run the way any failure does — the scan is marked failed with this
+/// as the reason, the log is shipped, and `main` reads the recorded signal to
+/// leave with its code.
+///
+/// The boundaries that state a stage but return nothing (the discovery pass,
+/// the per-endpoint definitions) are left as they are: the next boundary after
+/// them is where such a run stops.
+fn enter_stage(stage: crate::scan_stage::Stage) -> Result<(), crate::shutdown::Interrupted> {
+    crate::scan_stage::enter(stage);
+    crate::shutdown::check()
+}
+
 async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     storage: &T,
     repo_path: &str,
@@ -407,7 +426,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         commit: git_state.commit.clone(),
         dirty: git_state.dirty,
     };
-    crate::scan_stage::enter(crate::scan_stage::Stage::Discovery);
+    enter_stage(crate::scan_stage::Stage::Discovery)?;
     let sp = logging::spinner("Connecting to Carrick Cloud...");
     let run_start = storage
         .begin_run(&run_context)
@@ -863,7 +882,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     //    would clobber. Gate it on the backend advertising support; cross-repo
     //    analysis below still runs locally regardless. `None` = do not upload
     //    (PR/branch mode, or an unsupported multi-service repo).
-    crate::scan_stage::enter(crate::scan_stage::Stage::BlobBuild);
+    enter_stage(crate::scan_stage::Stage::BlobBuild)?;
     let upload_payloads: Option<Vec<CloudRepoData>> = if should_upload {
         if upload_blocked {
             warn!(
@@ -1071,7 +1090,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             .collect::<Vec<_>>(),
     );
 
-    crate::scan_stage::enter(crate::scan_stage::Stage::CrossRepoCheck);
+    enter_stage(crate::scan_stage::Stage::CrossRepoCheck)?;
     let sp = logging::spinner("Running cross-repo analysis...");
     let analyzer = match build_cross_repo_analyzer(all_repo_data, current_services_data, sidecar)
         .await
@@ -1155,7 +1174,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             &analyzer.call_bases(),
             &analyzer.call_unfollowed_members(),
         );
-        println!("{}", serde_json::to_string_pretty(&projection)?);
+        crate::outln!("{}", serde_json::to_string_pretty(&projection)?);
         return Ok(());
     }
 
@@ -1219,6 +1238,13 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         let closes_run =
             first_index_open.is_empty() || storage.name_pending_on_final_write(&first_index_open);
         closed_by_final_write = closes_run && !payloads.is_empty();
+        // The last boundary, and the one that matters most: a run somebody
+        // stopped must not replace this repo's index with what it had got to
+        // (carrick#1387). The salvage uploads on the failure paths above are
+        // left as they are — each lands services that finished whole before
+        // the run stopped, which is as true of an interruption as of any
+        // other failure.
+        enter_stage(crate::scan_stage::Stage::Upload)?;
         unconfirmed_uploads =
             upload_service_payloads(storage, &payloads, no_cache, closes_run, &boundary).await;
     }
@@ -1600,10 +1626,10 @@ fn print_boundaries(boundaries: &[(String, crate::boundary::ServiceBoundary)]) {
     if boundaries.is_empty() {
         return;
     }
-    println!("\nWhat this scan could not classify");
+    crate::outln!("\nWhat this scan could not classify");
     for (service, boundary) in boundaries {
         for line in boundary.lines(service) {
-            println!("{line}");
+            crate::outln!("{line}");
         }
     }
 }
@@ -1673,13 +1699,13 @@ fn print_graphql_notices(notices: &crate::graphql::GraphqlNotices) {
     if notices.warnings.is_empty() && notices.hints.is_empty() {
         return;
     }
-    println!("\nGraphQL schemas");
+    crate::outln!("\nGraphQL schemas");
     for warning in &notices.warnings {
-        println!("  {warning}");
+        crate::outln!("  {warning}");
         logging::annotate(logging::Annotation::Warning, warning);
     }
     for hint in &notices.hints {
-        println!("  {hint}");
+        crate::outln!("  {hint}");
     }
 }
 
@@ -2658,7 +2684,7 @@ async fn analyze_current_repo_incremental(
             // fix reach this repo without a model call — and it is why there is
             // no merge with the previous scan's rows below: this run states
             // them all, and a deleted file simply has no row.
-            crate::scan_stage::enter(crate::scan_stage::Stage::FileAnalysis);
+            enter_stage(crate::scan_stage::Stage::FileAnalysis)?;
             let analysis = file_orchestrator
                 .analyze_files(
                     &files,
@@ -2726,11 +2752,11 @@ async fn analyze_current_repo_incremental(
             // Collect the intents started after discovery (body_source is
             // stripped from every definition by now). `Intents` times only the
             // wait left at this point; the rest overlapped the stages above.
-            crate::scan_stage::enter(crate::scan_stage::Stage::Intents);
+            enter_stage(crate::scan_stage::Stage::Intents)?;
             let mut function_definitions = intents.finish().await;
             crate::phase_timing::mark(crate::phase_timing::Phase::Intents);
 
-            crate::scan_stage::enter(crate::scan_stage::Stage::Signatures);
+            enter_stage(crate::scan_stage::Stage::Signatures)?;
             // Compose function signatures, inferring unannotated slots via sidecar.
             populate_function_signatures(
                 signature_sidecar(sidecar),
@@ -2738,7 +2764,7 @@ async fn analyze_current_repo_incremental(
                 repo_path,
             );
             crate::phase_timing::mark(crate::phase_timing::Phase::Signatures);
-            crate::scan_stage::enter(crate::scan_stage::Stage::BlobBuild);
+            enter_stage(crate::scan_stage::Stage::BlobBuild)?;
 
             let elapsed = start.elapsed();
             debug!(
@@ -6186,7 +6212,7 @@ async fn analyze_current_repo(
     // 4. Run the complete multi-agent analysis
     let normalizer = UrlNormalizer::new(config);
     let service_root = service_scan_root(repo_path, config);
-    crate::scan_stage::enter(crate::scan_stage::Stage::FileAnalysis);
+    enter_stage(crate::scan_stage::Stage::FileAnalysis)?;
     let analysis_result = orchestrator
         .run_complete_analysis(
             files.clone(),
@@ -6205,11 +6231,11 @@ async fn analyze_current_repo(
     // 4b. Collect the function intents started after discovery. `Intents`
     // times only the wait left at this point; the rest overlapped the model
     // stage above.
-    crate::scan_stage::enter(crate::scan_stage::Stage::Intents);
+    enter_stage(crate::scan_stage::Stage::Intents)?;
     let mut function_definitions = intents.finish().await;
     crate::phase_timing::mark(crate::phase_timing::Phase::Intents);
 
-    crate::scan_stage::enter(crate::scan_stage::Stage::Signatures);
+    enter_stage(crate::scan_stage::Stage::Signatures)?;
     // 4c. Compose function signatures, inferring unannotated slots via sidecar.
     populate_function_signatures(
         signature_sidecar(sidecar),
@@ -6217,7 +6243,7 @@ async fn analyze_current_repo(
         repo_path,
     );
     crate::phase_timing::mark(crate::phase_timing::Phase::Signatures);
-    crate::scan_stage::enter(crate::scan_stage::Stage::BlobBuild);
+    enter_stage(crate::scan_stage::Stage::BlobBuild)?;
 
     // 4d. Deterministic protocol scans run BEFORE the graph is projected: the
     // GraphQL consumer file set folds transport data calls out of the mount

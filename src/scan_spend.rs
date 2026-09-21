@@ -147,7 +147,7 @@ pub fn report(spend: &ScanSpend) {
         return;
     }
     if let Ok(line) = serde_json::to_string(spend) {
-        eprintln!("{MARKER}{line}");
+        crate::errln!("{MARKER}{line}");
     }
 }
 

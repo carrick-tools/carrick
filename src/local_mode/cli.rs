@@ -276,11 +276,11 @@ pub fn run(command: LocalCommand) -> i32 {
     match command {
         LocalCommand::Derive { workspace } => match derive(workspace.as_deref()) {
             Ok(proposal) => {
-                println!("{proposal}");
+                crate::outln!("{proposal}");
                 0
             }
             Err(error) => {
-                eprintln!("carrick derive: {error}");
+                crate::errln!("carrick derive: {error}");
                 1
             }
         },
@@ -292,7 +292,7 @@ pub fn run(command: LocalCommand) -> i32 {
         } => match start_detached(workspace.as_deref(), dispatch, allow_unprepared) {
             Ok(()) => 0,
             Err(message) => {
-                eprintln!("carrick index: {message}");
+                crate::errln!("carrick index: {message}");
                 1
             }
         },
@@ -316,7 +316,7 @@ pub fn run(command: LocalCommand) -> i32 {
             match build(workspace.as_deref(), None, &pass) {
                 Ok(()) => 0,
                 Err(message) => {
-                    eprintln!("carrick index: {message}");
+                    crate::errln!("carrick index: {message}");
                     1
                 }
             }
@@ -324,7 +324,7 @@ pub fn run(command: LocalCommand) -> i32 {
         LocalCommand::Resume { workspace } => match resume(workspace.as_deref()) {
             Ok(()) => 0,
             Err(message) => {
-                eprintln!("carrick resume: {message}");
+                crate::errln!("carrick resume: {message}");
                 1
             }
         },
@@ -339,7 +339,7 @@ pub fn run(command: LocalCommand) -> i32 {
             ) {
                 Ok(()) => 0,
                 Err(message) => {
-                    eprintln!("carrick refresh: {message}");
+                    crate::errln!("carrick refresh: {message}");
                     1
                 }
             }
@@ -432,9 +432,9 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
             output.analysing = analysing.clone();
             if json {
                 match serde_json::to_string_pretty(&output) {
-                    Ok(text) => println!("{text}"),
+                    Ok(text) => crate::outln!("{text}"),
                     Err(e) => {
-                        eprintln!("carrick: could not serialize the answer: {e}");
+                        crate::errln!("carrick: could not serialize the answer: {e}");
                         return report(
                             ReadFailure::new(ReadError::IndexUnreadable),
                             json,
@@ -443,7 +443,7 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
                     }
                 }
             } else {
-                print!("{}", output.render());
+                crate::out!("{}", output.render());
             }
             0
         }
@@ -456,10 +456,10 @@ fn status(root: Option<&Path>, json: bool) -> i32 {
             // answer.
             if !json {
                 for line in super::scan_state::status_lines(&scans, &index_dir) {
-                    println!("{line}");
+                    crate::outln!("{line}");
                 }
                 for line in &analysing {
-                    println!("{line}");
+                    crate::outln!("{line}");
                 }
             }
             // `status` takes no file and cannot be told to run a scan that is
@@ -617,7 +617,7 @@ fn resume(root: Option<&Path>) -> Result<(), String> {
         let names: Vec<String> = unrecorded.iter().map(|(_, name)| name.clone()).collect();
         let (recovered, lines) = recovered_jobs(&unrecorded, super::jobs::ask_by_repo(&names));
         for line in &lines {
-            println!("{line}");
+            crate::outln!("{line}");
         }
         for job in recovered {
             // Written back before anything is collected, so a resume that dies
@@ -628,7 +628,7 @@ fn resume(root: Option<&Path>) -> Result<(), String> {
         }
     }
     if jobs.is_empty() {
-        println!(
+        crate::outln!(
             "Nothing from this workspace is being analysed. `carrick index` builds the index \
              here, and `carrick index --dispatch` hands the analysis to Carrick Cloud."
         );
@@ -661,7 +661,7 @@ fn resume(root: Option<&Path>) -> Result<(), String> {
         super::jobs::download(job, &answers_dir)
     });
     for line in &collection.lines {
-        println!("{line}");
+        crate::outln!("{line}");
     }
     resuming.extend(collection.resuming);
     // Nothing more is coming for these and there was nothing in them to
@@ -1056,9 +1056,9 @@ fn build_workspace(
 ) -> Result<(), String> {
     let infer = pass.infers();
     if let Some(proposal) = &workspace.parent_proposal {
-        eprintln!("carrick: {}", proposal.description());
+        crate::errln!("carrick: {}", proposal.description());
     }
-    eprintln!(
+    crate::errln!(
         "carrick: indexing {} repos ({}): {}",
         workspace.repos.len(),
         workspace.repos_detected_by,
@@ -1070,7 +1070,7 @@ fn build_workspace(
             .join(", ")
     );
     for missing in &workspace.missing {
-        eprintln!(
+        crate::errln!(
             "carrick: {} lists '{missing}', which is not a directory on this machine — it is \
              not indexed, so nothing will be said about it",
             super::workspace::WORKSPACE_FILE
@@ -1078,7 +1078,7 @@ fn build_workspace(
     }
 
     if infer {
-        eprintln!(
+        crate::errln!(
             "carrick: this scan asks Carrick Cloud to classify what the deterministic passes \
              could not, and uploads the result. It runs the analysis; later scans read it."
         );
@@ -1094,10 +1094,10 @@ fn build_workspace(
         } => {
             super::scan_state::dispatched(&jobs);
             for line in dispatched_lines(&jobs) {
-                println!("{line}");
+                crate::outln!("{line}");
             }
             for (repo, reason) in &not_dispatched {
-                println!("{}", kept_here_line(repo, *reason));
+                crate::outln!("{}", kept_here_line(repo, *reason));
             }
             report_dispatch_summary(&jobs, &not_dispatched);
             return Ok(());
@@ -1108,14 +1108,14 @@ fn build_workspace(
     // the one that used to be told apart from a broken flag by nothing at all
     // (carrick#1251).
     for (repo, reason) in &outcome.not_dispatched {
-        eprintln!("carrick: {}", indexed_here_line(repo, *reason));
+        crate::errln!("carrick: {}", indexed_here_line(repo, *reason));
     }
     // A project whose services all carry the hash the cached blobs already
     // hold is not downloaded again, and a download that failed also leaves the
     // cached blobs in place. Saying how many rows each of those was is what
     // tells a skipped download apart from a failed one (carrick#1012 item 2).
     if let Some(line) = &outcome.hosted_download {
-        eprintln!("carrick: {line}");
+        crate::errln!("carrick: {line}");
     }
     // What this build amounts to, for a parent that renders it: the counts and
     // the next step, without the map's per-service diagnostics (carrick#1315).
@@ -1305,16 +1305,16 @@ fn start_detached(
     let child = command
         .spawn()
         .map_err(|e| format!("could not start the scan: {e}"))?;
-    println!(
+    crate::outln!(
         "scan {scan_id} started in the background (pid {}).",
         child.id()
     );
-    println!("  watch it:  tail -f {}", log.display());
-    println!(
+    crate::outln!("  watch it:  tail -f {}", log.display());
+    crate::outln!(
         "  or:        carrick status --workspace {}",
         workspace.root.display()
     );
-    println!(
+    crate::outln!(
         "The scan keeps running after this shell closes. `carrick status` names the service it \
          is on, how far through it is, and how long it has been running."
     );
@@ -1426,8 +1426,8 @@ fn unprepared_refusal(workspace: &Workspace) -> Result<(), String> {
 /// classify.
 fn print_map(outcome: &super::index::IndexOutcome) {
     let index = &outcome.index;
-    println!();
-    println!(
+    crate::outln!();
+    crate::outln!(
         "indexed {} repo(s) in {:.1}s at {}",
         outcome.scanned.len(),
         outcome.elapsed_secs,
@@ -1445,7 +1445,7 @@ fn print_map(outcome: &super::index::IndexOutcome) {
                 .and_then(|boundary| boundary.awaiting_model())
                 .map(|sentence| format!("  {sentence}"))
                 .unwrap_or_default();
-            println!(
+            crate::outln!(
                 "  {:<28} {:>4} route(s)  {:>4} call(s)  {}{}",
                 service.name,
                 service.routes,
@@ -1462,8 +1462,8 @@ fn print_map(outcome: &super::index::IndexOutcome) {
         .flat_map(|items| items.iter())
         .map(|item| item.counterparts.len())
         .sum();
-    println!("  {counterparts} counterpart link(s) across the workspace");
-    println!();
+    crate::outln!("  {counterparts} counterpart link(s) across the workspace");
+    crate::outln!();
     for repo in &index.repos {
         for service in &repo.services {
             // The same renderer the read-only commands print from, so the
@@ -1473,7 +1473,7 @@ fn print_map(outcome: &super::index::IndexOutcome) {
             for line in
                 super::query::boundary_lines(&service.name, &note, service.boundary.as_ref())
             {
-                println!("{line}");
+                crate::outln!("{line}");
             }
         }
     }
@@ -1530,14 +1530,14 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode, freshness: Fre
         Ok(output) => {
             if json {
                 match serde_json::to_string_pretty(&output) {
-                    Ok(text) => println!("{text}"),
+                    Ok(text) => crate::outln!("{text}"),
                     Err(e) => {
-                        eprintln!("carrick: could not serialize the answer: {e}");
+                        crate::errln!("carrick: could not serialize the answer: {e}");
                         return refuse(ReadFailure::new(ReadError::IndexUnreadable));
                     }
                 }
             } else {
-                print!("{}", output.render());
+                crate::out!("{}", output.render());
             }
             0
         }
@@ -1566,21 +1566,21 @@ fn report_with_scans(
     // One sentence, on stderr and on the wire: the surfaces that read the JSON
     // body could not say what the terminal says until this carried it
     // (carrick#1009).
-    eprintln!("carrick: {}", failure.message());
+    crate::errln!("carrick: {}", failure.message());
     if json {
         let mut body = ErrorOutput::new(&failure, schema)
             .with_scans(scans)
             .with_last_scan(last_scan);
         body.analysing = analysing;
         if let Ok(text) = serde_json::to_string(&body) {
-            println!("{text}");
+            crate::outln!("{text}");
         }
     }
     0
 }
 
 fn print_help() {
-    eprintln!(
+    crate::errln!(
         r#"Carrick — read-only facts from your disk
 
 USAGE:
