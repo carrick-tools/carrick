@@ -12,10 +12,17 @@ import type {
   InferAnchorRequest,
   SymbolAnchorRequest,
 } from './api.js';
-import { printTypeForDestination, undeclaredNamesIn } from './node-builder.js';
+import {
+  printTypeForDestination,
+  substituteUndeclaredNames,
+  undeclaredNamesIn,
+} from './node-builder.js';
 import { typeIsOrContainsMachinery } from './machinery.js';
 import type { UnresolvedAtAnchor } from './deep-walk.js';
-import { unresolvedAtAnchor } from './unresolved.js';
+import {
+  unresolvedAtAnchor,
+  unresolvedSpecifiersReachableFrom,
+} from './unresolved.js';
 
 export interface ResolvedAnchor {
   request: CaptureAnchorRequest;
@@ -129,13 +136,27 @@ export function resolveAnchor(
     // (a generated model that was never generated). The stub then self-checks
     // such a name as an error placeholder, which no walk flags. A name a
     // sibling symbol anchor imports is resolved by that import.
+    // carrick#1377: rewrite what nothing declares to `unknown` in place, so
+    // one member typed by a module the checkout does not have stops taking
+    // every member around it down with it.
+    const rewritten =
+      siblingSpec || !args.placeholder
+        ? undefined
+        : substituteUndeclaredNamesInText(text, program, args.placeholder);
+    const aliasBody = rewritten?.text ?? text;
     const undeclaredNames =
       siblingSpec || !args.placeholder
         ? []
-        : undeclaredNamesInText(text, program, args.placeholder);
+        : undeclaredNamesInText(aliasBody, program, args.placeholder);
+    const unresolved = rewritten?.paths.length
+      ? {
+          paths: rewritten.paths,
+          specifiers: unresolvedSpecifiersForLiteral(program, request.source_file, args.repoRoot),
+        }
+      : undefined;
     return {
       request,
-      aliasText: siblingSpec ? `import('${siblingSpec}').${text}` : text,
+      aliasText: siblingSpec ? `import('${siblingSpec}').${text}` : aliasBody,
       // Literal anchors ARE the legacy-text tier (WP3 wiring of the design's
       // structural_fallback): hand-produced type text riding the surface.
       // The self-check still classifies decay; the fidelity metric counts
@@ -143,6 +164,7 @@ export function resolveAnchor(
       // ratchetable. Demotions are distinguished by failureReason.
       serialization: 'structural_fallback',
       ...(undeclaredNames.length > 0 ? { undeclaredNames } : {}),
+      ...(unresolved ? { unresolved } : {}),
     };
   }
 
@@ -413,7 +435,14 @@ function finishInferAnchor(
   if (!printed.text) {
     return demote(printed.failure ?? 'node builder print failed');
   }
-  const unresolved = unresolvedAtAnchor(program, sourceFile, type, located);
+  const atAnchor = unresolvedAtAnchor(program, sourceFile, type, located);
+  // carrick#1377: a member the print named undeclared and this rewrote to
+  // `unknown` is an unresolved position too, whether or not the source type
+  // carried the compiler's placeholder at it (a bare name the print reused as
+  // written does not). Both lists feed the same labelling.
+  const unresolved = mergeUnresolved(atAnchor, printed.substitutedPaths, () =>
+    unresolvedSpecifiersReachableFrom(program, sourceFile)
+  );
   return {
     request,
     aliasText: printed.text,
@@ -424,12 +453,72 @@ function finishInferAnchor(
   };
 }
 
+/**
+ * Fold substituted member positions into what the source program could not
+ * resolve. `specifiers` is a thunk: the reachable-import walk is only worth
+ * running for an anchor that actually substituted something.
+ */
+function mergeUnresolved(
+  atAnchor: UnresolvedAtAnchor | undefined,
+  substitutedPaths: readonly string[] | undefined,
+  specifiers: () => readonly string[]
+): UnresolvedAtAnchor | undefined {
+  if (!substitutedPaths || substitutedPaths.length === 0) return atAnchor;
+  const paths = new Set([...(atAnchor?.paths ?? []), ...substitutedPaths]);
+  return {
+    paths: [...paths],
+    specifiers: atAnchor?.specifiers ?? specifiers(),
+  };
+}
+
+/**
+ * The unresolved specifiers a LITERAL anchor's source file reaches, or none
+ * when the anchor names no file (its text names a type with nothing behind it
+ * and the detail says only that).
+ */
+function unresolvedSpecifiersForLiteral(
+  program: ts.Program,
+  sourceFileRel: string | undefined,
+  repoRoot: string
+): string[] {
+  if (!sourceFileRel) return [];
+  const sourceFile = program.getSourceFile(path.join(repoRoot, sourceFileRel));
+  return sourceFile ? unresolvedSpecifiersReachableFrom(program, sourceFile) : [];
+}
+
 /** `undeclaredNamesIn` over type text rather than a built node. */
 function undeclaredNamesInText(
   text: string,
   program: ts.Program,
   destination: ts.Node
 ): string[] {
+  const parsed = parseLiteralAnchor(text);
+  return parsed ? undeclaredNamesIn(parsed, program, destination) : [];
+}
+
+/** `substituteUndeclaredNames` over type text rather than a built node. */
+function substituteUndeclaredNamesInText(
+  text: string,
+  program: ts.Program,
+  destination: ts.Node
+): { text: string; paths: string[] } | undefined {
+  const parsed = parseLiteralAnchor(text);
+  if (!parsed) return undefined;
+  const rewritten = substituteUndeclaredNames(parsed, program, destination);
+  if (rewritten.substitutions.length === 0) return undefined;
+  const printer = ts.createPrinter({ removeComments: true });
+  return {
+    text: printer.printNode(
+      ts.EmitHint.Unspecified,
+      rewritten.node,
+      parsed.getSourceFile()
+    ),
+    paths: rewritten.substitutions.map((entry) => entry.path),
+  };
+}
+
+/** The type node of `type __LiteralAnchor = <text>;`, or undefined. */
+function parseLiteralAnchor(text: string): ts.TypeNode | undefined {
   const parsed = ts.createSourceFile(
     'literal-anchor.ts',
     `type __LiteralAnchor = ${text};`,
@@ -437,8 +526,7 @@ function undeclaredNamesInText(
     true
   );
   const statement = parsed.statements[0];
-  if (!statement || !ts.isTypeAliasDeclaration(statement)) return [];
-  return undeclaredNamesIn(statement.type, program, destination);
+  return statement && ts.isTypeAliasDeclaration(statement) ? statement.type : undefined;
 }
 
 /**

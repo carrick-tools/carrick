@@ -360,6 +360,13 @@ pub struct CaptureAliasRecord {
     /// Identifiers the alias's anonymous print names that resolve to nothing
     /// in the producer's program where the surface declares the alias
     /// (carrick#1165).
+    ///
+    /// carrick#1377 rewrites every such reference the print reaches to
+    /// `unknown` at its own member position, so a current scan fills this only
+    /// for what the rewrite could not reach. It is still read, and still
+    /// refuses publication, because the check phase also reads PEER artifacts
+    /// captured by earlier releases, whose prints still name what nothing
+    /// declares.
     #[serde(default)]
     pub undeclared_names: Vec<String>,
 }
