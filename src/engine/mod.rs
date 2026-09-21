@@ -1723,7 +1723,10 @@ async fn upload_run_log_from<T: CloudStorage>(
     // here, which is how a scan on an older installed binary passed for a
     // defect in this function.
     if !storage.uploads_run_logs() {
-        debug!("Run log not uploaded: this storage backend does not ship run logs");
+        debug!(
+            "Run log not uploaded: this run has nowhere to put it, either because the backend \
+             ships no logs or because no scan of its own was ever opened"
+        );
         return;
     }
 
@@ -7158,6 +7161,70 @@ mod tests {
         let none = crate::cloud_storage::MockStorage::new();
         upload_run_log_from(&none, "/repos/api", None).await;
         assert!(none.uploaded_logs().is_empty());
+    }
+
+    /// A run refused at `start-scan` never opened a scan, and a laptop run's
+    /// log is stored against its scan. With no id to name, the only answer the
+    /// cloud can give is `404 scan_not_started`: a warn line there and a
+    /// wasted request here, from a run that is already being told to stop
+    /// (carrick#1370).
+    ///
+    /// What makes an absence provable is the probe at the end. The stub has
+    /// exactly one answer left after the refusal, so a log upload that went
+    /// out would take it and the probe would find nobody listening.
+    #[tokio::test]
+    async fn a_run_refused_at_start_scan_ships_no_log_for_the_scan_it_never_opened() {
+        let (base, server) = crate::agent_service::tests::stub_server(vec![
+            (
+                409,
+                serde_json::json!({
+                    "error": "A scan of example/api is already running.",
+                    "code": "laptop_scan_in_flight"
+                })
+                .to_string(),
+            ),
+            (200, serde_json::json!({ "ok": true }).to_string()),
+        ]);
+        let url = format!("{base}/types/check-or-upload");
+        let storage = crate::cloud_storage::AwsStorage::for_test(
+            &url,
+            crate::credentials::CloudAuth::Bearer("carrick_sk_live_test".to_string()),
+            false,
+        );
+        let refusal = storage
+            .begin_run(&crate::cloud_storage::RunContext {
+                repo_full_name: Some("example/api".to_string()),
+                commit: "4f2a1c9000000000000000000000000000000000".to_string(),
+                dirty: false,
+            })
+            .await
+            .expect_err("the slot is held by the scan that is still in flight");
+        assert!(refusal.to_string().contains("laptop_scan_in_flight"));
+
+        let logs = tempfile::tempdir().expect("log dir");
+        let own = logs.path().join("2026-09-21T09-00-00Z-e52ff358-41234.log");
+        std::fs::write(&own, "analysed 12 files\n").expect("seed log");
+        upload_run_log_from(&storage, "/repos/api", Some(&own)).await;
+
+        let probe = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("a client")
+            .post(&url)
+            .json(&serde_json::json!({ "action": "carrick-1370-probe" }))
+            .send()
+            .await
+            .expect("the stub still had its second answer for a request of this test's own");
+        assert!(probe.status().is_success());
+
+        let seen = server.join().expect("the stub server thread");
+        assert_eq!(seen.len(), 2, "{seen:#?}");
+        assert!(
+            !seen.iter().any(|request| request.contains("upload-logs")),
+            "a run with no scan open sent a log anyway:\n{seen:#?}"
+        );
+        assert!(seen[1].contains("carrick-1370-probe"), "{seen:#?}");
     }
 
     /// A refusal that is simply a cloud without the action deployed is not a

@@ -1983,8 +1983,17 @@ impl CloudStorage for AwsStorage {
     /// directory and drops any line naming a credential before a byte leaves
     /// (`crate::logging::Redaction`). The CI behaviour is exactly what it
     /// was.
+    ///
+    /// A laptop run's log is stored against its scan, so a run whose
+    /// `start-scan` was refused has nowhere to put one: the cloud can only
+    /// answer `404 scan_not_started`, and it is a warn line there and a wasted
+    /// request here (carrick#1370). The CI path opens no scan and never had
+    /// one to name, so it is unaffected.
     fn uploads_run_logs(&self) -> bool {
-        true
+        match &self.auth {
+            CloudAuth::Oidc => true,
+            CloudAuth::Bearer(_) => self.scan_id().is_some(),
+        }
     }
 
     /// Mark this run as dead in the cloud, naming the stage it died in.
@@ -3450,11 +3459,22 @@ mod tests {
 
     /// Both credentials ship their run log now (carrick#1063). The laptop's
     /// is the one that was missing, and it is the one anyone needed.
+    ///
+    /// With one thing it needs: the scan it is stored against. A laptop run
+    /// refused at `start-scan` has no id to name, and the log it would send
+    /// can only be answered `404 scan_not_started` (carrick#1370). The CI path
+    /// opens no scan and never named one.
     #[test]
-    fn every_run_ships_its_debug_log() {
+    fn every_run_ships_its_debug_log_to_the_scan_it_opened() {
+        let refused =
+            AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Bearer("t".into()), false);
+        assert!(!refused.uploads_run_logs());
+
         let laptop =
             AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Bearer("t".into()), false);
+        laptop.scan_id.set("scan_01J".to_string()).unwrap();
         assert!(laptop.uploads_run_logs());
+
         let ci = AwsStorage::for_test("http://127.0.0.1:1", CloudAuth::Oidc, false);
         assert!(ci.uploads_run_logs());
     }

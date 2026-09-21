@@ -211,6 +211,10 @@ async fn main() {
     // then: a `process::exit` inside the arm would skip that drop, leaving the
     // sidecar process running and in-flight intent tasks still calling the
     // model while the report is sent.
+    //
+    // The listener outlives the race so the report can be raced against it in
+    // turn: a second Ctrl-C ends this process where it stands rather than
+    // being swallowed by the handler that is still installed (carrick#1235).
     let mut shutdown = ShutdownListener::install();
     let raced = tokio::select! {
         biased;
@@ -225,7 +229,13 @@ async fn main() {
                 signal.name(),
                 scan_stage::current().as_str()
             );
-            report_interruption(&repo_path).await;
+            let ended = within_budget(
+                report_interruption(&repo_path),
+                shutdown.recv(),
+                INTERRUPTION_REPORT_BUDGET,
+            )
+            .await;
+            debug!("This run's report of its own interruption: {ended:?}");
             std::process::exit(signal.exit_code());
         }
     };
@@ -306,6 +316,11 @@ async fn report_failure_before_scan(repo_path: &str, error: &dyn std::error::Err
 enum Shutdown {
     Interrupt,
     Terminate,
+    /// The terminal this run was started from went away. Its default action
+    /// ends the process too, and a run that does not listen for it dies with
+    /// its slot still held (carrick#1235) — the same outcome a Ctrl-C had
+    /// before either was listened for.
+    Hangup,
 }
 
 impl Shutdown {
@@ -313,6 +328,7 @@ impl Shutdown {
         match self {
             Shutdown::Interrupt => "SIGINT",
             Shutdown::Terminate => "SIGTERM",
+            Shutdown::Hangup => "SIGHUP",
         }
     }
 
@@ -323,20 +339,24 @@ impl Shutdown {
         match self {
             Shutdown::Interrupt => 130,
             Shutdown::Terminate => 143,
+            Shutdown::Hangup => 129,
         }
     }
 }
 
-/// SIGINT and SIGTERM, listened for from the moment [`Self::install`] runs.
+/// SIGINT, SIGTERM and SIGHUP, listened for from the moment [`Self::install`]
+/// runs.
 struct ShutdownListener {
     #[cfg(unix)]
     interrupt: Option<tokio::signal::unix::Signal>,
     #[cfg(unix)]
     terminate: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    hangup: Option<tokio::signal::unix::Signal>,
 }
 
 impl ShutdownListener {
-    /// Register both handlers now. A signal that cannot be listened for is
+    /// Register every handler now. A signal that cannot be listened for is
     /// left with its default action.
     fn install() -> Self {
         #[cfg(unix)]
@@ -345,6 +365,7 @@ impl ShutdownListener {
             Self {
                 interrupt: signal(SignalKind::interrupt()).ok(),
                 terminate: signal(SignalKind::terminate()).ok(),
+                hangup: signal(SignalKind::hangup()).ok(),
             }
         }
         #[cfg(not(unix))]
@@ -353,7 +374,7 @@ impl ShutdownListener {
         }
     }
 
-    /// The next signal. Never resolves when neither could be listened for.
+    /// The next signal. Never resolves when none could be listened for.
     async fn recv(&mut self) -> Shutdown {
         #[cfg(unix)]
         {
@@ -368,6 +389,7 @@ impl ShutdownListener {
             tokio::select! {
                 () = next(self.interrupt.as_mut()) => Shutdown::Interrupt,
                 () = next(self.terminate.as_mut()) => Shutdown::Terminate,
+                () = next(self.hangup.as_mut()) => Shutdown::Hangup,
             }
         }
         #[cfg(not(unix))]
@@ -382,6 +404,47 @@ impl ShutdownListener {
 
 /// The reason an interrupted run reports, on either failure event.
 const INTERRUPTED_REASON: &str = "interrupted";
+
+/// How long an interrupted run may spend telling the cloud it stopped.
+///
+/// Deliberately shorter than the request timeout the marker itself carries:
+/// someone who pressed Ctrl-C is waiting for the process to go, and the whole
+/// report — reading the credential, asking git for the remote on the pre-scan
+/// branch, the POST — has to fit inside what they will wait for. The slot's
+/// own expiry is what covers a report that does not fit (carrick#1235).
+const INTERRUPTION_REPORT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How an interrupted run's report to the cloud ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    /// The report was made, whatever the cloud did with it.
+    Reported,
+    /// A second signal arrived while it was being made. Someone is asking
+    /// this process to go now, and it goes.
+    SecondSignal(Shutdown),
+    /// [`INTERRUPTION_REPORT_BUDGET`] ran out first.
+    Budget,
+}
+
+/// Run `report` with a way out of it: a second signal, or a budget.
+///
+/// The report is best effort on a process that is already ending, so nothing
+/// here waits on it — both escapes abandon it where it stands. `biased`, so a
+/// second signal that is already pending wins over a budget that expired in
+/// the same poll: what the user did beats what the clock did.
+async fn within_budget<R, S>(report: R, second_signal: S, budget: std::time::Duration) -> Ended
+where
+    R: std::future::Future<Output = ()>,
+    S: std::future::Future<Output = Shutdown>,
+{
+    tokio::pin!(report, second_signal);
+    tokio::select! {
+        biased;
+        signal = &mut second_signal => Ended::SecondSignal(signal),
+        () = &mut report => Ended::Reported,
+        () = tokio::time::sleep(budget) => Ended::Budget,
+    }
+}
 
 /// Which event an interrupted run sends.
 #[derive(Debug, PartialEq, Eq)]
@@ -877,6 +940,73 @@ mod tests {
         );
         assert_eq!(Shutdown::Interrupt.exit_code(), 130);
         assert_eq!(Shutdown::Terminate.exit_code(), 143);
+    }
+
+    /// Closing the terminal a scan is running in is one of the three ways a
+    /// laptop scan ends without asking, and the one that used to leave no
+    /// handler between the signal and the process (carrick#1235). Under test
+    /// it is raised at this process, which is why the listener is installed
+    /// first: without the handler this signal's default action ends the test
+    /// binary rather than failing the test.
+    #[tokio::test]
+    async fn a_closed_terminal_reaches_the_listener_that_reports_it() {
+        let mut shutdown = ShutdownListener::install();
+        // SAFETY: a signal to this process, whose handler was installed above.
+        unsafe { libc::raise(libc::SIGHUP) };
+        let caught = tokio::time::timeout(std::time::Duration::from_secs(30), shutdown.recv())
+            .await
+            .expect("SIGHUP reached the listener");
+        assert_eq!(caught, Shutdown::Hangup);
+        assert_eq!(caught.name(), "SIGHUP");
+        assert_eq!(caught.exit_code(), 129);
+    }
+
+    /// The report is made if it can be, and abandoned if it cannot: a user who
+    /// pressed Ctrl-C is waiting on this process, not on a request about it.
+    ///
+    /// Every case is wrapped in a timeout an order of magnitude past the
+    /// budget, because the failure this guards against is a report with no way
+    /// out of it — which hangs rather than fails.
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupted_run_abandons_a_report_it_cannot_finish() {
+        let budget = std::time::Duration::from_secs(5);
+        let outer = std::time::Duration::from_secs(300);
+
+        let ended = tokio::time::timeout(
+            outer,
+            within_budget(
+                std::future::pending(),
+                std::future::pending::<Shutdown>(),
+                budget,
+            ),
+        )
+        .await
+        .expect("a report nobody stops still ends on the budget");
+        assert_eq!(ended, Ended::Budget);
+
+        let ended = tokio::time::timeout(
+            outer,
+            within_budget(
+                std::future::pending(),
+                std::future::ready(Shutdown::Interrupt),
+                budget,
+            ),
+        )
+        .await
+        .expect("a second Ctrl-C ends it at once");
+        assert_eq!(ended, Ended::SecondSignal(Shutdown::Interrupt));
+
+        let ended = tokio::time::timeout(
+            outer,
+            within_budget(
+                std::future::ready(()),
+                std::future::pending::<Shutdown>(),
+                budget,
+            ),
+        )
+        .await
+        .expect("a report that lands, lands");
+        assert_eq!(ended, Ended::Reported);
     }
 
     /// A mistyped command is answered as a command, and the answer names the
