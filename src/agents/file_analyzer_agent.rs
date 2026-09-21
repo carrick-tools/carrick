@@ -232,6 +232,18 @@ pub enum ResolutionSource {
     /// A request whose target is an env-backed base binding followed by a
     /// literal path (carrick#733): `` axios.get(`${API_URL}/api/users/${id}`) ``.
     EnvBasePath,
+    /// A request whose target is a base declared in the source as a plain
+    /// string literal, followed by a literal path (carrick#627/#641):
+    /// `` const BASE = "http://localhost:8080" `` and then
+    /// `` fetch(`${BASE}/status`, { method: "DELETE" }) ``.
+    ///
+    /// Named apart from [`Self::EnvBasePath`] because it is a different claim:
+    /// there the origin is the environment's to supply at runtime, here the
+    /// whole URL is spelled out in the file, a binding away. Only a base whose
+    /// literal states an absolute http(s) origin qualifies — a base declared
+    /// as a PATH is a route prefix, and what is written after it is not
+    /// another service's route.
+    LiteralBasePath,
     /// The path a `new URL(path, base)` states for the call's target
     /// (carrick#610).
     NewUrl,

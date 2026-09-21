@@ -16,9 +16,9 @@
 //!   base, a bare relative path, a schema-declared variable with no `??`
 //!   path). `helpdesk.ts:20` used to be listed here too; carrick#733 made a
 //!   base-plus-path target a row of its own, so it is now asserted present.
-//! - `demo-services-shape`: every row in `decoys.ts` — a bare path literal
-//!   with no base (which no structural rule may claim), a base declared as a
-//!   string literal, a base injected as an option, a class whose methods
+//! - `demo-services-shape`: every row in `decoys.ts` EXCEPT the literal base
+//!   at line 19 — a bare path literal with no base (which no structural rule
+//!   may claim), a base injected as an option, a class whose methods
 //!   carry verb decorators but whose declaration states no prefix, and a route
 //!   REGISTRATION whose prefix comes from the environment (carrick#744: the
 //!   binding's declared default is a path, so the base is not an origin and
@@ -28,10 +28,13 @@
 //!   own target and reaches no URL constructor.
 //! - `imported-request-member`: `legacy.ts`'s local call, which resolves
 //!   through no imported member.
-//! - `literal-base-url`: every row. A base declared as a module-level string
-//!   literal is resolved by REWRITING the model's target (carrick#627); it is
-//!   not an emitting source in this phase, and becomes one when the structured
-//!   URL resolver lands.
+//! - `literal-base-url`: the two rows at `checks.ts:8` and `checks.ts:10`.
+//!   A base declared as a module-level string literal IS an emitting source
+//!   (carrick#641), but a target states no verb, and neither of those two
+//!   sites writes one anywhere — a bare `fetch(url)` and a bag carrying only
+//!   headers. Both stay the model's reading with the base resolved onto it.
+//!   `checks.ts:22` states its verb in its own options bag, so it is asserted
+//!   present below.
 //! - `flat-routes-method-guard`: every row. The fixture carries no manifest, so
 //!   no routing convention is bootstrapped for an end-to-end scan of it and the
 //!   file-based pass is a no-op; its routes are pinned by
@@ -45,8 +48,7 @@
 //! The contradicting cassette is exercised on the fixtures whose
 //! deterministic rows sit at a candidate span the model can answer at. It is
 //! inert for `class-controller-api`, `flat-routes-method-guard` and
-//! `e2e-scaffolding` (their rows have no call-site candidate to answer at) and
-//! for `literal-base-url` (it has no deterministic row to contradict).
+//! `e2e-scaffolding`: their rows have no call-site candidate to answer at.
 //!
 //! `file-route-model-twin` is the third arrangement (carrick#660): the model
 //! answers for a route the file layout already states, so what is pinned is
@@ -477,27 +479,64 @@ fn a_silent_model_keeps_every_env_base_path_call() {
         );
     }
 
-    // The decoys: a bare literal with no base at all, a base declared as a
-    // string literal, a base injected as an option, and — carrick#744 — a
-    // route REGISTRATION written in this rule's own shape, whose base is
-    // declared with a PATH default and is therefore a prefix, not an origin.
-    // None of the four is a statement this rule may claim.
-    for line in [8, 18, 27, 62] {
+    // The decoys: a bare literal with no base at all, a base injected as an
+    // option, and — carrick#744 — a route REGISTRATION written in this rule's
+    // own shape, whose base is declared with a PATH default and is therefore a
+    // prefix, not an origin. None of the three is a statement this rule may
+    // claim. The line numbers are the CALL's, not the declaration's: a row
+    // carries the line its site sits on.
+    for line in [9, 28, 62] {
         assert_none_at(&calls, "src/decoys.ts", line);
     }
-    assert_eq!(calls.len(), 4, "no other call: {calls:#?}");
+    assert_eq!(
+        calls.len(),
+        5,
+        "the fifth is the literal base below, stated by a different rule: {calls:#?}"
+    );
 }
 
-/// The three fixtures whose rows are all the model's own reading. Pinned so a
+/// carrick#627/#641: a base declared in the source as a plain string literal
+/// spells the whole URL out a binding away, so the site is a request whatever
+/// the model says about it. Before this the resolution was a REWRITE of the
+/// model's row, which lost the site entirely whenever the model returned none.
+#[test]
+fn a_silent_model_keeps_a_literal_base_call() {
+    let calls = rows(&empty_scan("demo-services-shape"), "calls");
+
+    let row = row_at(&calls, "src/decoys.ts", 19);
+    assert_eq!(row["method"], "GET");
+    assert_eq!(row["target_url"], "https://api.example.com/api/things");
+    assert_eq!(row["resolution_source"], "literal_base_path");
+}
+
+/// The same rule end to end on the fixture carrick#627/#641 own: the one site
+/// that states a verb of its own survives the silence, and the two that state
+/// none anywhere do not. A target states no verb, and one taken from anywhere
+/// else would index the wrong operation.
+#[test]
+fn a_silent_model_keeps_the_literal_base_call_that_states_its_verb() {
+    let calls = rows(&empty_scan("literal-base-url"), "calls");
+
+    let row = row_at(&calls, "src/checks.ts", 22);
+    assert_eq!(row["method"], "DELETE");
+    assert_eq!(row["target_url"], "http://localhost:8080/cache/${id}");
+    assert_eq!(row["path"], "/cache/:id");
+    assert_eq!(row["resolution_source"], "literal_base_path");
+
+    // A bare `fetch(url)` and a bag carrying only headers: neither writes a
+    // verb anywhere, so both stay the model's to state.
+    for line in [8, 10] {
+        assert_none_at(&calls, "src/checks.ts", line);
+    }
+    assert_eq!(calls.len(), 1, "no other call: {calls:#?}");
+}
+
+/// The two fixtures whose rows are all the model's own reading. Pinned so a
 /// change that starts emitting for them is a deliberate one, and so the list
 /// at the top of this file stays honest.
 #[test]
 fn a_silent_model_leaves_the_model_only_fixtures_empty() {
-    for fixture in [
-        "literal-base-url",
-        "flat-routes-method-guard",
-        "e2e-scaffolding",
-    ] {
+    for fixture in ["flat-routes-method-guard", "e2e-scaffolding"] {
         let projection = empty_scan(fixture);
         assert!(
             rows(&projection, "calls").is_empty(),
@@ -601,6 +640,31 @@ fn a_contradicting_model_loses_to_the_env_base_and_its_path() {
         rename["target_url"],
         "${process.env.USER_SERVICE_URL}/api/users/${userId}/rename"
     );
+
+    for call in &calls {
+        let target = call["target_url"].as_str().unwrap_or_default();
+        assert!(
+            !target.contains("/invented/"),
+            "an invented path reached the index: {call:#?}"
+        );
+        assert_ne!(call["method"], "OPTIONS", "an invented verb: {call:#?}");
+    }
+}
+
+/// The same, where the deterministic statement is a base declared as a plain
+/// string literal and the path written beside it (carrick#627/#641).
+#[test]
+fn a_contradicting_model_loses_to_the_literal_base_and_its_path() {
+    let dir = cassette("literal-base-url", &|stem| match stem {
+        "checks" => contradicting_file(&[(22, "")]),
+        _ => NOTHING.to_string(),
+    });
+    let calls = rows(&scan("literal-base-url", dir.path()), "calls");
+
+    let evict = row_at(&calls, "src/checks.ts", 22);
+    assert_eq!(evict["method"], "DELETE", "the options bag states the verb");
+    assert_eq!(evict["target_url"], "http://localhost:8080/cache/${id}");
+    assert_eq!(evict["resolution_source"], "literal_base_path");
 
     for call in &calls {
         let target = call["target_url"].as_str().unwrap_or_default();
