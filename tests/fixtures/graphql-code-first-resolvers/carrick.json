@@ -3,6 +3,7 @@
     {
       "serviceName": "parcels-api",
       "directory": "apps/api",
+      "tsconfig": "tsconfig.json",
       "graphqlSchemas": ["apps/api/dist/schema.graphql"]
     }
   ]
