@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.85](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.84...carrick-v0.3.85) (2026-09-21)
+
+
+### Features
+
+* **cli:** leave no older global carrick on PATH behind an npx run ([#1392](https://github.com/carrick-tools/carrick/issues/1392)) ([92c20a1](https://github.com/carrick-tools/carrick/commit/92c20a11fe3f9910a45032d691dc4a2986ee6b06))
+
+
+### Bug Fixes
+
+* **cli:** stay for the scan and pass the signal on to it ([#1399](https://github.com/carrick-tools/carrick/issues/1399)) ([f920340](https://github.com/carrick-tools/carrick/commit/f920340900951f474735d1212cb344330421a363))
+* **consumers:** fold the setup line and the body read into the request they belong to ([#1383](https://github.com/carrick-tools/carrick/issues/1383)) ([2e60e04](https://github.com/carrick-tools/carrick/commit/2e60e0472fdf5f15fd00d8b15a7f9ad37998fd3e))
+* **join:** fold a route row with no site of its own onto the row that states it ([#1401](https://github.com/carrick-tools/carrick/issues/1401)) ([8cb8adb](https://github.com/carrick-tools/carrick/commit/8cb8adbf14b7edc738130e3ed2cbd39ef9ed46e1))
+* **scan:** let a signal reach a pass, and never panic on a print ([#1390](https://github.com/carrick-tools/carrick/issues/1390)) ([0adffd5](https://github.com/carrick-tools/carrick/commit/0adffd582f18daa8245869ac1835724b8ac543bc))
+* **scan:** report an interruption within a budget, and ship no log for a scan that never opened ([#1378](https://github.com/carrick-tools/carrick/issues/1378)) ([e34f011](https://github.com/carrick-tools/carrick/commit/e34f011b7a27e43c4ae200b36e8782cafb8bed60)), closes [#1235](https://github.com/carrick-tools/carrick/issues/1235) [#1370](https://github.com/carrick-tools/carrick/issues/1370)
+* **sidecar:** a body read is a floor for a consumer payload, not a ceiling ([#1389](https://github.com/carrick-tools/carrick/issues/1389)) ([8a71edd](https://github.com/carrick-tools/carrick/commit/8a71eddcb2eb7b05523131a70cadff1fbff4409c)), closes [#1382](https://github.com/carrick-tools/carrick/issues/1382)
+* **sidecar:** a projection of a call result is not the response it states ([#1381](https://github.com/carrick-tools/carrick/issues/1381)) ([cc1991b](https://github.com/carrick-tools/carrick/commit/cc1991bc7658154a7fcd1a84d8969252bbba5954)), closes [#1375](https://github.com/carrick-tools/carrick/issues/1375)
+* **sidecar:** a result carrier is not the payload it carries ([#1393](https://github.com/carrick-tools/carrick/issues/1393)) ([d8093ff](https://github.com/carrick-tools/carrick/commit/d8093ff7644e38e7ace356f4d8e5eee1483e84b7))
+* **sidecar:** one member that did not resolve no longer discards the type ([#1396](https://github.com/carrick-tools/carrick/issues/1396)) ([337d395](https://github.com/carrick-tools/carrick/commit/337d39542edce0e8f832456dfa9e45a3c6369a61)), closes [#1377](https://github.com/carrick-tools/carrick/issues/1377)
+* **skills:** the census receipt states what a no-intent function was searched on ([#1380](https://github.com/carrick-tools/carrick/issues/1380)) ([8fd28ad](https://github.com/carrick-tools/carrick/commit/8fd28adaa49824693013fe84618b1fa16d4f00f5))
+
 ## [0.3.84](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.83...carrick-v0.3.84) (2026-09-20)
 
 
