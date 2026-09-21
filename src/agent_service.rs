@@ -179,10 +179,12 @@ pub const QUOTA_ABORT_CODE: &str = "quota_exhausted";
 
 /// The cloud's code for "the model was not asked, on purpose": an operator
 /// kill switch, the daily bucket on an OIDC caller, a service-wide daily
-/// limit, or a spend allowance. `details.reason` says which, and nothing
-/// anywhere reads it — the set is open, a reason this build has never heard of
-/// still means the scan finishes facts-only, and a scanner that branched on
-/// the reason would have to be released before the cloud could add one.
+/// limit, or a spend allowance. `details.reason` says which, and no code that
+/// handles this refusal reads it — the set is open, a reason this build has
+/// never heard of still means the scan finishes facts-only, and a scanner that
+/// branched on the reason would have to be released before the cloud could add
+/// one. (The reason on a `model_error` is a different thing and IS read; see
+/// [`ANALYSIS_IN_FLIGHT_CODE`].)
 ///
 /// What the person running the scan should read is `error.message`, which the
 /// cloud writes to suit the reason it refused for. The scan quotes it once,

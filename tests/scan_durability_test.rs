@@ -567,11 +567,30 @@ async fn a_refused_file_is_asked_about_again_on_the_next_scan() {
          to hold a first index open for one"
     );
     assert!(storage.scan_failed.lock().unwrap().is_empty());
+    // Counted in the boundary, in the scanner's own words. Until carrick#1419
+    // gives a refusal a bucket of its own, `files_lost` is the only one a file
+    // with no model answer has, and a boundary that counted nothing here would
+    // say this service's index is complete.
     let beta = storage.latest("beta").unwrap();
+    let files_lost = &beta.boundary.as_ref().unwrap().files_lost;
     assert_eq!(
-        beta.boundary.as_ref().unwrap().files_lost.total,
-        0,
-        "the model was never asked, so nothing was lost"
+        files_lost.total, 1,
+        "a refused file is counted, not hidden: {files_lost:?}"
+    );
+    assert!(
+        files_lost
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("server.ts") && reason.contains("not sent to the model")),
+        "the reason names the file and says it was not sent: {files_lost:?}"
+    );
+    assert!(
+        !files_lost
+            .reasons
+            .iter()
+            .any(|reason| reason.contains(REFUSAL_SENTENCE)),
+        "the cloud's sentence belongs to the run's single line, not to one row \
+         per refused file: {files_lost:?}"
     );
 
     // The mechanism the re-ask rests on: no answer was recorded for the

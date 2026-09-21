@@ -2653,16 +2653,30 @@ impl FileOrchestrator {
                             stats.files_analysis_failed += 1;
                         }
                         ModelAnswer::Refused(e) => {
-                            // Debug, and no `stats.errors` entry: the model
-                            // was never asked, so this file is not one the
-                            // analyzer failed on and the boundary must not
-                            // count it lost. The run says what happened once,
-                            // in `scan_health::not_refreshed_line`, in the
-                            // cloud's own words — warning here would repeat
-                            // that sentence once per refused file
+                            // Debug, not warn: the run says what happened
+                            // once, in `scan_health::not_refreshed_line`, in
+                            // the cloud's own words, and warning here would
+                            // repeat that sentence once per refused file
                             // (carrick#1413).
                             debug!("The model was not asked about {}: {}", pf.path_str, e);
+                            // Counted in the boundary all the same, with a
+                            // fixed reason of its own. `files_lost` is the
+                            // only bucket a file with no model answer has
+                            // until carrick#1419 gives a refusal one, and a
+                            // boundary that counted nothing here would report
+                            // this service complete while every candidate
+                            // these files hold went unclassified — a read
+                            // must count what it hid, and silence is the
+                            // worse of the two wrong answers. The reason is
+                            // the scanner's own short phrase, never the
+                            // cloud's sentence, which stays on the run's
+                            // single line.
+                            stats.errors.push(format!(
+                                "{}: not sent to the model (inference limit)",
+                                pf.path_str
+                            ));
                             stats.files_skipped += 1;
+                            stats.files_analysis_failed += 1;
                         }
                         ModelAnswer::Answered(_) | ModelAnswer::NotAsked => {}
                     }

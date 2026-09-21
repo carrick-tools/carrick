@@ -60,9 +60,9 @@ const MAX_NAMED_FILES: usize = 10;
 /// What the run says about a refusal the cloud sent no sentence with.
 ///
 /// Only ever a fallback. The cloud knows which budget refused and when
-/// inference resumes; the scanner does not, and `details.reason` is an open
-/// set it deliberately never reads, so a refusal whose sentence is missing is
-/// the only case this describes in the scanner's own words.
+/// inference resumes; the scanner does not, and the refusal's `details.reason`
+/// is an open set it deliberately never reads, so a refusal whose sentence is
+/// missing is the only case this describes in the scanner's own words.
 const REFUSAL_WITHOUT_A_SENTENCE: &str = concat!(
     "This workspace is past an inference allowance. They keep the rows the ",
     "deterministic layer stated and their candidates were not refreshed this run."
@@ -400,10 +400,10 @@ pub fn is_budget_refusal(error: &(dyn std::error::Error + 'static)) -> bool {
 /// The sentence a refusal carried, when the failure is one and the cloud sent
 /// words with it.
 ///
-/// The refusal's `details.reason` stays unread here as everywhere else: it is
-/// an open set, and a reason this build has never heard of must change nothing
-/// about what the scan does. The message is what the person running the scan
-/// should read, so it is what the summary prints.
+/// The refusal's `details.reason` stays unread here, as it does everywhere a
+/// refusal is handled: it is an open set, and a reason this build has never
+/// heard of must change nothing about what the scan does. The message is what
+/// the person running the scan should read, so it is what the summary prints.
 pub fn refusal_sentence<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a str> {
     let call = error.downcast_ref::<crate::agent_service::AgentCallError>()?;
     call.is_budget_refusal()
