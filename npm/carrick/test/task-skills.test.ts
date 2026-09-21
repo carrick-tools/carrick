@@ -164,11 +164,24 @@ test("the bodies read what an answer carries rather than a response shape writte
   // it came to name four of the five it now returns.
   assert.doesNotMatch(reuse, /awaiting_embedding/);
 
+  // The pair-level headline `type_verdicts` does not carry. A check that
+  // compared nothing answers `unresolved` and no boolean at all, so a body
+  // reading the buckets alone has nothing to tell that apart from agreement.
+  const impact = renderTaskSkill("carrick-impact", { slug: "acme-index" }).replace(/\s+/g, " ");
+  assert.match(impact, /Read `status` before the buckets/);
+  assert.match(impact, /`pairs_compared` and `pairs_uncompared`/);
+
   // One call where the server answers both wordings, two where it does not.
   const census = renderTaskSkill("carrick-census", { slug: "acme-index" }).replace(/\s+/g, " ");
   assert.match(census, /also_phrased_as: \["<how it does it>"\]/);
   assert.match(census, /Where the answer carries no `phrasings`, or the field comes back refused/);
   assert.match(census, /`hidden_by_threshold` where the answer carries it/);
+
+  // The other hidden count, and its lever is a different one: these rows are
+  // held back by word weight, so a lower similarity_threshold never reaches
+  // them and a receipt naming only the first count reads as if it would.
+  assert.match(census, /`hidden_by_lexical_floor` where the answer carries it/);
+  assert.match(census, /A lower `similarity_threshold` does not reach these rows\./);
 
   // A function with no intent is still ranked, on its own tokens, so the
   // receipt cannot report it as a function no search looked at.
