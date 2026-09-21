@@ -350,7 +350,7 @@ export function syncGlobalInstall(options: SyncOptions): SyncOutcome {
   const after = machine.find();
   if (!after) {
     options.say(
-      `carrick ${running} is installed, but nothing answers to \`carrick\` on PATH. Add the directory ${command.split(" ")[0]} installs into to PATH, so your agent's hooks can run it by name.`,
+      `carrick ${running} is installed and nothing answers to \`carrick\` on PATH. The directory ${argv[0]} installs into is not on it; add that directory, so your agent's hooks can run carrick by name.`,
     );
     return { kind: "stale", path: null, version: null, command };
   }
