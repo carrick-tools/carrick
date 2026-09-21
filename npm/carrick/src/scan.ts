@@ -475,7 +475,16 @@ export function relaySignals(
   } = {
     on: (signal, handler) => void process.on(signal, handler),
     off: (signal, handler) => void process.off(signal, handler),
-    raise: (signal) => void process.kill(process.pid, signal),
+    raise: (signal) => {
+      try {
+        process.kill(process.pid, signal);
+      } catch {
+        // Windows implements a few signals and refuses the rest, and this is
+        // the moment someone asked twice for this to be over: end, rather
+        // than throw out of a handler on the way.
+        process.exit(1);
+      }
+    },
   },
 ): () => void {
   const installed: [NodeJS.Signals, () => void][] = [];
