@@ -178,9 +178,15 @@ fn is_quota_error(err: &AgentError) -> bool {
 pub const QUOTA_ABORT_CODE: &str = "quota_exhausted";
 
 /// The cloud's code for "the model was not asked, on purpose": an operator
-/// kill switch, the daily bucket on an OIDC caller, or a spend allowance.
-/// `details.reason` says which, and nothing here reads it — every reason means
-/// the same thing to a scan.
+/// kill switch, the daily bucket on an OIDC caller, a service-wide daily
+/// limit, or a spend allowance. `details.reason` says which, and nothing
+/// anywhere reads it — the set is open, a reason this build has never heard of
+/// still means the scan finishes facts-only, and a scanner that branched on
+/// the reason would have to be released before the cloud could add one.
+///
+/// What the person running the scan should read is `error.message`, which the
+/// cloud writes to suit the reason it refused for. The scan quotes it once,
+/// on its own line ([`crate::scan_health::refusal_sentence`]).
 ///
 /// Distinct from [`QUOTA_ABORT_CODE`] and from `rate_limited`: this call
 /// failed because a budget refused it, not because the backend is exhausted,
@@ -1254,6 +1260,10 @@ struct MockFailure {
     remaining: usize,
     /// `model_error` (transient) or `llm_disabled` (a budget refusal).
     code: &'static str,
+    /// The refusal's `error.message`, for a refusal. The cloud writes it to
+    /// suit whichever budget refused, so a test that pins what the run prints
+    /// supplies its own.
+    message: String,
 }
 
 fn mock_failures() -> &'static Mutex<Vec<MockFailure>> {
@@ -1276,19 +1286,27 @@ pub fn inject_mock_failure(task_path: &str, body_contains: &str, times: usize) {
         body_contains: body_contains.to_string(),
         remaining: times,
         code: "model_error",
+        message: "Gemini overloaded; retries exhausted (injected offline failure)".to_string(),
     });
 }
 
-/// The same, answered the way a spent allowance answers: `llm_disabled`,
-/// `retriable: false`. For the tests that pin what a refused service does to
-/// the scan (carrick-cloud#892).
+/// The same, answered the way a budget refuses: [`LLM_DISABLED_CODE`],
+/// `retriable: false`, carrying `message` as the cloud's own `error.message`.
+/// For the tests that pin what a refused service does to the scan
+/// (carrick-cloud#892) and what the run prints about it (carrick#1413).
 #[allow(dead_code)] // Called by tests/ through the library, never by the binary.
-pub fn inject_mock_budget_refusal(task_path: &str, body_contains: &str, times: usize) {
+pub fn inject_mock_budget_refusal(
+    task_path: &str,
+    body_contains: &str,
+    times: usize,
+    message: &str,
+) {
     mock_failures().lock().unwrap().push(MockFailure {
         task_path: task_path.to_string(),
         body_contains: body_contains.to_string(),
         remaining: times,
         code: LLM_DISABLED_CODE,
+        message: message.to_string(),
     });
 }
 
@@ -1305,12 +1323,12 @@ fn take_mock_failure<B: Serialize + ?Sized>(task_path: &str, body: &B) -> Option
     if failure.code == LLM_DISABLED_CODE {
         return Some(AgentCallError::permanent(
             LLM_DISABLED_CODE,
-            "The allowance for this scan is spent (injected offline refusal)".to_string(),
+            failure.message.clone(),
         ));
     }
     Some(AgentCallError::transient(
         "model_error",
-        "Gemini overloaded; retries exhausted (injected offline failure)".to_string(),
+        failure.message.clone(),
     ))
 }
 
@@ -2563,6 +2581,39 @@ pub(crate) mod tests {
             message: "boom".to_string(),
             retriable: true,
             details: None,
+        }
+    }
+
+    /// Two refusals under the same code, one for a reason the cloud added
+    /// after this build and one for a reason nothing has ever sent. Both must
+    /// read as the same refusal, carrying their own words: `details.reason` is
+    /// an open set, and a scanner that branched on it would need a release
+    /// before the cloud could refuse for a new cause (carrick#1413).
+    #[test]
+    fn a_refusal_is_one_thing_whatever_reason_it_names() {
+        for body in [
+            r#"{"success":false,"error":{"code":"llm_disabled","message":"Today's limit is reached; this scan finished with facts only.","retriable":false,"details":{"reason":"daily_limit"}}}"#,
+            r#"{"success":false,"error":{"code":"llm_disabled","message":"Refused for a cause this build has never heard of.","retriable":false,"details":{"reason":"a_reason_from_a_later_cloud"}}}"#,
+            r#"{"success":false,"error":{"code":"llm_disabled","message":"Refused with no reason at all.","retriable":false}}"#,
+        ] {
+            let err = envelope_error(body);
+            let call = AgentCallError {
+                code: err.code.clone(),
+                message: err.message.clone(),
+                retriable: err.retriable,
+            };
+            assert!(call.is_budget_refusal(), "{body}");
+            assert!(!call.retriable, "a refusal is never retried: {body}");
+            assert!(!is_quota_error(&err), "a refusal must not trip the breaker");
+            assert!(
+                !is_analysis_in_flight(&err),
+                "a refusal is not a lease wait"
+            );
+            assert_eq!(
+                crate::scan_health::refusal_sentence(&call),
+                Some(err.message.as_str()),
+                "the run prints the cloud's own sentence: {body}"
+            );
         }
     }
 
