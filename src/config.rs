@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
@@ -399,6 +399,30 @@ impl Config {
         self.external_env_vars.contains(env_var)
     }
 
+    /// The service directory and the `tsconfig` this entry names, both
+    /// relative to the repo root, as
+    /// [`crate::workspace_resolver::WorkspaceIndex::build_with_aliases`]
+    /// takes them: that config governs every file under the directory in
+    /// place of the nearest one on disk.
+    ///
+    /// `None` when the entry names no config, which leaves each file to the
+    /// nearest config above it. A Deno config named here is also `None`: Deno
+    /// import maps are read from the tree whether or not they are named, and
+    /// treating one as a tsconfig would state `paths` it does not have.
+    pub fn alias_tsconfig(&self) -> Option<(PathBuf, PathBuf)> {
+        let config = PathBuf::from(self.tsconfig.as_deref()?);
+        if config
+            .file_name()
+            .is_some_and(|name| name == "deno.json" || name == "deno.jsonc")
+        {
+            return None;
+        }
+        let directory = crate::workspace_resolver::normalize(Path::new(
+            self.directory.as_deref().unwrap_or(""),
+        ));
+        Some((directory, config))
+    }
+
     pub fn is_external_call(&self, route: &str) -> bool {
         // Check if route starts with any external env var
         if route.starts_with("ENV_VAR:") {
@@ -480,6 +504,44 @@ mod tests {
         assert_eq!(config.directory, None);
         assert_eq!(config.tsconfig, None);
         assert!(config.include.is_empty());
+    }
+
+    /// carrick#1411: the alias pair a service hands the module resolver. A
+    /// service that names no config leaves every file to the nearest one, and
+    /// a Deno config is not a tsconfig even when `tsconfig` names it.
+    #[test]
+    fn alias_tsconfig_names_the_config_that_governs_the_service() {
+        let with_config: Config = serde_json::from_str(
+            r#"{ "name": "api", "directory": "./apps/api/", "tsconfig": "tsconfig.build.json" }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            with_config.alias_tsconfig(),
+            Some((
+                PathBuf::from("apps/api"),
+                PathBuf::from("tsconfig.build.json")
+            )),
+            "the directory is normalized, as the resolver keys its scopes"
+        );
+
+        let flat: Config =
+            serde_json::from_str(r#"{ "name": "api", "tsconfig": "tsconfig.json" }"#).unwrap();
+        assert_eq!(
+            flat.alias_tsconfig(),
+            Some((PathBuf::from(""), PathBuf::from("tsconfig.json"))),
+            "a flat config governs the whole repo"
+        );
+
+        let no_config: Config =
+            serde_json::from_str(r#"{ "name": "api", "directory": "apps/api" }"#).unwrap();
+        assert_eq!(no_config.alias_tsconfig(), None);
+
+        for deno in ["deno.json", "deno.jsonc", "apps/api/deno.jsonc"] {
+            let config: Config =
+                serde_json::from_str(&format!(r#"{{ "name": "api", "tsconfig": "{deno}" }}"#))
+                    .unwrap();
+            assert_eq!(config.alias_tsconfig(), None, "{deno}");
+        }
     }
 
     #[test]

@@ -14,21 +14,23 @@
 //!
 //! A resolver the field NAMES rather than writes is followed to the function
 //! the name binds, in this file or in the module it is imported from
-//! (carrick#1294); a name that leads to no function declaration still sends
-//! nothing.
+//! (carrick#1294), through a relative specifier or one the service's own
+//! tsconfig aliases (carrick#1411); a name that leads to no function
+//! declaration still sends nothing.
 //!
 //! Answer key, read by hand from the fixture:
 //!
 //! | field | resolver | response type |
 //! |---|---|---|
 //! | `health` (`kit.ts:19`) | `() => 'ok'` on the field line | `string` |
-//! | `parcels` (`queries.ts:7`) | `() => listParcels()` two lines down | `Parcel[]` |
-//! | `parcel` (`queries.ts:11`) | arrow four lines down | `Parcel` (the sidecar renders an optional payload as the payload) |
-//! | `heaviestWeight` (`queries.ts:17`) | `resolve` beside a `validate` function | `number` |
+//! | `parcels` (`queries.ts:8`) | `() => listParcels()` two lines down | `Parcel[]` |
+//! | `parcel` (`queries.ts:12`) | arrow four lines down | `Parcel` (the sidecar renders an optional payload as the payload) |
+//! | `heaviestWeight` (`queries.ts:18`) | `resolve` beside a `validate` function | `number` |
 //! | `dispatchParcel` (`mutations.ts:5`) | arrow three lines down | `Parcel` |
-//! | `recentParcels` (`queries.ts:22`) | an identifier, declared in `store.ts` | `Parcel[]` |
-//! | `parcelCount` (`queries.ts:26`) | an identifier, declared below in the same file | `number` |
-//! | `archivedParcels` (`queries.ts:29`) | `store.listArchived`, a member of a namespace | none: no anchor is sent |
+//! | `recentParcels` (`queries.ts:23`) | an identifier, declared in `store.ts` | `Parcel[]` |
+//! | `parcelCount` (`queries.ts:27`) | an identifier, declared below in the same file | `number` |
+//! | `pendingParcels` (`queries.ts:34`) | an identifier, imported through the `@/` alias | `Parcel[]` (its `Promise` unwrapped) |
+//! | `archivedParcels` (`queries.ts:30`) | `store.listArchived`, a member of a namespace | none: no anchor is sent |
 //! | `recallParcel`, `retireParcel` | no resolver located | none |
 //!
 //! Without the span, a bare line anchor binds `parcels` and `dispatchParcel`
@@ -174,6 +176,12 @@ fn a_code_first_field_serves_its_resolver_return_type() {
         typed("query|parcelCount"),
         ("explicit".to_string(), Some("number".to_string())),
         "an identifier resolver declared in the same file is followed to it"
+    );
+    assert_eq!(
+        typed("query|pendingParcels"),
+        ("explicit".to_string(), Some(format!("{PARCEL}[]"))),
+        "an identifier resolver imported through the service's own tsconfig \
+         alias is followed too (carrick#1411)"
     );
 
     // A name the pass cannot follow to a function declaration still sends

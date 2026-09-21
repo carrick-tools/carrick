@@ -1,6 +1,7 @@
 import { kit } from '../kit.ts';
 import * as store from './store.ts';
 import { findParcel, heaviestParcel, listParcels, listRecentParcels } from './store.ts';
+import { listPending } from '@/graphql/parcels/pending';
 
 // Colis — lecture
 kit.queryFields((t) => ({
@@ -29,6 +30,10 @@ kit.queryFields((t) => ({
   archivedParcels: t.field({
     type: ['Parcel'],
     resolve: store.listArchived,
+  }),
+  pendingParcels: t.field({
+    type: ['Parcel'],
+    resolve: listPending,
   }),
 }));
 

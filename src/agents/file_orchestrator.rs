@@ -4095,8 +4095,19 @@ impl FileOrchestrator {
         &self,
         graphql: &crate::graphql::GraphqlExtraction,
         repo_path: &str,
+        service: &crate::config::Config,
     ) -> Vec<InferRequestItem> {
         use crate::graphql_resolver_anchor::{ResolverAnchor, resolver_anchor};
+
+        // Reading the repo's alias config costs a walk, so it waits until a
+        // producer that could use it exists.
+        if !graphql
+            .producers
+            .iter()
+            .any(|op| op.resolver_file.is_some() && op.resolver_line.is_some())
+        {
+            return Vec::new();
+        }
 
         let repo_root = std::path::Path::new(repo_path);
         let repo_root_absolute = if repo_root.is_absolute() {
@@ -4114,10 +4125,21 @@ impl FileOrchestrator {
         // Resolver files are read once each; `None` records a file that could
         // not be read, whose anchors fall back to the line.
         let mut file_source: HashMap<String, Option<String>> = HashMap::new();
-        // Relative specifiers only, as every analyzer-adjacent pass resolves
-        // them: a resolver imported through a path alias or a package name is
-        // not followed and abstains (carrick#1294).
-        let mut bindings = BindingResolver::new();
+        // The hop that follows a named resolver resolves specifiers the way
+        // the repo's own config says to: relative, through the tsconfig
+        // `paths`/`baseUrl` (or Deno import map, or package `imports`) that
+        // governs the importing file, and through workspace package names
+        // (carrick#1411). Widening it here is safe where the mount and
+        // wrapper passes must not (carrick#474): this builds a SIDECAR type
+        // request, so a module it newly reaches changes no prompt byte and
+        // re-keys no cached model answer.
+        let aliases = service.alias_tsconfig();
+        let mut bindings = BindingResolver::with_workspace(WorkspaceIndex::build_with_aliases(
+            repo_root,
+            aliases
+                .as_ref()
+                .map(|(directory, config)| (directory.as_path(), config.as_path())),
+        ));
         let mut spanned = 0usize;
         let mut followed = 0usize;
         let mut withheld = 0usize;

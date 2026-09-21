@@ -16,5 +16,6 @@ type Query {
   parcel(id: ID!): Parcel
   parcelCount: Int!
   parcels: [Parcel!]!
+  pendingParcels: [Parcel!]!
   recentParcels: [Parcel!]!
 }
