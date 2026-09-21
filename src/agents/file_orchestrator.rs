@@ -203,6 +203,9 @@ pub struct ProcessingStats {
     /// HTTP rows dropped at call sites that execute a GraphQL document
     /// (carrick#1154), by the step that decided it.
     pub graphql_document_site_drops: crate::graphql_document_sites::DocumentSiteDrops,
+    /// Consumer rows folded onto the request they belong to (carrick#1371),
+    /// by the rule that decided it.
+    pub consumer_row_folds: crate::consumer_row_fold::ConsumerRowFolds,
     /// Model rows that joined a deterministic row at their span and
     /// contributed only what determinism did not state.
     pub model_rows_joined: usize,
@@ -2797,6 +2800,25 @@ impl FileOrchestrator {
                 stats.graphql_document_site_drops.total(),
                 stats.graphql_document_site_drops.document_argument,
                 stats.graphql_document_site_drops.document_executor
+            );
+        }
+
+        // PHASE 5d (carrick#1371): one consumer row per request. A request is
+        // written across several lines — the setup, the call, the request
+        // itself, the body read — and each of them can carry a row, so one
+        // request reaches the index as several consumers. Runs here, after
+        // every pass that states or corrects a row, because it decides which
+        // rows are the same request and needs their final targets.
+        stats.consumer_row_folds =
+            crate::consumer_row_fold::fold_consumer_rows(&mut file_results, normalizer);
+        if stats.consumer_row_folds.total() > 0 {
+            debug!(
+                "  - Consumer rows folded onto their request: {} (response read {}, enclosing setup {}, type anchors carried {}, reads kept {})",
+                stats.consumer_row_folds.total(),
+                stats.consumer_row_folds.response_reads,
+                stats.consumer_row_folds.enclosing_setup,
+                stats.consumer_row_folds.anchors_carried,
+                stats.consumer_row_folds.response_reads_kept
             );
         }
 
@@ -7854,7 +7876,7 @@ impl FileOrchestrator {
         None
     }
 
-    fn normalize_consumer_method(method: Option<&str>) -> Option<String> {
+    pub(crate) fn normalize_consumer_method(method: Option<&str>) -> Option<String> {
         let raw = method.unwrap_or("").trim();
         if raw.is_empty() || raw.eq_ignore_ascii_case("unknown") {
             return Some("GET".to_string());

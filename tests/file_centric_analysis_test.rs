@@ -323,6 +323,7 @@ fn test_processing_stats_tracking() {
         pubsub_anchor_backfills: 0,
         pubsub_phantom_topic_drops: 0,
         graphql_document_site_drops: Default::default(),
+        consumer_row_folds: Default::default(),
         total_data_calls: 4,
         errors: vec!["Test error".to_string()],
     };

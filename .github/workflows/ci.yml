@@ -148,6 +148,7 @@ jobs:
           --test imported_request_member_test
           --test integration_test
           --test llm_cassette_hard_gate_test
+          --test one_row_per_request_test
           --test pubsub_wrapper_type_capture_test
           --test run_log_isolation_test
           --test undeclared_external_host_test

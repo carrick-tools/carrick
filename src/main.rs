@@ -11,6 +11,7 @@ mod call_site_extractor;
 mod cloud_storage;
 mod commonjs;
 mod config;
+mod consumer_row_fold;
 mod credentials;
 mod current_service;
 mod deno_support;
