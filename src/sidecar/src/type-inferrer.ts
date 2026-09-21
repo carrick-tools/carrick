@@ -1440,6 +1440,44 @@ export class TypeInferrer {
       isExplicit = true;
     }
 
+    // carrick#1376: the call answers a RESULT CARRIER — a generic union whose
+    // branches say whether the call worked and carry, on the success side, the
+    // value it produced. The carrier is the transport's own bookkeeping; the
+    // payload a caller receives is the success type argument, and publishing
+    // the carrier instead reports an envelope as a wire contract, which is the
+    // same class of answer the machinery guard refuses on the producer side.
+    //
+    // A wrapper rule that already unwrapped, and a type the source itself
+    // states, both outrank this: they are what the service's own config and
+    // its own author said.
+    const carrierCandidate =
+      unwrapResult.wasUnwrapped || explicitType
+        ? undefined
+        : this.resultCarrierPayload(
+            returnType,
+            terminalNode,
+            use.projections,
+            `${request.file_path}:${request.line_number}`
+          );
+    // The payload rides the row as its own MEMBERS, never as its bare name
+    // (#257): `derive_capture_anchors` turns a usable inference into a literal
+    // capture anchor, and a bare name is out of scope where the surface
+    // declares the alias, so it would decay to a top type and publish nothing
+    // — trading a wrong answer for no answer. Where the payload carries no
+    // member shape to print, the carrier keeps its own answer.
+    const carrierText = carrierCandidate
+      ? this.structuralTextFromType(carrierCandidate, terminalNode)
+      : null;
+    const carrierPayload = carrierText ? carrierCandidate : undefined;
+    if (carrierPayload && carrierText) {
+      typeString = carrierText;
+    } else if (carrierCandidate) {
+      this.log(
+        `Call result at ${request.file_path}:${request.line_number} carries a payload with no ` +
+          'printable member shape; publishing the carrier as written'
+      );
+    }
+
     // carrick#1375: the source never read this call's result whole — every
     // read took a member out of it, and one of those members is the generic
     // this result was instantiated with. That is a source unwrapping an
@@ -1463,6 +1501,7 @@ export class TypeInferrer {
       this.projectionReadsGenericPayload(callExpr, use.projections) &&
       !unwrapResult.wasUnwrapped &&
       !explicitType &&
+      !carrierPayload &&
       callExpr.getTypeArguments().length !== 1
     ) {
       this.log(
@@ -1512,9 +1551,17 @@ export class TypeInferrer {
       callExpr,
       extractionConfig
     );
-    const anchorSource = callUnwrap.wasUnwrapped
-      ? callUnwrap.payloadType
-      : callPayloadType;
+    // carrick#1376: the carrier's own symbol must never anchor either. The
+    // surface pre-claims the alias from the anchor, so anchoring on the
+    // carrier makes the capture emit the transport's bookkeeping as the
+    // operation's declaration — and where the carrier is a local interface the
+    // service does not export, nothing is emitted at all and the row reads
+    // null. The payload the carrier was found to hold is the anchor.
+    const anchorSource = carrierPayload
+      ? carrierPayload
+      : callUnwrap.wasUnwrapped
+        ? callUnwrap.payloadType
+        : callPayloadType;
     let anchor = anchorSource
       ? this.unwrapArrayLevels(this.unwrapPromiseType(anchorSource))
       : undefined;
@@ -2109,6 +2156,168 @@ export class TypeInferrer {
       }
       return parts.some((part) => argTexts.has(part.getText()));
     });
+  }
+
+  /**
+   * The payload a RESULT CARRIER carries, or `undefined` when `type` is not
+   * one or its success side cannot be told from its failure side
+   * (carrick#1376).
+   *
+   * A carrier is recognised by its shape, never by a name: a union of object
+   * branches, instantiated with two or more type arguments, at least one of
+   * which a branch holds as a member. `Result<T, E>`, `Either<L, R>` and a
+   * hand-rolled `{ ok: true; value: T } | { ok: false; error: E }` are all the
+   * same shape, and a promise-like around one is peeled first through the
+   * language's own await protocol. A single generic object — a resource state,
+   * a query result — is NOT a union and is left to carrick#1375, which
+   * abstains on it so a sibling site can answer.
+   *
+   * Which argument is the payload is decided twice over, and never guessed:
+   *
+   *  1. the platform's error shape. Exactly one argument that is not
+   *     error-shaped, beside at least one that is, is the success side.
+   *  2. what the source reads. Where every argument looks alike — `Pair<A,
+   *     string>` — a member read of the carrier that resolves to exactly one
+   *     of the arguments names the side this call site takes.
+   *
+   * Where neither decides, the carrier keeps its own answer and the limit is
+   * logged: a coin flip published as a contract is worse than an envelope a
+   * reader can see is an envelope.
+   */
+  private resultCarrierPayload(
+    type: Type,
+    at: Node,
+    projections: Node[],
+    where: string
+  ): Type | undefined {
+    const carrier = this.unwrapThenableType(this.unwrapPromiseType(type));
+    if (!carrier.isUnion()) {
+      return undefined;
+    }
+    const branches = carrier.getUnionTypes();
+    if (branches.length < 2 || !branches.every((branch) => this.isObjectShape(branch))) {
+      return undefined;
+    }
+    const args = [
+      ...carrier.getAliasTypeArguments(),
+      ...carrier.getTypeArguments(),
+    ];
+    if (args.length < 2) {
+      return undefined;
+    }
+    // A type argument only names a payload when a branch actually holds it:
+    // a generic that parameterises a status code or a key carries nothing.
+    const carried = args.filter((arg) =>
+      branches.some((branch) =>
+        branch
+          .getProperties()
+          .some((property) => {
+            try {
+              return property.getTypeAtLocation(at).getText() === arg.getText();
+            } catch {
+              return false;
+            }
+          })
+      )
+    );
+    if (carried.length === 0) {
+      return undefined;
+    }
+
+    const succeeded = carried.filter((arg) => !this.isErrorShaped(arg, at));
+    if (succeeded.length === 1 && succeeded.length < carried.length) {
+      return succeeded[0];
+    }
+
+    const argTexts = new Map(carried.map((arg) => [arg.getText(), arg]));
+    const read = new Set<string>();
+    for (const projection of projections) {
+      const projected = this.unwrapPromiseType(projection.getType()).getNonNullableType();
+      if (argTexts.has(projected.getText())) {
+        read.add(projected.getText());
+      }
+    }
+    if (read.size === 1) {
+      return argTexts.get([...read][0]);
+    }
+
+    this.log(
+      `Call result at ${where} answers a carrier (${typeText(carrier, at)}) whose success ` +
+        'side cannot be told from its failure side: no single argument is the only ' +
+        'non-error one and the source reads none of them out. Publishing the carrier as ' +
+        'written rather than guessing which argument is the payload'
+    );
+    return undefined;
+  }
+
+  /**
+   * `Future<T>` -> `T` for a promise-like of the source's own making, read off
+   * the await protocol rather than a name: a `then` whose first parameter is a
+   * callback, whose own first parameter is the value awaiting it yields.
+   * `Promise` and `PromiseLike` are peeled by `unwrapPromiseType` before this.
+   */
+  private unwrapThenableType(type: Type): Type {
+    let current = type;
+    for (let depth = 0; depth < 8; depth++) {
+      const then = current.getProperty('then');
+      const declaration = then?.getDeclarations()[0];
+      if (!then || !declaration) return current;
+      let onValue: Type | undefined;
+      try {
+        onValue = then
+          .getTypeAtLocation(declaration)
+          .getCallSignatures()[0]
+          ?.getParameters()[0]
+          ?.getTypeAtLocation(declaration);
+      } catch {
+        return current;
+      }
+      const value = onValue
+        ?.getCallSignatures()[0]
+        ?.getParameters()[0]
+        ?.getTypeAtLocation(declaration);
+      if (!value || value === current) return current;
+      current = value;
+    }
+    return current;
+  }
+
+  /**
+   * The platform's error shape: a `name` and a `message`, both strings. Every
+   * `Error` subclass has them and no payload a JSON body describes needs to.
+   * A union is error-shaped when every member of it is.
+   */
+  private isErrorShaped(type: Type, at: Node): boolean {
+    if (type.isUnion()) {
+      return type.getUnionTypes().every((part) => this.isErrorShaped(part, at));
+    }
+    const stringy = (property: TsSymbol | undefined): boolean => {
+      if (!property) return false;
+      try {
+        return property.getTypeAtLocation(at).getText() === 'string';
+      } catch {
+        return false;
+      }
+    };
+    return stringy(type.getProperty('name')) && stringy(type.getProperty('message'));
+  }
+
+  /**
+   * A shape a JSON body can be: an object, an array, or a union of them.
+   * Top types, primitives, `void` and callables are not.
+   */
+  private isObjectShape(type: Type): boolean {
+    if (type.isAny() || type.isUnknown()) return false;
+    if (type.isUnion()) {
+      const parts = type
+        .getUnionTypes()
+        .filter((part) => !part.isUndefined() && !part.isNull());
+      return parts.length > 0 && parts.every((part) => this.isObjectShape(part));
+    }
+    if (type.isIntersection()) {
+      return type.getIntersectionTypes().every((part) => this.isObjectShape(part));
+    }
+    return type.isObject() && !this.isCallableType(type);
   }
 
   /**
