@@ -80,6 +80,12 @@ pub fn init(verbose: bool, sink: LogSink) {
         .with_target(false)
         .with_level(false)
         .without_time()
+        // Its own default, stated because the run depends on it: a terminal
+        // that has gone away answers every write with an error, and a layer
+        // that reported its own write errors would be doing it to the stream
+        // that just failed — on the path a panicking print used to end runs on
+        // (carrick#1386, and [`crate::console`] for the rest of it).
+        .log_internal_errors(false)
         .with_filter(terminal_filter);
 
     // Try to set up file logging to ~/.carrick/logs/
@@ -643,7 +649,7 @@ impl<W: Write> Write for CappedWriter<'_, W> {
         let now = left.saturating_sub(written as u64);
         self.remaining.store(now, Ordering::Relaxed);
         if now == 0 && !self.announced.swap(true, Ordering::Relaxed) {
-            eprintln!(
+            crate::errln!(
                 "{} reached its {} MB cap and the rest of this run is not being written to it. \
                  Set {}=0 to log without a cap.",
                 self.what,
@@ -870,7 +876,7 @@ pub fn is_tty() -> bool {
 /// still sees the stage start. `finish_spinner` mirrors with `✓ <msg>`.
 pub fn spinner(msg: &str) -> ProgressBar {
     if !is_tty() {
-        eprintln!("▸ {}", msg);
+        crate::errln!("▸ {}", msg);
         // Returning a hidden ProgressBar keeps the call sites uniform — no
         // ticks are drawn and `finish_*` skips its rendering path. The
         // matching `✓ <msg>` line is still emitted by the same is_tty()
@@ -897,7 +903,7 @@ pub fn spinner(msg: &str) -> ProgressBar {
 /// item, the same shape [`spinner`] emits for a stage start.
 pub fn progress(pb: &ProgressBar, msg: &str) {
     if !is_tty() {
-        eprintln!("▸ {}", msg);
+        crate::errln!("▸ {}", msg);
         return;
     }
     pb.set_message(msg.to_string());
@@ -906,7 +912,7 @@ pub fn progress(pb: &ProgressBar, msg: &str) {
 /// Finish a spinner with a success checkmark.
 pub fn finish_spinner(pb: &ProgressBar, msg: &str) {
     if !is_tty() {
-        eprintln!("✓ {}", msg);
+        crate::errln!("✓ {}", msg);
         return;
     }
     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
@@ -937,13 +943,13 @@ pub fn annotate(level: Annotation, msg: &str) {
     };
     // Annotations are one line: a newline would end the command and print the
     // rest as ordinary log text.
-    eprintln!("::{}::{}", tag, msg.replace('\n', " "));
+    crate::errln!("::{}::{}", tag, msg.replace('\n', " "));
 }
 
 /// Finish a spinner with a warning marker.
 pub fn finish_spinner_warn(pb: &ProgressBar, msg: &str) {
     if !is_tty() {
-        eprintln!("⚠ {}", msg);
+        crate::errln!("⚠ {}", msg);
         return;
     }
     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());

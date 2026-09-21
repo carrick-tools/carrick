@@ -505,7 +505,7 @@ pub fn notice(text: &str) {
 /// the same split `logging::spinner` makes for its own lines.
 fn log_line(line: &str) {
     if !crate::logging::is_tty() {
-        eprintln!("{line}");
+        crate::errln!("{line}");
     }
 }
 

@@ -164,7 +164,7 @@ pub fn tick(phase: Phase, done: usize, total: usize) {
         total,
     };
     if let Ok(line) = serde_json::to_string(&update) {
-        eprintln!("{MARKER}{line}");
+        crate::errln!("{MARKER}{line}");
     }
 }
 
@@ -181,7 +181,7 @@ pub fn report_pending(summary: &str) {
     if !enabled() {
         return;
     }
-    eprintln!("{PENDING_MARKER}{}", summary.replace('\n', " "));
+    crate::errln!("{PENDING_MARKER}{}", summary.replace('\n', " "));
 }
 
 /// Read a pending statement out of a line of a scan's stderr.
@@ -204,7 +204,7 @@ pub fn report_dispatched(dispatched: &crate::analysis_job::Dispatched) {
         return;
     }
     if let Ok(payload) = serde_json::to_string(dispatched) {
-        eprintln!("{DISPATCHED_MARKER}{payload}");
+        crate::errln!("{DISPATCHED_MARKER}{payload}");
     }
 }
 
@@ -254,7 +254,7 @@ pub fn report_not_dispatched(reason: NotDispatched) {
         return;
     }
     if let Ok(payload) = serde_json::to_string(&reason) {
-        eprintln!("{NOT_DISPATCHED_MARKER}{payload}");
+        crate::errln!("{NOT_DISPATCHED_MARKER}{payload}");
     }
 }
 
@@ -312,7 +312,7 @@ pub fn report_phase(label: &str, state: PhaseState) {
         state,
     };
     if let Ok(line) = serde_json::to_string(&update) {
-        eprintln!("{PHASE_MARKER}{line}");
+        crate::errln!("{PHASE_MARKER}{line}");
     }
 }
 
@@ -376,7 +376,7 @@ pub fn report_summary(summary: &Summary) {
         return;
     }
     if let Ok(line) = serde_json::to_string(summary) {
-        eprintln!("{SUMMARY_MARKER}{line}");
+        crate::errln!("{SUMMARY_MARKER}{line}");
     }
 }
 
@@ -435,7 +435,7 @@ pub fn announce(text: &str) {
     if let Ok(line) = serde_json::to_string(&Notice {
         text: text.to_string(),
     }) {
-        eprintln!("{NOTICE_MARKER}{line}");
+        crate::errln!("{NOTICE_MARKER}{line}");
     }
 }
 
@@ -472,7 +472,7 @@ pub fn failed(stage: &str, error: &str) {
         return;
     }
     if let Ok(line) = serde_json::to_string(&failure(stage, error)) {
-        eprintln!("{FAILURE_MARKER}{line}");
+        crate::errln!("{FAILURE_MARKER}{line}");
     }
 }
 

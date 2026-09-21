@@ -47,6 +47,17 @@ jobs:
       - name: Run sidecar readiness timing tests
         run: cargo test --test sidecar_readiness_test --verbose
 
+      # Each raises a real signal at its own process, and each is the only
+      # test in its binary: the signal and the flag it sets are process-wide,
+      # and the flag keeps the FIRST signal, so a second test in the same
+      # binary reads the other one's signal as its own however they are
+      # ordered (carrick#1387 — it passed on the pull request and failed in
+      # the merge queue on the order alone).
+      - name: Run the signal tests
+        run: |
+          cargo test --test shutdown_signal_test --verbose
+          cargo test --test shutdown_drain_test --verbose
+
       # Fixture- and mock-driven; no live LLM, no env beyond what they set
       # themselves. route_request_anchor_test and span_locator_units_test need
       # the sidecar built above. eval_xrepo is the cross-repo scorer math only:
@@ -147,6 +158,7 @@ jobs:
           --test hosted_enrichment_test
           --test imported_request_member_test
           --test integration_test
+          --test interrupted_scan_test
           --test llm_cassette_hard_gate_test
           --test one_row_per_request_test
           --test pubsub_wrapper_type_capture_test

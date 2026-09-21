@@ -838,7 +838,7 @@ fn run_scan(
             crate::logging::finish_spinner_warn(&bar, &reporting.done);
             crate::progress::report_phase(&reporting.done, crate::progress::PhaseState::Warned);
             for statement in &pending {
-                eprintln!("carrick: {statement}");
+                crate::errln!("carrick: {statement}");
             }
         }
         return Ok(ScanReport {
@@ -868,7 +868,7 @@ fn run_scan(
 /// nobody is reading.
 fn forward(line: &str) {
     if crate::progress::parent_is_reading() {
-        eprintln!("{line}");
+        crate::errln!("{line}");
     }
 }
 

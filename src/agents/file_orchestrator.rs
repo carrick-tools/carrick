@@ -1397,6 +1397,12 @@ impl FileOrchestrator {
         // it is; it ticks for a parent that renders a line (carrick#955).
         let mut reading = crate::progress::Ticker::new(crate::progress::Phase::Files, files.len());
         for file_path in files {
+            // The one place a long CPU-bound pass can hear a signal: nothing
+            // in the loop below awaits, so on a large repo this is minutes in
+            // which the race in `main` is never polled (carrick#1387). Between
+            // files, because a file half-read leaves nothing to keep and an
+            // atomic load per file is not a cost.
+            crate::shutdown::check()?;
             reading.item();
             let path_str = file_path.to_string_lossy().to_string();
 

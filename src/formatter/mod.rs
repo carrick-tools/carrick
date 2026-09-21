@@ -60,7 +60,7 @@ impl FormattedOutput {
     }
 
     pub fn print(&self) {
-        println!("{}", self.content);
+        crate::outln!("{}", self.content);
     }
 }
 
