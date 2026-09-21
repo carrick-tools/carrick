@@ -246,6 +246,57 @@ test("the hooks that fire on every edit say it once a day", () => {
   }
 });
 
+test("a hook that is not the build that set the workspace up says so where the agent reads", posix, () => {
+  const dir = workspace();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-home-"));
+  try {
+    fs.mkdirSync(path.join(dir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "src", "main.ts"), "export {};\n");
+    // A version no release will ever be, so this compares against whatever
+    // version the checkout is at.
+    recordCliVersion(dir, "99.0.0");
+    const env = {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      CARRICK_BIN: path.join(packageRoot, "test", "fake-carrick.mjs"),
+      CARRICK_LOG_QUIET: "1",
+    };
+    const run = (...args: string[]): { stdout: string; stderr: string } =>
+      spawnSync(process.execPath, [path.join(packageRoot, "bin", "carrick.mjs"), ...args], {
+        cwd: dir,
+        env,
+        encoding: "utf8",
+        input: JSON.stringify({
+          cwd: dir,
+          session_id: "session-1",
+          tool_input: { file_path: path.join(dir, "src", "main.ts") },
+        }),
+      });
+
+    // Session start: on stdout, which is what this host adds to the session.
+    assert.match(run("hook", "session-start").stdout, /99\.0\.0 set this workspace up/);
+
+    // And the edit hook, inside `additionalContext` — a bare line on stdout is
+    // a malformed hook response, not a message.
+    const edit = run("hook", "post-edit");
+    const emitted = JSON.parse(edit.stdout);
+    assert.match(
+      emitted.hookSpecificOutput.additionalContext,
+      /99\.0\.0 set this workspace up/,
+      edit.stdout,
+    );
+    // Once a day: the same edit a minute later is the same mismatch, and the
+    // hook goes back to saying only what it found in the file.
+    const second = run("hook", "post-edit");
+    assert.doesNotMatch(second.stdout, /set this workspace up/, second.stdout);
+    assert.match(JSON.parse(second.stdout).hookSpecificOutput.additionalContext, /Carrick checked/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("a folder carrick was never set up in has no install to speak for", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-bare-"));
   try {

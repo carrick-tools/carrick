@@ -528,6 +528,50 @@ test("doctor reports the carrick a hook here will actually run", () => {
   }
 });
 
+test(
+  "a real doctor run reports the carrick on PATH against the one that set the workspace up",
+  { skip: process.platform === "win32" ? "the fake carrick needs a POSIX shebang" : false },
+  () => {
+    // The check above proves what the function answers; this proves the command
+    // asks it. `carrick` is put on PATH here rather than trusted to be on the
+    // machine's, so the line is the same on a laptop and on a runner.
+    const root = workspace({ "carrick.json": JSON.stringify({ serviceName: "api" }) });
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-doctor-home-"));
+    const bin = path.join(home, "bin");
+    fs.mkdirSync(bin, { recursive: true });
+    fs.writeFileSync(path.join(bin, "carrick"), "#!/bin/sh\necho 0.3.81\n", { mode: 0o755 });
+    fs.mkdirSync(path.join(root, ".carrick"), { recursive: true });
+    recordCliVersion(root, "0.3.84");
+    try {
+      const run = spawnSync(
+        process.execPath,
+        [path.join(packageRoot, "bin", "carrick.mjs"), "doctor", root],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            PATH: [bin, process.env["PATH"] ?? ""].join(path.delimiter),
+            HOME: home,
+            USERPROFILE: home,
+            XDG_CONFIG_HOME: path.join(home, ".config"),
+            CLAUDE_CONFIG_DIR: path.join(home, ".claude-config"),
+            APPDATA: path.join(home, "AppData"),
+            CARRICK_BIN: path.join(packageRoot, "test", "fake-carrick.mjs"),
+            CARRICK_NO_UPDATE_CHECK: "1",
+          },
+        },
+      );
+      assert.match(
+        run.stdout,
+        /on PATH is 0\.3\.81 and 0\.3\.84 set this workspace up/,
+        `${run.stdout}\n${run.stderr}`,
+      );
+    } finally {
+      for (const target of [root, home]) fs.rmSync(target, { recursive: true, force: true });
+    }
+  },
+);
+
 test("the hook reader sees exactly what the writer wrote", () => {
   for (const command of ["carrick", '"/opt/my tools/carrick/bin/carrick.mjs"']) {
     const body = mergeCarrickHooks(null, command).body;
