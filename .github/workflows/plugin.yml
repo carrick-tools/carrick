@@ -429,6 +429,12 @@ jobs:
       - name: A project .npmrc release-age policy does not reach npm install -g
         run: |
           set -euo pipefail
+          # An npm that knows the setting: the runner's is older and reports it
+          # as an unknown config, which reads exactly like a policy that did not
+          # apply. Fetched from here, OUTSIDE the probe directory, because the
+          # policy below applies to resolving npm itself just as much.
+          npm install --prefix npm12 --no-audit --no-fund npm@12
+          NPM="$PWD/npm12/node_modules/.bin/npm"
           mkdir -p probe-npmrc/prefix/lib probe-npmrc/prefix/bin
           cd probe-npmrc
           echo '{"name":"probe","private":true}' > package.json
@@ -436,10 +442,10 @@ jobs:
           # is read, so the refusal below does not depend on how recently
           # carrick was released.
           echo 'min-release-age=5256000' > .npmrc
-          NPM="npx --yes npm@12 install -g carrick --dry-run --ignore-scripts --omit=optional --prefix $PWD/prefix"
-          $NPM
+          GLOBAL="install -g carrick --dry-run --ignore-scripts --omit=optional --prefix $PWD/prefix"
+          "$NPM" $GLOBAL
           echo "the project policy did not reach it, as npm documents"
-          if $NPM --userconfig "$PWD/.npmrc"; then
+          if "$NPM" $GLOBAL --userconfig "$PWD/.npmrc"; then
             echo "::error::the same policy in the user config installed too: this npm does not know min-release-age, so the line above proves nothing"
             exit 1
           fi
