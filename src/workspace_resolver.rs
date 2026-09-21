@@ -170,8 +170,11 @@ impl WorkspaceIndex {
     /// repo root; it governs every file under that directory in place of the
     /// nearest config.
     ///
-    /// Used by the call graph, whose edges feed no analyzer input. The
+    /// Used by the surfaces that feed no analyzer input: the call graph's
+    /// edges, the GraphQL named-resolver hop, and every type request the
+    /// sidecar is sent (`engine::service_module_index`, carrick#1416). The
     /// analyzer-input path keeps [`WorkspaceIndex::build`] until carrick#474.
+    /// See `docs/reference/module-resolution.md`.
     pub fn build_with_aliases(repo_root: &Path, service_tsconfig: Option<(&Path, &Path)>) -> Self {
         Self::build_inner(repo_root, Some(service_tsconfig))
     }
