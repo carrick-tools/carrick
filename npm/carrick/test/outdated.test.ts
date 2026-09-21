@@ -17,8 +17,13 @@ import {
   initialisedRoot,
   noticeFile,
   outdatedInstall,
+  recordCliVersion,
+  recordedCliVersion,
   refreshNotice,
   removeNotice,
+  throttledVersionMismatch,
+  versionMismatch,
+  versionNoticeFile,
 } from "../src/init/outdated.ts";
 import { carrickHooks, mergeCarrickHooks, SETTINGS_FILES } from "../src/init/settings.ts";
 import { skillFile, SKILL_ROOTS, stamped, writeTaskSkills } from "../src/init/task-skills.ts";
@@ -175,6 +180,69 @@ test("a typed command says it once; a hook says nothing at all", posix, () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// The version that wrote these files, against the carrick that is reading them
+// (carrick#1372). A number here rather than content, because the question is
+// which BUILD is answering, not whether a body changed.
+
+test("a hook running the version that set the workspace up says nothing", () => {
+  const dir = workspace();
+  try {
+    assert.equal(recordCliVersion(dir, "0.3.84"), true);
+    assert.equal(recordedCliVersion(dir), "0.3.84");
+    assert.equal(versionMismatch(dir, "0.3.84"), null);
+    // And a workspace no version was recorded in is not a finding: an install
+    // from before this existed is not a mismatch.
+    const bare = workspace();
+    try {
+      assert.equal(recordedCliVersion(bare), null);
+      assert.equal(versionMismatch(bare, "0.3.84"), null);
+    } finally {
+      fs.rmSync(bare, { recursive: true, force: true });
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an older carrick reading newer files is told to upgrade, and a newer one to re-init", () => {
+  const dir = workspace();
+  try {
+    recordCliVersion(dir, "0.3.84");
+    const older = versionMismatch(dir, "0.3.81", "npm install -g carrick@0.3.84");
+    assert.match(older!, /This carrick is 0\.3\.81; 0\.3\.84 set this workspace up/);
+    assert.match(older!, /npm install -g carrick@0\.3\.84/);
+    const newer = versionMismatch(dir, "0.4.0", "npm install -g carrick@0.3.84");
+    assert.match(newer!, /carrick init/);
+    assert.doesNotMatch(newer!, /npm install/);
+    // A build that does not state a plain version compares against nothing.
+    assert.equal(versionMismatch(dir, null), null);
+    assert.equal(versionMismatch(dir, "0.4.0-rc.1"), null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the hooks that fire on every edit say it once a day", () => {
+  const dir = workspace();
+  try {
+    recordCliVersion(dir, "0.3.84");
+    const monday = new Date("2026-09-21T08:00:00Z");
+    assert.match(throttledVersionMismatch(dir, "0.3.81", monday)!, /set this workspace up/);
+    assert.equal(throttledVersionMismatch(dir, "0.3.81", new Date("2026-09-21T23:00:00Z")), null);
+    assert.match(
+      throttledVersionMismatch(dir, "0.3.81", new Date("2026-09-22T08:00:00Z"))!,
+      /set this workspace up/,
+    );
+    // The day is spent only on a line that exists: a matching version leaves
+    // tomorrow's line available.
+    fs.rmSync(versionNoticeFile(dir));
+    assert.equal(throttledVersionMismatch(dir, "0.3.84", monday), null);
+    assert.equal(fs.existsSync(versionNoticeFile(dir)), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

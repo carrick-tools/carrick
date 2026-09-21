@@ -419,6 +419,32 @@ jobs:
           which carrick
           carrick --version
 
+      # The upgrade an npx run performs on an older global uses the machine's
+      # own npm configuration and overrides none of it (carrick#1372), so what
+      # a repository's `.npmrc` says about release age decides whether that
+      # upgrade can happen at all. npm documents that a project `.npmrc` is not
+      # read in global mode; this is the measurement rather than the
+      # assumption, and the second half is what makes it worth running — an npm
+      # that does not know the setting installs in both and turns this red.
+      - name: A project .npmrc release-age policy does not reach npm install -g
+        run: |
+          set -euo pipefail
+          mkdir -p probe-npmrc/prefix/lib probe-npmrc/prefix/bin
+          cd probe-npmrc
+          echo '{"name":"probe","private":true}' > package.json
+          # Large enough that no published version qualifies however the unit
+          # is read, so the refusal below does not depend on how recently
+          # carrick was released.
+          echo 'min-release-age=5256000' > .npmrc
+          NPM="npx --yes npm@12 install -g carrick --dry-run --ignore-scripts --omit=optional --prefix $PWD/prefix"
+          $NPM
+          echo "the project policy did not reach it, as npm documents"
+          if $NPM --userconfig "$PWD/.npmrc"; then
+            echo "::error::the same policy in the user config installed too: this npm does not know min-release-age, so the line above proves nothing"
+            exit 1
+          fi
+          echo "the same policy in the user config refused it, which is the refusal a user sees"
+
   # An install over an install. What this catches is a file the previous version
   # left behind, or a `dist/` that half-updated: both install cleanly and answer
   # wrongly.

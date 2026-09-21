@@ -48,6 +48,8 @@ import {
   suppressed,
   writeUpdateState,
 } from "../update.ts";
+import { findCarrick, globalCommand, installedVersion, type GlobalCarrick } from "../global-install.ts";
+import { recordedCliVersion } from "./outdated.ts";
 import { repoRoots } from "./repos.ts";
 import { excludedRepos } from "./workspace-file.ts";
 import {
@@ -1009,6 +1011,56 @@ export async function checkVersion(
   ];
 }
 
+/**
+ * The carrick a hook here will actually run, against the one that wrote its
+ * files (carrick#1372).
+ *
+ * Different from `checkVersion` above, which asks the registry what is
+ * published. This asks the machine: an agent hook is `carrick hook post-edit`,
+ * resolved on PATH, so what answers it can be an install from three releases
+ * ago that an `npx carrick@latest` run never replaced. The two numbers only
+ * exist together here and in the hooks themselves.
+ *
+ * `findCarrick` rather than `which`, for the reason in `src/global-install.ts`:
+ * a `which` inside an npx run answers with the npx cache's own shim.
+ */
+export function checkPathVersion(workspace: string, found: GlobalCarrick | null): Line[] {
+  const recorded = recordedCliVersion(workspace);
+  if (recorded === null) return [];
+  if (found === null) {
+    return [
+      warn(
+        `carrick ${recorded} set this workspace up, and nothing answers to \`carrick\` on PATH, so the agent hooks here run whatever their command names. \`${installShape().command}\` puts it there.`,
+      ),
+    ];
+  }
+  if (found.version === null) {
+    return [
+      say(
+        `\`carrick\` on PATH is ${found.binary}, which does not say which version it is; ${recorded} set this workspace up.`,
+      ),
+    ];
+  }
+  if (found.version === recorded) {
+    return [done(`\`carrick\` on PATH is ${found.version}, the version that set this workspace up.`)];
+  }
+  const command = globalCommand(installShape(found.real).kind, recorded);
+  const fix = command
+    ? `Run \`${command.join(" ")}\`, or \`carrick init\` if ${found.version} is the one you want here.`
+    : `Update ${found.binary} where it is pinned, or run \`carrick init\` if ${found.version} is the one you want here.`;
+  return [
+    warn(
+      `\`carrick\` on PATH is ${found.version} and ${recorded} set this workspace up, so every agent hook here runs ${found.version}. ${fix}`,
+    ),
+  ];
+}
+
+/** The global carrick this machine has, with its version read. */
+function pathCarrick(): GlobalCarrick | null {
+  const found = findCarrick();
+  return found === null ? null : { ...found, version: installedVersion(found) };
+}
+
 /** Print one check's lines through the shared renderer. */
 function print(out: InitOutput, lines: Line[]): void {
   for (const line of lines) {
@@ -1034,6 +1086,7 @@ export async function doctor(argv: string[], out: InitOutput = createOutput()): 
   const repos = configuredRepos(workspace);
   const lines: Line[] = [
     ...(await checkVersion()),
+    ...checkPathVersion(workspace, pathCarrick()),
     ...checkDeclaredPaths(repos),
     ...checkWorkflow(repos),
     ...checkHooks(workspace, realMachine()),

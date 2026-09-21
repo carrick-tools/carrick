@@ -36,6 +36,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { ancestors, hasMarker } from "../root.ts";
+import { installShape, isNewer } from "../update.ts";
 import { CODEX_HOOKS_FILE, codexInUse, expectedCodexHooks, readHooksFile } from "./codex.ts";
 import {
   expectedCarrickHooks,
@@ -131,6 +132,114 @@ export function outdatedInstall(workspace: string): Outdated {
  */
 export function initialisedRoot(from: string): string | null {
   return ancestors(from).find((directory) => hasMarker(directory)) ?? null;
+}
+
+/**
+ * The version of carrick that last set this workspace up.
+ *
+ * A version number, where everything above this line is content — and the
+ * difference is what the two answer. The skills and the hook entries are read
+ * back to decide whether to rewrite them, and a body that did not change
+ * between two releases is current in both, which a version stamp could not say.
+ * This answers a different question: which build wrote them, so the `carrick`
+ * an agent hook actually resolves can say whether it is that build.
+ *
+ * It is inside `.carrick/`, which is ours and is ignored by the repository.
+ * Nothing of this goes into a settings file or an MCP entry: those belong to
+ * the client that validates them, and a key it does not know is a key it may
+ * one day reject (carrick#1333).
+ */
+export function versionFile(workspace: string): string {
+  return path.join(workspace, ".carrick", "cli-version");
+}
+
+/** Record the version writing these files, or leave no record. */
+export function recordCliVersion(workspace: string, version: string | null): boolean {
+  if (!version) return false;
+  try {
+    fs.mkdirSync(path.dirname(versionFile(workspace)), { recursive: true });
+    fs.writeFileSync(versionFile(workspace), `${version}\n`);
+    return true;
+  } catch {
+    // A workspace that cannot be written is a workspace init already reported
+    // on. Nothing here is worth a second message about it.
+    return false;
+  }
+}
+
+/** The version that wrote these files, or null where nothing recorded one. */
+export function recordedCliVersion(workspace: string): string | null {
+  try {
+    const recorded = fs.readFileSync(versionFile(workspace), "utf8").trim();
+    return /^\d+\.\d+\.\d+$/.test(recorded) ? recorded : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The line a hook prints when it is not the build that set this workspace up.
+ *
+ * Hooks are the surface an upgrade leaves behind. `npx carrick@latest` writes
+ * the skills and the hook entries, and then every hook runs whichever `carrick`
+ * PATH answers with, which can be an older global that was never replaced. The
+ * hook is the only thing in that chain that knows both numbers, so it is the
+ * backstop for every case the upgrade could not fix.
+ *
+ * Directional, because the two directions have different fixes: an older hook
+ * needs the install replaced, and a newer one needs `carrick init` run again so
+ * the files catch up.
+ */
+export function versionMismatch(
+  workspace: string,
+  running: string | null,
+  command: string = installShape().command,
+): string | null {
+  if (!running || !/^\d+\.\d+\.\d+$/.test(running)) return null;
+  const recorded = recordedCliVersion(workspace);
+  if (recorded === null || recorded === running) return null;
+  return isNewer(recorded, running)
+    ? `This carrick is ${running}; ${recorded} set this workspace up. Run \`${command}\` so your agent runs the version these files were written for.`
+    : `This carrick is ${running}; ${recorded} set this workspace up. Run \`carrick init\` to bring the hooks and skills here up to date.`;
+}
+
+/** Where the once-a-day stamp for the line above lives. */
+export function versionNoticeFile(workspace: string): string {
+  return path.join(workspace, ".carrick", "last-version-notice");
+}
+
+/**
+ * The same line, at most once a day in one workspace.
+ *
+ * For the hooks that fire on every edit and at the end of every task. Session
+ * start says it without a throttle: it is one line per session, in the one
+ * place an agent reads before it does anything.
+ *
+ * The day is recorded only when there is a line, so a mismatch that appears an
+ * hour from now is still named an hour from now.
+ */
+export function throttledVersionMismatch(
+  workspace: string,
+  running: string | null,
+  now: Date = new Date(),
+): string | null {
+  try {
+    const line = versionMismatch(workspace, running);
+    if (line === null) return null;
+    const file = versionNoticeFile(workspace);
+    let last: string | null;
+    try {
+      last = fs.readFileSync(file, "utf8").trim();
+    } catch {
+      last = null;
+    }
+    if (last === today(now)) return null;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${today(now)}\n`);
+    return line;
+  } catch {
+    return null;
+  }
 }
 
 /**

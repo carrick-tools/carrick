@@ -26,6 +26,8 @@
 import { createLogger } from "../log.ts";
 import { resolveChannel } from "../channel.ts";
 import { drain } from "./reuse.ts";
+import { initialisedRoot, throttledVersionMismatch } from "../init/outdated.ts";
+import { currentVersion } from "../update.ts";
 
 const log = createLogger("carrick-user-prompt");
 
@@ -76,12 +78,19 @@ async function main(): Promise<void> {
   }
 
   const spoken = drain(session);
-  if (spoken === null) {
-    log(`nothing new in ${session}: everything recorded has been named`);
-    return;
-  }
-  process.stdout.write(emission(spoken.line));
-  log(`named ${spoken.named} new function(s) to the model, of ${spoken.found} recorded`);
+  const parts: string[] = [];
+  if (spoken === null) log(`nothing new in ${session}: everything recorded has been named`);
+  else parts.push(spoken.line);
+
+  // The same backstop the other hooks carry: this `carrick` is not the one
+  // that set this workspace up (carrick#1372), once a day per workspace.
+  const root = initialisedRoot(process.env["CLAUDE_PROJECT_DIR"] ?? process.cwd());
+  const mismatch = root === null ? null : throttledVersionMismatch(root, currentVersion());
+  if (mismatch) parts.push(mismatch);
+
+  if (parts.length === 0) return;
+  process.stdout.write(emission(parts.join("\n\n")));
+  if (spoken) log(`named ${spoken.named} new function(s) to the model, of ${spoken.found} recorded`);
 }
 
 await main();

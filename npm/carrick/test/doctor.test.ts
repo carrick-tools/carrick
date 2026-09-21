@@ -23,6 +23,7 @@ import {
   checkHooks,
   checkIndex,
   checkMcp,
+  checkPathVersion,
   checkTaskSkills,
   checkWorkflow,
   configuredRepos,
@@ -45,6 +46,7 @@ import {
   stamped,
   writeTaskSkills,
 } from "../src/init/task-skills.ts";
+import { recordCliVersion } from "../src/init/outdated.ts";
 import { renderTemplate, TEMPLATE_PATHS } from "../src/templates.ts";
 import { statusFixture } from "./helpers.ts";
 import type { StatusResult } from "../src/contract.ts";
@@ -485,6 +487,42 @@ test("missing skills, skills an older version wrote, and skills edited here", ()
     assert.match(all, /1 task skill file\(s\) here were written by an older version of carrick/);
     assert.match(all, /carrick-reuse\/SKILL\.md has been edited here/);
     assert.equal(lines.find((line) => line.text.includes("edited here"))?.level, "say");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("doctor reports the carrick a hook here will actually run", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-doctor-version-"));
+  const found = (version: string | null) => ({
+    binary: "/usr/local/bin/carrick",
+    real: "/usr/local/lib/node_modules/carrick/bin/carrick.mjs",
+    version,
+  });
+  try {
+    fs.mkdirSync(path.join(dir, ".carrick"), { recursive: true });
+    // A workspace init has never run in says nothing: there are no hooks here
+    // for a version to be wrong for.
+    assert.deepEqual(checkPathVersion(dir, found("0.3.81")), []);
+
+    recordCliVersion(dir, "0.3.84");
+    const healthy = checkPathVersion(dir, found("0.3.84"));
+    assert.equal(findingCount(healthy), 0, texts(healthy).join("\n"));
+
+    const stale = checkPathVersion(dir, found("0.3.81"));
+    assert.equal(findingCount(stale), 1, texts(stale).join("\n"));
+    assert.match(stale[0]!.text, /on PATH is 0\.3\.81 and 0\.3\.84 set this workspace up/);
+    assert.match(stale[0]!.text, /npm install -g carrick@0\.3\.84/);
+
+    // Nothing on PATH at all is the same fault with a different fix: the hooks
+    // here name a command this machine cannot resolve.
+    const missing = checkPathVersion(dir, null);
+    assert.equal(findingCount(missing), 1, texts(missing).join("\n"));
+    assert.match(missing[0]!.text, /nothing answers to `carrick` on PATH/);
+
+    // A shim that will not say which version it is is a note, not a fault.
+    const unknown = checkPathVersion(dir, found(null));
+    assert.equal(findingCount(unknown), 0, texts(unknown).join("\n"));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

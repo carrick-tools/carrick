@@ -124,6 +124,33 @@ async function noticeUpdate() {
 await noticeUpdate();
 
 /**
+ * Leave no older `carrick` on PATH behind this run (carrick#1372).
+ *
+ * A run through `npx carrick@latest` is current by construction and changes
+ * nothing on the machine, so a global install from an earlier release keeps
+ * answering every hook, every script and every new shell afterwards. Where one
+ * exists, this brings it level, through the package manager that owns it, and
+ * then resolves `carrick` again to check that it took. It installs nothing on a
+ * machine that has no global: that offer is `carrick init`'s, where there is
+ * somebody to ask.
+ *
+ * `src/global-install.ts` has the reasoning. Silent unless it does something,
+ * and never a reason a command does not run.
+ */
+async function keepGlobalCurrent() {
+  try {
+    const sync = await import("../dist/global-install.js");
+    if (!sync.syncsOnThisRun(command, process.env)) return;
+    // stderr, so a `--json` answer on stdout stays parseable.
+    sync.syncGlobalInstall({ say: (line) => process.stderr.write(`carrick: ${line}\n`) });
+  } catch {
+    // An upgrade that could not even be attempted is not a failed command.
+  }
+}
+
+await keepGlobalCurrent();
+
+/**
  * Run a build of the index and render it (carrick#1315).
  *
  * The binary writes for a log file as well as for a person: a run banner, a

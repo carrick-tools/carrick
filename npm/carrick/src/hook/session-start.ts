@@ -19,6 +19,7 @@ import { renderSessionStart } from "../render.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { currentVersion, readUpdateState, suppressed, updateNotice } from "../update.ts";
 import { refreshInBackground } from "./refresh.ts";
+import { versionMismatch } from "../init/outdated.ts";
 
 const log = createLogger("carrick-session");
 
@@ -57,6 +58,15 @@ async function main(): Promise<void> {
   // run its first scan, which is the worst moment to be on a stale build.
   const version = versionLine();
   if (version) process.stdout.write(`${version}\n`);
+
+  // And the other mismatch: not "a newer one is published" but "the one
+  // answering this hook is not the one that wrote these files". Unthrottled,
+  // because this runs once per session and the agent about to work here is the
+  // reader who can act on it (carrick#1372).
+  if (choice.markerFound) {
+    const mismatch = versionMismatch(choice.root, currentVersion());
+    if (mismatch) process.stdout.write(`${mismatch}\n`);
+  }
 
   const outcome = await status({ cwd: choice.root, workspace: choice.markerFound ? choice.root : null });
   if (!outcome.result) {

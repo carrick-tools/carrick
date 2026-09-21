@@ -67,6 +67,13 @@ which fails silently when it is wrong.
 An explicit `carrick upgrade` that runs the detected command is a small
 follow-up on top of `installShape`, not a prerequisite.
 
+That argument still holds for the notice, and "Global sync" below is where it
+stops holding. It is not a self-update: a run through npx does not replace
+itself, it replaces the OTHER carrick it can prove is there — resolved off
+PATH, with its shape read from where it actually sits, and with the result
+verified by resolving it again. The failure the paragraph above describes is a
+guess about where an install is; that one does not guess.
+
 ## Where the check runs, and what it costs
 
 | Surface | When | Cost |
@@ -131,6 +138,87 @@ one, and this guard is the second line rather than the first.
 air-gapped machine. The package's own test script sets it through
 `test/no-update-check.mjs`, because a third of the tests spawn the shim as a
 real child process.
+
+## Global sync: an npx run leaves no older carrick on PATH (carrick#1372)
+
+The notice above still installs nothing. This is the one thing beside it that
+does, and only ever to an install that already exists.
+
+`npx carrick@latest` is current by construction, and a global install from
+three releases ago goes on answering everything else on that machine: every
+agent hook (`carrick hook post-edit` is resolved on PATH), every script, every
+new shell. That is the "two versions on one machine in one morning" incident,
+seen from the other side — the run a person watched was fine and everything
+after it was not.
+
+So a command started through npx, before it does anything else:
+
+1. Resolves `carrick` on PATH, skipping the npx cache it is running from, and
+   reads that install's version off its own manifest.
+2. Where that is older, upgrades it to the version this run is, with the
+   command for the shape it is in (`npm install -g`, `pnpm add -g`,
+   `bun add -g`, `volta install`) and **no flag of ours**: not a registry, not
+   a prefix, not a release-age override. Somebody who installed carrick
+   globally chose to have it on the machine; keeping that choice current is
+   inside what they agreed to. Forcing it past their machine's policy is not.
+3. Resolves `carrick` again and compares. A second install earlier on PATH, a
+   version manager's shim, or an install that reported success and changed
+   nothing all end the run with a line naming the path that is still stale and
+   the command for it. It never ends silently on an older binary.
+
+A refusal is printed with its reason and the one command, and the run carries
+on. Nothing is retried with more force.
+
+`hook`, `lsp`, `remove`, `--version` and `--help` are excluded, along with CI
+and `CARRICK_NO_UPDATE_CHECK=1`. A run that is not through npx is skipped
+because it IS the install in question: a global `carrick index` is already the
+version on PATH, and a project dependency belongs to the repository that pins
+it — that one is reported, never replaced.
+
+### A machine with no global
+
+Never installed onto silently. Interactive `carrick init` asks;
+`carrick init --yes` prints the command and installs nothing, because `--yes`
+is an answer about the workspace; `carrick init --install-global` is the
+consent a script gives. The answer decides what the hook entries say: with a
+global they are the bare `carrick`, and without one they name the install that
+wrote them — which, under npx, is a cache directory that gets cleared.
+
+`init` used to write the bare command whenever `which carrick` succeeded, and
+inside an npx run that is always: npm puts the exec tree's own
+`node_modules/.bin` first on PATH for the child it runs. Every hook entry
+written that way named a command that stopped existing when npx exited.
+`findCarrick` walks PATH itself and skips that entry.
+
+### Release-age policy, measured
+
+npm documents that a project `.npmrc` is not read in global mode. Measured
+with npm 12.0.2 against `carrick@0.3.84`, published the day before:
+
+| Where `min-release-age=43200` was set | `npm install -g carrick@0.3.84 --dry-run` |
+|---|---|
+| the project `.npmrc` in the cwd | installed, 37 packages |
+| the user config (`--userconfig`) | refused: `code ETARGET … no matching version … with a date before …` |
+
+So a repository's release-age policy does not block this, and a person's own
+does — which is a refusal they see, with its reason and the command, rather
+than something overridden behind their back. The pair runs as a step in the
+`Global install` job, with the second half asserted: an npm too old to know
+the setting would install in both and turn that step red.
+
+### The backstop
+
+Each hook compares the version it is running with the version recorded in
+`.carrick/cli-version` when `carrick init` wrote these files, and says so on a
+mismatch — upgrade the install when the hook is older, run `carrick init` when
+it is newer. `carrick doctor` reports the same comparison against the `carrick`
+a PATH lookup finds. A version number rather than content, unlike everything in
+`outdated.ts`: the question is which build is answering, not whether a body
+changed. It lives in `.carrick/`, which is ours and ignored, and never in a
+settings file or an MCP entry (carrick#1333).
+
+Session start says it once per session, unthrottled. The hooks that fire on
+every edit say it once a day per workspace.
 
 ## What this does not touch
 

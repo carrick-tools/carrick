@@ -41,6 +41,9 @@ import { connectMcpClients, mcpLine, offeredFileClients, type McpOutcome, type O
 import { hookCommand, mergeCarrickHooks, removeCarrickHooks } from "./settings.ts";
 import { CODEX_HOOKS_FILE, writeCodexHooks } from "./codex.ts";
 import { ignoredSkillRoots, taskSkillLines, writeTaskSkills } from "./task-skills.ts";
+import { recordCliVersion } from "./outdated.ts";
+import { findCarrick, offerGlobalInstall } from "../global-install.ts";
+import { currentVersion } from "../update.ts";
 import { writeIfChanged } from "./files.ts";
 import { excludedRepos, writeSelection, WORKSPACE_FILE } from "./workspace-file.ts";
 import { createOutput, DOCS, PromptCancelled, type Choice, type InitOutput } from "./output.ts";
@@ -115,18 +118,38 @@ export type InitOptions = {
   assumeYes: boolean;
   /** Take the selected repos out of whatever project they are in now. */
   allowMove: boolean;
+  /**
+   * Install carrick globally where this machine has none (carrick#1372).
+   *
+   * Its own flag, because `--yes` is an answer about this workspace and a
+   * global install is a change to the machine. Without a global, the hooks
+   * written below name this install — an npx cache directory, when that is how
+   * this ran — and stop working when it is cleared.
+   */
+  installGlobal: boolean;
 };
 
 const OWNER_REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
 export function parseArgs(argv: string[], cwd = process.cwd()): InitOptions | string {
-  const options: InitOptions = { workspace: cwd, project: null, repos: [], editors: [], assumeYes: false, allowMove: false };
+  const options: InitOptions = {
+    workspace: cwd,
+    project: null,
+    repos: [],
+    editors: [],
+    assumeYes: false,
+    allowMove: false,
+    installGlobal: false,
+  };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     switch (argument) {
       case "--yes":
       case "-y":
         options.assumeYes = true;
+        break;
+      case "--install-global":
+        options.installGlobal = true;
         break;
       case "--allow-move":
         options.allowMove = true;
@@ -211,17 +234,25 @@ function help(): string {
     "                         comma-separated list. Without a terminal no editor file is",
     "                         written unless this names one, and --yes does not name one",
     "    -y, --yes            Take the proposal as printed",
+    "        --install-global Install carrick on this machine where there is none,",
+    "                         so the agent hooks can run it by name after this run",
+    "                         ends. A terminal is asked instead; --yes is not this",
     "",
     `The editor extension, the hooks, CI and a carrick.json written by hand: ${DOCS}`,
   ].join("\n");
 }
 
-/** Whether a command answers on this machine, for a line we should not print. */
-function onPath(command: string): boolean {
-  const probe = spawnSync(process.platform === "win32" ? "where" : "which", [command], {
-    stdio: "ignore",
-  });
-  return probe.status === 0;
+/**
+ * Whether `carrick` answers on this machine after this run ends.
+ *
+ * Not `which`: npm puts the exec tree's own `node_modules/.bin` first on PATH
+ * for the child it runs, so inside `npx carrick init` a `which carrick` says
+ * yes on a machine with no global — and the hooks were then written as a bare
+ * `carrick hook post-edit`, naming a command that stopped existing when npx
+ * exited (carrick#1372). `findCarrick` skips the copy doing the looking.
+ */
+function carrickOnPath(): boolean {
+  return findCarrick() !== null;
 }
 
 /**
@@ -962,7 +993,26 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   // connection, for work that crosses repos this machine does not hold,
   // configured for every client this machine has rather than printed for one
   // of them (carrick#955).
-  const command = hookCommand({ onPath });
+  // Before the hook commands are decided, because what they say depends on the
+  // answer: with a global, they are the bare `carrick`, which every shell and
+  // every agent on this machine resolves; without one, they name this install,
+  // and an npx cache is cleared (carrick#1372). A machine that already has one
+  // was brought level before this command started.
+  try {
+    await offerGlobalInstall({
+      assumeYes: parsed.assumeYes,
+      install: parsed.installGlobal,
+      confirm: (question) => out.confirm(question),
+      say: (line) => out.warn(line),
+    });
+  } catch (error) {
+    // Including a cancelled prompt: somebody answering Ctrl-C to an offer is
+    // answering the offer, not ending the setup.
+    if (!(error instanceof PromptCancelled)) {
+      out.warn(`The global install was not offered: ${(error as Error).message}`);
+    }
+  }
+  const command = hookCommand({ onPath: carrickOnPath });
   const settingsName = path.join(".claude", command.bare ? "settings.json" : "settings.local.json");
   const settingsFile = path.join(workspace, settingsName);
   let hooksWritten = true;
@@ -1007,6 +1057,10 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     const { done, warn } = taskSkillLines(writeTaskSkills(workspace, { slug: projectSlug }));
     for (const line of done) out.done(line);
     for (const line of warn) out.warn(line);
+    // Which build wrote them, so a hook running an older `carrick` than this
+    // one says so instead of answering from files it does not match
+    // (carrick#1372).
+    recordCliVersion(workspace, currentVersion());
     const ignored = ignoredSkillRoots(workspace);
     if (ignored.length > 0) {
       const one = ignored.length === 1;
@@ -1021,11 +1075,9 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   const mcp = connectMcpClients(editors);
   if (hooksWritten) out.done(configuredLine(mcp));
   for (const line of mcpClientLines(mcp)) out.done(line);
-  if (!command.bare) {
-    out.warn(
-      `\`carrick\` is not on PATH, so the hooks in ${settingsName} name this install. Run \`npm install -g carrick\` and carrick init again for the short command.`,
-    );
-  }
+  // Nothing here about `carrick` not being on PATH: the offer above said it, in
+  // front of the decision it changes, and with the command for this machine's
+  // package manager rather than a guess at npm (carrick#1372).
   for (const outcome of mcp.filter((entry) => entry.state === "failed")) {
     out.warn(`MCP not configured for ${outcome.client}: ${outcome.detail}`);
   }
