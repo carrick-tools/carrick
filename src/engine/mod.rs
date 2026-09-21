@@ -2854,8 +2854,11 @@ async fn analyze_current_repo_incremental(
             // GraphQL producers take the infer path, not the bundle path: their
             // response contract is the resolver's expanded RETURN type, so they
             // become `FunctionReturn` infer requests (Stage B1).
-            let mut protocol_infer = file_orchestrator
-                .collect_graphql_producer_infer_requests(&protocol_extractions.graphql, repo_path);
+            let mut protocol_infer = file_orchestrator.collect_graphql_producer_infer_requests(
+                &protocol_extractions.graphql,
+                repo_path,
+                config,
+            );
             // Pub/sub payloads with no named symbol (wrapper patterns:
             // topic-map emitters, schema-catalog workers, generic channel
             // handles) resolve via the LLM-located payload expression through
@@ -5303,23 +5306,12 @@ fn discover_files_and_symbols(
     // which is why only this index reads them; see
     // `docs/reference/module-resolution.md`.
     let repo_root = std::path::Path::new(repo_path);
-    // A Deno config named as the service's `tsconfig` selects Deno, whose
-    // import maps are read from the tree anyway.
-    let service_tsconfig = service
-        .tsconfig
-        .as_deref()
-        .map(std::path::Path::new)
-        .filter(|config| {
-            !config
-                .file_name()
-                .is_some_and(|name| name == "deno.json" || name == "deno.jsonc")
-        });
-    let service_dir = crate::workspace_resolver::normalize(std::path::Path::new(
-        service.directory.as_deref().unwrap_or(""),
-    ));
+    let service_tsconfig = service.alias_tsconfig();
     let workspace = crate::workspace_resolver::WorkspaceIndex::build_with_aliases(
         repo_root,
-        service_tsconfig.map(|config| (service_dir.as_path(), config)),
+        service_tsconfig
+            .as_ref()
+            .map(|(directory, config)| (directory.as_path(), config.as_path())),
     );
     let unresolved = crate::call_graph::resolve_call_edges(
         &mut all_function_definitions,
@@ -6347,8 +6339,11 @@ async fn analyze_current_repo(
     // GraphQL producers take the infer path, not the bundle path: their response
     // contract is the resolver's expanded RETURN type, so they become
     // `FunctionReturn` infer requests (Stage B1).
-    let mut protocol_infer = file_orchestrator
-        .collect_graphql_producer_infer_requests(&protocol_extractions.graphql, repo_path);
+    let mut protocol_infer = file_orchestrator.collect_graphql_producer_infer_requests(
+        &protocol_extractions.graphql,
+        repo_path,
+        config,
+    );
     // Pub/sub payloads with no named symbol (wrapper patterns: topic-map
     // emitters, schema-catalog workers, generic channel handles) resolve via
     // the LLM-located payload expression through the same infer path.
@@ -11568,7 +11563,11 @@ mod tests {
         let orchestrator = FileOrchestrator::new(AgentService::new());
         assert!(
             orchestrator
-                .collect_graphql_producer_infer_requests(&graphql, ".")
+                .collect_graphql_producer_infer_requests(
+                    &graphql,
+                    ".",
+                    &crate::config::Config::default()
+                )
                 .is_empty(),
             "no resolver line means no FunctionReturn infer request"
         );
@@ -13051,7 +13050,11 @@ mod tests {
         let manifest_alias = manifest_entry.type_alias.clone();
 
         let orchestrator = FileOrchestrator::new(AgentService::new());
-        let infer = orchestrator.collect_graphql_producer_infer_requests(&extractions.graphql, ".");
+        let infer = orchestrator.collect_graphql_producer_infer_requests(
+            &extractions.graphql,
+            ".",
+            &crate::config::Config::default(),
+        );
         assert_eq!(infer.len(), 1, "exactly one producer infer request");
         let request = &infer[0];
 
@@ -13100,7 +13103,11 @@ mod tests {
         };
         assert!(
             orchestrator
-                .collect_graphql_producer_infer_requests(&bare.graphql, ".")
+                .collect_graphql_producer_infer_requests(
+                    &bare.graphql,
+                    ".",
+                    &crate::config::Config::default()
+                )
                 .is_empty(),
             "an SDL producer with no merged resolver location produces no infer request"
         );
