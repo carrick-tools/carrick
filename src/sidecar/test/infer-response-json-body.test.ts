@@ -123,6 +123,28 @@ export async function fetchEntry(id: string): Promise<LedgerEntry | null> {
   if (response.status === 404) return null;
   return (await response.json()) as LedgerEntry;
 }
+
+export interface Outcome {
+  status: number;
+  body?: string;
+}
+
+declare function runOutcome(): Promise<Outcome>;
+declare function send(body: unknown, meta: unknown): Response;
+
+export async function outcomeRoute() {
+  const result = await runOutcome();
+  return new Response(result.body ?? "", { status: result.status });
+}
+
+export async function summaryStatusRoute() {
+  const result = await runOutcome();
+  return new Response(JSON.stringify(readSummary()), { status: result.status });
+}
+
+export function queuedRoute() {
+  return send("accepted", { status: "queued" });
+}
 `;
 
 /** 1-based lines in SERVICE_TS, read off the source above. */
@@ -131,6 +153,9 @@ const NEW_RESPONSE_LINE = 29;
 const CONTEXT_JSON_LINE = 35;
 const PROXY_LINE = 39;
 const FETCH_LINE = 43;
+const VARIABLE_STATUS_LINE = 56;
+const VARIABLE_STATUS_WITH_BODY_LINE = 61;
+const STRING_STATUS_LINE = 66;
 
 /** The live extraction config for a service on this runtime (ticket evidence). */
 const EXTRACTION_CONFIG = {
@@ -311,6 +336,57 @@ describe('carrick#1017: the json body, never the Response wrapper', () => {
     } else {
       assert.ok(true, 'abstained: no verdict is possible, and none is claimed');
     }
+  });
+
+  it('never publishes the init object when the status beside the body is a variable', async () => {
+    // The shape a file-based route writes when the status travels with the
+    // result: `new Response(<body>, { status: result.status })`. The init
+    // object states HOW to send, never WHAT is sent — whether the status is a
+    // literal code or a value the source does not fix. The body here is a
+    // string, which this layer does not publish as a contract, so the honest
+    // answer is an abstention.
+    const inferred = await infer(
+      'Endpoint_Outcome_Response',
+      VARIABLE_STATUS_LINE,
+      'function_return'
+    );
+    assert.ok(
+      !inferred || collapse(inferred.type_string) !== '{ status: number; }',
+      `the ResponseInit object is not the response contract, got: ${inferred?.type_string}`
+    );
+    assert.ok(
+      !inferred,
+      `the body is a string, so nothing object-shaped may be published; got: ${inferred?.type_string}`
+    );
+  });
+
+  it('still reads the body when a variable status travels beside it', async () => {
+    // Control for the case above: skipping the init object must not cost the
+    // body when there IS one.
+    const inferred = await infer(
+      'Endpoint_SummaryStatus_Response',
+      VARIABLE_STATUS_WITH_BODY_LINE,
+      'function_return'
+    );
+    assert.ok(inferred, 'must resolve the summary body, not abstain');
+    assert.strictEqual(
+      collapse(inferred.type_string),
+      '{ count: number; total: number; }'
+    );
+  });
+
+  it('keeps an object whose status is not status-shaped as a payload', async () => {
+    // The negative of the rule: an argument beside the body counts as init
+    // only when it states init — an HTTP status code, fixed or variable, or
+    // headers. `{ status: "queued" }` states neither, so it stays a payload
+    // and the init test must not have been widened to any `status` member.
+    const inferred = await infer(
+      'Endpoint_Queued_Response',
+      STRING_STATUS_LINE,
+      'function_return'
+    );
+    assert.ok(inferred, 'must resolve the queued payload, not abstain');
+    assert.strictEqual(collapse(inferred.type_string), '{ status: string; }');
   });
 
   it('takes the body a consumer reads, not the status check beside the call', async () => {

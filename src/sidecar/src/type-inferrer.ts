@@ -3869,7 +3869,16 @@ export class TypeInferrer {
    * True when an object literal argument is response INIT rather than a body:
    * every property it declares is one the standard `ResponseInit` declares
    * (`status`, `statusText`, `headers`), and it states at least one of them as
-   * init really does — a numeric status in the HTTP range, or headers.
+   * init really does — a status in the HTTP range, or headers.
+   *
+   * The status does NOT have to be a literal code. A route that carries its
+   * outcome in a value writes `new Response(body, { status: result.status })`,
+   * where the source fixes no code and `statedStatusCodes` answers
+   * `'variable'` — status-shaped, just not pinned. Requiring a literal there
+   * left the whole init object reading as a body, so an endpoint whose payload
+   * this layer does not publish (a string body) published `{ status: number }`
+   * as its response contract instead: a wrong contract, served, where an
+   * abstention was the honest answer.
    *
    * A payload that merely has a `status` member of its own (`{ status: "ok",
    * service: "ledger" }`) declares members init does not, or states `status` as
@@ -3893,7 +3902,7 @@ export class TypeInferrer {
         statesInit = true;
         continue;
       }
-      if (name === 'status' && Array.isArray(this.statedStatusCodes(value))) {
+      if (name === 'status' && this.statedStatusCodes(value) !== undefined) {
         statesInit = true;
       }
     }
