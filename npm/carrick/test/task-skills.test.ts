@@ -169,6 +169,11 @@ test("the bodies read what an answer carries rather than a response shape writte
   assert.match(census, /also_phrased_as: \["<how it does it>"\]/);
   assert.match(census, /Where the answer carries no `phrasings`, or the field comes back refused/);
   assert.match(census, /`hidden_by_threshold` where the answer carries it/);
+
+  // A function with no intent is still ranked, on its own tokens, so the
+  // receipt cannot report it as a function no search looked at.
+  assert.doesNotMatch(census, /which no search looked at/);
+  assert.match(census, /ranked on their name, signature and body tokens alone/);
 });
 
 test("a second run writes nothing and reports nothing to fix", () => {
