@@ -50,7 +50,7 @@ import { writeIfChanged } from "../src/init/files.ts";
 import { WORKSPACE_FILE } from "../src/init/workspace-file.ts";
 import { CODEX_HOOKS_FILE } from "../src/init/codex.ts";
 import { TEMPLATE_PATHS } from "../src/templates.ts";
-import { DOWNLOAD_LABEL, downloadProgress, hostedReport } from "../src/init/hosted.ts";
+import { BEAT_MS, DOWNLOAD_LABEL, downloadProgress, hostedReport } from "../src/init/hosted.ts";
 import {
   chosenNumbers,
   DOCS,
@@ -1971,27 +1971,79 @@ test("the download says how far through the workspace it is, and how long", () =
   let clock = 1000;
   const report = downloadProgress((text) => void said.push(text), () => clock);
   // Not a marker: nothing is drawn for the scanner's ordinary log lines.
-  report("2026-09-20T18:00:00Z  INFO carrick: indexing 5 repos");
+  report.read("2026-09-20T18:00:00Z  INFO carrick: indexing 5 repos");
   assert.deepEqual(said, []);
 
   clock = 3500;
-  report(
+  report.read(
     '@carrick-progress {"service":"api","service_index":7,"service_total":15,"phase":"files","done":40,"total":120}',
   );
   assert.deepEqual(said, [`${DOWNLOAD_LABEL}: 7 of 15 services, 2.5s`]);
 
   // The hosted half says its size once, as a notice, because it is two
   // requests for the whole workspace rather than a count that ticks.
-  clock = 6000;
-  report('@carrick-notice {"text":"hosted bytes 3.2 MB"}');
-  clock = 8000;
-  report(
+  clock = 9000;
+  report.read('@carrick-notice {"text":"hosted bytes 3.2 MB"}');
+  clock = 15_000;
+  report.read(
     '@carrick-progress {"service":"web","service_index":8,"service_total":15,"phase":"files","done":5,"total":90}',
   );
-  assert.deepEqual(said.at(-1), `${DOWNLOAD_LABEL}: 8 of 15 services, 3.2 MB, 7.0s`);
+  assert.deepEqual(said.at(-1), `${DOWNLOAD_LABEL}: 8 of 15 services, 3.2 MB, 14.0s`);
 
   // And never a time remaining: there is no measured rate to derive one from.
   for (const line of said) assert.doesNotMatch(line, /left|remaining|eta/i);
+});
+
+// carrick#1373: the markers arrive when the scanner finishes a service, and
+// the hosted request in front of them is one call that runs for minutes on a
+// large project. An agent harness reading a pipe cannot tell that wait from a
+// hang, and it is the silence that ends the run — so the line is written off a
+// clock as well as off the markers, and never twice inside one beat.
+test("the download says where it is on a clock, not only when a marker arrives", () => {
+  const said: string[] = [];
+  let clock = 0;
+  const report = downloadProgress((text) => void said.push(text), () => clock);
+
+  // Nothing has moved and nothing has been said, and the beat says so anyway.
+  clock = BEAT_MS;
+  report.beat();
+  assert.deepEqual(said, [`${DOWNLOAD_LABEL}: reading, ${(BEAT_MS / 1000).toFixed(1)}s`]);
+
+  // Two beats inside one interval are one line: the cadence is the promise in
+  // both directions.
+  clock = BEAT_MS + 1;
+  report.beat();
+  report.read(
+    '@carrick-progress {"service":"api","service_index":1,"service_total":9,"phase":"files","done":1,"total":9}',
+  );
+  assert.equal(said.length, 1, said.join("\n"));
+
+  // And a beat a whole interval later says where the markers got it to.
+  clock = BEAT_MS * 2 + 1;
+  report.beat();
+  assert.equal(said.length, 2, said.join("\n"));
+  assert.match(said[1] as string, /1 of 9 services/);
+});
+
+// The other half of the same defect: the plain rendering used to drop every
+// progress line, so the cadence above reached a terminal and nothing else.
+test("the plain rendering writes what a running step says, not only its report", async () => {
+  const written: string[] = [];
+  const out = plainOutput((text) => void written.push(text));
+  await out.step(
+    "Downloading your index",
+    async (progress) => {
+      progress("Downloading your index: reading, 5.0s");
+      progress("Downloading your index: 2 of 9 services, 10.0s");
+      return "ok";
+    },
+    () => ({ kind: "done", text: "Hosted index for 9 services downloaded into .carrick/" }),
+  );
+  assert.deepEqual(written, [
+    "Downloading your index: reading, 5.0s\n",
+    "Downloading your index: 2 of 9 services, 10.0s\n",
+    "◇ Hosted index for 9 services downloaded into .carrick/\n",
+  ]);
 });
 
 // What the picker opens on. A default is a claim about somebody's folder, so

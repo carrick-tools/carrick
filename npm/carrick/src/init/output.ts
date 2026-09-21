@@ -107,9 +107,11 @@ export type StepReport = { kind: "done" | "warn" | "refuse"; text: string };
  *
  * Handed to the step's work rather than exposed on its own, because only the
  * step that owns the terminal may write to it: a spinner rewrites one line, so
- * anything else printing underneath corrupts it. In the plain rendering this
- * does nothing — one line per step is what a pipe gets, and a scan of a large
- * repo would otherwise write thousands (carrick#1315).
+ * anything else printing underneath corrupts it. The interactive rendering
+ * draws it on that one line; the plain rendering writes it as its own line,
+ * because a reader on a pipe has nothing else to tell a long read from a hang
+ * (carrick#1373). Keeping that bounded is the WORK's job — it states the
+ * cadence, and both renderings say what it says.
  */
 export type StepProgress = (text: string) => void;
 
@@ -253,11 +255,19 @@ export function plainOutput(
       for (const entry of body) write(`  ${entry}\n`);
       write("\n");
     },
-    // No spinner here, so the label was never printed: the step is exactly the
-    // one line its work reports, which is what the plain rendering already
-    // spent on it.
+    // No spinner here, so the label is never printed on its own: a step that
+    // finishes quickly is exactly the one line its work reports, which is what
+    // the plain rendering already spent on it.
+    //
+    // What the work says WHILE it runs is written through (carrick#1373). This
+    // used to be dropped, on the grounds that a pipe gets one line per step
+    // and a scan of a large repo would otherwise write thousands — but the one
+    // step that reports progress is a read that takes minutes, and a reader
+    // with a tool timeout cannot tell minutes of silence from a hang. The
+    // bound is kept where it belongs: the work states its own cadence, and
+    // this writes what it says (see `BEAT_MS` in `hosted.ts`).
     step: async (_label, work, report) => {
-      const value = await work(() => {});
+      const value = await work((text) => write(`${text}\n`));
       const outcome = report(value);
       line(marker(outcome.kind), outcome.text);
       return value;
