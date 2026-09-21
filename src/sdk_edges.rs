@@ -1365,6 +1365,10 @@ mod tests {
                 },
                 (!compatible).then_some("Property 'amountCents' is missing in type 'Payment'"),
             )),
+            // The SDK join reads the pair-level directions, which are what a
+            // peer's blob has always carried; the per-site list (carrick#1385)
+            // is beside them and nothing here reads it.
+            sites: Vec::new(),
             scanner_version: "0.0.0-test".to_string(),
         }
     }
