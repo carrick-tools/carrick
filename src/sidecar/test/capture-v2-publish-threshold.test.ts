@@ -37,6 +37,7 @@ import type { CaptureAliasRecord } from '../src/capture/api.js';
 const ROUTE = 'src/parcels/route.ts';
 const VIEWS = 'src/parcels/views.ts';
 const CLEAN = 'src/parcels/clean.ts';
+const EXTENDS = 'src/parcels/extends.ts';
 const MODEL = 'src/parcels/model.ts';
 const STATUS_ROUTE = 'src/parcels/status-route.ts';
 
@@ -87,6 +88,16 @@ const FILES: Record<string, string> = {
     'export interface CleanView {',
     '  id: string;',
     '  sendEmail?: boolean;',
+    '}',
+    '',
+  ].join('\n'),
+  // The missing module's type in a position `unknown` cannot take: the repair
+  // (carrick#1397) leaves this file exactly as it is.
+  [EXTENDS]: [
+    "import type { ParcelRow } from '../generated/client';",
+    '',
+    'export interface ExtendedView extends ParcelRow {',
+    '  id: string;',
     '}',
     '',
   ].join('\n'),
@@ -196,6 +207,13 @@ describe('capture record carries what an answer cannot resolve (#1165)', () => {
           symbol_name: 'CleanView',
           anchor_origin: 'llm-symbol',
         },
+        {
+          kind: 'symbol',
+          alias: 'Endpoint_extends_Response',
+          source_file: EXTENDS,
+          symbol_name: 'ExtendedView',
+          anchor_origin: 'llm-symbol',
+        },
       ],
     });
     assert.ok(result.success, `capture failed: ${JSON.stringify(result.errors)}`);
@@ -230,21 +248,37 @@ describe('capture record carries what an answer cannot resolve (#1165)', () => {
     assert.strictEqual(record?.source_file, '<inline>', 'the answer is still the text');
   });
 
-  it('records the module an emitted declaration imports that does not exist', () => {
+  it('repairs an emitted declaration whose import does not exist (carrick#1397)', () => {
+    // The import is dropped and the member it typed reads `unknown`, the same
+    // repair carrick#1377 makes on the print paths. The module is no longer
+    // named by the tree, so nothing dangles and the alias is publishable with
+    // the members that did resolve.
     const record = records.get('Endpoint_view_Response');
+    assert.strictEqual(record?.dangling_specifiers, undefined, JSON.stringify(record));
+    assert.strictEqual(record?.top_type_at_self_check, false);
     assert.deepStrictEqual(
-      record?.dangling_specifiers,
-      ['../generated/client'],
+      (record?.any_provenance ?? []).map((entry) => [entry.path, entry.kind, entry.reason]),
+      [['row', 'unknown', 'unresolved_import']],
       JSON.stringify(record)
     );
   });
 
-  it('blames a declaration file, not a declaration: a clean sibling in that file is listed too', () => {
+  it('frees the clean sibling in that file with it: the repair is file-granular', () => {
     // The self-check attributes a failed import to every alias whose closure
-    // reaches the FILE that holds it (fail closed), and has since before this
-    // field existed: the sibling already self-checks `decayed_internal`. The
-    // field states that verdict's cause as data; it does not narrow it.
+    // reaches the FILE that holds it (fail closed), so a sibling declaration
+    // that resolves entirely used to self-check `decayed_internal` too. The
+    // repair is on the same file, so it lifts both at once.
     const record = records.get('Endpoint_sibling_Response');
+    assert.strictEqual(record?.self_check, 'ok', JSON.stringify(record));
+    assert.strictEqual(record?.dangling_specifiers, undefined);
+  });
+
+  it('leaves the file alone where `unknown` is not a type, and still says so', () => {
+    // A declaration that EXTENDS the missing module's type cannot have it
+    // written `unknown`, so the file keeps its import and the alias keeps its
+    // honest refusal — with the specifier named, which is what a reader acts
+    // on.
+    const record = records.get('Endpoint_extends_Response');
     assert.strictEqual(record?.self_check, 'decayed_internal', JSON.stringify(record));
     assert.deepStrictEqual(record?.dangling_specifiers, ['../generated/client']);
   });
