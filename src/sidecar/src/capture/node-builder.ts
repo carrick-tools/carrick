@@ -32,9 +32,24 @@ export interface NodeBuilderPrintResult {
   failure?: string;
   /**
    * Names the print refers to that do not resolve at the destination in the
-   * producer's program (carrick#1165). Present only when there are some.
+   * producer's program (carrick#1165). Present only when there are some —
+   * which, since carrick#1377 rewrites what it can reach, means a reference
+   * the substitution could not replace.
    */
   undeclaredNames?: string[];
+  /**
+   * Member positions the print named something undeclared at, and where that
+   * reference now reads `unknown` (carrick#1377). In the walk's own path
+   * notation, so a finding at one of them can be labelled as what it is: a
+   * module that did not resolve, not a declared top type.
+   */
+  substitutedPaths?: string[];
+}
+
+/** One reference replaced by `unknown`, with the member position it sat at. */
+export interface UndeclaredSubstitution {
+  name: string;
+  path: string;
 }
 
 /**
@@ -180,14 +195,114 @@ export function printTypeForDestination(
     };
   }
 
+  // carrick#1377: a reference nothing declares makes the WHOLE answer
+  // unpublishable, so one member typed by a package the checkout does not
+  // have used to discard every member around it. Replace what it names with
+  // `unknown` in place and print that; the rest of the shape survives, and
+  // the positions are reported so the finding at each can be labelled as a
+  // module that did not resolve rather than a top type the author declared.
+  const substituted = substituteUndeclaredNames(node, program, destination);
   const printer = ts.createPrinter({ removeComments: true });
   const text = printer.printNode(
     ts.EmitHint.Unspecified,
-    node,
+    substituted.node,
     destination.getSourceFile()
   );
-  const undeclaredNames = undeclaredNamesIn(node, program, destination);
-  return { text, inaccessible, ...(undeclaredNames.length > 0 ? { undeclaredNames } : {}) };
+  // Asked of the REWRITTEN node: the field says what the printed answer
+  // names, so anything the substitution could not reach still fills it and
+  // still refuses publication.
+  const undeclaredNames = undeclaredNamesIn(substituted.node, program, destination);
+  const substitutedPaths = substituted.substitutions.map((entry) => entry.path);
+  return {
+    text,
+    inaccessible,
+    ...(undeclaredNames.length > 0 ? { undeclaredNames } : {}),
+    ...(substitutedPaths.length > 0 ? { substitutedPaths } : {}),
+  };
+}
+
+/**
+ * Rewrite every reference in `node` that nothing in the producer's program
+ * declares to the `unknown` keyword, and report the member position each sat
+ * at (carrick#1377).
+ *
+ * The positions use the same notation as the capture's deep walk — `sub`,
+ * `items<0>.meta`, `[index]`, `()` for a callable return — so a path found
+ * here names the same member a self-check finding at that path names.
+ */
+export function substituteUndeclaredNames(
+  node: ts.TypeNode,
+  program: ts.Program,
+  destination: ts.Node
+): { node: ts.TypeNode; substitutions: UndeclaredSubstitution[] } {
+  const undeclared = new Set(undeclaredNamesIn(node, program, destination));
+  if (undeclared.size === 0) {
+    return { node, substitutions: [] };
+  }
+  const substitutions: UndeclaredSubstitution[] = [];
+  const leftmost = (name: ts.EntityName): ts.Identifier =>
+    ts.isIdentifier(name) ? name : leftmost(name.left);
+
+  // The path is carried down the visit rather than reconstructed, because a
+  // rewritten node has no parent to walk back up from.
+  const rewrite = (current: ts.Node, path: string): ts.Node => {
+    if (
+      (ts.isTypeReferenceNode(current) && undeclared.has(leftmost(current.typeName).text)) ||
+      (ts.isTypeQueryNode(current) && undeclared.has(leftmost(current.exprName).text))
+    ) {
+      substitutions.push({
+        name: ts.isTypeReferenceNode(current)
+          ? leftmost(current.typeName).text
+          : leftmost(current.exprName).text,
+        path: path === '' ? '<root>' : path,
+      });
+      return ts.factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+    }
+    return ts.visitEachChild(
+      current,
+      (child) => rewrite(child, childPath(current, child, path)),
+      /* context */ undefined
+    );
+  };
+
+  const rewritten = rewrite(node, '') as ts.TypeNode;
+  return { node: rewritten, substitutions };
+}
+
+/** The deep walk's path for `child` inside `parent`, extending `path`. */
+function childPath(parent: ts.Node, child: ts.Node, path: string): string {
+  if (ts.isPropertySignature(parent) && parent.type === child) {
+    const name = ts.isIdentifier(parent.name) || ts.isStringLiteral(parent.name)
+      ? parent.name.text
+      : parent.name.getText?.() ?? '';
+    return path === '' ? name : `${path}.${name}`;
+  }
+  if (ts.isArrayTypeNode(parent) && parent.elementType === child) {
+    return `${path}<0>`;
+  }
+  if (ts.isIndexSignatureDeclaration(parent) && parent.type === child) {
+    return `${path}[index]`;
+  }
+  if (
+    (ts.isFunctionTypeNode(parent) ||
+      ts.isMethodSignature(parent) ||
+      ts.isCallSignatureDeclaration(parent)) &&
+    parent.type === child
+  ) {
+    return `${path}()`;
+  }
+  if (ts.isTypeReferenceNode(parent) && parent.typeArguments) {
+    const index = parent.typeArguments.indexOf(child as ts.TypeNode);
+    if (index >= 0) return `${path}<${index}>`;
+  }
+  if (ts.isTupleTypeNode(parent)) {
+    const index = parent.elements.indexOf(child as ts.TypeNode);
+    if (index >= 0) return `${path}<${index}>`;
+  }
+  // A union or intersection member sits at its parent's position, as the deep
+  // walk records it; everything else (a type literal's members, a parenthesis)
+  // keeps the path it was reached with.
+  return path;
 }
 
 /**

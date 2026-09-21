@@ -15,6 +15,15 @@
  * Both used to reach the record only as prose (or not at all), so nothing
  * downstream could refuse them. The record now carries them as data:
  * `undeclared_names` and `dangling_specifiers`.
+ *
+ * carrick#1377 then narrowed the first of those to what it could not repair.
+ * A name the print reaches is rewritten to `unknown` at its own member
+ * position, so the rest of the shape is published and the member is labelled
+ * `unresolved_import`; `undeclared_names` describes the PRINTED answer, and
+ * the printed answer no longer names it. The field stays for what the rewrite
+ * cannot reach and for an artifact an older scanner wrote, both of which the
+ * publish gate must still refuse. `dangling_specifiers` — a name inside an
+ * EMITTED declaration rather than a printed one — is untouched.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -197,18 +206,28 @@ describe('capture record carries what an answer cannot resolve (#1165)', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it('records an identifier the anonymous print names but nothing declares', () => {
+  it('writes an identifier the anonymous print names and nothing declares to `unknown`', () => {
+    // carrick#1377: the name is rewritten at its own member position instead
+    // of taking the whole answer down with it, so the field that describes
+    // the PRINTED answer no longer has anything to name.
     const record = records.get('Endpoint_answer_Response');
-    assert.deepStrictEqual(record?.undeclared_names, ['ParcelRow'], JSON.stringify(record));
-  });
-
-  it('records the identifiers literal text names that nothing declares, not the globals', () => {
-    const record = records.get('Endpoint_literal_Response');
+    assert.strictEqual(record?.undeclared_names, undefined, JSON.stringify(record));
     assert.deepStrictEqual(
-      record?.undeclared_names,
-      ['LineRow', 'ManifestRow'],
+      (record?.any_provenance ?? []).map((entry) => [entry.path, entry.kind, entry.reason]),
+      [['parcel', 'unknown', 'unresolved_import']],
       JSON.stringify(record)
     );
+  });
+
+  it('does the same for the identifiers literal text names, and still not for globals', () => {
+    const record = records.get('Endpoint_literal_Response');
+    assert.strictEqual(record?.undeclared_names, undefined, JSON.stringify(record));
+    const reasons = (record?.any_provenance ?? []).map((entry) => entry.reason);
+    assert.ok(
+      reasons.length > 0 && reasons.every((reason) => reason === 'unresolved_import'),
+      `every substituted member is an unresolved import, got: ${JSON.stringify(record)}`
+    );
+    assert.strictEqual(record?.source_file, '<inline>', 'the answer is still the text');
   });
 
   it('records the module an emitted declaration imports that does not exist', () => {

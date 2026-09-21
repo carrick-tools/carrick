@@ -61,7 +61,7 @@ function prefixPath(prefix: string, path: string): string {
  * relative specifiers ahead of package names. Installed packages and the
  * default library are not descended into.
  */
-function unresolvedSpecifiersReachableFrom(
+export function unresolvedSpecifiersReachableFrom(
   program: ts.Program,
   sourceFile: ts.SourceFile
 ): string[] {

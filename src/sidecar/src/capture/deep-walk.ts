@@ -324,7 +324,10 @@ export function provenanceOf(
         'the type is too deep or wide to verify within the capture budget here, so it is reported unverified rather than assumed clean',
     };
   }
-  if (finding.kind === 'any' && unresolved?.paths.includes(finding.path)) {
+  // `unknown` reads here as well as `any` (carrick#1377): a reference nothing
+  // declares is rewritten to `unknown` at its own position, and a reader told
+  // the author declared it that way stops looking where the fix is.
+  if (unresolved?.paths.includes(finding.path)) {
     return {
       path: finding.path,
       kind: finding.kind,
