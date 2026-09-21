@@ -2915,6 +2915,7 @@ impl FileOrchestrator {
         repo_path: &str,
         mount_graph: &MountGraph,
         config: &Config,
+        modules: &WorkspaceIndex,
     ) -> (
         Vec<SymbolRequest>,
         Vec<InferRequestItem>,
@@ -3195,7 +3196,7 @@ impl FileOrchestrator {
                         // Explicit type with import source - bundle it
                         push_explicit(
                             symbol.clone(),
-                            Self::resolve_import_path(&file_path_absolute, import_source),
+                            Self::resolve_import_path(&file_path_absolute, import_source, modules),
                             Some(response_alias.clone()),
                         );
                     } else if endpoint.primary_type_symbol.is_some()
@@ -3493,7 +3494,7 @@ impl FileOrchestrator {
                     // Explicit type with import source - bundle it
                     push_explicit(
                         symbol.clone(),
-                        Self::resolve_import_path(&file_path_absolute, import_source),
+                        Self::resolve_import_path(&file_path_absolute, import_source, modules),
                         Some(response_alias.clone()),
                     );
                 } else if data_call.primary_type_symbol.is_some()
@@ -3583,6 +3584,7 @@ impl FileOrchestrator {
         &self,
         sockets: &crate::socket_io::SocketExtraction,
         repo_path: &str,
+        modules: &WorkspaceIndex,
     ) -> Vec<SymbolRequest> {
         let repo_root = std::path::Path::new(repo_path);
         let repo_root_absolute = if repo_root.is_absolute() {
@@ -3604,7 +3606,7 @@ impl FileOrchestrator {
             let file_abs =
                 Self::to_absolute_path(&op.file_path.to_string_lossy(), &repo_root_absolute);
             let source_file = match op.payload_type_source.as_ref() {
-                Some(import_source) => Self::resolve_import_path(&file_abs, import_source),
+                Some(import_source) => Self::resolve_import_path(&file_abs, import_source, modules),
                 // No import → same-file declaration: resolve against the file.
                 None => file_abs,
             };
@@ -3673,6 +3675,7 @@ impl FileOrchestrator {
         &self,
         file_results: &HashMap<String, FileAnalysisResult>,
         repo_path: &str,
+        modules: &WorkspaceIndex,
     ) -> Vec<SymbolRequest> {
         use crate::operation::{OperationKey, PubsubRole};
 
@@ -3715,7 +3718,9 @@ impl FileOrchestrator {
                     continue;
                 };
                 let source_file = match op.type_import_source.as_ref() {
-                    Some(import_source) => Self::resolve_import_path(&file_abs, import_source),
+                    Some(import_source) => {
+                        Self::resolve_import_path(&file_abs, import_source, modules)
+                    }
                     // No import → same-file declaration: resolve against the file.
                     None => file_abs.clone(),
                 };
@@ -4012,6 +4017,7 @@ impl FileOrchestrator {
         &self,
         graphql: &crate::graphql::GraphqlExtraction,
         repo_path: &str,
+        modules: &WorkspaceIndex,
     ) -> Vec<SymbolRequest> {
         let repo_root = std::path::Path::new(repo_path);
         let repo_root_absolute = if repo_root.is_absolute() {
@@ -4045,7 +4051,7 @@ impl FileOrchestrator {
             let file_abs =
                 Self::to_absolute_path(&op.file_path.to_string_lossy(), &repo_root_absolute);
             let source_file = match source {
-                Some(import_source) => Self::resolve_import_path(&file_abs, import_source),
+                Some(import_source) => Self::resolve_import_path(&file_abs, import_source, modules),
                 // No import → same-file declaration: resolve against the file.
                 None => file_abs,
             };
@@ -4083,7 +4089,7 @@ impl FileOrchestrator {
             let file_abs =
                 Self::to_absolute_path(&entry_file.to_string_lossy(), &repo_root_absolute);
             let source_file = match op.response_type_source.as_ref() {
-                Some(import_source) => Self::resolve_import_path(&file_abs, import_source),
+                Some(import_source) => Self::resolve_import_path(&file_abs, import_source, modules),
                 None => file_abs,
             };
             let alias = build_manifest_type_alias(
@@ -4162,19 +4168,9 @@ impl FileOrchestrator {
         &self,
         graphql: &crate::graphql::GraphqlExtraction,
         repo_path: &str,
-        service: &crate::config::Config,
+        modules: &WorkspaceIndex,
     ) -> Vec<InferRequestItem> {
         use crate::graphql_resolver_anchor::{ResolverAnchor, resolver_anchor};
-
-        // Reading the repo's alias config costs a walk, so it waits until a
-        // producer that could use it exists.
-        if !graphql
-            .producers
-            .iter()
-            .any(|op| op.resolver_file.is_some() && op.resolver_line.is_some())
-        {
-            return Vec::new();
-        }
 
         let repo_root = std::path::Path::new(repo_path);
         let repo_root_absolute = if repo_root.is_absolute() {
@@ -4193,20 +4189,13 @@ impl FileOrchestrator {
         // not be read, whose anchors fall back to the line.
         let mut file_source: HashMap<String, Option<String>> = HashMap::new();
         // The hop that follows a named resolver resolves specifiers the way
-        // the repo's own config says to: relative, through the tsconfig
-        // `paths`/`baseUrl` (or Deno import map, or package `imports`) that
-        // governs the importing file, and through workspace package names
-        // (carrick#1411). Widening it here is safe where the mount and
-        // wrapper passes must not (carrick#474): this builds a SIDECAR type
-        // request, so a module it newly reaches changes no prompt byte and
-        // re-keys no cached model answer.
-        let aliases = service.alias_tsconfig();
-        let mut bindings = BindingResolver::with_workspace(WorkspaceIndex::build_with_aliases(
-            repo_root,
-            aliases
-                .as_ref()
-                .map(|(directory, config)| (directory.as_path(), config.as_path())),
-        ));
+        // the repo's own config says to (carrick#1411), through the same
+        // index every other type request resolves through (carrick#1416).
+        // Widening it here is safe where the mount and wrapper passes must
+        // not (carrick#474): this builds a SIDECAR type request, so a module
+        // it newly reaches changes no prompt byte and re-keys no cached model
+        // answer.
+        let mut bindings = BindingResolver::with_workspace(modules.clone());
         let mut spanned = 0usize;
         let mut followed = 0usize;
         let mut withheld = 0usize;
@@ -7849,6 +7838,8 @@ impl FileOrchestrator {
     /// * `extraction_config` - Agent-generated machinery-unwrap rules
     /// * `mount_graph` - Resolved mount graph for canonical method/path aliases
     /// * `config` - Config used for URL normalization
+    /// * `modules` - The service's module resolver: what an import specifier
+    ///   a type was located through names on disk (carrick#1416)
     /// * `extra_explicit` - Deterministically-collected explicit symbol
     ///   requests for non-HTTP protocols (socket payload anchors, #245)
     /// * `extra_infer` - Deterministically-collected `FunctionReturn` infer
@@ -7864,11 +7855,12 @@ impl FileOrchestrator {
         extraction_config: Option<&ExtractionConfig>,
         mount_graph: &MountGraph,
         config: &Config,
+        modules: &WorkspaceIndex,
         extra_explicit: &[SymbolRequest],
         extra_infer: &[InferRequestItem],
     ) -> Result<TypeResolutionResult, Box<dyn std::error::Error>> {
         let (mut explicit, mut infer, inline_aliases) =
-            self.collect_type_requests(file_results, repo_path, mount_graph, config);
+            self.collect_type_requests(file_results, repo_path, mount_graph, config, modules);
 
         // Deterministically-collected explicit requests for non-HTTP protocols
         // (today: Socket.IO payload anchors, #245). They use the same
@@ -8036,16 +8028,24 @@ impl FileOrchestrator {
             })
     }
 
-    /// Resolve an import path relative to a file.
+    /// Resolve the import specifier a type was located through to the file
+    /// that declares it, for a type request the sidecar will read.
     ///
-    /// Converts relative import paths like "./types/user" to absolute paths.
-    /// Bare specifiers (e.g. `types/user`) are also resolved against the
-    /// nearest `tsconfig.json#compilerOptions.baseUrl` so TypeScript's
-    /// classic non-relative resolution works — consistent with `tsc` behaviour
-    /// when `baseUrl` is set. If neither relative nor baseUrl resolution
-    /// finds a real file, the original specifier is returned unchanged so
-    /// node_modules packages like `react` still pass through.
-    pub(crate) fn resolve_import_path(current_file: &str, import_source: &str) -> String {
+    /// Relative specifiers are joined and probed here, because the probe owns
+    /// the `.js`→`.ts` rewrite and the "return a plausible path anyway"
+    /// fallback that downstream joins rely on. Everything else — a tsconfig
+    /// or jsconfig `paths` pattern or `baseUrl`, through an `extends` chain
+    /// and JSONC and the config the service declares, a package.json
+    /// `imports` subpath, a Deno import map, a workspace package name — is
+    /// answered by `modules`, the one resolver the rest of the scanner reads
+    /// (carrick#1416). A specifier nothing resolves is returned unchanged, so
+    /// an installed package like `react` still passes through to the sidecar,
+    /// which resolves it from node_modules.
+    pub(crate) fn resolve_import_path(
+        current_file: &str,
+        import_source: &str,
+        modules: &WorkspaceIndex,
+    ) -> String {
         use std::path::Path;
 
         let current_dir = Path::new(current_file).parent().unwrap_or(Path::new(""));
@@ -8072,33 +8072,13 @@ impl FileOrchestrator {
             });
         }
 
-        // Bare specifier — try tsconfig `paths` mappings first (in tsc they
-        // take precedence over plain baseUrl lookup). This is how a workspace
-        // shared-types package (`@meridian/contracts` mapped to
-        // `../contracts/src/index.ts`) resolves to a real source file.
-        if let Some(found) = Self::resolve_via_tsconfig_paths(current_dir, import_source) {
-            return found;
+        // Everything non-relative is the shared resolver's answer. It reads
+        // what the repo's config declares and nothing else: a specifier no
+        // mapping claims and no workspace package answers stays as written.
+        match modules.resolve_module_path(Path::new(current_file), import_source) {
+            Some(found) => found.to_string_lossy().to_string(),
+            None => import_source.to_string(),
         }
-
-        // Then only attempt baseUrl resolution if a tsconfig in
-        // the file's ancestry sets `compilerOptions.baseUrl` *explicitly*.
-        // `tsc` only enables non-relative module resolution against baseUrl
-        // when it's set; defaulting to "." here would shadow real
-        // node_modules packages. Falling through returns the source
-        // unchanged so package imports (`react`, `axios`) still flow through.
-        if let Some((tsconfig_dir, base_url)) = Self::find_tsconfig_base_url(current_dir)
-            && let Some(found) = Self::canonicalize_or_probe(
-                tsconfig_dir
-                    .join(&base_url)
-                    .join(import_source)
-                    .to_string_lossy()
-                    .as_ref(),
-            )
-        {
-            return found;
-        }
-
-        import_source.to_string()
     }
 
     /// Returns true if `path` ends in a TypeScript-family source extension.
@@ -8186,95 +8166,6 @@ impl FileOrchestrator {
         ];
 
         candidates.iter().find_map(|c| probe(c))
-    }
-
-    /// Walk up from `start_dir` looking for `tsconfig.json`. Return its
-    /// directory and the resolved `compilerOptions.baseUrl` only if the
-    /// option is *explicitly set* — matches `tsc` behaviour, which only
-    /// enables baseUrl-based non-relative resolution when configured.
-    /// Returns `None` for tsconfigs that omit baseUrl (or for repos with
-    /// no tsconfig at all). Path aliases (`compilerOptions.paths`) and
-    /// `extends` inheritance are out of scope here.
-    /// Resolve a bare import specifier through `compilerOptions.paths`
-    /// mappings of tsconfigs in the file's ancestry (nearest first). Mapping
-    /// targets resolve against `baseUrl` when set (tsc's rule), else the
-    /// tsconfig's own directory (TS 4.1+ paths-without-baseUrl). Supports the
-    /// spec's single-`*` wildcard. Only a target that probes to a real file
-    /// wins — a dangling mapping cannot eat a real package import. Walking
-    /// past a paths-less tsconfig keeps `extends`-style layouts working; the
-    /// probe gate makes that safe.
-    fn resolve_via_tsconfig_paths(
-        start_dir: &std::path::Path,
-        import_source: &str,
-    ) -> Option<String> {
-        let mut dir = Some(start_dir);
-        while let Some(d) = dir {
-            let tsconfig = d.join("tsconfig.json");
-            if tsconfig.is_file()
-                && let Ok(text) = std::fs::read_to_string(&tsconfig)
-                && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
-                && let Some(co) = json.get("compilerOptions")
-                && let Some(paths) = co.get("paths").and_then(|p| p.as_object())
-            {
-                let base = co.get("baseUrl").and_then(|v| v.as_str()).unwrap_or(".");
-                for (pattern, targets) in paths {
-                    let Some(targets) = targets.as_array() else {
-                        continue;
-                    };
-                    // At most one `*` per pattern (the tsconfig spec); the
-                    // matched substring substitutes into each target's `*`.
-                    let substitution: Option<String> = match pattern.matches('*').count() {
-                        0 => (pattern == import_source).then(String::new),
-                        1 => {
-                            let (prefix, suffix) = pattern.split_once('*').unwrap();
-                            (import_source.len() >= prefix.len() + suffix.len()
-                                && import_source.starts_with(prefix)
-                                && import_source.ends_with(suffix))
-                            .then(|| {
-                                import_source[prefix.len()..import_source.len() - suffix.len()]
-                                    .to_string()
-                            })
-                        }
-                        _ => None,
-                    };
-                    let Some(substitution) = substitution else {
-                        continue;
-                    };
-                    for target in targets {
-                        let Some(target) = target.as_str() else {
-                            continue;
-                        };
-                        let candidate = target.replacen('*', &substitution, 1);
-                        if let Some(found) = Self::canonicalize_or_probe(
-                            d.join(base).join(candidate).to_string_lossy().as_ref(),
-                        ) {
-                            return Some(found);
-                        }
-                    }
-                }
-            }
-            dir = d.parent();
-        }
-        None
-    }
-
-    fn find_tsconfig_base_url(start_dir: &std::path::Path) -> Option<(std::path::PathBuf, String)> {
-        let mut dir = Some(start_dir);
-        while let Some(d) = dir {
-            let tsconfig = d.join("tsconfig.json");
-            if tsconfig.is_file()
-                && let Ok(text) = std::fs::read_to_string(&tsconfig)
-                && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
-                && let Some(base_url) = json
-                    .get("compilerOptions")
-                    .and_then(|c| c.get("baseUrl"))
-                    .and_then(|v| v.as_str())
-            {
-                return Some((d.to_path_buf(), base_url.to_string()));
-            }
-            dir = d.parent();
-        }
-        None
     }
 
     pub(crate) fn normalize_consumer_method(method: Option<&str>) -> Option<String> {
@@ -9837,6 +9728,19 @@ export * from "./aFetch.js";"#,
         assert_eq!(FileOrchestrator::join_paths("field/", "/"), "/field");
     }
 
+    /// The resolver a service scan hands the type-request builders: every
+    /// alias the fixture repo's own config declares (carrick#1416).
+    fn repo_modules(root: &std::path::Path) -> WorkspaceIndex {
+        WorkspaceIndex::build_with_aliases(root, None)
+    }
+
+    /// The same resolver over a tree with no config at all, for fixtures that
+    /// name every file by path and put no specifier to it.
+    fn modules_without_config() -> WorkspaceIndex {
+        let empty = tempfile::tempdir().expect("tempdir");
+        WorkspaceIndex::build_with_aliases(empty.path(), None)
+    }
+
     /// Regression: `tsconfig.json` with `"baseUrl": "."` makes
     /// `import { X } from "types/user"` resolve to `<repo>/types/user.ts`.
     /// Pre-fix this hit the early `if !import_source.starts_with('.')` return
@@ -9859,8 +9763,11 @@ export * from "./aFetch.js";"#,
         let server = repo.path().join("server.ts");
         std::fs::write(&server, "// stub").unwrap();
 
-        let resolved =
-            FileOrchestrator::resolve_import_path(server.to_string_lossy().as_ref(), "types/user");
+        let resolved = FileOrchestrator::resolve_import_path(
+            server.to_string_lossy().as_ref(),
+            "types/user",
+            &repo_modules(repo.path()),
+        );
 
         let expected = repo.path().join("types/user.ts").canonicalize().unwrap();
         assert_eq!(
@@ -9884,8 +9791,11 @@ export * from "./aFetch.js";"#,
         let server = repo.path().join("server.ts");
         std::fs::write(&server, "// stub").unwrap();
 
-        let resolved =
-            FileOrchestrator::resolve_import_path(server.to_string_lossy().as_ref(), "react");
+        let resolved = FileOrchestrator::resolve_import_path(
+            server.to_string_lossy().as_ref(),
+            "react",
+            &repo_modules(repo.path()),
+        );
 
         assert_eq!(resolved, "react");
     }
@@ -9920,6 +9830,7 @@ export * from "./aFetch.js";"#,
         let resolved = FileOrchestrator::resolve_import_path(
             routes.to_string_lossy().as_ref(),
             "@meridian/contracts",
+            &repo_modules(repo.path()),
         );
 
         let expected = repo
@@ -9955,6 +9866,7 @@ export * from "./aFetch.js";"#,
         let resolved = FileOrchestrator::resolve_import_path(
             server.to_string_lossy().as_ref(),
             "@app/models/user",
+            &repo_modules(repo.path()),
         );
 
         let expected = repo
@@ -9982,8 +9894,11 @@ export * from "./aFetch.js";"#,
         let server = repo.path().join("server.ts");
         std::fs::write(&server, "// stub").unwrap();
 
-        let resolved =
-            FileOrchestrator::resolve_import_path(server.to_string_lossy().as_ref(), "react");
+        let resolved = FileOrchestrator::resolve_import_path(
+            server.to_string_lossy().as_ref(),
+            "react",
+            &repo_modules(repo.path()),
+        );
 
         assert_eq!(resolved, "react");
     }
@@ -10011,8 +9926,11 @@ export * from "./aFetch.js";"#,
         let server = repo.path().join("server.ts");
         std::fs::write(&server, "// stub").unwrap();
 
-        let resolved =
-            FileOrchestrator::resolve_import_path(server.to_string_lossy().as_ref(), "types/user");
+        let resolved = FileOrchestrator::resolve_import_path(
+            server.to_string_lossy().as_ref(),
+            "types/user",
+            &repo_modules(repo.path()),
+        );
 
         assert_eq!(
             resolved, "types/user",
@@ -10034,6 +9952,7 @@ export * from "./aFetch.js";"#,
         let resolved = FileOrchestrator::resolve_import_path(
             server.to_string_lossy().as_ref(),
             "./missing.ts",
+            &repo_modules(repo.path()),
         );
 
         assert!(
@@ -10065,6 +9984,7 @@ export * from "./aFetch.js";"#,
         let resolved = FileOrchestrator::resolve_import_path(
             server.to_string_lossy().as_ref(),
             "./types/order",
+            &repo_modules(repo.path()),
         );
 
         let expected = repo
@@ -10095,8 +10015,11 @@ export * from "./aFetch.js";"#,
         let server = repo.path().join("src/index.ts");
         std::fs::write(&server, "// stub").unwrap();
 
-        let resolved =
-            FileOrchestrator::resolve_import_path(server.to_string_lossy().as_ref(), "./types.js");
+        let resolved = FileOrchestrator::resolve_import_path(
+            server.to_string_lossy().as_ref(),
+            "./types.js",
+            &repo_modules(repo.path()),
+        );
 
         let resolved_path = std::path::Path::new(&resolved);
         assert!(
@@ -10127,8 +10050,11 @@ export * from "./aFetch.js";"#,
         let server = repo.path().join("src/index.ts");
         std::fs::write(&server, "// stub").unwrap();
 
-        let resolved =
-            FileOrchestrator::resolve_import_path(server.to_string_lossy().as_ref(), "./types.js");
+        let resolved = FileOrchestrator::resolve_import_path(
+            server.to_string_lossy().as_ref(),
+            "./types.js",
+            &repo_modules(repo.path()),
+        );
 
         let expected = repo.path().join("src/types.ts").canonicalize().unwrap();
         assert_eq!(
@@ -10153,8 +10079,11 @@ export * from "./aFetch.js";"#,
         let server = repo.path().join("src/index.ts");
         std::fs::write(&server, "// stub").unwrap();
 
-        let resolved =
-            FileOrchestrator::resolve_import_path(server.to_string_lossy().as_ref(), "./types.mts");
+        let resolved = FileOrchestrator::resolve_import_path(
+            server.to_string_lossy().as_ref(),
+            "./types.mts",
+            &repo_modules(repo.path()),
+        );
 
         let expected = repo.path().join("src/types.mts").canonicalize().unwrap();
         assert_eq!(
@@ -11870,6 +11799,7 @@ export * from "./aFetch.js";"#,
             &repo.path().to_string_lossy(),
             &graph,
             &config,
+            &repo_modules(repo.path()),
         );
 
         assert_eq!(infer.len(), 1);
@@ -11922,8 +11852,13 @@ export * from "./aFetch.js";"#,
             Path::new(""),
         );
         let config = Config::default();
-        let (explicit, infer, inline) =
-            orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
+        let (explicit, infer, inline) = orchestrator.collect_type_requests(
+            &file_results,
+            ".",
+            &graph,
+            &config,
+            &modules_without_config(),
+        );
 
         assert!(explicit.is_empty());
         assert!(infer.is_empty());
@@ -12007,6 +11942,7 @@ export * from "./aFetch.js";"#,
             &repo.path().to_string_lossy(),
             &graph,
             &config,
+            &repo_modules(repo.path()),
         );
 
         let mut aliases: Vec<String> = infer.into_iter().filter_map(|item| item.alias).collect();
@@ -12072,8 +12008,13 @@ export * from "./aFetch.js";"#,
             Path::new(""),
         );
         let config = Config::default();
-        let (_explicit, infer, _inline) =
-            orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
+        let (_explicit, infer, _inline) = orchestrator.collect_type_requests(
+            &file_results,
+            ".",
+            &graph,
+            &config,
+            &modules_without_config(),
+        );
 
         // Exactly one inference: the response. A GET asks no request-body
         // question at all, whatever it carries.
@@ -12147,8 +12088,13 @@ export * from "./aFetch.js";"#,
             Path::new(""),
         );
         let config = Config::default();
-        let (_explicit, infer, _inline) =
-            orchestrator.collect_type_requests(&file_results, ".", &graph, &config);
+        let (_explicit, infer, _inline) = orchestrator.collect_type_requests(
+            &file_results,
+            ".",
+            &graph,
+            &config,
+            &modules_without_config(),
+        );
         infer
     }
 
@@ -12368,7 +12314,13 @@ export * from "./aFetch.js";"#,
             Path::new(""),
         );
         let config = Config::default();
-        orchestrator.collect_type_requests(&file_results, ".", &graph, &config)
+        orchestrator.collect_type_requests(
+            &file_results,
+            ".",
+            &graph,
+            &config,
+            &modules_without_config(),
+        )
     }
 
     fn infer_for_endpoint(endpoint: EndpointResult) -> Vec<InferRequestItem> {
@@ -17157,8 +17109,9 @@ export { routes };
                 .collect()
         };
 
-        let first = orchestrator.collect_pubsub_type_requests(&file_results, ".");
-        let second = orchestrator.collect_pubsub_type_requests(&file_results, ".");
+        let modules = modules_without_config();
+        let first = orchestrator.collect_pubsub_type_requests(&file_results, ".", &modules);
+        let second = orchestrator.collect_pubsub_type_requests(&file_results, ".", &modules);
 
         assert_eq!(first.len(), 3, "every typed op should anchor a request");
         assert_eq!(
@@ -17211,7 +17164,11 @@ export function publishWrapped(order: OrderPlaced): void {
         let mut file_results = HashMap::new();
         file_results.insert("src/pub.ts".to_string(), pubsub_only_result(ops));
         let orchestrator = FileOrchestrator::new(AgentService::new());
-        orchestrator.collect_pubsub_type_requests(&file_results, dir.to_str().unwrap())
+        orchestrator.collect_pubsub_type_requests(
+            &file_results,
+            dir.to_str().unwrap(),
+            &repo_modules(dir),
+        )
     }
 
     /// The witness fires exactly when the payload binding's annotation

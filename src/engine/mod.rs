@@ -2822,9 +2822,21 @@ async fn analyze_current_repo_incremental(
             cloud_data.package_json_hash = Some(current_pkg_hash);
             cloud_data.cache_version = Some(CACHE_VERSION);
 
+            // Every type request below names the file a type was imported
+            // from, and the specifier it was imported by is the repo's to
+            // resolve: one index reads the config that governs each file
+            // (carrick#1416), built once for this service and shared by the
+            // request builders and the anchor stamp.
+            let service_modules = service_module_index(repo_path, config);
+
             // Build type manifest
             let mut manifest_entries = build_type_manifest_entries(&mount_graph, config, repo_path);
-            stamp_manifest_anchor_symbols(&mut manifest_entries, &merged_results, repo_path);
+            stamp_manifest_anchor_symbols(
+                &mut manifest_entries,
+                &merged_results,
+                repo_path,
+                &service_modules,
+            );
             append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
             append_pubsub_manifest_entries(
                 &mut manifest_entries,
@@ -2839,17 +2851,24 @@ async fn analyze_current_repo_incremental(
             // Socket payload anchors and GraphQL consumer result-type anchors
             // both resolve through the same sidecar bundle path as HTTP explicit
             // symbols (#245/#248). Concatenate both into the extra-explicit slice.
-            let mut protocol_requests = file_orchestrator
-                .collect_socket_type_requests(&protocol_extractions.sockets, repo_path);
-            protocol_requests.extend(
-                file_orchestrator
-                    .collect_graphql_type_requests(&protocol_extractions.graphql, repo_path),
+            let mut protocol_requests = file_orchestrator.collect_socket_type_requests(
+                &protocol_extractions.sockets,
+                repo_path,
+                &service_modules,
             );
+            protocol_requests.extend(file_orchestrator.collect_graphql_type_requests(
+                &protocol_extractions.graphql,
+                repo_path,
+                &service_modules,
+            ));
             // Pub/sub ops are LLM-sourced in `merged_results`, not in the
             // deterministic `protocol_extractions`, so their payload anchors
             // bundle through the same path (#corpus-2 resolution dim).
-            protocol_requests
-                .extend(file_orchestrator.collect_pubsub_type_requests(&merged_results, repo_path));
+            protocol_requests.extend(file_orchestrator.collect_pubsub_type_requests(
+                &merged_results,
+                repo_path,
+                &service_modules,
+            ));
 
             // GraphQL producers take the infer path, not the bundle path: their
             // response contract is the resolver's expanded RETURN type, so they
@@ -2857,7 +2876,7 @@ async fn analyze_current_repo_incremental(
             let mut protocol_infer = file_orchestrator.collect_graphql_producer_infer_requests(
                 &protocol_extractions.graphql,
                 repo_path,
-                config,
+                &service_modules,
             );
             // Pub/sub payloads with no named symbol (wrapper patterns:
             // topic-map emitters, schema-catalog workers, generic channel
@@ -2878,6 +2897,7 @@ async fn analyze_current_repo_incremental(
                 setup.extraction_config.as_ref(),
                 &mount_graph,
                 config,
+                &service_modules,
                 &protocol_requests,
                 &protocol_infer,
                 &mut cloud_data,
@@ -4790,6 +4810,28 @@ fn degraded_type_findings(services: &[CloudRepoData]) -> Vec<crate::findings::Fi
 /// Resolve types through the sidecar and run the v2 capture for this
 /// service. Returns the on-disk capture stub dir when capture succeeded (the
 /// definitions re-point reads from it; the caller owns cleanup).
+/// The module resolver for one service: every alias its own config declares,
+/// and the config `carrick.json` names for it when it names one
+/// (carrick#1416).
+///
+/// Built once per service scan and shared by everything that turns an import
+/// specifier into a file for the sidecar. It reads the repo's config files, so
+/// it costs a walk — but every service with a typed endpoint needs it, and the
+/// alternative is the second, weaker resolver this replaced.
+fn service_module_index(
+    repo_path: &str,
+    config: &Config,
+) -> crate::workspace_resolver::WorkspaceIndex {
+    let service_tsconfig = config.alias_tsconfig();
+    crate::workspace_resolver::WorkspaceIndex::build_with_aliases(
+        Path::new(repo_path),
+        service_tsconfig
+            .as_ref()
+            .map(|(directory, tsconfig)| (directory.as_path(), tsconfig.as_path())),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn resolve_types_if_available(
     sidecar: Option<&TypeSidecar>,
     file_orchestrator: &FileOrchestrator,
@@ -4798,6 +4840,7 @@ fn resolve_types_if_available(
     extraction_config: Option<&crate::services::type_sidecar::ExtractionConfig>,
     mount_graph: &MountGraph,
     config: &Config,
+    modules: &crate::workspace_resolver::WorkspaceIndex,
     extra_explicit: &[crate::services::type_sidecar::SymbolRequest],
     extra_infer: &[crate::services::type_sidecar::InferRequestItem],
     cloud_data: &mut CloudRepoData,
@@ -4831,6 +4874,7 @@ fn resolve_types_if_available(
                 extraction_config,
                 mount_graph,
                 config,
+                modules,
                 extra_explicit,
                 extra_infer,
             ) {
@@ -4886,6 +4930,7 @@ fn resolve_types_if_available(
                         repo_path,
                         mount_graph,
                         config,
+                        modules,
                         extra_explicit,
                         extra_infer,
                         &type_resolution,
@@ -4938,14 +4983,20 @@ fn run_capture_for_service(
     repo_path: &str,
     mount_graph: &MountGraph,
     config: &Config,
+    modules: &crate::workspace_resolver::WorkspaceIndex,
     extra_explicit: &[crate::services::type_sidecar::SymbolRequest],
     extra_infer: &[crate::services::type_sidecar::InferRequestItem],
     type_resolution: &TypeResolutionResult,
     cloud_data: &mut CloudRepoData,
 ) -> Option<PathBuf> {
     crate::scan_stage::enter(crate::scan_stage::Stage::TypeCapture);
-    let (mut explicit, mut infer, inline_aliases) =
-        file_orchestrator.collect_type_requests(file_results, repo_path, mount_graph, config);
+    let (mut explicit, mut infer, inline_aliases) = file_orchestrator.collect_type_requests(
+        file_results,
+        repo_path,
+        mount_graph,
+        config,
+        modules,
+    );
     explicit.extend_from_slice(extra_explicit);
     infer.extend_from_slice(extra_infer);
     // Mirror resolve_all_types' post-processing exactly: the #413 two-anchor
@@ -5735,6 +5786,7 @@ fn stamp_manifest_anchor_symbols(
     manifest: &mut [TypeManifestEntry],
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     repo_path: &str,
+    modules: &crate::workspace_resolver::WorkspaceIndex,
 ) {
     // Mirror `parse_file_location`'s `Some(0) | None => 1` normalization so the
     // join keys line up on both sides.
@@ -5780,7 +5832,7 @@ fn stamp_manifest_anchor_symbols(
         entry.defined_in = homes
             .entry((entry.file_path.clone(), anchor.symbol.clone()))
             .or_insert_with(|| {
-                anchor_declaration_site(&entry.file_path, anchor, repo_path, &cm, &handler)
+                anchor_declaration_site(&entry.file_path, anchor, repo_path, modules, &cm, &handler)
             })
             .clone();
     }
@@ -5803,6 +5855,7 @@ fn anchor_declaration_site(
     using_file: &str,
     anchor: &AnchorAtSite,
     repo_path: &str,
+    modules: &crate::workspace_resolver::WorkspaceIndex,
     cm: &Lrc<SourceMap>,
     handler: &Handler,
 ) -> Option<crate::cloud_storage::TypeHome> {
@@ -5812,6 +5865,7 @@ fn anchor_declaration_site(
             crate::agents::file_orchestrator::FileOrchestrator::resolve_import_path(
                 &using_absolute.to_string_lossy(),
                 source,
+                modules,
             ),
         ),
         None => using_absolute,
@@ -6297,12 +6351,18 @@ async fn analyze_current_repo(
     attach_sdk_surface(&mut cloud_data, repo_path, config);
     crate::phase_timing::mark(crate::phase_timing::Phase::Surface);
 
+    // One index for this service's type requests and anchor stamps: the
+    // specifier a type was imported by is the repo's config to resolve
+    // (carrick#1416).
+    let service_modules = service_module_index(repo_path, config);
+
     let mut manifest_entries =
         build_type_manifest_entries(&analysis_result.mount_graph, config, repo_path);
     stamp_manifest_anchor_symbols(
         &mut manifest_entries,
         &analysis_result.file_results,
         repo_path,
+        &service_modules,
     );
     append_protocol_manifest_entries(&mut manifest_entries, &protocol_extractions);
     append_pubsub_manifest_entries(
@@ -6324,17 +6384,24 @@ async fn analyze_current_repo(
     // Socket payload anchors and GraphQL consumer result-type anchors both
     // resolve through the same sidecar bundle path as HTTP explicit symbols
     // (#245/#248). Concatenate both into the extra-explicit slice.
-    let mut protocol_requests =
-        file_orchestrator.collect_socket_type_requests(&protocol_extractions.sockets, repo_path);
-    protocol_requests.extend(
-        file_orchestrator.collect_graphql_type_requests(&protocol_extractions.graphql, repo_path),
+    let mut protocol_requests = file_orchestrator.collect_socket_type_requests(
+        &protocol_extractions.sockets,
+        repo_path,
+        &service_modules,
     );
+    protocol_requests.extend(file_orchestrator.collect_graphql_type_requests(
+        &protocol_extractions.graphql,
+        repo_path,
+        &service_modules,
+    ));
     // Pub/sub ops are LLM-sourced in `analysis_result.file_results`, not in the
     // deterministic `protocol_extractions`, so their payload anchors bundle
     // through the same path (#corpus-2 resolution dim).
-    protocol_requests.extend(
-        file_orchestrator.collect_pubsub_type_requests(&analysis_result.file_results, repo_path),
-    );
+    protocol_requests.extend(file_orchestrator.collect_pubsub_type_requests(
+        &analysis_result.file_results,
+        repo_path,
+        &service_modules,
+    ));
 
     // GraphQL producers take the infer path, not the bundle path: their response
     // contract is the resolver's expanded RETURN type, so they become
@@ -6342,7 +6409,7 @@ async fn analyze_current_repo(
     let mut protocol_infer = file_orchestrator.collect_graphql_producer_infer_requests(
         &protocol_extractions.graphql,
         repo_path,
-        config,
+        &service_modules,
     );
     // Pub/sub payloads with no named symbol (wrapper patterns: topic-map
     // emitters, schema-catalog workers, generic channel handles) resolve via
@@ -6361,6 +6428,7 @@ async fn analyze_current_repo(
         extraction_config.as_ref(),
         &analysis_result.mount_graph,
         config,
+        &service_modules,
         &protocol_requests,
         &protocol_infer,
         &mut cloud_data,
@@ -6509,6 +6577,13 @@ async fn build_cross_repo_analyzer(
 #[cfg(test)]
 mod tests {
     use crate::git_state::tests::committed_repo;
+
+    /// A module resolver over a tree with no config: these fixtures name
+    /// every file by path, so no alias mapping is in play (carrick#1416).
+    fn modules_without_config() -> crate::workspace_resolver::WorkspaceIndex {
+        let empty = tempfile::tempdir().expect("tempdir");
+        crate::workspace_resolver::WorkspaceIndex::build_with_aliases(empty.path(), None)
+    }
 
     /// The aliased-specifier line, pinned for the same reason as its sibling
     /// below: it carried the same internals clause and the same stray ticket
@@ -6782,6 +6857,7 @@ mod tests {
             root.to_str().unwrap(),
             &MountGraph::default(),
             &member,
+            &service_module_index(root.to_str().unwrap(), &member),
             &explicit,
             &[],
             &resolution,
@@ -6795,6 +6871,7 @@ mod tests {
             root.to_str().unwrap(),
             &MountGraph::default(),
             &Config::default(),
+            &service_module_index(root.to_str().unwrap(), &Config::default()),
             &explicit,
             &[],
             &resolution,
@@ -11563,15 +11640,12 @@ mod tests {
         let orchestrator = FileOrchestrator::new(AgentService::new());
         assert!(
             orchestrator
-                .collect_graphql_producer_infer_requests(
-                    &graphql,
-                    ".",
-                    &crate::config::Config::default()
-                )
+                .collect_graphql_producer_infer_requests(&graphql, ".", &modules_without_config())
                 .is_empty(),
             "no resolver line means no FunctionReturn infer request"
         );
-        let requests = orchestrator.collect_graphql_type_requests(&graphql, ".");
+        let requests =
+            orchestrator.collect_graphql_type_requests(&graphql, ".", &modules_without_config());
         assert_eq!(
             requests.len(),
             2,
@@ -12133,7 +12207,11 @@ mod tests {
             .expect("socket manifest entry");
 
         let orchestrator = FileOrchestrator::new(AgentService::new());
-        let requests = orchestrator.collect_socket_type_requests(&extractions.sockets, ".");
+        let requests = orchestrator.collect_socket_type_requests(
+            &extractions.sockets,
+            ".",
+            &modules_without_config(),
+        );
         let request = requests
             .iter()
             .find(|r| r.symbol_name == "Payment")
@@ -12193,7 +12271,11 @@ mod tests {
             .expect("pubsub manifest entry");
 
         let orchestrator = FileOrchestrator::new(AgentService::new());
-        let requests = orchestrator.collect_pubsub_type_requests(&file_results, ".");
+        let requests = orchestrator.collect_pubsub_type_requests(
+            &file_results,
+            ".",
+            &modules_without_config(),
+        );
         let request = requests
             .iter()
             .find(|r| r.symbol_name == "PageView")
@@ -12279,7 +12361,11 @@ mod tests {
         // Each publisher's SymbolRequest alias must byte-match its manifest alias
         // (same call site → same call_id), so the resolution enrich-join holds.
         let orchestrator = FileOrchestrator::new(AgentService::new());
-        let requests = orchestrator.collect_pubsub_type_requests(&file_results, ".");
+        let requests = orchestrator.collect_pubsub_type_requests(
+            &file_results,
+            ".",
+            &modules_without_config(),
+        );
         let request_aliases: HashSet<String> =
             requests.iter().filter_map(|r| r.alias.clone()).collect();
         assert_eq!(
@@ -12923,7 +13009,11 @@ mod tests {
         let manifest_alias = manifest_entry.type_alias.clone();
 
         let orchestrator = FileOrchestrator::new(AgentService::new());
-        let requests = orchestrator.collect_graphql_type_requests(&extractions.graphql, ".");
+        let requests = orchestrator.collect_graphql_type_requests(
+            &extractions.graphql,
+            ".",
+            &modules_without_config(),
+        );
         let request = requests
             .iter()
             .find(|r| r.symbol_name == "OrderView")
@@ -12985,7 +13075,8 @@ mod tests {
         };
 
         let orchestrator = FileOrchestrator::new(AgentService::new());
-        let requests = orchestrator.collect_graphql_type_requests(&extraction, ".");
+        let requests =
+            orchestrator.collect_graphql_type_requests(&extraction, ".", &modules_without_config());
 
         assert!(
             requests.iter().any(|r| r.symbol_name == "OrderUpdate"),
@@ -13053,7 +13144,7 @@ mod tests {
         let infer = orchestrator.collect_graphql_producer_infer_requests(
             &extractions.graphql,
             ".",
-            &crate::config::Config::default(),
+            &modules_without_config(),
         );
         assert_eq!(infer.len(), 1, "exactly one producer infer request");
         let request = &infer[0];
@@ -13106,7 +13197,7 @@ mod tests {
                 .collect_graphql_producer_infer_requests(
                     &bare.graphql,
                     ".",
-                    &crate::config::Config::default()
+                    &modules_without_config()
                 )
                 .is_empty(),
             "an SDL producer with no merged resolver location produces no infer request"

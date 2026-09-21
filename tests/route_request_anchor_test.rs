@@ -272,6 +272,7 @@ fn live_request_infer_item(
         &repo.to_string_lossy(),
         &mount_graph,
         &Config::default(),
+        &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(repo, None),
     );
 
     let item = infer

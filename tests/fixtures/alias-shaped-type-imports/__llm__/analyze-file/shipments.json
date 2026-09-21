@@ -1,0 +1,21 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:6",
+      "line_number": 6,
+      "owner_node": "shipments",
+      "method": "GET",
+      "path": "/shipments/:id",
+      "handler_name": "anonymous",
+      "pattern_matched": ".get(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": "shipment",
+      "response_expression_line": 8,
+      "primary_type_symbol": "Shipment",
+      "type_import_source": "@shipping/shipment.ts"
+    }
+  ],
+  "data_calls": []
+}

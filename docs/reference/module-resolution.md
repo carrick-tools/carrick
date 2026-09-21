@@ -144,9 +144,17 @@ the same tree, and `scan_health` counts losses the scan could not account for.
 `WorkspaceIndex::build` reads no aliases, and `BindingResolver::new` follows
 relative hops only. The wrapper-context and mount passes build analyzer inputs
 from them. Resolving more specifiers there would change what the model is
-asked, and cached answers would stop replaying. Only the call graph uses
-`WorkspaceIndex::build_with_aliases` and `BindingResolver::with_workspace`.
-Moving the analyzer path onto the same resolver is carrick#474.
+asked, and cached answers would stop replaying. Moving the analyzer path onto
+the same resolver is carrick#474.
+
+Three surfaces read the alias-bearing index, and none of them is an analyzer
+input: the call graph's edges (carrick#1104), the GraphQL hop that follows a
+field's named resolver (carrick#1411), and every type request the sidecar is
+sent — endpoint and data-call types, socket and pub/sub payloads, GraphQL
+consumer anchors, and the manifest's `TypeHome` stamp (carrick#1416). The
+last of these is built once per service as `engine::service_module_index` and
+passed down; it is what turns the specifier a type was located through into
+the file the sidecar reads.
 
 Call edges do feed one model input: a function's intent context includes the
 intents of the functions it calls (`intent_generator::compute_intent_hash`).

@@ -1,0 +1,10 @@
+{
+  // The config a hand-maintained repo actually carries: comments, and a
+  // trailing comma a strict JSON parser rejects outright.
+  "compilerOptions": {
+    /* Receipts are addressed by a subpath pattern, not by a relative path. */
+    "paths": {
+      "~receipts/*": ["./contracts/*"],
+    },
+  },
+}
