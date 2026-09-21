@@ -8396,6 +8396,13 @@ impl FileOrchestrator {
                         // Which layer stated the row (carrick#660): the pass
                         // that resolved it, or the model. Retention only.
                         resolution_source: data_call.resolution_source,
+                        // What the row IS (carrick#1385), derived from the
+                        // line above rather than stored beside it: the source
+                        // is what says whether the call site's own file states
+                        // the target. Derived HERE, where the row is built
+                        // from the cached per-file answer, so it is recomputed
+                        // on every scan and no cache version has to move.
+                        role: crate::mount_graph::ConsumerRole::of(data_call.resolution_source),
                         // The value this call sends for the field its target
                         // dispatches on (carrick#831). Read by matching, and
                         // only against a producer that dispatches.
@@ -10585,6 +10592,90 @@ export * from "./aFetch.js";"#,
             "https://api.example.com/data"
         );
         assert_eq!(graph.data_calls[0].method, "POST");
+    }
+
+    /// carrick#1385: the row the graph carries says what it IS, derived from
+    /// the resolution source of the per-file row it is built from.
+    ///
+    /// The three rows here are the reported shape: a request the site's own
+    /// file states, a call through a member declared in another module, and
+    /// the model's own reading — which states nothing about the row's kind and
+    /// so gets no role.
+    #[test]
+    fn data_calls_carry_the_role_their_resolution_source_implies() {
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+
+        let call =
+            |line_number: i32, target: &str, source: Option<ResolutionSource>| -> DataCallResult {
+                DataCallResult {
+                    call_kind: None,
+                    candidate_id: format!("span:{line_number}"),
+                    line_number,
+                    target: target.to_string(),
+                    method: Some("GET".to_string()),
+                    pattern_matched: "fetch(".to_string(),
+                    call_expression_span_start: None,
+                    call_expression_span_end: None,
+                    call_expression_text: None,
+                    call_expression_line: None,
+                    payload_expression_text: None,
+                    payload_expression_line: None,
+                    primary_type_symbol: None,
+                    type_import_source: None,
+                    loopback_default_url: None,
+                    base: None,
+                    consumers_not_resolved: None,
+                    resolution_source: source,
+                    dispatch: None,
+                }
+            };
+
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/service.ts".to_string(),
+            FileAnalysisResult {
+                data_calls: vec![
+                    call(10, "/api/a", Some(ResolutionSource::SameFileWrapper)),
+                    call(20, "/api/b", Some(ResolutionSource::ImportedMember)),
+                    call(30, "/api/c", Some(ResolutionSource::Model)),
+                ],
+                ..Default::default()
+            },
+        );
+
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+
+        let role_of = |path: &str| {
+            graph
+                .data_calls
+                .iter()
+                .find(|c| c.canonical_path == path)
+                .unwrap_or_else(|| panic!("a row for {path}"))
+                .role
+        };
+        assert_eq!(
+            role_of("/api/a"),
+            Some(crate::mount_graph::ConsumerRole::NetworkRequest),
+            "a wrapper resolved in the site's own file states the target there, \
+             so the request is made at this line"
+        );
+        assert_eq!(
+            role_of("/api/b"),
+            Some(crate::mount_graph::ConsumerRole::WrapperCall),
+            "an imported member's site states neither method nor path: it \
+             reaches a request declared in another module"
+        );
+        assert_eq!(
+            role_of("/api/c"),
+            None,
+            "the model's reading is not the scanner's statement about what the \
+             row is, and absence is not 'this is a request'"
+        );
     }
 
     /// The host normalisation computes and the line extraction reports are both

@@ -3818,6 +3818,7 @@ mod tests {
                 consumers_not_resolved: None,
                 resolution_source: None,
                 dispatch: None,
+                role: None,
             }
         }
 
