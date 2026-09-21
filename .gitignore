@@ -25,6 +25,11 @@ target/
 !src/sidecar/test/fixtures/capture-v2-installed/node_modules/@acme/models/
 !src/sidecar/test/fixtures/capture-v2-installed/node_modules/@acme/models/package.json
 !src/sidecar/test/fixtures/capture-v2-installed/node_modules/@acme/models/index.d.ts
+!tests/fixtures/inline-handler-response/node_modules/
+!tests/fixtures/inline-handler-response/node_modules/@fixture-http/
+!tests/fixtures/inline-handler-response/node_modules/@fixture-http/runtime/
+!tests/fixtures/inline-handler-response/node_modules/@fixture-http/runtime/package.json
+!tests/fixtures/inline-handler-response/node_modules/@fixture-http/runtime/index.d.ts
 **/ts_check/output
 mcp-server/dist
 mcp-server/dist-lambda

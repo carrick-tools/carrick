@@ -157,6 +157,7 @@ jobs:
           --test env_var_whole_url_test
           --test hosted_enrichment_test
           --test imported_request_member_test
+          --test inline_handler_response_test
           --test integration_test
           --test interrupted_scan_test
           --test llm_cassette_hard_gate_test

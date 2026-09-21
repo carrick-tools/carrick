@@ -1,0 +1,7 @@
+{
+  "name": "inline-handler-response",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fixture: routes registered with an inline anonymous handler that sends its payload through the context (carrick#1253)",
+  "main": "src/routes.ts"
+}
