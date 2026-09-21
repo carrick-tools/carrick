@@ -469,6 +469,21 @@ pub struct DataCallResult {
     /// emit/join pass. See [`ResolutionSource`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_source: Option<ResolutionSource>,
+    /// The site the request this call reaches is WRITTEN at (carrick#1402),
+    /// `"<file>:<line>"` in the same spelling `file_location` carries, when
+    /// this row is a call through a declaration in another module.
+    ///
+    /// Never from the model — set by [`crate::wrapper_call_join`] once every
+    /// file's rows are in, from the file's import table and the resolution
+    /// source of the rows in the module its callee resolves to. Absent on
+    /// every row that IS the request, and on every call through a declaration
+    /// this scan could not read.
+    ///
+    /// Carrying it makes the row a `wrapper_call` in the graph
+    /// ([`crate::mount_graph::ConsumerRole`]) and names the row it should be
+    /// grouped with, which is what a reader needs to count one request once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaches_request: Option<String>,
 }
 
 /// A GraphQL resolver the file-analyzer found: the schema field it answers and
@@ -1873,6 +1888,7 @@ mod tests {
             consumers_not_resolved: None,
             resolution_source: None,
             dispatch: None,
+            reaches_request: None,
         };
 
         let json = serde_json::to_string(&data_call).unwrap();
@@ -1933,6 +1949,7 @@ mod tests {
                 consumers_not_resolved: None,
                 resolution_source: None,
                 dispatch: None,
+                reaches_request: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],

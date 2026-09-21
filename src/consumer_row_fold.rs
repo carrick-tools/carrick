@@ -440,6 +440,7 @@ mod tests {
             consumers_not_resolved: None,
             dispatch: None,
             resolution_source: Some(ResolutionSource::Model),
+            reaches_request: None,
         }
     }
 

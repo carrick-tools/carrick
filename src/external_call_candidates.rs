@@ -3819,6 +3819,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: None,
                 role: None,
+                reaches_request: None,
             }
         }
 

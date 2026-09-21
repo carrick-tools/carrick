@@ -71,5 +71,6 @@ pub mod url_normalizer;
 pub mod utils;
 pub mod visitor;
 pub mod workspace_resolver;
+pub mod wrapper_call_join;
 pub mod wrapper_dispatch;
 pub mod wrapper_request_shape;

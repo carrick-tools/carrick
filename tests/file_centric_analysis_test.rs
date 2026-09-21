@@ -158,6 +158,7 @@ fn test_file_analysis_result_structures() {
         consumers_not_resolved: None,
         resolution_source: None,
         dispatch: None,
+        reaches_request: None,
     };
     assert_eq!(data_call.target, "https://api.example.com/users");
     assert_eq!(data_call.method, Some("POST".to_string()));
@@ -254,6 +255,7 @@ fn test_file_analysis_result_serialization() {
             consumers_not_resolved: None,
             resolution_source: None,
             dispatch: None,
+            reaches_request: None,
         }],
         dispatch_tables: Vec::new(),
     };
@@ -327,6 +329,7 @@ fn test_processing_stats_tracking() {
         consumer_row_folds: Default::default(),
         total_data_calls: 4,
         errors: vec!["Test error".to_string()],
+        wrapper_call_joins: Default::default(),
     };
 
     assert_eq!(stats.files_processed, 5);
@@ -606,6 +609,7 @@ fn test_data_call_extraction() {
                 consumers_not_resolved: None,
                 resolution_source: None,
                 dispatch: None,
+                reaches_request: None,
             },
             DataCallResult {
                 call_kind: None,
@@ -628,6 +632,7 @@ fn test_data_call_extraction() {
                 consumers_not_resolved: None,
                 resolution_source: None,
                 dispatch: None,
+                reaches_request: None,
             },
             DataCallResult {
                 call_kind: None,
@@ -650,6 +655,7 @@ fn test_data_call_extraction() {
                 consumers_not_resolved: None,
                 resolution_source: None,
                 dispatch: None,
+                reaches_request: None,
             },
         ],
         dispatch_tables: Vec::new(),

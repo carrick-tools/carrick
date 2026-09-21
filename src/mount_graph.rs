@@ -297,6 +297,17 @@ pub struct DataFetchingCall {
     /// exact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<ConsumerRole>,
+    /// The site the request this row reaches is WRITTEN at (carrick#1402),
+    /// `"<file>:<line>"` in the same repo-relative form `file_location` uses.
+    ///
+    /// Present only on a `wrapper_call` row whose declaration this scan read
+    /// and whose request has a row of its own, which is what lets a reader
+    /// GROUP the two rows of one request instead of counting around them.
+    /// `None` is the ordinary case — every request row, and every call through
+    /// a declaration whose own request the scan raised no row for. Retention
+    /// only: nothing in matching reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaches_request: Option<String>,
     /// The literal this call sends for the field its target dispatches on
     /// (carrick#831), read off the call site's own request body.
     ///
@@ -708,6 +719,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             role: None,
+            reaches_request: None,
         };
         assert_eq!(
             serde_json::to_value(&call).unwrap(),
@@ -733,6 +745,9 @@ mod tests {
         // Same rule one field on (carrick#1385): a row with no role is a row
         // the scan did not classify, never a request.
         assert_eq!(older.role, None);
+        // And one field further (carrick#1402): a row naming no request site
+        // reaches nothing this scan read, which is every request row.
+        assert_eq!(older.reaches_request, None);
 
         let retained = DataFetchingCall {
             host: Some("api.vendor.test".to_string()),
@@ -741,12 +756,18 @@ mod tests {
                 crate::agents::file_analyzer_agent::ResolutionSource::ImportedMember,
             ),
             role: Some(ConsumerRole::WrapperCall),
+            reaches_request: Some("src/lib/client.ts:88".to_string()),
             ..call
         };
         let json = serde_json::to_value(&retained).unwrap();
         assert_eq!(json["host"], serde_json::json!("api.vendor.test"));
         assert_eq!(json["line"], serde_json::json!(4));
         assert_eq!(json["role"], serde_json::json!("wrapper_call"));
+        assert_eq!(
+            json["reaches_request"],
+            serde_json::json!("src/lib/client.ts:88"),
+            "the link is a location in the same form file_location carries"
+        );
         assert_eq!(
             json["resolution_source"],
             serde_json::json!("imported_member")
@@ -1471,6 +1492,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: None,
                 role: None,
+                reaches_request: None,
             });
         let merged = MountGraph::merge_from_repos(&[repo]);
         assert_eq!(merged.data_calls.len(), 1);

@@ -4867,6 +4867,7 @@ mod tests {
                 resolution_source: consumer_source,
                 dispatch: None,
                 role: None,
+                reaches_request: None,
             });
 
             let (findings, _verified, _edges) =
@@ -4960,6 +4961,7 @@ mod tests {
             resolution_source: Some(ResolutionSource::ImportedMember),
             dispatch: None,
             role: None,
+            reaches_request: None,
         });
 
         let (findings, _verified, _edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -5387,6 +5389,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             role: None,
+            reaches_request: None,
         });
 
         let (findings, verified, edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -5501,6 +5504,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             role: None,
+            reaches_request: None,
         });
         analyzer
             .calls
@@ -5584,6 +5588,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             role: None,
+            reaches_request: None,
         });
         analyzer
             .calls
@@ -5650,6 +5655,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             role: None,
+            reaches_request: None,
         });
         analyzer.calls.push(http_call(
             "POST",
@@ -6880,6 +6886,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             role: None,
+            reaches_request: None,
         }
     }
 

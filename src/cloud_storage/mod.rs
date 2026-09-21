@@ -1698,6 +1698,7 @@ mod tests {
             resolution_source: Some(ResolutionSource::WholeUrlEnv),
             dispatch: None,
             role: None,
+            reaches_request: None,
         });
 
         let (endpoints, calls) = mount_graph_to_api_details(&graph);
@@ -1770,6 +1771,7 @@ mod tests {
             resolution_source: None,
             dispatch: Some(case("search-by-intent")),
             role: None,
+            reaches_request: None,
         });
 
         let (endpoints, calls) = mount_graph_to_api_details(&graph);
@@ -1898,6 +1900,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             role: None,
+            reaches_request: None,
         });
 
         let (endpoints, calls) = mount_graph_to_api_details(&graph);

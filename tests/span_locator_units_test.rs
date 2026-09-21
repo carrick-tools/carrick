@@ -142,6 +142,7 @@ fn analyzer_result(client_file: &str, site: &Site) -> HashMap<String, FileAnalys
         consumers_not_resolved: None,
         resolution_source: None,
         dispatch: None,
+        reaches_request: None,
     };
 
     let mut file_results = HashMap::new();
