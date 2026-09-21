@@ -166,8 +166,7 @@ pub enum Finding {
         /// pairs the two type strings with a direction must therefore require
         /// this field, never assume a default.
         ///
-        /// Scan-local, like [`crate::cloud_storage::TypeManifestEntry`]'s
-        /// `v1_unresolved`: the hand-rolled [`Serialize`] below deliberately
+        /// Scan-local: the hand-rolled [`Serialize`] below deliberately
         /// does NOT write it, because the local join reads the in-process
         /// struct and publishing a field on the PR-result payload the cloud
         /// reads is a payload-contract question rather than a scanner-internal

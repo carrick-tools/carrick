@@ -691,7 +691,6 @@ mod tests {
             primary_type_symbol: primary_type_symbol.map(String::from),
             defined_in: None,
             any_provenance: Vec::new(),
-            v1_unresolved: false,
         }
     }
 
