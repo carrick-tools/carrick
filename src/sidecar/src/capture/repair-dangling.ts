@@ -78,9 +78,20 @@ function repairFile(file: string, specifiers: Set<string>): RepairedFile | undef
   const edits: Edit[] = [];
   const removedSpecifiers = new Set<string>();
 
+  // A re-export of the failing module binds nothing in THIS file and is what
+  // another file reads through: dropping it would turn "cannot find module"
+  // into "has no exported member" over there, which is neither diagnostic the
+  // re-check reads, and the importer's member would publish as clean. There is
+  // no `unknown` to write for an export, so the file keeps its refusal.
+  let unreplaceable = false;
+
   for (const statement of source.statements) {
     const specifier = importSpecifierOf(statement);
     if (specifier === undefined || !specifiers.has(specifier)) continue;
+    if (ts.isExportDeclaration(statement)) {
+      unreplaceable = true;
+      break;
+    }
     for (const name of boundNames(statement)) names.add(name);
     removedSpecifiers.add(specifier);
     edits.push({ start: statement.getFullStart(), end: statement.getEnd(), text: '' });
@@ -88,7 +99,6 @@ function repairFile(file: string, specifiers: Set<string>): RepairedFile | undef
 
   // An `import(...)` type written inline carries its own specifier and has no
   // statement to drop; the whole node becomes `unknown`.
-  let unreplaceable = false;
   const visit = (node: ts.Node): void => {
     if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) {
       const literal = node.argument.literal;

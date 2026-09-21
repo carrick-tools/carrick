@@ -38,6 +38,8 @@ const ROUTE = 'src/parcels/route.ts';
 const VIEWS = 'src/parcels/views.ts';
 const CLEAN = 'src/parcels/clean.ts';
 const EXTENDS = 'src/parcels/extends.ts';
+const BARREL = 'src/parcels/barrel.ts';
+const THROUGH = 'src/parcels/through.ts';
 const MODEL = 'src/parcels/model.ts';
 const STATUS_ROUTE = 'src/parcels/status-route.ts';
 
@@ -88,6 +90,20 @@ const FILES: Record<string, string> = {
     'export interface CleanView {',
     '  id: string;',
     '  sendEmail?: boolean;',
+    '}',
+    '',
+  ].join('\n'),
+  // A barrel over the module that was never generated, and a declaration that
+  // reads the missing type THROUGH it. Dropping the re-export would turn
+  // "cannot find module" here into "has no exported member" over there — a
+  // diagnostic the repair's re-check does not read — so the repair declines.
+  [BARREL]: ["export * from '../generated/client';", ''].join('\n'),
+  [THROUGH]: [
+    "import type { ParcelRow } from './barrel';",
+    '',
+    'export interface ThroughView {',
+    '  id: string;',
+    '  row: ParcelRow;',
     '}',
     '',
   ].join('\n'),
@@ -214,6 +230,13 @@ describe('capture record carries what an answer cannot resolve (#1165)', () => {
           symbol_name: 'ExtendedView',
           anchor_origin: 'llm-symbol',
         },
+        {
+          kind: 'symbol',
+          alias: 'Endpoint_through_Response',
+          source_file: THROUGH,
+          symbol_name: 'ThroughView',
+          anchor_origin: 'llm-symbol',
+        },
       ],
     });
     assert.ok(result.success, `capture failed: ${JSON.stringify(result.errors)}`);
@@ -279,6 +302,16 @@ describe('capture record carries what an answer cannot resolve (#1165)', () => {
     // honest refusal — with the specifier named, which is what a reader acts
     // on.
     const record = records.get('Endpoint_extends_Response');
+    assert.strictEqual(record?.self_check, 'decayed_internal', JSON.stringify(record));
+    assert.deepStrictEqual(record?.dangling_specifiers, ['../generated/client']);
+  });
+
+  it('declines to drop a RE-export of the missing module, which binds nothing here', () => {
+    // Dropping `export * from '<never generated>'` would leave the file that
+    // reads the type through the barrel with "has no exported member" — which
+    // is neither diagnostic the repair's re-check reads — and that file's
+    // member would then publish as clean. The refusal stays where it is.
+    const record = records.get('Endpoint_through_Response');
     assert.strictEqual(record?.self_check, 'decayed_internal', JSON.stringify(record));
     assert.deepStrictEqual(record?.dangling_specifiers, ['../generated/client']);
   });
