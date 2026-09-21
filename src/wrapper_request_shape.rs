@@ -234,6 +234,52 @@ pub fn call_request_shape(call: &CallExpr, callee_property: Option<&str>) -> Req
     })
 }
 
+/// The request shape a call states when a request-options bag carrying no
+/// `method` is read as the GET it is (carrick#1384).
+///
+/// [`call_request_shape`] deliberately answers `Unreadable` for that bag, and
+/// the comment there says why: the module fold reading it also strips payload
+/// anchors, so a wrong `GET` would delete a real one. This reader corrects only
+/// the VERB, and only at a site that states none of its own, so the same
+/// absence is read the way [`crate::imported_request_member`] reads it — a
+/// request-options bag with no `method` is a GET.
+///
+/// Everything else is identical, including which calls are requests at all: a
+/// non-literal `method` is still the parameterized wrapper, and a call with
+/// neither a verb nor an options bag is still not a request.
+pub fn call_request_verb(call: &CallExpr, callee_property: Option<&str>) -> RequestShapeSignal {
+    let verb = verb_from_callee_property(callee_property);
+    let options = request_options_argument(call);
+    if verb.is_none() && options.is_none() {
+        return RequestShapeSignal::NotARequest;
+    }
+    let method = match options {
+        Some((_, obj)) => match prop_value(obj, "method") {
+            Some(value) => match value.and_then(literal_string) {
+                Some(literal) => {
+                    let normalized = normalize_manifest_method(&literal);
+                    if !is_http_method(&normalized) {
+                        return RequestShapeSignal::Unreadable;
+                    }
+                    normalized
+                }
+                None => return RequestShapeSignal::Unreadable,
+            },
+            // The difference from `call_request_shape`, and the whole reason
+            // this exists: a bag that names no method sends a GET.
+            None => verb.unwrap_or_else(|| "GET".to_string()),
+        },
+        None => match verb {
+            Some(verb) => verb,
+            None => return RequestShapeSignal::Unreadable,
+        },
+    };
+    RequestShapeSignal::Known(WrapperRequestShape {
+        method,
+        has_body: body_presence(call, options),
+    })
+}
+
 /// Whether the call carries a request body.
 ///
 /// `Some(true)` when an options bag names one, or when a verb-spelled call
