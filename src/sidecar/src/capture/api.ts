@@ -180,6 +180,9 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *  - `no_request_body`: the located request read is a validated part the
  *    route's validator binds that is not a body (a path parameter, a query), so
  *    the route states no request body contract there (carrick#1166).
+ *  - `projected_value_only`: every read of a call's result takes a member out
+ *    of it and none reads the value itself, so the site states a part of a
+ *    payload rather than the payload a caller receives (carrick#1375).
  *  - `not_recorded`: the position carries a top type and this layer has no
  *    cause for it.
  */
@@ -192,6 +195,7 @@ export type TypeProvenanceReason =
   | 'coerced_input'
   | 'no_success_payload'
   | 'no_request_body'
+  | 'projected_value_only'
   | 'not_recorded';
 
 /**

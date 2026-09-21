@@ -394,6 +394,23 @@ type FunctionLike =
   | MethodDeclaration;
 
 /**
+ * What the def-use walk found downstream of a call whose result was bound:
+ * the node whose type is the call's payload, and whether the source reached
+ * the payload only by reading MEMBERS out of it (carrick#1375).
+ */
+interface CallResultUse {
+  terminal: Node;
+  /**
+   * Every read of the value took a member out of it and none read it whole,
+   * so this site states a part of a payload rather than a payload. The type
+   * a projection prints is not a wire contract and must not be judged as one.
+   */
+  projectionOnly: boolean;
+  /** The member reads themselves, so a caller can ask what they resolve to. */
+  projections: Node[];
+}
+
+/**
  * Options for TypeInferrer construction
  */
 export interface TypeInferrerOptions {
@@ -1396,7 +1413,8 @@ export class TypeInferrer {
 
     // Walk up from the already-found call expression instead of re-searching
     const func = this.findContainingFunctionForNode(callExpr);
-    const terminalNode = this.resolveCallResultTerminalNode(callExpr, func);
+    const use = this.resolveCallResultTerminalNode(callExpr, func);
+    const terminalNode = use.terminal;
     const returnType = terminalNode.getType();
     let typeString = typeText(returnType, terminalNode);
     let isExplicit = false;
@@ -1416,6 +1434,56 @@ export class TypeInferrer {
     if (explicitType) {
       typeString = explicitType;
       isExplicit = true;
+    }
+
+    // carrick#1375: the source never read this call's result whole — every
+    // read took a member out of it, and one of those members is the generic
+    // this result was instantiated with. That is a source unwrapping an
+    // envelope by hand, so both answers available here are wrong: the
+    // projection is a fragment of the payload, and the envelope around it is
+    // machinery. A wrapper rule that DID unwrap the envelope, or a type the
+    // source itself states, is a contract and keeps its answer.
+    //
+    // A single explicit call generic (`client.get<Order[]>(url)`) is the
+    // caller's own payload claim and states the contract as plainly as an
+    // `as` does — it is what the anchor below falls back to on a checkout
+    // with no node_modules. Several generics claim nothing unambiguously.
+    //
+    // The decision has to ride the row: a plain `null` is re-read by the
+    // capture's own locator, which is kind-blind and would publish the
+    // projection this just declined to publish (`inference_decided_no_contract`,
+    // engine/type_compat_v2.rs). No anchor and no depth go with it, so the
+    // row also reads as blind rather than as a sighted answer.
+    if (
+      use.projectionOnly &&
+      this.projectionReadsGenericPayload(callExpr, use.projections) &&
+      !unwrapResult.wasUnwrapped &&
+      !explicitType &&
+      callExpr.getTypeArguments().length !== 1
+    ) {
+      this.log(
+        `Call result at ${request.file_path}:${request.line_number} is only ever read as ` +
+          `members of ${typeText(callExpr.getType(), callExpr)}; a part of a payload is not ` +
+          'a payload, so this site states no response contract'
+      );
+      const abstain = this.createInferredType(
+        request,
+        'unknown',
+        false,
+        this.getNodeLocation(callExpr)
+      );
+      abstain.any_provenance = [
+        {
+          path: '',
+          kind: 'unknown',
+          reason: 'projected_value_only',
+          detail:
+            "every read of this call's result takes a member out of it and none reads the " +
+            'value itself, so what this site states is a part of a payload rather than the ' +
+            'payload a caller receives',
+        },
+      ];
+      return abstain;
     }
 
     typeString = this.unwrapPromise(typeString, returnType);
@@ -1892,12 +1960,12 @@ export class TypeInferrer {
   private resolveCallResultTerminalNode(
     callExpr: CallExpression,
     func: FunctionLike | undefined
-  ): Node {
+  ): CallResultUse {
     const returnStmt = callExpr.getFirstAncestorByKind(SyntaxKind.ReturnStatement);
     if (returnStmt) {
       const returnExpr = returnStmt.getExpression();
       if (returnExpr) {
-        return returnExpr;
+        return { terminal: returnExpr, projectionOnly: false, projections: [] };
       }
     }
 
@@ -1905,6 +1973,10 @@ export class TypeInferrer {
     if (binding && func) {
       let currentNames = binding.names;
       let lastNode: Node = binding.node;
+      /** The member reads taken OUT of the tracked value (carrick#1375). */
+      const projections: Node[] = [];
+      /** The value itself was read: returned, passed, aliased, or body-read. */
+      let sawWholeRead = false;
       const startPos = callExpr.getStart();
       const candidates = this.collectDefUseNodes(func);
 
@@ -1930,8 +2002,18 @@ export class TypeInferrer {
         if (Node.isIdentifier(expr) && this.isIdentifierUsage(expr, currentNames)) {
           const bodyRead = this.bodyReadOnReceiver(expr);
           if (bodyRead) {
+            sawWholeRead = true;
             lastNode = bodyRead;
             continue;
+          }
+          // carrick#1375: how the source reads the value decides whether this
+          // site states a payload at all. A member read takes a PART of it; a
+          // return, an argument, an alias or a parse reads the value itself.
+          const projection = this.projectionOnReceiver(expr);
+          if (projection) {
+            projections.push(projection);
+          } else {
+            sawWholeRead = true;
           }
         }
 
@@ -1963,15 +2045,106 @@ export class TypeInferrer {
           }
         }
 
-        if (this.expressionUsesNames(expr, currentNames)) {
+        // The last expression the value flows into is the call's payload — a
+        // cast, a parse, an alias. An expression that only reads MEMBERS out
+        // of it is a projection and states a part of the payload, never the
+        // payload: the hook that derives `query.data?.flags` off a query
+        // result published a boolean map as the expected response of a call
+        // whose envelope the client declares in full (carrick#1375).
+        if (
+          this.expressionUsesNames(expr, currentNames) &&
+          !this.usesNamesOnlyByProjection(expr, currentNames)
+        ) {
           lastNode = expr;
         }
       }
 
-      return lastNode;
+      return {
+        terminal: lastNode,
+        projectionOnly: projections.length > 0 && !sawWholeRead,
+        projections,
+      };
     }
 
-    return callExpr;
+    return { terminal: callExpr, projectionOnly: false, projections: [] };
+  }
+
+  /**
+   * True when a member read on the call's result resolves to one of that
+   * result's own TYPE ARGUMENTS — the source is unwrapping a generic envelope
+   * by hand (`state.data` off a `ResourceState<Envelope>`), and the payload it
+   * carries is the instantiation, not the envelope (carrick#1375).
+   *
+   * The generic is what tells the two apart. A call that answers its payload
+   * directly is read member by member too, and its declared result IS the
+   * contract; abstaining there would throw away the type the request boundary
+   * states, which a replay over a real repo's consumer rows showed on a
+   * `{ ok: true } | { ok: false; reason: string }` result read as `sent.ok`.
+   */
+  private projectionReadsGenericPayload(
+    callExpr: CallExpression,
+    projections: Node[]
+  ): boolean {
+    if (projections.length === 0) return false;
+    const result = this.unwrapPromiseType(callExpr.getType());
+    const args = [...result.getTypeArguments(), ...result.getAliasTypeArguments()];
+    if (args.length === 0) return false;
+    const argTexts = new Set(args.map((arg) => arg.getText()));
+    return projections.some((projection) => {
+      const read = this.unwrapPromiseType(projection.getType());
+      const parts = [read, read.getNonNullableType()];
+      for (const part of [...parts]) {
+        if (part.isUnion()) parts.push(...part.getUnionTypes());
+      }
+      return parts.some((part) => argTexts.has(part.getText()));
+    });
+  }
+
+  /**
+   * The member read that takes `identifier` as its RECEIVER — `query` in
+   * `query.data`, `envelope` in `envelope.list[0]` — or `undefined` when the
+   * identifier names the value itself.
+   *
+   * A member CALL is not a projection: `res.text()` yields a body rather than
+   * a part of one, and what it returns stays the walk's business. The
+   * zero-argument json body read has its own branch and is taken before this
+   * is asked.
+   */
+  private projectionOnReceiver(identifier: Node): Node | undefined {
+    const access = identifier.getParent();
+    if (
+      !access ||
+      (!Node.isPropertyAccessExpression(access) &&
+        !Node.isElementAccessExpression(access)) ||
+      access.getExpression() !== identifier
+    ) {
+      return undefined;
+    }
+    const parent = access.getParent();
+    if (
+      parent &&
+      Node.isCallExpression(parent) &&
+      parent.getExpression() === access
+    ) {
+      return undefined;
+    }
+    return access;
+  }
+
+  /**
+   * Every use of a tracked name inside `expr` reads a member out of the
+   * tracked value, so the expression's type describes a PART of the payload.
+   * False when the expression uses no tracked name at all, so a caller can
+   * read it as "this is a projection" rather than "this is not a use".
+   */
+  private usesNamesOnlyByProjection(expr: Node, names: string[]): boolean {
+    const uses = expr
+      .getDescendantsOfKind(SyntaxKind.Identifier)
+      .filter((id) => this.isIdentifierUsage(id, names));
+    if (uses.length === 0) {
+      return false;
+    }
+    return uses.every((id) => this.projectionOnReceiver(id) !== undefined);
   }
 
   private extractBindingFromCall(callExpr: CallExpression): { names: string[]; node: Node } | null {
