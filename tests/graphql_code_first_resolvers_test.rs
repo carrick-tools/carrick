@@ -22,10 +22,12 @@
 //! | field | resolved at | served at |
 //! |---|---|---|
 //! | `health` | `kit.ts:19` | `kit.ts:19` |
-//! | `parcels` | `parcels/queries.ts:6` | `parcels/queries.ts:6` |
-//! | `parcel` | `parcels/queries.ts:10` | `parcels/queries.ts:10` |
-//! | `heaviestWeight` | `parcels/queries.ts:16` | `parcels/queries.ts:16` |
-//! | `recentParcels` | `parcels/queries.ts:21` | `parcels/queries.ts:21` |
+//! | `parcels` | `parcels/queries.ts:7` | `parcels/queries.ts:7` |
+//! | `parcel` | `parcels/queries.ts:11` | `parcels/queries.ts:11` |
+//! | `heaviestWeight` | `parcels/queries.ts:17` | `parcels/queries.ts:17` |
+//! | `recentParcels` | `parcels/queries.ts:22` | `parcels/queries.ts:22` |
+//! | `parcelCount` | `parcels/queries.ts:26` | `parcels/queries.ts:26` |
+//! | `archivedParcels` | `parcels/queries.ts:29` | `parcels/queries.ts:29` |
 //! | `dispatchParcel` | `parcels/mutations.ts:5` | `parcels/mutations.ts:5` |
 //! | `recallParcel` | nowhere admitted | `dist/schema.graphql:3` |
 //! | `retireParcel` | nowhere admitted | `dist/schema.graphql:4` |
@@ -131,15 +133,23 @@ fn a_code_first_schema_is_served_where_its_fields_are_resolved() {
         scan_graphql_endpoints(&fixture_dir().join("__llm__")),
         rows(&[
             ("query|health", "apps/api/src/graphql/kit.ts:19"),
-            ("query|parcels", "apps/api/src/graphql/parcels/queries.ts:6"),
-            ("query|parcel", "apps/api/src/graphql/parcels/queries.ts:10"),
+            ("query|parcels", "apps/api/src/graphql/parcels/queries.ts:7"),
+            ("query|parcel", "apps/api/src/graphql/parcels/queries.ts:11"),
             (
                 "query|heaviestWeight",
-                "apps/api/src/graphql/parcels/queries.ts:16"
+                "apps/api/src/graphql/parcels/queries.ts:17"
             ),
             (
                 "query|recentParcels",
-                "apps/api/src/graphql/parcels/queries.ts:21"
+                "apps/api/src/graphql/parcels/queries.ts:22"
+            ),
+            (
+                "query|parcelCount",
+                "apps/api/src/graphql/parcels/queries.ts:26"
+            ),
+            (
+                "query|archivedParcels",
+                "apps/api/src/graphql/parcels/queries.ts:29"
             ),
             (
                 "mutation|dispatchParcel",
@@ -171,11 +181,13 @@ fn without_the_builder_package_in_detection_no_file_is_admitted_for_its_schema()
     assert_eq!(
         scan_graphql_endpoints(cassettes.path()),
         rows(&[
-            ("query|health", &format!("{printed}:13")),
-            ("query|heaviestWeight", &format!("{printed}:14")),
-            ("query|parcels", &format!("{printed}:16")),
-            ("query|parcel", &format!("{printed}:15")),
-            ("query|recentParcels", &format!("{printed}:17")),
+            ("query|archivedParcels", &format!("{printed}:13")),
+            ("query|health", &format!("{printed}:14")),
+            ("query|heaviestWeight", &format!("{printed}:15")),
+            ("query|parcel", &format!("{printed}:16")),
+            ("query|parcelCount", &format!("{printed}:17")),
+            ("query|parcels", &format!("{printed}:18")),
+            ("query|recentParcels", &format!("{printed}:19")),
             ("mutation|dispatchParcel", &format!("{printed}:2")),
             ("mutation|recallParcel", &format!("{printed}:3")),
             ("mutation|retireParcel", &format!("{printed}:4")),

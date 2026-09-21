@@ -4081,11 +4081,16 @@ impl FileOrchestrator {
     /// callback above, or the previous field's resolver (carrick#1256). So the
     /// request carries the resolver function's own span when
     /// [`crate::graphql_resolver_anchor`] can read it from the AST, converted
-    /// to the sidecar's UTF-16 numbering at this boundary (carrick#805). A
-    /// field whose resolver the pass sees but cannot span (an identifier)
-    /// gets NO request: the manifest entry stays `Unknown` rather than
-    /// carrying a neighbour's type. A line the pass cannot read at all keeps
-    /// the line-only anchor.
+    /// to the sidecar's UTF-16 numbering at this boundary (carrick#805).
+    ///
+    /// A field that NAMES its resolver (`resolve: listRecentParcels`) is
+    /// followed to the function the name binds — a module-scope declaration in
+    /// the same file, or one in the module an import leads to, in which case
+    /// the request moves to THAT file and line (carrick#1294). Anything the
+    /// name does not lead to a function literal gets NO request, and so does a
+    /// resolver the pass sees but cannot follow at all: the manifest entry
+    /// stays `Unknown` rather than carrying a neighbour's type. A line the
+    /// pass cannot read at all keeps the line-only anchor.
     pub fn collect_graphql_producer_infer_requests(
         &self,
         graphql: &crate::graphql::GraphqlExtraction,
@@ -4109,7 +4114,12 @@ impl FileOrchestrator {
         // Resolver files are read once each; `None` records a file that could
         // not be read, whose anchors fall back to the line.
         let mut file_source: HashMap<String, Option<String>> = HashMap::new();
+        // Relative specifiers only, as every analyzer-adjacent pass resolves
+        // them: a resolver imported through a path alias or a package name is
+        // not followed and abstains (carrick#1294).
+        let mut bindings = BindingResolver::new();
         let mut spanned = 0usize;
+        let mut followed = 0usize;
         let mut withheld = 0usize;
         for op in &graphql.producers {
             let (Some(resolver_file), Some(resolver_line)) =
@@ -4124,24 +4134,54 @@ impl FileOrchestrator {
                 ManifestRole::Producer,
                 ManifestTypeKind::Response,
             );
-            let source = file_source
-                .entry(file_abs.clone())
-                .or_insert_with(|| std::fs::read_to_string(&file_abs).ok());
-            let anchor = match source.as_deref() {
+            let anchor = match Self::cached_source(&mut file_source, &file_abs) {
                 Some(content) => {
                     resolver_anchor(std::path::Path::new(&file_abs), content, resolver_line)
                 }
                 None => ResolverAnchor::Absent,
             };
-            let (span_start, span_end) = match (anchor, source.as_deref()) {
-                (ResolverAnchor::Function { lo, hi }, Some(content)) => {
-                    spanned += 1;
-                    (
-                        Some(Self::sidecar_position(content, lo)),
-                        Some(Self::sidecar_position(content, hi)),
-                    )
+            // Where the request lands: the field's own file and line unless a
+            // named resolver moves it to the module that declares the function.
+            let mut anchor_file = file_abs.clone();
+            let mut anchor_line = resolver_line;
+            let (span_start, span_end) = match anchor {
+                ResolverAnchor::Function { lo, hi } => {
+                    match Self::cached_source(&mut file_source, &file_abs) {
+                        Some(content) => {
+                            spanned += 1;
+                            (
+                                Some(Self::sidecar_position(content, lo)),
+                                Some(Self::sidecar_position(content, hi)),
+                            )
+                        }
+                        // Unreachable while the source that produced the
+                        // anchor is cached; the line-only anchor either way.
+                        None => (None, None),
+                    }
                 }
-                (ResolverAnchor::Unresolvable, _) => {
+                ResolverAnchor::Named(name) => {
+                    let Some((file, line, start, end)) = Self::named_resolver_anchor(
+                        &file_abs,
+                        &name,
+                        &mut file_source,
+                        &mut bindings,
+                    ) else {
+                        withheld += 1;
+                        debug!(
+                            op = %op.key.canonical(),
+                            file = %file_abs,
+                            line = resolver_line,
+                            binding = %name,
+                            "graphql resolver names a binding that leads to no function declaration; sending no type anchor"
+                        );
+                        continue;
+                    };
+                    followed += 1;
+                    anchor_file = file;
+                    anchor_line = line;
+                    (Some(start), Some(end))
+                }
+                ResolverAnchor::Unresolvable => {
                     withheld += 1;
                     debug!(
                         op = %op.key.canonical(),
@@ -4151,13 +4191,13 @@ impl FileOrchestrator {
                     );
                     continue;
                 }
-                _ => (None, None),
+                ResolverAnchor::Absent => (None, None),
             };
-            let dedup_key = format!("{}|{}|{}", file_abs, resolver_line, alias);
+            let dedup_key = format!("{}|{}|{}", anchor_file, anchor_line, alias);
             if seen.insert(dedup_key) {
                 requests.push(InferRequestItem {
-                    file_path: file_abs,
-                    line_number: resolver_line,
+                    file_path: anchor_file,
+                    line_number: anchor_line,
                     span_start,
                     span_end,
                     expression_text: None,
@@ -4169,12 +4209,85 @@ impl FileOrchestrator {
             }
         }
         debug!(
-            "[FileOrchestrator] Collected {} graphql producer infer requests ({} span-anchored at their resolver function, {} withheld: resolver not a function literal)",
+            "[FileOrchestrator] Collected {} graphql producer infer requests ({} span-anchored at their resolver function, {} followed from a named resolver to its declaration, {} withheld: resolver not a function literal)",
             requests.len(),
             spanned,
+            followed,
             withheld,
         );
         requests
+    }
+
+    /// The source of `file_abs`, read once and remembered. `None` records a
+    /// file that could not be read, so a second op on it does not retry.
+    fn cached_source<'a>(
+        file_source: &'a mut HashMap<String, Option<String>>,
+        file_abs: &str,
+    ) -> Option<&'a str> {
+        file_source
+            .entry(file_abs.to_string())
+            .or_insert_with(|| std::fs::read_to_string(file_abs).ok())
+            .as_deref()
+    }
+
+    /// Follow a named GraphQL resolver (`resolve: listRecentParcels`) to the
+    /// function it binds, returning that function's file, 1-based line and
+    /// span in the SIDECAR's numbering (carrick#1294).
+    ///
+    /// The name is resolved in the file that uses it: a module-scope
+    /// declaration there answers directly, and an import is followed with
+    /// [`BindingResolver`] to the module that declares the binding, where the
+    /// same read runs once more. Exactly one import hop of naming is
+    /// followed — a declaration that is itself another name abstains — and the
+    /// span is always converted against the source of the file it was read
+    /// from, never the importer's (carrick#805).
+    fn named_resolver_anchor(
+        file_abs: &str,
+        name: &str,
+        file_source: &mut HashMap<String, Option<String>>,
+        bindings: &mut BindingResolver,
+    ) -> Option<(String, u32, u32, u32)> {
+        use crate::graphql_resolver_anchor::{NamedResolver, named_resolver};
+
+        let binding = {
+            let content = Self::cached_source(file_source, file_abs)?;
+            named_resolver(std::path::Path::new(file_abs), content, name)?
+        };
+        let (declaring_file, declaration) = match binding {
+            NamedResolver::Declared { lo, hi, line } => (
+                file_abs.to_string(),
+                NamedResolver::Declared { lo, hi, line },
+            ),
+            NamedResolver::Imported {
+                specifier,
+                imported,
+            } => {
+                let resolved =
+                    bindings.resolve(std::path::Path::new(file_abs), &specifier, &imported)?;
+                let declaring_file = resolved.file.to_string_lossy().to_string();
+                // The module may publish the binding under another name
+                // (`export { listRecentParcels as recent }`); the resolver
+                // reports the local one it declares.
+                let local = resolved
+                    .local_name
+                    .unwrap_or_else(|| crate::import_bindings::DEFAULT_EXPORT.to_string());
+                let declaration = {
+                    let content = Self::cached_source(file_source, &declaring_file)?;
+                    named_resolver(&resolved.file, content, &local)?
+                };
+                (declaring_file, declaration)
+            }
+        };
+        let NamedResolver::Declared { lo, hi, line } = declaration else {
+            return None;
+        };
+        let content = Self::cached_source(file_source, &declaring_file)?;
+        Some((
+            declaring_file.clone(),
+            line,
+            Self::sidecar_position(content, lo),
+            Self::sidecar_position(content, hi),
+        ))
     }
 
     /// Parse a file once and extract both the symbol table and the env-var
@@ -8990,6 +9103,59 @@ mod tests {
     use super::*;
     use crate::agents::file_analyzer_agent::{DataCallResult, EndpointResult, MountResult};
     use crate::dispatch::DispatchLocation;
+
+    /// carrick#1294: a named GraphQL resolver is followed to the module that
+    /// declares it, and the span sent for it is measured in THAT module's
+    /// source. The declaring module carries multi-byte prose the importer
+    /// does not, so a span converted against the importer's source names
+    /// different characters (carrick#805).
+    #[test]
+    fn a_named_resolver_is_spanned_in_the_module_that_declares_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let store = root.join("store.ts");
+        let store_source = "\
+export function findParcel(id: string): string {
+  return id;
+}
+
+// Colis — archives
+export const listRecentParcels = (): string[] => [];
+";
+        std::fs::write(&store, store_source).unwrap();
+        let resolvers = root.join("resolvers.ts");
+        std::fs::write(
+            &resolvers,
+            "import { listRecentParcels as recent } from './store.ts';\n\
+             export const fields = { recentParcels: { resolve: recent } };\n",
+        )
+        .unwrap();
+
+        let mut file_source: HashMap<String, Option<String>> = HashMap::new();
+        let mut bindings = BindingResolver::new();
+        let (file, line, span_start, span_end) = FileOrchestrator::named_resolver_anchor(
+            &resolvers.to_string_lossy(),
+            "recent",
+            &mut file_source,
+            &mut bindings,
+        )
+        .expect("a renaming import resolves through the exported name");
+
+        assert!(
+            std::path::Path::new(&file).ends_with("store.ts"),
+            "the request moves to the declaring module, got {file}"
+        );
+        assert_eq!(line, 6, "the declaration's line in the declaring module");
+        // The sidecar counts UTF-16 code units from zero, so the expected
+        // positions are computed from the declaring module's own source.
+        let arrow = "(): string[] => []";
+        let byte_start = store_source.find(arrow).expect("the arrow");
+        let utf16 = |bytes: usize| store_source[..bytes].encode_utf16().count() as u32;
+        assert_eq!(
+            (span_start, span_end),
+            (utf16(byte_start), utf16(byte_start + arrow.len())),
+        );
+    }
 
     /// #369: relative import specifiers resolve through the TS extension
     /// order to an existing file; package and alias specifiers resolve to
