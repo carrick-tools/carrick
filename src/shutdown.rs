@@ -135,12 +135,6 @@ fn record(signal: Shutdown) {
     let _ = RECORDED.compare_exchange(0, signal.code(), Ordering::Relaxed, Ordering::Relaxed);
 }
 
-/// Forget the recorded signal, for a test that raised one at its own process.
-#[cfg(test)]
-pub fn reset() {
-    RECORDED.store(0, Ordering::Relaxed);
-}
-
 /// Listen for every signal that ends a scan, from now, in a task of this
 /// process's own.
 ///
@@ -299,31 +293,27 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
     use std::time::Duration;
 
-    /// Every signal round-trips the process-global, and an encoding no
-    /// release wrote reads as no signal rather than as whichever one sits at
-    /// that index.
+    /// Every signal round-trips its encoding, and one no release wrote reads
+    /// as no signal rather than as whichever one sits at that index.
+    ///
+    /// Nothing here writes [`RECORDED`], and nothing in this binary may: a
+    /// test that sets the process-global is read by every other test in the
+    /// process — two thousand of them, on parallel threads, some of which run
+    /// pipeline stages that call [`check`] — as an interruption of its own.
+    /// What the flag does under a real signal is proven where a real signal
+    /// can be raised safely, which is one test per process in
+    /// `tests/shutdown_signal_test.rs` and `tests/shutdown_drain_test.rs`.
     #[test]
-    #[serial(shutdown_flag)]
-    fn the_recorded_signal_round_trips_and_the_first_one_wins() {
-        reset();
-        assert_eq!(requested(), None);
-        assert!(check().is_ok());
+    fn every_signal_round_trips_its_encoding() {
         for signal in [Shutdown::Interrupt, Shutdown::Terminate, Shutdown::Hangup] {
-            reset();
-            record(signal);
-            assert_eq!(requested(), Some(signal));
-            // A second signal is an instruction to go now, not a correction of
-            // what stopped the run: the reported reason and the exit code stay
-            // the first signal's.
-            record(Shutdown::Hangup);
-            assert_eq!(requested(), Some(signal));
-            assert_eq!(check(), Err(Interrupted { signal }));
+            assert_eq!(Shutdown::from_code(signal.code()), Some(signal));
+            // Zero is "no signal", so no signal may encode to it.
+            assert_ne!(signal.code(), 0);
         }
+        assert_eq!(Shutdown::from_code(0), None);
         assert_eq!(Shutdown::from_code(200), None);
-        reset();
     }
 
     /// The reason the cloud stores names the signal, and still carries the
