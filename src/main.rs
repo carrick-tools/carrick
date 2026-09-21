@@ -72,6 +72,7 @@ mod utils;
 mod visitor;
 mod workspace_resolver;
 mod wrapper_call_join;
+mod wrapper_call_method;
 mod wrapper_dispatch;
 mod wrapper_request_shape;
 

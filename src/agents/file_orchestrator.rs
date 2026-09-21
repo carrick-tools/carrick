@@ -210,6 +210,9 @@ pub struct ProcessingStats {
     /// another module (carrick#1403), and the rows left unclassified because
     /// that declaration's module states the operation more than once.
     pub wrapper_call_joins: crate::wrapper_call_join::WrapperCallJoins,
+    /// Model rows whose verb the declaration they reach stated (carrick#1384),
+    /// and the rows left with the model's because it stated no single verb.
+    pub wrapper_method_corrections: crate::wrapper_call_method::WrapperMethodCorrections,
     /// Model rows that joined a deterministic row at their span and
     /// contributed only what determinism did not state.
     pub model_rows_joined: usize,
@@ -2875,6 +2878,29 @@ impl FileOrchestrator {
                 stats.graphql_document_site_drops.total(),
                 stats.graphql_document_site_drops.document_argument,
                 stats.graphql_document_site_drops.document_executor
+            );
+        }
+
+        // PHASE 5c2 (carrick#1384): the verb at a call through a declaration is
+        // the declaration's. A site written on an imported binding states no
+        // method, the model answers one anyway, and the module-level
+        // propagation reaches only rows with no span. Cross-file, resolved
+        // through the same service index as the join below, and before the two
+        // passes that follow: correcting a verb moves the row's operation, and
+        // both of them decide which rows state the same one.
+        let wrapper_method_corrections = crate::wrapper_call_method::correct_wrapper_call_methods(
+            &mut file_results,
+            Some(service_modules),
+        );
+        stats.wrapper_method_corrections = wrapper_method_corrections;
+        if wrapper_method_corrections
+            != crate::wrapper_call_method::WrapperMethodCorrections::default()
+        {
+            debug!(
+                "  - Methods read off the declaration the call reaches: {} (declaration states no \
+                 single verb: {})",
+                wrapper_method_corrections.corrected,
+                wrapper_method_corrections.declaration_unreadable
             );
         }
 

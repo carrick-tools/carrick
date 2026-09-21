@@ -330,6 +330,7 @@ fn test_processing_stats_tracking() {
         total_data_calls: 4,
         errors: vec!["Test error".to_string()],
         wrapper_call_joins: Default::default(),
+        wrapper_method_corrections: Default::default(),
     };
 
     assert_eq!(stats.files_processed, 5);

@@ -47,7 +47,7 @@ use swc_common::{
     errors::{ColorConfig, Handler},
     sync::Lrc,
 };
-use swc_ecma_ast::{CallExpr, Callee, Expr, Module};
+use swc_ecma_ast::{CallExpr, Callee, Expr, Module, ModuleDecl, ModuleItem};
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::debug;
 
@@ -59,6 +59,7 @@ use crate::parser::parse_file;
 use crate::swc_scanner::SWC_SPAN_BASE;
 use crate::url_normalizer::UrlNormalizer;
 use crate::workspace_resolver::WorkspaceIndex;
+use crate::wrapper_request_shape::{RequestShapeSignal, call_request_verb};
 
 /// What the join decided, so a scan can state it rather than change the index
 /// silently.
@@ -130,7 +131,7 @@ pub fn join_wrapper_calls(
         let Ok(canonical) = file.canonicalize() else {
             continue;
         };
-        let Some((sites, imports)) = read_call_sites(file) else {
+        let Some(calls) = read_call_sites(file) else {
             continue;
         };
 
@@ -144,30 +145,20 @@ pub fn join_wrapper_calls(
             if !is_linkable_row(call) {
                 continue;
             }
-            let Some(site) = site_of(&sites, call) else {
+            let Some(site) = site_of(&calls.sites, call) else {
                 continue;
             };
-            let Some(import) = imports.get(&site.root) else {
-                continue; // declared here, or a name this file never imported
-            };
-            // Canonical, because every file's rows are keyed that way and the
-            // resolver's ALIAS branch answers with the path as joined: on a
-            // checkout reached through a link, `/var/…` and `/private/var/…`
-            // are one file and only one of them matches a row.
-            let Some(module) = resolve_module(workspace, file, &import.specifier)
-                .map(|module| module.canonicalize().unwrap_or(module))
-            else {
+            let Some(declaration) = declaration_reached(
+                &mut resolver,
+                workspace,
+                file,
+                &canonical,
+                &calls.imports,
+                &site.root,
+            ) else {
                 continue;
             };
-            // The module that DECLARES the binding, which is the module whose
-            // rows state the request: a barrel republishing it holds none.
-            let declaring = resolver
-                .resolve_export(&module, &import.imported)
-                .map(|binding| binding.file)
-                .unwrap_or(module);
-            if declaring == canonical {
-                continue; // a same-file wrapper: `consumer_row_fold` owns it
-            }
+            let declaring = declaration.file;
             let Some(rows) = requests.get(&declaring) else {
                 continue;
             };
@@ -184,7 +175,7 @@ pub fn join_wrapper_calls(
                     "  - {key}: line {} reaches {} in {}, which states {operation} on more than \
                      one line; left unclassified",
                     call.line_number,
-                    import.imported,
+                    declaration.published,
                     declaring.display()
                 );
                 continue;
@@ -258,7 +249,58 @@ fn operation_key(call: &DataCallResult, normalizer: &UrlNormalizer) -> Option<St
     ))
 }
 
-fn resolve_module(
+/// The module a call site reaches, and the name it reaches it under.
+pub(crate) struct ReachedDeclaration {
+    /// Canonical path of the module that DECLARES the binding the call is
+    /// written on — never a barrel that republishes it.
+    pub(crate) file: PathBuf,
+    /// The name that module publishes it as.
+    pub(crate) published: String,
+}
+
+/// The declaration a call written on `root` reaches, or `None` when `root` is
+/// not a binding this file imports, or the module graph cannot reach it.
+///
+/// This is the one question both wrapper-call passes ask of a site: which
+/// module does this line reach. carrick#1403 reads that module's rows;
+/// carrick#1384 reads the requests it issues.
+///
+/// A binding that resolves back to `file` itself — a circular barrel — is not a
+/// call one file boundary out, and answers `None`: what one file's rows are is
+/// [`crate::consumer_row_fold`]'s question.
+pub(crate) fn declaration_reached(
+    resolver: &mut BindingResolver,
+    workspace: Option<&WorkspaceIndex>,
+    file: &Path,
+    canonical: &Path,
+    imports: &HashMap<String, Import>,
+    root: &str,
+) -> Option<ReachedDeclaration> {
+    // Not imported here: a binding this file declares, whose rows are one
+    // file's own.
+    let import = imports.get(root)?;
+    // Canonical, because every file's rows are keyed that way and the
+    // resolver's ALIAS branch answers with the path as joined: on a checkout
+    // reached through a link, `/var/…` and `/private/var/…` are one file and
+    // only one of them matches a row.
+    let module = resolve_module(workspace, file, &import.specifier)
+        .map(|module| module.canonicalize().unwrap_or(module))?;
+    // The module that DECLARES the binding, which is the module whose rows
+    // state the request: a barrel republishing it holds none.
+    let declaring = resolver
+        .resolve_export(&module, &import.imported)
+        .map(|binding| binding.file)
+        .unwrap_or(module);
+    if declaring == canonical {
+        return None;
+    }
+    Some(ReachedDeclaration {
+        file: declaring,
+        published: import.imported.clone(),
+    })
+}
+
+pub(crate) fn resolve_module(
     workspace: Option<&WorkspaceIndex>,
     importer: &Path,
     specifier: &str,
@@ -271,7 +313,9 @@ fn resolve_module(
     }
 }
 
-/// One call in a file: where it is, and the binding it is written on.
+/// One call in a file, as much of it as both wrapper-call passes need: where
+/// it is, the binding it is written on, and what it says about being a request
+/// itself.
 pub(crate) struct CallSite {
     /// Start of the call expression, in candidate span units.
     pub(crate) span: u32,
@@ -281,14 +325,41 @@ pub(crate) struct CallSite {
     /// The root binding the callee is written on (`client` in
     /// `client.list()`).
     pub(crate) root: String,
+    /// What this call states about its own request (carrick#1384): a site that
+    /// is a request itself states its own verb, and neither pass looks
+    /// elsewhere for it.
+    pub(crate) request: RequestShapeSignal,
 }
 
-/// Every call written on a binding, with the file's import table.
-fn read_call_sites(file: &Path) -> Option<(Vec<CallSite>, HashMap<String, Import>)> {
+/// What one file's calls are, read in a single parse.
+pub(crate) struct FileCalls {
+    /// Every call written on a binding, in source order.
+    pub(crate) sites: Vec<CallSite>,
+    /// Local name → where it was imported from.
+    pub(crate) imports: HashMap<String, Import>,
+    /// Every module specifier the file imports from, in source order.
+    pub(crate) specifiers: Vec<String>,
+}
+
+/// Read one file's calls and imports.
+pub(crate) fn read_call_sites(file: &Path) -> Option<FileCalls> {
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
     let module = parse_file(file, &cm, &handler)?;
-    Some((call_sites(&module, &cm), import_table(&module)))
+    Some(FileCalls {
+        sites: call_sites(&module, &cm),
+        imports: import_table(&module),
+        specifiers: module
+            .body
+            .iter()
+            .filter_map(|item| match item {
+                ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
+                    Some(import.src.value.to_string())
+                }
+                _ => None,
+            })
+            .collect(),
+    })
 }
 
 fn call_sites(module: &Module, cm: &Lrc<SourceMap>) -> Vec<CallSite> {
@@ -297,7 +368,7 @@ fn call_sites(module: &Module, cm: &Lrc<SourceMap>) -> Vec<CallSite> {
     collector
         .calls
         .into_iter()
-        .filter_map(|(pos, root)| {
+        .filter_map(|(pos, root, request)| {
             let span = cm
                 .lookup_byte_offset(pos)
                 .pos
@@ -307,6 +378,7 @@ fn call_sites(module: &Module, cm: &Lrc<SourceMap>) -> Vec<CallSite> {
                 span,
                 line: cm.lookup_char_pos(pos).line as u32,
                 root,
+                request,
             })
         })
         .collect()
@@ -317,7 +389,7 @@ fn call_sites(module: &Module, cm: &Lrc<SourceMap>) -> Vec<CallSite> {
 /// left out.
 #[derive(Default)]
 struct CallCollector {
-    calls: Vec<(swc_common::BytePos, String)>,
+    calls: Vec<(swc_common::BytePos, String, RequestShapeSignal)>,
 }
 
 impl Visit for CallCollector {
@@ -325,9 +397,22 @@ impl Visit for CallCollector {
         if let Callee::Expr(expr) = &node.callee
             && let Some(root) = callee_root(expr)
         {
-            self.calls.push((node.span.lo, root));
+            self.calls.push((
+                node.span.lo,
+                root,
+                call_request_verb(node, callee_property(expr).as_deref()),
+            ));
         }
         node.visit_children_with(self);
+    }
+}
+
+/// The property a call is made through (`post` in `client.post(...)`), which
+/// is one of the two ways a call states its own verb.
+fn callee_property(expr: &Expr) -> Option<String> {
+    match unwrap_expression(expr) {
+        Expr::Member(member) => member.prop.as_ident().map(|ident| ident.sym.to_string()),
+        _ => None,
     }
 }
 
