@@ -1273,7 +1273,7 @@ export class TypeInferrer {
       this.isResponseSend(candidate, extractionConfig, serialisers);
 
     const peeled = this.peelTransparentExpression(located);
-    const site = isSend(peeled) ? peeled : this.sendReceivingArgument(located, isSend);
+    const site = isSend(peeled) ? peeled : this.receivingCallOf(located, isSend);
     if (!site) return undefined;
     const contains = (outer: Node, inner: Node): boolean =>
       outer.getStart() <= inner.getStart() && inner.getEnd() <= outer.getEnd();
@@ -1370,14 +1370,18 @@ export class TypeInferrer {
   }
 
   /**
-   * The send `node` is an argument of, looking through the wrappers that do
+   * The call `node` is an ARGUMENT of, looking through the wrappers that do
    * not change a payload (parentheses, `as`, `satisfies`, `!`, `await`) and a
-   * `JSON.stringify` around the body. `undefined` when the parent call is not
-   * a send or `node` is its callee.
+   * `JSON.stringify` around the body. `undefined` when `accept` rejects that
+   * call or `node` is its callee.
+   *
+   * Two readings use it: a value handed to a response send is the payload that
+   * send transmits, and a body read handed to a call that states what it
+   * returns is a better statement of that body than the read (carrick#1382).
    */
-  private sendReceivingArgument(
+  private receivingCallOf(
     node: Node,
-    isSend: (candidate: Node) => boolean
+    accept: (candidate: Node) => boolean
   ): Node | undefined {
     let current = node;
     let parent = current.getParent();
@@ -1397,7 +1401,7 @@ export class TypeInferrer {
       return undefined;
     }
     if (!parent.getArguments().includes(current)) return undefined;
-    return isSend(parent) ? parent : undefined;
+    return accept(parent) ? parent : undefined;
   }
 
   private inferCallResult(
@@ -2003,7 +2007,14 @@ export class TypeInferrer {
           const bodyRead = this.bodyReadOnReceiver(expr);
           if (bodyRead) {
             sawWholeRead = true;
-            lastNode = bodyRead;
+            // carrick#1382: the read is a FLOOR, not a ceiling. Where the
+            // source hands the body it read to a call that states what it
+            // returns, that call says strictly more about the payload than
+            // the untyped read does, and it must not lose to the read just
+            // because the walk reaches the read second (candidates come in
+            // pre-order, so the declaration of the parsed value is visited
+            // before the identifier inside its own initializer).
+            lastNode = this.statedPayloadAroundBodyRead(bodyRead) ?? bodyRead;
             continue;
           }
           // carrick#1375: how the source reads the value decides whether this
@@ -2129,6 +2140,92 @@ export class TypeInferrer {
       return undefined;
     }
     return access;
+  }
+
+  /**
+   * The call that CONSUMES this json body read and states what the body is —
+   * `parseEnvelope(await response.json())` — or `undefined` when nothing
+   * downstream of the read says more about it than the read itself does
+   * (carrick#1382).
+   *
+   * Three conditions, all shapes of the language rather than names:
+   *
+   *  - the read reaches the call as an ARGUMENT, through the wrappers that do
+   *    not change a value (`await`, parentheses, `as`, `satisfies`, `!`). A
+   *    cast with no call around it therefore keeps the read as the terminal,
+   *    so `(await res.json()) as Entry` is still read off the read itself;
+   *  - the call's own result is BOUND — declared into a variable, returned, or
+   *    assigned — so a call the source made for its side effect
+   *    (`store(await res.json())`) states nothing about the payload;
+   *  - that result is an OBJECT shape. A validator answering `boolean` or a
+   *    serialiser answering `string` describes what the caller did with the
+   *    body, not what the body is, and publishing it would be a
+   *    concrete-but-wrong contract where the honest `any` of the read is
+   *    merely unresolved.
+   */
+  private statedPayloadAroundBodyRead(bodyRead: Node): Node | undefined {
+    return this.receivingCallOf(
+      bodyRead,
+      (candidate) =>
+        Node.isCallExpression(candidate) &&
+        this.callResultIsBound(candidate) &&
+        this.isObjectShape(this.unwrapPromiseType(candidate.getType()))
+    );
+  }
+
+  /**
+   * The source keeps this call's result: it initializes a declaration, is
+   * returned, is assigned, or is an arrow's expression body. A result that is
+   * kept is one the source has a use for; a discarded one is a side effect.
+   */
+  private callResultIsBound(call: CallExpression): boolean {
+    let current: Node = call;
+    let parent = current.getParent();
+    while (
+      parent &&
+      (Node.isParenthesizedExpression(parent) ||
+        Node.isAwaitExpression(parent) ||
+        Node.isAsExpression(parent) ||
+        Node.isSatisfiesExpression(parent) ||
+        Node.isNonNullExpression(parent)) &&
+      parent.getExpression() === current
+    ) {
+      current = parent;
+      parent = current.getParent();
+    }
+    if (!parent) return false;
+    if (Node.isVariableDeclaration(parent)) {
+      return parent.getInitializer() === current;
+    }
+    if (Node.isReturnStatement(parent)) {
+      return parent.getExpression() === current;
+    }
+    if (Node.isArrowFunction(parent)) {
+      return parent.getBody() === current;
+    }
+    if (Node.isBinaryExpression(parent)) {
+      return (
+        parent.getOperatorToken().getKind() === SyntaxKind.EqualsToken &&
+        parent.getRight() === current
+      );
+    }
+    return false;
+  }
+
+  /**
+   * A shape a JSON body can be: an object, an array, or a union of them.
+   * Top types, primitives, `void` and callables are not.
+   */
+  private isObjectShape(type: Type): boolean {
+    if (type.isAny() || type.isUnknown()) return false;
+    if (type.isUnion()) {
+      const parts = type.getUnionTypes().filter((part) => !part.isUndefined() && !part.isNull());
+      return parts.length > 0 && parts.every((part) => this.isObjectShape(part));
+    }
+    if (type.isIntersection()) {
+      return type.getIntersectionTypes().every((part) => this.isObjectShape(part));
+    }
+    return type.isObject() && !this.isCallableType(type);
   }
 
   /**
