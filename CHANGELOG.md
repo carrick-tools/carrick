@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.87](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.86...carrick-v0.3.87) (2026-09-21)
+
+
+### Bug Fixes
+
+* **check:** state the re-check block even when nothing was re-checked ([#1435](https://github.com/carrick-tools/carrick/issues/1435)) ([eeef118](https://github.com/carrick-tools/carrick/commit/eeef11856d362e8eb8e46d5f15b9d3e55f9e9149)), closes [#1374](https://github.com/carrick-tools/carrick/issues/1374)
+* **consumers:** classify the model's row at a call through a client method ([#1422](https://github.com/carrick-tools/carrick/issues/1422)) ([562d2e9](https://github.com/carrick-tools/carrick/commit/562d2e97a92c0a2e0f4f5507cc4c08fb2f0006c0))
+* **consumers:** read the verb of a call through a declaration where it is written ([#1427](https://github.com/carrick-tools/carrick/issues/1427)) ([332fbf3](https://github.com/carrick-tools/carrick/commit/332fbf3afc70c91ca39d5b564fcac876fe944462)), closes [#1384](https://github.com/carrick-tools/carrick/issues/1384)
+* **consumers:** state the call a literal base and a path write, with no model row ([#1434](https://github.com/carrick-tools/carrick/issues/1434)) ([ec3dd9c](https://github.com/carrick-tools/carrick/commit/ec3dd9c5fe565ef72e88fa8d96b02616ddb324cf))
+* **index:** pass a SIGTERM on to the scan the build is waiting on ([#1440](https://github.com/carrick-tools/carrick/issues/1440)) ([1c6e55f](https://github.com/carrick-tools/carrick/commit/1c6e55f36632afcd1315eed9b84b2e9b925b143c))
+* **init:** say where the hosted read has got to on a clock, and in a pipe ([#1439](https://github.com/carrick-tools/carrick/issues/1439)) ([39e819e](https://github.com/carrick-tools/carrick/commit/39e819ead6325318c9318e1801bd4e4fcf742730)), closes [#1373](https://github.com/carrick-tools/carrick/issues/1373)
+* **sidecar:** an alias the stub cannot resolve answers the top type it is ([#1445](https://github.com/carrick-tools/carrick/issues/1445)) ([67e6d57](https://github.com/carrick-tools/carrick/commit/67e6d5777fdb69642a5f13de34521c491f472d43)), closes [#1444](https://github.com/carrick-tools/carrick/issues/1444)
+* **sidecar:** repair an emitted declaration whose import does not resolve ([#1443](https://github.com/carrick-tools/carrick/issues/1443)) ([06d9737](https://github.com/carrick-tools/carrick/commit/06d9737969d6a99ca4f7893f680d68126a922503))
+* **types:** ask the capture about every alias, not the ones v1 labelled ([#1442](https://github.com/carrick-tools/carrick/issues/1442)) ([92670c0](https://github.com/carrick-tools/carrick/commit/92670c0cee65dd8e1ca5c1e6e2e548acaa5feda2)), closes [#1441](https://github.com/carrick-tools/carrick/issues/1441) [#449](https://github.com/carrick-tools/carrick/issues/449) [#1438](https://github.com/carrick-tools/carrick/issues/1438)
+* **types:** decide library origin from the program, and read a synthesised member ([#1436](https://github.com/carrick-tools/carrick/issues/1436)) ([96d5186](https://github.com/carrick-tools/carrick/commit/96d5186db75e4e53aefa440e7a1fd183ea1340ea))
+
+
+### Documentation
+
+* **skills:** read the pair's status, and the rows the lexical floor held back ([#1432](https://github.com/carrick-tools/carrick/issues/1432)) ([197b7cc](https://github.com/carrick-tools/carrick/commit/197b7ccf3733c635805a152db1a5675af2b2b329))
+
 ## [0.3.86](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.85...carrick-v0.3.86) (2026-09-21)
 
 
