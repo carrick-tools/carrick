@@ -1,0 +1,7 @@
+{
+  "name": "one-row-per-request",
+  "private": true,
+  "dependencies": {
+    "@example/query": "1.0.0"
+  }
+}

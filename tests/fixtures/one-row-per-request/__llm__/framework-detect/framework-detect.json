@@ -1,0 +1,6 @@
+{
+  "frameworks": [],
+  "data_fetchers": ["@example/query"],
+  "messaging_clients": [],
+  "notes": "A React client. @example/query is the query-hook package the components fetch through."
+}
