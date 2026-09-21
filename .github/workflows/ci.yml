@@ -47,6 +47,12 @@ jobs:
       - name: Run sidecar readiness timing tests
         run: cargo test --test sidecar_readiness_test --verbose
 
+      # Raises real signals at its own process, so it runs as a binary of its
+      # own: beside two thousand other tests, one of them would read this
+      # one's SIGHUP as its own interruption (carrick#1387).
+      - name: Run the signal tests
+        run: cargo test --test shutdown_signal_test --verbose
+
       # Fixture- and mock-driven; no live LLM, no env beyond what they set
       # themselves. route_request_anchor_test and span_locator_units_test need
       # the sidecar built above. eval_xrepo is the cross-repo scorer math only:

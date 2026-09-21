@@ -181,14 +181,19 @@ impl ShutdownWatcher {
     }
 
     /// Drop the signals that have already arrived, so what [`Self::recv`]
-    /// answers next is a signal sent from here on.
+    /// answers next is a signal sent from here on, and say how many there
+    /// were.
     ///
     /// The run that ends because a pass read [`check`] never consumed the
     /// signal that ended it. Racing a report against it unconsumed would
     /// abandon that report in its first poll — "a second Ctrl-C ends this
     /// process now" answered by the first one (carrick#1387).
-    pub fn drain(&mut self) {
-        while self.rx.try_recv().is_ok() {}
+    pub fn drain(&mut self) -> usize {
+        let mut dropped = 0;
+        while self.rx.try_recv().is_ok() {
+            dropped += 1;
+        }
+        dropped
     }
 }
 
@@ -334,67 +339,6 @@ mod tests {
         assert_eq!(Shutdown::Interrupt.exit_code(), 130);
         assert_eq!(Shutdown::Terminate.exit_code(), 143);
         assert_eq!(Shutdown::Hangup.exit_code(), 129);
-    }
-
-    /// Closing the terminal a scan is running in is one of the three ways a
-    /// laptop scan ends without asking, and the one that used to leave no
-    /// handler between the signal and the process (carrick#1235). Under test
-    /// it is raised at this process, which is why the watcher is installed
-    /// first: without the handler this signal's default action ends the test
-    /// binary rather than failing the test.
-    ///
-    /// It also proves the reach the watcher exists for (carrick#1387): the
-    /// flag is set by the task, not by whoever is racing, so it is readable
-    /// here without anything having awaited the signal.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial(shutdown_flag)]
-    async fn a_closed_terminal_reaches_the_watcher_that_records_it() {
-        reset();
-        let mut shutdown = watch();
-        // SAFETY: a signal to this process, whose handler was installed above.
-        unsafe { libc::raise(libc::SIGHUP) };
-        let caught = tokio::time::timeout(Duration::from_secs(30), shutdown.recv())
-            .await
-            .expect("SIGHUP reached the watcher");
-        assert_eq!(caught, Shutdown::Hangup);
-        assert_eq!(requested(), Some(Shutdown::Hangup));
-        assert_eq!(check(), Err(Interrupted { signal: caught }));
-        reset();
-    }
-
-    /// A signal the race never consumed must not be the answer to "has a
-    /// second one arrived": the report of an interruption a pass noticed is
-    /// raced against the watcher, and an undrained first signal abandons it
-    /// before it starts (carrick#1387).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial(shutdown_flag)]
-    async fn a_signal_a_pass_noticed_is_not_read_as_the_second_one() {
-        reset();
-        let mut shutdown = watch();
-        // SAFETY: a signal to this process, whose handler was installed above.
-        unsafe { libc::raise(libc::SIGTERM) };
-        // The pass reads the flag rather than the channel, which is the case
-        // this is about: wait for the record, leaving the signal unconsumed.
-        let recorded = tokio::time::timeout(Duration::from_secs(30), async {
-            while requested().is_none() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
-        assert!(recorded.is_ok(), "the watcher recorded the signal");
-        shutdown.drain();
-        let ended = tokio::time::timeout(
-            Duration::from_secs(300),
-            within_budget(
-                std::future::ready(()),
-                shutdown.recv(),
-                INTERRUPTION_REPORT_BUDGET,
-            ),
-        )
-        .await
-        .expect("the report is not left without a way out");
-        assert_eq!(ended, Ended::Reported);
-        reset();
     }
 
     /// The report is made if it can be, and abandoned if it cannot: a user who
