@@ -36,6 +36,7 @@ import * as path from 'node:path';
 import type { CaptureAliasRecord, SelfCheckOutcome } from './api.js';
 import type { ResolvedAnchor } from './anchors.js';
 import { collectSpecifiers, isRelative, packageNameOf } from './specifiers.js';
+import { repairDanglingImports, type RepairedFile } from './repair-dangling.js';
 import {
   findDisqualifyingTopTypes,
   provenanceOf,
@@ -80,7 +81,17 @@ export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[] {
   }
 
   try {
-    return runSelfCheck(args, treeFiles);
+    const first = runSelfCheck(args, treeFiles);
+    // carrick#1397: an emitted declaration that imports a module the checkout
+    // does not have makes every alias reaching that file unpublishable, however
+    // much of it resolved. Repair the file — drop the import, write `unknown`
+    // where its names were used — and check the tree again. The second pass is
+    // the verdict: it reads the repaired text, and a name the rewrite did not
+    // reach comes back as a `Cannot find name` diagnostic that
+    // `repairedNameFailures` folds back into the same dangling specifier.
+    const repaired = repairDanglingImports(first.internalFailuresByFile);
+    if (repaired.size === 0) return first.records;
+    return runSelfCheck(args, treeFiles, repaired).records;
   } finally {
     // unlinkSync, not rmSync: the link target is a directory and rmSync
     // refuses symlinks-to-directories with EISDIR.
@@ -88,7 +99,22 @@ export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[] {
   }
 }
 
-function runSelfCheck(args: SelfCheckArgs, treeFiles: string[]): CaptureAliasRecord[] {
+/** One self-check pass: its records, and what each file could not resolve. */
+interface SelfCheckPass {
+  records: CaptureAliasRecord[];
+  /**
+   * Absolute file -> internal specifiers that failed in it, for the repair
+   * pass. The surface file is excluded: its failures are the pasted text of a
+   * literal anchor (carrick#1361), not a declaration to repair.
+   */
+  internalFailuresByFile: Map<string, Set<string>>;
+}
+
+function runSelfCheck(
+  args: SelfCheckArgs,
+  treeFiles: string[],
+  repaired?: Map<string, RepairedFile>
+): SelfCheckPass {
   const options: ts.CompilerOptions = {
     noEmit: true,
     strict: true,
@@ -127,12 +153,22 @@ function runSelfCheck(args: SelfCheckArgs, treeFiles: string[]): CaptureAliasRec
     return entry;
   };
   for (const d of diagnostics) {
-    if ((d.code !== 2307 && d.code !== 2792) || !d.file) continue;
+    if (!d.file) continue;
+    const abs = path.resolve(d.file.fileName);
     const msg = ts.flattenDiagnosticMessageText(d.messageText, ' ');
+    // A name the repair did not reach: the import that bound it is gone, so
+    // the module is no longer reported missing and only this diagnostic is
+    // left to say the tree is incomplete. Blamed on the specifier that bound
+    // the name, which is the sentence a reader can act on (carrick#1397).
+    const orphaned = repairedNameFailure(repaired, abs, d, msg);
+    if (orphaned) {
+      bucketIn(failuresByFile, abs).internal.add(orphaned);
+      continue;
+    }
+    if (d.code !== 2307 && d.code !== 2792) continue;
     const m = /Cannot find module '([^']+)'/.exec(msg);
     if (!m) continue;
     const spec = m[1];
-    const abs = path.resolve(d.file.fileName);
     // A surface diagnostic outside every alias statement (a file-level import,
     // a reference directive) is attributable to no alias and keeps the
     // service-wide file bucket: soundness over precision, the same fallback
@@ -183,7 +219,42 @@ function runSelfCheck(args: SelfCheckArgs, treeFiles: string[]): CaptureAliasRec
           })
     );
   }
-  return records;
+
+  const internalFailuresByFile = new Map<string, Set<string>>();
+  for (const [file, failures] of failuresByFile) {
+    // The surface's own failures are a literal anchor's pasted text
+    // (carrick#1361), not a declaration with an import to drop.
+    if (file === surfaceAbs || failures.internal.size === 0) continue;
+    // A file already repaired has had its turn: repairing it again would chase
+    // its own leftover diagnostics.
+    if (repaired?.has(file)) continue;
+    internalFailuresByFile.set(file, failures.internal);
+  }
+  return { records, internalFailuresByFile };
+}
+
+/**
+ * The specifier to blame for a `Cannot find name` diagnostic in a file this
+ * capture repaired, when the name is one the dropped import bound.
+ *
+ * The rewrite writes `unknown` at every type position it can reach; a use it
+ * cannot — and there should be none, since a position where `unknown` is not a
+ * type leaves the whole file untouched — would otherwise read as a clean tree,
+ * because the module that is missing is no longer imported to be reported.
+ * Fail closed: the alias keeps the refusal it had before the repair.
+ */
+function repairedNameFailure(
+  repaired: Map<string, RepairedFile> | undefined,
+  file: string,
+  diagnostic: ts.Diagnostic,
+  message: string
+): string | undefined {
+  if (!repaired || diagnostic.code !== 2304) return undefined;
+  const entry = repaired.get(file);
+  if (!entry) return undefined;
+  const named = /Cannot find name '([^']+)'/.exec(message);
+  if (!named || !entry.names.includes(named[1])) return undefined;
+  return entry.specifiers[0];
 }
 
 /**
