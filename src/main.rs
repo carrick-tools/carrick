@@ -312,15 +312,28 @@ async fn main() {
 /// reports its own interruption to the cloud.
 async fn run_build(command: local_mode::cli::LocalCommand) -> i32 {
     let mut shutdown = shutdown::watch();
-    let build = tokio::task::spawn_blocking(move || local_mode::cli::run(command));
-    tokio::select! {
+    let mut build = tokio::task::spawn_blocking(move || local_mode::cli::run(command));
+    let signal = tokio::select! {
         biased;
-        signal = shutdown.recv() => {
-            local_mode::cli::interrupted(signal.name());
-            signal.exit_code()
-        }
-        code = build => code.unwrap_or(1),
+        signal = shutdown.recv() => signal,
+        code = &mut build => return code.unwrap_or(1),
+    };
+    local_mode::cli::interrupted(signal.name());
+    // The build is a parent: the scan it is waiting on is a process of its
+    // own, and a signal sent to this pid alone never reached it. Without the
+    // forward the two disagree for as long as the child runs — `carrick
+    // status` says the scan was interrupted while a scan of that repo is
+    // still writing an index, and a second `carrick index` is refused by a
+    // slot whose run the user was told had stopped (carrick#1379).
+    //
+    // Waited on afterwards, because the forward is what asks the child for its
+    // own bounded report and leaving at once would take that back. A child
+    // that does not go inside the grace is left to the slot's own expiry,
+    // exactly as it is today.
+    if local_mode::cli::forward_to_running_scan(signal) {
+        let _ = tokio::time::timeout(local_mode::cli::forwarded_exit_grace(), build).await;
     }
+    signal.exit_code()
 }
 
 /// Tell the cloud about a laptop run that died before `start-scan` opened a
