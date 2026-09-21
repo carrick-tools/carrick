@@ -12,6 +12,13 @@
  *  - `expanded`: the fully *structural* form, with every named member type
  *    inlined to its member structure, recursively.
  *
+ * An alias whose own type did not resolve produces neither: the tree is read
+ * with nothing installed, so a reference that leaves it lands on TypeScript's
+ * unresolved-reference placeholder, which the compiler prints as the reference
+ * text rather than as `any` (see `isUnresolvedReference`). Both forms are then
+ * the top type, which is what every downstream rule about an empty answer is
+ * written to refuse.
+ *
  * `type.getText(node, NoTruncation)` does NOT inline named members — the
  * compiler prints a referenced type by its symbol name when that symbol is in
  * scope (`total: Money`, not `total: { amountCents: number; currency: string }`).
@@ -26,7 +33,7 @@
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
-import { Project, Node, type SourceFile } from 'ts-morph';
+import { Project, Node, type SourceFile, type Type } from 'ts-morph';
 import {
   expandTypeStructural,
   type ExpandOrigin,
@@ -126,6 +133,13 @@ export class DefinitionResolver {
     try {
       const type = decl.getType();
 
+      // An alias whose own type did not resolve answers the top type it IS,
+      // not the reference the compiler echoes for it (carrick#1444).
+      if (isUnresolvedReference(type)) {
+        this.log(`${alias} names a type this tree cannot resolve; answering any`);
+        return { type_alias: alias, definition: 'any', expanded: 'any' };
+      }
+
       // As-written form: prefer the alias target's own declaration (the real
       // `interface Order {...}` in the tree) over the surface's import-type
       // line, so named shapes read naturally. Fall back to the alias line for
@@ -167,6 +181,32 @@ export class DefinitionResolver {
   private logError(message: string): void {
     console.error(`[sidecar:definition-resolver:error] ${message}`);
   }
+}
+
+/**
+ * True when a type is TypeScript's unresolved-reference placeholder:
+ * `TypeFlags.Any` carrying the internal `intrinsicName === 'error'` (stable
+ * since TS 1.x). `capture/deep-walk.ts` tests the same two facts for the same
+ * reason; the seam forbids importing it from here, so the pin is that both read
+ * the flag and the intrinsic name and nothing else.
+ *
+ * The compiler prints this placeholder as the reference text it FAILED to
+ * resolve, never as `any`. That print is what makes an unresolvable alias read
+ * as a confident name: an instantiation over a dependency's internal generics
+ * has no members in it and resolves nowhere, and every scanner-side rule that
+ * refuses an empty answer asks the TEXT (`text_is_bare_top_type`), so nothing
+ * downstream can tell the difference (carrick#1444).
+ *
+ * Asked only of the alias's own type. At a member position the same echo is
+ * the producer's own vocabulary (`status: OrderStatus`) inside a shape that
+ * otherwise resolved, and replacing it with `any` would remove a name a reader
+ * can look up in the producing repo.
+ */
+function isUnresolvedReference(type: Type): boolean {
+  return (
+    type.isAny() &&
+    (type.compilerType as { intrinsicName?: string }).intrinsicName === 'error'
+  );
 }
 
 /** All .d.ts files under a directory, depth-first, deterministic order. */
