@@ -314,9 +314,58 @@ pub struct CompatVerdict {
     /// on the same terms as [`CompatVerdict::request`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<DirectionVerdict>,
+    /// Every consumer CALL SITE this row folded, with that site's own answer
+    /// (carrick#1385).
+    ///
+    /// The four key fields above name a canonical pair, and several call sites
+    /// routinely land on one: a hook that sets a request up, the client method
+    /// it calls, and the line that issues the request are three sites on one
+    /// `(METHOD, path)`. The fold above is what a reader with one row and
+    /// several sites to attach it to needs; it is not what a reader listing
+    /// those sites needs, and quoting the folded row against each of them
+    /// states the worst site's verdict about sites that never produced it.
+    ///
+    /// The scan already files every outcome per site — the verdict key is
+    /// `(producer method, normalized producer path, (consumer file, consumer
+    /// line))` — so this field retains what the fold collapses rather than
+    /// computing anything new.
+    ///
+    /// INVARIANT, and the test `the_pair_row_is_the_fold_of_its_sites` asserts
+    /// it: the pair-level `request`/`response` are the worst-wins fold of the
+    /// sites listed here. A reader that ignores this field reads exactly what
+    /// it read before the field existed.
+    ///
+    /// Empty only on a blob written before the field existed: a persisted row
+    /// folded at least one site by construction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sites: Vec<CompatVerdictSite>,
     /// Scanner release that produced this verdict (`CARGO_PKG_VERSION`), so a
     /// reader can see how stale the verdict is relative to the current scanner.
     pub scanner_version: String,
+}
+
+/// One consumer call site's own answer, inside the pair row that folds it
+/// (carrick#1385).
+///
+/// The directions are read exactly as [`CompatVerdict::request`] and
+/// [`CompatVerdict::response`] are: absent means the check filed no outcome
+/// for that half of THIS site, which is not a verdict of any kind.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CompatVerdictSite {
+    /// The call site, `"<file>:<line>"`, repo-relative.
+    ///
+    /// Written as the canonical `(file, line)` identity the check filed the
+    /// outcome under, so any column suffix an edge carried is gone and the
+    /// string joins byte-for-byte against `parse_file_location` of the
+    /// consumer row's own `file_location`. Repo-relative because
+    /// `attach_compat_verdicts` runs after `relativize_cloud_paths`.
+    pub consumer_location: String,
+    /// This site's REQUEST direction. See [`CompatVerdict::request`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<DirectionVerdict>,
+    /// This site's RESPONSE direction. See [`CompatVerdict::response`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<DirectionVerdict>,
 }
 
 /// A consumer call that reaches a producer endpoint through a published npm
@@ -1222,10 +1271,37 @@ pub(crate) fn direction_verdict(
     }
 }
 
+/// Worst-wins rank of one direction: the verdict first, then whether it
+/// compared two KNOWN types (carrick#839).
+///
+/// The verdict half is exactly [`crate::operation::TypeVerdict::combine`]'s
+/// precedence (incompatible > unverifiable > compatible) written as an order,
+/// so a strict increase here is the same replacement decision the fold made
+/// before this function existed.
+///
+/// The resolution half is the tie-break it was missing. Two call sites on one
+/// pair and one direction, both `compatible`, one that compared two known
+/// types and one that compared over an `any`, used to store whichever arrived
+/// first — deterministic, because `matches` is sorted, but not honest: the row
+/// could say the check compared two known types while a sibling call site on
+/// the same contract compared nothing. An unresolved sibling degrades the
+/// stored direction instead, which is the rule
+/// [`crate::analyzer::PairDirections::from_outcomes`] already applies WITHIN a
+/// direction, and the precedence the cloud's own reader already ranks rows by.
+fn direction_rank(direction: &DirectionVerdict) -> (u8, u8) {
+    use crate::operation::TypeVerdict;
+    let verdict = match direction.verdict {
+        TypeVerdict::Compatible => 0,
+        TypeVerdict::Unverifiable => 1,
+        TypeVerdict::Incompatible => 2,
+    };
+    (verdict, u8::from(!direction.resolved))
+}
+
 /// Fold an incoming direction into a stored one, worst-wins by
-/// [`crate::operation::TypeVerdict::combine`]. A direction only one side states
-/// is kept as stated: the other call site compared nothing there, and nothing
-/// never overrides an answer.
+/// [`direction_rank`]. A direction only one side states is kept as stated: the
+/// other call site compared nothing there, and nothing never overrides an
+/// answer.
 ///
 /// `notes` survives the fold either way (carrick#1341), on the same rule
 /// [`crate::analyzer::PairDirections::from_outcomes`] uses: worst-wins picks
@@ -1239,7 +1315,7 @@ fn merge_direction(stored: &mut Option<DirectionVerdict>, incoming: &Option<Dire
         Some(existing) => {
             let mut notes = std::mem::take(&mut existing.notes);
             notes.extend(incoming.notes.iter().cloned());
-            if existing.verdict.combine(incoming.verdict) != existing.verdict {
+            if direction_rank(incoming) > direction_rank(existing) {
                 *existing = incoming.clone();
             }
             notes.sort();
@@ -1247,6 +1323,24 @@ fn merge_direction(stored: &mut Option<DirectionVerdict>, incoming: &Option<Dire
             existing.notes = notes;
         }
     }
+}
+
+/// Fold an incoming site into the list a pair row carries, by call-site
+/// identity (carrick#1385).
+///
+/// Two edges at one location is a duplicate, not two sites, and it folds
+/// through exactly the same [`merge_direction`] the pair row does — otherwise
+/// the pair row would stop being the fold of the sites it lists.
+fn merge_site(sites: &mut Vec<CompatVerdictSite>, incoming: CompatVerdictSite) {
+    if let Some(existing) = sites
+        .iter_mut()
+        .find(|s| s.consumer_location == incoming.consumer_location)
+    {
+        merge_direction(&mut existing.request, &incoming.request);
+        merge_direction(&mut existing.response, &incoming.response);
+        return;
+    }
+    sites.push(incoming);
 }
 
 /// Attach per-pair type-compat verdicts to each service payload, for the cross-repo
@@ -1267,7 +1361,14 @@ fn merge_direction(stored: &mut Option<DirectionVerdict>, incoming: &Option<Dire
 /// call site that happened to agree, and a pair that compared nothing is never
 /// upgraded by one that did. That dedup runs PER DIRECTION (carrick#822): a
 /// sibling call site that resolved the response half cannot upgrade this row's
-/// request half, and vice versa.
+/// request half, and vice versa. Within a direction it ranks on the verdict
+/// AND on whether the site compared two known types (carrick#839), so a
+/// `compatible` produced over an `any` no longer masks a sibling's.
+///
+/// What the dedup collapses is retained beside it: each row lists the call
+/// sites it folded and their own answers (`sites`, carrick#1385), so a reader
+/// listing an operation's consumers can say what the check found AT a site
+/// instead of quoting the worst site's verdict against all of them.
 pub fn attach_compat_verdicts(
     payloads: &mut [CloudRepoData],
     matches: &[crate::analyzer::CrossRepoMatch],
@@ -1300,12 +1401,29 @@ pub fn attach_compat_verdicts(
                 // closed).
                 continue;
             }
+            // The call site this edge's outcome was filed for. Every edge that
+            // filed one has a location — `verdict_key_of_edge` returns `None`
+            // without it, and an edge with no key files nothing — so this is
+            // the same condition as the `dirs.is_empty()` check above, stated
+            // where the site needs it. Reduced to the canonical `(file, line)`
+            // the check keyed on, so a column suffix cannot split one site in
+            // two and the string joins against the consumer row's own
+            // `file_location`.
+            let Some(location) = m.consumer_location.as_deref() else {
+                continue;
+            };
+            let (file, line) = crate::type_manifest::parse_file_location(location);
             let pair = (
                 m.producer_repo.clone(),
                 m.producer_key.clone(),
                 m.consumer_repo.clone(),
                 m.consumer_key.clone(),
             );
+            let site = CompatVerdictSite {
+                consumer_location: format!("{file}:{line}"),
+                request: dirs.request.as_ref().map(direction_verdict),
+                response: dirs.response.as_ref().map(direction_verdict),
+            };
             let row = CompatVerdict {
                 producer_repo: m.producer_repo.clone(),
                 producer_key: m.producer_key.clone(),
@@ -1313,19 +1431,26 @@ pub fn attach_compat_verdicts(
                 consumer_key: m.consumer_key.clone(),
                 request: dirs.request.as_ref().map(direction_verdict),
                 response: dirs.response.as_ref().map(direction_verdict),
+                sites: vec![site.clone()],
                 scanner_version: scanner_version.to_string(),
             };
             by_pair
                 .entry(pair)
                 .and_modify(|existing| {
+                    // The site keeps its OWN answer; only the pair-level
+                    // fields below fold. The two are written from one `dirs`,
+                    // and the same `merge_direction` runs over both, which is
+                    // what makes the pair row the fold of this list.
+                    merge_site(&mut existing.sites, site.clone());
                     // Worst-wins on the same canonical pair, PER DIRECTION, by
                     // the one precedence the scanner states
-                    // (`TypeVerdict::combine`): a direction is replaced only
-                    // when the incoming verdict is worse than the stored one,
-                    // so equal verdicts keep the first — and `matches` is
-                    // sorted, so that is deterministic. Folding the two
-                    // directions together here would put back exactly the
-                    // conflation carrick#822 removed.
+                    // ([`direction_rank`]): a direction is replaced only when
+                    // the incoming one ranks strictly worse than the stored
+                    // one, so two sites that tie on verdict AND on resolution
+                    // keep the first — and `matches` is sorted, so that is
+                    // deterministic. Folding the two directions together here
+                    // would put back exactly the conflation carrick#822
+                    // removed.
                     merge_direction(&mut existing.request, &row.request);
                     merge_direction(&mut existing.response, &row.response);
                 })
@@ -1335,7 +1460,17 @@ pub fn attach_compat_verdicts(
         payload.compat_verdicts = if by_pair.is_empty() {
             None
         } else {
-            Some(by_pair.into_values().collect())
+            Some(
+                by_pair
+                    .into_values()
+                    .map(|mut row| {
+                        // By location, so the stored bytes do not depend on
+                        // the order the edges arrived in.
+                        row.sites.sort();
+                        row
+                    })
+                    .collect(),
+            )
         };
     }
 }
@@ -1899,15 +2034,21 @@ mod tests {
     ) -> crate::analyzer::PairCheckOutcome {
         let rest = e.producer_key.split_once('|').expect("http key").1;
         let (method, path) = rest.split_once('|').expect("http key");
+        // The manifest entry production fills these from states the file and
+        // the line separately, so a test edge whose location packs a line (or
+        // a line and a column) has to be split the same way — the edge side of
+        // the key runs the location through `parse_file_location`, and a
+        // verbatim `consumer_file` would silently file the outcome under a key
+        // no edge can recover.
+        let (consumer_file, consumer_line) = crate::type_manifest::parse_file_location(
+            e.consumer_location.as_deref().unwrap_or("src/client.ts"),
+        );
         crate::analyzer::PairCheckOutcome {
             pair_key: format!("{}~{}", e.producer_key, e.consumer_key),
             pseudo_method: method.to_uppercase(),
             identity: path.to_string(),
-            consumer_file: e
-                .consumer_location
-                .clone()
-                .unwrap_or_else(|| "src/client.ts".to_string()),
-            consumer_line: 1,
+            consumer_file,
+            consumer_line,
             type_kind,
             bucket,
             gate: None,
@@ -2811,5 +2952,252 @@ mod tests {
         let request = verdicts[0].request.as_ref().unwrap();
         assert_eq!(request.verdict, crate::operation::TypeVerdict::Incompatible);
         assert_eq!(request.reason.as_deref(), Some("mismatch"));
+    }
+
+    /// A `compatible` outcome that compared over an `any` (carrick#839).
+    fn compatible_but_unresolved_outcome(
+        e: &CrossRepoMatch,
+        type_kind: ManifestTypeKind,
+        reason: &str,
+    ) -> crate::analyzer::PairCheckOutcome {
+        outcome(
+            e,
+            type_kind,
+            crate::services::type_sidecar::VerdictBucket::Compatible,
+            None,
+            false,
+            Some(reason),
+        )
+    }
+
+    /// The pair-level fold, recomputed from the sites a row lists.
+    fn fold_of_sites(
+        sites: &[CompatVerdictSite],
+    ) -> (Option<DirectionVerdict>, Option<DirectionVerdict>) {
+        let mut request = None;
+        let mut response = None;
+        for site in sites {
+            merge_direction(&mut request, &site.request);
+            merge_direction(&mut response, &site.response);
+        }
+        (request, response)
+    }
+
+    /// carrick#839: two call sites on one pair and one direction, both
+    /// `compatible`, one that compared two known types and one that compared
+    /// over an `any`. The stored direction is the unresolved one WHICHEVER
+    /// order they arrive in — before the resolution tie-break the fold ranked
+    /// on the verdict alone, so the row kept whichever came first and could
+    /// say the check compared two known types while a sibling call site on the
+    /// same contract compared nothing.
+    #[test]
+    fn a_resolved_site_never_masks_an_unresolved_sibling() {
+        for reversed in [false, true] {
+            let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
+            let known = edge_at("producer", "http|GET|/x", "consumer", "http|GET|/x", "a.ts");
+            let blind = edge_at("producer", "http|GET|/x", "consumer", "http|GET|/x", "b.ts");
+            let dirs = directions(&[
+                compatible_outcome(&known, ManifestTypeKind::Response),
+                compatible_but_unresolved_outcome(
+                    &blind,
+                    ManifestTypeKind::Response,
+                    "consumer side carries `any` at `data`",
+                ),
+            ]);
+            let mut edges = vec![known, blind];
+            if reversed {
+                edges.reverse();
+            }
+            attach_compat_verdicts(&mut payloads, &edges, &dirs);
+
+            let verdicts = payloads[0].compat_verdicts.clone().unwrap();
+            assert_eq!(verdicts.len(), 1);
+            let response = verdicts[0].response.as_ref().unwrap();
+            assert_eq!(
+                response.verdict,
+                crate::operation::TypeVerdict::Compatible,
+                "the verdict axis is untouched: both sites answered compatible"
+            );
+            assert!(
+                !response.resolved,
+                "arrival order {reversed}: an unresolved sibling degrades the \
+                 stored direction instead of being dropped"
+            );
+            assert_eq!(
+                response.unresolved_reason.as_deref(),
+                Some("consumer side carries `any` at `data`"),
+                "the unresolution travels with the verdict it qualifies"
+            );
+        }
+    }
+
+    /// carrick#1385: the row lists every call site it folded, each with its own
+    /// answer, so a reader listing an operation's consumers can say what the
+    /// check found AT a site. The sites here disagree, which is the whole
+    /// reported shape: one operation-level `incompatible` was quoted against
+    /// four call sites, one of which agreed with the producer.
+    #[test]
+    fn a_verdict_row_lists_each_call_sites_own_answer() {
+        let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
+        let agrees = edge_at(
+            "producer",
+            "http|GET|/x",
+            "consumer",
+            "http|GET|/x",
+            "src/lib/client.ts:124",
+        );
+        let breaks = edge_at(
+            "producer",
+            "http|GET|/x",
+            "consumer",
+            "http|GET|/x",
+            "src/hooks/use-thing.ts:17:9",
+        );
+        let dirs = directions(&[
+            compatible_outcome(&agrees, ManifestTypeKind::Response),
+            incompatible_outcome(&breaks, ManifestTypeKind::Response, "not assignable"),
+        ]);
+        attach_compat_verdicts(&mut payloads, &[agrees, breaks], &dirs);
+
+        let verdicts = payloads[0].compat_verdicts.clone().unwrap();
+        assert_eq!(verdicts.len(), 1, "still one row per canonical pair");
+        let sites = &verdicts[0].sites;
+        assert_eq!(sites.len(), 2, "both call sites are listed");
+
+        // Sorted by location, and the column suffix the edge carried is gone:
+        // a site's identity is the `(file, line)` the check keyed on, which is
+        // what the consumer row's own `file_location` reduces to.
+        assert_eq!(sites[0].consumer_location, "src/hooks/use-thing.ts:17");
+        assert_eq!(sites[1].consumer_location, "src/lib/client.ts:124");
+
+        let broken = sites[0].response.as_ref().expect("the site that broke");
+        assert_eq!(broken.verdict, crate::operation::TypeVerdict::Incompatible);
+        assert_eq!(broken.reason.as_deref(), Some("not assignable"));
+
+        let fine = sites[1].response.as_ref().expect("the site that agreed");
+        assert_eq!(
+            fine.verdict,
+            crate::operation::TypeVerdict::Compatible,
+            "the site that agreed keeps its own answer instead of inheriting \
+             the worst site's"
+        );
+        assert!(fine.reason.is_none());
+    }
+
+    /// THE PIN: the pair-level directions are the worst-wins fold of the sites
+    /// the row lists. A reader that ignores `sites` reads exactly what it read
+    /// before the field existed, and a reader that reads them can recover how
+    /// the fold got its answer. Asserted over sites that disagree on BOTH
+    /// directions in opposite senses, so neither half can pass by accident.
+    #[test]
+    fn the_pair_row_is_the_fold_of_its_sites() {
+        let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
+        let first = edge_at(
+            "producer",
+            "http|POST|/x",
+            "consumer",
+            "http|POST|/x",
+            "src/a.ts:3",
+        );
+        let second = edge_at(
+            "producer",
+            "http|POST|/x",
+            "consumer",
+            "http|POST|/x",
+            "src/b.ts:9",
+        );
+        let dirs = directions(&[
+            incompatible_outcome(&first, ManifestTypeKind::Request, "request mismatch"),
+            compatible_outcome(&first, ManifestTypeKind::Response),
+            compatible_outcome(&second, ManifestTypeKind::Request),
+            unverifiable_outcome(
+                &second,
+                ManifestTypeKind::Response,
+                "producer side carries `any`",
+            ),
+        ]);
+        attach_compat_verdicts(&mut payloads, &[first, second], &dirs);
+
+        let row = payloads[0].compat_verdicts.clone().unwrap().remove(0);
+        assert_eq!(row.sites.len(), 2);
+        let (request, response) = fold_of_sites(&row.sites);
+        assert_eq!(
+            row.request, request,
+            "the stored request direction is the fold of the sites' request halves"
+        );
+        assert_eq!(
+            row.response, response,
+            "the stored response direction is the fold of the sites' response halves"
+        );
+        // Stated outright as well, so the pin cannot pass by both sides being
+        // empty or by both being computed the same wrong way.
+        assert_eq!(
+            row.request.as_ref().unwrap().verdict,
+            crate::operation::TypeVerdict::Incompatible
+        );
+        assert_eq!(
+            row.response.as_ref().unwrap().verdict,
+            crate::operation::TypeVerdict::Unverifiable
+        );
+    }
+
+    /// The wire spelling, and the two things a blob written before the field
+    /// existed must still do (carrick#1385).
+    #[test]
+    fn sites_ride_the_wire_and_an_older_row_reads_without_them() {
+        let mut payloads = vec![empty_repo("org/consumer", Some("consumer"))];
+        let e = edge_at(
+            "producer",
+            "http|GET|/x",
+            "consumer",
+            "http|GET|/x",
+            "src/a.ts:3",
+        );
+        let dirs = directions(&[compatible_outcome(&e, ManifestTypeKind::Response)]);
+        attach_compat_verdicts(&mut payloads, &[e], &dirs);
+
+        let json = serde_json::to_value(&payloads[0].compat_verdicts).unwrap();
+        assert_eq!(
+            json[0]["sites"],
+            serde_json::json!([{
+                "consumer_location": "src/a.ts:3",
+                "response": { "verdict": "compatible", "resolved": true },
+            }]),
+            "the site list reaches the blob under `sites`, with the site's own \
+             directions spelled exactly as the pair-level ones are"
+        );
+
+        // A row the field never touched: absent from the wire, not `null`, so
+        // a row with nothing to list is byte-identical to a pre-#1385 one.
+        let empty = CompatVerdict {
+            producer_repo: "p".to_string(),
+            producer_key: "http|GET|/x".to_string(),
+            consumer_repo: "c".to_string(),
+            consumer_key: "http|GET|/x".to_string(),
+            request: None,
+            response: None,
+            sites: Vec::new(),
+            scanner_version: "0.0.0-test".to_string(),
+        };
+        let text = serde_json::to_string(&empty).unwrap();
+        assert!(
+            !text.contains("sites"),
+            "an empty site list must be omitted, not serialized as []"
+        );
+
+        // And a stored row written before the field existed still reads, with
+        // the pair-level directions it has always carried.
+        let older: CompatVerdict = serde_json::from_str(
+            r#"{"producer_repo":"p","producer_key":"http|GET|/x","consumer_repo":"c",
+                "consumer_key":"http|GET|/x",
+                "response":{"verdict":"compatible","resolved":true},
+                "scanner_version":"0.3.48"}"#,
+        )
+        .expect("a blob written before `sites` existed still deserializes");
+        assert!(older.sites.is_empty());
+        assert_eq!(
+            older.response.as_ref().unwrap().verdict,
+            crate::operation::TypeVerdict::Compatible
+        );
     }
 }
