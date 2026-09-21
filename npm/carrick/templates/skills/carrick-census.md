@@ -54,7 +54,9 @@ Report these numbers before the list, per query where the field is per query:
   removed, and `best` where it names the closest of them. A count above zero is
   the case for one more search at a lower `similarity_threshold`;
 - `total_without_intent`, which is index-wide: functions carrying no intent
-  text, which no search looked at;
+  text, which the search ranked on their name, signature and body tokens
+  alone, so a query that names one finds it and a query that describes what
+  it does without naming it does not;
 - `total_intent_carried_forward` where the response states it, which are intents
   describing the code as of an earlier scan.
 
