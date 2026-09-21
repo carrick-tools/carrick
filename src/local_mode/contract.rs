@@ -270,9 +270,11 @@ pub struct CheckOutput {
     /// The struct stays beside it for a reader that wants the numbers.
     pub boundary_lines: Vec<String>,
     /// What a `--recheck` call did about the file having moved since the index
-    /// (carrick#1036). Absent whenever no re-check was asked for, which is
-    /// every `touch`, every language-server read, and every `check` on a file
-    /// the tree has not changed.
+    /// (carrick#1036). Present on every `check --recheck`, including the ones
+    /// where nothing ran — a file the tree has not changed, or one that is no
+    /// longer on disk — because a reader told to read `ran` must not meet an
+    /// absent key (carrick#1374). Absent only when no re-check was asked for,
+    /// which is every `touch` and every language-server read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recheck: Option<Recheck>,
 }
@@ -291,15 +293,20 @@ pub struct Recheck {
     /// verdict. `extraction` — the same, and no row of this file carries one:
     /// nothing here pairs with anything, or the pairs it has were not both
     /// resolved. Which of those it is, is in each row's own detail. `none` —
-    /// the rows above are the indexed ones.
+    /// the rows above are the indexed ones, and `reason` says why: the file
+    /// has not changed since the index, it is no longer on disk, or a re-check
+    /// was warranted and did not finish.
     pub ran: String,
     /// Wall time of the re-check, including the run that missed its budget.
+    /// Zero where no re-check was attempted at all.
     pub elapsed_ms: u64,
     /// When the rows above were computed, on a `none`. Absent when they are
     /// this run's, because then the answer is now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_since: Option<String>,
-    /// Why the re-check did not run, on a `none`. One sentence, for a log.
+    /// Why the re-check did not run, on a `none`. One sentence, for a log, and
+    /// the only thing that tells a re-check that failed from one that was not
+    /// needed (carrick#1374).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Functions this file declares in the working tree that the index does
@@ -332,9 +339,17 @@ impl Recheck {
     /// `ran`, which is the field that says whose rows these are.
     pub fn line(&self) -> String {
         match self.ran.as_str() {
+            // The reason is what tells the two `none`s apart: a re-check that
+            // was warranted and did not finish, and one that had nothing to do
+            // because the file has not moved (carrick#1374). Printing the
+            // reason rather than one hardcoded sentence is what keeps the line
+            // true for both.
             "none" => format!(
-                "re-check: did not finish inside its budget ({} ms), so these verdicts are the indexed ones{}.",
-                self.elapsed_ms,
+                "re-check: {}, so these verdicts are the indexed ones{}.",
+                match self.reason.as_deref() {
+                    Some(reason) => format!("did not run — {reason}"),
+                    None => format!("did not finish inside its budget ({} ms)", self.elapsed_ms),
+                },
                 match self.stale_since.as_deref() {
                     Some(since) => format!(", computed at {since}"),
                     None => String::new(),
@@ -766,6 +781,27 @@ mod tests {
         let text = degraded.render();
         assert!(text.contains("computed at 2026-09-13T22:26:26Z"), "{text}");
         assert!(text.contains("unresolved since your edit"), "{text}");
+    }
+
+    /// carrick#1374: a re-check that had nothing to do is a `none` too, and
+    /// the line must not tell the reader it ran out of time.
+    #[test]
+    fn a_re_check_with_nothing_to_do_says_that_rather_than_a_budget() {
+        let mut unchanged = output();
+        unchanged.stale = false;
+        unchanged.recheck = Some(Recheck {
+            ran: "none".to_string(),
+            elapsed_ms: 0,
+            stale_since: Some("2026-09-13T22:26:26Z".to_string()),
+            reason: Some("the file has not changed since the index".to_string()),
+            new_functions: Vec::new(),
+        });
+        let text = unchanged.render();
+        assert!(
+            text.contains("did not run — the file has not changed since the index"),
+            "{text}"
+        );
+        assert!(!text.contains("inside its budget"), "{text}");
     }
 
     #[test]

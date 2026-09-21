@@ -495,10 +495,23 @@ fn an_edit_is_re_judged_before_the_index_catches_up() {
         &budget,
     ))
     .expect("check --recheck --json was not JSON");
+    // carrick#1374: the block is stated anyway. A reader told to read
+    // `recheck.ran` meets an answer on the commonest case of all rather than
+    // an absent key, and the reason says the indexed rows ARE this file's.
     assert_eq!(
-        untouched["recheck"],
-        serde_json::Value::Null,
-        "an unchanged file is answered from the index, with no re-check at all:\n{untouched:#}"
+        untouched["recheck"]["ran"],
+        serde_json::json!("none"),
+        "nothing was re-extracted, so the rows are the indexed ones:\n{untouched:#}"
+    );
+    assert_eq!(
+        untouched["recheck"]["reason"],
+        serde_json::json!("the file has not changed since the index"),
+        "and the block says why nothing ran:\n{untouched:#}"
+    );
+    assert_eq!(
+        untouched["recheck"]["elapsed_ms"],
+        serde_json::json!(0),
+        "no re-check was attempted, so no time was spent on one:\n{untouched:#}"
     );
     assert_eq!(
         untouched["items"][0]["verdict"]["result"],
