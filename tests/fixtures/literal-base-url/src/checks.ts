@@ -13,3 +13,13 @@ export async function healthCheck() {
 
   return { statuses: statuses.ok, app: app.ok };
 }
+
+// The same base, at a site the cassette holds no row for, with the verb written
+// in the call's own options bag. Neither of the two sites above states a verb
+// anywhere — a bare `fetch(url)` and a bag carrying only headers — so this is
+// the one site the scanner can state a whole row for on its own (carrick#641).
+export async function evictCache(id: string) {
+  return fetch(`${ADMIN_API}/cache/${id}`, {
+    method: "DELETE",
+  });
+}

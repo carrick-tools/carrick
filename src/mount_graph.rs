@@ -179,6 +179,7 @@ impl ConsumerRole {
             | S::SameFileWrapper
             | S::WholeUrlEnv
             | S::EnvBasePath
+            | S::LiteralBasePath
             | S::NewUrl
             | S::ReceiverType
             | S::InlineLiteral => Some(Self::NetworkRequest),
@@ -788,6 +789,7 @@ mod tests {
             S::SameFileWrapper,
             S::WholeUrlEnv,
             S::EnvBasePath,
+            S::LiteralBasePath,
             S::NewUrl,
             S::ReceiverType,
             S::InlineLiteral,

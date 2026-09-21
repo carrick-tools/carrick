@@ -504,6 +504,30 @@ fn is_literal_http_origin(prefix: &str) -> bool {
     host_is_literal && port_is_literal
 }
 
+/// Does a base declared as a plain string literal state an absolute http(s)
+/// ORIGIN — with or without a path after it (carrick#641)?
+///
+/// The origin-or-not question is what tells a base from a route prefix, the
+/// same line [`crate::env_alias::base_default_states_a_path`] draws for an
+/// env-backed binding: `const BASE = "http://localhost:8080"` says where the
+/// request goes, and `const PREFIX = "/api"` says where a route is registered.
+/// A base carrying a path (`"https://api.example.test/v1"`) is still an
+/// origin, so the authority is what [`is_literal_http_origin`] is asked about
+/// rather than the whole literal.
+fn literal_base_states_an_origin(literal: &str) -> bool {
+    let scheme = if literal.starts_with("https://") {
+        "https://"
+    } else if literal.starts_with("http://") {
+        "http://"
+    } else {
+        return false;
+    };
+    let authority_end = literal[scheme.len()..]
+        .find(['/', '?', '#'])
+        .map_or(literal.len(), |offset| scheme.len() + offset);
+    is_literal_http_origin(&literal[..authority_end])
+}
+
 /// Whole-word substring test: `word` appears in `haystack` bounded by
 /// non-identifier characters, so `TICKET_QUERY` matches the call text but does
 /// not match inside `TICKET_QUERY_V2`.
@@ -913,7 +937,7 @@ impl ResolutionSource {
     /// request spec overruled the `new URL` path.
     fn precedence(self) -> u8 {
         match self {
-            Self::WholeUrlEnv => 7,
+            Self::WholeUrlEnv => 8,
             // Documentation rather than arbitration: an env-backed base
             // followed by a literal path is a different SHAPE from a binding
             // that holds the whole URL, from a request spec's object literal
@@ -921,7 +945,13 @@ impl ResolutionSource {
             // sits below the whole-URL rule for the same reason that rule
             // sits at the top: a binding read straight out of the environment
             // is the most specific statement a target makes.
-            Self::EnvBasePath => 6,
+            Self::EnvBasePath => 7,
+            // The same shape with the origin spelled out in the file rather
+            // than read from the environment (carrick#641). A binding is
+            // declared one way or the other, so the two never claim one site;
+            // ranked below the env rule so that if a file ever declared both,
+            // the environment's reading is the one kept.
+            Self::LiteralBasePath => 6,
             Self::ImportedMember => 5,
             Self::RequestSpec => 4,
             Self::NewUrl => 3,
@@ -1689,6 +1719,7 @@ impl FileOrchestrator {
                             &EnvAliasMap::new(),
                             &WholeUrlFallbackMap::new(),
                             &EnvFallbackMap::new(),
+                            &LiteralBaseMap::new(),
                             &route_endpoints,
                             &descriptor_endpoints,
                             &decorator_endpoints,
@@ -2345,6 +2376,7 @@ impl FileOrchestrator {
                 &pf.env_alias_map,
                 &pf.whole_url_fallbacks,
                 &pf.env_fallbacks,
+                &pf.literal_bases,
                 &pf.route_endpoints,
                 &pf.descriptor_endpoints,
                 &pf.decorator_endpoints,
@@ -5784,6 +5816,10 @@ impl FileOrchestrator {
         // back to, which is what tells a base from a route prefix
         // (carrick#744).
         env_fallbacks: &EnvFallbackMap,
+        // Every base this file declares as a plain string literal, its own and
+        // the ones it imports (carrick#627). The value is the literal, so an
+        // origin is told from a route prefix by reading it.
+        literal_bases: &LiteralBaseMap,
         route_endpoints: &[EndpointResult],
         descriptor_endpoints: &[EndpointResult],
         decorator_endpoints: &[EndpointResult],
@@ -5893,6 +5929,49 @@ impl FileOrchestrator {
                         target,
                         Some(shape.method.clone()),
                         ResolutionSource::EnvBasePath,
+                        None,
+                    ))),
+                });
+            }
+
+            // The same shape with the base declared as a plain string literal
+            // rather than read from the environment (carrick#627/#641). The
+            // whole URL is spelled out in the file, a binding away, so the
+            // site is a request to a known origin whatever the model says
+            // about it — and before this the resolution was a REWRITE of the
+            // model's row, which lost the site entirely whenever the model
+            // returned none.
+            //
+            // The target is emitted in the source's own spelling, exactly as
+            // the env-backed rule emits its own: `resolve_target_bases` is the
+            // one place that performs the join, and it runs over this row and
+            // over the model's reading of the same line alike.
+            //
+            // Two gates, both the same question the env rule asks. The verb
+            // has to be the call's own, because a target states none and one
+            // inferred from elsewhere would index the wrong operation. And the
+            // base has to state an ORIGIN: a base declared as a path is a
+            // route prefix, and what is written after it is not another
+            // service's route.
+            if let Some(base_path) = candidate.base_path_target.as_ref()
+                && let RequestShapeSignal::Known(shape) = &candidate.request_shape
+                && let Some(literal) = literal_bases.get(&base_path.base)
+                && literal_base_states_an_origin(literal)
+            {
+                let target = base_path.target();
+                claim(Resolved {
+                    method: Some(shape.method.clone()),
+                    url: target.clone(),
+                    span,
+                    line,
+                    source: ResolutionSource::LiteralBasePath,
+                    emits: true,
+                    row: ResolvedRow::Call(Box::new(Self::deterministic_call(
+                        candidate,
+                        line,
+                        target,
+                        Some(shape.method.clone()),
+                        ResolutionSource::LiteralBasePath,
                         None,
                     ))),
                 });
@@ -15026,6 +15105,28 @@ export { routes };
         )
     }
 
+    /// The same seam with the carrick#627/#641 literal bases supplied.
+    fn emit_and_join_with_literal_bases(
+        model: FileAnalysisResult,
+        candidate_map: &HashMap<String, CandidateTarget>,
+        literal_bases: &LiteralBaseMap,
+        file_path: &str,
+    ) -> (FileAnalysisResult, ProcessingStats) {
+        emit_and_join_core(
+            model,
+            candidate_map,
+            &HashMap::new(),
+            &[],
+            &EnvAliasMap::new(),
+            &WholeUrlFallbackMap::new(),
+            literal_bases,
+            &[],
+            file_path,
+            false,
+            &HashMap::new(),
+        )
+    }
+
     /// The same seam with the carrick#695 receiver answers supplied.
     #[allow(clippy::too_many_arguments)]
     fn emit_and_join_with_receivers(
@@ -15040,6 +15141,37 @@ export { routes };
         route_module_claimed: bool,
         receiver_roles: &HashMap<u32, ReceiverRole>,
     ) -> (FileAnalysisResult, ProcessingStats) {
+        emit_and_join_core(
+            model,
+            candidate_map,
+            resolved_members,
+            local_wrapper_calls,
+            aliases,
+            whole_url_fallbacks,
+            &LiteralBaseMap::new(),
+            route_endpoints,
+            file_path,
+            route_module_claimed,
+            receiver_roles,
+        )
+    }
+
+    /// Every input the emit/join seam takes. The wrappers above are the same
+    /// call with the inputs a given test does not vary left empty.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_and_join_core(
+        model: FileAnalysisResult,
+        candidate_map: &HashMap<String, CandidateTarget>,
+        resolved_members: &HashMap<u32, ResolvedMember>,
+        local_wrapper_calls: &[LocalWrapperCall],
+        aliases: &EnvAliasMap,
+        whole_url_fallbacks: &WholeUrlFallbackMap,
+        literal_bases: &LiteralBaseMap,
+        route_endpoints: &[EndpointResult],
+        file_path: &str,
+        route_module_claimed: bool,
+        receiver_roles: &HashMap<u32, ReceiverRole>,
+    ) -> (FileAnalysisResult, ProcessingStats) {
         let mut stats = ProcessingStats::default();
         let resolved = FileOrchestrator::resolve_candidates(
             candidate_map,
@@ -15048,6 +15180,7 @@ export { routes };
             aliases,
             whole_url_fallbacks,
             &EnvFallbackMap::new(),
+            literal_bases,
             route_endpoints,
             &[],
             &[],
@@ -17172,6 +17305,131 @@ export { routes };
 
         assert_eq!((added, corrected), (0, 0));
         assert!(result.data_calls.is_empty());
+    }
+
+    /// A site whose target opens with a base binding and continues with a
+    /// literal path, with the verb stated in its own options bag.
+    fn literal_base_site(target: &str, method: &str) -> HashMap<String, CandidateTarget> {
+        let mut candidate = candidate_with_snippet("c1", Some(target));
+        candidate.callee_object = "fetch".to_string();
+        candidate.callee_property = None;
+        candidate.request_shape = RequestShapeSignal::Known(WrapperRequestShape {
+            method: method.to_string(),
+            has_body: Some(true),
+        });
+        let (base, path) = target
+            .split_once('}')
+            .expect("a base-plus-path target opens with an interpolation");
+        candidate.base_path_target = Some(crate::swc_scanner::BasePathTarget {
+            base: base.trim_start_matches("${").to_string(),
+            base_reads_env: false,
+            path: path.to_string(),
+        });
+        HashMap::from([("c1".to_string(), candidate)])
+    }
+
+    /// carrick#641: `resolve_target_literal_base` can only rewrite a row that
+    /// already exists, so a call written against a base declared as a string
+    /// literal was lost outright whenever extraction answered nothing for its
+    /// site — and the route it reaches read as having no caller at all.
+    #[test]
+    fn a_literal_base_states_the_site_the_model_returned_no_row_for() {
+        let bases =
+            LiteralBaseMap::from([("ADMIN_API".to_string(), "http://localhost:8080".to_string())]);
+
+        let (result, stats) = emit_and_join_with_literal_bases(
+            FileAnalysisResult::default(),
+            &literal_base_site("${ADMIN_API}/cache/${id}", "DELETE"),
+            &bases,
+            "src/checks.ts",
+        );
+
+        assert_eq!(emitted(&stats, ResolutionSource::LiteralBasePath), 1);
+        assert_eq!(
+            result.data_calls[0].target, "${ADMIN_API}/cache/${id}",
+            "the source's own spelling; `resolve_target_bases` performs the join"
+        );
+        assert_eq!(result.data_calls[0].method.as_deref(), Some("DELETE"));
+        assert_eq!(
+            result.data_calls[0].candidate_id, "c1",
+            "the candidate's own id, with no pass-name prefix"
+        );
+        // The span is the SITE's: it anchors the type sidecar and marks the
+        // call candidate-backed downstream.
+        assert_eq!(result.data_calls[0].call_expression_span_start, Some(100));
+        assert_eq!(result.data_calls[0].call_expression_span_end, Some(140));
+        assert_eq!(result.data_calls[0].line_number, 12);
+    }
+
+    /// A base whose literal is a PATH states a route prefix, not an origin:
+    /// `` app.get(`${ACCOUNTS_PATH}/:id`, handler) `` is written in exactly
+    /// this shape to REGISTER a route. Claiming it would put a call this file
+    /// never makes into the index.
+    #[test]
+    fn a_literal_base_that_states_a_path_is_not_claimed() {
+        let bases =
+            LiteralBaseMap::from([("ACCOUNTS_PATH".to_string(), "/admin/accounts".to_string())]);
+
+        let (result, stats) = emit_and_join_with_literal_bases(
+            FileAnalysisResult::default(),
+            &literal_base_site("${ACCOUNTS_PATH}/${accountId}", "GET"),
+            &bases,
+            "src/admin.ts",
+        );
+
+        assert_eq!(emitted(&stats, ResolutionSource::LiteralBasePath), 0);
+        assert!(result.data_calls.is_empty(), "{:#?}", result.data_calls);
+    }
+
+    /// A base carrying a path after its origin is still an origin, so the
+    /// whole URL is spelled out in the file and the site is a request.
+    #[test]
+    fn a_literal_base_with_a_path_prefix_is_still_an_origin() {
+        let bases = LiteralBaseMap::from([(
+            "VENDOR_BASE".to_string(),
+            "https://api.example.test/v1".to_string(),
+        )]);
+
+        let (result, stats) = emit_and_join_with_literal_bases(
+            FileAnalysisResult::default(),
+            &literal_base_site("${VENDOR_BASE}/charges", "POST"),
+            &bases,
+            "src/billing.ts",
+        );
+
+        assert_eq!(emitted(&stats, ResolutionSource::LiteralBasePath), 1);
+        assert_eq!(result.data_calls[0].target, "${VENDOR_BASE}/charges");
+    }
+
+    /// A base this file declares nothing about is not this rule's to claim: the
+    /// value could be anything, including a path.
+    #[test]
+    fn a_base_no_literal_declares_is_not_claimed() {
+        let (result, stats) = emit_and_join_with_literal_bases(
+            FileAnalysisResult::default(),
+            &literal_base_site("${apiBase}/charges", "POST"),
+            &LiteralBaseMap::new(),
+            "src/billing.ts",
+        );
+
+        assert_eq!(emitted(&stats, ResolutionSource::LiteralBasePath), 0);
+        assert!(result.data_calls.is_empty(), "{:#?}", result.data_calls);
+    }
+
+    #[test]
+    fn a_literal_base_origin_is_read_with_or_without_a_path() {
+        assert!(literal_base_states_an_origin("http://localhost:8080"));
+        assert!(literal_base_states_an_origin("https://api.example.test"));
+        assert!(literal_base_states_an_origin("https://api.example.test/v1"));
+        assert!(literal_base_states_an_origin(
+            "http://localhost:8080/api?k=v"
+        ));
+
+        assert!(!literal_base_states_an_origin("/admin/accounts"));
+        assert!(!literal_base_states_an_origin("admin"));
+        assert!(!literal_base_states_an_origin("//api.example.test/v1"));
+        assert!(!literal_base_states_an_origin("https://"));
+        assert!(!literal_base_states_an_origin("https://${HOST}/v1"));
     }
 
     /// An OpenAPI-style path the model copied verbatim states the same route as
